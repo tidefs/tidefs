@@ -22,6 +22,8 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rand;
@@ -66,6 +68,10 @@ use tidefs_types_reclaim_queue_core::{
     DeadObjectEntry, DeadObjectReceiptPolicy, DeadObjectReplacementReceipt,
     ObjectKey as ReclaimObjectKey,
 };
+
+const RECEIPT_GENERATION_HIGH_WATER_MAGIC: [u8; 8] = *b"TFSPGH1\0";
+const RECEIPT_GENERATION_HIGH_WATER_ENCODED_LEN: usize = 64;
+const RECEIPT_GENERATION_RESERVATION_SIZE: u64 = 4096;
 
 // ---------------------------------------------------------------------------
 // Pool configuration
@@ -1140,9 +1146,10 @@ fn build_class_map(classes: &[DeviceClass]) -> ClassMap {
 // Pool
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum OldReceiptPolicy {
     RequireValid,
+    UseValidated(PlacementReceipt),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1197,6 +1204,14 @@ pub struct Pool {
     /// Next monotonic receipt generation for distinguishing same-topology
     /// rewrites of the same logical object.
     next_placement_receipt_generation: u64,
+    /// Inclusive durable ceiling reserved before any receipt in the range is
+    /// published. Reopen burns the unused tail rather than risking reuse.
+    reserved_placement_receipt_generation_through: u64,
+    /// Whether receipt-generation authority is writable, retrying one exact
+    /// reservation, or waiting for explicit topology recovery.
+    receipt_generation_authority_state: ReceiptGenerationAuthorityState,
+    /// Shared fail-closed gate consulted by public raw-store mutations.
+    raw_store_mutation_allowed: Arc<AtomicBool>,
     /// Pending removal result established only after this Pool instance
     /// actually detached the target. A marker plus a caller-supplied reduced
     /// configuration is not enough to populate this state.
@@ -1548,8 +1563,47 @@ fn restore_device_replacement_evidence(pool: &mut Pool) -> Result<()> {
             reason: "device replacement evidence does not match the loaded topology",
         });
     }
-    if evidence.state.is_active() {
-        evidence.state = ReplacementRebuildStatusState::Resuming;
+    match evidence.state {
+        ReplacementRebuildStatusState::Pending | ReplacementRebuildStatusState::Resuming => {
+            if new_topology_loaded && pool.placement_epoch == evidence.topology_epoch {
+                // The replacement member and its labels are the admitted
+                // topology. Ordinary writes may continue while rebuild
+                // evidence remains fail-closed for old-device detach.
+            } else if old_topology_loaded
+                && pool.placement_epoch.saturating_add(1).max(1) == evidence.topology_epoch
+            {
+                pool.set_receipt_generation_authority_state(
+                    ReceiptGenerationAuthorityState::ReplacementResumeRequired,
+                );
+            } else {
+                return Err(StoreError::InvalidOptions {
+                    reason:
+                        "active device replacement evidence has no complete matching label topology",
+                });
+            }
+            evidence.state = ReplacementRebuildStatusState::Resuming;
+        }
+        ReplacementRebuildStatusState::Canceled => {
+            if pool.placement_epoch != evidence.topology_epoch
+                || (!old_topology_loaded && !new_topology_loaded)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "canceled device replacement evidence is ahead of its final labels",
+                });
+            }
+        }
+        ReplacementRebuildStatusState::Completed => {
+            if !new_topology_loaded || pool.placement_epoch != evidence.topology_epoch {
+                return Err(StoreError::InvalidOptions {
+                    reason: "completed device replacement evidence does not match the new topology",
+                });
+            }
+        }
+        ReplacementRebuildStatusState::Refused => {
+            return Err(StoreError::InvalidOptions {
+                reason: "refused device replacement evidence has no writable final topology",
+            });
+        }
     }
     pool.replacement_evidence = Some(evidence);
     Ok(())
@@ -1764,6 +1818,12 @@ fn validate_read_only_lifecycle_state(
     {
         return Ok(());
     }
+    if evidence.state == ReplacementRebuildStatusState::Completed
+        && new_topology_loaded
+        && evidence.topology_epoch == topology_generation
+    {
+        return Ok(());
+    }
     Err(StoreError::InvalidOptions {
         reason: "read-only pool import refuses unresolved device replacement",
     })
@@ -1787,8 +1847,9 @@ fn resume_device_removal_if_pending(pool: &mut Pool) -> Result<()> {
                 .copied()
                 .all(|guid| unique_device_guids.insert(guid))
         {
-            // Preserve the marker when topology identity cannot be trusted.
-            return Ok(());
+            return Err(StoreError::InvalidOptions {
+                reason: "pending device removal has incomplete topology identity",
+            });
         }
         let target_path = pool
             .device_guids
@@ -1796,12 +1857,18 @@ fn resume_device_removal_if_pending(pool: &mut Pool) -> Result<()> {
             .position(|guid| *guid == marker.target_guid)
             .and_then(|idx| pool.devices.get(idx))
             .map(|device| device.root().to_path_buf());
-        if let Some(target_path) = target_path {
-            // A successful retry removes the target only from this Pool
-            // instance. Keep the marker because neither that detach nor GUID
-            // absence from a caller-supplied configuration proves a durable
-            // topology commit.
-            let _ = pool.safe_remove_device(&target_path);
+        let target_path = target_path.ok_or(StoreError::InvalidOptions {
+            reason: "pending device removal target is absent from the labeled topology",
+        })?;
+        // A successful retry removes the target only from this Pool
+        // instance. Keep the marker because neither that detach nor GUID
+        // absence from a caller-supplied configuration proves a durable
+        // topology commit.
+        let result = pool.safe_remove_device(&target_path)?;
+        if result.objects_failed != 0 || !result.topology_commit_pending {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending device removal could not reach topology-commit-pending state",
+            });
         }
     }
     Ok(())
@@ -1829,7 +1896,108 @@ fn placement_receipt_proves_device_evacuation(
         )
 }
 
-fn next_placement_receipt_generation_for_devices(devices: &[Device]) -> Result<u64> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReceiptGenerationHighWater {
+    pool_guid: [u8; 16],
+    reserved_through: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiptGenerationAuthorityState {
+    Converged,
+    ReservationPending { from: u64, through: u64 },
+    ReplacementResumeRequired,
+    RemovalTopologyCommitRequired,
+    RecoveryRequired,
+}
+
+fn receipt_generation_high_water_key() -> ObjectKey {
+    crate::pool_receipt_generation_high_water_key()
+}
+
+fn encode_receipt_generation_high_water(marker: ReceiptGenerationHighWater) -> [u8; 64] {
+    let mut encoded = [0u8; RECEIPT_GENERATION_HIGH_WATER_ENCODED_LEN];
+    encoded[..8].copy_from_slice(&RECEIPT_GENERATION_HIGH_WATER_MAGIC);
+    encoded[8..24].copy_from_slice(&marker.pool_guid);
+    encoded[24..32].copy_from_slice(&marker.reserved_through.to_le_bytes());
+    let checksum = blake3::hash(&encoded[..32]);
+    encoded[32..].copy_from_slice(checksum.as_bytes());
+    encoded
+}
+
+fn decode_receipt_generation_high_water(encoded: &[u8]) -> Result<ReceiptGenerationHighWater> {
+    if encoded.len() != RECEIPT_GENERATION_HIGH_WATER_ENCODED_LEN {
+        return Err(StoreError::InvalidOptions {
+            reason: "placement receipt generation high-water marker has an invalid length",
+        });
+    }
+    if encoded[..8] != RECEIPT_GENERATION_HIGH_WATER_MAGIC {
+        return Err(StoreError::InvalidOptions {
+            reason: "placement receipt generation high-water marker has invalid magic",
+        });
+    }
+    if encoded[32..] != *blake3::hash(&encoded[..32]).as_bytes() {
+        return Err(StoreError::InvalidOptions {
+            reason: "placement receipt generation high-water marker checksum mismatch",
+        });
+    }
+
+    let mut pool_guid = [0u8; 16];
+    pool_guid.copy_from_slice(&encoded[8..24]);
+    Ok(ReceiptGenerationHighWater {
+        pool_guid,
+        reserved_through: u64::from_le_bytes(encoded[24..32].try_into().unwrap()),
+    })
+}
+
+fn read_receipt_generation_high_water(
+    device: &Device,
+) -> Result<Option<ReceiptGenerationHighWater>> {
+    device
+        .get(receipt_generation_high_water_key())?
+        .map(|encoded| decode_receipt_generation_high_water(&encoded))
+        .transpose()
+}
+
+fn require_receipt_generation_high_water(
+    device: &Device,
+    pool_guid: [u8; 16],
+) -> Result<ReceiptGenerationHighWater> {
+    let marker = read_receipt_generation_high_water(device)?.ok_or(StoreError::InvalidOptions {
+        reason: "placement receipt generation high-water marker is missing",
+    })?;
+    if marker.pool_guid != pool_guid {
+        return Err(StoreError::InvalidOptions {
+            reason: "placement receipt generation high-water marker belongs to another pool",
+        });
+    }
+    Ok(marker)
+}
+
+fn receipt_generation_high_water_for_devices(
+    devices: &[Device],
+    pool_guid: [u8; 16],
+) -> Result<u64> {
+    let mut expected = None;
+    for device in devices {
+        let marker = require_receipt_generation_high_water(device, pool_guid)?;
+        match expected {
+            Some(reserved_through) if reserved_through != marker.reserved_through => {
+                return Err(StoreError::InvalidOptions {
+                    reason:
+                        "placement receipt generation high-water markers conflict across devices",
+                });
+            }
+            None => expected = Some(marker.reserved_through),
+            Some(_) => {}
+        }
+    }
+    expected.ok_or(StoreError::InvalidOptions {
+        reason: "placement receipt generation high-water authority has no devices",
+    })
+}
+
+fn max_valid_placement_receipt_generation(devices: &[Device]) -> Result<u64> {
     let mut max_generation = 0;
     for device in devices {
         for receipt_key in device.store().list_keys_including_internal() {
@@ -1854,10 +2022,186 @@ fn next_placement_receipt_generation_for_devices(devices: &[Device]) -> Result<u
             max_generation = max_generation.max(receipt.generation);
         }
     }
-    // Zero is the in-memory exhausted sentinel. A valid receipt generation is
-    // always nonzero, so a durable u64::MAX authority can be represented
-    // without ever reusing it.
-    Ok(max_generation.checked_add(1).unwrap_or(0))
+    Ok(max_generation)
+}
+
+fn validate_receipts_within_generation_high_water(
+    devices: &[Device],
+    reserved_through: u64,
+) -> Result<()> {
+    if max_valid_placement_receipt_generation(devices)? > reserved_through {
+        return Err(StoreError::InvalidOptions {
+            reason: "placement receipt generation exceeds durable high-water authority",
+        });
+    }
+    Ok(())
+}
+
+fn verify_receipt_generation_high_water_copy(
+    device: &Device,
+    expected: ReceiptGenerationHighWater,
+) -> Result<()> {
+    if require_receipt_generation_high_water(device, expected.pool_guid)? != expected {
+        return Err(StoreError::InvalidOptions {
+            reason: "placement receipt generation high-water publication did not converge",
+        });
+    }
+    Ok(())
+}
+
+fn initialize_receipt_generation_high_water(
+    devices: &mut [Device],
+    pool_guid: [u8; 16],
+) -> Result<u64> {
+    if devices.is_empty() {
+        return Err(StoreError::InvalidOptions {
+            reason: "pool receipt generation authority requires at least one device",
+        });
+    }
+    if devices
+        .iter()
+        .any(|device| !device.store().list_keys_including_internal().is_empty())
+    {
+        return Err(StoreError::InvalidOptions {
+            reason: "new pool receipt generation authority requires empty devices",
+        });
+    }
+
+    let marker = ReceiptGenerationHighWater {
+        pool_guid,
+        reserved_through: 0,
+    };
+    let key = receipt_generation_high_water_key();
+    let encoded = encode_receipt_generation_high_water(marker);
+    for device in devices.iter_mut() {
+        device.put_pool_internal(key, &encoded)?;
+    }
+    for device in devices.iter_mut() {
+        device.sync_all()?;
+    }
+    for device in devices.iter() {
+        verify_receipt_generation_high_water_copy(device, marker)?;
+    }
+    Ok(marker.reserved_through)
+}
+
+fn publish_receipt_generation_high_water(
+    devices: &mut [Device],
+    pool_guid: [u8; 16],
+    current_reserved_through: u64,
+    new_reserved_through: u64,
+) -> Result<()> {
+    if new_reserved_through < current_reserved_through {
+        return Err(StoreError::InvalidOptions {
+            reason: "placement receipt generation high-water cannot move backward",
+        });
+    }
+
+    let mut needs_write = Vec::with_capacity(devices.len());
+    for device in devices.iter() {
+        let marker = require_receipt_generation_high_water(device, pool_guid)?;
+        if marker.reserved_through != current_reserved_through
+            && marker.reserved_through != new_reserved_through
+        {
+            return Err(StoreError::InvalidOptions {
+                reason:
+                    "placement receipt generation high-water reservation conflicts across devices",
+            });
+        }
+        needs_write.push(marker.reserved_through != new_reserved_through);
+    }
+
+    let marker = ReceiptGenerationHighWater {
+        pool_guid,
+        reserved_through: new_reserved_through,
+    };
+    let key = receipt_generation_high_water_key();
+    let encoded = encode_receipt_generation_high_water(marker);
+    for (device, needs_write) in devices.iter_mut().zip(needs_write) {
+        if needs_write {
+            device.put_pool_internal(key, &encoded)?;
+        }
+    }
+    for device in devices.iter_mut() {
+        device.sync_all()?;
+    }
+    for device in devices.iter() {
+        verify_receipt_generation_high_water_copy(device, marker)?;
+    }
+    Ok(())
+}
+
+fn seed_receipt_generation_high_water_on_candidate(
+    device: &mut Device,
+    pool_guid: [u8; 16],
+    reserved_through: u64,
+) -> Result<()> {
+    let existing = read_receipt_generation_high_water(device)?;
+    if let Some(marker) = existing {
+        if marker.pool_guid != pool_guid {
+            return Err(StoreError::InvalidOptions {
+                reason: "candidate device receipt generation authority belongs to another pool",
+            });
+        }
+        if marker.reserved_through > reserved_through {
+            return Err(StoreError::InvalidOptions {
+                reason: "candidate device receipt generation authority exceeds the active pool",
+            });
+        }
+    }
+    if max_valid_placement_receipt_generation(std::slice::from_ref(&*device))? > reserved_through {
+        return Err(StoreError::InvalidOptions {
+            reason: "candidate device contains a receipt beyond the active generation authority",
+        });
+    }
+
+    if existing.is_some_and(|marker| marker.reserved_through == reserved_through) {
+        return verify_receipt_generation_high_water_copy(
+            device,
+            ReceiptGenerationHighWater {
+                pool_guid,
+                reserved_through,
+            },
+        );
+    }
+
+    let marker = ReceiptGenerationHighWater {
+        pool_guid,
+        reserved_through,
+    };
+    let key = receipt_generation_high_water_key();
+    let encoded = encode_receipt_generation_high_water(marker);
+    device.put_pool_internal(key, &encoded)?;
+    device.sync_all()?;
+    verify_receipt_generation_high_water_copy(device, marker)
+}
+
+fn retire_receipt_generation_high_water_on_device(
+    device: &mut Device,
+    pool_guid: [u8; 16],
+) -> Result<()> {
+    require_receipt_generation_high_water(device, pool_guid)?;
+    let marker = ReceiptGenerationHighWater {
+        pool_guid,
+        reserved_through: u64::MAX,
+    };
+    device.put_pool_internal(
+        receipt_generation_high_water_key(),
+        &encode_receipt_generation_high_water(marker),
+    )?;
+    device.sync_all()?;
+    verify_receipt_generation_high_water_copy(device, marker)
+}
+
+fn install_pool_raw_mutation_guard(
+    devices: &mut [Device],
+    initially_allowed: bool,
+) -> Arc<AtomicBool> {
+    let allowed = Arc::new(AtomicBool::new(initially_allowed));
+    for device in devices {
+        device.install_pool_raw_mutation_guard(Arc::clone(&allowed));
+    }
+    allowed
 }
 
 impl Pool {
@@ -1872,6 +2216,21 @@ impl Pool {
     ) -> WriteAllocator {
         let total_bytes: Vec<u64> = devices.iter().map(|d| d.store().capacity_bytes()).collect();
         WriteAllocator::new(media_classes.to_vec(), total_bytes)
+    }
+
+    fn refresh_raw_store_mutation_gate(&self) {
+        let allowed = !self.read_only
+            && !self.locked
+            && self.next_placement_receipt_generation != 0
+            && self.receipt_generation_authority_state
+                == ReceiptGenerationAuthorityState::Converged;
+        self.raw_store_mutation_allowed
+            .store(allowed, Ordering::Release);
+    }
+
+    fn set_receipt_generation_authority_state(&mut self, state: ReceiptGenerationAuthorityState) {
+        self.receipt_generation_authority_state = state;
+        self.refresh_raw_store_mutation_gate();
     }
 
     /// Create a new pool from a configuration.
@@ -1905,9 +2264,11 @@ impl Pool {
         let classes: Vec<DeviceClass> = config.devices.iter().map(|vc| vc.class).collect();
         let class_map = build_class_map(&classes);
 
-        let devices = open_devices(&config, options)?;
-        let next_placement_receipt_generation =
-            next_placement_receipt_generation_for_devices(&devices)?;
+        let mut devices = open_devices(&config, options)?;
+        let reserved_placement_receipt_generation_through =
+            initialize_receipt_generation_high_water(&mut devices, pool_guid)?;
+        let next_placement_receipt_generation = 1;
+        let raw_store_mutation_allowed = install_pool_raw_mutation_guard(&mut devices, true);
 
         // Build device-class-aware layout state.
         let media_classes: Vec<DeviceMediaClass> =
@@ -1958,6 +2319,9 @@ impl Pool {
             placement_epoch: 1,
             persisted_label_epoch: None,
             next_placement_receipt_generation,
+            reserved_placement_receipt_generation_through,
+            receipt_generation_authority_state: ReceiptGenerationAuthorityState::Converged,
+            raw_store_mutation_allowed,
             pending_device_removal: None,
             spare_policy: SparePolicy::Manual,
             health_transitions: Vec::new(),
@@ -2040,6 +2404,7 @@ impl Pool {
         let mut device_guids: Vec<[u8; 16]> = Vec::new();
         let mut label_health_states: Vec<(usize, u8, u64, u64, u64)> = Vec::new();
         let mut label_found = false;
+        let mut labeled_device_count = 0usize;
         let mut label_redundancy_policy: Option<PoolRedundancyPolicy> = None;
         // Pool-level feature bitmasks captured from the first valid label
         // for post-import compatibility gating.
@@ -2108,18 +2473,31 @@ impl Pool {
             let label = pool_label::decode_label(&buf).map_err(|_| StoreError::InvalidOptions {
                 reason: "pool label corrupt or unreadable",
             })?;
+            labeled_device_count += 1;
+            if label.device_count as usize != config.devices.len() {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pool topology is missing or has extra configured members",
+                });
+            }
+            if label.device_index as usize != configured_index {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pool topology device order does not match labels",
+                });
+            }
+            if !read_only_device_guids.insert(label.device_guid) {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pool topology contains duplicate device GUIDs",
+                });
+            }
+            match topology_generation {
+                Some(generation) if generation != label.topology_generation => {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "pool topology generation mismatch across devices",
+                    });
+                }
+                _ => {}
+            }
             if mode == PoolOpenMode::ReadOnlyExisting {
-                if label.device_count as usize != config.devices.len() {
-                    return Err(StoreError::InvalidOptions {
-                        reason:
-                            "read-only pool topology is missing or has extra configured members",
-                    });
-                }
-                if label.device_index as usize != configured_index {
-                    return Err(StoreError::InvalidOptions {
-                        reason: "read-only pool topology device order does not match labels",
-                    });
-                }
                 let configured_name = config.name.as_bytes();
                 let configured_name_len = configured_name.len().min(pool_label::POOL_NAME_MAX);
                 if label.pool_name_len as usize != configured_name_len
@@ -2134,19 +2512,6 @@ impl Pool {
                     return Err(StoreError::InvalidOptions {
                         reason: "read-only pool device class does not match label",
                     });
-                }
-                if !read_only_device_guids.insert(label.device_guid) {
-                    return Err(StoreError::InvalidOptions {
-                        reason: "read-only pool topology contains duplicate device GUIDs",
-                    });
-                }
-                match topology_generation {
-                    Some(generation) if generation != label.topology_generation => {
-                        return Err(StoreError::InvalidOptions {
-                            reason: "read-only pool topology generation mismatch across devices",
-                        });
-                    }
-                    _ => {}
                 }
                 let features = (
                     label.features_compat,
@@ -2248,6 +2613,12 @@ impl Pool {
             }
         }
 
+        if label_found && labeled_device_count != config.devices.len() {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool import requires a label on every configured device",
+            });
+        }
+
         if !label_found {
             if mode == PoolOpenMode::ReadOnlyExisting {
                 return Err(StoreError::InvalidOptions {
@@ -2346,10 +2717,22 @@ impl Pool {
             PoolOpenMode::Writable => open_devices(&config, options)?,
             PoolOpenMode::ReadOnlyExisting => open_devices_read_only_existing(&config, options)?,
         };
+        let reserved_placement_receipt_generation_through =
+            receipt_generation_high_water_for_devices(&devices, pg)?;
+        validate_receipts_within_generation_high_water(
+            &devices,
+            reserved_placement_receipt_generation_through,
+        )?;
         let next_placement_receipt_generation = match mode {
-            PoolOpenMode::Writable => next_placement_receipt_generation_for_devices(&devices)?,
+            PoolOpenMode::Writable => reserved_placement_receipt_generation_through
+                .checked_add(1)
+                .unwrap_or(0),
             PoolOpenMode::ReadOnlyExisting => 0,
         };
+        let raw_store_mutation_allowed = install_pool_raw_mutation_guard(
+            &mut devices,
+            mode == PoolOpenMode::Writable && !locked && next_placement_receipt_generation != 0,
+        );
         if label_device_layouts.len() != devices.len() {
             return Err(StoreError::InvalidOptions {
                 reason: "pool label DeviceLayoutV1 count does not match devices",
@@ -2409,6 +2792,9 @@ impl Pool {
             placement_epoch: topology_generation.unwrap_or(1).max(1),
             persisted_label_epoch: Some(topology_generation.unwrap_or(1).max(1)),
             next_placement_receipt_generation,
+            reserved_placement_receipt_generation_through,
+            receipt_generation_authority_state: ReceiptGenerationAuthorityState::Converged,
+            raw_store_mutation_allowed,
             pending_device_removal: None,
             spare_policy: SparePolicy::Manual,
             health_transitions: Vec::new(),
@@ -2435,6 +2821,7 @@ impl Pool {
     /// be validated.
     pub fn export(&self) -> Result<()> {
         self.ensure_writable("pool export")?;
+        self.validate_receipt_generation_high_water()?;
         // Flush the log device before export.
         if let Some(ref log_device) = self.log_device {
             log_device.commit()?;
@@ -2806,13 +3193,139 @@ impl Pool {
         self.placement_epoch = self.placement_epoch.saturating_add(1).max(1);
     }
 
+    fn ensure_receipt_generation_authority_converged(&self) -> Result<()> {
+        let result = if self.next_placement_receipt_generation == 0 {
+            Err(StoreError::InvalidOptions {
+                reason: "placement receipt generation exhausted",
+            })
+        } else {
+            match self.receipt_generation_authority_state {
+            ReceiptGenerationAuthorityState::Converged => Ok(()),
+            ReceiptGenerationAuthorityState::ReservationPending { .. } => {
+                Err(StoreError::InvalidOptions {
+                    reason: "placement receipt generation high-water reservation has not converged",
+                })
+            }
+            ReceiptGenerationAuthorityState::ReplacementResumeRequired => {
+                Err(StoreError::InvalidOptions {
+                    reason: "placement receipt generation authority requires explicit replacement resume",
+                })
+            }
+            ReceiptGenerationAuthorityState::RemovalTopologyCommitRequired => {
+                Err(StoreError::InvalidOptions {
+                    reason: "placement receipt generation authority awaits durable removal topology commit",
+                })
+            }
+            ReceiptGenerationAuthorityState::RecoveryRequired => {
+                Err(StoreError::InvalidOptions {
+                    reason: "placement receipt generation authority requires explicit recovery",
+                })
+            }
+            }
+        };
+        self.refresh_raw_store_mutation_gate();
+        result
+    }
+
+    fn validate_loaded_receipt_generation_high_water(&self) -> Result<()> {
+        let reserved_through =
+            receipt_generation_high_water_for_devices(&self.devices, self.pool_guid)?;
+        if reserved_through != self.reserved_placement_receipt_generation_through {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement receipt generation high-water differs from loaded authority",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_receipt_generation_high_water(&self) -> Result<()> {
+        self.ensure_receipt_generation_authority_converged()?;
+        self.validate_loaded_receipt_generation_high_water()
+    }
+
+    fn reconcile_receipt_generation_high_water_with_replacement(
+        &mut self,
+        candidate: &mut Device,
+    ) -> Result<()> {
+        if self.receipt_generation_authority_state
+            != ReceiptGenerationAuthorityState::ReplacementResumeRequired
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "receipt generation reconciliation requires replacement-resume state",
+            });
+        }
+        self.validate_loaded_receipt_generation_high_water()?;
+        let candidate_marker = require_receipt_generation_high_water(candidate, self.pool_guid)?;
+        validate_receipts_within_generation_high_water(
+            std::slice::from_ref(&*candidate),
+            candidate_marker.reserved_through,
+        )?;
+
+        let loaded = self.reserved_placement_receipt_generation_through;
+        let reconciled = loaded.max(candidate_marker.reserved_through);
+        if reconciled > loaded {
+            publish_receipt_generation_high_water(
+                &mut self.devices,
+                self.pool_guid,
+                loaded,
+                reconciled,
+            )?;
+        }
+        seed_receipt_generation_high_water_on_candidate(candidate, self.pool_guid, reconciled)?;
+        self.reserved_placement_receipt_generation_through = reconciled;
+        self.next_placement_receipt_generation = reconciled.checked_add(1).unwrap_or(0);
+        Ok(())
+    }
+
     fn allocate_placement_receipt_generation(&mut self) -> Result<u64> {
         let generation = self.next_placement_receipt_generation;
         if generation == 0 {
+            self.ensure_receipt_generation_authority_converged()?;
             return Err(StoreError::InvalidOptions {
                 reason: "placement receipt generation exhausted",
             });
         }
+        // Burn the final value rather than wrapping the in-memory zero
+        // sentinel after a successful allocation.
+        if generation == u64::MAX {
+            self.next_placement_receipt_generation = 0;
+            self.refresh_raw_store_mutation_gate();
+            return Err(StoreError::InvalidOptions {
+                reason: "placement receipt generation exhausted",
+            });
+        }
+
+        if generation > self.reserved_placement_receipt_generation_through {
+            let new_reserved_through =
+                generation.saturating_add(RECEIPT_GENERATION_RESERVATION_SIZE.saturating_sub(1));
+            match self.receipt_generation_authority_state {
+                ReceiptGenerationAuthorityState::Converged => {
+                    self.set_receipt_generation_authority_state(
+                        ReceiptGenerationAuthorityState::ReservationPending {
+                            from: self.reserved_placement_receipt_generation_through,
+                            through: new_reserved_through,
+                        },
+                    );
+                }
+                ReceiptGenerationAuthorityState::ReservationPending { from, through }
+                    if from == self.reserved_placement_receipt_generation_through
+                        && through == new_reserved_through => {}
+                _ => {
+                    self.ensure_receipt_generation_authority_converged()?;
+                }
+            }
+            publish_receipt_generation_high_water(
+                &mut self.devices,
+                self.pool_guid,
+                self.reserved_placement_receipt_generation_through,
+                new_reserved_through,
+            )?;
+            self.reserved_placement_receipt_generation_through = new_reserved_through;
+            self.set_receipt_generation_authority_state(ReceiptGenerationAuthorityState::Converged);
+        } else {
+            self.ensure_receipt_generation_authority_converged()?;
+        }
+
         self.next_placement_receipt_generation = generation.checked_add(1).unwrap_or(0);
         Ok(generation)
     }
@@ -3153,9 +3666,14 @@ impl Pool {
     fn restore_device_objects(&mut self, previous: &[(usize, ObjectKey, Option<Vec<u8>>)]) -> bool {
         let mut restored = true;
         for (idx, key, payload) in previous {
-            let result = match payload {
-                Some(payload) => self.devices[*idx].put(*key, payload).map(|_| ()),
-                None => self.devices[*idx].delete(*key).map(|_| ()),
+            let pool_internal = crate::is_pool_placement_scan_internal_key(*key);
+            let result = match (payload, pool_internal) {
+                (Some(payload), true) => self.devices[*idx]
+                    .put_pool_internal(*key, payload)
+                    .map(|_| ()),
+                (Some(payload), false) => self.devices[*idx].put(*key, payload).map(|_| ()),
+                (None, true) => self.devices[*idx].delete_pool_internal(*key).map(|_| ()),
+                (None, false) => self.devices[*idx].delete(*key).map(|_| ()),
             };
             restored &= result.is_ok();
         }
@@ -3193,11 +3711,17 @@ impl Pool {
         indices: &[usize],
         receipt: &PlacementReceipt,
     ) -> Result<()> {
+        self.ensure_receipt_generation_authority_converged()?;
         self.ensure_receipt_replay_authority(receipt)?;
         validate_strict_receipt_structure(receipt)?;
         if receipt.epoch == 0 || receipt.generation == 0 {
             return Err(StoreError::InvalidOptions {
                 reason: "placement receipt publication requires nonzero epoch and generation",
+            });
+        }
+        if receipt.generation > self.reserved_placement_receipt_generation_through {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement receipt generation exceeds the durable high-water reservation",
             });
         }
         let receipt_key = placement_receipt_object_key(receipt.object_key);
@@ -3208,7 +3732,7 @@ impl Pool {
         }
         for position in 0..previous.len() {
             let idx = previous[position].0;
-            if let Err(error) = self.devices[idx].put(receipt_key, &encoded) {
+            if let Err(error) = self.devices[idx].put_pool_internal(receipt_key, &encoded) {
                 // A device write may report an error after the record reached
                 // media. Restore the failing slot as well as every successful
                 // prefix instead of assuming that Err implies no mutation.
@@ -3252,6 +3776,11 @@ impl Pool {
         indices: &[usize],
         old_receipt_policy: OldReceiptPolicy,
     ) -> Result<(StoredObject, PlacementReceipt)> {
+        if crate::is_pool_placement_scan_internal_key(key) {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool receipt, shard, and generation namespaces are reserved",
+            });
+        }
         let old_receipt = match old_receipt_policy {
             OldReceiptPolicy::RequireValid => {
                 match self.load_current_placement_receipt_strict(indices, key)? {
@@ -3263,6 +3792,16 @@ impl Pool {
                     }
                     None => None,
                 }
+            }
+            OldReceiptPolicy::UseValidated(receipt) => {
+                if receipt.object_key != key {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "replacement receipt does not match the logical object",
+                    });
+                }
+                validate_strict_receipt_structure(&receipt)?;
+                self.ensure_receipt_replay_authority(&receipt)?;
+                Some(receipt)
             }
         };
         let mut receipt = self.plan_pool_wide_placement(class, key, payload.len(), indices)?;
@@ -3435,7 +3974,7 @@ impl Pool {
                     reason: "erasure placement lost a validated encoded shard",
                 });
             };
-            let result = self.devices[idx].put(shard_key, &shard.bytes);
+            let result = self.devices[idx].put_pool_internal(shard_key, &shard.bytes);
             self.record_device_write_result(idx, shard.bytes.len(), &result);
             match result {
                 Ok(_) => {
@@ -3525,7 +4064,7 @@ impl Pool {
             );
             self.devices[placement.device_index]
                 .store_mut()
-                .enqueue_pending_receipt_bound_dead_object(entry)?;
+                .enqueue_pending_receipt_bound_dead_object_pool_internal(entry)?;
         }
         Ok(placements)
     }
@@ -3550,7 +4089,7 @@ impl Pool {
             )?;
             let _updated = self.devices[placement.device_index]
                 .store_mut()
-                .publish_dead_object_replacement_receipt(&object_id, replacement)?;
+                .publish_dead_object_replacement_receipt_pool_internal(&object_id, replacement)?;
         }
         Ok(())
     }
@@ -3594,7 +4133,7 @@ impl Pool {
         .with_replacement_receipt(replacement);
         self.devices[device_index]
             .store_mut()
-            .enqueue_receipt_bound_dead_object(entry)?;
+            .enqueue_receipt_bound_dead_object_pool_internal(entry)?;
         Ok(())
     }
 
@@ -3635,7 +4174,7 @@ impl Pool {
             for shard_index in 0..receipt.targets.len() {
                 let shard_key = placement_shard_object_key(key, shard_index as u16);
                 if keep_shard != Some(shard_index as u16) {
-                    let _ = self.devices[idx].delete(shard_key);
+                    let _ = self.devices[idx].delete_pool_internal(shard_key);
                 }
             }
             let _ = self.devices[idx].delete(key);
@@ -3654,6 +4193,11 @@ impl Pool {
                 reason: "pool is locked: encryption key required for I/O",
             });
         }
+        if crate::is_pool_placement_scan_internal_key(key) {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool receipt, shard, and generation namespaces are reserved",
+            });
+        }
         let indices: Vec<usize> = self.class_map.get(class).to_vec();
         if indices.is_empty() {
             return Err(StoreError::InvalidOptions {
@@ -3663,6 +4207,7 @@ impl Pool {
 
         match class {
             IoClass::IntentLog => {
+                self.ensure_receipt_generation_authority_converged()?;
                 // Write to all healthy intent-log devices (write-ahead-log
                 // semantics).  Faulted devices are skipped; if every device
                 // fails the operation returns the last error.  The
@@ -4283,6 +4828,12 @@ impl Pool {
     /// Delete an object from every device that can hold this I/O class.
     pub fn delete(&mut self, class: IoClass, key: ObjectKey) -> Result<bool> {
         self.ensure_writable("pool delete")?;
+        if crate::is_pool_placement_scan_internal_key(key) {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool receipt, shard, and generation metadata cannot be deleted directly",
+            });
+        }
+        self.ensure_receipt_generation_authority_converged()?;
         let indices: Vec<usize> = self.class_map.get(class).to_vec();
         if indices.is_empty() {
             return Err(StoreError::InvalidOptions {
@@ -4349,7 +4900,9 @@ impl Pool {
                     for target in &receipt.targets {
                         let shard_key =
                             placement_shard_object_key(receipt.object_key, target.shard_index);
-                        deleted |= self.devices[idx].delete(shard_key).unwrap_or(false);
+                        deleted |= self.devices[idx]
+                            .delete_pool_internal(shard_key)
+                            .unwrap_or(false);
                     }
                     deleted |= self.devices[idx]
                         .delete(receipt.object_key)
@@ -4360,7 +4913,9 @@ impl Pool {
 
         let receipt_key = placement_receipt_object_key(receipt.object_key);
         for idx in self.usable_candidates(indices) {
-            deleted |= self.devices[idx].delete(receipt_key).unwrap_or(false);
+            deleted |= self.devices[idx]
+                .delete_pool_internal(receipt_key)
+                .unwrap_or(false);
         }
         Ok(deleted)
     }
@@ -4412,6 +4967,9 @@ impl Pool {
             }
             .into());
         }
+        if let Err(error) = self.ensure_receipt_generation_authority_converged() {
+            return Err(error.into());
+        }
 
         let indices: Vec<usize> = self.class_map.get(class).to_vec();
         if indices.is_empty() {
@@ -4426,7 +4984,7 @@ impl Pool {
         for idx in self.usable_candidates(&indices) {
             let stats = self.devices[idx]
                 .store_mut()
-                .drain_receipt_bound_dead_objects_at_stable_generation(
+                .drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
                     stable_committed_txg,
                     stable_committed_generation,
                     remaining,
@@ -4477,15 +5035,36 @@ impl Pool {
     /// Add a device to the running pool.
     pub fn add_device(&mut self, config: DeviceConfig, options: &StoreOptions) -> Result<()> {
         self.ensure_writable("pool add device")?;
+        self.validate_receipt_generation_high_water()?;
         let config_for_record = config.clone();
         let mut dev_opts = options.clone();
         dev_opts.max_segment_bytes = config.media_class.default_segment_size();
-        let device =
+        let mut device =
             open_single_device(&config, &dev_opts, options.is_test_fast_harness_fixture())?;
+        device.install_pool_raw_mutation_guard(Arc::clone(&self.raw_store_mutation_allowed));
+        seed_receipt_generation_high_water_on_candidate(
+            &mut device,
+            self.pool_guid,
+            self.reserved_placement_receipt_generation_through,
+        )?;
+        let capacity_bytes = device.store().capacity_bytes();
+        let device_layout = self
+            .properties
+            .layout_policy
+            .compute(capacity_bytes)
+            .unwrap_or_else(|_| {
+                DeviceLayoutPolicy::Slice0Small
+                    .compute(capacity_bytes)
+                    .expect("Slice0Small must succeed for non-zero device")
+            });
+        self.set_receipt_generation_authority_state(
+            ReceiptGenerationAuthorityState::RecoveryRequired,
+        );
         self.classes.push(config.class);
         self.media_classes.push(config.media_class);
         self.devices.push(device);
         self.device_guids.push(rand::random());
+        self.device_layouts.push(device_layout);
         self.class_map = build_class_map(&self.classes);
         self.device_layout_stats
             .push(DeviceLayoutStats::with_segment_size(
@@ -4500,52 +5079,9 @@ impl Pool {
         self.health = compute_health(&self.devices);
         self.config.devices.push(config_for_record);
         self.bump_placement_epoch();
+        self.persist_active_labels_if_needed()?;
+        self.set_receipt_generation_authority_state(ReceiptGenerationAuthorityState::Converged);
         self.record_health_transitions();
-        Ok(())
-    }
-
-    /// Add a device with label persistence.
-    ///
-    /// Extends the in-memory [`add_device`](Self::add_device) by writing
-    /// PoolLabelV1 labels to the new device and updating topology labels on
-    /// all existing devices via [`DeviceManager`].  The topology generation is
-    /// incremented and device_count is bumped.
-    ///
-    /// Returns an error if label writing fails on any device.
-    pub fn add_device_labeled(
-        &mut self,
-        config: DeviceConfig,
-        options: &StoreOptions,
-        pool_name: &str,
-        commit_group: u64,
-    ) -> Result<()> {
-        self.ensure_writable("pool add labelled device")?;
-        // Compute the new device GUID before opening (the device may not
-        // have a label yet, so we generate one).
-        let new_device_guid: [u8; 16] = rand::random();
-
-        // Preserve explicit media identity while writing updated labels.
-        let existing_configs = self.config.devices.clone();
-
-        // Add the device in-memory first.
-        self.add_device(config.clone(), options)?;
-
-        // Now write labels via DeviceManager.
-        DeviceManager::add_device(
-            &existing_configs,
-            &config,
-            self.pool_guid,
-            &self.device_guids[..self.device_guids.len().saturating_sub(1)], // GUIDs before the new one
-            new_device_guid,
-            pool_name,
-            commit_group,
-        )?;
-
-        // Update the device_guids entry that add_device pushed randomly.
-        if let Some(last) = self.device_guids.last_mut() {
-            *last = new_device_guid;
-        }
-
         Ok(())
     }
 
@@ -4578,6 +5114,31 @@ impl Pool {
 
         let existing_configs = self.config.devices.clone();
 
+        self.validate_receipt_generation_high_water()?;
+        let mut dev_opts = options.clone();
+        dev_opts.max_segment_bytes = spare_config.media_class.default_segment_size();
+        let mut new_device = open_single_device(
+            &spare_config,
+            &dev_opts,
+            options.is_test_fast_harness_fixture(),
+        )?;
+        new_device.install_pool_raw_mutation_guard(Arc::clone(&self.raw_store_mutation_allowed));
+        seed_receipt_generation_high_water_on_candidate(
+            &mut new_device,
+            self.pool_guid,
+            self.reserved_placement_receipt_generation_through,
+        )?;
+        self.set_receipt_generation_authority_state(
+            ReceiptGenerationAuthorityState::RecoveryRequired,
+        );
+        // A spare activation has no cancellation path. Exhaust the detached
+        // member's generation authority before its labels can describe a
+        // competing complete topology.
+        retire_receipt_generation_high_water_on_device(
+            &mut self.devices[faulted_index],
+            self.pool_guid,
+        )?;
+
         // Delegate to DeviceManager for label persistence.
         let request = crate::device_manager::SpareActivationRequest {
             existing_device_configs: &existing_configs,
@@ -4592,16 +5153,13 @@ impl Pool {
         };
         DeviceManager::activate_spare(request)?;
 
-        // Update in-memory device at the faulted index.
-        let mut dev_opts = options.clone();
-        dev_opts.max_segment_bytes = spare_config.media_class.default_segment_size();
-        let new_device = open_single_device(
-            &spare_config,
-            &dev_opts,
-            options.is_test_fast_harness_fixture(),
-        )?;
+        // Update in-memory device at the faulted index only after its receipt
+        // generation authority is durable and pool labels have admitted it.
         self.devices[faulted_index] = new_device;
         self.device_guids[faulted_index] = spare_device_guid;
+        self.config.devices[faulted_index] = spare_config.clone();
+        self.classes[faulted_index] = spare_config.class;
+        self.class_map = build_class_map(&self.classes);
 
         // Update media class and layout stats.
         if faulted_index < self.media_classes.len() {
@@ -4612,6 +5170,16 @@ impl Pool {
                 spare_config.media_class.default_segment_size(),
             );
         }
+        let replacement_capacity = self.devices[faulted_index].store().capacity_bytes();
+        self.device_layouts[faulted_index] = self
+            .properties
+            .layout_policy
+            .compute(replacement_capacity)
+            .unwrap_or_else(|_| {
+                DeviceLayoutPolicy::Slice0Small
+                    .compute(replacement_capacity)
+                    .expect("Slice0Small must succeed for non-zero device")
+            });
         let total_bytes: Vec<u64> = self
             .devices
             .iter()
@@ -4621,6 +5189,7 @@ impl Pool {
 
         self.health = compute_health(&self.devices);
         self.bump_placement_epoch();
+        self.set_receipt_generation_authority_state(ReceiptGenerationAuthorityState::Converged);
         self.record_health_transitions();
 
         Ok(())
@@ -4843,6 +5412,7 @@ impl Pool {
         if let Some(result) = self.pending_device_removal_result(path)? {
             return Ok(result);
         }
+        self.validate_receipt_generation_high_water()?;
 
         let target_idx = self.devices.iter().position(|v| v.root() == path).ok_or(
             StoreError::InvalidOptions {
@@ -4972,6 +5542,7 @@ impl Pool {
         accounted_internal_keys.insert(ObjectKey::from_name(
             crate::reclaim_queue::DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes(),
         ));
+        accounted_internal_keys.insert(receipt_generation_high_water_key());
         let mut current_logical_keys = BTreeSet::new();
         let mut rewritten_logical_keys = BTreeSet::new();
         let mut placement_receipts = BTreeMap::new();
@@ -5135,7 +5706,7 @@ impl Pool {
                 receipt.object_key,
                 &data,
                 &surviving_indices,
-                OldReceiptPolicy::RequireValid,
+                OldReceiptPolicy::UseValidated(receipt.clone()),
             ) {
                 Ok((_stored, receipt)) => receipt,
                 Err(_) => {
@@ -5198,6 +5769,9 @@ impl Pool {
 
         // All objects evacuated -- remove the device.
         self.remove_device(path)?;
+        self.set_receipt_generation_authority_state(
+            ReceiptGenerationAuthorityState::RemovalTopologyCommitRequired,
+        );
 
         // Keep the pending-removal marker until a later implementation can
         // prove one durable topology commit. Neither the in-memory detach nor
@@ -5248,7 +5822,9 @@ impl Pool {
             .as_ref()
             .filter(|evidence| evidence.state.is_active())
             .cloned();
-        let (idx, old_config, old_device_guid, replacement_evidence) = if let Some(mut evidence) =
+        let (idx, old_config, old_device_guid, replacement_evidence, resuming) = if let Some(
+            mut evidence,
+        ) =
             replayed_evidence
         {
             if old_path != evidence.old_path
@@ -5266,6 +5842,13 @@ impl Pool {
                     reason: "device replacement resume does not match durable evidence",
                 });
             }
+            if self.receipt_generation_authority_state
+                != ReceiptGenerationAuthorityState::ReplacementResumeRequired
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "device replacement resume requires the recorded old-topology recovery state",
+                });
+            }
             let old_config = self
                 .config
                 .devices
@@ -5280,6 +5863,7 @@ impl Pool {
                 old_config,
                 evidence.old_device_guid,
                 evidence,
+                true,
             )
         } else {
             // Find the device to replace.
@@ -5323,12 +5907,33 @@ impl Pool {
                 evidence_stable: false,
                 state: ReplacementRebuildStatusState::Pending,
             };
-            (idx, old_config, old_device_guid, evidence)
+            (idx, old_config, old_device_guid, evidence, false)
         };
 
-        // Open the replacement device.
-        let new_device =
+        if resuming {
+            self.validate_loaded_receipt_generation_high_water()?;
+        } else {
+            self.validate_receipt_generation_high_water()?;
+        }
+
+        // Open and seed the replacement before it can enter the admitted
+        // topology. A stale removed member may advance to the active ceiling,
+        // but it may never make that ceiling move backward.
+        let mut new_device =
             open_single_device(&new_config, options, options.is_test_fast_harness_fixture())?;
+        new_device.install_pool_raw_mutation_guard(Arc::clone(&self.raw_store_mutation_allowed));
+        if resuming {
+            self.reconcile_receipt_generation_high_water_with_replacement(&mut new_device)?;
+        } else {
+            seed_receipt_generation_high_water_on_candidate(
+                &mut new_device,
+                self.pool_guid,
+                self.reserved_placement_receipt_generation_through,
+            )?;
+            self.set_receipt_generation_authority_state(
+                ReceiptGenerationAuthorityState::RecoveryRequired,
+            );
+        }
 
         // Publish identity, epoch, and fail-closed progress before changing
         // the loaded topology. A crash therefore reopens either the old
@@ -5392,6 +5997,7 @@ impl Pool {
         // so a reopen against the new topology can resume from the marker.
         // Pending evidence still does not authorize old-device detach.
         self.persist_active_labels_if_needed()?;
+        self.set_receipt_generation_authority_state(ReceiptGenerationAuthorityState::Converged);
 
         Ok(())
     }
@@ -5491,6 +6097,7 @@ impl Pool {
     /// new device in place.
     pub fn cancel_replacement(&mut self, options: &StoreOptions) -> Result<()> {
         self.ensure_writable("pool cancel device replacement")?;
+        self.validate_receipt_generation_high_water()?;
         let live_replacement_active = self.replacement.as_ref().is_some_and(|r| r.is_active());
         if !live_replacement_active {
             let Some(mut evidence) = self
@@ -5548,6 +6155,31 @@ impl Pool {
                 reason: "active device replacement does not match durable evidence",
             });
         }
+
+        // Seed a readable old member before publishing cancellation. If it is
+        // unavailable, cancellation retains the current replacement device;
+        // if it is readable but carries incompatible authority, fail before
+        // changing either topology or replacement evidence.
+        let restored_old_device = match open_single_device(
+            &replacement.old_config,
+            options,
+            options.is_test_fast_harness_fixture(),
+        ) {
+            Ok(mut old_device) => {
+                old_device
+                    .install_pool_raw_mutation_guard(Arc::clone(&self.raw_store_mutation_allowed));
+                seed_receipt_generation_high_water_on_candidate(
+                    &mut old_device,
+                    self.pool_guid,
+                    self.reserved_placement_receipt_generation_through,
+                )?;
+                Some(old_device)
+            }
+            Err(_) => None,
+        };
+        self.set_receipt_generation_authority_state(
+            ReceiptGenerationAuthorityState::RecoveryRequired,
+        );
         evidence.state = ReplacementRebuildStatusState::Canceled;
         evidence.topology_epoch = self.placement_epoch.saturating_add(1).max(1);
         persist_device_replacement_evidence(&self.config.root_path, &evidence)?;
@@ -5557,11 +6189,7 @@ impl Pool {
 
         // If the old device can still be opened, swap it back using the exact
         // media configuration captured before replacement.
-        if let Ok(old_device) = open_single_device(
-            &replacement.old_config,
-            options,
-            options.is_test_fast_harness_fixture(),
-        ) {
+        if let Some(old_device) = restored_old_device {
             self.devices[replacement.device_index] = old_device;
             if replacement.device_index < self.config.devices.len() {
                 self.config.devices[replacement.device_index] = replacement.old_config.clone();
@@ -5614,6 +6242,7 @@ impl Pool {
         // the old topology. Cancellation still leaves old-device detach
         // unsafe until a later replacement has stable rebuild evidence.
         self.persist_active_labels_if_needed()?;
+        self.set_receipt_generation_authority_state(ReceiptGenerationAuthorityState::Converged);
         Ok(())
     }
 
@@ -5779,22 +6408,36 @@ impl Pool {
         protected_exact_locations: &[ObjectLocation],
     ) -> Result<StoreRetentionCompactionReport> {
         self.ensure_writable("pool compaction")?;
-        let indices = self.class_map.get(IoClass::Data);
+        self.validate_receipt_generation_high_water()?;
+        let indices = self.class_map.get(IoClass::Data).to_vec();
         if indices.is_empty() {
             return Err(StoreError::InvalidOptions {
                 reason: "pool has no devices for compaction",
             });
         }
         let mut report = None;
-        for &idx in indices {
-            report = Some(
-                self.devices[idx].compact_retaining(protected_keys, protected_exact_locations)?,
-            );
+        for idx in indices {
+            match self.devices[idx].compact_retaining(protected_keys, protected_exact_locations) {
+                Ok(device_report) => report = Some(device_report),
+                Err(error) => {
+                    self.set_receipt_generation_authority_state(
+                        ReceiptGenerationAuthorityState::RecoveryRequired,
+                    );
+                    return Err(error);
+                }
+            }
         }
         self.health = compute_health(&self.devices);
-        report.ok_or(StoreError::InvalidOptions {
+        if let Err(error) = self.validate_loaded_receipt_generation_high_water() {
+            self.set_receipt_generation_authority_state(
+                ReceiptGenerationAuthorityState::RecoveryRequired,
+            );
+            return Err(error);
+        }
+        let report = report.ok_or(StoreError::InvalidOptions {
             reason: "no devices available for compaction",
-        })
+        })?;
+        Ok(report)
     }
 
     /// Whether any device should be compacted given the waste threshold.
@@ -5844,6 +6487,12 @@ impl Pool {
     /// Scrub all devices, repairing mismatched or missing entries.
     pub fn scrub_mirror(&mut self) -> Result<ScrubStats> {
         self.ensure_writable("pool mirror repair scrub")?;
+        if self.locked {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool is locked: encryption key required for mirror repair scrub",
+            });
+        }
+        self.ensure_receipt_generation_authority_converged()?;
         let mut total = ScrubStats::default();
         for device in &mut self.devices {
             let s = device.scrub_mirror()?;
@@ -6104,6 +6753,7 @@ impl Pool {
     /// Mutable access to the primary Data device's raw LocalObjectStore.
     pub fn raw_primary_store_mut(&mut self) -> &mut LocalObjectStore {
         assert!(!self.read_only, "read-only pool has no mutable raw store");
+        self.refresh_raw_store_mutation_gate();
         let indices = self.class_map.get(IoClass::Data);
         let idx = *indices.first().expect("pool has no data device");
         self.devices[idx].store_mut()
@@ -6159,6 +6809,7 @@ impl Pool {
     /// first.
     pub fn log_device_append(&mut self, payload: &[u8]) -> Result<()> {
         self.ensure_writable("pool log append")?;
+        self.ensure_receipt_generation_authority_converged()?;
         match self.log_device.as_mut() {
             Some(w) => w.append(payload),
             None => Ok(()),
@@ -6898,6 +7549,23 @@ mod tests {
         }
     }
 
+    fn two_leg_mirror_device_config(root: &Path) -> PoolConfig {
+        let paths = vec![root.join("mirror-0"), root.join("mirror-1")];
+        PoolConfig {
+            name: "testpool".into(),
+            root_path: root.to_path_buf(),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: paths[0].clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Mirror { paths },
+                encryption: None,
+                compression: None,
+            }],
+        }
+    }
+
     fn create_regular_file_device_with_size(path: &Path, size: u64) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -6960,6 +7628,23 @@ mod tests {
             Ok(_) => panic!("expected InvalidOptions containing {needle:?}, got success"),
             Err(other) => panic!("expected InvalidOptions containing {needle:?}, got {other:?}"),
         }
+    }
+
+    fn assert_generation_high_water_open_refused(label: &str, mutate: impl FnOnce(&mut Pool)) {
+        let root = temp_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let properties = PoolProperties::default();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+        mutate(&mut pool);
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        assert!(matches!(
+            Pool::create(config, properties, &test_options()),
+            Err(StoreError::InvalidOptions { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn assert_topology_commit_pending(result: &crate::device_removal::EvacuationResult) {
@@ -7094,6 +7779,10 @@ mod tests {
 
         let mut incomplete = config.clone();
         incomplete.devices.pop();
+        assert_invalid_options_reason_contains(
+            Pool::open(incomplete.clone(), properties.clone(), &options),
+            "missing or has extra",
+        );
         assert_invalid_options_reason_contains(
             Pool::open_read_only_existing(incomplete, properties.clone(), &options),
             "missing or has extra",
@@ -7420,7 +8109,7 @@ mod tests {
     }
 
     #[test]
-    fn read_cache_falls_back_to_data() {
+    fn read_cache_fallback_add_reopen_and_dedicated_io() {
         let root = temp_dir("cache-fallback");
         let _ = std::fs::remove_dir_all(&root);
         let data_dir = root.join("data");
@@ -7444,6 +8133,36 @@ mod tests {
         pool.put(IoClass::ReadCache, key, b"cached-data").unwrap();
         let val = pool.get(IoClass::ReadCache, key).unwrap();
         assert_eq!(val, Some(b"cached-data".to_vec()));
+
+        let read_cache_path = root.join("read-cache");
+        pool.add_device(
+            DeviceConfig {
+                media_class: DeviceMediaClass::Nvme,
+                path: read_cache_path.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::ReadCache,
+                kind: DeviceKind::Single {
+                    path: read_cache_path,
+                },
+                encryption: None,
+                compression: None,
+            },
+            &test_options(),
+        )
+        .unwrap();
+        let reopen_config = pool.config.clone();
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        let mut pool =
+            Pool::create(reopen_config, PoolProperties::default(), &test_options()).unwrap();
+        let dedicated_key = ObjectKey::from_name(b"dedicated-read-cache");
+        pool.put(IoClass::ReadCache, dedicated_key, b"dedicated cached data")
+            .unwrap();
+        assert_eq!(
+            pool.get(IoClass::ReadCache, dedicated_key).unwrap(),
+            Some(b"dedicated cached data".to_vec())
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7679,7 +8398,7 @@ mod tests {
             let last = raw.len() - 1;
             raw[last] ^= 0x5a;
             pool.devices[idx]
-                .put(receipt_key, &raw)
+                .put_pool_internal(receipt_key, &raw)
                 .expect("replace receipt with bad replay seal");
         }
 
@@ -7812,7 +8531,7 @@ mod tests {
         pool.put_with_receipt(IoClass::Data, key, original).unwrap();
 
         let receipt_key = placement_receipt_object_key(key);
-        pool.devices[0].delete(receipt_key).unwrap();
+        pool.devices[0].delete_pool_internal(receipt_key).unwrap();
         assert_invalid_options_reason_contains(
             pool.put_with_receipt(IoClass::Data, key, b"replacement must not publish"),
             "receiptless raw payload",
@@ -7861,7 +8580,7 @@ mod tests {
 
         let receipt_key = placement_receipt_object_key(key);
         for device in &mut pool.devices {
-            device.delete(receipt_key).unwrap();
+            device.delete_pool_internal(receipt_key).unwrap();
         }
         assert_invalid_options_reason_contains(
             pool.get_with_current_receipt(IoClass::Data, key),
@@ -7897,7 +8616,7 @@ mod tests {
         replayless.truncate(V2_FIXED_WIRE_LEN + receipt.targets.len() * RECEIPT_TARGET_WIRE_LEN);
         let receipt_key = placement_receipt_object_key(replayless_key);
         for device in &mut pool.devices {
-            device.put(receipt_key, &replayless).unwrap();
+            device.put_pool_internal(receipt_key, &replayless).unwrap();
         }
         assert_invalid_options_reason_contains(
             pool.get_with_current_receipt(IoClass::Data, replayless_key),
@@ -7915,7 +8634,7 @@ mod tests {
         let encoded = zero_version.encode().unwrap();
         let receipt_key = placement_receipt_object_key(zero_version_key);
         for device in &mut pool.devices {
-            device.put(receipt_key, &encoded).unwrap();
+            device.put_pool_internal(receipt_key, &encoded).unwrap();
         }
         assert_invalid_options_reason_contains(
             pool.get_with_current_receipt(IoClass::Data, zero_version_key),
@@ -7947,7 +8666,7 @@ mod tests {
         let mut malformed = receipt.clone();
         malformed.shard_len = 1;
         pool.devices[0]
-            .put(receipt_key, &malformed.encode().unwrap())
+            .put_pool_internal(receipt_key, &malformed.encode().unwrap())
             .unwrap();
         assert_invalid_options_reason_contains(
             pool.get_with_current_receipt(IoClass::Data, key),
@@ -7965,7 +8684,7 @@ mod tests {
         malformed = receipt;
         malformed.targets[0].stored_digest = digest32(b"different target bytes");
         pool.devices[0]
-            .put(receipt_key, &malformed.encode().unwrap())
+            .put_pool_internal(receipt_key, &malformed.encode().unwrap())
             .unwrap();
         assert_invalid_options_reason_contains(
             pool.get_with_current_receipt(IoClass::Data, key),
@@ -8008,13 +8727,13 @@ mod tests {
         }
         let receipt_key = placement_receipt_object_key(key);
         pool.devices[0]
-            .put(receipt_key, &older.encode().unwrap())
+            .put_pool_internal(receipt_key, &older.encode().unwrap())
             .unwrap();
         pool.devices[1]
-            .put(receipt_key, &newer.encode().unwrap())
+            .put_pool_internal(receipt_key, &newer.encode().unwrap())
             .unwrap();
         pool.devices[2]
-            .put(receipt_key, &conflicting_older.encode().unwrap())
+            .put_pool_internal(receipt_key, &conflicting_older.encode().unwrap())
             .unwrap();
 
         assert_invalid_options_reason_contains(
@@ -8070,7 +8789,7 @@ mod tests {
             .expect("replicated(2) on three devices has one non-target receipt carrier");
         let receipt_key = placement_receipt_object_key(key);
         pool.devices[stale_receipt_idx]
-            .put(receipt_key, &older.encode().unwrap())
+            .put_pool_internal(receipt_key, &older.encode().unwrap())
             .unwrap();
         let payloads_before: Vec<_> = pool
             .devices
@@ -8107,7 +8826,9 @@ mod tests {
             "ambiguous receipt state must not permit receipt replacement"
         );
 
-        pool.devices[stale_receipt_idx].delete(receipt_key).unwrap();
+        pool.devices[stale_receipt_idx]
+            .delete_pool_internal(receipt_key)
+            .unwrap();
         assert_eq!(
             pool.get_with_current_receipt(IoClass::Data, key).unwrap(),
             Some((newer_payload.to_vec(), newer))
@@ -8170,7 +8891,9 @@ mod tests {
         let receipt_key = placement_receipt_object_key(key);
         let encoded_receipt = receipt.encode().unwrap();
 
-        assert!(pool.devices[target_idx].delete(receipt_key).unwrap());
+        assert!(pool.devices[target_idx]
+            .delete_pool_internal(receipt_key)
+            .unwrap());
         assert_invalid_options_reason_contains(
             pool.get_with_current_receipt(IoClass::Data, key),
             "missing target receipt copy",
@@ -8181,7 +8904,7 @@ mod tests {
             "degraded Pool::get remains readable from another receipt carrier"
         );
         pool.devices[target_idx]
-            .put(receipt_key, &encoded_receipt)
+            .put_pool_internal(receipt_key, &encoded_receipt)
             .unwrap();
 
         let original = pool.devices[target_idx]
@@ -8378,7 +9101,7 @@ mod tests {
         let stale_encoded = stale_receipt.encode().unwrap();
         let last_idx = pool.devices.len() - 1;
         pool.devices[last_idx]
-            .put(stale_key, &stale_encoded)
+            .put_pool_internal(stale_key, &stale_encoded)
             .expect("inject stale receipt");
 
         let selected = pool
@@ -8440,7 +9163,7 @@ mod tests {
         let stale_encoded = stale_epoch_receipt.encode().unwrap();
         let last_idx = pool.devices.len() - 1;
         pool.devices[last_idx]
-            .put(receipt_key, &stale_encoded)
+            .put_pool_internal(receipt_key, &stale_encoded)
             .expect("inject stale higher-generation receipt");
 
         let selected = pool
@@ -8497,7 +9220,7 @@ mod tests {
             .map(|idx| {
                 let stats = reopened.devices[*idx]
                     .store_mut()
-                    .drain_receipt_bound_dead_objects_at_stable_generation(
+                    .drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
                         replacement.generation.saturating_add(1),
                         replacement.generation.saturating_sub(1),
                         16,
@@ -8514,7 +9237,7 @@ mod tests {
             .map(|idx| {
                 reopened.devices[*idx]
                     .store_mut()
-                    .drain_receipt_bound_dead_objects_at_stable_generation(
+                    .drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
                         replacement.generation.saturating_add(1),
                         replacement.generation,
                         16,
@@ -8580,7 +9303,7 @@ mod tests {
             .map(|idx| {
                 let stats = reopened.devices[*idx]
                     .store_mut()
-                    .drain_receipt_bound_dead_objects_at_stable_generation(
+                    .drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
                         replacement.generation.saturating_add(1),
                         replacement.generation.saturating_sub(1),
                         16,
@@ -8597,7 +9320,7 @@ mod tests {
             .map(|idx| {
                 reopened.devices[*idx]
                     .store_mut()
-                    .drain_receipt_bound_dead_objects_at_stable_generation(
+                    .drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
                         replacement.generation.saturating_add(1),
                         replacement.generation,
                         16,
@@ -8645,10 +9368,22 @@ mod tests {
         for idx in old_target_indices {
             let stats = pool.devices[idx]
                 .store_mut()
-                .drain_receipt_bound_dead_objects_at_stable_generation(u64::MAX, u64::MAX, 16)
+                .drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
+                    u64::MAX,
+                    u64::MAX,
+                    16,
+                )
                 .expect("delete drain");
             assert_eq!(stats.entries_processed, 1);
             assert_eq!(stats.reclaim_queue_depth, 0);
+        }
+        for device in &pool.devices {
+            assert_eq!(
+                require_receipt_generation_high_water(device, pool.pool_guid)
+                    .unwrap()
+                    .reserved_through,
+                pool.reserved_placement_receipt_generation_through
+            );
         }
 
         let _ = std::fs::remove_dir_all(&root);
@@ -8680,7 +9415,7 @@ mod tests {
         let stale_encoded = stale_first.encode().unwrap();
         let last_idx = pool.devices.len() - 1;
         pool.devices[last_idx]
-            .put(stale_receipt_key, &stale_encoded)
+            .put_pool_internal(stale_receipt_key, &stale_encoded)
             .expect("inject stale receipt");
 
         let receipts = pool.placement_receipts(IoClass::Data).unwrap();
@@ -8744,31 +9479,315 @@ mod tests {
     }
 
     #[test]
-    fn receipt_generation_recovers_after_pool_reopen() {
-        let root = temp_dir("receipt-generation-reopen");
+    fn receipt_generation_survives_complete_receipt_reclaim() {
+        let root = temp_dir("receipt-generation-complete-reclaim");
         let _ = std::fs::remove_dir_all(&root);
         let config = single_device_config(&root);
         let properties = PoolProperties::default();
+        let key = ObjectKey::from_name(b"receipt-generation-complete-reclaim");
 
         let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
-        let first_key = ObjectKey::from_name(b"first-before-reopen");
-        pool.put(IoClass::Data, first_key, b"first").unwrap();
-        let first_receipt = pool
-            .placement_receipt_for_key(IoClass::Data, first_key)
-            .unwrap()
-            .expect("first receipt");
+        let (_, first_receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"first lifetime")
+            .unwrap();
         assert_eq!(first_receipt.generation, 1);
+        let receipt_key = placement_receipt_object_key(key);
+        let marker_key = receipt_generation_high_water_key();
+        let shard_key = placement_shard_object_key(key, 0);
+        let reserved_keys = [marker_key, receipt_key, shard_key];
+        let reserved_before: Vec<_> = reserved_keys
+            .iter()
+            .map(|reserved_key| pool.devices[0].get(*reserved_key).unwrap())
+            .collect();
+        assert_invalid_options_reason_contains(
+            pool.devices[0].put(marker_key, b"forged pool metadata"),
+            "require pool authority",
+        );
+        for reserved_key in [receipt_key, shard_key] {
+            assert!(matches!(
+                pool.devices[0].put(reserved_key, b"forged pool metadata"),
+                Err(StoreError::InvalidOptions { .. })
+            ));
+        }
+        assert!(matches!(
+            pool.devices[0].delete(marker_key),
+            Err(StoreError::InvalidOptions { .. })
+        ));
+        let reserved_after: Vec<_> = reserved_keys
+            .iter()
+            .map(|reserved_key| pool.devices[0].get(*reserved_key).unwrap())
+            .collect();
+        assert_eq!(
+            reserved_after, reserved_before,
+            "public device mutation must leave every reserved namespace unchanged"
+        );
+        assert_invalid_options_reason_contains(
+            pool.delete(IoClass::Data, receipt_generation_high_water_key()),
+            "cannot be deleted",
+        );
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+
+        pool.compact_retaining(&[], &[]).unwrap();
+        pool.sync_all().unwrap();
         drop(pool);
 
         let mut reopened = Pool::create(config, properties, &test_options()).unwrap();
-        let second_key = ObjectKey::from_name(b"second-after-reopen");
-        reopened.put(IoClass::Data, second_key, b"second").unwrap();
-        let second_receipt = reopened
-            .placement_receipt_for_key(IoClass::Data, second_key)
-            .unwrap()
-            .expect("second receipt");
-        assert!(second_receipt.generation > first_receipt.generation);
+        let (_, recreated_receipt) = reopened
+            .put_with_receipt(IoClass::Data, key, b"second lifetime")
+            .unwrap();
+        assert!(recreated_receipt.generation > first_receipt.generation);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn receipt_generation_high_water_survives_composite_compaction_and_burns_unused_range() {
+        for (label, mirror) in [("mirror", true), ("parity", false)] {
+            let root = temp_dir(&format!("receipt-generation-{label}-compaction"));
+            let _ = std::fs::remove_dir_all(&root);
+            let config = if mirror {
+                two_leg_mirror_device_config(&root)
+            } else {
+                parity_raid1_device_config(&root, 2)
+            };
+            let properties = PoolProperties::default();
+
+            let mut pool =
+                Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+            assert_eq!(pool.allocate_placement_receipt_generation().unwrap(), 1);
+            let burned_through = pool.reserved_placement_receipt_generation_through;
+            assert_eq!(burned_through, RECEIPT_GENERATION_RESERVATION_SIZE);
+            pool.compact_retaining(&[], &[]).unwrap();
+            pool.sync_all().unwrap();
+            drop(pool);
+
+            let mut reopened =
+                Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+            let key = ObjectKey::from_name(b"receipt-after-composite-compaction");
+            let payload = b"first published payload";
+            let (_, receipt) = reopened
+                .put_with_receipt(IoClass::Data, key, payload)
+                .unwrap();
+            assert_eq!(receipt.generation, burned_through + 1);
+            assert_eq!(
+                reopened.get(IoClass::Data, key).unwrap(),
+                Some(payload.to_vec())
+            );
+
+            let pool_guid = reopened.pool_guid;
+            let reserved_through = reopened.reserved_placement_receipt_generation_through;
+            if mirror {
+                reopened.sync_all().unwrap();
+                drop(reopened);
+
+                let mut stale_leg = LocalObjectStore::open_with_options(
+                    root.join("mirror-1"),
+                    StoreOptions::default(),
+                )
+                .unwrap();
+                stale_leg
+                    .put_pool_internal(
+                        receipt_generation_high_water_key(),
+                        &encode_receipt_generation_high_water(ReceiptGenerationHighWater {
+                            pool_guid,
+                            reserved_through: 0,
+                        }),
+                    )
+                    .unwrap();
+                stale_leg.sync_all().unwrap();
+                drop(stale_leg);
+            } else {
+                let mut failure = crate::FaultInjectionConfig::off();
+                failure.write_failure_probability = 1.0;
+                let Device::ParityRaid1(parity) = &mut reopened.devices[0] else {
+                    panic!("expected PARITY_RAID1 device");
+                };
+                parity
+                    .children
+                    .last_mut()
+                    .unwrap()
+                    .store_mut()
+                    .enable_fault_injection(failure);
+                assert!(publish_receipt_generation_high_water(
+                    &mut reopened.devices,
+                    pool_guid,
+                    reserved_through,
+                    reserved_through + RECEIPT_GENERATION_RESERVATION_SIZE,
+                )
+                .is_err());
+                let Device::ParityRaid1(parity) = &mut reopened.devices[0] else {
+                    unreachable!();
+                };
+                parity
+                    .children
+                    .last_mut()
+                    .unwrap()
+                    .store_mut()
+                    .disable_fault_injection();
+                reopened.sync_all().unwrap();
+                drop(reopened);
+            }
+            assert!(matches!(
+                Pool::create(config, properties, &test_options()),
+                Err(StoreError::InvalidOptions { .. })
+            ));
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn receipt_generation_high_water_refuses_invalid_topology_authority() {
+        assert_generation_high_water_open_refused("receipt-generation-marker-missing", |pool| {
+            pool.devices[1]
+                .delete_pool_internal(receipt_generation_high_water_key())
+                .unwrap();
+        });
+        assert_generation_high_water_open_refused("receipt-generation-marker-conflict", |pool| {
+            let marker = ReceiptGenerationHighWater {
+                pool_guid: pool.pool_guid,
+                reserved_through: 1,
+            };
+            pool.devices[1]
+                .put_pool_internal(
+                    receipt_generation_high_water_key(),
+                    &encode_receipt_generation_high_water(marker),
+                )
+                .unwrap();
+        });
+        assert_generation_high_water_open_refused("receipt-generation-marker-wrong-pool", |pool| {
+            let marker = ReceiptGenerationHighWater {
+                pool_guid: [0x5a; 16],
+                reserved_through: 0,
+            };
+            pool.devices[0]
+                .put_pool_internal(
+                    receipt_generation_high_water_key(),
+                    &encode_receipt_generation_high_water(marker),
+                )
+                .unwrap();
+        });
+        assert_generation_high_water_open_refused("receipt-generation-marker-malformed", |pool| {
+            let marker = ReceiptGenerationHighWater {
+                pool_guid: pool.pool_guid,
+                reserved_through: 0,
+            };
+            let mut encoded = encode_receipt_generation_high_water(marker);
+            encoded[RECEIPT_GENERATION_HIGH_WATER_ENCODED_LEN - 1] ^= 0x5a;
+            pool.devices[0]
+                .put_pool_internal(receipt_generation_high_water_key(), &encoded)
+                .unwrap();
+        });
+        assert_generation_high_water_open_refused(
+            "receipt-generation-marker-below-valid-receipt",
+            |pool| {
+                pool.put_with_receipt(
+                    IoClass::Data,
+                    ObjectKey::from_name(b"receipt-above-rolled-back-marker"),
+                    b"valid payload",
+                )
+                .unwrap();
+                let marker = ReceiptGenerationHighWater {
+                    pool_guid: pool.pool_guid,
+                    reserved_through: 0,
+                };
+                let encoded = encode_receipt_generation_high_water(marker);
+                for device in &mut pool.devices {
+                    device
+                        .put_pool_internal(receipt_generation_high_water_key(), &encoded)
+                        .unwrap();
+                }
+            },
+        );
+
+        let root = temp_dir("receipt-generation-store-replica-rollback");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut config = single_device_config(&root);
+        config.root_path = config.devices[0].path.clone();
+        let properties = PoolProperties::default();
+        let replica_path = root.join("store-replica");
+        let mut options = test_options();
+        options.mirror_path = Some(replica_path.clone());
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options).unwrap();
+        assert_eq!(pool.allocate_placement_receipt_generation().unwrap(), 1);
+        let pool_guid = pool.pool_guid;
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        let mut stale_replica =
+            LocalObjectStore::open_with_options(replica_path, StoreOptions::default()).unwrap();
+        stale_replica
+            .put_pool_internal(
+                receipt_generation_high_water_key(),
+                &encode_receipt_generation_high_water(ReceiptGenerationHighWater {
+                    pool_guid,
+                    reserved_through: 0,
+                }),
+            )
+            .unwrap();
+        stale_replica.sync_all().unwrap();
+        drop(stale_replica);
+
+        assert!(matches!(
+            Pool::create(config, properties, &options),
+            Err(StoreError::InvalidOptions { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn receipt_generation_high_water_partial_reservation_refuses_reopen_before_payload() {
+        let root = temp_dir("receipt-generation-partial-reservation");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let properties = PoolProperties::default();
+        let key = ObjectKey::from_name(b"must-remain-unwritten");
+        let receipt_key = placement_receipt_object_key(key);
+        let raw_existing_key = ObjectKey::from_name(b"raw-metadata-before-reservation-poison");
+
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+        pool.raw_primary_store_mut()
+            .put(raw_existing_key, b"stable raw metadata")
+            .unwrap();
+        pool.compact_retaining(&[raw_existing_key], &[]).unwrap();
+        let mut failure = crate::FaultInjectionConfig::off();
+        failure.write_failure_probability = 1.0;
+        pool.devices[1].store_mut().enable_fault_injection(failure);
+        assert!(pool
+            .put_with_receipt(IoClass::Data, key, b"must not reach payload storage")
+            .is_err());
+        for device in &pool.devices {
+            assert!(device.get(key).unwrap().is_none());
+            assert!(device.get(receipt_key).unwrap().is_none());
+        }
+        assert_eq!(
+            require_receipt_generation_high_water(&pool.devices[0], pool.pool_guid)
+                .unwrap()
+                .reserved_through,
+            RECEIPT_GENERATION_RESERVATION_SIZE
+        );
+        assert_eq!(
+            require_receipt_generation_high_water(&pool.devices[1], pool.pool_guid)
+                .unwrap()
+                .reserved_through,
+            0
+        );
+        assert_invalid_options_reason_contains(
+            pool.raw_primary_store_mut().delete(raw_existing_key),
+            "receipt-generation authority is unavailable",
+        );
+        assert_eq!(
+            pool.raw_primary_store().get(raw_existing_key).unwrap(),
+            Some(b"stable raw metadata".to_vec())
+        );
+        pool.devices[1].store_mut().disable_fault_injection();
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        assert_invalid_options_reason_contains(
+            Pool::create(config, properties, &test_options()),
+            "markers conflict",
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8776,25 +9795,41 @@ mod tests {
     fn receipt_generation_exhaustion_refuses_before_payload_mutation() {
         let root = temp_dir("receipt-generation-exhaustion");
         let _ = std::fs::remove_dir_all(&root);
-        let config = multi_data_device_config(&root, 2);
+        let mut config = multi_data_device_config(&root, 2);
+        let log_dir = root.join("intent-log-device");
+        config.devices.push(DeviceConfig {
+            media_class: DeviceMediaClass::Ssd,
+            path: log_dir.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::IntentLog,
+            kind: DeviceKind::Single {
+                path: log_dir.clone(),
+            },
+            encryption: None,
+            compression: None,
+        });
         let properties = PoolProperties::default();
         let key = ObjectKey::from_name(b"generation-exhaustion-subject");
 
         let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
-        let (_, mut receipt) = pool
+        let (_, receipt) = pool
             .put_with_receipt(IoClass::Data, key, b"committed payload")
             .unwrap();
-        receipt.generation = u64::MAX;
-        let receipt_key = placement_receipt_object_key(key);
-        let encoded = receipt.encode().unwrap();
-        for device in &mut pool.devices {
-            device.put(receipt_key, &encoded).unwrap();
-        }
-        pool.sync_all().unwrap();
+        publish_receipt_generation_high_water(
+            &mut pool.devices,
+            pool.pool_guid,
+            pool.reserved_placement_receipt_generation_through,
+            u64::MAX,
+        )
+        .unwrap();
+        pool.reserved_placement_receipt_generation_through = u64::MAX;
         drop(pool);
 
         let mut reopened = Pool::create(config, properties, &test_options()).unwrap();
         assert_eq!(reopened.next_placement_receipt_generation, 0);
+        assert!(reopened.has_log_device());
+        let log_path = log_dir.join(LOG_DEVICE_FILENAME);
+        let log_len_before = std::fs::metadata(&log_path).unwrap().len();
         let before: Vec<Option<Vec<u8>>> = reopened
             .devices
             .iter()
@@ -8802,6 +9837,10 @@ mod tests {
             .collect();
         assert_invalid_options_reason_contains(
             reopened.put_with_receipt(IoClass::Data, key, b"must not be written"),
+            "generation exhausted",
+        );
+        assert_invalid_options_reason_contains(
+            reopened.log_device_append(b"must not reach the separate log device"),
             "generation exhausted",
         );
         let after: Vec<Option<Vec<u8>>> = reopened
@@ -8812,6 +9851,18 @@ mod tests {
         assert_eq!(
             after, before,
             "counter exhaustion must precede payload writes"
+        );
+        assert_eq!(
+            reopened
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap(),
+            Some(receipt),
+            "exhaustion must not mutate current receipt authority"
+        );
+        assert_eq!(
+            std::fs::metadata(&log_path).unwrap().len(),
+            log_len_before,
+            "exhaustion must precede separate log-device append"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -8834,24 +9885,29 @@ mod tests {
         let wrong_receipt_key = placement_receipt_object_key(wrong_key);
         let encoded = receipt.encode().unwrap();
         for device in &mut pool.devices {
-            device.put(wrong_receipt_key, &encoded).unwrap();
+            device
+                .put_pool_internal(wrong_receipt_key, &encoded)
+                .unwrap();
         }
         pool.sync_all().unwrap();
         drop(pool);
 
         let mut reopened = Pool::create(config, properties, &test_options()).unwrap();
-        assert_eq!(reopened.next_placement_receipt_generation, 2);
+        assert_eq!(
+            reopened.next_placement_receipt_generation,
+            RECEIPT_GENERATION_RESERVATION_SIZE + 1
+        );
         let fresh_key = ObjectKey::from_name(b"generation-after-wrong-key");
         let (_, fresh) = reopened
             .put_with_receipt(IoClass::Data, fresh_key, b"fresh payload")
             .unwrap();
-        assert_eq!(fresh.generation, 2);
+        assert_eq!(fresh.generation, RECEIPT_GENERATION_RESERVATION_SIZE + 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn partial_receipt_publication_restores_prior_strict_authority() {
+    fn receipt_generation_publication_ceiling_and_partial_rollback_preserve_prior_authority() {
         let root = temp_dir("partial-receipt-publication");
         let _ = std::fs::remove_dir_all(&root);
         let config = multi_data_device_config(&root, 2);
@@ -8859,11 +9915,23 @@ mod tests {
         let key = ObjectKey::from_name(b"partial-receipt-publication");
         let payload = b"stable payload";
         let (_, prior) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        let indices = pool.class_map.get(IoClass::Data).to_vec();
+        let mut above_reservation = prior.clone();
+        above_reservation.generation = pool.reserved_placement_receipt_generation_through + 1;
+        assert_invalid_options_reason_contains(
+            pool.write_placement_receipt(&indices, &above_reservation),
+            "exceeds the durable high-water reservation",
+        );
+        assert_eq!(
+            pool.load_current_placement_receipt_strict(&indices, key)
+                .unwrap(),
+            Some(prior.clone())
+        );
+
         let mut replacement = prior.clone();
         replacement.generation = pool
             .allocate_placement_receipt_generation()
             .expect("allocate replacement generation");
-        let indices = pool.class_map.get(IoClass::Data).to_vec();
         let mut failure = crate::FaultInjectionConfig::off();
         failure.write_failure_probability = 1.0;
         pool.devices[indices[1]]
@@ -8922,14 +9990,16 @@ mod tests {
         let receipt_key = placement_receipt_object_key(key);
         let encoded_receipt = receipt.encode().unwrap();
 
-        assert!(pool.devices[non_target_idx].delete(receipt_key).unwrap());
+        assert!(pool.devices[non_target_idx]
+            .delete_pool_internal(receipt_key)
+            .unwrap());
         assert_invalid_options_reason_contains(
             pool.verify_placement_receipt_publication(&indices, &receipt),
             "missing receipt copy",
         );
 
         pool.devices[non_target_idx]
-            .put(receipt_key, b"corrupt receipt copy")
+            .put_pool_internal(receipt_key, b"corrupt receipt copy")
             .unwrap();
         assert_invalid_options_reason_contains(
             pool.verify_placement_receipt_publication(&indices, &receipt),
@@ -8937,7 +10007,7 @@ mod tests {
         );
 
         pool.devices[non_target_idx]
-            .put(receipt_key, &encoded_receipt)
+            .put_pool_internal(receipt_key, &encoded_receipt)
             .unwrap();
         pool.verify_placement_receipt_publication(&indices, &receipt)
             .expect("all write-time receipt copies are exact");
@@ -9296,7 +10366,9 @@ mod tests {
         let victim = receipt.targets[0].clone();
         let victim_idx = pool.resolve_receipt_target(&victim).unwrap();
         let victim_key = placement_shard_object_key(key, victim.shard_index);
-        assert!(pool.devices[victim_idx].delete(victim_key).unwrap());
+        assert!(pool.devices[victim_idx]
+            .delete_pool_internal(victim_key)
+            .unwrap());
 
         assert_invalid_options_reason_contains(
             pool.get_with_current_receipt(IoClass::Data, key),
@@ -9334,7 +10406,9 @@ mod tests {
         let receipt_key = placement_receipt_object_key(key);
         let encoded_receipt = receipt.encode().unwrap();
 
-        assert!(pool.devices[target_idx].delete(receipt_key).unwrap());
+        assert!(pool.devices[target_idx]
+            .delete_pool_internal(receipt_key)
+            .unwrap());
         assert_invalid_options_reason_contains(
             pool.get_with_current_receipt(IoClass::Data, key),
             "missing target receipt copy",
@@ -9345,12 +10419,12 @@ mod tests {
             "degraded Pool::get remains readable through another receipt copy"
         );
         pool.devices[target_idx]
-            .put(receipt_key, &encoded_receipt)
+            .put_pool_internal(receipt_key, &encoded_receipt)
             .unwrap();
 
         let shard_key = placement_shard_object_key(key, target.shard_index);
         pool.devices[target_idx]
-            .put(shard_key, b"corrupt erasure shard")
+            .put_pool_internal(shard_key, b"corrupt erasure shard")
             .unwrap();
         assert_invalid_options_reason_contains(
             pool.get_with_current_receipt(IoClass::Data, key),
@@ -9397,7 +10471,9 @@ mod tests {
         let victim = original_receipt.targets[0].clone();
         let victim_idx = pool.resolve_receipt_target(&victim).unwrap();
         let victim_key = placement_shard_object_key(key, victim.shard_index);
-        assert!(pool.devices[victim_idx].delete(victim_key).unwrap());
+        assert!(pool.devices[victim_idx]
+            .delete_pool_internal(victim_key)
+            .unwrap());
 
         let repaired_read = pool
             .get_erasure_with_repair_receipt(IoClass::Data, key)
@@ -9639,7 +10715,7 @@ mod tests {
 
         for idx in 0..pool.devices.len() {
             if idx != victim_idx {
-                assert!(pool.devices[idx].delete(receipt_key).unwrap());
+                assert!(pool.devices[idx].delete_pool_internal(receipt_key).unwrap());
             }
         }
         for _ in 0..3 {
@@ -9735,7 +10811,7 @@ mod tests {
         for idx in 0..pool.devices.len() {
             if idx != current_owner_idx {
                 pool.devices[idx]
-                    .put(receipt_key, &stale_encoded)
+                    .put_pool_internal(receipt_key, &stale_encoded)
                     .expect("restore stale receipt copy");
             }
         }
@@ -9885,7 +10961,7 @@ mod tests {
             let last = raw.len() - 1;
             raw[last] ^= 0x5a;
             device
-                .put(receipt_key, &raw)
+                .put_pool_internal(receipt_key, &raw)
                 .expect("replace receipt with bad replay seal");
         }
 
@@ -9931,7 +11007,7 @@ mod tests {
         for idx in 0..pool.devices.len() {
             if idx != victim_idx {
                 pool.devices[idx]
-                    .put(receipt_key, &encoded)
+                    .put_pool_internal(receipt_key, &encoded)
                     .expect("write conflicting survivor receipt");
             }
         }
@@ -9982,7 +11058,7 @@ mod tests {
         let receipt_key = placement_receipt_object_key(key);
 
         for device in &mut pool.devices {
-            assert!(device.delete(receipt_key).unwrap());
+            assert!(device.delete_pool_internal(receipt_key).unwrap());
         }
         assert!(pool.devices[victim_idx].get(shard_key).unwrap().is_some());
 
@@ -10434,7 +11510,7 @@ mod tests {
             let last = raw.len() - 1;
             raw[last] ^= 0x5a;
             pool.devices[idx]
-                .put(receipt_key, &raw)
+                .put_pool_internal(receipt_key, &raw)
                 .expect("replace survivor receipt with bad replay seal");
         }
 
@@ -10549,7 +11625,7 @@ mod tests {
 
         let receipt_key = placement_receipt_object_key(key);
         for device in &mut pool.devices {
-            device.put(receipt_key, &replayless).unwrap();
+            device.put_pool_internal(receipt_key, &replayless).unwrap();
         }
 
         let removal = pool.safe_remove_device(&victim_path).unwrap();
@@ -10836,12 +11912,10 @@ mod tests {
         assert_eq!(marker.target_guid, first_target_guid);
 
         let second_result = pool.safe_remove_device(&second_target);
-        assert!(matches!(
+        assert_invalid_options_reason_contains(
             second_result,
-            Err(StoreError::InvalidOptions {
-                reason: "another device removal is already pending"
-            })
-        ));
+            "awaits durable removal topology commit",
+        );
         assert_eq!(pool.stats().device_count, 2);
         let marker = read_device_removal_marker(&marker_path).unwrap();
         assert_eq!(marker.target_guid, first_target_guid);
@@ -11037,12 +12111,11 @@ mod tests {
         let reduced_config = pool2.config.clone();
         drop(pool2);
 
-        let pool3 = Pool::open(reduced_config, PoolProperties::default(), &test_options()).unwrap();
+        assert_invalid_options_reason_contains(
+            Pool::open(reduced_config, PoolProperties::default(), &test_options()),
+            "missing or has extra",
+        );
         assert!(marker_path.exists());
-        assert_eq!(pool3.stats().device_count, 1);
-        assert_eq!(pool3.get(IoClass::Data, key1).unwrap(), Some(data1));
-        assert_eq!(pool3.get(IoClass::Data, key2).unwrap(), Some(data2));
-        assert_eq!(pool3.get(IoClass::Data, key3).unwrap(), Some(data3));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -11075,16 +12148,7 @@ mod tests {
             Some(payload.to_vec())
         );
 
-        let reduced_config = reopened.config.clone();
         drop(reopened);
-        let reopened =
-            Pool::open(reduced_config, PoolProperties::default(), &test_options()).unwrap();
-        assert!(marker_path.exists());
-        assert_eq!(reopened.stats().device_count, 1);
-        assert_eq!(
-            reopened.get(IoClass::Data, key).unwrap(),
-            Some(payload.to_vec())
-        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -11131,11 +12195,24 @@ mod tests {
         assert_topology_commit_pending(&result);
         assert_eq!(pool.stats().device_count, 1);
         assert!(d1.exists());
+        let refused_key = ObjectKey::from_name(b"post-detach-mutation-must-wait");
+        assert_invalid_options_reason_contains(
+            pool.put(
+                IoClass::Data,
+                refused_key,
+                b"must not enter an uncommitted removal topology",
+            ),
+            "awaits durable removal topology commit",
+        );
+        assert!(pool.devices[0].get(refused_key).unwrap().is_none());
 
         let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
         persist_device_removal_marker(&root, pool.pool_guid, &d1, target_guid).unwrap();
 
-        resume_device_removal_if_pending(&mut pool).unwrap();
+        assert_invalid_options_reason_contains(
+            resume_device_removal_if_pending(&mut pool),
+            "target is absent from the labeled topology",
+        );
 
         assert!(marker_path.exists());
         assert_eq!(pool.stats().device_count, 1);
@@ -11156,7 +12233,10 @@ mod tests {
         persist_device_removal_marker(&root, pool.pool_guid, &target_path, target_guid).unwrap();
 
         pool.device_guids.pop();
-        resume_device_removal_if_pending(&mut pool).unwrap();
+        assert_invalid_options_reason_contains(
+            resume_device_removal_if_pending(&mut pool),
+            "incomplete topology identity",
+        );
 
         assert!(marker_path.exists());
         assert_eq!(pool.stats().device_count, 2);
@@ -11211,7 +12291,10 @@ mod tests {
         persist_device_removal_marker(&root, pool.pool_guid, &target_path, target_guid).unwrap();
 
         pool.device_guids[1] = deterministic_device_guid(2);
-        resume_device_removal_if_pending(&mut pool).unwrap();
+        assert_invalid_options_reason_contains(
+            resume_device_removal_if_pending(&mut pool),
+            "target is absent from the labeled topology",
+        );
 
         let marker = read_device_removal_marker(&marker_path).unwrap();
         assert_eq!(marker.pool_guid, pool.pool_guid);
@@ -11250,16 +12333,14 @@ mod tests {
 
         drop(pool);
 
-        let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
+        assert_invalid_options_reason_contains(
+            Pool::open(config, PoolProperties::default(), &test_options()),
+            "could not reach topology-commit-pending state",
+        );
         let marker = read_device_removal_marker(&marker_path).unwrap();
         assert_eq!(
             marker.target_path.as_os_str().as_bytes(),
             target_path.as_os_str().as_bytes()
-        );
-        assert_eq!(reopened.stats().device_count, 2);
-        assert_eq!(
-            reopened.devices[0].get(rogue_key).unwrap(),
-            Some(rogue_payload.to_vec())
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -11404,13 +12485,18 @@ mod tests {
 
         drop(pool);
 
-        let pool2 = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
+        assert_invalid_options_reason_contains(
+            Pool::open(config.clone(), PoolProperties::default(), &test_options()),
+            "could not reach topology-commit-pending state",
+        );
 
         assert!(marker_path.exists());
         assert!(!marker_tmp_path.exists());
         let marker = read_device_removal_marker(&marker_path).unwrap();
         assert_eq!(marker.target_path, d1);
         assert_eq!(marker.target_guid, target_guid);
+        std::fs::remove_file(&marker_path).unwrap();
+        let pool2 = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
         assert_eq!(pool2.stats().device_count, 2);
         assert_eq!(
             pool2.devices[0].get(rogue_key).unwrap(),
@@ -11648,7 +12734,7 @@ mod tests {
             redundancy_policy: PoolRedundancyPolicy::replicated(1),
             ..PoolProperties::default()
         };
-        let config = multi_data_device_config(&root, 2);
+        let mut config = multi_data_device_config(&root, 2);
         let mut pool = Pool::create(config.clone(), properties, &test_options()).unwrap();
         set_deterministic_device_guids(&mut pool);
 
@@ -11674,34 +12760,21 @@ mod tests {
         }
 
         let replacement_path = root.join("replacement-data");
-        pool.replace_device(
-            &old_path,
-            DeviceConfig {
-                media_class: Default::default(),
-                path: replacement_path.clone(),
-                backing: DeviceBacking::DirectoryObjectStoreCompat,
-                class: DeviceClass::Data,
-                kind: DeviceKind::Single {
-                    path: replacement_path,
-                },
-                encryption: None,
-                compression: None,
+        let replacement_config = DeviceConfig {
+            media_class: Default::default(),
+            path: replacement_path.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single {
+                path: replacement_path,
             },
-            &test_options(),
-        )
-        .unwrap();
+            encryption: None,
+            compression: None,
+        };
+        pool.replace_device(&old_path, replacement_config.clone(), &test_options())
+            .unwrap();
 
-        let evidence = pool
-            .replacement_rebuild_evidence_status()
-            .expect("replacement evidence status");
-        assert_eq!(evidence.total_subjects, 2);
-        assert_eq!(evidence.subjects_completed, 0);
-        assert_eq!(evidence.verified_receipt_count, 0);
-        assert!(!evidence.evidence_stable);
-        assert_eq!(
-            evidence.detach_decision,
-            ReplacementDetachDecision::UnsafeToDetach
-        );
+        config.devices[old_index] = replacement_config;
         drop(pool);
 
         let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
@@ -11808,6 +12881,16 @@ mod tests {
             replacement_replay_test_pool("replace-evidence-reopen-resume");
         pool.replace_device(&old_path, replacement_config.clone(), &test_options())
             .unwrap();
+        let candidate_key = ObjectKey::from_name(b"candidate-high-water-before-stale-reopen");
+        let (_, candidate_receipt) = pool
+            .put_with_receipt(
+                IoClass::Data,
+                candidate_key,
+                b"candidate generation authority",
+            )
+            .unwrap();
+        let candidate_ceiling = pool.reserved_placement_receipt_generation_through;
+        assert!(candidate_ceiling >= candidate_receipt.generation);
         let before_reopen = pool
             .replacement_rebuild_evidence_status()
             .expect("replacement evidence before reopen");
@@ -11830,6 +12913,21 @@ mod tests {
             ReplacementDetachDecision::UnsafeToDetach
         );
 
+        let refused_key = ObjectKey::from_name(b"stale-old-topology-must-not-write");
+        assert_invalid_options_reason_contains(
+            reopened.put_with_receipt(
+                IoClass::Data,
+                refused_key,
+                b"must not reach stale old topology",
+            ),
+            "explicit replacement resume",
+        );
+        assert!(reopened.devices[0].get(refused_key).unwrap().is_none());
+        assert!(reopened.devices[0]
+            .get(placement_receipt_object_key(refused_key))
+            .unwrap()
+            .is_none());
+
         reopened
             .replace_device(&old_path, replacement_config, &test_options())
             .unwrap();
@@ -11841,6 +12939,14 @@ mod tests {
         assert_eq!(resumed.new_member, before_reopen.new_member);
         assert_eq!(resumed.topology_epoch, before_reopen.topology_epoch);
         assert!(resumed.evidence_replayable_after_reopen);
+        let (_, after_resume) = reopened
+            .put_with_receipt(
+                IoClass::Data,
+                ObjectKey::from_name(b"generation-after-explicit-resume"),
+                b"new authority",
+            )
+            .unwrap();
+        assert!(after_resume.generation > candidate_ceiling);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -11932,7 +13038,7 @@ mod tests {
     fn replayed_replacement_cancel_persists_terminal_evidence() {
         let (root, old_path, config, replacement_config, mut pool) =
             replacement_replay_test_pool("replace-evidence-reopen-cancel");
-        pool.replace_device(&old_path, replacement_config, &test_options())
+        pool.replace_device(&old_path, replacement_config.clone(), &test_options())
             .unwrap();
         let replacement_identity = pool
             .replacement_rebuild_evidence_status()
@@ -11941,6 +13047,9 @@ mod tests {
 
         let mut reopened =
             Pool::open(config.clone(), PoolProperties::default(), &test_options()).unwrap();
+        reopened
+            .replace_device(&old_path, replacement_config, &test_options())
+            .unwrap();
         reopened.cancel_replacement(&test_options()).unwrap();
         let canceled = reopened
             .replacement_rebuild_evidence_status()
@@ -13735,9 +14844,20 @@ mod tests {
 
         // Create and export an encrypted pool.
         let (config, _key) = encrypted_device_config(&root);
-        let pool = Pool::create(config.clone(), PoolProperties::default(), &options)
+        let mut pool = Pool::create(config.clone(), PoolProperties::default(), &options)
             .expect("create encrypted pool");
         assert!(!pool.is_locked(), "freshly created pool must not be locked");
+        let data_key = ObjectKey::from_name(b"locked-import-encrypted-payload");
+        let data_payload = b"encrypted payload must not become raw marker metadata";
+        pool.put(IoClass::Data, data_key, data_payload).unwrap();
+        let stored_frame = pool.devices[0]
+            .store()
+            .get(data_key)
+            .unwrap()
+            .expect("encrypted raw frame");
+        assert_ne!(stored_frame, data_payload);
+        let pool_guid = pool.pool_guid;
+        let reserved_through = pool.reserved_placement_receipt_generation_through;
         pool.export().expect("export encrypted pool");
         drop(pool);
 
@@ -13747,19 +14867,52 @@ mod tests {
                 encryption: None,
                 ..config.devices[0].clone()
             }],
-            ..config
+            ..config.clone()
         };
-        let mut imported = Pool::open(config_no_key, PoolProperties::default(), &options)
+        let mut imported = Pool::open(config_no_key.clone(), PoolProperties::default(), &options)
             .expect("open encrypted pool without key");
         assert!(
             imported.is_locked(),
             "pool opened without encryption key must be locked"
+        );
+        assert_eq!(
+            require_receipt_generation_high_water(&imported.devices[0], imported.pool_guid)
+                .unwrap()
+                .reserved_through,
+            reserved_through,
+            "locked import must validate the raw-only generation marker"
         );
         assert!(
             imported
                 .put(IoClass::Data, ObjectKey::from_name(b"data"), b"test")
                 .is_err(),
             "locked pool must refuse put"
+        );
+        let raw_key = ObjectKey::from_name(b"locked-import-raw-mutation");
+        assert_invalid_options_reason_contains(
+            imported
+                .raw_primary_store_mut()
+                .put(raw_key, b"must not reach raw storage"),
+            "receipt-generation authority is unavailable",
+        );
+        assert!(imported.raw_primary_store().get(raw_key).unwrap().is_none());
+        drop(imported);
+
+        let mut marker_device =
+            open_single_device(&config.devices[0], &options, true).expect("open marker device");
+        let mut corrupt = encode_receipt_generation_high_water(ReceiptGenerationHighWater {
+            pool_guid,
+            reserved_through,
+        });
+        corrupt[RECEIPT_GENERATION_HIGH_WATER_ENCODED_LEN - 1] ^= 0x5a;
+        marker_device
+            .put_pool_internal(receipt_generation_high_water_key(), &corrupt)
+            .unwrap();
+        marker_device.sync_all().unwrap();
+        drop(marker_device);
+        assert_invalid_options_reason_contains(
+            Pool::open(config_no_key, PoolProperties::default(), &options),
+            "checksum mismatch",
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -13772,9 +14925,22 @@ mod tests {
         let options = test_options();
 
         let (config, _key) = encrypted_compressed_device_config(&root);
-        let pool = Pool::create(config.clone(), PoolProperties::default(), &options)
+        let mut pool = Pool::create(config.clone(), PoolProperties::default(), &options)
             .expect("create encrypted compressed pool");
         assert!(!pool.is_locked(), "freshly created pool must not be locked");
+        let data_key = ObjectKey::from_name(b"locked-import-encrypted-compressed-payload");
+        let data_payload = vec![0x5a; 4096];
+        pool.put(IoClass::Data, data_key, &data_payload).unwrap();
+        assert_ne!(
+            pool.devices[0]
+                .store()
+                .get(data_key)
+                .unwrap()
+                .expect("encrypted compressed raw frame"),
+            data_payload,
+            "ordinary objects must remain transformed while the marker stays raw-only"
+        );
+        let reserved_through = pool.reserved_placement_receipt_generation_through;
         pool.export().expect("export encrypted compressed pool");
         drop(pool);
 
@@ -13790,6 +14956,13 @@ mod tests {
         assert!(
             imported.is_locked(),
             "pool label must keep encrypted+compressed pools locked without a key"
+        );
+        assert_eq!(
+            require_receipt_generation_high_water(&imported.devices[0], imported.pool_guid)
+                .unwrap()
+                .reserved_through,
+            reserved_through,
+            "locked encrypted+compressed import must validate the raw-only marker"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -14039,7 +15212,7 @@ mod tests {
         let corrupt_key = ObjectKey::from_name(b"uncommitted-replay-corrupt-receipt");
         pool.devices[0].put(corrupt_key, b"orphan bytes").unwrap();
         pool.devices[0]
-            .put(placement_receipt_object_key(corrupt_key), b"corrupt")
+            .put_pool_internal(placement_receipt_object_key(corrupt_key), b"corrupt")
             .unwrap();
         assert_invalid_options_reason_contains(
             pool.ensure_prepublication_data_object_with_receipt(corrupt_key, expected),
@@ -14108,7 +15281,7 @@ mod tests {
             .unwrap();
         let receipt_key = placement_receipt_object_key(key);
         for device in &mut pool.devices {
-            device.delete(receipt_key).unwrap();
+            device.delete_pool_internal(receipt_key).unwrap();
         }
         let expected = b"intent-authoritative erasure payload";
         let payloads_before: Vec<_> = pool

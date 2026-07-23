@@ -19,8 +19,10 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::device_health::{
@@ -684,6 +686,50 @@ impl SingleDevice {
         self.status.checksum_errors = self.health_tracker.get_mut().total_checksum_errors;
         self.evaluate_health();
     }
+
+    fn put_pool_internal(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        match self.store.put_pool_internal(key, payload) {
+            Ok(obj) => {
+                self.write_ops = self.write_ops.saturating_add(1);
+                Ok(obj)
+            }
+            Err(e) => {
+                if store_error_counts_as_device_write_fault(&e) {
+                    self.health_tracker
+                        .get_mut()
+                        .record_error(DeviceErrorKind::Write);
+                    self.status.write_errors = self.health_tracker.get_mut().total_write_errors;
+                }
+                self.status.last_error = Some(format!("{e:?}"));
+                self.evaluate_health();
+                Err(e)
+            }
+        }
+    }
+
+    fn delete_pool_internal(&mut self, key: ObjectKey) -> Result<bool> {
+        match self.store.delete_pool_internal(key) {
+            Ok(existed) => {
+                self.delete_ops = self.delete_ops.saturating_add(1);
+                Ok(existed)
+            }
+            Err(e) => {
+                if store_error_counts_as_device_write_fault(&e) {
+                    self.health_tracker
+                        .get_mut()
+                        .record_error(DeviceErrorKind::Write);
+                    self.status.write_errors = self.health_tracker.get_mut().total_write_errors;
+                }
+                self.status.last_error = Some(format!("{e:?}"));
+                self.evaluate_health();
+                Err(e)
+            }
+        }
+    }
+
+    fn install_pool_raw_mutation_guard(&mut self, allowed: Arc<AtomicBool>) {
+        self.store.install_pool_raw_mutation_guard(allowed);
+    }
 }
 
 impl DeviceImpl for SingleDevice {
@@ -1116,10 +1162,13 @@ impl MirrorDevice {
             DeviceState::Online
         };
     }
-}
 
-impl DeviceImpl for MirrorDevice {
-    fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+    fn put_with_pool_authority(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+        pool_internal: bool,
+    ) -> Result<StoredObject> {
         let mut last_ok: Option<StoredObject> = None;
         let mut ok_count = 0_usize;
         let total = self.members.len();
@@ -1128,14 +1177,14 @@ impl DeviceImpl for MirrorDevice {
             if member.status.state != DeviceState::Online {
                 continue;
             }
-            match member.put(key, payload) {
-                Ok(obj) => {
-                    ok_count += 1;
-                    last_ok = Some(obj);
-                }
-                Err(_e) => {
-                    // member handles its own error counters
-                }
+            let result = if pool_internal {
+                member.put_pool_internal(key, payload)
+            } else {
+                member.put(key, payload)
+            };
+            if let Ok(obj) = result {
+                ok_count += 1;
+                last_ok = Some(obj);
             }
         }
 
@@ -1147,17 +1196,89 @@ impl DeviceImpl for MirrorDevice {
                 path: PathBuf::from("<mirror>"),
                 source: std::io::Error::other("mirror: no healthy members for write"),
             })
-        } else if ok_count < total {
-            self.status.last_error = Some(format!(
-                "mirror degraded write: {ok_count}/{total} members succeeded"
-            ));
-            Ok(last_ok.unwrap())
         } else {
+            if ok_count < total {
+                self.status.last_error = Some(format!(
+                    "mirror degraded write: {ok_count}/{total} members succeeded"
+                ));
+            }
             Ok(last_ok.unwrap())
         }
     }
 
+    fn delete_with_pool_authority(&mut self, key: ObjectKey, pool_internal: bool) -> Result<bool> {
+        let mut last_result: Option<bool> = None;
+        for member in &mut self.members {
+            if member.status.state != DeviceState::Online {
+                continue;
+            }
+            let result = if pool_internal {
+                member.delete_pool_internal(key)
+            } else {
+                member.delete(key)
+            };
+            if let Ok(existed) = result {
+                last_result = Some(existed);
+            }
+        }
+        self.recompute_state();
+        last_result.ok_or_else(|| StoreError::Io {
+            operation: "mirror_delete",
+            path: PathBuf::from("<mirror>"),
+            source: std::io::Error::other("mirror: no healthy members for delete"),
+        })
+    }
+
+    fn put_pool_internal(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        let result = self.put_with_pool_authority(key, payload, true)?;
+        if key == crate::pool_receipt_generation_high_water_key()
+            && self
+                .members
+                .iter()
+                .any(|member| member.get(key).ok().flatten().as_deref() != Some(payload))
+        {
+            return Err(StoreError::InvalidOptions {
+                reason:
+                    "placement receipt generation high-water did not converge across mirror legs",
+            });
+        }
+        Ok(result)
+    }
+
+    fn delete_pool_internal(&mut self, key: ObjectKey) -> Result<bool> {
+        self.delete_with_pool_authority(key, true)
+    }
+
+    fn install_pool_raw_mutation_guard(&mut self, allowed: Arc<AtomicBool>) {
+        for member in &mut self.members {
+            member.install_pool_raw_mutation_guard(Arc::clone(&allowed));
+        }
+    }
+}
+
+impl DeviceImpl for MirrorDevice {
+    fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.put_with_pool_authority(key, payload, false)
+    }
+
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        if key == crate::pool_receipt_generation_high_water_key() {
+            let mut expected: Option<Option<Vec<u8>>> = None;
+            for member in &self.members {
+                let copy = member.get(key)?;
+                if expected.as_ref().is_some_and(|expected| *expected != copy) {
+                    return Err(StoreError::InvalidOptions {
+                        reason:
+                            "placement receipt generation high-water conflicts across mirror legs",
+                    });
+                }
+                expected = Some(copy);
+            }
+            return expected.ok_or(StoreError::InvalidOptions {
+                reason: "placement receipt generation high-water mirror has no legs",
+            });
+        }
+
         let mut leg_errors: Vec<(usize, StoreError)> = Vec::new();
         let n = self.members.len();
         // Empty mirror (no children): no data to read, propagate EIO.
@@ -1300,21 +1421,7 @@ impl DeviceImpl for MirrorDevice {
     }
 
     fn delete(&mut self, key: ObjectKey) -> Result<bool> {
-        let mut last_result: Option<bool> = None;
-        for member in &mut self.members {
-            if member.status.state != DeviceState::Online {
-                continue;
-            }
-            if let Ok(existed) = member.delete(key) {
-                last_result = Some(existed);
-            }
-        }
-        self.recompute_state();
-        last_result.ok_or_else(|| StoreError::Io {
-            operation: "mirror_delete",
-            path: PathBuf::from("<mirror>"),
-            source: std::io::Error::other("mirror: no healthy members for delete"),
-        })
+        self.delete_with_pool_authority(key, false)
     }
 
     fn sync_all(&mut self) -> Result<()> {
@@ -1664,11 +1771,16 @@ impl ParityRaidDevice {
     pub fn column_states(&self) -> Vec<DeviceState> {
         self.children.iter().map(|c| c.status.state).collect()
     }
-}
 
-impl DeviceImpl for ParityRaidDevice {
-    fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+    fn put_with_pool_authority(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+        pool_internal: bool,
+    ) -> Result<StoredObject> {
         use crate::parity_raid::ParityRaidLayout;
+        let generation_high_water =
+            pool_internal && crate::is_pool_receipt_generation_high_water_key(key);
         let stripes =
             ParityRaidLayout::stripe_write(payload, self.n_data, self.n_parity).map_err(|_e| {
                 StoreError::InvalidOptions {
@@ -1677,13 +1789,22 @@ impl DeviceImpl for ParityRaidDevice {
             })?;
         let len_key = Self::len_key(key);
         let len_bytes = (payload.len() as u64).to_le_bytes();
-        self.children[0].put(len_key, &len_bytes)?;
+        if pool_internal {
+            self.children[0].put_pool_internal(len_key, &len_bytes)?;
+        } else {
+            self.children[0].put(len_key, &len_bytes)?;
+        }
         let total = stripes.len();
         let mut last_ok: Option<StoredObject> = None;
         let mut ok_count = 0;
         for (i, stripe) in stripes.iter().enumerate().take(total) {
             let col_key = Self::column_key(key, i as u8);
-            match self.children[i].put(col_key, stripe) {
+            let result = if pool_internal {
+                self.children[i].put_pool_internal(col_key, stripe)
+            } else {
+                self.children[i].put(col_key, stripe)
+            };
+            match result {
                 Ok(obj) => {
                     ok_count += 1;
                     last_ok = Some(obj);
@@ -1698,6 +1819,25 @@ impl DeviceImpl for ParityRaidDevice {
         self.write_ops = self.write_ops.saturating_add(1);
         self.row_sequence = self.row_sequence.saturating_add(1);
         self.evaluate_health();
+        if generation_high_water {
+            let len_matches = self.children[0]
+                .get(len_key)?
+                .is_some_and(|persisted| persisted == len_bytes);
+            let stripes_match = ok_count == total
+                && stripes.iter().enumerate().all(|(i, expected)| {
+                    self.children[i]
+                        .get(Self::column_key(key, i as u8))
+                        .ok()
+                        .flatten()
+                        .is_some_and(|persisted| persisted == *expected)
+                });
+            if !len_matches || !stripes_match {
+                return Err(StoreError::InvalidOptions {
+                    reason:
+                        "placement receipt generation high-water did not converge across parity columns",
+                });
+            }
+        }
         if ok_count == 0 {
             Err(StoreError::Io {
                 operation: "parity_raid_put",
@@ -1716,8 +1856,53 @@ impl DeviceImpl for ParityRaidDevice {
         }
     }
 
+    fn delete_with_pool_authority(&mut self, key: ObjectKey, pool_internal: bool) -> Result<bool> {
+        let mut existed = false;
+        for i in 0..self.children.len() {
+            let col_key = Self::column_key(key, i as u8);
+            let result = if pool_internal {
+                self.children[i].delete_pool_internal(col_key)
+            } else {
+                self.children[i].delete(col_key)
+            };
+            if result.unwrap_or(false) {
+                existed = true;
+            }
+        }
+        let len_key = Self::len_key(key);
+        if pool_internal {
+            let _ = self.children[0].delete_pool_internal(len_key);
+        } else {
+            let _ = self.children[0].delete(len_key);
+        }
+        self.delete_ops = self.delete_ops.saturating_add(1);
+        self.evaluate_health();
+        Ok(existed)
+    }
+
+    fn put_pool_internal(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.put_with_pool_authority(key, payload, true)
+    }
+
+    fn delete_pool_internal(&mut self, key: ObjectKey) -> Result<bool> {
+        self.delete_with_pool_authority(key, true)
+    }
+
+    fn install_pool_raw_mutation_guard(&mut self, allowed: Arc<AtomicBool>) {
+        for child in &mut self.children {
+            child.install_pool_raw_mutation_guard(Arc::clone(&allowed));
+        }
+    }
+}
+
+impl DeviceImpl for ParityRaidDevice {
+    fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.put_with_pool_authority(key, payload, false)
+    }
+
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
         use crate::parity_raid::ParityRaidLayout;
+        let generation_high_water = crate::is_pool_receipt_generation_high_water_key(key);
         let len_key = Self::len_key(key);
         let len_data = match self.children[0].get(len_key)? {
             Some(data) if data.len() >= 8 => {
@@ -1742,6 +1927,11 @@ impl DeviceImpl for ParityRaidDevice {
             }
         }
         self.read_ops.set(self.read_ops.get().saturating_add(1));
+        if generation_high_water && missing_count != 0 {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement receipt generation high-water is missing a parity column",
+            });
+        }
         if missing_count == 0 {
             let data_len = usize::from(self.n_data);
             let mut result = Vec::new();
@@ -1749,6 +1939,24 @@ impl DeviceImpl for ParityRaidDevice {
                 result.extend_from_slice(stripe);
             }
             result.truncate(len_data);
+            if generation_high_water {
+                let expected = ParityRaidLayout::stripe_write(&result, self.n_data, self.n_parity)
+                    .map_err(|_error| StoreError::InvalidOptions {
+                        reason: "placement receipt generation high-water parity validation failed",
+                    })?;
+                if expected.len() != stripes.len()
+                    || expected.iter().zip(&stripes).any(|(expected, actual)| {
+                        actual
+                            .as_ref()
+                            .is_none_or(|actual| actual.as_slice() != expected)
+                    })
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason:
+                            "placement receipt generation high-water conflicts across parity columns",
+                    });
+                }
+            }
             return Ok(Some(result));
         }
         if missing_count > 0 && missing_count <= self.n_parity as usize {
@@ -1800,18 +2008,7 @@ impl DeviceImpl for ParityRaidDevice {
     }
 
     fn delete(&mut self, key: ObjectKey) -> Result<bool> {
-        let mut existed = false;
-        for i in 0..self.children.len() {
-            let col_key = Self::column_key(key, i as u8);
-            if self.children[i].delete(col_key).unwrap_or(false) {
-                existed = true;
-            }
-        }
-        let len_key = Self::len_key(key);
-        let _ = self.children[0].delete(len_key);
-        self.delete_ops = self.delete_ops.saturating_add(1);
-        self.evaluate_health();
-        Ok(existed)
+        self.delete_with_pool_authority(key, false)
     }
 
     fn sync_all(&mut self) -> Result<()> {
@@ -2198,6 +2395,28 @@ impl LogDevice {
         self.evaluate_health();
     }
 
+    fn put_pool_internal(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.store.put_pool_internal(key, payload).map_err(|e| {
+            if store_error_counts_as_device_write_fault(&e) {
+                self.health_tracker
+                    .get_mut()
+                    .record_error(DeviceErrorKind::Write);
+                self.status.write_errors = self.health_tracker.get_mut().total_write_errors;
+            }
+            self.status.last_error = Some(format!("{e:?}"));
+            self.evaluate_health();
+            e
+        })
+    }
+
+    fn delete_pool_internal(&mut self, key: ObjectKey) -> Result<bool> {
+        self.store.delete_pool_internal(key)
+    }
+
+    fn install_pool_raw_mutation_guard(&mut self, allowed: Arc<AtomicBool>) {
+        self.store.install_pool_raw_mutation_guard(allowed);
+    }
+
     /// Whether the log device is healthy enough to accept writes (Online or Degraded).
     pub fn is_healthy_for_writes(&self) -> bool {
         matches!(
@@ -2390,6 +2609,34 @@ impl CompressedDevice {
     pub fn compression_bytes_out(&self) -> u64 {
         self.bytes_out
     }
+
+    fn put_pool_internal(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        if key == crate::pool_receipt_generation_high_water_key() {
+            return self.inner.put_pool_internal(key, payload);
+        }
+
+        self.write_ops = self.write_ops.saturating_add(1);
+        let mut frame_stats = crate::compress::CompressionStats::default();
+        let framed = crate::compress::compress_frame(payload, &self.config, &mut frame_stats);
+        self.bytes_in = self.bytes_in.saturating_add(frame_stats.bytes_in);
+        self.bytes_out = self.bytes_out.saturating_add(frame_stats.bytes_out);
+        self.objects_compressed = self
+            .objects_compressed
+            .saturating_add(frame_stats.objects_compressed);
+        self.objects_uncompressed = self
+            .objects_uncompressed
+            .saturating_add(frame_stats.objects_uncompressed);
+        self.inner.put_pool_internal(key, &framed)
+    }
+
+    fn delete_pool_internal(&mut self, key: ObjectKey) -> Result<bool> {
+        self.delete_ops = self.delete_ops.saturating_add(1);
+        self.inner.delete_pool_internal(key)
+    }
+
+    fn install_pool_raw_mutation_guard(&mut self, allowed: Arc<AtomicBool>) {
+        self.inner.install_pool_raw_mutation_guard(allowed);
+    }
 }
 
 impl DeviceImpl for CompressedDevice {
@@ -2412,6 +2659,9 @@ impl DeviceImpl for CompressedDevice {
     }
 
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        if key == crate::pool_receipt_generation_high_water_key() {
+            return self.inner.get(key);
+        }
         match self.inner.get(key)? {
             Some(framed) => {
                 self.read_ops.set(self.read_ops.get().saturating_add(1));
@@ -2558,6 +2808,23 @@ impl EncryptedDevice {
     pub fn objects_encrypted(&self) -> u64 {
         self.objects_encrypted
     }
+
+    fn put_pool_internal(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        if key == crate::pool_receipt_generation_high_water_key() {
+            return self.inner.put_pool_internal(key, payload);
+        }
+        let ciphertext = crate::encrypt::encrypt_object(&self.config.key, payload);
+        self.objects_encrypted = self.objects_encrypted.saturating_add(1);
+        self.inner.put_pool_internal(key, &ciphertext)
+    }
+
+    fn delete_pool_internal(&mut self, key: ObjectKey) -> Result<bool> {
+        self.inner.delete_pool_internal(key)
+    }
+
+    fn install_pool_raw_mutation_guard(&mut self, allowed: Arc<AtomicBool>) {
+        self.inner.install_pool_raw_mutation_guard(allowed);
+    }
 }
 
 impl DeviceImpl for EncryptedDevice {
@@ -2568,6 +2835,9 @@ impl DeviceImpl for EncryptedDevice {
     }
 
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        if key == crate::pool_receipt_generation_high_water_key() {
+            return self.inner.get(key);
+        }
         match self.inner.get(key)? {
             Some(framed) => {
                 let plaintext = crate::encrypt::decrypt_object(&self.config.key, &framed);
@@ -2677,6 +2947,49 @@ pub enum Device {
 }
 
 impl Device {
+    pub(crate) fn put_pool_internal(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<StoredObject> {
+        match self {
+            Self::Single(device) => device.put_pool_internal(key, payload),
+            Self::Mirror(device) => device.put_pool_internal(key, payload),
+            Self::Compressed(device) => device.put_pool_internal(key, payload),
+            Self::Encrypted(device) => device.put_pool_internal(key, payload),
+            Self::LogDevice(device) => device.put_pool_internal(key, payload),
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                device.put_pool_internal(key, payload)
+            }
+        }
+    }
+
+    pub(crate) fn delete_pool_internal(&mut self, key: ObjectKey) -> Result<bool> {
+        match self {
+            Self::Single(device) => device.delete_pool_internal(key),
+            Self::Mirror(device) => device.delete_pool_internal(key),
+            Self::Compressed(device) => device.delete_pool_internal(key),
+            Self::Encrypted(device) => device.delete_pool_internal(key),
+            Self::LogDevice(device) => device.delete_pool_internal(key),
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                device.delete_pool_internal(key)
+            }
+        }
+    }
+
+    pub(crate) fn install_pool_raw_mutation_guard(&mut self, allowed: Arc<AtomicBool>) {
+        match self {
+            Self::Single(device) => device.install_pool_raw_mutation_guard(allowed),
+            Self::Mirror(device) => device.install_pool_raw_mutation_guard(allowed),
+            Self::Compressed(device) => device.install_pool_raw_mutation_guard(allowed),
+            Self::Encrypted(device) => device.install_pool_raw_mutation_guard(allowed),
+            Self::LogDevice(device) => device.install_pool_raw_mutation_guard(allowed),
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                device.install_pool_raw_mutation_guard(allowed)
+            }
+        }
+    }
+
     /// Run an incremental background integrity scrub on this device's store.
     ///
     /// Delegates to [`LocalObjectStore::run_background_scrub`]. The scrub

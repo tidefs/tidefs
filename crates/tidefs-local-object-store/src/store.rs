@@ -476,6 +476,14 @@ pub struct LocalObjectStore {
     /// When set, the write path consults the reserve before consuming
     /// free segments; set via [`set_reserve_ledger`](LocalObjectStore::set_reserve_ledger).
     pub(crate) reserve_ledger: Option<Arc<Mutex<ReserveLedger>>>,
+    /// Pool-owned gate for public raw mutations.
+    ///
+    /// A pool installs one shared gate on every admitted raw store. Pool
+    /// internals retain separate crate-private mutation entry points for
+    /// receipt and high-water publication while public raw callers fail
+    /// closed whenever the pool's receipt-generation authority is not
+    /// converged.
+    pool_raw_mutation_allowed: Option<Arc<AtomicBool>>,
     /// Optional compression config set via [`set_compression`].
     compression_config: Option<CompressionConfig>,
     /// Cumulative inline compression statistics.
@@ -633,6 +641,7 @@ fn is_stats_internal_key(key: ObjectKey) -> bool {
     key == committed_root_key()
         || is_persistent_reclaim_metadata_key(key)
         || crate::is_pool_placement_receipt_key(key)
+        || crate::is_pool_receipt_generation_high_water_key(key)
         || is_compaction_target_key(key)
 }
 
@@ -1403,6 +1412,7 @@ impl LocalObjectStore {
         rewrites: Vec<VerifiedCompactionRewrite>,
         extent_map: &mut impl ExtentMapOps,
     ) -> Result<CompactionPublishReport> {
+        self.ensure_pool_raw_mutation_allowed()?;
         self.ensure_writable("publish_verified_compaction_rewrites")?;
         if rewrites.is_empty() {
             return Err(StoreError::InvalidCompactionRewrite {
@@ -1414,6 +1424,7 @@ impl LocalObjectStore {
         let mut prepared = Vec::with_capacity(rewrites.len());
         let mut seen_keys = BTreeSet::new();
         for (ordinal, rewrite) in rewrites.into_iter().enumerate() {
+            Self::ensure_public_pool_key_mutation_allowed(rewrite.key)?;
             if !seen_keys.insert(rewrite.key) {
                 return Err(StoreError::InvalidCompactionRewrite {
                     reason: "compaction publish batch contains duplicate source key",
@@ -1633,6 +1644,7 @@ impl LocalObjectStore {
             intent_log: crate::intent_log::sync_write::IntentLog::new(INTENT_LOG_BUFFER_CAPACITY),
             intent_log_tx_open: false,
             reserve_ledger: None,
+            pool_raw_mutation_allowed: None,
             compression_config: None,
             compression_stats: CompressionStats::default(),
             durability_layout: None,
@@ -1932,6 +1944,7 @@ impl LocalObjectStore {
             intent_log: crate::intent_log::sync_write::IntentLog::new(INTENT_LOG_BUFFER_CAPACITY),
             intent_log_tx_open: false,
             reserve_ledger: None,
+            pool_raw_mutation_allowed: None,
             compression_config: None,
             compression_stats: CompressionStats::default(),
             durability_layout,
@@ -2518,6 +2531,7 @@ impl LocalObjectStore {
     /// divergence (missing keys, digest mismatches). Returns scrub statistics
     /// aggregated across all replicas.
     pub fn scrub_replicas(&mut self) -> Result<ScrubStats> {
+        self.ensure_pool_raw_mutation_allowed()?;
         let started = Instant::now();
         let mut stats = ScrubStats::default();
 
@@ -3102,7 +3116,12 @@ impl LocalObjectStore {
     where
         I: IntoIterator<Item = SnapshotDeadObjectCandidate>,
     {
+        self.ensure_pool_raw_mutation_allowed()?;
         self.ensure_writable("enqueue_snapshot_deadlist_candidates")?;
+        let candidates: Vec<_> = candidates.into_iter().collect();
+        for candidate in &candidates {
+            Self::ensure_public_pool_reclaim_key_allowed(candidate.object_id)?;
+        }
         let mut inserted = 0usize;
         for candidate in candidates {
             if self
@@ -3127,6 +3146,22 @@ impl LocalObjectStore {
     /// in-memory-only receipt publication. Duplicate object ids are accepted as
     /// idempotent replays and return `Ok(false)`.
     pub fn enqueue_receipt_bound_dead_object(&mut self, entry: DeadObjectEntry) -> Result<bool> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        Self::ensure_public_pool_reclaim_key_allowed(entry.object_id)?;
+        self.enqueue_receipt_bound_dead_object_authorized(entry)
+    }
+
+    pub(crate) fn enqueue_receipt_bound_dead_object_pool_internal(
+        &mut self,
+        entry: DeadObjectEntry,
+    ) -> Result<bool> {
+        self.enqueue_receipt_bound_dead_object_authorized(entry)
+    }
+
+    fn enqueue_receipt_bound_dead_object_authorized(
+        &mut self,
+        entry: DeadObjectEntry,
+    ) -> Result<bool> {
         self.ensure_writable("enqueue_receipt_bound_dead_object")?;
         let Some(receipt) = entry.replacement_receipt else {
             return Err(StoreError::InvalidDeadObjectReceipt {
@@ -3157,6 +3192,22 @@ impl LocalObjectStore {
     /// [`publish_dead_object_replacement_receipt`](Self::publish_dead_object_replacement_receipt)
     /// attaches durable, authorizing receipt evidence.
     pub fn enqueue_pending_receipt_bound_dead_object(
+        &mut self,
+        entry: DeadObjectEntry,
+    ) -> Result<bool> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        Self::ensure_public_pool_reclaim_key_allowed(entry.object_id)?;
+        self.enqueue_pending_receipt_bound_dead_object_authorized(entry)
+    }
+
+    pub(crate) fn enqueue_pending_receipt_bound_dead_object_pool_internal(
+        &mut self,
+        entry: DeadObjectEntry,
+    ) -> Result<bool> {
+        self.enqueue_pending_receipt_bound_dead_object_authorized(entry)
+    }
+
+    fn enqueue_pending_receipt_bound_dead_object_authorized(
         &mut self,
         entry: DeadObjectEntry,
     ) -> Result<bool> {
@@ -3194,6 +3245,24 @@ impl LocalObjectStore {
         object_id: &ReclaimObjectKey,
         receipt: DeadObjectReplacementReceipt,
     ) -> Result<bool> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        Self::ensure_public_pool_reclaim_key_allowed(*object_id)?;
+        self.publish_dead_object_replacement_receipt_authorized(object_id, receipt)
+    }
+
+    pub(crate) fn publish_dead_object_replacement_receipt_pool_internal(
+        &mut self,
+        object_id: &ReclaimObjectKey,
+        receipt: DeadObjectReplacementReceipt,
+    ) -> Result<bool> {
+        self.publish_dead_object_replacement_receipt_authorized(object_id, receipt)
+    }
+
+    fn publish_dead_object_replacement_receipt_authorized(
+        &mut self,
+        object_id: &ReclaimObjectKey,
+        receipt: DeadObjectReplacementReceipt,
+    ) -> Result<bool> {
         self.ensure_writable("publish_dead_object_replacement_receipt")?;
         if !receipt.authorizes_reclaim_for(*object_id) {
             return Err(StoreError::InvalidDeadObjectReceipt {
@@ -3225,7 +3294,44 @@ impl LocalObjectStore {
         max_count: usize,
     ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
     {
+        self.drain_receipt_bound_dead_objects_authorized(
+            stable_committed_txg,
+            stable_committed_generation,
+            max_count,
+            false,
+        )
+    }
+
+    pub(crate) fn drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
+        &mut self,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+        max_count: usize,
+    ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
+    {
+        self.drain_receipt_bound_dead_objects_authorized(
+            stable_committed_txg,
+            stable_committed_generation,
+            max_count,
+            true,
+        )
+    }
+
+    fn drain_receipt_bound_dead_objects_authorized(
+        &mut self,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+        max_count: usize,
+        pool_internal: bool,
+    ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
+    {
+        self.ensure_pool_raw_mutation_allowed()?;
         self.ensure_writable("drain_receipt_bound_dead_objects_at_stable_generation")?;
+        if !pool_internal {
+            for entry in self.dead_object_reclaim_queue.all_entries() {
+                Self::ensure_public_pool_reclaim_key_allowed(entry.object_id)?;
+            }
+        }
         // A block backing is one virtual segment containing labels, recovery
         // state, and every live record. It cannot be handed to segment-file
         // reclamation; physical recovery waits for block compaction authority.
@@ -3258,6 +3364,22 @@ impl LocalObjectStore {
                 reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
                 ..tidefs_reclaim::ReclaimConsumerStats::ZERO
             });
+        }
+
+        let reserved_copies: Vec<_> = self
+            .index
+            .iter()
+            .filter(|(key, location)| {
+                crate::is_pool_placement_scan_internal_key(**key)
+                    && plan.dead_segments.contains(&location.segment_id)
+            })
+            .map(|(key, location)| Ok((*key, self.read_location(*location)?)))
+            .collect::<Result<_>>()?;
+        if !reserved_copies.is_empty() {
+            for (key, payload) in reserved_copies {
+                self.put_direct(key, &payload)?;
+            }
+            self.sync_all()?;
         }
 
         let queue_snapshot = self.dead_object_reclaim_queue.clone();
@@ -3557,6 +3679,40 @@ impl LocalObjectStore {
         self.durability_layout.as_ref()
     }
 
+    pub(crate) fn install_pool_raw_mutation_guard(&mut self, allowed: Arc<AtomicBool>) {
+        self.pool_raw_mutation_allowed = Some(Arc::clone(&allowed));
+        for replica in &mut self.replicas {
+            replica.install_pool_raw_mutation_guard(Arc::clone(&allowed));
+        }
+    }
+
+    fn ensure_pool_raw_mutation_allowed(&self) -> Result<()> {
+        if self
+            .pool_raw_mutation_allowed
+            .as_ref()
+            .is_some_and(|allowed| !allowed.load(Ordering::Acquire))
+        {
+            return Err(StoreError::InvalidOptions {
+                reason:
+                    "raw mutation refused while pool receipt-generation authority is unavailable",
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_public_pool_key_mutation_allowed(key: ObjectKey) -> Result<()> {
+        if crate::is_pool_placement_scan_internal_key(key) {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool receipt, shard, and generation metadata require pool authority",
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_public_pool_reclaim_key_allowed(key: ReclaimObjectKey) -> Result<()> {
+        Self::ensure_public_pool_key_mutation_allowed(ObjectKey::from_bytes(key.0))
+    }
+
     /// Return the current I/O class.
     pub fn io_class(&self) -> IoClass {
         self.current_io_class
@@ -3766,23 +3922,42 @@ impl LocalObjectStore {
         }
     }
 
-    pub fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+    fn put_authorized(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         // Apply fault injection before the write (skipped for internal paths).
         let effective_payload = self.prepare_payload_with_fault_injection(payload)?;
+        let generation_high_water_key = key == crate::pool_receipt_generation_high_water_key();
+        let generation_high_water_family = crate::is_pool_receipt_generation_high_water_key(key);
 
         // Transparently compress the payload when compression is configured.
-        let (stored_payload, compression_algorithm) =
-            if let Some(ref config) = self.compression_config {
-                let mut stats = self.compression_stats;
-                let framed = tidefs_frame::compress_frame(&effective_payload, config, &mut stats);
-                self.compression_stats = stats;
-                let alg = config.algorithm as u8;
-                (std::borrow::Cow::Owned(framed), alg)
-            } else {
-                (effective_payload, 0)
-            };
+        let (stored_payload, compression_algorithm) = if generation_high_water_key {
+            (effective_payload, 0)
+        } else if let Some(ref config) = self.compression_config {
+            let mut stats = self.compression_stats;
+            let framed = tidefs_frame::compress_frame(&effective_payload, config, &mut stats);
+            self.compression_stats = stats;
+            let alg = config.algorithm as u8;
+            (std::borrow::Cow::Owned(framed), alg)
+        } else {
+            (effective_payload, 0)
+        };
 
-        let result = self.put_inner(key, &stored_payload, compression_algorithm, true)?;
+        let result = self.put_inner(
+            key,
+            &stored_payload,
+            compression_algorithm,
+            !generation_high_water_family,
+        )?;
+        if generation_high_water_family
+            && self
+                .last_replicated_write
+                .as_ref()
+                .is_none_or(|outcome| outcome.class != crate::ReplicatedWriteClass::Committed)
+        {
+            return Err(StoreError::InvalidOptions {
+                reason:
+                    "placement receipt generation high-water did not converge across store replicas",
+            });
+        }
 
         // Compute per-object BLAKE3 domain-separated checksum for
         // read-path verification (#5273).
@@ -3790,6 +3965,14 @@ impl LocalObjectStore {
             let domain_key = DomainTag::ReadVerify.derive_key();
             let digest = ObjectDigest::compute(payload, &domain_key);
             self.checksums.insert(key, digest);
+        }
+
+        // The pool high-water marker is its own durable authority. Recording
+        // it in the ordinary payload WAL would let generic intent replay
+        // resurrect an older reservation after marker loss. Pool publication
+        // writes and verifies every copy synchronously instead.
+        if generation_high_water_family {
+            return Ok(result);
         }
 
         // Track this write in the current transaction group for
@@ -3818,6 +4001,20 @@ impl LocalObjectStore {
         let _ = self.intent_log.append(mutation.to_intent_log_record());
 
         Ok(result)
+    }
+
+    pub fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        Self::ensure_public_pool_key_mutation_allowed(key)?;
+        self.put_authorized(key, payload)
+    }
+
+    pub(crate) fn put_pool_internal(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<StoredObject> {
+        self.put_authorized(key, payload)
     }
 
     /// Write a named object directly to the segment without commit_group tracking.
@@ -3879,6 +4076,31 @@ impl LocalObjectStore {
     /// Use [`LocalObjectStore::get_verified`] for a one-step read with
     /// content-address verification built in.
     pub fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        if crate::is_pool_receipt_generation_high_water_key(key) {
+            if self.options.replica_count() != self.replicas.len()
+                || self.replica_healthy.iter().any(|healthy| !healthy)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "placement receipt generation high-water store replica is unavailable",
+                });
+            }
+            let primary = self
+                .index
+                .get(&key)
+                .copied()
+                .map(|location| self.read_location(location))
+                .transpose()?;
+            for replica in &self.replicas {
+                if replica.get(key)? != primary {
+                    return Err(StoreError::InvalidOptions {
+                        reason:
+                            "placement receipt generation high-water conflicts across store replicas",
+                    });
+                }
+            }
+            return Ok(primary);
+        }
+
         let result = match self.index.get(&key).copied() {
             Some(location) => self.read_location(location).map(Some),
             None => {
@@ -4130,10 +4352,15 @@ impl LocalObjectStore {
         self.delete(ObjectKey::from_name(name))
     }
 
-    pub fn delete(&mut self, key: ObjectKey) -> Result<bool> {
+    fn delete_authorized(&mut self, key: ObjectKey) -> Result<bool> {
         self.ensure_writable("delete")?;
+        let generation_high_water_family = crate::is_pool_receipt_generation_high_water_key(key);
         let existed = self.index.contains_key(&key);
-        let sequence = self.next_sequence;
+        let sequence = if generation_high_water_family {
+            0
+        } else {
+            self.next_sequence
+        };
         let empty_checksum = checksum64(&[]);
         self.append_record(RecordKind::Delete, key, &[], empty_checksum, sequence, 0)?;
         // Record the last-known location in history so the reclaim-queue
@@ -4141,27 +4368,43 @@ impl LocalObjectStore {
         // after the index entry is removed.
         if let Some(loc) = self.index.get(&key).copied() {
             self.history.entry(key).or_default().push(loc);
-            // Record the old segment liveness so the background reclaim
-            // process can track dead space and prioritize cleaning.
-            self.segment_liveness
-                .record_delete(loc.segment_id, loc.payload_len);
+            if !generation_high_water_family {
+                // Record the old segment liveness so the background reclaim
+                // process can track dead space and prioritize cleaning.
+                self.segment_liveness
+                    .record_delete(loc.segment_id, loc.payload_len);
 
-            // Test-only raw-store accounting fixtures can model deletions.
-            self.record_test_current_dataset_delete(loc.payload_len);
+                // Test-only raw-store accounting fixtures can model deletions.
+                self.record_test_current_dataset_delete(loc.payload_len);
+            }
         }
 
         self.index.remove(&key);
         self.checksums.remove(&key);
-        // Enqueue a reclaim entry so the background drain loop can
-        // eventually free the segment when all objects in it are dead.
-        self.enqueue_reclaim_entry(key);
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        self.tombstone_count = self.tombstone_count.saturating_add(1);
+        if !generation_high_water_family {
+            // Enqueue a reclaim entry so the background drain loop can
+            // eventually free the segment when all objects in it are dead.
+            self.enqueue_reclaim_entry(key);
+            self.next_sequence = self.next_sequence.saturating_add(1);
+            self.tombstone_count = self.tombstone_count.saturating_add(1);
+        }
 
         // Fan out delete to all replicas so stale data does not
         // resurrect on a replica fallback read.
         for replica in &mut self.replicas {
-            let _ = replica.delete(key);
+            let result = if crate::is_pool_placement_scan_internal_key(key) {
+                replica.delete_pool_internal(key)
+            } else {
+                replica.delete(key)
+            };
+            let _ = result;
+        }
+
+        // The generation marker is not part of the generic payload WAL.
+        // Replaying a marker tombstone after a later Pool-authorized repair
+        // could otherwise delete the repaired authority.
+        if generation_high_water_family {
+            return Ok(existed);
         }
 
         // Record the deletion in the intent-log for crash recovery.
@@ -4184,11 +4427,22 @@ impl LocalObjectStore {
         Ok(existed)
     }
 
+    pub fn delete(&mut self, key: ObjectKey) -> Result<bool> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        Self::ensure_public_pool_key_mutation_allowed(key)?;
+        self.delete_authorized(key)
+    }
+
+    pub(crate) fn delete_pool_internal(&mut self, key: ObjectKey) -> Result<bool> {
+        self.delete_authorized(key)
+    }
+
     pub fn compact_retaining(
         &mut self,
         protected_keys: &[ObjectKey],
         protected_exact_locations: &[ObjectLocation],
     ) -> Result<StoreRetentionCompactionReport> {
+        self.ensure_pool_raw_mutation_allowed()?;
         self.ensure_writable("compact_retaining")?;
         if self.block_device_mode {
             return self.compact_block_device_retaining(protected_keys, protected_exact_locations);
@@ -4212,23 +4466,41 @@ impl LocalObjectStore {
             self.rotate_segment()?;
         }
 
-        let mut protected_copies = Vec::new();
-        for key in &protected_keys {
-            if exact_location_keys.contains(key) {
+        let mut retained_keys = protected_keys.clone();
+        retained_keys.extend(
+            self.index
+                .keys()
+                .copied()
+                .filter(|key| crate::is_pool_placement_scan_internal_key(*key)),
+        );
+        let mut retained_copies = Vec::new();
+        for key in retained_keys {
+            if exact_location_keys.contains(&key) {
                 continue;
             }
-            let Some(location) = self.index.get(key).copied() else {
+            let Some(location) = self.index.get(&key).copied() else {
                 continue;
             };
             if retained_segments.contains(&location.segment_id) {
                 continue;
             }
-            protected_copies.push((*key, self.read_location(location)?));
+            retained_copies.push((
+                key,
+                crate::is_pool_placement_scan_internal_key(key),
+                self.read_location(location)?,
+            ));
         }
 
-        let copied_protected_objects = protected_copies.len();
-        for (key, bytes) in protected_copies {
-            self.put(key, &bytes)?;
+        let copied_protected_objects = retained_copies
+            .iter()
+            .filter(|(key, _, _)| protected_keys.contains(key))
+            .count();
+        for (key, internal_key, bytes) in retained_copies {
+            if internal_key {
+                self.put_direct(key, &bytes)?;
+            } else {
+                self.put(key, &bytes)?;
+            }
         }
 
         let mut tombstone_keys = BTreeSet::new();
@@ -4293,8 +4565,12 @@ impl LocalObjectStore {
         let root = self.root.clone();
         let options = self.options.clone();
         let replica_healthy = self.replica_healthy.clone();
+        let pool_raw_mutation_allowed = self.pool_raw_mutation_allowed.clone();
         *self = LocalObjectStore::open_with_options(root, options)?;
         self.replica_healthy = replica_healthy;
+        if let Some(allowed) = pool_raw_mutation_allowed {
+            self.install_pool_raw_mutation_guard(allowed);
+        }
         // Safety net: after reopen, the index must reflect only the
         // surviving tombstone-only segments.  Clear any objects that
         // may have been resurrected by a stale checkpoint or segment
@@ -8756,7 +9032,7 @@ mod reclaim_queue_production_tests {
     }
 
     #[test]
-    fn receipt_bound_dead_object_enqueue_rejects_receiptless_entries() {
+    fn receipt_bound_dead_object_enqueue_rejects_receiptless_and_pool_reserved_entries() {
         let (mut store, _dir) = temp_store();
         let key = dead_object_key(0x52);
         let entry =
@@ -8773,6 +9049,33 @@ mod reclaim_queue_production_tests {
         ));
         assert!(store.dead_object_reclaim_queue.is_empty());
         assert!(!store.dead_object_reclaim_queue_dirty);
+
+        let reserved_key = reclaim_key(crate::pool_receipt_generation_high_water_key());
+        let reserved_entry = dead_object_entry_for_key(reserved_key, 5, true, 1);
+        let err = store
+            .enqueue_receipt_bound_dead_object(reserved_entry)
+            .expect_err("public reclaim enqueue must reject pool-reserved metadata");
+        assert!(matches!(
+            err,
+            StoreError::InvalidOptions {
+                reason: "pool receipt, shard, and generation metadata require pool authority"
+            }
+        ));
+        assert!(store
+            .enqueue_receipt_bound_dead_object_pool_internal(reserved_entry)
+            .expect("pool reclaim authority may enqueue reserved physical placement"));
+        let replacement = dead_object_receipt(reserved_key, 2);
+        assert!(matches!(
+            store.publish_dead_object_replacement_receipt(&reserved_key, replacement),
+            Err(StoreError::InvalidOptions { .. })
+        ));
+        assert!(matches!(
+            store.drain_receipt_bound_dead_objects_at_stable_generation(6, 2, 16),
+            Err(ReceiptBoundDeadObjectDrainError::Store(
+                StoreError::InvalidOptions { .. }
+            ))
+        ));
+        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
     }
 
     #[test]
@@ -9666,6 +9969,27 @@ mod compaction_publish_tests {
         let mut extent_map = extent_map_with(source_extent.clone());
         let mut store =
             LocalObjectStore::open_with_options(dir.path(), compaction_options()).expect("open");
+
+        let reserved_key = crate::pool_receipt_generation_high_water_key();
+        assert!(matches!(
+            store.publish_verified_compaction_rewrites(
+                vec![rewrite(
+                    reserved_key,
+                    source_extent.clone(),
+                    &payload,
+                    receipt.receipt_generation,
+                )],
+                &mut extent_map,
+            ),
+            Err(StoreError::InvalidOptions { .. })
+        ));
+        assert_eq!(
+            extent_map
+                .lookup_range(0, payload.len() as u64)
+                .expect("reserved rewrite leaves source extent unchanged"),
+            vec![source_extent.clone()]
+        );
+        assert!(store.dead_object_reclaim_queue.is_empty());
 
         store.put(key, &payload).expect("put source");
         let old_location = store.location_of(key).expect("source location");
