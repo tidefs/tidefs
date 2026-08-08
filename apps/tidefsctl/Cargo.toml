@@ -42,7 +42,6 @@ serde = { version = "1", features = ["derive"] }
 tidefs-storage-intent-core = { workspace = true, features = ["serde"] }
 tidefs-storage-intent-policy = { workspace = true }
 tidefs-encryption = { workspace = true }
-rand = "0.8"
 
 [dev-dependencies]
 tempfile = { workspace = true }
