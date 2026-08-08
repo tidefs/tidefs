@@ -244,78 +244,37 @@ pub fn handle_mount(args: PoolMountArgs) {
         }
     }
 
-    // Determine the backing directory: explicit --devices import or live-owner route.
-    let (backing_dir, owner_pool_uuid) = if let Some(ref devices) = args.devices {
-        let existing_config = scan_device_pool_config(&args.pool_name, devices, "mount");
-        // Mount with explicit devices creates a userspace owner only for a
-        // pool that is not already imported. ACTIVE labels are cached
-        // imported-pool state, so live work must go through the current owner.
-        super::live_owner::route_or_refuse_active_for_uuid_with_format_and_args(
-            "pool",
-            "mount",
-            &args.pool_name,
-            existing_config.pool_uuid,
-            existing_config.state == tidefs_types_pool_label_core::PoolState::Active,
-            false,
-            live_args.clone(),
-        );
-
-        // Block-device path: import from raw devices, then use a
-        // runtime-managed backing directory keyed by pool UUID.
-        // Resolve encryption key before import for label validation + fingerprint.
-        let (import_encryption_key, encryption_config) =
-            resolve_encryption_for_import(&args.encryption_envelope);
-        let imported = match tidefs_pool_import::pool_import(
-            devices,
-            &lock_dir,
-            args.read_only,
-            import_encryption_key,
-            None,
-        ) {
-            Ok(imp) => imp,
-            Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
-                super::live_owner::route_imported_with_format_and_args(
-                    "pool",
-                    "mount",
-                    &args.pool_name,
-                    pool_uuid,
-                    false,
-                    live_args,
-                )
-            }
-            Err(err) => {
-                eprintln!("tidefsctl pool mount: pool import failed: {err}");
-                process::exit(1);
-            }
-        };
-        let cfg = &imported.config;
-        let stats = &imported.stats;
-        println!("pool \"{}\" imported", cfg.pool_name);
-        println!("  pool uuid:   {}", hex_uuid(&cfg.pool_uuid));
-        println!("  state:       {}", cfg.state);
-        println!("  devices:     {}", cfg.device_count);
-        println!("  import time: {} ms", stats.import_time_ms);
-        if stats.encrypted {
-            println!("  encrypted:   yes");
-            if let Some(ref fp) = stats.key_fingerprint {
-                println!("  key fp:      {fp}");
-            }
+    let devices = match args.devices.as_ref() {
+        Some(devices) => devices,
+        None => {
+            super::live_owner::route_with_args("pool", "mount", &args.pool_name, live_args.clone())
         }
-        if stats.read_only {
-            println!("  read-only:   yes");
-        }
-        check_encryption_consistency(cfg, &args.encryption_envelope);
-
-        // Use a runtime directory keyed by pool UUID as the backing store.
-        let pool_dir = std::path::PathBuf::from("/run/tidefs/pools").join(hex_uuid(&cfg.pool_uuid));
-        std::fs::create_dir_all(&pool_dir).unwrap_or_else(|e| {
-            eprintln!("tidefsctl pool mount: cannot create pool runtime dir: {e}");
-            process::exit(1);
-        });
-        (pool_dir, Some(cfg.pool_uuid))
-    } else {
-        super::live_owner::route_with_args("pool", "mount", &args.pool_name, live_args);
     };
+    let existing_config = scan_device_pool_config(&args.pool_name, devices, "mount");
+    // Route a reachable owner. Otherwise import exclusion, not cached owner
+    // metadata or an ACTIVE label, decides whether this process may own mount.
+    super::live_owner::route_reachable_owner_for_uuid_with_args(
+        "pool",
+        "mount",
+        &args.pool_name,
+        existing_config.pool_uuid,
+        live_args.clone(),
+    );
+
+    // Complete all CLI preflight before activating labels or acquiring the
+    // import exclusion. The unique import owner is created only immediately
+    // before `run_mount` takes responsibility for it.
+    let (import_encryption_key, encryption_config) =
+        resolve_encryption_for_import(&args.encryption_envelope);
+    check_encryption_consistency(&existing_config, &args.encryption_envelope);
+
+    let backing_dir =
+        std::path::PathBuf::from("/run/tidefs/pools").join(hex_uuid(&existing_config.pool_uuid));
+    std::fs::create_dir_all(&backing_dir).unwrap_or_else(|e| {
+        eprintln!("tidefsctl pool mount: cannot create pool runtime dir: {e}");
+        process::exit(1);
+    });
+    let owner_pool_uuid = Some(existing_config.pool_uuid);
 
     // --- Encryption passphrase verification ---
 
@@ -364,29 +323,6 @@ pub fn handle_mount(args: PoolMountArgs) {
     if !mount_options.is_empty() {
         println!("  options: {}", mount_options.join(","));
     }
-    let encryption_config = if let Some(ref envelope_path) = args.encryption_envelope {
-        // Resolve root auth key for envelope unwrapping.
-        let root_auth_key = super::root_authentication_key_or_exit("pool mount");
-        match tidefs_posix_filesystem_adapter_daemon::resolve_encryption_key_from_envelope(
-            envelope_path,
-            &root_auth_key,
-        ) {
-            Some(config) => Some(config),
-            None => {
-                eprintln!(
-                    "tidefsctl pool mount: failed to unseal encryption envelope {}",
-                    envelope_path.display()
-                );
-                eprintln!(
-                    "tidefsctl pool mount: wrong root auth key, corrupt envelope, or tampered file"
-                );
-                process::exit(1);
-            }
-        }
-    } else {
-        None
-    };
-
     // Cluster label validation and lease acquisition.
     let mount_authority = if args.cluster {
         match validate_cluster_pool_labels(&backing_dir, &args.devices) {
@@ -553,6 +489,47 @@ pub fn handle_mount(args: PoolMountArgs) {
         tidefs_posix_filesystem_adapter_daemon::MountAuthority::standalone()
     };
 
+    let import_owner = match tidefs_pool_import::pool_import_owned(
+        devices,
+        &lock_dir,
+        args.read_only,
+        import_encryption_key,
+        None,
+    ) {
+        Ok(owner) => owner,
+        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
+            super::live_owner::route_imported_with_format_and_args(
+                "pool",
+                "mount",
+                &args.pool_name,
+                pool_uuid,
+                false,
+                live_args,
+            )
+        }
+        Err(err) => {
+            eprintln!("tidefsctl pool mount: pool import failed: {err}");
+            process::exit(1);
+        }
+    };
+    let imported = import_owner.imported();
+    let cfg = &imported.config;
+    let stats = &imported.stats;
+    println!("pool \"{}\" imported", cfg.pool_name);
+    println!("  pool uuid:   {}", hex_uuid(&cfg.pool_uuid));
+    println!("  state:       {}", cfg.state);
+    println!("  devices:     {}", cfg.device_count);
+    println!("  import time: {} ms", stats.import_time_ms);
+    if stats.encrypted {
+        println!("  encrypted:   yes");
+        if let Some(ref fp) = stats.key_fingerprint {
+            println!("  key fp:      {fp}");
+        }
+    }
+    if stats.read_only {
+        println!("  read-only:   yes");
+    }
+
     let config = tidefs_posix_filesystem_adapter_daemon::MountConfig {
         backing_dir,
         mountpoint,
@@ -564,6 +541,7 @@ pub fn handle_mount(args: PoolMountArgs) {
         coherency_profile:
             tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile::Writeback,
         block_devices: args.devices.clone(),
+        import_owner: Some(import_owner),
         dataset_path: Some(args.dataset.clone()),
         encryption: encryption_config,
         snapshot_name: None,

@@ -274,6 +274,32 @@ pub struct ImportedPool {
     pub stats: PoolImportStats,
 }
 
+/// Unique ownership of a successful pool import.
+///
+/// The owner retains the exact device paths and import-lock directory used
+/// during activation so mounted callers can perform the matching export and
+/// lock release without reconstructing ownership from an `ACTIVE` label.
+#[derive(Debug)]
+#[must_use = "a successful pool import must remain owned until it is explicitly exported"]
+pub struct PoolImportOwner {
+    imported: ImportedPool,
+    device_paths: Vec<PathBuf>,
+    lock_dir: PathBuf,
+}
+
+impl PoolImportOwner {
+    /// Return the imported pool configuration and statistics.
+    #[must_use]
+    pub fn imported(&self) -> &ImportedPool {
+        &self.imported
+    }
+
+    /// Export this owner's pool and release its import exclusion.
+    pub fn export(self) -> Result<(), ImportError> {
+        pool_export(&self.device_paths, &self.lock_dir, false)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LabelAgreementReport — bounded member-label authority evidence
 // ---------------------------------------------------------------------------
@@ -358,6 +384,26 @@ pub fn pool_import(
     Ok(ImportedPool {
         config: import.config().clone(),
         stats,
+    })
+}
+
+/// Import a pool and return the unique owner of that activation.
+///
+/// This is the mounted-lifecycle entry point. The returned owner must be held
+/// until startup failure or clean shutdown and then consumed by
+/// [`PoolImportOwner::export`].
+pub fn pool_import_owned(
+    device_paths: &[PathBuf],
+    lock_dir: &Path,
+    read_only: bool,
+    encryption_key: Option<tidefs_encryption::StoreKey>,
+    min_epoch: Option<u64>,
+) -> Result<PoolImportOwner, ImportError> {
+    let imported = pool_import(device_paths, lock_dir, read_only, encryption_key, min_epoch)?;
+    Ok(PoolImportOwner {
+        imported,
+        device_paths: device_paths.to_vec(),
+        lock_dir: lock_dir.to_path_buf(),
     })
 }
 // ---------------------------------------------------------------------------
@@ -3438,10 +3484,10 @@ mod tests {
         }
         let lock_dir = dir.path().join("locks");
 
-        let result = pool_import(&[dev_path.clone()], &lock_dir, false, None, None).unwrap();
-        assert_eq!(result.config.state, PoolState::Active);
+        let owner = pool_import_owned(&[dev_path.clone()], &lock_dir, false, None, None).unwrap();
+        assert_eq!(owner.imported().config.state, PoolState::Active);
 
-        pool_export(&[dev_path.clone()], &lock_dir, false).unwrap();
+        owner.export().unwrap();
 
         let mut handle = DeviceHandle::open_ro(&dev_path, 0).unwrap();
         let buf = handle.read_label_bytes().unwrap();
