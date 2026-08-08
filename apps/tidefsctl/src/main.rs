@@ -231,6 +231,7 @@ fn handle_mount(
         writeback_cache: false,
         coherency_profile: CoherencyProfile::Writeback,
         block_devices: None,
+        import_owner: None,
         dataset_path: Some(dataset),
         encryption: encryption_config,
         snapshot_name: None,

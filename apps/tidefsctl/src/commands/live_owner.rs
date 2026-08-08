@@ -235,6 +235,24 @@ pub(crate) fn route_or_refuse_active_for_uuid_with_format_and_args(
     }
 }
 
+/// Route an explicit owner-creating mount only when a live owner is reachable.
+///
+/// A cached owner record or `ACTIVE` device label is not import ownership.
+/// When no endpoint is reachable, the caller must proceed to `pool_import` so
+/// its exclusive lock can either establish ownership or reject a live owner.
+pub(crate) fn route_reachable_owner_for_uuid_with_args(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    pool_uuid: [u8; 16],
+    args: LivePoolAdminArgs,
+) {
+    let root = pool_runtime_root();
+    if owner_interface_reachable_for_uuid_at(&root, pool, &pool_uuid) {
+        route_imported_with_format_and_args(command, operation, pool, pool_uuid, false, args);
+    }
+}
+
 pub(crate) fn route_imported_with_format_and_args(
     command: &str,
     operation: &str,

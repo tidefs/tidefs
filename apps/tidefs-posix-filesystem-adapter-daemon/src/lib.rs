@@ -230,7 +230,7 @@ mod root_authentication_tests {
 }
 
 /// Configuration for `run_mount`: boots a LocalFileSystem and mounts it via FUSE.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MountConfig {
     /// Optional per-object encryption configuration for the pool.
     /// When set, every object is transparently encrypted with
@@ -276,6 +276,12 @@ pub struct MountConfig {
     /// only for pool metadata such as labels and markers; all object data
     /// is stored on the block devices).
     pub block_devices: Option<Vec<std::path::PathBuf>>,
+
+    /// Unique owner of an explicit pool import performed for this mount.
+    ///
+    /// When present, `run_mount` consumes the owner and performs the matching
+    /// export on startup failure or after the FUSE session has joined.
+    pub import_owner: Option<tidefs_pool_import::PoolImportOwner>,
 
     /// Dataset path to resolve through the catalog (default "root").
     /// When None, the root dataset is mounted.
@@ -410,19 +416,15 @@ fn validate_cluster_lease_token(
     Ok(())
 }
 
-/// Bootstrap the TideFS FUSE mount lifecycle.
-///
-/// Creates a `LocalFileSystem` rooted at `config.backing_dir`, wraps it in
-/// the `VfsLocalFileSystem` adapter, and mounts a FUSE session at
-/// `config.mountpoint`. The calling thread is parked until the process
-/// receives SIGINT or SIGTERM; shutdown joins the FUSE session so clean
-/// unmount and filesystem teardown finish before the process exits.
-///
-/// # Errors
-///
-/// Returns a human-readable string on store-open failure, adapter-init
-/// failure, or FUSE mount failure.
-pub fn run_mount(config: MountConfig) -> Result<(), String> {
+// Resources established before the mount becomes a reachable live owner.
+struct StartedMount {
+    snapshot_export: bool,
+    shutdown: Arc<AtomicBool>,
+    session: fuser::BackgroundSession,
+    live_owner: Option<live_owner::LiveOwnerHandle>,
+}
+
+fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     use std::fs;
 
     use tidefs_dataset_lifecycle::DatasetId;
@@ -664,7 +666,10 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
 
     // Refuse idmapped mounts: TideFS does not support idmapped mount
     // UID/GID translation in the current FUSE adapter boundary.
-    check_idmapped_mount(&config.mountpoint)?;
+    if let Err(err) = check_idmapped_mount(&config.mountpoint) {
+        session.join();
+        return Err(err);
+    }
     let live_owner = if snapshot_export {
         None
     } else {
@@ -678,13 +683,67 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
                     mountpoint: config.mountpoint.clone(),
                     runtime_dir,
                 };
-                Some(live_owner::start_fuse_owner(
+                let owner = match live_owner::start_fuse_owner(
                     owner_config,
                     live_owner_engine,
                     Arc::clone(&shutdown),
-                )?)
+                ) {
+                    Ok(owner) => owner,
+                    Err(err) => {
+                        session.join();
+                        return Err(err);
+                    }
+                };
+                Some(owner)
             }
             _ => None,
+        }
+    };
+
+    Ok(StartedMount {
+        snapshot_export,
+        shutdown,
+        session,
+        live_owner,
+    })
+}
+
+/// Bootstrap the TideFS FUSE mount lifecycle.
+///
+/// Creates a `LocalFileSystem` rooted at `config.backing_dir`, wraps it in
+/// the `VfsLocalFileSystem` adapter, and mounts a FUSE session at
+/// `config.mountpoint`. The calling thread is parked until the process
+/// receives SIGINT or SIGTERM; shutdown joins the FUSE session so clean
+/// unmount and filesystem teardown finish before the process exits. An
+/// explicit pool import is unwound on startup error and exported after join.
+///
+/// # Errors
+///
+/// Returns a human-readable string on store-open, adapter-init, FUSE mount,
+/// startup-unwind, or clean-export failure.
+pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
+    let import_owner = config.import_owner.take();
+
+    let StartedMount {
+        snapshot_export,
+        shutdown,
+        session,
+        live_owner,
+    } = match start_mount(&config) {
+        Ok(started) => started,
+        Err(primary_error) => {
+            return Err(match import_owner {
+                Some(owner) => match owner.export() {
+                    Ok(()) => {
+                        eprintln!("tidefsctl: pool import unwound after mount startup failure");
+                        primary_error
+                    }
+                    Err(unwind_error) => format!(
+                        "{primary_error}; additionally failed to unwind imported pool: {unwind_error}"
+                    ),
+                },
+                None => primary_error,
+            });
         }
     };
 
@@ -698,21 +757,15 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
 
     crate::observability::emit_all_summaries();
     session.join();
-    if !snapshot_export {
-        if let Some(ref block_devices) = config.block_devices {
-            let lock_dir = PathBuf::from("/run/tidefs/import");
-            match tidefs_pool_import::pool_export(block_devices, &lock_dir, false) {
-                Ok(()) => {
-                    if let Some(ref pool_name) = config.pool_name {
-                        eprintln!("tidefsctl: pool exported: {pool_name}");
-                    } else {
-                        eprintln!("tidefsctl: block-device pool exported");
-                    }
-                }
-                Err(err) => {
-                    eprintln!("tidefsctl: warning: clean pool export failed during unmount: {err}");
-                }
-            }
+    let export_result = match import_owner {
+        Some(owner) => owner
+            .export()
+            .map_err(|err| format!("clean pool export failed during unmount: {err}")),
+        None => Ok(()),
+    };
+    if export_result.is_ok() && !snapshot_export {
+        if let Some(ref pool_name) = config.pool_name {
+            eprintln!("tidefsctl: pool exported: {pool_name}");
         }
     }
     if let Some(live_owner) = live_owner {
@@ -729,7 +782,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
             config.mountpoint.display()
         );
     }
-    Ok(())
+    export_result
 }
 
 fn hex_uuid(uuid: &[u8; 16]) -> String {

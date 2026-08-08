@@ -202,7 +202,8 @@ done
 [ -b "$DEV1" ] && pass "virtio1_present" || fail "virtio1_present" "$DEV1 missing"
 
 if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
-    for op in virtio0_size virtio1_size pool_create pool_import mount \
+    for op in virtio0_size virtio1_size pool_create startup_failure_unwind \
+             startup_retry_mount pool_import mount \
              write_data fsync_data read_verify unmount pool_export reimport remount \
              persist_verify committed_root_advance intent_log_consistency \
              crash_cycle_export_prep crash_cycle_preimport crash_cycle_premount \
@@ -250,45 +251,74 @@ else
 fi
 
 echo ""
-echo "--- Phase 4: Pool import ---"
+echo "--- Phase 3.5: Mount startup failure unwind and retry ---"
 
-IMPORT_OK=0
-if [ "$POOL_CREATED" -eq 1 ]; then
-    IOUT=$(tidefsctl pool import "$DEV0" "$DEV1" --json 2>&1); RC=$?
-    echo "  import exit=$RC"
-    echo "  $IOUT"
-    if [ "$RC" -eq 0 ]; then
-        pass "pool_import"
-        IMPORT_OK=1
-        rm -f /run/tidefs/import/* 2>/dev/null || true
-        [ -z "$POOL_UUID" ] && POOL_UUID=$(echo "$IOUT" | grep -o '"pool_uuid"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/' || echo "")
+STARTUP_RETRY_OK=0
+STARTUP_RETRY_PID=""
+unset TIDEFS_ROOT_AUTHENTICATION_KEY_HEX
+if [ "$POOL_CREATED" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
+    if tidefsctl pool mount "$POOL_NAME" /mnt/tidefs --devices "$DEV0" "$DEV1" \
+        > /tmp/startup_failure.log 2>&1; then
+        STARTUP_FAILURE_RC=0
     else
-        fail "pool_import" "$IOUT"
+        STARTUP_FAILURE_RC=$?
+    fi
+    if [ "$STARTUP_FAILURE_RC" -ne 0 ] \
+        && grep -q 'pool ".*" imported' /tmp/startup_failure.log \
+        && grep -q 'root authentication key is required' /tmp/startup_failure.log \
+        && grep -q 'pool import unwound after mount startup failure' /tmp/startup_failure.log; then
+        pass "startup_failure_unwind"
+    else
+        fail "startup_failure_unwind" "$(tail -20 /tmp/startup_failure.log 2>/dev/null)"
+    fi
+
+    export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141
+    tidefsctl pool mount "$POOL_NAME" /mnt/tidefs --devices "$DEV0" "$DEV1" \
+        > /tmp/startup_retry.log 2>&1 &
+    STARTUP_RETRY_PID=$!
+    for _ in $(seq 1 45); do
+        mountpoint -q /mnt/tidefs 2>/dev/null && { STARTUP_RETRY_OK=1; break; }
+        ! kill -0 "$STARTUP_RETRY_PID" 2>/dev/null && break
+        sleep 1
+    done
+    if [ "$STARTUP_RETRY_OK" -eq 1 ] \
+        && grep -q 'pool ".*" imported' /tmp/startup_retry.log; then
+        pass "startup_retry_mount"
+    else
+        fail "startup_retry_mount" "$(tail -20 /tmp/startup_retry.log 2>/dev/null)"
+    fi
+
+    if [ "$STARTUP_RETRY_OK" -ne 1 ]; then
+        kill "$STARTUP_RETRY_PID" 2>/dev/null || true
+        wait "$STARTUP_RETRY_PID" 2>/dev/null || true
     fi
 else
-    blocked "pool_import" "pool not created"
+    blocked "startup_failure_unwind" "pool or FUSE not ready"
+    blocked "startup_retry_mount" "startup failure case not runnable"
+fi
+
+echo ""
+echo "--- Phase 4: Pool import ---"
+
+IMPORT_OK=$STARTUP_RETRY_OK
+if [ "$IMPORT_OK" -eq 1 ]; then
+    pass "pool_import"
+else
+    blocked "pool_import" "owner-creating mount retry did not import"
 fi
 
 echo ""
 echo "--- Phase 5: FUSE mount ---"
 
 MNT=/mnt/tidefs
-MOUNTED=0
-DAEMON_PID=""
+MOUNTED=$STARTUP_RETRY_OK
+DAEMON_PID=$STARTUP_RETRY_PID
 
-if [ "$FUSE_OK" -eq 1 ] && [ "$IMPORT_OK" -eq 1 ]; then
-    tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV0" "$DEV1" > /tmp/mount.log 2>&1 &
-    DAEMON_PID=$!
+if [ "$MOUNTED" -eq 1 ]; then
     echo "  daemon PID=$DAEMON_PID"
-
-    for _ in $(seq 1 45); do
-        mountpoint -q "$MNT" 2>/dev/null && { MOUNTED=1; break; }
-        sleep 1
-    done
-
-    [ "$MOUNTED" -eq 1 ] && pass "mount" || fail "mount" "$(tail -20 /tmp/mount.log 2>/dev/null)"
+    pass "mount"
 else
-    blocked "mount" "FUSE not ready or import not done"
+    blocked "mount" "startup retry did not reach mounted state"
 fi
 
 echo ""
@@ -340,7 +370,7 @@ if [ "$MOUNTED" -eq 1 ]; then
     fi
     wait "$DAEMON_PID" 2>/dev/null || true
     echo "  initial mount daemon log:"
-    tail -80 /tmp/mount.log 2>/dev/null || true
+    tail -80 /tmp/startup_retry.log 2>/dev/null || true
     umount "$MNT" 2>/dev/null || true
     mountpoint -q "$MNT" 2>/dev/null && fail "unmount" "still mounted" || pass "unmount"
 else
@@ -369,21 +399,8 @@ echo ""
 echo "--- Phase 9: Reimport ---"
 
 REIMPORT_OK=0
-if [ "$EXPORT_OK" -ne 1 ]; then
-    blocked "reimport" "pool export failed"
-elif command -v tidefsctl >/dev/null 2>&1; then
-    RIOUT=$(tidefsctl pool import "$DEV0" "$DEV1" --json 2>&1); RC=$?
-    echo "  reimport exit=$RC"
-    echo "  $RIOUT"
-    if [ "$RC" -eq 0 ]; then
-        pass "reimport"
-        REIMPORT_OK=1
-        rm -f /run/tidefs/import/* 2>/dev/null || true
-    else
-        fail "reimport" "$RIOUT"
-    fi
-else
-    blocked "reimport" "tidefsctl missing"
+if [ "$EXPORT_OK" -eq 1 ] && command -v tidefsctl >/dev/null 2>&1; then
+    REIMPORT_OK=1
 fi
 
 echo ""
@@ -400,11 +417,18 @@ if [ "$REIMPORT_OK" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
     done
 
     if [ "$REMOUNTED" -eq 1 ]; then
+        if grep -q 'pool ".*" imported' /tmp/remount.log; then
+            pass "reimport"
+        else
+            fail "reimport" "remount did not report import ownership"
+        fi
         pass "remount"
     else
+        fail "reimport" "$(tail -20 /tmp/remount.log 2>/dev/null)"
         fail "remount" "$(tail -20 /tmp/remount.log 2>/dev/null)"
     fi
 else
+    blocked "reimport" "export/FUSE not ready"
     blocked "remount" "reimport/FUSE not ready"
 fi
 
@@ -554,16 +578,7 @@ fi
 
 CRASH_CYCLE_IMPORT_OK=0
 if [ "$CRASH_CYCLE_EXPORT_OK" -eq 1 ]; then
-    CIOUT=$(tidefsctl pool import "$DEV0" "$DEV1" --json 2>&1); RC=$?
-    if [ "$RC" -eq 0 ]; then
-        pass "crash_cycle_preimport"
-        CRASH_CYCLE_IMPORT_OK=1
-        rm -f /run/tidefs/import/* 2>/dev/null || true
-    else
-        fail "crash_cycle_preimport" "$CIOUT"
-    fi
-else
-    blocked "crash_cycle_preimport" "export preparation failed"
+    CRASH_CYCLE_IMPORT_OK=1
 fi
 
 CRASH_CYCLE_MOUNTED=0
@@ -575,8 +590,19 @@ if [ "$CRASH_CYCLE_IMPORT_OK" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
         mountpoint -q "$MNT" 2>/dev/null && { CRASH_CYCLE_MOUNTED=1; break; }
         sleep 1
     done
-    [ "$CRASH_CYCLE_MOUNTED" -eq 1 ] && pass "crash_cycle_premount" || fail "crash_cycle_premount" "$(tail -20 /tmp/crash_mount.log 2>/dev/null)"
+    if [ "$CRASH_CYCLE_MOUNTED" -eq 1 ]; then
+        if grep -q 'pool ".*" imported' /tmp/crash_mount.log; then
+            pass "crash_cycle_preimport"
+        else
+            fail "crash_cycle_preimport" "mount did not report import ownership"
+        fi
+        pass "crash_cycle_premount"
+    else
+        fail "crash_cycle_preimport" "$(tail -20 /tmp/crash_mount.log 2>/dev/null)"
+        fail "crash_cycle_premount" "$(tail -20 /tmp/crash_mount.log 2>/dev/null)"
+    fi
 else
+    blocked "crash_cycle_preimport" "export/FUSE not ready"
     blocked "crash_cycle_premount" "import/FUSE not ready"
 fi
 
@@ -651,30 +677,30 @@ else
     pass "crash_cycle_stale_mount_detached"
 fi
 
-# IMPORT WITHOUT EXPORT: this exercises committed-root selection + intent replay
-CRASH_RECOVERY_IMPORT_OK=0
-CROUT=$(tidefsctl pool import "$DEV0" "$DEV1" --json 2>&1); RC=$?
-echo "  crash-recovery import exit=$RC"
-if [ "$RC" -eq 0 ]; then
-    pass "crash_cycle_reimport_no_export"
-    CRASH_RECOVERY_IMPORT_OK=1
-    rm -f /run/tidefs/import/* 2>/dev/null || true
-else
-    fail "crash_cycle_reimport_no_export" "$CROUT"
-fi
-
-# Remount after crash recovery
+# Remount after crash recovery. The owner-creating mount performs stale-lock
+# recovery, import/root selection, and FUSE startup as one owned lifecycle.
 CRASH_RECOVERY_MOUNTED=0
 CRP=""
-if [ "$CRASH_RECOVERY_IMPORT_OK" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
+if [ "$FUSE_OK" -eq 1 ]; then
     tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV0" "$DEV1" > /tmp/crash_recovery_mount.log 2>&1 &
     CRP=$!
     for _ in $(seq 1 45); do
         mountpoint -q "$MNT" 2>/dev/null && { CRASH_RECOVERY_MOUNTED=1; break; }
         sleep 1
     done
-    [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ] && pass "crash_cycle_recovery_remount" || fail "crash_cycle_recovery_remount" "$(tail -20 /tmp/crash_recovery_mount.log 2>/dev/null)"
+    if [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ]; then
+        if grep -q 'pool ".*" imported' /tmp/crash_recovery_mount.log; then
+            pass "crash_cycle_reimport_no_export"
+        else
+            fail "crash_cycle_reimport_no_export" "recovery mount did not report import ownership"
+        fi
+        pass "crash_cycle_recovery_remount"
+    else
+        fail "crash_cycle_reimport_no_export" "$(tail -20 /tmp/crash_recovery_mount.log 2>/dev/null)"
+        fail "crash_cycle_recovery_remount" "$(tail -20 /tmp/crash_recovery_mount.log 2>/dev/null)"
+    fi
 else
+    blocked "crash_cycle_reimport_no_export" "FUSE not ready"
     blocked "crash_cycle_recovery_remount" "crash-recovery import failed"
 fi
 
@@ -777,7 +803,8 @@ INITSCRIPT
     for op in \
       fuse_support fuse_device \
       virtio0_present virtio1_present virtio0_size virtio1_size \
-      pool_create pool_import mount write_data fsync_data read_verify \
+      pool_create startup_failure_unwind startup_retry_mount \
+      pool_import mount write_data fsync_data read_verify \
       unmount pool_export reimport remount persist_verify \
       committed_root_advance intent_log_consistency \
       suspect_log_persistence \

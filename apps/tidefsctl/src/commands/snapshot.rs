@@ -1978,6 +1978,7 @@ fn handle_export(args: SnapshotExportArgs) {
         coherency_profile:
             tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile::Writeback,
         block_devices: None,
+        import_owner: None,
         dataset_path: None,
         snapshot_name: Some(snapshot_name),
         mount_authority: tidefs_posix_filesystem_adapter_daemon::MountAuthority::standalone(),
