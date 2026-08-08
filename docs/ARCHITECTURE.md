@@ -88,9 +88,15 @@ The repository is not short of implementations; it has too many overlapping
 ones in the default graph:
 
 - 166 root-workspace packages plus four excluded fuzz packages are present.
-- The normal dependency closure of `tidefsctl` plus the POSIX daemon is 126 of
-  166 workspace packages. Block, cluster, kernel, validation, workload, and
-  performance-policy families are therefore coupled to the local carrier.
+- The default normal dependency closure of `tidefsctl` plus the POSIX daemon is
+  118 of 166 workspace packages: all 37 keep packages, 49 of 54 consolidation
+  packages, and 32 of 73 extraction packages. Block, cluster, validation,
+  workload, and performance-policy families are therefore still coupled to
+  the local carrier; neither demo package is in the closure.
+- Twenty-five of those 32 extraction packages are reachable through
+  `tidefs-local-filesystem` itself. Gating only CLI commands or the daemon
+  binary cannot contract the carrier; the core package must separate its local
+  filesystem path from replication, send/receive, and policy subsystems.
 - `fuse_vfs_adapter.rs` is 46,314 lines, `local-filesystem/src/lib.rs` is
   17,534, `vfs_engine_impl.rs` is 16,488, and the binary daemon `main.rs` is
   4,763 lines. The size is concentrated in four mixed-authority carriers.
