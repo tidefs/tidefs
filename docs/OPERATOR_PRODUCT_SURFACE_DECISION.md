@@ -2,7 +2,15 @@
 
 Issue: #1267
 Date: 2026-06-24
-Status: design decision for follow-up issue mapping
+Status: historical distributed-truth-surface decision; superseded for the
+local mounted carrier by `README.md`, `docs/ARCHITECTURE.md`, and issue #2388
+
+Current scope note (2026-08-08): this document's conclusion that no carrier is
+selectable applies only to the distributed runtime-fed truth surface it
+reviewed. It does not override TideFS's later product contract, does not block
+the selected local `tidefsctl` lifecycle/status carrier, and does not make
+cluster transport or a missing dashboard grammar a prerequisite for local
+mounted-filesystem work.
 
 This decision records the current runtime-fed operator product-surface
 boundary after the OW-307D blocker map. It does not implement a product
@@ -129,11 +137,11 @@ The runtime-fed operator product surface boundary is:
    exist in the repository. Until this gap is resolved, no carrier can
    claim to render truth-surface-compliant operator data.
 
-3. **No product carrier class is selectable now.** The current pre-alpha
-   operator/UAPI command boundary is closed, but it is not a product carrier.
-   TFR-017 transport/cluster authority and the missing P10-04 truth grammar
-   must close before any carrier (CLI, API, dashboard, archive-reader) can be
-   selected or implemented.
+3. **No distributed truth-surface carrier class was selectable for the scope
+   reviewed in 2026-06.** The current pre-alpha distributed operator/UAPI
+   command boundary was not a product carrier. TFR-017 transport/cluster
+   authority and the missing P10-04 truth grammar remain relevant to a future
+   distributed truth surface, not to the selected local `tidefsctl` carrier.
 
 4. **OW-307D remains Historical input.** Its classification in
    `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` is preserved. The OW-307
@@ -156,7 +164,7 @@ The runtime-fed operator product surface boundary is:
 | API | Not plausible | Requires live runtime mirrors, receipt-backed source classes, and transport authority that do not exist |
 | Dashboard | Not plausible | Requires API carrier or equivalent backend, render pipeline, and refusal behavior paths |
 | Archive-reader | Not plausible | Requires runtime-fed receipts, render bundles, and archive format authority |
-| No product carrier | Current state | Deterministic demo output is the only visible surface; it is not a product carrier |
+| No distributed truth-surface carrier | State reviewed in 2026-06 | Deterministic distributed demo output was the only visible surface; it was not a product carrier. The local carrier is now selected separately. |
 
 ## Non-Claims
 

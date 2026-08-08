@@ -18,7 +18,6 @@ zstd = { version = "0.13", default-features = false }
 lz4_flex = "0.11"
 tidefs-dataset-feature-flags = { workspace = true }
 tidefs-extent-map = { workspace = true }
-tidefs-dir-index = { workspace = true }
 tidefs-types-extent-map-core = { workspace = true }
 tidefs-block-allocator = { workspace = true }
 tidefs-types-dataset-feature-flags-core = { workspace = true }
