@@ -151,7 +151,6 @@ USAGE
     cat > "$RUN_DIR/init" << 'INITSCRIPT'
 #!/bin/sh
 export PATH=/bin
-export TIDEFS_FUSE_OP_DIAGNOSTICS=1
 
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -337,10 +336,10 @@ if [ "$MOUNTED" -eq 1 ]; then
     echo "$TC" > "$TF" 2>/tmp/werr
     [ -f "$TF" ] && pass "write_data" || fail "write_data" "$(cat /tmp/werr 2>/dev/null)"
 
-    if sync -f "$TF" 2>/tmp/fsync.err; then
+    if sync "$TF" 2>/tmp/fsync.err; then
         pass "fsync_data"
     else
-        fail "fsync_data" "sync -f failed: $(cat /tmp/fsync.err 2>/dev/null)"
+        fail "fsync_data" "per-file fsync failed: $(cat /tmp/fsync.err 2>/dev/null)"
     fi
 
     RC=$(cat "$TF" 2>/dev/null || true)
@@ -479,7 +478,7 @@ if [ "$REMOUNTED" -eq 1 ]; then
     TC2="TideFS-Committed-Root-Advance-$(date +%s 2>/dev/null || echo 0)"
     TF2="$MNT/committed_root_test.txt"
     echo "$TC2" > "$TF2" 2>/dev/null
-    sync -f "$TF2" 2>/dev/null || sync
+    sync "$TF2" 2>/dev/null || sync
 
     # Get pool status JSON and extract committed-root epoch info
     POST_STATUS="/tmp/post_remount_status.json"
@@ -516,7 +515,7 @@ if [ "$REMOUNTED" -eq 1 ]; then
     TF3="$MNT/intent_log_test.txt"
     TC3="TideFS-IntentLog-Consistency-$(date +%s 2>/dev/null || echo 0)"
     echo "$TC3" > "$TF3" 2>/dev/null
-    sync -f "$TF3" 2>/dev/null || sync
+    sync "$TF3" 2>/dev/null || sync
     RC3=$(cat "$TF3" 2>/dev/null || true)
     if [ "$RC3" = "$TC3" ]; then
         pass "intent_log_consistency"
@@ -778,7 +777,7 @@ CRASH_UNCOMMITTED_HOLDER=""
 
 if [ "$CRASH_CYCLE_MOUNTED" -eq 1 ]; then
     echo "$CRASH_COMMITTED_CONTENT" > "$CRASH_COMMITTED_FILE" 2>/dev/null
-    sync -f "$CRASH_COMMITTED_FILE" 2>/dev/null || sync
+    sync "$CRASH_COMMITTED_FILE" 2>/dev/null || sync
     [ -f "$CRASH_COMMITTED_FILE" ] && pass "crash_cycle_write_committed" || fail "crash_cycle_write_committed" "write failed"
     echo "  committed file stat before crash:"
     stat "$CRASH_COMMITTED_FILE" 2>/dev/null || true

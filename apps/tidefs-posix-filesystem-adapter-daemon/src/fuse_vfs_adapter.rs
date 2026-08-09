@@ -11602,37 +11602,13 @@ impl Filesystem for FuseVfsAdapter {
         }
     }
     fn syncfs(&mut self, req: &Request<'_>, reply: ReplyEmpty) {
-        let diagnostic = fuse_op_diagnostics_enabled();
-        let started = std::time::Instant::now();
         if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Syncfs) {
-            if diagnostic {
-                eprintln!(
-                    "tidefs-diagnostic: fuse syncfs rejected unique={} errno={errno:?}",
-                    req.unique()
-                );
-            }
             reply.reply_errno(errno);
             return;
         }
-        if diagnostic {
-            eprintln!(
-                "tidefs-diagnostic: fuse syncfs start unique={}",
-                req.unique()
-            );
-        }
         let _p5_02 = Self::classify_fuse_syncfs(req.unique(), 1, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
-        let result = self.dispatch_syncfs(&ctx);
-        if diagnostic {
-            eprintln!(
-                "tidefs-diagnostic: fuse syncfs end unique={} status={} errno={:?} elapsed_ms={}",
-                req.unique(),
-                if result.is_ok() { "ok" } else { "err" },
-                result.as_ref().err(),
-                started.elapsed().as_millis()
-            );
-        }
-        reply_empty_ok_or_errno(reply, result);
+        reply_empty_ok_or_errno(reply, self.dispatch_syncfs(&ctx));
     }
 
     fn statx(&mut self, req: &Request<'_>, ino: u64, _flags: u32, mask: u32, reply: ReplyStatx) {
