@@ -1773,18 +1773,10 @@ fn replay_namespace_create_intent(
     Ok(())
 }
 
-fn replay_metadata_setattr_intent(
+fn validate_metadata_setattr_inode_identity(
+    current: &InodeRecord,
     updated: &InodeRecord,
-    state: &mut crate::FileSystemState,
 ) -> Result<()> {
-    use std::sync::Arc;
-
-    let current = state
-        .inodes
-        .get(&updated.inode_id)
-        .ok_or(FileSystemError::CorruptState {
-            reason: "intent log replay: metadata setattr inode not found",
-        })?;
     if current.generation != updated.generation {
         return Err(FileSystemError::CorruptState {
             reason: "intent log replay: metadata setattr generation mismatch",
@@ -1800,6 +1792,22 @@ fn replay_metadata_setattr_intent(
             reason: "intent log replay: metadata setattr rdev mismatch",
         });
     }
+    Ok(())
+}
+
+fn replay_metadata_setattr_intent(
+    updated: &InodeRecord,
+    state: &mut crate::FileSystemState,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    let current = state
+        .inodes
+        .get(&updated.inode_id)
+        .ok_or(FileSystemError::CorruptState {
+            reason: "intent log replay: metadata setattr inode not found",
+        })?;
+    validate_metadata_setattr_inode_identity(current, updated)?;
 
     if current.size != updated.size || current.data_version != updated.data_version {
         return Err(FileSystemError::CorruptState {
@@ -1821,6 +1829,159 @@ fn replay_metadata_setattr_intent(
     Arc::make_mut(&mut state.inodes).insert(updated.inode_id, merged);
     state.observe_explicit_inode_id(updated.inode_id);
     state.dirty_inodes.insert(updated.inode_id);
+    Ok(())
+}
+
+fn replay_metadata_setattr_intent_with_pool(
+    entry: &IntentLogEntry,
+    updated: &InodeRecord,
+    state: &mut crate::FileSystemState,
+    pool: &Pool,
+    preceding_data: Option<&PoolReplayDataTransition>,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    let current =
+        state
+            .inodes
+            .get(&updated.inode_id)
+            .cloned()
+            .ok_or(FileSystemError::CorruptState {
+                reason: "intent log replay: metadata setattr inode not found",
+            })?;
+    validate_metadata_setattr_inode_identity(&current, updated)?;
+
+    if entry.root_anchor.transaction_id != entry.root_anchor.generation
+        || entry.root_anchor.generation > updated.metadata_version
+        || entry.root_anchor.manifest_checksum != IntegrityDigest64::ZERO
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "Pool intent replay metadata setattr has an invalid generation anchor",
+        });
+    }
+
+    let follows_replayed_data = preceding_data.is_some_and(|transition| {
+        current.data_version == transition.effective_data_version
+            && (updated.data_version == transition.recorded_base_data_version
+                || updated.data_version == transition.recorded_target_data_version)
+    });
+    if follows_replayed_data {
+        let transition = preceding_data.expect("checked preceding Pool replay transition");
+        if updated.data_version == transition.recorded_target_data_version
+            && updated.size != current.size
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay metadata setattr disagrees with replayed content size",
+            });
+        }
+
+        // Data intents do not mutate the producer's live inode until commit,
+        // so a later metadata-only intent can still name the logged data
+        // predecessor. Preserve the content just reconstructed through Pool
+        // receipts while applying the later metadata record in log order.
+        let mut merged = updated.clone();
+        merged.size = current.size;
+        merged.data_version = current.data_version;
+
+        let mut comparable = merged.clone();
+        comparable.metadata_version = current.metadata_version;
+        comparable.subtree_rev = current.subtree_rev;
+        if comparable == current {
+            return Ok(());
+        }
+        if merged.metadata_version <= current.metadata_version {
+            merged.metadata_version =
+                current
+                    .metadata_version
+                    .checked_add(1)
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "Pool intent replay metadata version cannot advance",
+                    })?;
+        }
+        if merged.subtree_rev <= current.subtree_rev {
+            merged.subtree_rev =
+                current
+                    .subtree_rev
+                    .checked_add(1)
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "Pool intent replay subtree revision cannot advance",
+                    })?;
+        }
+
+        Arc::make_mut(&mut state.inodes).insert(updated.inode_id, merged.clone());
+        state.generation = state
+            .generation
+            .max(merged.data_version)
+            .max(merged.metadata_version);
+        state.observe_explicit_inode_id(updated.inode_id);
+        state.dirty_inodes.insert(updated.inode_id);
+        return Ok(());
+    }
+
+    if updated.data_version == current.data_version {
+        if updated.size != current.size {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay metadata setattr changes size without a new content identity",
+            });
+        }
+        if updated.metadata_version < current.metadata_version {
+            return Ok(());
+        }
+        if updated.metadata_version == current.metadata_version {
+            if updated == &current {
+                return Ok(());
+            }
+            return Err(FileSystemError::CorruptState {
+                reason:
+                    "Pool intent replay metadata setattr conflicts at the current metadata version",
+            });
+        }
+        if updated.subtree_rev <= current.subtree_rev {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay metadata setattr subtree revision is non-monotonic",
+            });
+        }
+
+        Arc::make_mut(&mut state.inodes).insert(updated.inode_id, updated.clone());
+        state.generation = state.generation.max(updated.metadata_version);
+        state.observe_explicit_inode_id(updated.inode_id);
+        state.dirty_inodes.insert(updated.inode_id);
+        return Ok(());
+    }
+
+    if updated.data_version < current.data_version {
+        if updated.metadata_version < current.metadata_version {
+            return Ok(());
+        }
+        return Err(FileSystemError::CorruptState {
+            reason: "Pool intent replay metadata setattr would replace newer content identity",
+        });
+    }
+    if updated.metadata_version < current.metadata_version {
+        return Err(FileSystemError::CorruptState {
+            reason: "Pool intent replay metadata setattr metadata version is non-monotonic",
+        });
+    }
+    if updated.subtree_rev <= current.subtree_rev {
+        return Err(FileSystemError::CorruptState {
+            reason: "Pool intent replay metadata setattr subtree revision is non-monotonic",
+        });
+    }
+
+    // MetadataSetattrIntent carries no bytes, but truncate publishes its exact
+    // versioned layout before recording this post-setattr inode. Adopt that
+    // content identity only after the manifest and every materialized chunk
+    // are readable through current Pool placement receipts.
+    let _ = crate::allocation::content_allocation_entries_for_inode_pool(pool, updated)?;
+
+    Arc::make_mut(&mut state.inodes).insert(updated.inode_id, updated.clone());
+    state.generation = state
+        .generation
+        .max(updated.data_version)
+        .max(updated.metadata_version);
+    state.observe_explicit_inode_id(updated.inode_id);
+    state.dirty_inodes.insert(updated.inode_id);
+    state.dirty_content.insert(updated.inode_id);
     Ok(())
 }
 
@@ -2554,6 +2715,13 @@ struct PoolReplayGenerationPlan {
     base_data_versions: BTreeMap<InodeId, u64>,
 }
 
+#[derive(Clone, Copy)]
+struct PoolReplayDataTransition {
+    recorded_base_data_version: u64,
+    recorded_target_data_version: u64,
+    effective_data_version: u64,
+}
+
 struct PoolReplayPlan {
     data_generations: Vec<PoolReplayGenerationPlan>,
     state_generation: u64,
@@ -2565,6 +2733,7 @@ fn flush_planned_pool_replay_generation(
     pool: &mut Pool,
     generation: &PoolReplayGenerationPlan,
     effective_versions: &mut BTreeMap<(InodeId, u64), u64>,
+    data_transitions: &mut BTreeMap<InodeId, PoolReplayDataTransition>,
 ) -> Result<u64> {
     let mut actual_base_versions = BTreeMap::new();
     for (&inode_id, &planned_base) in &generation.base_data_versions {
@@ -2593,11 +2762,37 @@ fn flush_planned_pool_replay_generation(
         generation.target_data_version,
         &actual_base_versions,
     )?;
-    for inode_id in generation.base_data_versions.keys().copied() {
+    for (&inode_id, &recorded_base_data_version) in &generation.base_data_versions {
         effective_versions.insert((inode_id, generation.target_data_version), effective_target);
+        data_transitions.insert(
+            inode_id,
+            PoolReplayDataTransition {
+                recorded_base_data_version,
+                recorded_target_data_version: generation.target_data_version,
+                effective_data_version: effective_target,
+            },
+        );
     }
     state.generation = state.generation.max(effective_target);
     Ok(effective_target)
+}
+
+fn finish_pool_replay_plan_generation(
+    active_target_data_version: &mut Option<u64>,
+    active_base_data_versions: &mut BTreeMap<InodeId, u64>,
+    projected_data_versions: &mut BTreeMap<InodeId, u64>,
+    data_generations: &mut Vec<PoolReplayGenerationPlan>,
+) {
+    let Some(target_data_version) = active_target_data_version.take() else {
+        return;
+    };
+    for inode_id in active_base_data_versions.keys() {
+        projected_data_versions.insert(*inode_id, target_data_version);
+    }
+    data_generations.push(PoolReplayGenerationPlan {
+        target_data_version,
+        base_data_versions: std::mem::take(active_base_data_versions),
+    });
 }
 
 fn plan_pool_replay(
@@ -2632,6 +2827,18 @@ fn plan_pool_replay(
             });
         }
         if !is_data_intent(&entry.entry_kind) {
+            // Preserve intent-log order. A metadata record following a data
+            // generation must observe that generation's receipt-backed
+            // content, not the committed predecessor that existed when the
+            // producer queued the data payload.
+            finish_pool_replay_plan_generation(
+                &mut active_target_data_version,
+                &mut active_base_data_versions,
+                &mut projected_data_versions,
+                &mut data_generations,
+            );
+        }
+        if !is_data_intent(&entry.entry_kind) {
             // Non-data entries retain their existing replay-generation anchor.
             // Data-entry anchors instead identify the committed predecessor.
             state_generation = state_generation.max(anchor.generation);
@@ -2644,6 +2851,10 @@ fn plan_pool_replay(
                 .max(intent.inode.data_version)
                 .max(intent.inode.metadata_version);
         } else if let IntentLogEntryKind::MetadataSetattrIntent(updated) = &entry.entry_kind {
+            projected_data_versions
+                .entry(updated.inode_id)
+                .and_modify(|version| *version = (*version).max(updated.data_version))
+                .or_insert(updated.data_version);
             state_generation = state_generation
                 .max(updated.generation.get())
                 .max(updated.data_version)
@@ -2690,13 +2901,12 @@ fn plan_pool_replay(
                 });
             }
             Some(previous) if target_data_version != previous => {
-                for inode_id in active_base_data_versions.keys() {
-                    projected_data_versions.insert(*inode_id, previous);
-                }
-                data_generations.push(PoolReplayGenerationPlan {
-                    target_data_version: previous,
-                    base_data_versions: std::mem::take(&mut active_base_data_versions),
-                });
+                finish_pool_replay_plan_generation(
+                    &mut active_target_data_version,
+                    &mut active_base_data_versions,
+                    &mut projected_data_versions,
+                    &mut data_generations,
+                );
                 active_target_data_version = Some(target_data_version);
             }
             None => active_target_data_version = Some(target_data_version),
@@ -2734,12 +2944,12 @@ fn plan_pool_replay(
         state_generation = state_generation.max(target_data_version);
     }
 
-    if let Some(target_data_version) = active_target_data_version {
-        data_generations.push(PoolReplayGenerationPlan {
-            target_data_version,
-            base_data_versions: active_base_data_versions,
-        });
-    }
+    finish_pool_replay_plan_generation(
+        &mut active_target_data_version,
+        &mut active_base_data_versions,
+        &mut projected_data_versions,
+        &mut data_generations,
+    );
 
     Ok(PoolReplayPlan {
         data_generations,
@@ -2815,6 +3025,43 @@ pub(crate) fn replay_live_data_with_pool(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn flush_active_pool_replay_generation(
+    batcher: &mut ReplayBatcher,
+    state: &mut crate::FileSystemState,
+    pool: &mut Pool,
+    replay_plan: &PoolReplayPlan,
+    active_data_version: &mut Option<u64>,
+    data_generation_index: &mut usize,
+    effective_versions: &mut BTreeMap<(InodeId, u64), u64>,
+    data_transitions: &mut BTreeMap<InodeId, PoolReplayDataTransition>,
+) -> Result<()> {
+    let Some(active_data_version) = active_data_version.take() else {
+        return Ok(());
+    };
+    let generation = replay_plan
+        .data_generations
+        .get(*data_generation_index)
+        .ok_or(FileSystemError::CorruptState {
+            reason: "Pool intent replay lost a planned data generation",
+        })?;
+    if generation.target_data_version != active_data_version {
+        return Err(FileSystemError::CorruptState {
+            reason: "Pool intent replay data generation changed after planning",
+        });
+    }
+    flush_planned_pool_replay_generation(
+        batcher,
+        state,
+        pool,
+        generation,
+        effective_versions,
+        data_transitions,
+    )?;
+    *data_generation_index = data_generation_index.saturating_add(1);
+    Ok(())
+}
+
 fn replay_with_pool(
     log: &IntentLog,
     state: &mut crate::FileSystemState,
@@ -2836,8 +3083,21 @@ fn replay_with_pool(
     let mut data_generation_index = 0_usize;
     let mut active_data_version = None;
     let mut effective_versions = BTreeMap::new();
+    let mut data_transitions = BTreeMap::new();
     let mut replayed = 0_u64;
     for entry in selected {
+        if !is_data_intent(&entry.entry_kind) {
+            flush_active_pool_replay_generation(
+                &mut batcher,
+                state,
+                pool,
+                &replay_plan,
+                &mut active_data_version,
+                &mut data_generation_index,
+                &mut effective_versions,
+                &mut data_transitions,
+            )?;
+        }
         match &entry.entry_kind {
             IntentLogEntryKind::SyncWriteRange {
                 inode_id,
@@ -2864,27 +3124,16 @@ fn replay_with_pool(
                 ..
             } => {
                 if active_data_version != Some(*data_version) {
-                    if let Some(previous_data_version) = active_data_version {
-                        let generation = replay_plan
-                            .data_generations
-                            .get(data_generation_index)
-                            .ok_or(FileSystemError::CorruptState {
-                                reason: "Pool intent replay lost a planned data generation",
-                            })?;
-                        if generation.target_data_version != previous_data_version {
-                            return Err(FileSystemError::CorruptState {
-                                reason: "Pool intent replay data generation changed after planning",
-                            });
-                        }
-                        flush_planned_pool_replay_generation(
-                            &mut batcher,
-                            state,
-                            pool,
-                            generation,
-                            &mut effective_versions,
-                        )?;
-                        data_generation_index = data_generation_index.saturating_add(1);
-                    }
+                    flush_active_pool_replay_generation(
+                        &mut batcher,
+                        state,
+                        pool,
+                        &replay_plan,
+                        &mut active_data_version,
+                        &mut data_generation_index,
+                        &mut effective_versions,
+                        &mut data_transitions,
+                    )?;
                     active_data_version = Some(*data_version);
                 }
                 let payload =
@@ -2895,7 +3144,13 @@ fn replay_with_pool(
                 replay_namespace_create_intent(intent, state)?;
             }
             IntentLogEntryKind::MetadataSetattrIntent(updated) => {
-                replay_metadata_setattr_intent(updated, state)?;
+                replay_metadata_setattr_intent_with_pool(
+                    entry,
+                    updated,
+                    state,
+                    pool,
+                    data_transitions.get(&updated.inode_id),
+                )?;
             }
             IntentLogEntryKind::NamespaceSyncIntent { .. } => {
                 replay_entry(entry, state, pool.raw_primary_store_mut())?;
@@ -2906,27 +3161,16 @@ fn replay_with_pool(
         }
         replayed = replayed.saturating_add(1);
     }
-    if let Some(active_data_version) = active_data_version {
-        let generation = replay_plan
-            .data_generations
-            .get(data_generation_index)
-            .ok_or(FileSystemError::CorruptState {
-                reason: "Pool intent replay lost its final planned data generation",
-            })?;
-        if generation.target_data_version != active_data_version {
-            return Err(FileSystemError::CorruptState {
-                reason: "Pool intent replay final data generation changed after planning",
-            });
-        }
-        flush_planned_pool_replay_generation(
-            &mut batcher,
-            state,
-            pool,
-            generation,
-            &mut effective_versions,
-        )?;
-        data_generation_index = data_generation_index.saturating_add(1);
-    }
+    flush_active_pool_replay_generation(
+        &mut batcher,
+        state,
+        pool,
+        &replay_plan,
+        &mut active_data_version,
+        &mut data_generation_index,
+        &mut effective_versions,
+        &mut data_transitions,
+    )?;
     if data_generation_index != replay_plan.data_generations.len() {
         return Err(FileSystemError::CorruptState {
             reason: "Pool intent replay did not consume every planned data generation",
@@ -5042,6 +5286,55 @@ mod tests {
         log
     }
 
+    fn pool_metadata_replay_fixture(
+        name: &str,
+    ) -> (
+        crate::LocalFileSystem,
+        std::path::PathBuf,
+        InodeId,
+        crate::FileSystemState,
+        IntentLogRootAnchor,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "tidefs-pool-metadata-replay-{name}-{}-{:016x}",
+            std::process::id(),
+            test_timestamp()
+        ));
+        let mut fs = crate::LocalFileSystem::open_with_options(
+            &dir,
+            tidefs_local_object_store::StoreOptions::test_fast(),
+        )
+        .expect("open Pool metadata replay fixture");
+        fs.set_auto_commit(false)
+            .expect("disable fixture auto commit");
+        let inode_id = fs
+            .create_file("/f", 0o644)
+            .expect("create fixture")
+            .inode_id;
+        fs.write_file("/f", 0, b"abcdefgh")
+            .expect("write fixture baseline");
+        fs.commit().expect("commit fixture baseline");
+        let committed_state = fs.state.clone();
+        let committed_base = IntentLogRootAnchor::from_committed_root_summary(
+            &fs.selected_current_root_summary()
+                .expect("select fixture committed root"),
+        );
+        (fs, dir, inode_id, committed_state, committed_base)
+    }
+
+    fn pool_metadata_entry(entry_id: u64, updated: InodeRecord) -> IntentLogEntry {
+        IntentLogEntry {
+            entry_id,
+            root_anchor: IntentLogRootAnchor {
+                transaction_id: updated.metadata_version,
+                generation: updated.metadata_version,
+                manifest_checksum: IntegrityDigest64::ZERO,
+            },
+            entry_kind: IntentLogEntryKind::MetadataSetattrIntent(updated),
+            timestamp_ns: test_timestamp(),
+        }
+    }
+
     #[test]
     fn batched_replay_many_writes_to_same_file_is_correct() {
         let (mut store, _dir) = test_store();
@@ -5197,6 +5490,141 @@ mod tests {
         ));
         assert_eq!(state.inodes.get(&file_id).expect("inode").size, 0);
         assert_eq!(state.inodes.get(&file_id).expect("inode").data_version, 1);
+    }
+
+    #[test]
+    fn pool_metadata_setattr_replay_preserves_unchanged_content_identity() {
+        let (mut fs, dir, inode_id, committed_state, committed_base) =
+            pool_metadata_replay_fixture("metadata-only");
+        let current = committed_state.inodes[&inode_id].clone();
+        let mut updated = current.clone();
+        updated.mode = S_IFREG | 0o600;
+        updated.metadata_version =
+            crate::allocation::next_generation_after(committed_state.generation);
+        updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
+        let log = log_from_entries(vec![pool_metadata_entry(0, updated.clone())]);
+
+        let replayed =
+            replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
+                .expect("replay metadata-only Pool intent");
+        assert_eq!(replayed, 1);
+        assert_eq!(fs.state.inodes[&inode_id], updated);
+        assert!(!fs.state.dirty_content.contains(&inode_id));
+        assert_eq!(
+            fs.read_file("/f").expect("read unchanged content"),
+            b"abcdefgh"
+        );
+
+        drop(fs);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pool_metadata_setattr_replay_adopts_receipted_truncate_idempotently() {
+        let (mut fs, dir, inode_id, committed_state, committed_base) =
+            pool_metadata_replay_fixture("receipted-truncate");
+        let truncated = fs.truncate_file("/f", 3).expect("publish truncate content");
+        let mut updated = truncated.clone();
+        updated.mode = S_IFREG | 0o600;
+        updated.metadata_version = crate::allocation::next_generation_after(
+            fs.state.generation.max(updated.metadata_version),
+        );
+        updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
+        let log = log_from_entries(vec![pool_metadata_entry(0, updated.clone())]);
+        fs.state = committed_state;
+
+        for _ in 0..2 {
+            let replayed =
+                replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
+                    .expect("replay receipted truncate");
+            assert_eq!(replayed, 1);
+            assert_eq!(fs.state.inodes[&inode_id], updated);
+            assert_eq!(fs.read_file("/f").expect("read truncated content"), b"abc");
+        }
+        assert!(fs.state.dirty_content.contains(&inode_id));
+
+        drop(fs);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pool_metadata_setattr_replay_refuses_missing_and_receiptless_content() {
+        let (mut fs, dir, inode_id, committed_state, committed_base) =
+            pool_metadata_replay_fixture("missing-content");
+        let current = committed_state.inodes[&inode_id].clone();
+        let mut updated = current.clone();
+        updated.size = 3;
+        updated.data_version = committed_state.generation.saturating_add(100);
+        updated.metadata_version = updated.data_version.saturating_add(1);
+        updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
+        let log = log_from_entries(vec![pool_metadata_entry(0, updated.clone())]);
+
+        replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
+            .expect_err("missing content must not authorize metadata transition");
+        assert_eq!(fs.state.inodes[&inode_id], current);
+
+        let content_key = content_object_key_for_version(inode_id, updated.data_version);
+        let encoded = crate::encoding::encode_content(&updated, b"abc");
+        fs.store
+            .raw_primary_store_mut()
+            .put(content_key, &encoded)
+            .expect("stage receiptless content fixture");
+        replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
+            .expect_err("receiptless content must not authorize metadata transition");
+        assert_eq!(fs.state.inodes[&inode_id], current);
+
+        drop(fs);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pool_replay_applies_later_metadata_after_queued_data_generation() {
+        let (mut fs, dir, inode_id, committed_state, committed_base) =
+            pool_metadata_replay_fixture("data-then-metadata");
+        let current = committed_state.inodes[&inode_id].clone();
+        let target_data_version = crate::allocation::next_generation_after(
+            committed_state.generation.max(current.data_version),
+        );
+        let payload = b"XY";
+        fs.store
+            .raw_primary_store_mut()
+            .put(intent_log_data_object_key(0), payload)
+            .expect("stage data replay payload");
+        let data_entry = IntentLogEntry {
+            entry_id: 0,
+            entry_kind: IntentLogEntryKind::SyncWriteRange {
+                inode_id,
+                offset: 0,
+                length: payload.len() as u64,
+                payload_digest: tidefs_local_object_store::checksum64(payload),
+                base_data_version: current.data_version,
+                data_version: target_data_version,
+            },
+            root_anchor: committed_base.clone(),
+            timestamp_ns: test_timestamp(),
+        };
+        let mut updated = current.clone();
+        updated.mode = S_IFREG | 0o600;
+        updated.metadata_version = target_data_version;
+        updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
+        let log = log_from_entries(vec![data_entry, pool_metadata_entry(1, updated)]);
+
+        let replayed =
+            replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
+                .expect("replay data before later metadata");
+        assert_eq!(replayed, 2);
+        let recovered = &fs.state.inodes[&inode_id];
+        assert_eq!(recovered.mode, S_IFREG | 0o600);
+        assert!(recovered.data_version > current.data_version);
+        assert!(recovered.metadata_version >= recovered.data_version);
+        assert!(recovered.subtree_rev > current.subtree_rev);
+        assert_eq!(
+            fs.read_file("/f").expect("read replayed content"),
+            b"XYcdefgh"
+        );
+
+        drop(fs);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
