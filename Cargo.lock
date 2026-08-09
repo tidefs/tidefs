@@ -3045,7 +3045,6 @@ dependencies = [
  "tidefs-extent-map",
  "tidefs-flow-commit-coordinator",
  "tidefs-inode-attributes",
- "tidefs-inode-table",
  "tidefs-intent-log",
  "tidefs-invalidation-feed",
  "tidefs-local-filesystem",

@@ -37,7 +37,7 @@ This authority does not cover:
   recovery ordering, except to say when invalidation must wait for them;
 - private mmap copy-on-write bytes;
 - FUSE lookup/forget durable inode ownership, which is decided by
-  `docs/INODE_NAMESPACE_AUTHORITY.md` and issue #665;
+  `docs/INODE_NAMESPACE_AUTHORITY.md` and implemented by closed issue #665;
 - POSIX lock identity or lock transport behavior from issues #618 and #633;
 - cache admission and memory-budget policy from issue #685;
 - claim-gate evidence reconciliation from issue #697.
@@ -90,17 +90,18 @@ Current source:
   invalidates metadata caches after engine writes, invalidates read-side caches
   after direct writes, and reconciles dirty mirrors after authoritative range
   mutations.
-- `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_lookup_forget.rs`
-  still treats lookup/forget reference accounting separately from durable inode
-  identity. Issue #665 owns the implementation cleanup for that projection.
+- `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` keeps
+  lookup and forget reference accounting in adapter-local maps, separate from
+  durable inode identity. The unwired inode-table-backed batch was retired
+  when the mounted namespace authority was contracted.
 
 Issue evidence:
 
 - Closed issue #443 proved the cache-core dirty/writeback/clean lifecycle and
   current invalidation behavior in focused cache tests.
 - Closed issue #511 created the page-cache writeback authority document.
-- Open issues #618, #633, #665, #685, and #697 own non-overlapping adjacent
-  slices. This decision does not implement or preempt their write sets.
+- Closed issues #618, #633, #665, #685, and #697 implemented adjacent lock,
+  lookup-reference, cache-admission, and claim-status slices.
 - Open issues #597 and #720 keep rename and orphan-index admission evidence
   separate from invalidation authority.
 
@@ -243,7 +244,7 @@ lands; they are not part of this slice.
 
 | Issue | Slice | Primary write set | Boundary |
 |---|---|---|---|
-| #752 | FUSE data-cache invalidation and generation fences. | `apps/tidefs-posix-filesystem-adapter-daemon/src/` data-cache, notification, mmap-coherency, and adapter tests only. | Must wait until active issue #665 / PR #709 clears or records an explicit non-overlap. Does not edit durable lookup/forget ownership. |
+| #752 | FUSE data-cache invalidation and generation fences. | `apps/tidefs-posix-filesystem-adapter-daemon/src/` data-cache, notification, mmap-coherency, and adapter tests only. | Implemented after #665 closed; does not edit durable lookup/forget ownership. |
 | #753 | Kernel page-cache coherency notifications and stale-generation checks. | `kmod/`, `crates/tidefs-kmod-posix-vfs/`, kernel-facing validation hooks, and focused kernel cache tests. | Owns kernel invalidation/fault/writeback checks. Does not change FUSE adapter policy or clustered lease transport. |
 | #754 | Clustered cache lease and epoch invalidation plumbing. | `crates/tidefs-cache-coherency/`, `crates/tidefs-lease/`, `crates/tidefs-lease-manager/`, `crates/tidefs-membership-epoch/`, `crates/tidefs-transport/`, and focused lease/transport tests as needed. | Owns cross-node invalidation messages and wait policies. Does not implement POSIX lock forwarding from #633 or cache admission from #685. |
 

@@ -22,7 +22,6 @@ tidefs-local-filesystem = { workspace = true, features = ["encryption"] }
 tidefs-pool-import = { workspace = true }
 tidefs-dataset-lifecycle = { workspace = true }
 tidefs-dataset-catalog = { workspace = true }
-tidefs-inode-table = { workspace = true }
 tidefs-invalidation-feed = { workspace = true }
 tidefs-dir-index = { workspace = true }
 tidefs-posix-acl = { workspace = true }

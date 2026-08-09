@@ -147,8 +147,6 @@ commit/read. Doing it twice wastes CPU in the daemon's hottest loop.
 Affected code:
 - `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` —
   `blake3::hash(&data[..written])` in dispatch_write
-- `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_write.rs` —
-  `use blake3::Hasher`
 
 **Fix**: Remove the BLAKE3 hash from the write path. The intent log and object
 store already compute and verify BLAKE3 digests at persist time. If the write

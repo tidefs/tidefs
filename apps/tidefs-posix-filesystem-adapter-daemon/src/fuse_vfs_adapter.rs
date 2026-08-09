@@ -21,7 +21,6 @@ use crate::capacity::{
 };
 use crate::dispatch_helpers::{reply_empty_ok_or_errno, ReplyError};
 use crate::fuse_create_unlink_dispatch::*;
-use crate::fuse_read::{EngineReadRequest, FuseReadDispatch};
 use crate::fuse_rename::{EngineRenameRequest, FuseRenameDispatch};
 use crate::fusewire::{
     parse_defrag_input, parse_fiemap_input, DefragIoctlInput, DefragIoctlOutput, FiemapInput,
@@ -680,7 +679,6 @@ struct DataCacheInvalidationState {
     inode_generations: BTreeMap<u64, u64>,
     range_fences: BTreeMap<u64, Vec<DataCacheRangeFence>>,
     read_cache_generations: BTreeMap<u64, u64>,
-    fuse_page_generations: BTreeMap<(u64, u64), u64>,
 }
 
 impl DataCacheInvalidationState {
@@ -696,8 +694,6 @@ impl DataCacheInvalidationState {
         self.inode_generations.insert(ino, generation);
         self.range_fences.remove(&ino);
         self.read_cache_generations.remove(&ino);
-        self.fuse_page_generations
-            .retain(|(page_ino, _), _| *page_ino != ino);
         generation
     }
 
@@ -770,39 +766,6 @@ impl DataCacheInvalidationState {
 
     fn forget_read_cache_fill(&mut self, ino: u64) {
         self.read_cache_generations.remove(&ino);
-    }
-
-    fn record_fuse_page_fill(
-        &mut self,
-        ino: u64,
-        offset: u64,
-        length: u64,
-        page_size: u64,
-        snapshot: DataCacheGenerationSnapshot,
-    ) {
-        if length == 0 || page_size == 0 {
-            return;
-        }
-        let end = offset.saturating_add(length);
-        let mut page_offset = (offset / page_size) * page_size;
-        while page_offset < end {
-            self.fuse_page_generations
-                .insert((ino, page_offset), snapshot.generation);
-            page_offset = page_offset.saturating_add(page_size);
-        }
-    }
-
-    fn fuse_page_allows_range(&self, ino: u64, page_offset: u64, page_size: u64) -> bool {
-        self.fuse_page_generations
-            .get(&(ino, page_offset))
-            .copied()
-            .is_some_and(|generation| {
-                generation >= self.current_generation(ino, page_offset, page_size)
-            })
-    }
-
-    fn forget_fuse_page_fill(&mut self, ino: u64, page_offset: u64) {
-        self.fuse_page_generations.remove(&(ino, page_offset));
     }
 }
 
@@ -2871,14 +2834,9 @@ pub struct FuseVfsAdapter {
     /// Non-authoritative LRU read cache with byte-size limit.
     /// Checked before VFS engine reads; filled on miss.
     pub(crate) page_cache: Mutex<ReadCache>,
-    /// PageCache + extent-map read dispatch path. When set, dispatch_read
-    /// prefers this over the engine / ReadCache path.
-    fuse_read_dispatch: Option<Arc<FuseReadDispatch>>,
     /// Page-cache from tidefs-cache-core for writeback dirty tracking.
     /// When present, flush/fsync iterate dirty pages via this cache.
     writeback_page_cache: Option<Arc<PageCache>>,
-    /// Per-file-handle readahead state: (last_ino, last_offset, last_size).
-    readahead_state: Mutex<Option<(u64, u64, u32)>>,
     /// Page-cache for write-path dirty tracking and writeback coordination.
     pub(crate) write_page_cache: Arc<PageCache>,
     write_dispatch: Mutex<DaemonWriteDispatch<256>>,
@@ -3008,9 +2966,7 @@ impl FuseVfsAdapter {
             removed_lookup_attrs: Mutex::new(BTreeMap::new()),
             block_volume: Mutex::new(None),
             page_cache: Mutex::new(ReadCache::new(256)),
-            fuse_read_dispatch: None,
             writeback_page_cache: None,
-            readahead_state: Mutex::new(None),
             write_page_cache: Arc::new(PageCache::new(1024, 4096)),
             write_dispatch: Mutex::new(DaemonWriteDispatch::new()),
             getattr_cache: Mutex::new(HashMap::new()),
@@ -3523,19 +3479,6 @@ impl FuseVfsAdapter {
         self
     }
 
-    /// Attach a [`FuseReadDispatch`] for the PageCache + extent-map read
-    /// path (issue #3574).
-    ///
-    /// When set, [`dispatch_read`] prefers this dispatcher over the
-    /// engine path for cache-hit and extent-resolved reads.
-    #[must_use]
-    pub fn with_read_dispatcher(mut self, dispatch: FuseReadDispatch) -> Self {
-        let sig_cache = Arc::clone(&self.signature_cache);
-        let dispatch = dispatch.with_signature_cache(sig_cache);
-        self.fuse_read_dispatch = Some(Arc::new(dispatch));
-        self
-    }
-
     fn ctx_from_req(req: &Request<'_>) -> RequestCtx {
         let gid = req.gid();
         RequestCtx {
@@ -3849,98 +3792,6 @@ impl FuseVfsAdapter {
             .lock()
             .unwrap()
             .record_read_cache_fill(ino, snapshot);
-    }
-
-    fn record_fuse_read_cache_fill(
-        &self,
-        ino: u64,
-        offset: u64,
-        length: u64,
-        page_size: u64,
-        snapshot: DataCacheGenerationSnapshot,
-    ) {
-        self.data_cache_invalidations
-            .lock()
-            .unwrap()
-            .record_fuse_page_fill(ino, offset, length, page_size, snapshot);
-    }
-
-    fn forget_fuse_read_cache_range(&self, ino: u64, offset: u64, length: u64, page_size: u64) {
-        if length == 0 || page_size == 0 {
-            return;
-        }
-        let end = offset.saturating_add(length);
-        let mut page_offset = (offset / page_size) * page_size;
-        let mut state = self.data_cache_invalidations.lock().unwrap();
-        while page_offset < end {
-            state.forget_fuse_page_fill(ino, page_offset);
-            page_offset = page_offset.saturating_add(page_size);
-        }
-    }
-
-    fn invalidate_fuse_read_cache_range(&self, ino: u64, offset: u64, length: u64) {
-        if length == 0 {
-            return;
-        }
-        if let Some(ref rd) = self.fuse_read_dispatch {
-            let page_size = rd.page_cache().page_size() as u64;
-            let end = offset.saturating_add(length);
-            rd.page_cache().invalidate_range(ino, offset, end);
-            self.forget_fuse_read_cache_range(ino, offset, length, page_size);
-        }
-    }
-
-    fn invalidate_fuse_read_cache_inode(&self, ino: u64) {
-        if let Some(ref rd) = self.fuse_read_dispatch {
-            rd.page_cache().remove_pages_for_inode(ino);
-        }
-        self.data_cache_invalidations
-            .lock()
-            .unwrap()
-            .fuse_page_generations
-            .retain(|(page_ino, _), _| *page_ino != ino);
-    }
-
-    fn fuse_read_cache_hit_range_still_current(
-        &self,
-        rd: &FuseReadDispatch,
-        ino: u64,
-        offset: u64,
-        length: u64,
-    ) -> bool {
-        if length == 0 {
-            return true;
-        }
-        let page_size = rd.page_cache().page_size() as u64;
-        if page_size == 0 {
-            return false;
-        }
-        let end = offset.saturating_add(length);
-        let mut page_offset = (offset / page_size) * page_size;
-        while page_offset < end {
-            let page_present = rd.page_cache().lookup(ino, page_offset).is_some();
-            if page_present {
-                let page_current = self
-                    .data_cache_invalidations
-                    .lock()
-                    .unwrap()
-                    .fuse_page_allows_range(ino, page_offset, page_size);
-                if !page_current {
-                    rd.page_cache().invalidate_range(
-                        ino,
-                        page_offset,
-                        page_offset.saturating_add(page_size),
-                    );
-                    self.data_cache_invalidations
-                        .lock()
-                        .unwrap()
-                        .forget_fuse_page_fill(ino, page_offset);
-                    return false;
-                }
-            }
-            page_offset = page_offset.saturating_add(page_size);
-        }
-        true
     }
 
     /// Best-effort kernel dentry invalidation with inotify notification
@@ -5599,51 +5450,6 @@ impl FuseVfsAdapter {
         }
         let read_snapshot =
             self.data_cache_generation_snapshot(ino, plan.offset, u64::from(plan.size));
-        // ── fuse_read dispatch path (issue #3574) ────────────────────────
-        //
-        // When a FuseReadDispatch is configured, probe the PageCache
-        // for the first page of the requested range.  On a cache hit,
-        // serve the full range through dispatch_read_with_engine.
-        // On a cache miss for the first page, fall through to the
-        // existing engine / ReadCache path below.
-        if !fuse_direct_io && !writeback_write_only_cache_fill {
-            if let Some(ref rd) = self.fuse_read_dispatch {
-                let page_size = rd.page_cache().page_size() as u64;
-                let probe_page = (plan.offset / page_size) * page_size;
-                if rd.page_cache().lookup(ino, probe_page).is_some()
-                    && self.fuse_read_cache_hit_range_still_current(
-                        rd,
-                        ino,
-                        plan.offset,
-                        u64::from(plan.size),
-                    )
-                {
-                    let file_size = {
-                        let e = self.engine.lock().unwrap();
-                        e.getattr(InodeId::new(ino), None, ctx)
-                            .map(|a| a.posix.size)
-                            .unwrap_or(u64::MAX)
-                    };
-                    let e = self.engine.lock().unwrap();
-                    match rd.dispatch_read_with_engine(EngineReadRequest {
-                        ino,
-                        fh,
-                        offset: plan.offset,
-                        size: plan.size,
-                        file_size,
-                        engine: &**e,
-                        ctx,
-                    }) {
-                        Ok(data) if !data.is_empty() => {
-                            drop(e);
-                            self.finish_successful_read_atime(ino, ctx);
-                            return Ok(data);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
         // ── page-cache read path (issue #3478) ──────────────────────────
         //
         // Check the non-authoritative read cache first.  A hit serves
@@ -5765,41 +5571,13 @@ impl FuseVfsAdapter {
             }
         };
 
-        // ── cache fill + sequential readahead ─────────────────────────
+        // ── cache fill ────────────────────────────────────────────────
         //
-        // The legacy ReadCache stores whole-file blocks only.  Range reads
+        // ReadCache stores whole-file blocks only. Range reads
         // must not be inserted there as byte-zero data, or subsequent reads
-        // can observe shifted content and readahead can allocate sparse
-        // prefix-sized buffers. Page-window readahead is delegated to
-        // FuseReadDispatch when present.
-        //
-        // Sequential readahead: when the current offset follows the
-        // previous read (of the same inode) by exactly the previous
-        // size, trigger a readahead of the next READAHEAD_PAGES pages.
-
-        const READAHEAD_PAGES: u32 = 4;
-        const PAGE_SIZE: u32 = 4096;
+        // can observe shifted content.
 
         if !fuse_direct_io && !writeback_write_only_cache_fill {
-            // ── PageCache population (issue #3574) ──────────────────
-            //
-            // If a FuseReadDispatch is configured, populate its
-            // PageCache with the data just read from the engine.
-            if let Some(ref rd) = self.fuse_read_dispatch {
-                let fill_len = engine_data.len() as u64;
-                if self.data_cache_snapshot_still_current(ino, plan.offset, fill_len, read_snapshot)
-                {
-                    self.invalidate_fuse_read_cache_range(ino, plan.offset, fill_len);
-                    rd.populate_cache(ino, plan.offset, &engine_data);
-                    self.record_fuse_read_cache_fill(
-                        ino,
-                        plan.offset,
-                        fill_len,
-                        rd.page_cache().page_size() as u64,
-                        read_snapshot,
-                    );
-                }
-            }
             if plan.offset == 0 && !engine_data.is_empty() {
                 let whole_file_size = {
                     let e = self.engine.lock().unwrap();
@@ -5822,49 +5600,7 @@ impl FuseVfsAdapter {
                         }
                     }
                 }
-            } // end if !fuse_direct_io
-
-            // Check sequential pattern
-            let mut ra = self.readahead_state.lock().unwrap();
-            let ra_size = READAHEAD_PAGES * PAGE_SIZE;
-            let triggered = match *ra {
-                Some((last_ino, last_offset, last_size))
-                    if last_ino == ino && plan.offset == last_offset + last_size as u64 =>
-                {
-                    // Sequential read: pre-fetch next pages
-                    let ra_offset = plan.offset + plan.size as u64;
-                    if let Some(ref rd) = self.fuse_read_dispatch {
-                        let ra_snapshot =
-                            self.data_cache_generation_snapshot(ino, ra_offset, u64::from(ra_size));
-                        let e = self.engine.lock().unwrap();
-                        if let Ok(ra_data) = e.read(&engine_fh, ra_offset, ra_size, ctx) {
-                            let fill_len = ra_data.len() as u64;
-                            if self.data_cache_snapshot_still_current(
-                                ino,
-                                ra_offset,
-                                fill_len,
-                                ra_snapshot,
-                            ) {
-                                self.invalidate_fuse_read_cache_range(ino, ra_offset, fill_len);
-                                rd.populate_cache(ino, ra_offset, &ra_data);
-                                self.record_fuse_read_cache_fill(
-                                    ino,
-                                    ra_offset,
-                                    fill_len,
-                                    rd.page_cache().page_size() as u64,
-                                    ra_snapshot,
-                                );
-                            }
-                        }
-                    }
-                    true
-                }
-                _ => false,
-            };
-
-            // Always update the state tracker
-            *ra = Some((ino, plan.offset, plan.size));
-            let _ = triggered; // readahead triggered flag (observability hook point)
+            }
         }
 
         if let Some(fallback) = fallback_read_to_release.take() {
@@ -6419,7 +6155,6 @@ impl FuseVfsAdapter {
         }
         self.write_page_cache.invalidate_range(ino, offset, end);
         self.invalidate_read_cache_entry(ino);
-        self.invalidate_fuse_read_cache_range(ino, offset, length);
         self.invalidate_inode_metadata_local(ino);
     }
 
@@ -6440,7 +6175,6 @@ impl FuseVfsAdapter {
             .unwrap()
             .invalidate_inode(ino);
         self.invalidate_read_cache_entry(ino);
-        self.invalidate_fuse_read_cache_inode(ino);
         let writeback_cache_aliases_write_page_cache = self
             .writeback_page_cache
             .as_ref()
@@ -6510,7 +6244,6 @@ impl FuseVfsAdapter {
             }
         }
         self.invalidate_read_cache_entry(ino);
-        self.invalidate_fuse_read_cache_range(ino, offset, u64::from(written));
         // The kernel issued this FUSE WRITE and already owns the page changes
         // represented by the reply. A synchronous page-range invalidation can
         // wait on that same request and deadlock the single FUSE dispatch
@@ -10687,8 +10420,6 @@ mod tests {
     };
     use tidefs_cache_core::page_cache::PageCache;
     use tidefs_dir_index::{DatasetDirPolicy, DirIndex};
-    use tidefs_extent_map::ExtentMap;
-    use tidefs_inode_table::{InodeTable, SystemTimeSource};
     use tidefs_local_filesystem::{
         vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem, LocalFileSystemOpenConfig,
         LocalStorageAllocatorPolicy, RootAuthenticationKey, MAX_NAME_BYTES,
@@ -13123,10 +12854,10 @@ mod tests {
     }
 
     #[test]
-    fn page_cache_readahead_sequential_detection() {
+    fn sequential_range_reads_do_not_populate_whole_file_cache() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
-        // Create a file larger than the readahead window (4 pages = 16384 bytes)
+        // Create a file larger than the repeated range-read window.
         let file_size = 20 * 4096; // 20 pages
         let payload: Vec<u8> = (0..file_size).map(|i| (i % 251) as u8).collect();
         let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
@@ -13144,9 +12875,8 @@ mod tests {
                 .expect("write large payload");
         }
 
-        // Read page-sized chunks sequentially to trigger readahead.
-        // 8 sequential pages (0..8 * 4096) exercise the detection
-        // path without running into file-length edge cases.
+        // Read page-sized chunks sequentially without treating any range as
+        // byte-zero whole-file cache content.
         let chunk_size = 4096u32;
         for i in 0..8u64 {
             let offset = i * chunk_size as u64;
@@ -13164,20 +12894,6 @@ mod tests {
             let expected = &payload[offset as usize..(offset as usize + chunk_size as usize)];
             assert_eq!(data, expected, "chunk at offset {offset} matches");
         }
-
-        // After sequential reads, the readahead state should have tracked progress
-        let ra = fixture.adapter.readahead_state.lock().unwrap();
-        assert!(
-            ra.is_some(),
-            "readahead state updated after sequential reads"
-        );
-        if let Some((ra_ino, ra_offset, ra_size)) = *ra {
-            assert_eq!(ra_ino, inode.get(), "readahead inode matches");
-            // Last chunk was at offset 7 * 4096 = 28672
-            assert_eq!(ra_offset, 7 * 4096, "last read offset recorded");
-            assert_eq!(ra_size, 4096, "last read size recorded");
-        }
-        drop(ra);
 
         let cache = fixture.adapter.page_cache.lock().unwrap();
         assert_eq!(
@@ -36218,238 +35934,6 @@ mod tests {
             .dispatch_symlink(&ctx, root_ino, b"long-link", &long_target)
             .unwrap_err();
         assert_eq!(err, Errno::ENAMETOOLONG);
-    }
-
-    // ── FuseReadDispatch integration tests (issue #3574) ─────────────
-
-    #[test]
-    fn fuse_read_dispatch_cache_hit_serves_data_without_engine() {
-        let mut fixture = adapter_fixture();
-        let ctx = root_ctx();
-        let (inode, adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"rd-cache-hit.bin",
-            libc::O_RDWR as u32,
-        );
-        let payload = b"fuse-read-dispatch-cache-hit-data-42!!";
-        fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, payload, 0)
-            .expect("write");
-        let pc = Arc::new(PageCache::new(64, 4096));
-        let em = ExtentMap::new();
-        let time_source = Box::new(SystemTimeSource);
-        let itable = Arc::new(InodeTable::new(16, time_source));
-        let rd = FuseReadDispatch::new(Arc::clone(&pc), em, Arc::clone(&itable));
-        fixture.adapter.fuse_read_dispatch = Some(Arc::new(rd));
-        let result = fixture
-            .adapter
-            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, payload.len() as u32, None)
-            .expect("dispatch_read");
-        assert_eq!(result, payload);
-    }
-
-    #[test]
-    fn fuse_read_dispatch_prepopulated_page_cache_serves_hit() {
-        let mut fixture = adapter_fixture();
-        let ctx = root_ctx();
-        let (inode, adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"rd-prepop.bin",
-            libc::O_RDWR as u32,
-        );
-        let payload = b"PREPOPULATED-PAGECACHE-DATA!!!!!";
-        fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, payload, 0)
-            .expect("write");
-        let pc = Arc::new(PageCache::new(64, 4096));
-        {
-            let _key = pc.insert(inode.get(), 0).expect("insert page");
-            let mut handle = pc.lookup(inode.get(), 0).expect("lookup page");
-            let buf = handle.data_mut();
-            let copy_len = payload.len().min(buf.len());
-            buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-        }
-        let em = ExtentMap::new();
-        let time_source = Box::new(SystemTimeSource);
-        let itable = Arc::new(InodeTable::new(16, time_source));
-        let rd = FuseReadDispatch::new(Arc::clone(&pc), em, Arc::clone(&itable));
-        fixture.adapter.fuse_read_dispatch = Some(Arc::new(rd));
-        let result = fixture
-            .adapter
-            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, payload.len() as u32, None)
-            .expect("dispatch_read");
-        assert_eq!(result, payload);
-    }
-
-    #[test]
-    fn fuse_read_dispatch_with_read_dispatcher_builder_method() {
-        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "tidefs-vfs-rd-builder-{}-{temp_id}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create temp root");
-        let local_fs = LocalFileSystem::open_with_root_authentication_key(
-            &root,
-            StoreOptions::default(),
-            RootAuthenticationKey::demo_key(),
-        )
-        .expect("open local filesystem");
-        let engine = VfsLocalFileSystem::new(local_fs);
-        let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
-        let pc = Arc::new(PageCache::new(64, 4096));
-        let em = ExtentMap::new();
-        let time_source = Box::new(SystemTimeSource);
-        let itable = Arc::new(InodeTable::new(16, time_source));
-        let rd = FuseReadDispatch::new(pc, em, itable);
-        let adapter = adapter.with_read_dispatcher(rd);
-        assert!(
-            adapter.fuse_read_dispatch.is_some(),
-            "with_read_dispatcher should set the field"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn fuse_read_dispatch_read_past_eof_returns_empty() {
-        let mut fixture = adapter_fixture();
-        let ctx = root_ctx();
-        let (inode, adapter_fh, _efh) =
-            create_adapter_file_handle(&fixture.adapter, &ctx, b"rd-eof.bin", libc::O_RDWR as u32);
-        let payload = vec![0xABu8; 100];
-        fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, &payload, 0)
-            .expect("write");
-        let pc = Arc::new(PageCache::new(64, 4096));
-        let em = ExtentMap::new();
-        let time_source = Box::new(SystemTimeSource);
-        let itable = Arc::new(InodeTable::new(16, time_source));
-        let rd = FuseReadDispatch::new(Arc::clone(&pc), em, Arc::clone(&itable));
-        fixture.adapter.fuse_read_dispatch = Some(Arc::new(rd));
-        let result = fixture
-            .adapter
-            .dispatch_read(&ctx, inode.get(), adapter_fh, 200, 50, None)
-            .expect("dispatch_read");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn fuse_read_dispatch_not_set_still_uses_engine_path() {
-        let fixture = adapter_fixture();
-        let ctx = root_ctx();
-        let (inode, adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"rd-no-rd.bin",
-            libc::O_RDWR as u32,
-        );
-        let payload = b"engine-path-should-work-anyway";
-        fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, payload, 0)
-            .expect("write");
-        assert!(fixture.adapter.fuse_read_dispatch.is_none());
-        let result = fixture
-            .adapter
-            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, payload.len() as u32, None)
-            .expect("dispatch_read");
-        assert_eq!(result, payload);
-    }
-
-    #[test]
-    fn fuse_read_dispatch_empty_size_returns_empty() {
-        let mut fixture = adapter_fixture();
-        let ctx = root_ctx();
-        let (inode, adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"rd-empty.bin",
-            libc::O_RDWR as u32,
-        );
-        let pc = Arc::new(PageCache::new(64, 4096));
-        let em = ExtentMap::new();
-        let time_source = Box::new(SystemTimeSource);
-        let itable = Arc::new(InodeTable::new(16, time_source));
-        let rd = FuseReadDispatch::new(Arc::clone(&pc), em, Arc::clone(&itable));
-        fixture.adapter.fuse_read_dispatch = Some(Arc::new(rd));
-        let result = fixture
-            .adapter
-            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, 0, None)
-            .expect("dispatch_read");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn fuse_read_dispatch_cache_miss_engine_path_works() {
-        let mut fixture = adapter_fixture();
-        let ctx = root_ctx();
-        let (inode, adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"rd-eng-path.bin",
-            libc::O_RDWR as u32,
-        );
-        let payload = b"ENGINE-PATH-CACHE-MISS-DATA-SHOULD-WORK";
-        fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, payload, 0)
-            .expect("write");
-        let pc = Arc::new(PageCache::new(64, 4096));
-        let em = ExtentMap::new();
-        let time_source = Box::new(SystemTimeSource);
-        let itable = Arc::new(InodeTable::new(16, time_source));
-        let rd = FuseReadDispatch::new(Arc::clone(&pc), em, Arc::clone(&itable));
-        fixture.adapter.fuse_read_dispatch = Some(Arc::new(rd));
-        let result = fixture
-            .adapter
-            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, payload.len() as u32, None)
-            .expect("dispatch_read");
-        assert_eq!(result, payload);
-    }
-
-    #[test]
-    fn fuse_read_dispatch_cache_hit_with_engine_populates_then_second_read_hits() {
-        let mut fixture = adapter_fixture();
-        let ctx = root_ctx();
-        let (inode, adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"rd-pop-2x.bin",
-            libc::O_RDWR as u32,
-        );
-        let payload = b"POPULATE-CACHE-TWICE-READ-TEST-DATA!!!";
-        fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, payload, 0)
-            .expect("write");
-        let pc = Arc::new(PageCache::new(64, 4096));
-        {
-            let _key = pc.insert(inode.get(), 0).expect("insert page");
-            let mut handle = pc.lookup(inode.get(), 0).expect("lookup page");
-            let buf = handle.data_mut();
-            let copy_len = payload.len().min(buf.len());
-            buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-        }
-        let em = ExtentMap::new();
-        let time_source = Box::new(SystemTimeSource);
-        let itable = Arc::new(InodeTable::new(16, time_source));
-        let rd = FuseReadDispatch::new(Arc::clone(&pc), em, Arc::clone(&itable));
-        fixture.adapter.fuse_read_dispatch = Some(Arc::new(rd));
-        let result1 = fixture
-            .adapter
-            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, payload.len() as u32, None)
-            .expect("dispatch_read 1");
-        assert_eq!(result1, payload);
-        let result2 = fixture
-            .adapter
-            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, payload.len() as u32, None)
-            .expect("dispatch_read 2");
-        assert_eq!(result2, payload);
     }
 
     // ── ACL enforcement tests ────────────────────────────────────────────────

@@ -59,10 +59,7 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`fuse_vfs_adapter`] | Main `fuser::Filesystem` impl; ~30 FUSE op handlers |
-//! | [`fuse_write`] | Write/write_buf dispatch with page-cache dirty tracking |
-//! | [`fuse_read`] | Read dispatch with page-cache look-aside |
 //! | [`fuse_flush_fsync`] | Flush/fsync dispatch with writeback and extent commit |
-//! | [`fuse_lookup_forget`] | Lookup and forget dispatch |
 //! | [`fuse_rename`] | Atomic rename with cross-directory validation |
 //! | [`fuse_create_unlink_dispatch`] | Unlink/rmdir with capacity release |
 //! | [`readdir_dispatch`] | Readdir/readdirplus with cookie-based pagination |
@@ -71,10 +68,7 @@
 //! | [`writeback_reclaim`] | Dirty-page writeback and reclaim |
 //!
 //! [`fuse_vfs_adapter`]: crate::fuse_vfs_adapter
-//! [`fuse_write`]: crate::fuse_write
-//! [`fuse_read`]: crate::fuse_read
 //! [`fuse_flush_fsync`]: crate::fuse_flush_fsync
-//! [`fuse_lookup_forget`]: crate::fuse_lookup_forget
 //! [`fuse_rename`]: crate::fuse_rename
 //! [`fuse_create_unlink_dispatch`]: crate::fuse_create_unlink_dispatch
 //! [`readdir_dispatch`]: crate::readdir_dispatch
@@ -90,12 +84,9 @@ pub mod dispatch_helpers;
 pub mod fsync_handler;
 pub mod fuse_create_unlink_dispatch;
 pub mod fuse_flush_fsync;
-pub mod fuse_lookup_forget;
 pub mod fuse_posix_lock;
-pub mod fuse_read;
 pub mod fuse_rename;
 pub mod fuse_vfs_adapter;
-pub mod fuse_write;
 pub mod handler_prelude;
 pub mod live_owner;
 pub mod lock_dispatch;

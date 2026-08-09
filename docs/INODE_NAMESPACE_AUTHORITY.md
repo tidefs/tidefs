@@ -37,9 +37,10 @@ The selected local mounted carrier applies the decision as follows:
 - `FuseVfsAdapter` attaches no `Namespace`. Lookup, attributes, mutation,
   rename, directory iteration, and xattrs project the VFS engine without a
   namespace fallback, mirrored durable attributes, or merged directory view.
-- FUSE lookup counts, forget counts, path/negative caches, and the older
-  `fuse_lookup_forget` inode table are derived kernel-reference state only.
-  `tidefs-namespace` remains outside the selected mounted carrier.
+- FUSE lookup counts, forget counts, and path/negative caches are derived
+  kernel-reference state only. The selected adapter has no inode-table-backed
+  lookup/read/write batch, and `tidefs-namespace` remains outside the selected
+  mounted carrier.
 - The mounted pool lifecycle checks stable inode identity through rename,
   hard-link, unlink, clean export/reimport, and crash recovery.
 
@@ -120,9 +121,9 @@ FUSE adapter:
   and cache state.
 - `bump_forget_refcount()` and `dispatch_forget()` track kernel lookup
   references and decide when adapter caches can be invalidated.
-- `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_lookup_forget.rs`
-  still wraps `tidefs-inode-table::InodeTable` for an older lookup/forget
-  batch. This is adapter reference state, not durable dataset identity.
+- At decision time, the now-retired pre-contraction `fuse_lookup_forget.rs`
+  wrapped `tidefs-inode-table::InodeTable` for an unwired lookup/forget batch.
+  Its removal left kernel reference accounting in `FuseVfsAdapter` itself.
 
 ## Owner Models Compared
 
@@ -250,10 +251,10 @@ FUSE lookup and forget state owns only kernel lookup references, adapter cache
 invalidation, negative cache state, and lookup hotness. It does not own durable
 inode allocation, existence, reuse, or persisted ID recovery.
 
-`lookup_counts`, `forget_refcounts`, path caches, removed-lookup attributes,
-and the older `fuse_lookup_forget`/`tidefs-inode-table` wrapper are projections
-of mounted dataset identity. `FuseVfsAdapter` obtains existence and attributes
-from the VFS engine rather than falling back to a second namespace.
+`lookup_counts`, `forget_refcounts`, path caches, and removed-lookup attributes
+are projections of mounted dataset identity. `FuseVfsAdapter` obtains existence
+and attributes from the VFS engine rather than consulting an inode-table batch
+or falling back to a second namespace.
 
 ### Old Catalogs
 

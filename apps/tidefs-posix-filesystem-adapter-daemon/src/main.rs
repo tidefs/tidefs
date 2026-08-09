@@ -11,7 +11,6 @@ mod fsync_handler;
 mod fuse_create_unlink_dispatch;
 mod fuse_flush_fsync;
 mod fuse_posix_lock;
-mod fuse_read;
 mod fuse_rename;
 mod fuse_vfs_adapter;
 mod fusewire;
