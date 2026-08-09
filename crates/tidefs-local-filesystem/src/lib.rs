@@ -388,8 +388,8 @@ use tidefs_local_object_store::{
     device_layout::DeviceMediaClass, CompressionConfig, CrashInjectionPoint, DeviceBacking,
     DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, EncryptionConfig, IntegrityDigest64,
     IoClass, LocalObjectStore, ObjectKey, ObjectLocation, Pool, PoolConfig, PoolProperties,
-    StoreEncryptionKey, StoreError, StoreOptions, SuspectLogStats, DEFAULT_MAX_SEGMENT_BYTES,
-    RECORD_OVERHEAD_BYTES,
+    PoolRedundancyPolicy, StoreEncryptionKey, StoreError, StoreOptions, SuspectLogStats,
+    DEFAULT_MAX_SEGMENT_BYTES, RECORD_OVERHEAD_BYTES,
 };
 use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex, OrphanIndexAdmissionError};
 use tidefs_performance_contract::AdmissionPermit;
@@ -2236,6 +2236,11 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
         )? {
             Some(state) => Ok(state),
             None => {
+                if !recovery_policy.allows_any_mutation() {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "read-only open requires an existing committed filesystem root",
+                    });
+                }
                 let state = initial_state();
                 persist_state_with_pool(&mut *self.store, &state, root_authentication_key)?;
                 Ok(state)
@@ -3078,6 +3083,7 @@ impl LocalFileSystem {
             encryption,
             compression,
             DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES,
+            RecoveryPolicy::default(),
         )
     }
 
@@ -3087,11 +3093,24 @@ impl LocalFileSystem {
         encryption: Option<EncryptionConfig>,
         compression: Option<CompressionConfig>,
         min_image_bytes: u64,
+        recovery_policy: RecoveryPolicy,
     ) -> Result<Pool> {
-        let device_path =
-            Self::ensure_default_development_device_image_with_min_bytes(root, min_image_bytes)?;
+        let device_path = if recovery_policy.allows_any_mutation() {
+            Self::ensure_default_development_device_image_with_min_bytes(root, min_image_bytes)?
+        } else {
+            Self::default_development_device_path(root)
+        };
         let devices = [device_path];
-        Self::block_device_pool(root, &devices, encryption, compression, options)
+        Self::block_device_pool_with_recovery_policy(
+            root,
+            &devices,
+            "tidefs",
+            PoolRedundancyPolicy::default(),
+            encryption,
+            compression,
+            options,
+            recovery_policy,
+        )
     }
 
     fn hidden_regular_file_dev_image_bytes_for_content_capacity(
@@ -3221,6 +3240,28 @@ impl LocalFileSystem {
         compression: Option<CompressionConfig>,
         options: &StoreOptions,
     ) -> Result<Pool> {
+        Self::block_device_pool_with_recovery_policy(
+            metadata_dir,
+            block_devices,
+            "tidefs",
+            PoolRedundancyPolicy::default(),
+            encryption,
+            compression,
+            options,
+            RecoveryPolicy::default(),
+        )
+    }
+
+    fn block_device_pool_with_recovery_policy(
+        metadata_dir: &std::path::Path,
+        block_devices: &[std::path::PathBuf],
+        pool_name: &str,
+        pool_redundancy_policy: PoolRedundancyPolicy,
+        encryption: Option<EncryptionConfig>,
+        compression: Option<CompressionConfig>,
+        options: &StoreOptions,
+        recovery_policy: RecoveryPolicy,
+    ) -> Result<Pool> {
         let mut devices: Vec<DeviceConfig> = Vec::with_capacity(block_devices.len());
         for dev_path in block_devices.iter() {
             let backing = Self::byte_addressable_device_backing(dev_path)?;
@@ -3237,11 +3278,20 @@ impl LocalFileSystem {
             });
         }
         let config = PoolConfig {
-            name: "tidefs".into(),
+            name: pool_name.into(),
             root_path: metadata_dir.to_path_buf(),
             devices,
         };
-        Ok(Pool::create(config, PoolProperties::default(), options)?)
+        let properties = PoolProperties {
+            redundancy_policy: pool_redundancy_policy,
+            ..PoolProperties::default()
+        };
+        let pool = if recovery_policy.allows_any_mutation() {
+            Pool::create(config, properties, options)?
+        } else {
+            Pool::open_read_only_existing(config, properties, options)?
+        };
+        Ok(pool)
     }
 
     pub fn byte_addressable_device_backing(path: &std::path::Path) -> Result<DeviceBacking> {
@@ -3428,6 +3478,8 @@ impl LocalFileSystem {
         Self::open_with_block_devices_and_recovery_policy(
             metadata_dir,
             block_devices,
+            "tidefs",
+            PoolRedundancyPolicy::default(),
             options,
             root_authentication_key,
             RecoveryPolicy::default(),
@@ -3442,13 +3494,17 @@ impl LocalFileSystem {
     pub fn open_with_block_devices_and_recovery_policy(
         metadata_dir: impl AsRef<Path>,
         block_devices: &[std::path::PathBuf],
+        pool_name: &str,
+        pool_redundancy_policy: PoolRedundancyPolicy,
         options: StoreOptions,
         root_authentication_key: RootAuthenticationKey,
         recovery_policy: RecoveryPolicy,
     ) -> Result<Self> {
         let metadata_path = metadata_dir.as_ref();
-        Self::open_with_allocator_policy_and_root_authentication_key(
+        Self::open_named_pool_with_allocator_policy_and_root_authentication_key(
             metadata_path,
+            pool_name,
+            pool_redundancy_policy,
             LocalFileSystemOpenConfig {
                 options,
                 allocator_policy: LocalStorageAllocatorPolicy::default(),
@@ -3538,6 +3594,20 @@ impl LocalFileSystem {
         root: impl AsRef<Path>,
         config: LocalFileSystemOpenConfig<'_>,
     ) -> Result<Self> {
+        Self::open_named_pool_with_allocator_policy_and_root_authentication_key(
+            root,
+            "tidefs",
+            PoolRedundancyPolicy::default(),
+            config,
+        )
+    }
+
+    pub fn open_named_pool_with_allocator_policy_and_root_authentication_key(
+        root: impl AsRef<Path>,
+        pool_name: &str,
+        pool_redundancy_policy: PoolRedundancyPolicy,
+        config: LocalFileSystemOpenConfig<'_>,
+    ) -> Result<Self> {
         let LocalFileSystemOpenConfig {
             options,
             allocator_policy,
@@ -3559,12 +3629,15 @@ impl LocalFileSystem {
         let root_path = root.as_ref().to_path_buf();
         let key_for_struct = encryption.as_ref().map(|c| c.key.clone());
         let mut store = if let Some(devices) = block_devices {
-            Self::block_device_pool(
+            Self::block_device_pool_with_recovery_policy(
                 &root_path,
                 devices,
+                pool_name,
+                pool_redundancy_policy,
                 encryption.clone(),
                 compression.clone(),
                 &options,
+                recovery_policy,
             )?
         } else {
             let min_image_bytes = Self::hidden_regular_file_dev_image_bytes_for_content_capacity(
@@ -3576,6 +3649,7 @@ impl LocalFileSystem {
                 encryption,
                 compression,
                 min_image_bytes,
+                recovery_policy,
             )?
         };
         // Check locked-dataset condition: import an encrypted pool without
@@ -4071,8 +4145,10 @@ impl LocalFileSystem {
         // Content objects, extent maps, stale directory entries, and
         // block allocator space are freed for each orphaned inode.
         // BackgroundOrphanReclamation handles incremental runtime orphans.
-        if let Err(e) = fs.cleanup_orphans() {
-            eprintln!("warning: mount-time orphan cleanup failed: {e}");
+        if recovery_policy.allows_any_mutation() {
+            if let Err(e) = fs.cleanup_orphans() {
+                eprintln!("warning: mount-time orphan cleanup failed: {e}");
+            }
         }
 
         Ok(fs)
@@ -17011,6 +17087,87 @@ mod recovery_integration_tests {
         assert!(result.is_ok(), "ReadOnly should load state without error");
         let loaded = result.unwrap();
         assert!(loaded.is_some(), "should find committed state");
+    }
+
+    #[test]
+    fn read_only_open_does_not_create_missing_development_storage() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().join("missing-read-only-store");
+
+        let opened =
+            LocalFileSystem::open_named_pool_with_allocator_policy_and_root_authentication_key(
+                &root,
+                "tidefs",
+                PoolRedundancyPolicy::default(),
+                LocalFileSystemOpenConfig {
+                    options: test_options(),
+                    allocator_policy: LocalStorageAllocatorPolicy::default(),
+                    root_authentication_key: RootAuthenticationKey::demo_key(),
+                    encryption: None,
+                    compression: None,
+                    log_device_device_path: None,
+                    recovery_policy: RecoveryPolicy::ReadOnly,
+                    block_devices: None,
+                },
+            );
+
+        assert!(opened.is_err(), "missing storage must be refused");
+        assert!(
+            !root.exists(),
+            "read-only open must not create metadata or a device image"
+        );
+    }
+
+    #[test]
+    fn read_only_open_refuses_missing_committed_root_without_changing_device_bytes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let metadata_dir = tmp.path().join("metadata");
+        let device_path = tmp.path().join("device.img");
+        std::fs::create_dir_all(&metadata_dir).expect("create metadata dir");
+        let device = std::fs::File::create(&device_path).expect("create device image");
+        device.set_len(32 * 1024 * 1024).expect("size device image");
+        drop(device);
+        let devices = [device_path.clone()];
+
+        drop(
+            LocalFileSystem::block_device_pool(
+                &metadata_dir,
+                &devices,
+                None,
+                None,
+                &test_options(),
+            )
+            .expect("initialize pool without a filesystem root"),
+        );
+        let bytes_before = std::fs::read(&device_path).expect("read device before read-only open");
+
+        let opened =
+            LocalFileSystem::open_named_pool_with_allocator_policy_and_root_authentication_key(
+                &metadata_dir,
+                "tidefs",
+                PoolRedundancyPolicy::default(),
+                LocalFileSystemOpenConfig {
+                    options: test_options(),
+                    allocator_policy: LocalStorageAllocatorPolicy::default(),
+                    root_authentication_key: RootAuthenticationKey::demo_key(),
+                    encryption: None,
+                    compression: None,
+                    log_device_device_path: None,
+                    recovery_policy: RecoveryPolicy::ReadOnly,
+                    block_devices: Some(&devices),
+                },
+            );
+
+        assert!(matches!(
+            opened,
+            Err(FileSystemError::CorruptState { reason })
+                if reason == "read-only open requires an existing committed filesystem root"
+        ));
+        assert_eq!(
+            std::fs::read(&device_path).expect("read device after read-only open"),
+            bytes_before,
+            "read-only admission refusal must not change device bytes"
+        );
     }
 
     #[test]

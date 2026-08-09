@@ -534,9 +534,13 @@ pub fn handle_mount(args: PoolMountArgs) {
         backing_dir,
         mountpoint,
         pool_name: Some(args.pool_name.clone()),
+        pool_redundancy_policy: tidefs_local_object_store::PoolRedundancyPolicy::from_label_policy(
+            cfg.redundancy_policy,
+        ),
         pool_uuid: owner_pool_uuid,
         foreground: true,
         debug: false,
+        read_only: args.read_only,
         writeback_cache: false,
         coherency_profile:
             tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile::Writeback,

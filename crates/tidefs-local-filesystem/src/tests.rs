@@ -10878,12 +10878,16 @@ fn block_device_dataset_catalog_create_persists_across_reopen() {
     }
 
     let dataset_id = DatasetId::from_bytes([0x42; 16]);
+    let redundancy_policy = PoolRedundancyPolicy::replicated(2);
     {
-        let mut fs = LocalFileSystem::open_with_block_devices(
+        let mut fs = LocalFileSystem::open_with_block_devices_and_recovery_policy(
             &root,
             &devices,
+            "tidefs",
+            redundancy_policy,
             options(),
             RootAuthenticationKey::demo_key(),
+            RecoveryPolicy::default(),
         )
         .expect("open block-device fs");
         fs.dataset_catalog_mut()
@@ -10903,9 +10907,15 @@ fn block_device_dataset_catalog_create_persists_across_reopen() {
     }
 
     {
+        let bytes_before: Vec<Vec<u8>> = devices
+            .iter()
+            .map(|path| std::fs::read(path).expect("read device before read-only reopen"))
+            .collect();
         let fs = LocalFileSystem::open_with_block_devices_and_recovery_policy(
             &root,
             &devices,
+            "tidefs",
+            redundancy_policy,
             options(),
             RootAuthenticationKey::demo_key(),
             RecoveryPolicy::ReadOnly,
@@ -10924,6 +10934,14 @@ fn block_device_dataset_catalog_create_persists_across_reopen() {
                 .any(|(name, id)| name == "demo" && *id == dataset_id),
             "dataset list source should include persisted dataset"
         );
+        drop(fs);
+        for (device, expected) in devices.iter().zip(bytes_before) {
+            assert_eq!(
+                std::fs::read(device).expect("read device after read-only reopen"),
+                expected,
+                "read-only reopen must preserve the entire device"
+            );
+        }
     }
 
     cleanup(&root);

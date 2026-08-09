@@ -2783,6 +2783,27 @@ enum FuseAdmissionOp {
 }
 
 impl FuseAdmissionOp {
+    const fn requires_writable_mount(self) -> bool {
+        matches!(
+            self,
+            Self::CopyFileRange
+                | Self::Create
+                | Self::Exchange
+                | Self::Fallocate
+                | Self::Link
+                | Self::Mkdir
+                | Self::Mknod
+                | Self::Removexattr
+                | Self::Rename
+                | Self::Rmdir
+                | Self::Setattr
+                | Self::Setxattr
+                | Self::Symlink
+                | Self::Unlink
+                | Self::Write
+        )
+    }
+
     fn class(self) -> FuseAdmissionClass {
         match self {
             Self::BatchForget
@@ -3285,6 +3306,11 @@ impl FuseVfsAdapter {
     fn admit_fuse_request(&self, op: FuseAdmissionOp) -> Result<(), Errno> {
         use crate::observability::FuseAdmissionReason;
 
+        if self.read_only && op.requires_writable_mount() {
+            return Err(Errno::EROFS);
+        }
+
+        let class = op.class();
         if self.governor.backpressure(BudgetCategory::InodeState) != BackpressureSignal::None {
             let _ = self.emit_governor_prune_notifications();
         }
@@ -3293,7 +3319,6 @@ impl FuseVfsAdapter {
             self.governor.backpressure(op.category()),
             self.governor.global_backpressure(),
         );
-        let class = op.class();
 
         let rejection = match (signal, class, self.fuse_admission_hard_policy) {
             (BackpressureSignal::HardPressure, FuseAdmissionClass::AlwaysAdmit, _) => None,
@@ -12094,6 +12119,27 @@ mod tests {
 
         let after = crate::observability::fuse_admission_reason_snapshot();
         assert!(after.hard_refused_mutating >= before.hard_refused_mutating + 1);
+    }
+
+    #[test]
+    fn fuse_admission_read_only_fence_precedes_governor_pressure() {
+        let governor = governor_with_used(BudgetCategory::MetaCache, 950);
+        let adapter = fresh_test_adapter()
+            .with_governor(governor)
+            .with_read_only();
+
+        assert_eq!(
+            adapter.admit_fuse_request(FuseAdmissionOp::Unlink),
+            Err(Errno::EROFS)
+        );
+    }
+
+    #[test]
+    fn fuse_admission_read_only_fence_preserves_advisory_locks() {
+        let adapter = fresh_test_adapter().with_read_only();
+
+        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Flock), Ok(()));
+        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Setlk), Ok(()));
     }
 
     #[test]
@@ -46203,10 +46249,7 @@ mod tests {
 
         adapter.set_read_only();
 
-        assert_eq!(
-            adapter.dentry_policy.positive_entry_ttl,
-            Duration::from_secs(5)
-        );
+        assert_eq!(adapter.dentry_policy.positive_entry_ttl, Duration::ZERO);
         assert_eq!(adapter.dentry_policy.positive_attr_ttl, Duration::ZERO);
         assert_eq!(adapter.dentry_policy.positive_reply_ttl(), Duration::ZERO);
     }

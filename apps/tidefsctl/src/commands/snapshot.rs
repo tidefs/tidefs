@@ -15,7 +15,7 @@ use tidefs_local_filesystem::{
     LocalStorageAllocatorPolicy, RecoveryPolicy, RootAuthenticationKey, SnapshotDescriptor,
     SnapshotKind, SnapshotRetentionPolicy, SnapshotRetentionReport, SnapshotSummary,
 };
-use tidefs_local_object_store::StoreOptions;
+use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
@@ -943,13 +943,16 @@ fn open_filesystem_with_live_args(
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let pool_name = pool.unwrap_or("<unnamed>");
-        let metadata_dir = import_devices_metadata_dir(devs, pool_name, operation, live_args);
+        let (metadata_dir, device_pool_name, pool_redundancy_policy) =
+            import_devices_metadata_dir(devs, pool_name, operation, live_args);
 
         let root_auth_key =
             super::root_authentication_key_or_exit(&format!("snapshot {operation}"));
         return match LocalFileSystem::open_with_block_devices_and_recovery_policy(
             &metadata_dir,
             devs,
+            &device_pool_name,
+            pool_redundancy_policy,
             StoreOptions::default(),
             root_auth_key,
             recovery_policy,
@@ -957,7 +960,7 @@ fn open_filesystem_with_live_args(
             Ok(fs) => fs,
             Err(err) => {
                 eprintln!(
-                    "tidefsctl snapshot {operation}: failed to open block-device-backed pool '{pool_name}' at {}: {err}",
+                    "tidefsctl snapshot {operation}: failed to open block-device-backed pool '{device_pool_name}' at {}: {err}",
                     metadata_dir.display()
                 );
                 process::exit(1);
@@ -1011,7 +1014,7 @@ fn import_devices_metadata_dir(
     pool_name: &str,
     operation: &str,
     live_args: LivePoolAdminArgs,
-) -> PathBuf {
+) -> (PathBuf, String, PoolRedundancyPolicy) {
     let config = scan_device_pool_config(pool_name, devices, operation);
     super::live_owner::route_or_refuse_active_for_uuid_with_args(
         "snapshot",
@@ -1022,7 +1025,9 @@ fn import_devices_metadata_dir(
         live_args,
     );
 
-    super::offline_pool::metadata_dir("snapshot", operation, &config.pool_uuid)
+    let metadata_dir = super::offline_pool::metadata_dir("snapshot", operation, &config.pool_uuid);
+    let redundancy_policy = PoolRedundancyPolicy::from_label_policy(config.redundancy_policy);
+    (metadata_dir, config.pool_name, redundancy_policy)
 }
 
 fn scan_device_pool_config(
@@ -1380,12 +1385,15 @@ fn snapshot_backing_path(
             super::offline_pool::refuse_runtime_pool_path("snapshot", operation, p);
             p.clone()
         }
-        (None, pool_name, Some(devs)) => import_devices_metadata_dir(
-            devs,
-            pool_name.unwrap_or("<unnamed>"),
-            operation,
-            LivePoolAdminArgs::default(),
-        ),
+        (None, pool_name, Some(devs)) => {
+            import_devices_metadata_dir(
+                devs,
+                pool_name.unwrap_or("<unnamed>"),
+                operation,
+                LivePoolAdminArgs::default(),
+            )
+            .0
+        }
         (None, Some(pool_name), None) => {
             super::live_owner::route_with_args("snapshot", operation, pool_name, live_args)
         }
@@ -1971,9 +1979,11 @@ fn handle_export(args: SnapshotExportArgs) {
         backing_dir,
         mountpoint: args.export_path.clone(),
         pool_name: Some(pool_name),
+        pool_redundancy_policy: tidefs_local_object_store::PoolRedundancyPolicy::default(),
         pool_uuid: None,
         foreground: true,
         debug: false,
+        read_only: false,
         writeback_cache: false,
         coherency_profile:
             tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile::Writeback,

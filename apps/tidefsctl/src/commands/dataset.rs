@@ -18,7 +18,7 @@ use tidefs_dataset_lifecycle::{
 };
 use tidefs_dataset_properties::{self, PropertyKey, PropertySet, PropertyValue};
 use tidefs_local_filesystem::{FileSystemStatfs, LocalFileSystem, RecoveryPolicy};
-use tidefs_local_object_store::StoreOptions;
+use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
@@ -468,6 +468,8 @@ fn open_filesystem_with_live_args(
         return match LocalFileSystem::open_with_block_devices_and_recovery_policy(
             &metadata_dir,
             devs,
+            pool,
+            PoolRedundancyPolicy::from_label_policy(config.redundancy_policy),
             StoreOptions::default(),
             root_auth_key,
             recovery_policy,
