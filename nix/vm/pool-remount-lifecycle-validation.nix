@@ -560,8 +560,9 @@ echo "--- Phase 15: Crash-cycle (SIGKILL without export) ---"
 # - Write fsynced data (committed through txg commit boundary)
 # - Write non-fsynced data while keeping the writer fd open, so FUSE_FLUSH
 #   cannot turn the row into a close-path durability commit. This row is
-#   bounded old-or-new: absent is valid, exact intent-log replay is valid,
-#   corrupted or partial content is not.
+#   bounded old-or-new: absent or the empty post-create/pre-write inode is
+#   valid, exact intent-log replay is valid, corrupted or partial content is
+#   not.
 # - SIGKILL the daemon (simulating crash/power-loss, no clean export)
 # - Detach the dead FUSE mount before starting the recovery mount
 # - Import the pool (exercising committed-root selection + intent replay)
@@ -706,7 +707,7 @@ else
     blocked "crash_cycle_recovery_remount" "crash-recovery import failed"
 fi
 
-# Verify: committed data survived; unfsynced data is absent or exact.
+# Verify: committed data survived; unfsynced data is absent, empty, or exact.
 POST_CRASH_COMMITTED=""
 POST_CRASH_UNCOMMITTED=""
 if [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ]; then
@@ -730,11 +731,13 @@ if [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ]; then
     fi
 
     if [ -f "$CRASH_UNCOMMITTED_FILE" ]; then
-        POST_CRASH_UNCOMMITTED=$(cat "$CRASH_UNCOMMITTED_FILE" 2>/dev/null || true)
-        if [ "$POST_CRASH_UNCOMMITTED" = "$CRASH_UNCOMMITTED_CONTENT" ]; then
+        if ! POST_CRASH_UNCOMMITTED=$(cat "$CRASH_UNCOMMITTED_FILE" 2>/tmp/crash_uncommitted_read.err); then
+            fail "crash_cycle_unfsynced_bounded" "recovered file is unreadable: $(cat /tmp/crash_uncommitted_read.err 2>/dev/null)"
+        elif [ -z "$POST_CRASH_UNCOMMITTED" ] \
+            || [ "$POST_CRASH_UNCOMMITTED" = "$CRASH_UNCOMMITTED_CONTENT" ]; then
             pass "crash_cycle_unfsynced_bounded"
         else
-            fail "crash_cycle_unfsynced_bounded" "expected absent or exact replay, got '$POST_CRASH_UNCOMMITTED'"
+            fail "crash_cycle_unfsynced_bounded" "expected absent, empty pre-write inode, or exact replay, got '$POST_CRASH_UNCOMMITTED'"
         fi
     else
         pass "crash_cycle_unfsynced_bounded"
