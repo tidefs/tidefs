@@ -1992,6 +1992,7 @@ fn handle_export(args: SnapshotExportArgs) {
         dataset_path: None,
         snapshot_name: Some(snapshot_name),
         mount_authority: tidefs_posix_filesystem_adapter_daemon::MountAuthority::standalone(),
+        runtime: tidefs_posix_filesystem_adapter_daemon::MountRuntimeOptions::default(),
     };
 
     if let Err(err) = tidefs_posix_filesystem_adapter_daemon::run_mount(config) {

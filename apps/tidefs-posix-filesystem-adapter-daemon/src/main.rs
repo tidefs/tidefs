@@ -38,7 +38,6 @@ mod write_dispatch;
 mod writeback_reclaim;
 mod xattr_integrity;
 mod xfstests_harness;
-use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
@@ -49,16 +48,11 @@ use crate::runtime::{
     PosixFilesystemAdapterDemoVisibleAnswerRecord,
     FIRST_PUBLICATION_PIPELINE_RESPONSE_REGISTRY_TO_POSIX_FILESYSTEM_ADAPTER_WAKE_CHAIN,
 };
-use tidefs_background_scheduler::{
-    BackgroundScheduler, BackgroundService, ServiceBudget, ServiceError, ServicePriority,
-    TickReport,
-};
-use tidefs_intent_log::IntentLogBuffer;
+use tidefs_dataset_lifecycle::SyncGuarantee;
 use tidefs_local_filesystem::{
-    LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy, RootAuthenticationKey,
-    ROOT_AUTHENTICATION_ENV_VAR,
+    LocalStorageAllocatorPolicy, RootAuthenticationKey, ROOT_AUTHENTICATION_ENV_VAR,
 };
-use tidefs_performance_contract::{ScrubRuntimeObservation, ServiceCurve};
+use tidefs_posix_filesystem_adapter_daemon::mount_options::MountOptions;
 #[cfg(feature = "receipt-demo")]
 use tidefs_schema_codec_posix_filesystem_adapter::CanonicalFixedWidth;
 #[cfg(feature = "receipt-demo")]
@@ -70,162 +64,8 @@ use tidefs_types_posix_filesystem_adapter_core::{
     PosixFilesystemAdapterId128, PosixFilesystemAdapterPolicyBudgetRecipeWitnessRefs,
     PosixFilesystemAdapterProductWakeReceiptRecord,
 };
-use tidefs_vfs_engine::{
-    LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminOutput,
-    LivePoolAdminRequest, LivePoolAdminResponseBody,
-};
 
-use crate::mount_options::MountOptions;
-use tidefs_dataset_lifecycle::SyncGuarantee;
-use tidefs_inode_attributes::timestamp::TimestampPolicy as EngineTimestampPolicy;
-
-const MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
-const MOUNT_VFS_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
-const MOUNT_VFS_TXG_COMMIT_INTERVAL_SECS: u64 = 30;
 const MOUNT_VFS_DEFAULT_BACKGROUND_SCRUB_INTERVAL_SECS: u64 = 0;
-
-struct MountedBackgroundScrubService {
-    store: tidefs_local_object_store::LocalObjectStore,
-    observation: ScrubRuntimeObservation,
-    observation_artifact: Option<PathBuf>,
-    next_tick_not_before: std::time::Instant,
-}
-
-impl MountedBackgroundScrubService {
-    const NAME: &'static str = "mounted-segment-scrub";
-
-    fn open(
-        root: &Path,
-        options: tidefs_local_object_store::StoreOptions,
-        observation_artifact: Option<PathBuf>,
-    ) -> Result<Self, String> {
-        let store = tidefs_local_object_store::LocalObjectStore::open_with_options(root, options)
-            .map_err(|error| format!("open scheduled scrub store: {error}"))?;
-        let service = Self {
-            store,
-            observation: ScrubRuntimeObservation::new(std::process::id()),
-            observation_artifact,
-            next_tick_not_before: std::time::Instant::now(),
-        };
-        service.publish_observation()?;
-        Ok(service)
-    }
-
-    fn publish_observation(&self) -> Result<(), String> {
-        if let Some(path) = self.observation_artifact.as_deref() {
-            write_scrub_runtime_observation(path, &self.observation)?;
-        }
-        Ok(())
-    }
-
-    fn bounded_limit(scheduler_limit: u64, curve_limit: u64) -> u64 {
-        if scheduler_limit == 0 {
-            curve_limit
-        } else {
-            scheduler_limit.min(curve_limit)
-        }
-    }
-}
-
-impl BackgroundService for MountedBackgroundScrubService {
-    fn name(&self) -> &'static str {
-        Self::NAME
-    }
-
-    fn priority(&self) -> ServicePriority {
-        ServicePriority::Critical
-    }
-
-    fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
-        let curve = ServiceCurve::SCRUB_BOUNDED_DEFAULT;
-        let max_records = Self::bounded_limit(budget.max_items, u64::from(curve.max_ops_per_tick));
-        let max_bytes = Self::bounded_limit(budget.max_bytes, curve.max_bytes_per_tick);
-        let report = self
-            .store
-            .run_background_scrub_with_budget(max_records, max_bytes)
-            .map_err(|error| {
-                eprintln!("background-scrub: scheduled tick failed: {error}");
-                ServiceError::Internal {
-                    service: Self::NAME,
-                    message: "object-store scrub tick failed",
-                }
-            })?;
-
-        if report.records_verified > max_records {
-            return Err(ServiceError::BudgetExceeded {
-                service: Self::NAME,
-                limit: max_records,
-                actual: report.records_verified,
-            });
-        }
-        if report.bytes_scanned > max_bytes {
-            return Err(ServiceError::BudgetExceeded {
-                service: Self::NAME,
-                limit: max_bytes,
-                actual: report.bytes_scanned,
-            });
-        }
-
-        if self.store.background_scrub_pending() && budget.max_ms > 0 {
-            self.next_tick_not_before =
-                std::time::Instant::now() + std::time::Duration::from_millis(budget.max_ms);
-        }
-
-        let work_observed =
-            report.segments_scanned > 0 || report.records_verified > 0 || report.bytes_scanned > 0;
-        let work_pending = self.store.background_scrub_pending();
-        if work_observed {
-            self.observation.record_admitted_cycle(
-                report.records_verified,
-                report.bytes_scanned,
-                work_pending,
-            );
-            if work_pending {
-                self.observation.record_budget_throttle();
-            }
-            if let Err(error) = self.publish_observation() {
-                eprintln!("background-scrub: failed to write runtime observation: {error}");
-            }
-        }
-
-        if report.segments_scanned > 0 || report.records_verified > 0 {
-            tracing::info!(
-                target: "tidefs.scrub",
-                segments = report.segments_scanned,
-                records = report.records_verified,
-                bytes = report.bytes_scanned,
-                completed = report.completed,
-                work_pending,
-                "scheduled segment scrub tick completed",
-            );
-        }
-
-        Ok(TickReport {
-            processed: report.records_verified,
-            skipped: 0,
-            errors: 0,
-            items_consumed: report.records_verified,
-            bytes_consumed: report.bytes_scanned,
-            has_more: work_pending,
-        })
-    }
-
-    fn has_work(&self) -> bool {
-        self.store.should_scrub() && std::time::Instant::now() >= self.next_tick_not_before
-    }
-}
-
-/// RAII guard that removes a PID file on drop (clean shutdown).
-/// On SIGKILL the guard never runs, leaving the PID file as validation.
-struct PidFileGuard(Option<PathBuf>);
-
-impl Drop for PidFileGuard {
-    fn drop(&mut self) {
-        if let Some(ref path) = self.0 {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SmokeMountProfile {
@@ -353,745 +193,50 @@ fn run() -> Result<(), String> {
     }
 }
 
-#[allow(unsafe_code)]
-fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
-    let snapshot_name = config.snapshot_name.clone();
-    let snapshot_export = snapshot_name.is_some();
-    let effective_mode = effective_mount_mode(&config);
-    if snapshot_export && config.queue_depth_artifact.is_some() {
-        return Err("--queue-depth-artifact is not supported for snapshot export mounts".into());
-    }
-    if snapshot_export && config.scrub_runtime_observation_artifact.is_some() {
-        return Err(
-            "--scrub-runtime-observation-artifact is not supported for snapshot export mounts"
-                .into(),
-        );
-    }
-    if effective_mode.background_scrub_interval_secs == 0
-        && config.scrub_runtime_observation_artifact.is_some()
-    {
-        return Err(
-            "--scrub-runtime-observation-artifact requires --background-scrub-interval > 0".into(),
-        );
-    }
-    use std::fs;
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
-    use tidefs_local_filesystem::human::local_filesystem::StoreOptions;
-    use tidefs_local_filesystem::vfs_engine_impl::VfsLocalFileSystem;
-    use tidefs_local_filesystem::LocalFileSystem;
-    use tidefs_namespace::Namespace;
-    use tidefs_recovery_loop::{CrashRecoveryLoop, CrashRecoveryState, MountState};
-
-    fs::create_dir_all(&config.store_root).map_err(|e| format!("store: {e}"))?;
-    fs::create_dir_all(&config.mountpoint).map_err(|e| format!("mountpoint: {e}"))?;
-    // PID-file support for crash-recovery testing: write the daemon PID so
-    // test harnesses can signal it. On clean shutdown the guard removes the
-    // file; on SIGKILL the guard never runs, leaving the PID file as validation.
-    let pid_file_path = std::env::var("TIDEFS_PID_FILE").ok().map(PathBuf::from);
-    if let Some(ref path) = pid_file_path {
-        std::fs::write(path, format!("{}", std::process::id()))
-            .map_err(|e| format!("write PID file {}: {e}", path.display()))?;
-    }
-    let _pid_guard = PidFileGuard(pid_file_path);
-
-    // ── Crash recovery detection ───────────────────────────────────────
-    // Detect whether the previous shutdown was unclean and replay
-    // intent-log segments before opening the full filesystem.
-    let mount_state_path = config.store_root.join(".tidefs_mount_state_fuse");
-    if !snapshot_export {
-        let mut recovery = CrashRecoveryLoop::detect(&mount_state_path)
-            .map_err(|e| format!("crash recovery detection: {e}"))?;
-
-        recovery.advance();
-        if recovery.state == CrashRecoveryState::Replay {
-            eprintln!(
-                "Unclean shutdown detected — replaying intent log in {}",
-                config.store_root.display()
-            );
-            let store = tidefs_local_object_store::LocalObjectStore::open(&config.store_root)
-                .map_err(|e| format!("open store for crash recovery: {e}"))?;
-            recovery
-                .run_replay(&store)
-                .map_err(|e| format!("intent log replay failed: {e}"))?;
-            recovery.reconcile_and_finish();
-            eprintln!("Crash recovery complete — pool is ready.");
-        }
-    }
-
-    // ── Namespace loading ─────────────────────────────────────────────
-    // Try to load a persistent namespace from the store. If none exists,
-    // create a fresh one (will be flushed on clean shutdown).
-    let namespace: Option<Arc<Namespace>> = if snapshot_export {
-        None
-    } else {
-        let store = tidefs_local_object_store::LocalObjectStore::open(&config.store_root)
-            .map_err(|e| format!("open store for namespace load: {e}"))?;
-        Some(match Namespace::load(&store) {
-            Ok(ns) => {
-                eprintln!("Loaded persistent namespace from store.");
-                Arc::new(ns)
-            }
-            Err(_) => {
-                eprintln!("No persistent namespace found — creating fresh.");
-                Arc::new(Namespace::new())
-            }
-        })
-    };
-
-    // Mark the mount state dirty for this daemon session.
-    // On clean shutdown the daemon will write Clean.
-    if !snapshot_export {
-        MountState::Dirty
-            .write_to_path(&mount_state_path)
-            .map_err(|e| format!("write mount-state: {e}"))?;
-    }
-
-    let store_options = StoreOptions {
-        background_scrub_interval_secs: effective_mode.background_scrub_interval_secs,
-        reclaim_enabled: !snapshot_export && config.enable_reclaim,
-        fault_injection_config: if snapshot_export {
-            None
-        } else {
-            config.fault_inject_corruption.map(|p| {
-                tidefs_local_object_store::FaultInjectionConfig {
-                    byte_corruption_probability: p,
-                    ..tidefs_local_object_store::FaultInjectionConfig::off()
-                }
-            })
-        },
-        ..StoreOptions::default()
-    };
-    let scrub_interval = effective_mode.background_scrub_interval_secs;
-    let scrub_store_root = config.store_root.clone();
-    let scrub_runtime_observation_artifact = config.scrub_runtime_observation_artifact.clone();
-
-    let open_config = LocalFileSystemOpenConfig {
-        options: store_options,
-        allocator_policy: LocalStorageAllocatorPolicy {
-            content_capacity_bytes: config.content_capacity_bytes,
-            ..LocalStorageAllocatorPolicy::default()
-        },
-        root_authentication_key: config.root_authentication_key,
-        encryption: None,
+fn canonical_mount_config(
+    config: MountVfsConfig,
+) -> tidefs_posix_filesystem_adapter_daemon::MountConfig {
+    let runtime = tidefs_posix_filesystem_adapter_daemon::MountRuntimeOptions {
+        fs_name: config.fs_name,
+        root_authentication_key: Some(config.root_authentication_key),
+        mount_options: config.mount_opts,
+        sync_guarantee: config.sync_guarantee,
+        intent_log_write: config.intent_log_write,
+        content_capacity_bytes: config.content_capacity_bytes,
+        writeback_cache_timeout_secs: config.writeback_cache_timeout,
+        drain_timeout_secs: config.drain_timeout_secs,
+        background_scrub_interval_secs: config.background_scrub_interval_secs,
         compression: config.compression,
-        log_device_device_path: None,
-        recovery_policy: if snapshot_export {
-            tidefs_recovery_loop::RecoveryPolicy::ReadOnly
-        } else if config.enable_repair_writeback {
-            tidefs_recovery_loop::RecoveryPolicy::RepairWriteback
-        } else {
-            tidefs_recovery_loop::RecoveryPolicy::default()
-        },
+        enable_dedup: config.enable_dedup,
+        enable_reclaim: config.enable_reclaim,
+        enable_repair_writeback: config.enable_repair_writeback,
+        fault_inject_corruption: config.fault_inject_corruption,
+        queue_depth_artifact: config.queue_depth_artifact,
+        scrub_runtime_observation_artifact: config.scrub_runtime_observation_artifact,
+    };
+    tidefs_posix_filesystem_adapter_daemon::MountConfig {
+        encryption: None,
+        backing_dir: config.store_root,
+        mountpoint: config.mountpoint,
+        pool_name: None,
+        pool_redundancy_policy: tidefs_local_object_store::PoolRedundancyPolicy::default(),
+        pool_uuid: None,
+        foreground: true,
+        debug: false,
+        read_only: config.read_only,
+        writeback_cache: config.writeback_cache,
+        coherency_profile: config.coherency_profile,
         block_devices: None,
-    };
-
-    let (mut vfs_engine, writeback_tracker) = if let Some(snapshot_name) = snapshot_name.as_deref()
-    {
-        let session =
-            LocalFileSystem::open_snapshot_export(&config.store_root, snapshot_name, open_config)
-                .map_err(|e| format!("open snapshot export `{snapshot_name}`: {e}"))?;
-        let summary = session.summary().clone();
-        eprintln!(
-            "Opened snapshot export `{}` at generation {} root inode {}",
-            summary.snapshot.name,
-            summary.generation,
-            summary.root_inode_id.get()
-        );
-        (
-            session
-                .into_engine()
-                .with_sync_guarantee(SyncGuarantee::Local),
-            None,
-        )
-    } else {
-        let mut lfs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            &config.store_root,
-            open_config,
-        )
-        .map_err(|e| format!("open store: {e}"))?;
-        lfs.set_write_buffer_flush_threshold_bytes(MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES)
-            .map_err(|e| format!("set mounted write-buffer threshold: {e}"))?;
-
-        // Enable org.tidefs:dedup dataset feature when requested by the operator.
-        if config.enable_dedup {
-            use tidefs_types_dataset_feature_flags_core::{FeatureClass, FeatureName};
-            let dedup_name = FeatureName::from_str("org.tidefs:dedup")
-                .expect("org.tidefs:dedup is a valid FeatureName");
-            lfs.feature_flags_mut()
-                .map_err(|e| format!("access dedup feature flags: {e}"))?
-                .enable_feature(dedup_name, FeatureClass::RoCompat)
-                .map_err(|e| format!("enable dedup feature: {e}"))?;
-            lfs.persist_feature_flags()
-                .map_err(|e| format!("persist dedup feature flag: {e}"))?;
-            lfs.refresh_policies_from_features()
-                .map_err(|e| format!("refresh mounted feature policies: {e}"))?;
-        }
-
-        // ── Committed-root validation ──────────────────────────────────────
-        // Validate the committed root discovered during pool import via
-        // BLAKE3 domain-separated chain verification.
-        {
-            let committed_root = lfs.committed_root_pointer();
-            if committed_root.commit_group_id.is_valid() {
-                let root_path = config.store_root.join("tidefs-committed-root");
-                let chain_digest = std::fs::read(&root_path)
-                    .ok()
-                    .and_then(|payload| {
-                        tidefs_local_object_store::txg_manager::CommitGroupManager::decode_root_with_digest(&payload)
-                    })
-                    .and_then(|(_root, digest)| digest);
-                match tidefs_recovery_loop::recovery_loop::validate_committed_root(
-                    committed_root,
-                    chain_digest,
-                ) {
-                    Ok(()) => {
-                        eprintln!(
-                            "Committed root validated: commit_group={} handle={}",
-                            committed_root.commit_group_id.0, committed_root.root_handle,
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                                "warning: committed root validation failed: {e};                          continuing with unvalidated root"
-                            );
-                    }
-                }
-            }
-        }
-
-        // Resolve the effective sync_guarantee: CLI flag overrides catalog value.
-
-        // For the default (Local), consult the dataset catalog for the pool root.
-        let effective_sync_guarantee = if config.sync_guarantee == SyncGuarantee::Local {
-            lfs.dataset_catalog()
-                .sync_guarantee("root")
-                .unwrap_or(SyncGuarantee::Local)
-        } else {
-            config.sync_guarantee
-        };
-        if effective_sync_guarantee != SyncGuarantee::Local {
-            eprintln!(
-                "tidefs-daemon: dataset sync_guarantee={effective_sync_guarantee} (from catalog)"
-            );
-        }
-
-        // Mounted FUSE uses commit-group batching for ordinary metadata writes.
-        // Keep the threshold large enough for metadata bursts while fsync, fsyncdir,
-        // syncfs, and destroy still force the durability barrier.
-        lfs.set_auto_commit(false)
-            .map_err(|e| format!("set mounted auto-commit policy: {e}"))?;
-        lfs.set_commit_group_throughput_profile()
-            .map_err(|e| format!("set mounted commit-group profile: {e}"))?;
-        lfs.set_max_uncommitted_mutations(MOUNT_VFS_MAX_UNCOMMITTED_MUTATIONS)
-            .map_err(|e| format!("set mounted mutation threshold: {e}"))?;
-
-        let writeback_tracker = lfs
-            .clone_writeback_range_tracker()
-            .map_err(|e| format!("attach mounted writeback tracker: {e}"))?;
-        (
-            VfsLocalFileSystem::new(lfs).with_sync_guarantee(effective_sync_guarantee),
-            Some(writeback_tracker),
-        )
-    };
-    let engine_timestamp_policy = if effective_mode.read_only {
-        EngineTimestampPolicy::Noatime
-    } else {
-        match config.mount_opts.timestamp_policy {
-            crate::mount_options::TimestampPolicy::StrictAtime => {
-                EngineTimestampPolicy::Strictatime
-            }
-            crate::mount_options::TimestampPolicy::RelativeAtime => EngineTimestampPolicy::Relatime,
-            crate::mount_options::TimestampPolicy::NoAtime => EngineTimestampPolicy::Noatime,
-        }
-    };
-    vfs_engine
-        .set_timestamp_policy(engine_timestamp_policy)
-        .map_err(|e| format!("set mounted timestamp policy: {e}"))?;
-    if effective_mode.read_only {
-        vfs_engine = vfs_engine.with_read_only();
-    }
-
-    let mut adapter = fuse_vfs_adapter::FuseVfsAdapter::new(
-        Box::new(vfs_engine) as Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send>
-    )
-    .map_err(|e| format!("adapter init: {e:?}"))?
-    .with_coherency_profile(config.coherency_profile);
-    if !snapshot_export {
-        adapter = adapter
-            .with_commit_group_cycle(Arc::new(
-                crate::txg_cycle::CommitGroupCycle::with_store_root(config.store_root.clone()),
-            ))
-            .with_background_scheduler(BackgroundScheduler::new(ServiceBudget::MAINTENANCE_TICK));
-    }
-    if let Some(ref namespace) = namespace {
-        adapter = adapter.with_namespace(Arc::clone(namespace));
-    }
-    // Demand-preemption signal: when set, the background scheduler yields
-
-    // after the current service tick so foreground FUSE I/O is not starved.
-
-    let fuse_demand = Arc::new(AtomicBool::new(false));
-
-    adapter.set_scheduler_preempt_signal(Arc::clone(&fuse_demand));
-    let adapter = if effective_mode.writeback_cache {
-        let writeback_tracker =
-            writeback_tracker.ok_or("writeback cache is unavailable for snapshot export")?;
-        adapter
-            .with_writeback_cache_enabled()
-            .with_writeback_cache_timeout(config.writeback_cache_timeout)
-            .with_writeback_range_tracker(writeback_tracker)
-    } else {
-        adapter.with_writeback_cache_disabled()
-    };
-    let adapter = if config.mount_opts.sync {
-        adapter.with_force_sync_writes()
-    } else {
-        adapter
-    };
-    let adapter_timestamp_policy = if effective_mode.read_only {
-        crate::mount_options::TimestampPolicy::NoAtime
-    } else {
-        config.mount_opts.timestamp_policy
-    };
-    let adapter = adapter
-        .with_timestamp_policy(adapter_timestamp_policy)
-        .with_suppress_dir_atime(config.mount_opts.suppress_dir_atime);
-    let adapter = if effective_mode.read_only {
-        adapter.with_read_only()
-    } else {
-        adapter
-    };
-
-    let adapter = if effective_mode.intent_log_write {
-        let buf = Arc::new(IntentLogBuffer::new());
-        adapter.with_intent_log_buffer(buf)
-    } else {
-        adapter.without_intent_log_write()
-    };
-
-    let mut options = vec![
-        if effective_mode.read_only {
-            fuser::MountOption::RO
-        } else {
-            fuser::MountOption::RW
-        },
-        fuser::MountOption::FSName(config.fs_name.clone()),
-    ];
-    options.extend(fuse_mount_options_for_mode(
-        &config.mount_opts,
-        effective_mode.read_only,
-    ));
-    if effective_mode.writeback_cache {
-        options.push(fuser::MountOption::WritebackCache);
-    }
-
-    let ns_handle = adapter.namespace_handle();
-    let queue_depth_engine = adapter.engine_handle();
-    let bg_scheduler = adapter.background_scheduler_handle();
-    let txg_cycle = if snapshot_export {
-        None
-    } else {
-        Some(adapter.txg_cycle_cell())
-    };
-    let notifier_cell = adapter.notifier_cell();
-    let mmap_coherency = adapter.mmap_coherency_cell();
-    // Diagnostic: confirm namespace availability for FUSE dispatch.
-    if let Some(ref ns) = adapter.namespace_handle() {
-        if ns.get_attrs(1).is_some() {
-            eprintln!("tidefs-daemon: namespace root inode (1) confirmed present");
-        } else {
-            eprintln!("tidefs-daemon: WARNING namespace root inode (1) MISSING");
-        }
-    } else {
-        eprintln!("tidefs-daemon: WARNING namespace is None — FUSE dispatch will use engine only");
-    }
-    let _session = fuser::spawn_mount2(adapter, &config.mountpoint, &options)
-        .map_err(|e| format!("mount: {e}"))?;
-    // Immediate liveness check: if the FUSE background session thread
-    // exited during spawn (panic, init failure, or kernel error), fail
-    // fast instead of entering the scheduler loop with a dead session.
-    if _session.guard.is_finished() {
-        return Err(
-            "FUSE background session exited during mount; refusing to leave a hung mountpoint"
-                .to_string(),
-        );
-    }
-    // Install the notifier so dispatch methods can invalidate kernel caches.
-    *notifier_cell.lock().unwrap() = Some(_session.notifier());
-    // Wait for the FUSE background session thread to enter its run loop
-    // before the main thread acquires scheduler, txg, and scrub locks.
-    // Avoid std::fs::metadata() on the mountpoint: reentrant FUSE access
-    // (the daemon calling stat() on its own mount) can deadlock with the
-    // kernel FUSE device lock when a concurrent directory operation (e.g.
-    // mkdir) holds the parent inode rwsem.
-    //
-    // Instead use a bounded yield loop with a session-liveness guard.
-    // The background thread enters its read loop within a few hundred ms
-    // of spawn; a 3 s budget covers slow TCG-mode QEMU guests.
-    for _attempt in 0..15 {
-        if _session.guard.is_finished() {
-            return Err("FUSE background session exited during mount readiness wait; refusing to leave a hung mountpoint".to_string());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-
-    let mode = if effective_mode.read_only { "RO" } else { "RW" };
-    eprintln!(
-        "Mounted TideFS (VFS engine) at {} ({})",
-        config.mountpoint.display(),
-        mode
-    );
-
-    // Refuse idmapped mounts: TideFS does not support idmapped mount
-    // UID/GID translation in the current FUSE adapter boundary.
-    tidefs_posix_filesystem_adapter_daemon::check_idmapped_mount(&config.mountpoint)?;
-
-    // Register mounted scrub with the same bounded scheduler that drives the
-    // daemon's other idle-period maintenance. The service clamps each tick to
-    // the typed scrub service curve and retains its cursor between ticks.
-    if scrub_interval > 0 {
-        let scrub_options = StoreOptions {
-            background_scrub_interval_secs: scrub_interval,
-            reclaim_enabled: config.enable_reclaim,
-            ..StoreOptions::default()
-        };
-        let observation_required = scrub_runtime_observation_artifact.is_some();
-        match MountedBackgroundScrubService::open(
-            &scrub_store_root,
-            scrub_options,
-            scrub_runtime_observation_artifact,
-        ) {
-            Ok(service) => {
-                let mut scheduler = bg_scheduler.lock().unwrap();
-                let scheduler = scheduler
-                    .as_mut()
-                    .ok_or("background scrub requires the mounted background scheduler")?;
-                scheduler.register(Box::new(service));
-                eprintln!("background-scrub: scheduled (interval={scrub_interval}s)");
-            }
-            Err(error) if observation_required => {
-                return Err(format!("background-scrub: {error}"));
-            }
-            Err(error) => {
-                eprintln!("background-scrub: disabled after setup failure: {error}");
-            }
-        }
-    }
-
-    // ── Clean shutdown via SIGINT/SIGTERM ─────────────────────────
-    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let shutdown_for_sig = std::sync::Arc::clone(&shutdown_flag);
-    let msp_for_sig = mount_state_path.clone();
-
-    std::thread::spawn(move || {
-        // SAFETY: `sigset_t` is a C value type and zeroed storage is the libc
-        // initialization baseline before `sigemptyset` populates it.
-        let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `sigset` is a valid stack-owned signal set. The selected
-        // signals are valid constants, and the null old-mask pointer records
-        // that the previous thread mask is intentionally not retained.
-        unsafe {
-            libc::sigemptyset(&mut sigset);
-            libc::sigaddset(&mut sigset, libc::SIGINT);
-            libc::sigaddset(&mut sigset, libc::SIGTERM);
-            libc::sigaddset(&mut sigset, libc::SIGHUP);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
-        }
-        loop {
-            let mut caught_sig: libc::c_int = 0;
-            // SAFETY: `sigset` remains initialized for the thread lifetime and
-            // `caught_sig` is a valid out pointer for the delivered signal.
-            let rc = unsafe { libc::sigwait(&sigset, &mut caught_sig) };
-            if rc == 0 {
-                shutdown_for_sig.store(true, std::sync::atomic::Ordering::Relaxed);
-                break;
-            }
-        }
-    });
-
-    // -- Periodic commit_group commit cycle ---------------------------------
-    let txg_shutdown = Arc::clone(&shutdown_flag);
-    let txg_handle = txg_cycle.map(|txg_cycle_for_loop| {
-        std::thread::spawn(move || {
-            crate::txg_cycle::CommitGroupCycle::spawn_periodic_commit_loop(
-                txg_cycle_for_loop,
-                txg_shutdown,
-                std::time::Duration::from_secs(MOUNT_VFS_TXG_COMMIT_INTERVAL_SECS),
-            );
-        })
-    });
-
-    // Wait until a shutdown signal arrives, running background scheduler
-    // cycles, including mounted scrub, during FUSE idle periods. Uses
-    // tick_if_idle() to avoid
-    // starting work when the demand-preemption signal is asserted.
-    // Each cycle is bounded by the MAINTENANCE_TICK budget (50ms max)
-    // to avoid starving the FUSE dispatch thread.
-    //
-    // Periodically check whether the FUSE background session thread is still
-    // alive.  If the session thread exits (panic, unhandled kernel error, or
-    // normal teardown), the /dev/fuse fd may remain open via the notifier
-    // clone held by BackgroundSession, causing guest filesystem I/O to hang
-    // indefinitely.  Detecting the thread exit and shutting down prevents
-    // that hang and lets the kernel properly unmount.
-    let mut idle_cycles: u64 = 0;
-    let mut loop_iter: u64 = 0;
-    while !shutdown_flag.load(Ordering::Relaxed) {
-        loop_iter = loop_iter.saturating_add(1);
-        let report_opt = bg_scheduler.lock().unwrap().as_mut().and_then(|sched| {
-            let cycle_start = std::time::Instant::now();
-            let result = sched.tick_if_idle();
-            if result.is_some() {
-                crate::observability::HIST_BG_SCHEDULER.record(cycle_start.elapsed());
-            }
-            result
-        });
-        match report_opt {
-            Some(report) => {
-                if report.preempted {
-                    tracing::debug!(
-                        target: "tidefs.bg_scheduler",
-                        services_ran = report.services_ran,
-                        total_processed = report.total_processed,
-                        wall_ms = report.wall_ms,
-                        preempted = true,
-                        "background scheduler cycle preempted",
-                    );
-                } else {
-                    tracing::debug!(
-                        target: "tidefs.bg_scheduler",
-                        services_ran = report.services_ran,
-                        services_skipped = report.services_skipped,
-                        total_processed = report.total_processed,
-                        total_errors = report.total_errors,
-                        wall_ms = report.wall_ms,
-                        "background scheduler cycle completed",
-                    );
-                }
-                std::thread::yield_now();
-            }
-            None => {
-                idle_cycles = idle_cycles.saturating_add(1);
-                if idle_cycles % 60 == 0 {
-                    tracing::info!(
-                        target: "tidefs.bg_scheduler",
-                        idle_cycles = idle_cycles,
-                        "background scheduler periodic summary",
-                    );
-                    crate::observability::HIST_BG_SCHEDULER.emit_summary("bg_scheduler_cycle");
-                }
-                std::thread::park_timeout(std::time::Duration::from_millis(500));
-                // Drain pending mmap coherency invalidation events.
-                // Budget: at most 16 events per tick to bound latency.
-                mmap_coherency.process_tick(16);
-            }
-        }
-
-        // Check whether the FUSE background session thread is still alive
-        // on every loop iteration, not just idle cycles.  If the session
-        // thread exits (panic, unhandled kernel error, or normal teardown),
-        // shut down immediately to prevent guest filesystem I/O from
-        // hanging indefinitely on a dead mountpoint.
-        if loop_iter % 2 == 0 && _session.guard.is_finished() {
-            eprintln!(
-                "FUSE background session thread exited prematurely;                  shutting down to prevent hung mountpoint"
-            );
-            // Diagnostic: if the session already finished, try to join and report the outcome.
-            // We cannot join() here because it consumes self, but we can inspect the guard.
-            tracing::error!(
-                target: "tidefs.fuse_session",
-                "FUSE background session thread finished prematurely on mount {}",
-                _session.mountpoint.display()
-            );
-            shutdown_flag.store(true, Ordering::Relaxed);
-        }
-    }
-    crate::observability::emit_all_summaries();
-    eprintln!("Shutting down TideFS at {}...", config.mountpoint.display());
-
-    // Drain grace period: allow in-flight FUSE requests to complete
-    // naturally before forcing unmount.
-    if config.drain_timeout_secs > 0 {
-        eprintln!(
-            "Draining in-flight requests for {}s...",
-            config.drain_timeout_secs
-        );
-        std::thread::sleep(std::time::Duration::from_secs(config.drain_timeout_secs));
-    }
-
-    // Wait for the periodic commit_group commit loop to finish its final flush.
-    if let Some(handle) = txg_handle {
-        let _ = handle.join();
-    }
-
-    // Drop scheduled maintenance stores before unmount and the final
-    // namespace flush open the backing store again.
-    *bg_scheduler.lock().unwrap() = None;
-
-    // Unmount and join the FUSE background session.  The session's Drop
-    // triggers adapter.destroy() which flushes writeback data via shutdown().
-    _session.join();
-
-    if let Some(path) = &config.queue_depth_artifact {
-        write_queue_depth_runtime_artifact(
-            &queue_depth_engine,
-            path,
-            "fuse-smoke-mount-quick",
-            "fuse",
-        )?;
-    }
-
-    // ── Persistent namespace flush ────────────────────────────────────
-    if let Some(ns_handle) = ns_handle {
-        let mut ns_store = tidefs_local_object_store::LocalObjectStore::open(&config.store_root)
-            .map_err(|e| format!("open store for namespace flush: {e}"))?;
-        ns_handle
-            .flush(&mut ns_store)
-            .map_err(|e| format!("namespace flush failed: {e:?}"))?;
-        eprintln!("Persistent namespace flushed to store.");
-    }
-
-    if !snapshot_export {
-        MountState::Clean
-            .write_to_path(&msp_for_sig)
-            .map_err(|e| format!("write clean mount-state: {e}"))?;
-    }
-    Ok(())
-}
-
-fn write_scrub_runtime_observation(
-    path: &Path,
-    observation: &ScrubRuntimeObservation,
-) -> Result<(), String> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "create scrub runtime observation dir {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
-    let bytes = serde_json::to_vec_pretty(observation)
-        .map_err(|error| format!("encode scrub runtime observation: {error}"))?;
-    let temp_path = path.with_extension(format!("tmp-{}", observation.daemon_pid));
-    std::fs::write(&temp_path, bytes).map_err(|error| {
-        format!(
-            "write scrub runtime observation temp file {}: {error}",
-            temp_path.display()
-        )
-    })?;
-    std::fs::rename(&temp_path, path).map_err(|error| {
-        format!(
-            "publish scrub runtime observation {}: {error}",
-            path.display()
-        )
-    })?;
-    Ok(())
-}
-
-fn write_queue_depth_runtime_artifact(
-    engine: &crate::live_owner::LiveOwnerEngine,
-    path: &Path,
-    workload: &str,
-    mount_adapter: &str,
-) -> Result<(), String> {
-    let mut args = BTreeMap::new();
-    args.insert(
-        "workload".to_string(),
-        LivePoolAdminArg::String(workload.to_string()),
-    );
-    args.insert(
-        "mount_adapter".to_string(),
-        LivePoolAdminArg::String(mount_adapter.to_string()),
-    );
-    args.insert(
-        "artifact_path".to_string(),
-        LivePoolAdminArg::String(path.display().to_string()),
-    );
-    let mut request =
-        LivePoolAdminRequest::new(LivePoolAdminCommand::PerformanceAdmissionSnapshot, "root");
-    request.output = LivePoolAdminOutput::MachineJson;
-    request.args = LivePoolAdminArgs(args);
-    let response = {
-        let engine = engine
-            .lock()
-            .map_err(|_| "queue-depth artifact engine lock poisoned".to_string())?;
-        engine
-            .live_pool_admin_request(&request)
-            .map_err(|err| format!("queue-depth artifact request failed: {err:?}"))?
-    };
-    if response.exit_code != 0 {
-        let message = match &response.body {
-            LivePoolAdminResponseBody::Error { message, .. } => message.as_str(),
-            _ => "unknown error",
-        };
-        return Err(format!("queue-depth artifact response failed: {message}"));
-    }
-    let artifact = match response.body {
-        LivePoolAdminResponseBody::MachineJson(json) => json,
-        _ => return Err("queue-depth artifact response did not include machine JSON".to_string()),
-    };
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "create queue-depth artifact dir {}: {err}",
-                parent.display()
-            )
-        })?;
-    }
-    let artifact: serde_json::Value = serde_json::from_str(&artifact)
-        .map_err(|err| format!("decode queue-depth artifact JSON: {err}"))?;
-    let bytes = serde_json::to_vec_pretty(&artifact)
-        .map_err(|err| format!("encode queue-depth artifact JSON: {err}"))?;
-    std::fs::write(path, bytes)
-        .map_err(|err| format!("write queue-depth artifact {}: {err}", path.display()))?;
-    eprintln!("queue_depth_runtime_artifact={}", path.display());
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct EffectiveMountMode {
-    read_only: bool,
-    writeback_cache: bool,
-    intent_log_write: bool,
-    background_scrub_interval_secs: u64,
-}
-
-fn effective_mount_mode(config: &MountVfsConfig) -> EffectiveMountMode {
-    let snapshot_export = config.snapshot_name.is_some();
-    EffectiveMountMode {
-        read_only: config.read_only || snapshot_export,
-        writeback_cache: config.writeback_cache && !snapshot_export,
-        intent_log_write: config.intent_log_write && !snapshot_export,
-        background_scrub_interval_secs: if snapshot_export {
-            0
-        } else {
-            config.background_scrub_interval_secs
-        },
+        import_owner: None,
+        dataset_path: None,
+        snapshot_name: config.snapshot_name,
+        mount_authority: tidefs_posix_filesystem_adapter_daemon::MountAuthority::standalone(),
+        runtime,
     }
 }
 
-fn fuse_mount_options_for_mode(
-    mount_opts: &MountOptions,
-    read_only: bool,
-) -> Vec<fuser::MountOption> {
-    let mut effective = mount_opts.clone();
-    // Read-write mounts keep the kernel-visible atime policy so cached reads
-    // update user-visible attrs. The adapter still records read access in the
-    // engine/namespace authority; read-only mounts suppress both paths.
-    if read_only {
-        effective.timestamp_policy = crate::mount_options::TimestampPolicy::NoAtime;
-    }
-    effective.to_fuse_mount_options()
+fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
+    tidefs_posix_filesystem_adapter_daemon::run_mount(canonical_mount_config(config))
 }
 
 /// Configuration for mount-vfs subcommand.
@@ -1132,7 +277,8 @@ pub struct MountVfsConfig {
     /// Coherency profile for FUSE caching behaviour.
     /// Default: Writeback for TTL/invalidation only; kernel writeback remains
     /// opt-in through `writeback_cache`.
-    pub coherency_profile: crate::coherency_profile::CoherencyProfile,
+    pub coherency_profile:
+        tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile,
     /// Optional per-object compression configuration for the backing store.
     /// When set, all objects written to the pool are compressed with the
     /// specified algorithm and level.  Omitted by default (no compression).
@@ -1303,7 +449,7 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
                 let val = iter
                     .next()
                     .ok_or("--coherency requires a profile name: strict, writeback, nearline, async, offline")?;
-                let profile: crate::coherency_profile::CoherencyProfile = val
+                let profile: tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile = val
                     .parse()
                     .map_err(|e: String| format!("invalid coherency profile: {e}"))?;
                 cache_profile = Some(profile);
@@ -4642,7 +3788,8 @@ mod tests {
     #[test]
     fn read_write_mount_preserves_kernel_atime_policy() {
         let opts = MountOptions {
-            timestamp_policy: crate::mount_options::TimestampPolicy::StrictAtime,
+            timestamp_policy:
+                tidefs_posix_filesystem_adapter_daemon::mount_options::TimestampPolicy::StrictAtime,
             suppress_dir_atime: false,
             sync: false,
             sync_guarantee: SyncGuarantee::Local,
@@ -4652,15 +3799,16 @@ mod tests {
         };
 
         assert_eq!(
-            fuse_mount_options_for_mode(&opts, false),
+            opts.to_fuse_mount_options(),
             vec![fuser::MountOption::StrictAtime]
         );
     }
 
     #[test]
-    fn read_only_mount_forces_kernel_noatime_policy() {
+    fn mount_vfs_translation_preserves_kernel_option_inputs() {
         let opts = MountOptions {
-            timestamp_policy: crate::mount_options::TimestampPolicy::StrictAtime,
+            timestamp_policy:
+                tidefs_posix_filesystem_adapter_daemon::mount_options::TimestampPolicy::StrictAtime,
             suppress_dir_atime: false,
             sync: true,
             sync_guarantee: SyncGuarantee::Local,
@@ -4668,14 +3816,13 @@ mod tests {
             dev: true,
             intent_log_write: false,
         };
+        let mut config = parse_mount_vfs_config(required_mount_args()).expect("parse mount config");
+        config.read_only = true;
+        config.mount_opts = opts.clone();
+        let translated = canonical_mount_config(config);
 
-        let mount_options = fuse_mount_options_for_mode(&opts, true);
-
-        assert!(mount_options.contains(&fuser::MountOption::NoAtime));
-        assert!(!mount_options.contains(&fuser::MountOption::StrictAtime));
-        assert!(mount_options.contains(&fuser::MountOption::Sync));
-        assert!(mount_options.contains(&fuser::MountOption::AllowOther));
-        assert!(mount_options.contains(&fuser::MountOption::Dev));
+        assert!(translated.read_only);
+        assert_eq!(translated.runtime.mount_options, opts);
     }
 
     #[test]
@@ -4751,13 +3898,12 @@ mod tests {
         args.push("60".to_string());
 
         let config = parse_mount_vfs_config(args).expect("parse mount config");
-        let mode = effective_mount_mode(&config);
+        let translated = canonical_mount_config(config);
 
-        assert_eq!(config.snapshot_name.as_deref(), Some("snap0"));
-        assert!(!config.read_only);
-        assert!(mode.read_only);
-        assert!(!mode.writeback_cache);
-        assert!(!mode.intent_log_write);
-        assert_eq!(mode.background_scrub_interval_secs, 0);
+        assert_eq!(translated.snapshot_name.as_deref(), Some("snap0"));
+        assert!(!translated.read_only);
+        assert!(translated.writeback_cache);
+        assert!(translated.runtime.intent_log_write);
+        assert_eq!(translated.runtime.background_scrub_interval_secs, 60);
     }
 }
