@@ -159,6 +159,7 @@ impl<'a> FuseCaller<'a> {
 /// - `requested` — access bits from [`fuse_access_requested_from_mask`]
 ///   or the re-exported [`ACCESS_READ`], [`ACCESS_WRITE`],
 ///   [`ACCESS_EXECUTE`], or [`ACCESS_NONE`] constants.
+///
 /// Returns `Ok(())` when all requested access bits are granted, or
 /// `Err(EACCES)` when denied.
 pub fn check_fuse_access(
