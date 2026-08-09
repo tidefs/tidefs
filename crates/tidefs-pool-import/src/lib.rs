@@ -335,8 +335,6 @@ struct LabelAgreementMember {
     device_count: u32,
     /// Committed txg recorded in the label.
     committed_txg: u64,
-    /// Authenticated committed-root evidence recovered from the member.
-    committed_root: Option<CommittedRoot>,
     /// Pool-wide redundancy policy recorded in the label.
     redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy,
     /// Device class recorded in the label.
@@ -351,6 +349,19 @@ struct LabelAgreementMember {
     device_layout_v1: Option<tidefs_types_pool_label_core::DeviceLayoutV1Bytes>,
     /// Pool state recorded in the label.
     pool_state: tidefs_types_pool_label_core::PoolState,
+}
+
+/// Fixed-region committed-root agreement used only by full import recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommittedRootAgreementReport {
+    members: Vec<CommittedRootAgreementMember>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommittedRootAgreementMember {
+    device_path: PathBuf,
+    committed_txg: u64,
+    committed_root: Option<CommittedRoot>,
 }
 
 // ---------------------------------------------------------------------------
@@ -373,8 +384,11 @@ pub fn pool_import(
     encryption_key: Option<tidefs_encryption::StoreKey>,
     min_epoch: Option<u64>,
 ) -> Result<ImportedPool, ImportError> {
-    let label_agreement = build_label_agreement_report_for_paths(device_paths, min_epoch)?;
+    let label_agreement = build_label_agreement_report_for_paths(device_paths)?;
     verify_label_agreement(&label_agreement)?;
+    let committed_root_agreement =
+        build_committed_root_agreement_report_for_paths(device_paths, min_epoch)?;
+    verify_committed_root_agreement(&committed_root_agreement)?;
 
     let entries = tidefs_pool_scan::scan_labels(device_paths)
         .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
@@ -402,9 +416,20 @@ pub fn pool_import_owned(
     lock_dir: &Path,
     read_only: bool,
     encryption_key: Option<tidefs_encryption::StoreKey>,
-    min_epoch: Option<u64>,
 ) -> Result<PoolImportOwner, ImportError> {
-    let imported = pool_import(device_paths, lock_dir, read_only, encryption_key, min_epoch)?;
+    let label_agreement = build_label_agreement_report_for_paths(device_paths)?;
+    verify_label_agreement(&label_agreement)?;
+
+    let entries = tidefs_pool_scan::scan_labels(device_paths)
+        .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
+    let config = tidefs_pool_scan::PoolAssembler::assemble(&entries, None)
+        .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
+    let mut admission = PoolImport::new(config, lock_dir, encryption_key, None);
+    let stats = admission.admit_owned(read_only)?;
+    let imported = ImportedPool {
+        config: admission.config().clone(),
+        stats,
+    };
     Ok(PoolImportOwner {
         imported,
         device_paths: device_paths.to_vec(),
@@ -751,7 +776,6 @@ const SUPPORTED_COMPAT_FEATURES: u64 = tidefs_types_pool_label_core::features::D
 
 fn build_label_agreement_report_for_paths(
     device_paths: &[PathBuf],
-    min_epoch: Option<u64>,
 ) -> Result<LabelAgreementReport, ImportError> {
     let mut members = Vec::with_capacity(device_paths.len());
 
@@ -766,12 +790,10 @@ fn build_label_agreement_report_for_paths(
             label.features_ro_compat,
             label.features_compat,
         )?;
-        let committed_root = recover_member_committed_root(&mut file, device_path, min_epoch)?;
         members.push(label_agreement_member(
             device_path.clone(),
             label,
             device_layout_v1,
-            committed_root,
         ));
     }
 
@@ -780,7 +802,6 @@ fn build_label_agreement_report_for_paths(
 
 fn build_label_agreement_report_for_devices(
     devices: &mut [DeviceHandle],
-    min_epoch: Option<u64>,
 ) -> Result<LabelAgreementReport, ImportError> {
     let mut members = Vec::with_capacity(devices.len());
 
@@ -804,17 +825,63 @@ fn build_label_agreement_report_for_devices(
             label.features_ro_compat,
             label.features_compat,
         )?;
-        let committed_root =
-            recover_member_committed_root(&mut device.file, &device.device_path, min_epoch)?;
         members.push(label_agreement_member(
             device.device_path.clone(),
             label,
             device_layout_v1,
-            committed_root,
         ));
     }
 
     Ok(LabelAgreementReport { members })
+}
+
+fn build_committed_root_agreement_report_for_paths(
+    device_paths: &[PathBuf],
+    min_epoch: Option<u64>,
+) -> Result<CommittedRootAgreementReport, ImportError> {
+    let mut members = Vec::with_capacity(device_paths.len());
+
+    for device_path in device_paths {
+        let mut file = File::open(device_path).map_err(|e| ImportError::DeviceOpen {
+            device_path: device_path.clone(),
+            msg: e.to_string(),
+        })?;
+        let (label, _) = read_member_label_from_file(&mut file, device_path)?;
+        let committed_root = recover_member_committed_root(&mut file, device_path, min_epoch)?;
+        members.push(CommittedRootAgreementMember {
+            device_path: device_path.clone(),
+            committed_txg: label.commit_group,
+            committed_root,
+        });
+    }
+
+    Ok(CommittedRootAgreementReport { members })
+}
+
+fn build_committed_root_agreement_report_for_devices(
+    devices: &mut [DeviceHandle],
+    min_epoch: Option<u64>,
+) -> Result<CommittedRootAgreementReport, ImportError> {
+    let mut members = Vec::with_capacity(devices.len());
+
+    for device in devices {
+        let label_buf = device.read_label_bytes()?;
+        let label = tidefs_types_pool_label_core::decode_label(&label_buf).map_err(|e| {
+            ImportError::Io {
+                device_path: Some(device.device_path.clone()),
+                msg: format!("decode label: {e}"),
+            }
+        })?;
+        let committed_root =
+            recover_member_committed_root(&mut device.file, &device.device_path, min_epoch)?;
+        members.push(CommittedRootAgreementMember {
+            device_path: device.device_path.clone(),
+            committed_txg: label.commit_group,
+            committed_root,
+        });
+    }
+
+    Ok(CommittedRootAgreementReport { members })
 }
 
 fn read_member_label_from_file(
@@ -876,7 +943,6 @@ fn label_agreement_member(
     device_path: PathBuf,
     label: tidefs_types_pool_label_core::PoolLabelV1,
     device_layout_v1: Option<tidefs_types_pool_label_core::DeviceLayoutV1Bytes>,
-    committed_root: Option<CommittedRoot>,
 ) -> LabelAgreementMember {
     LabelAgreementMember {
         device_path,
@@ -887,7 +953,6 @@ fn label_agreement_member(
         topology_generation: label.topology_generation,
         device_count: label.device_count,
         committed_txg: label.commit_group,
-        committed_root,
         redundancy_policy: label.redundancy_policy,
         device_class: label.device_class,
         features_incompat: label.features_incompat,
@@ -918,7 +983,7 @@ fn verify_label_agreement(report: &LabelAgreementReport) -> Result<(), ImportErr
     ensure_topology_generations_agree(report)?;
     ensure_device_counts_agree(report)?;
     ensure_pool_states_agree(report)?;
-    ensure_committed_roots_agree(report)?;
+    ensure_committed_txgs_agree(report)?;
     ensure_redundancy_policies_agree(report)?;
     ensure_device_classes_agree(report)?;
     ensure_feature_flags_agree(report)?;
@@ -1032,7 +1097,7 @@ fn ensure_pool_states_agree(report: &LabelAgreementReport) -> Result<(), ImportE
     Ok(())
 }
 
-fn ensure_committed_roots_agree(report: &LabelAgreementReport) -> Result<(), ImportError> {
+fn ensure_committed_txgs_agree(report: &LabelAgreementReport) -> Result<(), ImportError> {
     let first_txg = report.members[0].committed_txg;
     if report
         .members
@@ -1064,6 +1129,19 @@ fn ensure_committed_roots_agree(report: &LabelAgreementReport) -> Result<(), Imp
                 .iter()
                 .map(|member| member.committed_txg.to_string())
                 .collect(),
+        });
+    }
+
+    Ok(())
+}
+
+fn verify_committed_root_agreement(
+    report: &CommittedRootAgreementReport,
+) -> Result<(), ImportError> {
+    if report.members.is_empty() {
+        return Err(ImportError::Io {
+            device_path: None,
+            msg: "no candidate member roots supplied for import".to_string(),
         });
     }
 
@@ -1221,22 +1299,18 @@ fn ensure_device_layout_records_decode(report: &LabelAgreementReport) -> Result<
     Ok(())
 }
 
-fn committed_root_value(member: &LabelAgreementMember) -> String {
+fn committed_root_value(member: &CommittedRootAgreementMember) -> String {
     match &member.committed_root {
         Some(root) => format!(
-            "{}:member={} index={} txg={} root_epoch={} root_hash={}",
+            "{}:txg={} root_epoch={} root_hash={}",
             member.device_path.display(),
-            hex_uuid(&member.member_uuid),
-            member.device_index,
             member.committed_txg,
             root.epoch_number,
             hex_digest_prefix(&root.commitment_hash),
         ),
         None => format!(
-            "{}:member={} index={} txg={} root=none",
+            "{}:txg={} root=none",
             member.device_path.display(),
-            hex_uuid(&member.member_uuid),
-            member.device_index,
             member.committed_txg
         ),
     }
@@ -1311,6 +1385,29 @@ impl PoolImport {
     #[must_use]
     pub fn config(&self) -> &PoolConfig {
         &self.pool_config
+    }
+
+    /// Admit devices for the mounted owner without selecting or replaying
+    /// filesystem state. Full import recovery remains in [`Self::import`] and
+    /// [`Self::import_readonly`].
+    fn admit_owned(&mut self, read_only: bool) -> Result<PoolImportStats, ImportError> {
+        let start = Instant::now();
+        self.read_only = read_only;
+        self.stats.read_only = read_only;
+
+        self.acquire_import_lock()?;
+        if read_only {
+            self.open_devices_readonly()?;
+        } else {
+            self.open_devices()?;
+        }
+        self.verify_superblock()?;
+        if !read_only {
+            self.activate_pool_labels()?;
+        }
+        self.detect_in_progress_removal();
+        self.stats.import_time_ms = start.elapsed().as_millis() as u64;
+        Ok(self.stats.clone())
     }
 
     /// Import the pool read/write.  This is the primary entry point.
@@ -1490,7 +1587,7 @@ impl PoolImport {
             });
         }
 
-        let report = build_label_agreement_report_for_devices(&mut self.devices, self.min_epoch)?;
+        let report = build_label_agreement_report_for_devices(&mut self.devices)?;
         verify_label_agreement(&report)?;
         let first = &report.members[0];
 
@@ -1546,8 +1643,9 @@ impl PoolImport {
     /// For read-only import, the committed root is still recovered
     /// (verification is cheap and provides confidence in pool integrity).
     fn recover_committed_root(&mut self) -> Result<(), ImportError> {
-        let report = build_label_agreement_report_for_devices(&mut self.devices, self.min_epoch)?;
-        verify_label_agreement(&report)?;
+        let report =
+            build_committed_root_agreement_report_for_devices(&mut self.devices, self.min_epoch)?;
+        verify_committed_root_agreement(&report)?;
         let root = report.members[0].committed_root.clone();
 
         if root.is_none() && self.recovery_commit_group > 0 {
@@ -1686,9 +1784,15 @@ impl PoolImport {
     // Step 6: activate pool
     // ------------------------------------------------------------------
 
-    /// Transition the pool state to ACTIVE, making it ready for I/O.
-    /// Transition the pool state to ACTIVE on every leaf device label.
+    /// Activate labels and initialize the fixed-region VRBT for full import.
     fn activate_pool(&mut self) -> Result<(), ImportError> {
+        self.activate_pool_labels()?;
+        self.initialize_vrbt_for_full_import()
+    }
+
+    /// Transition every leaf label to ACTIVE without changing filesystem or
+    /// fixed-region recovery state.
+    fn activate_pool_labels(&mut self) -> Result<(), ImportError> {
         if self.read_only {
             return Ok(());
         }
@@ -1742,17 +1846,33 @@ impl PoolImport {
                 "activate",
             )?;
             device.write_label_bytes(&out_buf)?;
+        }
 
-            // Write the initial VRBT committed-root block to the system area
-            // so that future intent-log replay can locate the intent-log region.
-            // At activation time intent_log_tail is 0 (no intent-log records yet).
+        Ok(())
+    }
+
+    /// Initialize the legacy fixed-region VRBT only for callers of full
+    /// import. Mounted ownership admission deliberately never calls this.
+    fn initialize_vrbt_for_full_import(&mut self) -> Result<(), ImportError> {
+        if self.read_only {
+            return Ok(());
+        }
+
+        for device in &mut self.devices {
+            let label_buf = device.read_label_bytes()?;
+            let label = tidefs_types_pool_label_core::decode_label(&label_buf).map_err(|e| {
+                ImportError::Io {
+                    device_path: Some(device.device_path.clone()),
+                    msg: format!("decode active label: {e}"),
+                }
+            })?;
             let vrbt_bytes = encode_initial_vrbt(
-                recovery_cg,
-                old_label.system_area_pointer,
-                old_label.system_area_size,
+                self.recovery_commit_group,
+                label.system_area_pointer,
+                label.system_area_size,
             );
             if let Some(vrbt) = vrbt_bytes {
-                let vrbt_offset = old_label.system_area_pointer + (VRBT_BLOCK_INDEX as u64) * 4096;
+                let vrbt_offset = label.system_area_pointer + (VRBT_BLOCK_INDEX as u64) * 4096;
                 device.write_bytes_at(vrbt_offset, &vrbt)?;
             }
         }
@@ -3516,7 +3636,7 @@ mod tests {
         let vrbt_end = vrbt_start + VRBT_WIRE_SIZE;
 
         let lock_dir = dir.path().join("locks");
-        let owner = pool_import_owned(&[dev_path.clone()], &lock_dir, true, None, None).unwrap();
+        let owner = pool_import_owned(&[dev_path.clone()], &lock_dir, true, None).unwrap();
         assert!(owner.imported().stats.read_only);
 
         let lock_path = lock_dir.join(hex_uuid(&pool_guid));
@@ -3555,6 +3675,101 @@ mod tests {
     }
 
     #[test]
+    fn writable_owner_admission_preserves_committed_root_and_vrbt() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("device0");
+        {
+            let f = File::create(&dev_path).unwrap();
+            f.set_len(2 * 1024 * 1024).unwrap();
+        }
+
+        let pool_guid = [0xD2u8; 16];
+        let config = crate::create::PoolCreateConfig {
+            pool_name: "writable_owner_admission".into(),
+            pool_guid: Some(pool_guid),
+            redundancy: crate::create::RedundancyPolicy::replicated(1),
+            encryption_key: None,
+            clustered: false,
+        };
+        crate::create::PoolCreator::create_pool(&[dev_path.clone()], &config).unwrap();
+
+        let initial = fs::read(&dev_path).unwrap();
+        let label = tidefs_types_pool_label_core::decode_label(
+            &initial[..tidefs_types_pool_label_core::POOL_LABEL_SIZE],
+        )
+        .unwrap();
+        let committed_root_start = crate::committed_root::COMMIT_RECORD_REGION_OFFSET as usize;
+        let committed_root_end =
+            committed_root_start + crate::committed_root::COMMIT_RECORD_REGION_MAX as usize;
+        let vrbt_start = label.system_area_pointer as usize + (VRBT_BLOCK_INDEX as usize * 4096);
+        let vrbt_end = vrbt_start + VRBT_WIRE_SIZE;
+
+        {
+            let mut device = OpenOptions::new().write(true).open(&dev_path).unwrap();
+            device
+                .seek(SeekFrom::Start(committed_root_start as u64))
+                .unwrap();
+            device
+                .write_all(&vec![0xA5; committed_root_end - committed_root_start])
+                .unwrap();
+            device.seek(SeekFrom::Start(vrbt_start as u64)).unwrap();
+            device.write_all(&[0x5A; VRBT_WIRE_SIZE]).unwrap();
+            device.flush().unwrap();
+        }
+        let before = fs::read(&dev_path).unwrap();
+
+        let lock_dir = dir.path().join("locks");
+        let owner = pool_import_owned(&[dev_path.clone()], &lock_dir, false, None).unwrap();
+        assert!(!owner.imported().stats.read_only);
+        assert_eq!(owner.imported().stats.committed_root_epoch, None);
+        assert_eq!(owner.imported().stats.intent_log_replayed, 0);
+        assert_eq!(owner.imported().stats.datasets_available, 0);
+
+        let lock_path = lock_dir.join(hex_uuid(&pool_guid));
+        assert!(
+            lock_path.exists(),
+            "writable owner must hold its exact lock"
+        );
+        let admitted = fs::read(&dev_path).unwrap();
+        let admitted_label = tidefs_types_pool_label_core::decode_label(
+            &admitted[..tidefs_types_pool_label_core::POOL_LABEL_SIZE],
+        )
+        .unwrap();
+        assert_eq!(admitted_label.pool_state, PoolState::Active);
+        assert_eq!(
+            &admitted[committed_root_start..committed_root_end],
+            &before[committed_root_start..committed_root_end],
+            "writable mounted admission must not read-repair or rewrite the fixed root"
+        );
+        assert_eq!(
+            &admitted[vrbt_start..vrbt_end],
+            &before[vrbt_start..vrbt_end],
+            "writable mounted admission must not initialize or rewrite VRBT"
+        );
+
+        owner.export().unwrap();
+
+        assert!(
+            !lock_path.exists(),
+            "writable export must release its exact lock"
+        );
+        let exported = fs::read(&dev_path).unwrap();
+        let exported_label = tidefs_types_pool_label_core::decode_label(
+            &exported[..tidefs_types_pool_label_core::POOL_LABEL_SIZE],
+        )
+        .unwrap();
+        assert_eq!(exported_label.pool_state, PoolState::Exported);
+        assert_eq!(
+            &exported[committed_root_start..committed_root_end],
+            &before[committed_root_start..committed_root_end],
+        );
+        assert_eq!(
+            &exported[vrbt_start..vrbt_end],
+            &before[vrbt_start..vrbt_end],
+        );
+    }
+
+    #[test]
     fn pool_export_transitions_to_exported() {
         let dir = tempfile::tempdir().unwrap();
         let dev_path = dir.path().join("device0");
@@ -3564,7 +3779,7 @@ mod tests {
         }
         let lock_dir = dir.path().join("locks");
 
-        let owner = pool_import_owned(&[dev_path.clone()], &lock_dir, false, None, None).unwrap();
+        let owner = pool_import_owned(&[dev_path.clone()], &lock_dir, false, None).unwrap();
         assert_eq!(owner.imported().config.state, PoolState::Active);
 
         owner.export().unwrap();
