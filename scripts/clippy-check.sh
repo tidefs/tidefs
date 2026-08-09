@@ -154,8 +154,8 @@ run_clippy() {
 
     cd "$workspace_root"
     for crate in "$@"; do
-        echo "clippy-check: running cargo clippy -p $crate --locked --all-targets"
-        if ! cargo clippy -p "$crate" --locked --all-targets; then
+        echo "clippy-check: running cargo clippy -p $crate --locked --all-targets --no-deps"
+        if ! cargo clippy -p "$crate" --locked --all-targets --no-deps; then
             echo "clippy-check: failed: $crate" >&2
             failures=$((failures + 1))
         fi
