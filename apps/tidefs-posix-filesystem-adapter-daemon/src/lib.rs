@@ -416,6 +416,37 @@ fn validate_cluster_lease_token(
     Ok(())
 }
 
+// A lazily detached FUSE mount can leave a directory entry that races
+// `create_dir_all` into `EEXIST`. Admit only the exact, non-symlink directory.
+fn prepare_mountpoint_directory(mountpoint: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::create_dir_all(mountpoint) {
+        Ok(()) => Ok(()),
+        Err(create_error) if create_error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let Some(entry_name) = mountpoint.file_name() else {
+                return Err(create_error);
+            };
+            let parent = mountpoint
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+
+            for entry in std::fs::read_dir(parent)? {
+                let entry = entry?;
+                if entry.file_name().as_os_str() == entry_name {
+                    return if entry.file_type()?.is_dir() {
+                        Ok(())
+                    } else {
+                        Err(create_error)
+                    };
+                }
+            }
+
+            Err(create_error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 // Resources established before the mount becomes a reachable live owner.
 struct StartedMount {
     snapshot_export: bool,
@@ -447,7 +478,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         fs::create_dir_all(&config.backing_dir)
             .map_err(|e| format!("create backing dir {}: {e}", config.backing_dir.display()))?;
     }
-    fs::create_dir_all(&config.mountpoint)
+    prepare_mountpoint_directory(&config.mountpoint)
         .map_err(|e| format!("create mountpoint {}: {e}", config.mountpoint.display()))?;
 
     let root_auth_key = required_root_authentication_key("tidefs adapter mount setup")?;
