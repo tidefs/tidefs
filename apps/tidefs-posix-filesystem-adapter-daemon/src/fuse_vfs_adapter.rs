@@ -63,8 +63,7 @@ use tidefs_posix_filesystem_adapter_workers_io::{FuseCopyFileRangePlan, FuseCopy
 use tidefs_posix_filesystem_adapter_workers_locks::LockRange;
 use tidefs_posix_semantics::{
     enforce_append_only_write_guard, enforce_immutable_guard, open_flags_allow_read,
-    open_flags_allow_write, open_flags_require_exclusive_creation, open_flags_require_sync,
-    sticky_dir_allows_unlink_or_rename, O_SYNC,
+    open_flags_allow_write, open_flags_require_exclusive_creation, open_flags_require_sync, O_SYNC,
 };
 use tidefs_types_posix_filesystem_adapter_core::PosixFilesystemAdapterRequestContextMirrorRecord;
 use tidefs_types_posix_filesystem_adapter_core::PosixFilesystemAdapterWriteStagingOutcome;
