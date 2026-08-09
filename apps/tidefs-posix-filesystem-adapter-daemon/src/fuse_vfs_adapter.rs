@@ -1104,26 +1104,6 @@ struct WriteDispatchFlags {
     request_open: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum KernelPageCacheInvalidation {
-    Notify,
-    SkipSameRequestWriteback,
-}
-
-impl KernelPageCacheInvalidation {
-    fn for_write_request(is_writeback_cached: bool) -> Self {
-        if is_writeback_cached {
-            Self::SkipSameRequestWriteback
-        } else {
-            Self::Notify
-        }
-    }
-
-    fn should_notify(self) -> bool {
-        matches!(self, Self::Notify)
-    }
-}
-
 impl InodeOpenState {
     fn observe(&mut self, handle: AdapterFileHandle) {
         let flags = handle.engine_handle.open_flags;
@@ -6862,9 +6842,6 @@ impl FuseVfsAdapter {
                                             written,
                                             written_data,
                                             write_flags,
-                                            KernelPageCacheInvalidation::for_write_request(
-                                                is_writeback_cached,
-                                            ),
                                         );
                                     }
                                     if post_write_attr.is_none()
@@ -7059,9 +7036,6 @@ impl FuseVfsAdapter {
                                         written,
                                         data,
                                         write_flags,
-                                        KernelPageCacheInvalidation::for_write_request(
-                                            is_writeback_cached,
-                                        ),
                                     );
                                 }
                                 if post_write_attr.is_none()
@@ -7176,7 +7150,7 @@ impl FuseVfsAdapter {
         self.write_page_cache.invalidate_range(ino, offset, end);
         self.invalidate_read_cache_entry(ino);
         self.invalidate_fuse_read_cache_range(ino, offset, length);
-        self.invalidate_inode_metadata_after_engine_write(ino);
+        self.invalidate_inode_metadata_local(ino);
     }
 
     /// Invalidate daemon and kernel caches after an engine mutation changes
@@ -7186,6 +7160,7 @@ impl FuseVfsAdapter {
             return;
         }
         self.invalidate_daemon_caches_after_engine_data_mutation(ino, offset, length);
+        self.try_inval_inode_attrs(ino);
         self.try_inval_inode_range(ino, offset, length);
     }
 
@@ -7222,7 +7197,6 @@ impl FuseVfsAdapter {
         written: u32,
         data: &[u8],
         write_flags: u32,
-        kernel_page_cache_invalidation: KernelPageCacheInvalidation,
     ) {
         // Submit dirty extent to the writeback scheduler for
         // later flush/fsync writeback.
@@ -7267,10 +7241,12 @@ impl FuseVfsAdapter {
         }
         self.invalidate_read_cache_entry(ino);
         self.invalidate_fuse_read_cache_range(ino, offset, u64::from(written));
-        self.invalidate_inode_metadata_after_engine_write(ino);
-        if kernel_page_cache_invalidation.should_notify() {
-            self.try_inval_inode_range(ino, offset, u64::from(written));
-        }
+        // The kernel issued this FUSE WRITE and already owns the page changes
+        // represented by the reply. A synchronous page-range invalidation can
+        // wait on that same request and deadlock the single FUSE dispatch
+        // loop. Fence daemon caches now; later external engine mutations
+        // retain the notifier path above.
+        self.invalidate_inode_metadata_local(ino);
 
         // Mark dirty pages in the writeback PageCache so
         // flush/fsync can iterate them for writeback.
@@ -43002,22 +42978,6 @@ mod tests {
     }
 
     #[test]
-    fn writeback_cached_dirty_write_policy_skips_same_request_kernel_invalidation() {
-        assert_eq!(
-            KernelPageCacheInvalidation::for_write_request(true),
-            KernelPageCacheInvalidation::SkipSameRequestWriteback
-        );
-        assert!(
-            !KernelPageCacheInvalidation::for_write_request(true).should_notify(),
-            "writeback-cache WRITE replies must not invalidate the same kernel page-cache range"
-        );
-        assert!(
-            KernelPageCacheInvalidation::for_write_request(false).should_notify(),
-            "non-writeback dirty writes keep kernel page-cache invalidation"
-        );
-    }
-
-    #[test]
     fn writeback_cached_dirty_write_still_fences_daemon_caches_when_notify_skipped() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
@@ -43042,7 +43002,6 @@ mod tests {
                 payload.len() as u32,
                 &payload,
                 FUSE_WRITE_CACHE,
-                KernelPageCacheInvalidation::SkipSameRequestWriteback,
             );
         }
 
