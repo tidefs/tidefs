@@ -7915,6 +7915,13 @@ impl FuseVfsAdapter {
         efh: &EngineFileHandle,
         datasync: bool,
     ) -> Result<(), Errno> {
+        let diagnostic = fuse_op_diagnostics_enabled();
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fsync pipeline start ino={ino} fh={} datasync={datasync}",
+                efh.fh_id.0
+            );
+        }
         // Reject fsync on read-only mounts early (EROFS).
         if self.read_only {
             return Err(Errno::EROFS);
@@ -7936,6 +7943,9 @@ impl FuseVfsAdapter {
                 efh.inode_id,
                 datasync,
             )?;
+        }
+        if diagnostic {
+            eprintln!("tidefs-diagnostic: fsync pipeline phase=page-cache-flush status=ok");
         }
         self.writeback_cache.lock().unwrap().mark_clean(ino);
         self.write_page_cache.clear_dirty_for_inode(ino);
@@ -8011,8 +8021,12 @@ impl FuseVfsAdapter {
             tidefs_local_filesystem::fuse_fsync::map_cache_error(
                 bridge.fdatasync_inode(efh.inode_id, datasync),
             )?;
-        } // Phase 3: Engine fsync for metadata persistence.
-          // Record storage-sync latency separately from dispatch/protocol overhead.
+        }
+        if diagnostic {
+            eprintln!("tidefs-diagnostic: fsync pipeline phase=fdatasync-inode status=ok");
+        }
+        // Phase 3: Engine fsync for metadata persistence.
+        // Record storage-sync latency separately from dispatch/protocol overhead.
         {
             // Use try_lock with bounded retry to avoid blocking indefinitely
             // on the engine lock when a background thread (commit_group,
@@ -8040,6 +8054,13 @@ impl FuseVfsAdapter {
             let _storage_timer =
                 crate::observability::LatencyTimer::new(&crate::observability::HIST_FSYNC_STORAGE);
             let fs_res = e.fsync(efh, datasync, ctx);
+            if diagnostic {
+                eprintln!(
+                    "tidefs-diagnostic: fsync pipeline phase=engine-fsync status={} errno={:?}",
+                    if fs_res.is_ok() { "ok" } else { "err" },
+                    fs_res.as_ref().err()
+                );
+            }
             fs_res?;
         }
 
@@ -8049,8 +8070,14 @@ impl FuseVfsAdapter {
         // configured, this is a no-op (the engine's sync path already
         // provides durability).
         self.commit_current_txg_barrier("fsync")?;
+        if diagnostic {
+            eprintln!("tidefs-diagnostic: fsync pipeline phase=txg-barrier status=ok");
+        }
         self.sync_namespace_attrs_from_engine(ctx, ino, Some(efh));
         self.fsync_handler.handle_fsync(ino, datasync)?;
+        if diagnostic {
+            eprintln!("tidefs-diagnostic: fsync pipeline end status=ok");
+        }
         Ok(())
     }
 
