@@ -494,7 +494,6 @@ pub fn handle_mount(args: PoolMountArgs) {
         &lock_dir,
         args.read_only,
         import_encryption_key,
-        None,
     ) {
         Ok(owner) => owner,
         Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
