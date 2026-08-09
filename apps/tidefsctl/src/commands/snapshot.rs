@@ -943,7 +943,7 @@ fn open_filesystem_with_live_args(
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let pool_name = pool.unwrap_or("<unnamed>");
-        let (metadata_dir, pool_redundancy_policy) =
+        let (metadata_dir, device_pool_name, pool_redundancy_policy) =
             import_devices_metadata_dir(devs, pool_name, operation, live_args);
 
         let root_auth_key =
@@ -951,7 +951,7 @@ fn open_filesystem_with_live_args(
         return match LocalFileSystem::open_with_block_devices_and_recovery_policy(
             &metadata_dir,
             devs,
-            pool_name,
+            &device_pool_name,
             pool_redundancy_policy,
             StoreOptions::default(),
             root_auth_key,
@@ -960,7 +960,7 @@ fn open_filesystem_with_live_args(
             Ok(fs) => fs,
             Err(err) => {
                 eprintln!(
-                    "tidefsctl snapshot {operation}: failed to open block-device-backed pool '{pool_name}' at {}: {err}",
+                    "tidefsctl snapshot {operation}: failed to open block-device-backed pool '{device_pool_name}' at {}: {err}",
                     metadata_dir.display()
                 );
                 process::exit(1);
@@ -1014,7 +1014,7 @@ fn import_devices_metadata_dir(
     pool_name: &str,
     operation: &str,
     live_args: LivePoolAdminArgs,
-) -> (PathBuf, PoolRedundancyPolicy) {
+) -> (PathBuf, String, PoolRedundancyPolicy) {
     let config = scan_device_pool_config(pool_name, devices, operation);
     super::live_owner::route_or_refuse_active_for_uuid_with_args(
         "snapshot",
@@ -1025,10 +1025,9 @@ fn import_devices_metadata_dir(
         live_args,
     );
 
-    (
-        super::offline_pool::metadata_dir("snapshot", operation, &config.pool_uuid),
-        PoolRedundancyPolicy::from_label_policy(config.redundancy_policy),
-    )
+    let metadata_dir = super::offline_pool::metadata_dir("snapshot", operation, &config.pool_uuid);
+    let redundancy_policy = PoolRedundancyPolicy::from_label_policy(config.redundancy_policy);
+    (metadata_dir, config.pool_name, redundancy_policy)
 }
 
 fn scan_device_pool_config(
