@@ -667,11 +667,13 @@ fi
 echo "  crash mount daemon log:"
 tail -120 /tmp/crash_mount.log 2>/dev/null || true
 
-if mountpoint -q "$MNT" 2>/dev/null; then
-    if umount -l "$MNT" 2>/tmp/crash_umount.err; then
-        pass "crash_cycle_stale_mount_detached"
-    else
+if grep -q "[[:space:]]$MNT[[:space:]]" /proc/self/mountinfo 2>/dev/null; then
+    if ! umount -l "$MNT" 2>/tmp/crash_umount.err; then
         fail "crash_cycle_stale_mount_detached" "$(cat /tmp/crash_umount.err 2>/dev/null)"
+    elif grep -q "[[:space:]]$MNT[[:space:]]" /proc/self/mountinfo 2>/dev/null; then
+        fail "crash_cycle_stale_mount_detached" "mount remains in /proc/self/mountinfo after lazy detach"
+    else
+        pass "crash_cycle_stale_mount_detached"
     fi
 else
     pass "crash_cycle_stale_mount_detached"
