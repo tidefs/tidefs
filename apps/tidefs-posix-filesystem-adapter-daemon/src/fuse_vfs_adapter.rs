@@ -2783,6 +2783,27 @@ enum FuseAdmissionOp {
 }
 
 impl FuseAdmissionOp {
+    const fn requires_writable_mount(self) -> bool {
+        matches!(
+            self,
+            Self::CopyFileRange
+                | Self::Create
+                | Self::Exchange
+                | Self::Fallocate
+                | Self::Link
+                | Self::Mkdir
+                | Self::Mknod
+                | Self::Removexattr
+                | Self::Rename
+                | Self::Rmdir
+                | Self::Setattr
+                | Self::Setxattr
+                | Self::Symlink
+                | Self::Unlink
+                | Self::Write
+        )
+    }
+
     fn class(self) -> FuseAdmissionClass {
         match self {
             Self::BatchForget
@@ -3285,11 +3306,11 @@ impl FuseVfsAdapter {
     fn admit_fuse_request(&self, op: FuseAdmissionOp) -> Result<(), Errno> {
         use crate::observability::FuseAdmissionReason;
 
-        let class = op.class();
-        if self.read_only && class == FuseAdmissionClass::Mutating {
+        if self.read_only && op.requires_writable_mount() {
             return Err(Errno::EROFS);
         }
 
+        let class = op.class();
         if self.governor.backpressure(BudgetCategory::InodeState) != BackpressureSignal::None {
             let _ = self.emit_governor_prune_notifications();
         }
@@ -12111,6 +12132,14 @@ mod tests {
             adapter.admit_fuse_request(FuseAdmissionOp::Unlink),
             Err(Errno::EROFS)
         );
+    }
+
+    #[test]
+    fn fuse_admission_read_only_fence_preserves_advisory_locks() {
+        let adapter = fresh_test_adapter().with_read_only();
+
+        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Flock), Ok(()));
+        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Setlk), Ok(()));
     }
 
     #[test]
