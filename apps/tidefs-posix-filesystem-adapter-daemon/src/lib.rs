@@ -1341,7 +1341,11 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     }
     *notifier_cell.lock().unwrap() = Some(session.notifier());
 
-    eprintln!("Mounted TideFS at {}", config.mountpoint.display());
+    let mode = if effective_mode.read_only { "RO" } else { "RW" };
+    eprintln!(
+        "Mounted TideFS (VFS engine) at {} ({mode})",
+        config.mountpoint.display()
+    );
 
     // Refuse idmapped mounts: TideFS does not support idmapped mount
     // UID/GID translation in the current FUSE adapter boundary.
