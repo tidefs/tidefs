@@ -12141,7 +12141,7 @@ mod tests {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
         let name = b"lookup-atime.txt";
-        let (inode, _adapter_fh, _engine_fh) =
+        let (_inode, _adapter_fh, _engine_fh) =
             create_adapter_file_handle(&fixture.adapter, &ctx, name, libc::O_RDWR as u32);
 
         let mut stale_atime = SetAttr::new();
@@ -40457,8 +40457,12 @@ mod tests {
             RootAuthenticationKey::demo_key(),
         )
         .expect("open local filesystem");
-        local_fs.set_auto_commit(false);
-        local_fs.set_max_uncommitted_mutations(16 * 1024);
+        local_fs
+            .set_auto_commit(false)
+            .expect("configure deferred-commit fixture");
+        local_fs
+            .set_max_uncommitted_mutations(16 * 1024)
+            .expect("configure deferred-commit mutation limit");
         let engine = VfsLocalFileSystem::new(local_fs);
         let mut adapter = FuseVfsAdapter::new(Box::new(engine))
             .expect("create adapter")
