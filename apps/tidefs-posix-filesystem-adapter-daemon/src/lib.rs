@@ -156,6 +156,7 @@ use tidefs_vfs_engine::{
 const MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 const MOUNT_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
 const MOUNT_TXG_COMMIT_INTERVAL_SECS: u64 = 30;
+const MOUNT_FUSE_INIT_TIMEOUT_SECS: u64 = 5;
 
 /// Resolve an encryption configuration from a sealed pool key envelope file.
 ///
@@ -1337,6 +1338,20 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     if session.guard.is_finished() {
         return Err(
             "FUSE background session exited during mount; refusing a hung mountpoint".to_string(),
+        );
+    }
+    let initialized = session
+        .wait_until_initialized(std::time::Duration::from_secs(MOUNT_FUSE_INIT_TIMEOUT_SECS))
+        .map_err(|error| format!("wait for FUSE INIT: {error}"))?;
+    if !initialized {
+        return Err(format!(
+            "FUSE kernel initialization did not complete within {MOUNT_FUSE_INIT_TIMEOUT_SECS}s"
+        ));
+    }
+    if session.guard.is_finished() {
+        return Err(
+            "FUSE background session exited during kernel initialization; refusing a hung mountpoint"
+                .to_string(),
         );
     }
     *notifier_cell.lock().unwrap() = Some(session.notifier());

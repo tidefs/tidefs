@@ -481,6 +481,7 @@ impl<'a> Request<'a> {
                     config.max_write
                 );
                 se.initialized = true;
+                se.mark_initialized();
                 return Ok(Some(x.reply(&config)));
             }
             // Any operation is invalid before initialization

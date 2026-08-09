@@ -9,8 +9,9 @@ use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{info, warn};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use std::{io, ops::DerefMut};
 
 use crate::abort::{AbortHandle, AbortRegistry};
@@ -38,6 +39,35 @@ pub(crate) enum SessionACL {
     Owner,
 }
 
+#[derive(Debug, Default)]
+struct SessionReadiness {
+    initialized: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl SessionReadiness {
+    fn mark_initialized(&self) {
+        let mut initialized = match self.initialized.lock() {
+            Ok(initialized) => initialized,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *initialized = true;
+        self.changed.notify_all();
+    }
+
+    fn wait_until_initialized(&self, timeout: Duration) -> io::Result<bool> {
+        let initialized = self
+            .initialized
+            .lock()
+            .map_err(|_| io::Error::other("FUSE session readiness lock was poisoned"))?;
+        let (initialized, _) = self
+            .changed
+            .wait_timeout_while(initialized, timeout, |initialized| !*initialized)
+            .map_err(|_| io::Error::other("FUSE session readiness wait was poisoned"))?;
+        Ok(*initialized)
+    }
+}
+
 /// The session data structure
 #[derive(Debug)]
 pub struct Session<FS: Filesystem> {
@@ -60,6 +90,8 @@ pub struct Session<FS: Filesystem> {
     pub(crate) proto_minor: u32,
     /// True if the filesystem is initialized (init operation done)
     pub(crate) initialized: bool,
+    /// Completion boundary for a background session's successful FUSE INIT.
+    readiness: Arc<SessionReadiness>,
     /// True if the filesystem was destroyed (destroy operation done)
     pub(crate) destroyed: bool,
     /// Whether the WritebackCache mount option was set
@@ -120,6 +152,7 @@ impl<FS: Filesystem> Session<FS> {
             proto_major: 0,
             proto_minor: 0,
             initialized: false,
+            readiness: Arc::new(SessionReadiness::default()),
             destroyed: false,
         })
     }
@@ -248,6 +281,10 @@ impl<FS: Filesystem> Session<FS> {
         self.abort_registry.remove(unique);
     }
 
+    pub(crate) fn mark_initialized(&self) {
+        self.readiness.mark_initialized();
+    }
+
     /// Unmount the filesystem
     /// Safety: Mutex lock on mount handle. Since this is called
     /// from the owning Session, no other thread can poison this lock.
@@ -295,6 +332,8 @@ pub struct BackgroundSession {
     pub mountpoint: PathBuf,
     /// Thread guard of the background session
     pub guard: JoinHandle<io::Result<()>>,
+    /// Successful kernel FUSE INIT completion shared with the session thread.
+    readiness: Arc<SessionReadiness>,
     /// Object for creating Notifiers for client use
     #[cfg(feature = "abi-7-11")]
     sender: ChannelSender,
@@ -310,6 +349,7 @@ impl BackgroundSession {
         let mountpoint = se.mountpoint().to_path_buf();
         #[cfg(feature = "abi-7-11")]
         let sender = se.ch.sender();
+        let readiness = Arc::clone(&se.readiness);
         // Take the fuse_session, so that we can unmount it
         // Safety: Mutex lock is infallible unless the lock is poisoned by a panic
         // in another thread. Since this is the initialization path, no other
@@ -352,16 +392,28 @@ impl BackgroundSession {
         Ok(BackgroundSession {
             mountpoint,
             guard,
+            readiness,
             #[cfg(feature = "abi-7-11")]
             sender,
             _mount: mount,
         })
     }
+
+    /// Wait until the kernel FUSE INIT request has been accepted.
+    ///
+    /// Returning `Ok(true)` means the filesystem's `init` callback succeeded.
+    /// `Ok(false)` means the timeout elapsed first. A caller should also inspect
+    /// [`Self::guard`] when distinguishing a slow handshake from early exit.
+    pub fn wait_until_initialized(&self, timeout: Duration) -> io::Result<bool> {
+        self.readiness.wait_until_initialized(timeout)
+    }
+
     /// Unmount the filesystem and join the background thread.
     pub fn join(self) {
         let Self {
             mountpoint,
             guard,
+            readiness: _,
             #[cfg(feature = "abi-7-11")]
                 sender: _,
             _mount,
