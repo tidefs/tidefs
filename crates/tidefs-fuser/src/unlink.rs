@@ -25,9 +25,10 @@
 //! ```rust,ignore
 //! use fuser::unlink;
 //!
+//! let ownership = unlink::UnlinkOwnership::new(false, true, false, false);
+//! let caller = fuser::access::FuseCaller::new(1000, 100, &[], &mount_identity);
 //! let plan = unlink::handle_unlink(
-//!     b"myfile", false, false, true, false, false,
-//!     0o300, 1000, 100, 1000, 100, &[], &mount_identity,
+//!     b"myfile", false, ownership, 0o300, 1000, 100, caller,
 //! )?;
 //! ```
 
@@ -52,20 +53,14 @@ pub fn check_unlink_parent_permission(
     parent_mode: u32,
     parent_uid: u32,
     parent_gid: u32,
-    caller_uid: u32,
-    caller_gid: u32,
-    caller_groups: &[u32],
-    mount_identity: &tidefs_permission::MountIdentity,
+    caller: crate::access::FuseCaller<'_>,
 ) -> Result<(), UnlinkError> {
     crate::access::check_fuse_access(
         parent_mode,
         parent_uid,
         parent_gid,
-        caller_uid,
-        caller_gid,
-        caller_groups,
+        caller,
         crate::access::ACCESS_WRITE | crate::access::ACCESS_EXECUTE,
-        mount_identity,
     )
     .map_err(|_e| UnlinkError::PermissionDenied)
 }
@@ -204,6 +199,33 @@ pub fn check_unlink_sticky_bit(
     Err(UnlinkError::StickyPermissionDenied)
 }
 
+/// Ownership facts used to enforce sticky-directory unlink semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnlinkOwnership {
+    dir_has_sticky: bool,
+    caller_is_owner: bool,
+    caller_is_dir_owner: bool,
+    caller_is_root: bool,
+}
+
+impl UnlinkOwnership {
+    /// Capture the parent sticky bit and the caller's relevant ownership.
+    #[must_use]
+    pub const fn new(
+        dir_has_sticky: bool,
+        caller_is_owner: bool,
+        caller_is_dir_owner: bool,
+        caller_is_root: bool,
+    ) -> Self {
+        Self {
+            dir_has_sticky,
+            caller_is_owner,
+            caller_is_dir_owner,
+            caller_is_root,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Combined validation (convenience)
 // ---------------------------------------------------------------------------
@@ -213,37 +235,22 @@ pub fn check_unlink_sticky_bit(
 ///
 /// Returns `Ok(`[`UnlinkPlan`]`)` on success. On failure returns a
 /// [`UnlinkError`].
-#[allow(clippy::too_many_arguments)]
 pub fn plan_unlink(
     name: &[u8],
-    dir_has_sticky: bool,
-    caller_is_owner: bool,
-    caller_is_dir_owner: bool,
-    caller_is_root: bool,
+    ownership: UnlinkOwnership,
     parent_mode: u32,
     parent_uid: u32,
     parent_gid: u32,
-    caller_uid: u32,
-    caller_gid: u32,
-    caller_groups: &[u32],
-    mount_identity: &tidefs_permission::MountIdentity,
+    caller: crate::access::FuseCaller<'_>,
 ) -> Result<UnlinkPlan, UnlinkError> {
     validate_unlink_name(name)?;
     check_unlink_sticky_bit(
-        dir_has_sticky,
-        caller_is_owner,
-        caller_is_dir_owner,
-        caller_is_root,
+        ownership.dir_has_sticky,
+        ownership.caller_is_owner,
+        ownership.caller_is_dir_owner,
+        ownership.caller_is_root,
     )?;
-    check_unlink_parent_permission(
-        parent_mode,
-        parent_uid,
-        parent_gid,
-        caller_uid,
-        caller_gid,
-        caller_groups,
-        mount_identity,
-    )?;
+    check_unlink_parent_permission(parent_mode, parent_uid, parent_gid, caller)?;
     Ok(UnlinkPlan {
         name: name.to_vec(),
     })
@@ -314,33 +321,14 @@ pub fn check_unlink_readonly(read_only: bool) -> Result<(), UnlinkError> {
 pub fn handle_unlink(
     name: &[u8],
     read_only: bool,
-    dir_has_sticky: bool,
-    caller_is_owner: bool,
-    caller_is_dir_owner: bool,
-    caller_is_root: bool,
+    ownership: UnlinkOwnership,
     parent_mode: u32,
     parent_uid: u32,
     parent_gid: u32,
-    caller_uid: u32,
-    caller_gid: u32,
-    caller_groups: &[u32],
-    mount_identity: &tidefs_permission::MountIdentity,
+    caller: crate::access::FuseCaller<'_>,
 ) -> Result<UnlinkPlan, UnlinkError> {
     check_unlink_readonly(read_only)?;
-    plan_unlink(
-        name,
-        dir_has_sticky,
-        caller_is_owner,
-        caller_is_dir_owner,
-        caller_is_root,
-        parent_mode,
-        parent_uid,
-        parent_gid,
-        caller_uid,
-        caller_gid,
-        caller_groups,
-        mount_identity,
-    )
+    plan_unlink(name, ownership, parent_mode, parent_uid, parent_gid, caller)
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +343,10 @@ mod tests {
     const VALID_MOUNT: tidefs_permission::MountIdentity =
         tidefs_permission::MountIdentity::new([0x41; 16], 1);
 
+    fn caller(uid: u32, gid: u32, groups: &[u32]) -> crate::access::FuseCaller<'_> {
+        crate::access::FuseCaller::new(uid, gid, groups, &VALID_MOUNT)
+    }
+
     fn plan_unlink_for_owner(
         name: &[u8],
         dir_has_sticky: bool,
@@ -364,17 +356,16 @@ mod tests {
     ) -> Result<UnlinkPlan, UnlinkError> {
         plan_unlink(
             name,
-            dir_has_sticky,
-            caller_is_owner,
-            caller_is_dir_owner,
-            caller_is_root,
+            UnlinkOwnership::new(
+                dir_has_sticky,
+                caller_is_owner,
+                caller_is_dir_owner,
+                caller_is_root,
+            ),
             0o300,
             1000,
             100,
-            1000,
-            100,
-            &[],
-            &VALID_MOUNT,
+            caller(1000, 100, &[]),
         )
     }
 
@@ -389,17 +380,16 @@ mod tests {
         handle_unlink(
             name,
             read_only,
-            dir_has_sticky,
-            caller_is_owner,
-            caller_is_dir_owner,
-            caller_is_root,
+            UnlinkOwnership::new(
+                dir_has_sticky,
+                caller_is_owner,
+                caller_is_dir_owner,
+                caller_is_root,
+            ),
             0o300,
             1000,
             100,
-            1000,
-            100,
-            &[],
-            &VALID_MOUNT,
+            caller(1000, 100, &[]),
         )
     }
 
@@ -408,7 +398,7 @@ mod tests {
     #[test]
     fn unlink_parent_permission_owner_write_execute_allowed() {
         assert_eq!(
-            check_unlink_parent_permission(0o300, 1000, 100, 1000, 200, &[], &VALID_MOUNT),
+            check_unlink_parent_permission(0o300, 1000, 100, caller(1000, 200, &[])),
             Ok(())
         );
     }
@@ -416,7 +406,7 @@ mod tests {
     #[test]
     fn unlink_parent_permission_group_write_execute_allowed() {
         assert_eq!(
-            check_unlink_parent_permission(0o030, 1000, 100, 2000, 100, &[], &VALID_MOUNT),
+            check_unlink_parent_permission(0o030, 1000, 100, caller(2000, 100, &[])),
             Ok(())
         );
     }
@@ -424,7 +414,7 @@ mod tests {
     #[test]
     fn unlink_parent_permission_supplementary_group_write_execute_allowed() {
         assert_eq!(
-            check_unlink_parent_permission(0o030, 1000, 100, 2000, 200, &[100], &VALID_MOUNT),
+            check_unlink_parent_permission(0o030, 1000, 100, caller(2000, 200, &[100])),
             Ok(())
         );
     }
@@ -432,7 +422,7 @@ mod tests {
     #[test]
     fn unlink_parent_permission_other_write_execute_allowed() {
         assert_eq!(
-            check_unlink_parent_permission(0o003, 1000, 100, 2000, 200, &[], &VALID_MOUNT),
+            check_unlink_parent_permission(0o003, 1000, 100, caller(2000, 200, &[])),
             Ok(())
         );
     }
@@ -440,23 +430,23 @@ mod tests {
     #[test]
     fn unlink_parent_permission_root_allowed_without_permission_bits() {
         assert_eq!(
-            check_unlink_parent_permission(0o000, 1000, 100, 0, 0, &[], &VALID_MOUNT),
+            check_unlink_parent_permission(0o000, 1000, 100, caller(0, 0, &[])),
             Ok(())
         );
     }
 
     #[test]
     fn unlink_parent_permission_denied_without_write_bit() {
-        let err = check_unlink_parent_permission(0o100, 1000, 100, 1000, 100, &[], &VALID_MOUNT)
-            .unwrap_err();
+        let err =
+            check_unlink_parent_permission(0o100, 1000, 100, caller(1000, 100, &[])).unwrap_err();
         assert_eq!(err, UnlinkError::PermissionDenied);
         assert_eq!(err.to_errno(), errno::EACCES);
     }
 
     #[test]
     fn unlink_parent_permission_denied_without_execute_bit() {
-        let err = check_unlink_parent_permission(0o200, 1000, 100, 1000, 100, &[], &VALID_MOUNT)
-            .unwrap_err();
+        let err =
+            check_unlink_parent_permission(0o200, 1000, 100, caller(1000, 100, &[])).unwrap_err();
         assert_eq!(err, UnlinkError::PermissionDenied);
         assert_eq!(err.to_errno(), errno::EACCES);
     }
@@ -665,17 +655,11 @@ mod tests {
     fn plan_unlink_sticky_takes_priority_over_parent_permission() {
         let err = plan_unlink(
             b"myfile",
-            true,
-            false,
-            false,
-            false,
+            UnlinkOwnership::new(true, false, false, false),
             0o000,
             1000,
             100,
-            2000,
-            200,
-            &[],
-            &VALID_MOUNT,
+            caller(2000, 200, &[]),
         )
         .unwrap_err();
 
@@ -687,17 +671,11 @@ mod tests {
     fn plan_unlink_parent_permission_denied_maps_to_eacces() {
         let err = plan_unlink(
             b"myfile",
-            false,
-            false,
-            false,
-            false,
+            UnlinkOwnership::new(false, false, false, false),
             0o000,
             1000,
             100,
-            2000,
-            200,
-            &[],
-            &VALID_MOUNT,
+            caller(2000, 200, &[]),
         )
         .unwrap_err();
 
@@ -867,17 +845,11 @@ mod tests {
         let err = handle_unlink(
             b"myfile",
             true,
-            false,
-            false,
-            false,
-            false,
+            UnlinkOwnership::new(false, false, false, false),
             0o000,
             1000,
             100,
-            2000,
-            200,
-            &[],
-            &VALID_MOUNT,
+            caller(2000, 200, &[]),
         )
         .unwrap_err();
 
@@ -890,17 +862,11 @@ mod tests {
         let err = handle_unlink(
             b"myfile",
             false,
-            false,
-            false,
-            false,
-            false,
+            UnlinkOwnership::new(false, false, false, false),
             0o000,
             1000,
             100,
-            2000,
-            200,
-            &[],
-            &VALID_MOUNT,
+            caller(2000, 200, &[]),
         )
         .unwrap_err();
 

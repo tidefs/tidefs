@@ -730,6 +730,21 @@ impl ReplyDirectory {
 ///
 /// DirectoryPlus reply
 ///
+/// Dentry and inode-attribute cache lifetimes for one `readdirplus` entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectoryEntryTtls {
+    entry: Duration,
+    attr: Duration,
+}
+
+impl DirectoryEntryTtls {
+    /// Capture separate dentry and inode-attribute cache lifetimes.
+    #[must_use]
+    pub const fn new(entry: Duration, attr: Duration) -> Self {
+        Self { entry, attr }
+    }
+}
+
 #[derive(Debug)]
 pub struct ReplyDirectoryPlus {
     reply: ReplyBuilder,
@@ -757,7 +772,14 @@ impl ReplyDirectoryPlus {
         attr: &FileAttr,
         generation: u64,
     ) -> bool {
-        self.add_with_ttls(ino, offset, name, ttl, ttl, attr, generation)
+        self.add_with_ttls(
+            ino,
+            offset,
+            name,
+            DirectoryEntryTtls::new(*ttl, *ttl),
+            attr,
+            generation,
+        )
     }
 
     /// Add a directory-plus entry with separate dentry and attribute TTLs.
@@ -766,8 +788,7 @@ impl ReplyDirectoryPlus {
         ino: u64,
         offset: i64,
         name: T,
-        entry_ttl: &Duration,
-        attr_ttl: &Duration,
+        ttls: DirectoryEntryTtls,
         attr: &FileAttr,
         generation: u64,
     ) -> bool {
@@ -777,9 +798,9 @@ impl ReplyDirectoryPlus {
             Generation(generation),
             DirEntOffset(offset),
             name,
-            *entry_ttl,
+            ttls.entry,
             attr.into(),
-            *attr_ttl,
+            ttls.attr,
         ))
     }
 
@@ -1682,7 +1703,14 @@ mod test {
         let attr_ttl = Duration::ZERO;
         let attr = make_test_attr(0x66);
 
-        assert!(!reply.add_with_ttls(0x66, 1, "cached", &entry_ttl, &attr_ttl, &attr, 0x03));
+        assert!(!reply.add_with_ttls(
+            0x66,
+            1,
+            "cached",
+            DirectoryEntryTtls::new(entry_ttl, attr_ttl),
+            &attr,
+            0x03,
+        ));
         reply.ok();
 
         let bytes = captured.lock().unwrap();

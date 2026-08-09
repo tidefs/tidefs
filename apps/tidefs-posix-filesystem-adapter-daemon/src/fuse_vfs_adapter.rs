@@ -10952,8 +10952,7 @@ impl Filesystem for FuseVfsAdapter {
                         entry.inode_id.get(),
                         cookie,
                         OsStr::from_bytes(&entry.name),
-                        &entry_ttl,
-                        &attr_ttl,
+                        fuser::DirectoryEntryTtls::new(entry_ttl, attr_ttl),
                         &fa,
                         entry.generation.get(),
                     ) {

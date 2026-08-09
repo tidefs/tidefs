@@ -292,17 +292,16 @@ impl Filesystem for DirTestFS {
         let plan = fuser::unlink::handle_unlink(
             name.as_bytes(),
             false,
-            parent_inode.perm & libc::S_ISVTX as u16 != 0,
-            caller_uid == child.uid,
-            caller_uid == parent_inode.uid,
-            caller_uid == 0,
+            fuser::unlink::UnlinkOwnership::new(
+                parent_inode.perm & libc::S_ISVTX as u16 != 0,
+                caller_uid == child.uid,
+                caller_uid == parent_inode.uid,
+                caller_uid == 0,
+            ),
             parent_inode.perm as u32,
             parent_inode.uid,
             parent_inode.gid,
-            caller_uid,
-            caller_gid,
-            &[],
-            &VALID_MOUNT,
+            fuser::access::FuseCaller::new(caller_uid, caller_gid, &[], &VALID_MOUNT),
         );
         if let Err(err) = plan {
             reply.error(err.to_errno());

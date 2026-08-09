@@ -65,11 +65,8 @@ pub fn check_mknod_parent_permission(
         parent_mode,
         parent_uid,
         parent_gid,
-        caller_uid,
-        caller_gid,
-        caller_groups,
+        crate::access::FuseCaller::new(caller_uid, caller_gid, caller_groups, mount_identity),
         crate::access::ACCESS_WRITE | crate::access::ACCESS_EXECUTE,
-        mount_identity,
     )
 }
 

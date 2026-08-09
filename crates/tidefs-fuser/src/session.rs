@@ -244,13 +244,11 @@ impl<FS: Filesystem> Session<FS> {
                     .any(|line| line.split_whitespace().nth(4) == Some(mountpoint));
                 if found {
                     eprintln!(
-                        "ENODEV diagnostic: mountpoint {} is still listed in /proc/self/mountinfo; kernel aborted FUSE connection",
-                        mountpoint
+                        "ENODEV diagnostic: mountpoint {mountpoint} is still listed in /proc/self/mountinfo; kernel aborted FUSE connection"
                     );
                 } else {
                     eprintln!(
-                        "ENODEV diagnostic: mountpoint {} is NOT in /proc/self/mountinfo; mount was externally unmounted",
-                        mountpoint
+                        "ENODEV diagnostic: mountpoint {mountpoint} is NOT in /proc/self/mountinfo; mount was externally unmounted"
                     );
                 }
             }
@@ -382,10 +380,9 @@ impl BackgroundSession {
                         "FUSE session thread panicked on mount {}: {msg}",
                         mountpoint_captured.display()
                     );
-                    Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("FUSE session thread panicked: {msg}"),
-                    ))
+                    Err(io::Error::other(format!(
+                        "FUSE session thread panicked: {msg}"
+                    )))
                 }
             }
         });
