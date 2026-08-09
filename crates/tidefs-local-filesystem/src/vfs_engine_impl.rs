@@ -6243,10 +6243,16 @@ impl VfsEngine for VfsLocalFileSystem {
         if self.anonymous_tmpfiles.borrow().contains_key(&fh.inode_id) {
             return Ok(());
         }
-        self.fs
-            .borrow_mut()
-            .fdatasync_inode(fh.inode_id, datasync)
-            .map_err(|e| map_errno(&e))
+        let result = self.fs.borrow_mut().fdatasync_inode(fh.inode_id, datasync);
+        if let Err(error) = &result {
+            if vfs_op_diagnostics_enabled() {
+                eprintln!(
+                    "tidefs-diagnostic: vfs fdatasync error ino={} datasync={datasync} error={error:?}",
+                    fh.inode_id.get()
+                );
+            }
+        }
+        result.map_err(|error| map_errno(&error))
     }
 
     fn fsyncdir(
