@@ -2856,9 +2856,9 @@ pub struct FuseVfsAdapter {
     negative_cache: Mutex<NegativeLookupCache>,
     poll_registrations: Mutex<PollRegistrationTable>,
     pub(crate) dirty_state: Mutex<BTreeMap<u64, DirtyRanges>>,
-    /// Adapter-local FUSE kernel lookup references. This is the #665
-    /// projection state for the #655 dataset inode authority decision, not
-    /// durable inode lifetime; #664 owns the allocator authority extraction.
+    /// Adapter-local FUSE kernel lookup references. This projects the dataset
+    /// inode authority for kernel cache lifetime only; it does not own durable
+    /// inode existence, allocation, or reuse.
     forget_refcounts: Mutex<BTreeMap<u64, u64>>,
     /// Per-inode lookup frequency counter for reclaim hotness classification.
     /// This is adapter hotness only and must not allocate or preserve inodes.
