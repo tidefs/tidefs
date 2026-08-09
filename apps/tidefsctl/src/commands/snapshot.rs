@@ -1385,12 +1385,15 @@ fn snapshot_backing_path(
             super::offline_pool::refuse_runtime_pool_path("snapshot", operation, p);
             p.clone()
         }
-        (None, pool_name, Some(devs)) => import_devices_metadata_dir(
-            devs,
-            pool_name.unwrap_or("<unnamed>"),
-            operation,
-            LivePoolAdminArgs::default(),
-        ),
+        (None, pool_name, Some(devs)) => {
+            import_devices_metadata_dir(
+                devs,
+                pool_name.unwrap_or("<unnamed>"),
+                operation,
+                LivePoolAdminArgs::default(),
+            )
+            .0
+        }
         (None, Some(pool_name), None) => {
             super::live_owner::route_with_args("snapshot", operation, pool_name, live_args)
         }
