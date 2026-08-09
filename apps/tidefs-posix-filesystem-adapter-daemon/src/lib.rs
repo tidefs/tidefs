@@ -155,7 +155,6 @@ use tidefs_vfs_engine::{
 
 const MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 const MOUNT_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
-const MOUNT_TXG_COMMIT_INTERVAL_SECS: u64 = 30;
 const MOUNT_FUSE_INIT_TIMEOUT_SECS: u64 = 5;
 
 /// Resolve an encryption configuration from a sealed pool key envelope file.
@@ -923,7 +922,6 @@ struct StartedMount {
     live_owner: Option<live_owner::LiveOwnerHandle>,
     queue_depth_engine: live_owner::LiveOwnerEngine,
     background_scheduler: Option<Arc<Mutex<Option<BackgroundScheduler>>>>,
-    txg_cycle: Option<Arc<txg_cycle::CommitGroupCycle>>,
     mmap_coherency: Arc<mmap_coherency::MmapCoherency>,
 }
 
@@ -1222,9 +1220,6 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
 
     if !effective_mode.read_only {
         adapter = adapter
-            .with_commit_group_cycle(Arc::new(txg_cycle::CommitGroupCycle::with_store_root(
-                config.backing_dir.clone(),
-            )))
             .with_background_scheduler(BackgroundScheduler::new(ServiceBudget::MAINTENANCE_TICK));
     }
 
@@ -1279,12 +1274,6 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         adapter.set_scheduler_preempt_signal(fuse_demand);
         Some(scheduler)
     };
-    let txg_cycle = if effective_mode.read_only {
-        None
-    } else {
-        Some(adapter.txg_cycle_cell())
-    };
-
     if effective_mode.background_scrub_interval_secs > 0 {
         let scrub_options = tidefs_local_object_store::StoreOptions {
             background_scrub_interval_secs: effective_mode.background_scrub_interval_secs,
@@ -1405,7 +1394,6 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         live_owner,
         queue_depth_engine,
         background_scheduler,
-        txg_cycle,
         mmap_coherency,
     })
 }
@@ -1434,7 +1422,6 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
         live_owner,
         queue_depth_engine,
         background_scheduler,
-        txg_cycle,
         mmap_coherency,
     } = match start_mount(&config) {
         Ok(started) => started,
@@ -1457,17 +1444,6 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
     if config.debug {
         eprintln!("tidefsctl: FUSE session active, Ctrl-C to stop");
     }
-
-    let txg_shutdown = Arc::clone(&shutdown);
-    let txg_handle = txg_cycle.map(|cycle| {
-        std::thread::spawn(move || {
-            txg_cycle::CommitGroupCycle::spawn_periodic_commit_loop(
-                cycle,
-                txg_shutdown,
-                std::time::Duration::from_secs(MOUNT_TXG_COMMIT_INTERVAL_SECS),
-            );
-        })
-    });
 
     while !shutdown.load(Ordering::Relaxed) {
         let report = background_scheduler.as_ref().and_then(|scheduler| {
@@ -1501,9 +1477,6 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_secs(
             config.runtime.drain_timeout_secs,
         ));
-    }
-    if let Some(handle) = txg_handle {
-        let _ = handle.join();
     }
     if let Some(scheduler) = background_scheduler {
         *scheduler.lock().unwrap() = None;
