@@ -559,23 +559,29 @@ READONLY_HASH_AFTER=""
 expect_readonly_failure() {
     OP="$1"
     shift
+    OP_TIMEOUT="/tmp/$OP.timeout"
+    : > "$OP_TIMEOUT"
     "$@" > "/tmp/$OP.out" 2> "/tmp/$OP.err" &
     OP_PID=$!
-    OP_RC=""
-    for _ in $(seq 1 5); do
-        if ! kill -0 "$OP_PID" 2>/dev/null; then
-            wait "$OP_PID"
-            OP_RC=$?
-            break
+    (
+        sleep 5
+        if kill -0 "$OP_PID" 2>/dev/null; then
+            {
+                echo "pid=$OP_PID"
+                echo "wchan=$(cat "/proc/$OP_PID/wchan" 2>/dev/null || echo unknown)"
+                echo "stack=$(cat "/proc/$OP_PID/stack" 2>/dev/null || echo unavailable)"
+                echo "daemon=$(tail -20 /tmp/readonly_mount.log 2>/dev/null)"
+            } > "$OP_TIMEOUT"
+            kill -KILL "$OP_PID" 2>/dev/null || true
         fi
-        sleep 1
-    done
-    if [ -z "$OP_RC" ]; then
-        OP_WCHAN=$(cat "/proc/$OP_PID/wchan" 2>/dev/null || echo unknown)
-        OP_STACK=$(cat "/proc/$OP_PID/stack" 2>/dev/null || echo unavailable)
-        kill -KILL "$OP_PID" 2>/dev/null || true
-        wait "$OP_PID" 2>/dev/null || true
-        fail "$OP" "mutation timed out (pid=$OP_PID wchan=$OP_WCHAN stack=$OP_STACK daemon=$(tail -20 /tmp/readonly_mount.log 2>/dev/null))"
+    ) &
+    OP_WATCHDOG_PID=$!
+    wait "$OP_PID"
+    OP_RC=$?
+    kill "$OP_WATCHDOG_PID" 2>/dev/null || true
+    wait "$OP_WATCHDOG_PID" 2>/dev/null || true
+    if [ -s "$OP_TIMEOUT" ]; then
+        fail "$OP" "mutation timed out ($(cat "$OP_TIMEOUT" 2>/dev/null))"
     elif [ "$OP_RC" -eq 0 ]; then
         fail "$OP" "mutation unexpectedly succeeded"
     elif grep -qi 'read-only file system' "/tmp/$OP.err" 2>/dev/null; then
