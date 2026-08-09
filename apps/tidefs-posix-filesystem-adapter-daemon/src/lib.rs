@@ -21,19 +21,16 @@
 //!    the appropriate dispatch handler.
 //!
 //! 2. **Dispatch**: the [`FuseVfsAdapter`] implements [`fuser::Filesystem`]
-//!    and dispatches each operation to a type-safe handler.  Namespace
-//!    operations (lookup, mkdir, unlink, rename, symlink, …) go through
-//!    [`Namespace`]; data-path operations (read, write, fallocate, flush,
-//!    fsync) go through the page-cache and extent-map; metadata operations
-//!    (getattr, setattr, access) go through the inode table and permission
-//!    checker.
+//!    and projects each operation into the mounted [`VfsEngine`]. Adapter
+//!    handle, lookup-reference, page-cache, and reply state remains derived
+//!    transport state; namespace, inode, metadata, and persistence decisions
+//!    stay in the engine.
 //!
 //! 3. **Reply**: each handler returns either a success value (packed into
 //!    a FUSE reply) or an [`Errno`] error code.  The reply layer
 //!    converts these into the appropriate kernel reply message.
 //!
 //! [`FuseVfsAdapter`]: crate::fuse_vfs_adapter::FuseVfsAdapter
-//! [`Namespace`]: tidefs_namespace::Namespace
 //! [`RequestCtx`]: tidefs_types_vfs_core::RequestCtx
 //! [`Errno`]: tidefs_vfs_engine::Errno
 //!

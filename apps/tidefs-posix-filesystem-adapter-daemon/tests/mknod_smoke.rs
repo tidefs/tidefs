@@ -8,14 +8,13 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tidefs_local_filesystem::{
     human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem,
     RootAuthenticationKey,
 };
-use tidefs_namespace::Namespace;
 use tidefs_posix_filesystem_adapter_daemon::fuse_vfs_adapter::FuseVfsAdapter;
 
 static UMASK_LOCK: Mutex<()> = Mutex::new(());
@@ -60,9 +59,7 @@ impl MountedVfs {
         )
         .expect("open local filesystem");
         let engine = VfsLocalFileSystem::new(filesystem);
-        let adapter = FuseVfsAdapter::new(Box::new(engine))
-            .expect("create FUSE VFS adapter")
-            .with_namespace(Arc::new(Namespace::new()));
+        let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create FUSE VFS adapter");
         let session = fuser::spawn_mount2(adapter, &mount, &mount_options()).expect("mount FUSE");
 
         Self {

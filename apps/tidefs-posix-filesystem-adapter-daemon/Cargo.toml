@@ -50,7 +50,6 @@ tidefs-types-posix-filesystem-adapter-core = { workspace = true }
 tidefs-types-vfs-core = { workspace = true }
 tidefs-types-dataset-feature-flags-core = { workspace = true }
 tidefs-vfs-engine = { workspace = true }
-tidefs-namespace = { workspace = true, features = ["persistent-dir-index"] }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tidefs-flow-commit-coordinator = { workspace = true }

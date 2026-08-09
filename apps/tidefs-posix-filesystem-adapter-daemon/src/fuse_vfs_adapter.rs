@@ -81,7 +81,6 @@ use tidefs_vfs_engine::{
 };
 
 use crate::mount_options::TimestampPolicy;
-use tidefs_dir_index::DirCookie;
 use tidefs_intent_log::{IntentLogBuffer, IntentLogRecord as IlRecord};
 use tidefs_local_filesystem::PATH_MAX_BYTES;
 
@@ -91,7 +90,6 @@ fn fuse_op_diagnostics_enabled() -> bool {
         Ok("1") | Ok("true") | Ok("yes")
     )
 }
-use tidefs_namespace::Namespace;
 
 /// Compile-time authority guard: filesystem intent recording and crash
 /// recovery go through the canonical `tidefs_intent_log::IntentLogBuffer`
@@ -438,75 +436,7 @@ fn rename_mutation_preflight(
     Ok(())
 }
 
-/// Map a namespace `kind` field to a VFS [`NodeKind`].
-fn namespace_kind_to_node_kind(kind: u32) -> NodeKind {
-    match kind {
-        tidefs_namespace::KIND_DIR => NodeKind::Dir,
-        tidefs_namespace::KIND_FILE => NodeKind::File,
-        tidefs_namespace::KIND_SYMLINK => NodeKind::Symlink,
-        tidefs_namespace::KIND_FIFO => NodeKind::Fifo,
-        tidefs_namespace::KIND_SOCKET => NodeKind::Socket,
-        tidefs_namespace::KIND_CHAR => NodeKind::CharDev,
-        tidefs_namespace::KIND_BLOCK => NodeKind::BlockDev,
-        _ => NodeKind::File, // fallback: treat unknown as regular file
-    }
-}
-
-/// Convert namespace [`tidefs_namespace::InodeAttributes`] to VFS [`InodeAttr`].
-fn namespace_attrs_to_inode_attr(attrs: &tidefs_namespace::InodeAttributes) -> InodeAttr {
-    let kind = match attrs.mode & 0o170000 {
-        0o040000 => NodeKind::Dir,
-        0o120000 => NodeKind::Symlink,
-        0o010000 => NodeKind::Fifo,
-        0o140000 => NodeKind::Socket,
-        0o060000 => NodeKind::BlockDev,
-        0o020000 => NodeKind::CharDev,
-        _ => NodeKind::File,
-    };
-    let atime_ns = system_time_to_ns(attrs.atime);
-    let mtime_ns = system_time_to_ns(attrs.mtime);
-    let ctime_ns = system_time_to_ns(attrs.ctime);
-    InodeAttr::new(
-        InodeId::new(attrs.inode),
-        Generation::new(0),
-        kind,
-        tidefs_types_vfs_core::PosixAttrs::new(
-            attrs.mode,
-            attrs.uid,
-            attrs.gid,
-            attrs.nlink,
-            attrs.rdev,
-            atime_ns,
-            mtime_ns,
-            ctime_ns,
-            0_i64, // btime_ns
-            attrs.size,
-            0,   // blocks_512
-            512, // blksize
-        ),
-        tidefs_types_vfs_core::InodeFlags::none(),
-        0, // subtree_rev
-        0, // dir_rev
-    )
-}
 const CREATE_METADATA_RESERVATION_BYTES: u64 = 4096;
-/// Convert [`tidefs_namespace::NamespaceError`] to VFS [`Errno`].
-pub(crate) fn namespace_error_to_errno(e: tidefs_namespace::NamespaceError) -> Errno {
-    match e {
-        tidefs_namespace::NamespaceError::NotFound
-        | tidefs_namespace::NamespaceError::InodeNotFound => Errno::ENOENT,
-        tidefs_namespace::NamespaceError::AlreadyExists => Errno::EEXIST,
-        tidefs_namespace::NamespaceError::NotEmpty => Errno::ENOTEMPTY,
-        tidefs_namespace::NamespaceError::NotDirectory => Errno::ENOTDIR,
-        tidefs_namespace::NamespaceError::IsDirectory => Errno::EISDIR,
-        tidefs_namespace::NamespaceError::InvalidName => Errno::EINVAL,
-        tidefs_namespace::NamespaceError::TooManySymlinks => Errno::ELOOP,
-        tidefs_namespace::NamespaceError::NotSymlink => Errno::EINVAL,
-        tidefs_namespace::NamespaceError::LinkCountOverflow => Errno::EMLINK,
-        tidefs_namespace::NamespaceError::RenameCycle => Errno::EINVAL,
-        _ => Errno::EIO,
-    }
-}
 
 const LINUX_FMODE_EXEC_OPEN_FLAG: u32 = 0x20;
 const LINUX_O_TMPFILE: u32 = 0o20200000;
@@ -951,40 +881,15 @@ impl NegativeLookupCache {
     }
 }
 
-const NAMESPACE_DIR_HANDLE_TAG: u64 = 1 << 63;
-
-fn namespace_dir_handle_id(ino: u64) -> u64 {
-    NAMESPACE_DIR_HANDLE_TAG | (ino & !NAMESPACE_DIR_HANDLE_TAG)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdapterDirHandleBacking {
-    Engine,
-    Namespace,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdapterDirHandle {
     dh: EngineDirHandle,
     cursor: u64,
-    backing: AdapterDirHandleBacking,
 }
 
 impl AdapterDirHandle {
     fn new(dh: EngineDirHandle) -> Self {
-        Self {
-            dh,
-            cursor: 0,
-            backing: AdapterDirHandleBacking::Engine,
-        }
-    }
-
-    fn namespace(dh: EngineDirHandle) -> Self {
-        Self {
-            dh,
-            cursor: 0,
-            backing: AdapterDirHandleBacking::Namespace,
-        }
+        Self { dh, cursor: 0 }
     }
 
     fn requested_offset(&self, kernel_offset: u64) -> u64 {
@@ -1009,11 +914,6 @@ impl AdapterDirHandleTable {
     fn insert(&mut self, dh: EngineDirHandle) {
         self.handles
             .insert(dh.dh_id.get(), AdapterDirHandle::new(dh));
-    }
-
-    fn insert_namespace(&mut self, dh: EngineDirHandle) {
-        self.handles
-            .insert(dh.dh_id.get(), AdapterDirHandle::namespace(dh));
     }
 
     fn get(&self, fh: u64) -> Option<AdapterDirHandle> {
@@ -2957,7 +2857,6 @@ pub struct FuseVfsAdapter {
     negative_cache: Mutex<NegativeLookupCache>,
     poll_registrations: Mutex<PollRegistrationTable>,
     pub(crate) dirty_state: Mutex<BTreeMap<u64, DirtyRanges>>,
-    namespace: Option<Arc<Namespace>>,
     /// Adapter-local FUSE kernel lookup references. This is the #665
     /// projection state for the #655 dataset inode authority decision, not
     /// durable inode lifetime; #664 owns the allocator authority extraction.
@@ -3108,7 +3007,6 @@ impl FuseVfsAdapter {
             forget_refcounts: Mutex::new(BTreeMap::new()),
             lookup_counts: Mutex::new(BTreeMap::new()),
             removed_lookup_attrs: Mutex::new(BTreeMap::new()),
-            namespace: None,
             block_volume: Mutex::new(None),
             page_cache: Mutex::new(ReadCache::new(256)),
             fuse_read_dispatch: None,
@@ -3359,18 +3257,6 @@ impl FuseVfsAdapter {
         self.writeback_seen_inodes.lock().unwrap().contains(&ino)
     }
 
-    /// Attach a [`tidefs_namespace::Namespace`] for legacy namespace fallback.
-    ///
-    /// Mounted mutations remain engine-authoritative.  The namespace handle is
-    /// consulted only as a fallback, or merged into a single exhausted engine
-    /// page for legacy namespace-only test surfaces.
-    #[must_use]
-    pub fn with_namespace(mut self, ns: Arc<Namespace>) -> Self {
-        self.rename_dispatch = FuseRenameDispatch::new().with_namespace(Arc::clone(&ns));
-        self.namespace = Some(ns);
-        self
-    }
-
     /// Populate the short-lived getattr cache after an engine mutation
     /// (create, mkdir, link, symlink, mknod) so subsequent getattr calls
     /// avoid the engine lock until the cache TTL expires.
@@ -3385,15 +3271,6 @@ impl FuseVfsAdapter {
             .lock()
             .unwrap()
             .insert(ino, (attr_out, std::time::Instant::now() + cache_ttl));
-    }
-
-    /// Return a cloneable handle to the namespace, if one is attached.
-    ///
-    /// The handle can be used by the main thread to flush the namespace
-    /// on clean shutdown, even after the adapter is consumed by
-    /// [`fuser::spawn_mount2`].
-    pub fn namespace_handle(&self) -> Option<Arc<Namespace>> {
-        self.namespace.clone()
     }
 
     /// Force every write through the full synchronous durability path.
@@ -3792,64 +3669,6 @@ impl FuseVfsAdapter {
         self.try_inval_inode_attrs(ino);
     }
 
-    fn sync_namespace_attrs_local(&self, ino: u64, attr: &InodeAttr) {
-        if let Some(ns) = self.namespace.as_ref() {
-            if let Some(mut ns_attrs) = ns.get_attrs(ino) {
-                ns_attrs.mode = attr.posix.mode;
-                ns_attrs.uid = attr.posix.uid;
-                ns_attrs.gid = attr.posix.gid;
-                ns_attrs.nlink = attr.posix.nlink;
-                ns_attrs.size = attr.posix.size;
-                ns_attrs.atime = time_from_ns(attr.posix.atime_ns);
-                ns_attrs.mtime = time_from_ns(attr.posix.mtime_ns);
-                ns_attrs.ctime = time_from_ns(attr.posix.ctime_ns);
-
-                let _ = ns.update_attrs(ino, ns_attrs);
-            }
-        }
-    }
-
-    fn sync_namespace_attrs_after_engine_write(&self, ino: u64, attr: &InodeAttr) {
-        self.sync_namespace_attrs_local(ino, attr);
-        self.invalidate_inode_metadata_after_engine_write(ino);
-    }
-
-    fn sync_namespace_attrs_from_engine(
-        &self,
-        ctx: &RequestCtx,
-        ino: u64,
-        handle: Option<&EngineFileHandle>,
-    ) {
-        let updated = {
-            let e = self.engine.lock().unwrap();
-            e.getattr(InodeId::new(ino), handle, ctx).ok()
-        };
-        if let Some(attr) = updated {
-            self.sync_namespace_attrs_after_engine_write(ino, &attr);
-        } else {
-            self.invalidate_inode_metadata_after_engine_write(ino);
-        }
-    }
-
-    fn write_requires_namespace_attr_sync(
-        is_writeback_cached: bool,
-        posix_direct_io: bool,
-        write_flags: u32,
-        old_size: u64,
-        offset: u64,
-        written: u32,
-    ) -> bool {
-        if written == 0 {
-            return false;
-        }
-        if !is_writeback_cached || posix_direct_io || (write_flags & FUSE_WRITE_KILL_PRIV) != 0 {
-            return true;
-        }
-        offset
-            .checked_add(u64::from(written))
-            .is_none_or(|end| end > old_size)
-    }
-
     fn writeback_sparse_zero_write_is_noop(
         engine: &(dyn VfsEngineStatFs + Send),
         write_efh: &EngineFileHandle,
@@ -4139,26 +3958,6 @@ impl FuseVfsAdapter {
         }
     }
 
-    /// Namespace-backed symlink: call [`tidefs_namespace::Namespace::create_symlink`]
-    /// with the byte target, return the created inode's [`InodeAttr`].
-    fn dispatch_symlink_via_namespace(
-        &self,
-        ns: &Namespace,
-        parent: u64,
-        name: &[u8],
-        target: &[u8],
-    ) -> Result<InodeAttr, Errno> {
-        let name_str = std::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
-        let ino = ns
-            .create_symlink(parent, name_str, target)
-            .map_err(namespace_error_to_errno)?;
-        let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
-        let attr = namespace_attrs_to_inode_attr(&ns_attrs);
-        self.record_dentry_child_mutation(parent, name);
-        self.populate_getattr_cache(attr.inode_id.get(), &attr);
-        Ok(attr)
-    }
-
     /// Public dispatch for POSIX symlink(2).  Creates a symlink inode
     /// named `name` under `parent` with the raw byte target `target`.
     /// Returns the new inode attributes on success.
@@ -4213,28 +4012,10 @@ impl FuseVfsAdapter {
         plan_symlink_entry_reply(result, self.dentry_policy)
     }
 
-    /// Namespace-backed readlink: call [`tidefs_namespace::Namespace::readlink`]
-    /// and return the byte-preserved target.
-    fn dispatch_readlink_via_namespace(&self, ns: &Namespace, ino: u64) -> Result<Vec<u8>, Errno> {
-        let target = ns.readlink(ino).map_err(namespace_error_to_errno)?;
-        if target.len() > PATH_MAX_BYTES {
-            return Err(Errno::ENAMETOOLONG);
-        }
-        Ok(target)
-    }
-
     #[tracing::instrument(skip(self, ctx), fields(ino = %ino, op = "readlink"))]
     pub fn dispatch_readlink(&self, ctx: &RequestCtx, ino: u64) -> Result<Vec<u8>, Errno> {
         let e = self.engine.lock().unwrap();
-        let target = match e.readlink(InodeId::new(ino), ctx) {
-            Ok(target) => target,
-            Err(Errno::ENOENT | Errno::ESTALE | Errno::EIO) if self.namespace.is_some() => {
-                drop(e);
-                let ns = self.namespace.as_ref().expect("namespace checked");
-                return self.dispatch_readlink_via_namespace(ns, ino);
-            }
-            Err(errno) => return Err(errno),
-        };
+        let target = e.readlink(InodeId::new(ino), ctx)?;
         if target.len() > PATH_MAX_BYTES {
             return Err(Errno::ENAMETOOLONG);
         }
@@ -4635,10 +4416,6 @@ impl FuseVfsAdapter {
         newparent: u64,
         newname: &[u8],
     ) -> Result<InodeAttr, Errno> {
-        // Mounted hard links use the engine as the authoritative inode,
-        // metadata, and persistence boundary. Namespace-only hard-link
-        // support remains available through dispatch_link_via_namespace for
-        // legacy tests.
         self.dispatch_link_entry(ctx, ino, newparent, newname)
     }
 
@@ -4673,183 +4450,6 @@ impl FuseVfsAdapter {
         self.invalidate_inode_metadata_after_engine_write(attr.inode_id.get());
         self.record_dentry_child_mutation(newparent, newname);
         self.populate_getattr_cache(attr.inode_id.get(), &attr);
-        Ok(attr)
-    }
-    /// Namespace-backed mkdir: call [`tidefs_namespace::Namespace::create_dir`]
-    /// Namespace-backed hard link: call [`tidefs_namespace::Namespace::create_hard_link_by_inode`]
-    /// with the target inode directly, bypassing the old-parent/old-name lookup.
-    fn dispatch_link_via_namespace(
-        &self,
-        ns: &Namespace,
-        target: u64,
-        new_parent: u64,
-        new_name: &[u8],
-    ) -> Result<InodeAttr, Errno> {
-        let new_name_str = std::str::from_utf8(new_name).map_err(|_| Errno::EINVAL)?;
-        let ino = ns
-            .create_hard_link_by_inode(target, new_parent, new_name_str)
-            .map_err(namespace_error_to_errno)?;
-        let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
-        let attr = namespace_attrs_to_inode_attr(&ns_attrs);
-        self.record_dentry_child_mutation(new_parent, new_name);
-        self.populate_getattr_cache(attr.inode_id.get(), &attr);
-        Ok(attr)
-    }
-
-    /// with default directory attributes, return the created inode's [`InodeAttr`].
-    fn dispatch_mkdir_via_namespace(
-        &self,
-        ns: &Namespace,
-        parent: u64,
-        name: &[u8],
-        mode: u32,
-    ) -> Result<InodeAttr, Errno> {
-        let name_str = std::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
-        let now = std::time::SystemTime::now();
-        let attrs = tidefs_namespace::InodeAttributes {
-            inode: 0,                     // allocated by create_dir
-            mode: mode & 0o777 | 0o40000, // S_IFDIR + permissions
-            uid: 0,
-            gid: 0,
-            size: 0,
-            nlink: 2, // . and parent
-            atime: now,
-            mtime: now,
-            ctime: now,
-            rdev: 0,
-        };
-        let ino = ns
-            .create_dir(parent, name_str, attrs)
-            .map_err(namespace_error_to_errno)?;
-        let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
-        let attr = namespace_attrs_to_inode_attr(&ns_attrs);
-        self.record_dentry_child_mutation(parent, name);
-        self.populate_getattr_cache(attr.inode_id.get(), &attr);
-        Ok(attr)
-    }
-
-    /// Namespace-backed create: call [`tidefs_namespace::Namespace::create_file`]
-    /// with the given file attributes, allocate a file handle, and return a
-    /// [`VfsCreateDispatch`].
-    fn dispatch_create_via_namespace(
-        &self,
-        ns: &Namespace,
-        parent: u64,
-        name: &[u8],
-        mode: u32,
-        open_flags: u32,
-    ) -> Result<VfsCreateDispatch, Errno> {
-        let name_str = std::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
-        let now = std::time::SystemTime::now();
-        let attrs = tidefs_namespace::InodeAttributes {
-            inode: 0,
-            mode: mode & 0o777,
-            uid: 0,
-            gid: 0,
-            size: 0,
-            nlink: 1,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            rdev: 0,
-        };
-        let ino = ns
-            .create_file(parent, name_str, attrs)
-            .map_err(namespace_error_to_errno)?;
-        let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
-        let attr = namespace_attrs_to_inode_attr(&ns_attrs);
-        self.record_dentry_child_mutation(parent, name);
-        self.populate_getattr_cache(attr.inode_id.get(), &attr);
-
-        let engine_fh = tidefs_types_vfs_core::EngineFileHandle::new(
-            tidefs_types_vfs_core::InodeId::new(attr.inode_id.get()),
-            0u32,
-            tidefs_types_vfs_core::FileHandleId::new(0),
-            0,
-        );
-        let fuse_open_flags = self.fuse_open_flags_for_request(open_flags);
-        let adapter_fh = {
-            let mut handles = self.file_handles.lock().unwrap();
-            let adapter_fh = handles.allocate(attr.inode_id.get(), open_flags, engine_fh);
-            if let Some(handle) = handles.handles.get_mut(&adapter_fh) {
-                handle.fuse_open_flags = fuse_open_flags;
-            }
-            adapter_fh
-        };
-        self.file_handles.lock().unwrap().inc_open_ref(ino);
-        self.remember_writeback_inode(ino);
-        Ok(VfsCreateDispatch {
-            attr,
-            adapter_fh,
-            fuse_open_flags,
-        })
-    }
-    /// Namespace-backed mknod: call [`tidefs_namespace::Namespace::mknod`]
-    /// with the given mode and rdev, return the created inode's [`InodeAttr`].
-    fn dispatch_mknod_via_namespace(
-        &self,
-        ns: &Namespace,
-        parent: u64,
-        name: &[u8],
-        mode: u32,
-        rdev: u32,
-    ) -> Result<InodeAttr, Errno> {
-        let name_str = std::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
-        let ino = ns
-            .mknod(parent, name_str, mode, rdev)
-            .map_err(namespace_error_to_errno)?;
-        let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
-        let attr = namespace_attrs_to_inode_attr(&ns_attrs);
-        self.record_dentry_child_mutation(parent, name);
-        self.populate_getattr_cache(attr.inode_id.get(), &attr);
-        Ok(attr)
-    }
-
-    /// Namespace-backed lookup: use [`tidefs_namespace::Namespace::lookup`]
-    /// to resolve a (parent, name) pair through the directory index.  When
-    /// the VFS engine also knows the inode, return the engine attributes so
-    /// remounted namespace metadata cannot synthesize fresh timestamps.
-    fn dispatch_lookup_via_namespace(
-        &self,
-        ctx: &RequestCtx,
-        ns: &Namespace,
-        parent: u64,
-        name: &[u8],
-    ) -> Result<InodeAttr, Errno> {
-        let name_str = std::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
-        let ino = ns
-            .lookup(parent, name_str)
-            .map_err(namespace_error_to_errno)?
-            .ok_or(Errno::ENOENT)?;
-        let e = self.engine.lock().unwrap();
-        let engine_attr = e.getattr(InodeId::new(ino), None, ctx);
-        match engine_attr {
-            Ok(attr) => {
-                self.sync_namespace_attrs_local(ino, &attr);
-                self.cache_path_lookup(parent, name, &attr);
-                self.record_lookup_count(attr.inode_id.get());
-                return Ok(attr);
-            }
-            Err(Errno::ENOENT | Errno::ESTALE | Errno::EIO) => {}
-            Err(errno) => return Err(errno),
-        }
-
-        let engine_lookup_attr = e.lookup(InodeId::new(parent), name, ctx);
-        match engine_lookup_attr {
-            Ok(attr) if attr.inode_id.get() == ino => {
-                self.sync_namespace_attrs_local(ino, &attr);
-                self.cache_path_lookup(parent, name, &attr);
-                self.record_lookup_count(attr.inode_id.get());
-                return Ok(attr);
-            }
-            Ok(_) | Err(Errno::ENOENT | Errno::ESTALE | Errno::EIO) => {}
-            Err(errno) => return Err(errno),
-        }
-
-        let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
-        let attr = namespace_attrs_to_inode_attr(&ns_attrs);
-        self.cache_path_lookup(parent, name, &attr);
-        self.record_lookup_count(attr.inode_id.get());
         Ok(attr)
     }
 
@@ -5028,253 +4628,6 @@ impl FuseVfsAdapter {
 
         Ok(())
     }
-    /// Namespace-backed unlink: call [`tidefs_namespace::Namespace::unlink`]
-    /// which handles both file removal and empty-directory removal.
-    fn dispatch_unlink_via_namespace(
-        &self,
-        ns: &Namespace,
-        parent: u64,
-        name: &[u8],
-        ctx: &RequestCtx,
-    ) -> Result<(), Errno> {
-        let name_str = std::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
-
-        // Resolve child inode for sticky-bit enforcement and notify_delete.
-        let child_inode = ns
-            .lookup(parent, name_str)
-            .map_err(namespace_error_to_errno)
-            .unwrap_or(None);
-
-        // POSIX sticky-bit (S_ISVTX) enforcement: when the parent
-        // directory has the sticky bit set, only the file owner,
-        // directory owner, or root may delete entries.
-        if let Some(parent_attrs) = ns.get_attrs(parent) {
-            if let Some(child_ino) = child_inode {
-                if let Some(child_attrs) = ns.get_attrs(child_ino) {
-                    if !sticky_dir_allows_unlink_or_rename(
-                        parent_attrs.mode,
-                        parent_attrs.uid,
-                        child_attrs.uid,
-                        ctx.uid,
-                    ) {
-                        return Err(Errno::EPERM);
-                    }
-                }
-            }
-        }
-
-        let ns_result = ns
-            .unlink(parent, name_str)
-            .map_err(namespace_error_to_errno);
-
-        ns_result?;
-
-        self.record_dentry_child_mutation(parent, name);
-        if let Some(child) = child_inode {
-            self.negative_cache
-                .lock()
-                .unwrap()
-                .invalidate_parent_dir(child);
-            self.path_lookup_cache
-                .lock()
-                .unwrap()
-                .invalidate_parent_dir(child);
-        }
-        Ok(())
-    }
-
-    /// and enforce directory-empty constraint through the namespace.
-    fn dispatch_rmdir_via_namespace(
-        &self,
-        ns: &Namespace,
-        parent: u64,
-        name: &[u8],
-        ctx: &RequestCtx,
-    ) -> Result<(), Errno> {
-        let name_str = std::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
-
-        // Resolve child inode for sticky-bit enforcement and notify_delete.
-        let child_inode = ns
-            .lookup(parent, name_str)
-            .map_err(namespace_error_to_errno)
-            .unwrap_or(None);
-
-        // POSIX sticky-bit (S_ISVTX) enforcement: when the parent
-        // directory has the sticky bit set, only the file owner,
-        // directory owner, or root may delete entries.
-        if let Some(parent_attrs) = ns.get_attrs(parent) {
-            if let Some(child_ino) = child_inode {
-                if let Some(child_attrs) = ns.get_attrs(child_ino) {
-                    if !sticky_dir_allows_unlink_or_rename(
-                        parent_attrs.mode,
-                        parent_attrs.uid,
-                        child_attrs.uid,
-                        ctx.uid,
-                    ) {
-                        return Err(Errno::EPERM);
-                    }
-                }
-            }
-        }
-
-        let ns_result = ns
-            .unlink(parent, name_str)
-            .map_err(namespace_error_to_errno);
-
-        ns_result?;
-
-        self.record_dentry_child_mutation(parent, name);
-        if let Some(child) = child_inode {
-            self.negative_cache
-                .lock()
-                .unwrap()
-                .invalidate_parent_dir(child);
-            self.path_lookup_cache
-                .lock()
-                .unwrap()
-                .invalidate_parent_dir(child);
-        }
-        Ok(())
-    }
-
-    /// Namespace-backed getattr: resolve inode attributes through
-    /// [`tidefs_namespace::Namespace::get_attrs`], convert to [`FuseAttrOut`]
-    /// with TTL from the dentry policy, and populate the short-lived getattr
-    /// cache for subsequent requests.
-    fn dispatch_getattr_via_namespace(
-        &self,
-        ns: &Namespace,
-        ino: u64,
-    ) -> Result<FuseAttrOut, Errno> {
-        let attrs = ns.get_attrs(ino).ok_or(Errno::ESTALE)?;
-        let inode_attr = namespace_attrs_to_inode_attr(&attrs);
-        let attr_out = crate::workers_meta::fuse_attr_out(ino, &inode_attr.posix, inode_attr.kind);
-        // Populate cache with TTL from the coherency profile.
-        let cache_ttl = self.dentry_policy.positive_attr_ttl;
-        let attr_out = fuse_attr_out_with_ttl(attr_out, cache_ttl);
-        {
-            let mut cache = self.getattr_cache.lock().unwrap();
-            cache.insert(ino, (attr_out, std::time::Instant::now() + cache_ttl));
-        }
-        Ok(attr_out)
-    }
-
-    /// Namespace-backed setattr: read current attributes via
-    /// [`tidefs_namespace::Namespace::get_attrs`], apply the [`SetAttr`]
-    /// mask with partial-set semantics (only fields present in the valid
-    /// mask are modified), persist through
-    /// [`tidefs_namespace::Namespace::update_attrs`], and return the
-    /// updated [`FuseAttrOut`].
-    fn dispatch_setattr_via_namespace(
-        &self,
-        ns: &Namespace,
-        ino: u64,
-        attr: &SetAttr,
-        caller_uid: u32,
-        caller_gid: u32,
-        supplemental_gids: &[u32],
-    ) -> Result<FuseAttrOut, Errno> {
-        // Read-only mount: reject any attribute mutation.
-        if self.read_only {
-            return Err(Errno::EROFS);
-        }
-
-        let current = ns.get_attrs(ino).ok_or(Errno::ESTALE)?;
-        // ── Immutable inode flag enforcement ──────────────────────────────
-        // POSIX: immutable files reject chmod, chown, truncate, and utimes.
-        // Check before any mutation path so we never touch an immutable inode.
-        let mutation_requested = attr.valid
-            & (FATTR_SIZE | FATTR_MODE | FATTR_UID | FATTR_GID | FATTR_ATIME | FATTR_MTIME)
-            != 0;
-        if mutation_requested {
-            let e = self.engine.lock().unwrap();
-            if let Ok(engine_attr) = e.getattr(InodeId::new(ino), None, &RequestCtx::new_root()) {
-                enforce_immutable_guard(engine_attr.flags.to_raw_flags())?;
-            }
-        }
-        // POSIX: truncate on a directory must return EISDIR.
-        if attr.valid & FATTR_SIZE != 0 && (current.mode & 0o170000) == 0o040000 {
-            return Err(Errno::EISDIR);
-        }
-        // POSIX permission gate (chmod/chown/chgrp).
-        if let Err(_meta_err) = crate::workers_meta::can_setattr(
-            caller_uid,
-            caller_gid,
-            supplemental_gids,
-            current.uid,
-            current.gid,
-            attr.valid,
-            attr,
-        ) {
-            return Err(Errno::EPERM);
-        }
-
-        let mut attrs = current;
-
-        // Apply mutable fields from the SetAttr mask (partial-set semantics).
-        if attr.valid & FATTR_MODE != 0 {
-            attrs.mode = (attrs.mode & S_IFMT) | (attr.mode & !S_IFMT);
-        }
-        if attr.valid & FATTR_UID != 0 {
-            attrs.uid = attr.uid;
-        }
-        if attr.valid & FATTR_GID != 0 {
-            attrs.gid = attr.gid;
-        }
-        // FATTR_SIZE: update the metadata size field. Extent-map truncation
-        // (block deallocation, page-cache invalidation) is handled by the
-        // engine dispatch layer above; the namespace layer owns only metadata.
-        let now = std::time::SystemTime::now();
-        if attr.valid & FATTR_SIZE != 0 {
-            attrs.size = attr.size;
-            // POSIX: truncate updates mtime if not explicitly set by caller.
-            if attr.valid & (FATTR_MTIME | FATTR_MTIME_NOW) == 0 {
-                attrs.mtime = now;
-            }
-        }
-        if attr.valid & FATTR_ATIME != 0 {
-            attrs.atime = time_from_ns(attr.atime_ns);
-        }
-        if attr.valid & FATTR_MTIME != 0 {
-            attrs.mtime = time_from_ns(attr.mtime_ns);
-        }
-        if attr.valid & FATTR_ATIME_NOW != 0 {
-            attrs.atime = now;
-        }
-        if attr.valid & FATTR_MTIME_NOW != 0 {
-            attrs.mtime = now;
-        }
-        // Always bump ctime on any metadata change.
-        let had_metadata_change = attr.valid
-            & (FATTR_MODE
-                | FATTR_UID
-                | FATTR_GID
-                | FATTR_ATIME
-                | FATTR_MTIME
-                | FATTR_ATIME_NOW
-                | FATTR_MTIME_NOW
-                | FATTR_SIZE)
-            != 0;
-        if had_metadata_change {
-            attrs.ctime = now;
-        }
-
-        ns.update_attrs(ino, attrs)
-            .map_err(namespace_error_to_errno)?;
-
-        // Re-read to return committed state.
-        let updated = ns.get_attrs(ino).ok_or(Errno::ESTALE)?;
-        let inode_attr = namespace_attrs_to_inode_attr(&updated);
-        let attr_out = crate::workers_meta::fuse_attr_out(ino, &inode_attr.posix, inode_attr.kind);
-        // Invalidate getattr cache entry and path lookup cache on mutation.
-        {
-            let mut cache = self.getattr_cache.lock().unwrap();
-            cache.remove(&ino);
-        }
-        self.path_lookup_cache.lock().unwrap().remove_by_ino(ino);
-        Ok(attr_out)
-    }
-
     pub fn dispatch_rmdir_entry(
         &self,
         ctx: &RequestCtx,
@@ -5340,19 +4693,8 @@ impl FuseVfsAdapter {
                 Err(Errno::ENODATA) => None,
                 Err(_) => None,
             };
-        match e.getattr(InodeId::new(ino), None, ctx) {
-            Ok(attr) => {
-                plan_fuse_access_result(Ok(attr), ctx, requested, acl.as_deref(), &mount_identity)
-            }
-            Err(Errno::ENOENT | Errno::ESTALE | Errno::EIO) if self.namespace.is_some() => {
-                drop(e);
-                let ns = self.namespace.as_ref().expect("namespace checked");
-                let attrs = ns.get_attrs(ino).ok_or(Errno::ESTALE)?;
-                let inode_attr = namespace_attrs_to_inode_attr(&attrs);
-                plan_fuse_access_result(Ok(inode_attr), ctx, requested, None, &mount_identity)
-            }
-            Err(errno) => Err(errno),
-        }
+        let attr = e.getattr(InodeId::new(ino), None, ctx)?;
+        plan_fuse_access_result(Ok(attr), ctx, requested, acl.as_deref(), &mount_identity)
     }
 
     pub fn dispatch_access(&self, ctx: &RequestCtx, ino: u64, mask: i32) -> Result<(), Errno> {
@@ -5438,19 +4780,6 @@ impl FuseVfsAdapter {
             return Ok(attr);
         }
 
-        // Route through namespace when available; fall through
-        // to the engine when the lookup misses (fresh pool with empty
-        // namespace but authoritative engine data).
-        if let Some(ref ns) = self.namespace {
-            match self.dispatch_lookup_via_namespace(ctx, ns, parent, name) {
-                Ok(attr) => {
-                    return Ok(attr);
-                }
-                Err(Errno::ENOENT) | Err(Errno::EIO) | Err(Errno::ESTALE) => {} // fall through
-                Err(e) => return Err(e),
-            }
-        }
-
         let result = {
             let e = self.engine.lock().unwrap();
             e.lookup(InodeId::new(parent), name, ctx)
@@ -5511,9 +4840,6 @@ impl FuseVfsAdapter {
                 if let Some(attr_out) = self.removed_lookup_attr_out(ino) {
                     return Ok(attr_out);
                 }
-                if let Some(ref ns) = self.namespace {
-                    return self.dispatch_getattr_via_namespace(ns, ino);
-                }
                 let _ = unique;
                 return Err(Errno::ESTALE);
             }
@@ -5572,18 +4898,6 @@ impl FuseVfsAdapter {
                         || self.is_writeback_seen_inode(ino)) =>
             {
                 return Ok(orphan_timestamp_attr_out(ino, attr, ctx));
-            }
-            Err(Errno::ENOENT | Errno::EIO) if self.namespace.is_some() => {
-                drop(e);
-                let ns = self.namespace.as_ref().expect("namespace checked");
-                return self.dispatch_setattr_via_namespace(
-                    ns,
-                    ino,
-                    attr,
-                    ctx.uid,
-                    ctx.gid,
-                    ctx.groups.as_slice(),
-                );
             }
             Err(Errno::ENOENT | Errno::ESTALE | Errno::EIO) => return Err(Errno::ESTALE),
             Err(errno) => return Err(errno),
@@ -5682,12 +4996,11 @@ impl FuseVfsAdapter {
         // Capacity tracking for all size changes is handled by the engine's
         // CapacityAuthority during truncate dispatch (check_enospc for growth,
         // record_free for shrinkage).
-        self.sync_namespace_attrs_local(ino, &updated);
         drop(e);
         if let Some((offset, length)) = data_invalidation_range {
             self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
         } else {
-            self.invalidate_inode_metadata_local(ino);
+            self.invalidate_inode_metadata_after_engine_write(ino);
         }
 
         Ok(crate::workers_meta::fuse_attr_out(
@@ -5724,9 +5037,6 @@ impl FuseVfsAdapter {
 
         let updated = match self.record_fuse_read_atime_and_sync(ino, ctx, attr) {
             Ok(attr) => attr,
-            Err(Errno::ENOENT | Errno::ESTALE) if self.namespace.is_some() => {
-                return self.dispatch_getattr(ctx, ino, unique, None);
-            }
             Err(Errno::ENOENT) => return Err(Errno::ESTALE),
             Err(errno) => return Err(errno),
         };
@@ -5760,12 +5070,10 @@ impl FuseVfsAdapter {
         update.valid |= FATTR_CTIME;
         update.ctime_ns = attr.ctime_ns;
 
-        let updated = {
+        {
             let e = self.engine.lock().unwrap();
-            e.setattr(inode_id, &update, None, ctx)?
-        };
-        self.sync_namespace_attrs_local(ino, &updated);
-        Ok(updated)
+            e.setattr(inode_id, &update, None, ctx)
+        }
     }
 
     /// P5-02 classification for an incoming FUSE create request.
@@ -6155,9 +5463,6 @@ impl FuseVfsAdapter {
         mode: u32,
         rdev: u32,
     ) -> Result<InodeAttr, Errno> {
-        // Mounted mutations use the VFS engine as the authoritative inode,
-        // metadata, and persistence boundary. Namespace-only mknod remains
-        // available through dispatch_mknod_via_namespace for legacy tests.
         self.dispatch_mknod_entry(ctx, parent, name, mode, rdev)
     }
 
@@ -6171,10 +5476,6 @@ impl FuseVfsAdapter {
         open_flags: u32,
     ) -> Result<VfsCreateDispatch, Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_CREATE);
-        // Always route creates through the engine so the resulting
-        // EngineFileHandle is valid for subsequent write operations.
-        // The namespace fallthrough for getattr/lookup/readdir will
-        // pick up engine-created entries.
         self.dispatch_create_entry(ctx, parent, name, mode, open_flags)
     }
 
@@ -6756,7 +6057,6 @@ impl FuseVfsAdapter {
                 sync_efh,
                 mut fallback_to_release,
                 sparse_zero_noop,
-                post_write_attr,
                 clean_write_through_recorded,
             ) = {
                 let e = self.engine.lock().unwrap();
@@ -6797,7 +6097,6 @@ impl FuseVfsAdapter {
                         pre_write_size,
                         ctx,
                     );
-                let mut post_write_attr = None;
                 let metadata_error = if data.is_empty() {
                     None
                 } else {
@@ -6844,19 +6143,6 @@ impl FuseVfsAdapter {
                                             write_flags,
                                         );
                                     }
-                                    if post_write_attr.is_none()
-                                        && Self::write_requires_namespace_attr_sync(
-                                            is_writeback_cached,
-                                            posix_direct_io,
-                                            write_flags,
-                                            pre_write_size,
-                                            effective_offset as u64,
-                                            written,
-                                        )
-                                    {
-                                        post_write_attr =
-                                            e.getattr(InodeId::new(ino), Some(write_efh), ctx).ok();
-                                    }
                                 }
                                 Ok(written)
                             }
@@ -6874,7 +6160,6 @@ impl FuseVfsAdapter {
                     sync_efh,
                     fallback_efh,
                     sparse_zero_noop,
-                    post_write_attr,
                     clean_write_through_recorded,
                 )
             };
@@ -6888,8 +6173,8 @@ impl FuseVfsAdapter {
                     return Err(errno);
                 }
             };
-            if let Some(attr) = post_write_attr {
-                self.sync_namespace_attrs_after_engine_write(ino, &attr);
+            if written > 0 {
+                self.invalidate_inode_metadata_local(ino);
             }
             // Record write intent before acknowledging to kernel.
             if written > 0 && self.intent_log_write_enabled && !sparse_zero_noop {
@@ -6987,7 +6272,6 @@ impl FuseVfsAdapter {
             Ok(written)
         } else {
             let efh = resolved_efh.ok_or(Errno::EBADF)?;
-            let mut post_write_attr = None;
             let write_result = {
                 let e = self.engine.lock().unwrap();
                 // Capacity admission and allocation tracking are handled by the
@@ -7038,19 +6322,6 @@ impl FuseVfsAdapter {
                                         write_flags,
                                     );
                                 }
-                                if post_write_attr.is_none()
-                                    && Self::write_requires_namespace_attr_sync(
-                                        is_writeback_cached,
-                                        posix_direct_io,
-                                        write_flags,
-                                        pre_write_size,
-                                        effective_offset as u64,
-                                        written,
-                                    )
-                                {
-                                    post_write_attr =
-                                        e.getattr(InodeId::new(ino), Some(&efh), ctx).ok();
-                                }
                                 // Record write intent before acknowledging to kernel.
                                 if self.intent_log_write_enabled {
                                     if let Some(ref buf) = self.intent_log_buffer {
@@ -7096,8 +6367,8 @@ impl FuseVfsAdapter {
                 }
             }
 
-            if let Some(attr) = post_write_attr {
-                self.sync_namespace_attrs_after_engine_write(ino, &attr);
+            if matches!(write_result, Ok(written) if written > 0) {
+                self.invalidate_inode_metadata_local(ino);
             }
 
             // O_SYNC / O_DSYNC durability: when the file descriptor was opened
@@ -7854,7 +7125,7 @@ impl FuseVfsAdapter {
         };
         flush_result?;
         release_result?;
-        self.sync_namespace_attrs_from_engine(ctx, ino, None);
+        self.invalidate_inode_metadata_after_engine_write(ino);
         self.writeback_cache.lock().unwrap().mark_clean(ino);
         self.write_page_cache.clear_dirty_for_inode(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
@@ -8049,7 +7320,7 @@ impl FuseVfsAdapter {
         // configured, this is a no-op (the engine's sync path already
         // provides durability).
         self.commit_current_txg_barrier("fsync")?;
-        self.sync_namespace_attrs_from_engine(ctx, ino, Some(efh));
+        self.invalidate_inode_metadata_after_engine_write(ino);
         self.fsync_handler.handle_fsync(ino, datasync)?;
         Ok(())
     }
@@ -8902,8 +8173,6 @@ impl FuseVfsAdapter {
         Ok(revents)
     }
 
-    // Readdir dispatch prefers namespace iteration when available. When no
-    // namespace is attached, the existing VFS engine path is used.
     /// Conditionally record automatic read access time.
     ///
     /// Cached adapter reads do not call `VfsEngine::read`, so they need a
@@ -8917,7 +8186,6 @@ impl FuseVfsAdapter {
             e.record_read_access(inode_id, ctx)?;
             e.getattr(inode_id, None, ctx)?
         };
-        self.sync_namespace_attrs_local(ino, &updated);
         Ok(updated)
     }
 
@@ -8931,7 +8199,6 @@ impl FuseVfsAdapter {
             update.ctime_ns = current.posix.ctime_ns;
             e.setattr(inode_id, &update, None, ctx)?
         };
-        self.sync_namespace_attrs_local(ino, &updated);
         Ok(updated)
     }
 
@@ -8997,176 +8264,12 @@ impl FuseVfsAdapter {
         offset: u64,
     ) -> Result<(Vec<DirEntry>, bool), Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_METADATA);
-        // The VFS engine is authoritative for mounted mutations.  The
-        // namespace handle remains a fallback for legacy namespace-only test
-        // surfaces, but must not reset or renumber engine pagination.
-        let engine_error = match self.dispatch_readdir_via_engine(ctx, ino, fh, offset) {
-            Ok(engine_entries) => {
-                let entries = if let Some(ref ns) = self.namespace {
-                    self.merge_namespace_readdir_entries(ns, ino, fh, offset, engine_entries)?
-                } else {
-                    engine_entries
-                };
-                self.maybe_update_dir_read_atime(ctx, ino);
-                return Ok(entries);
-            }
-            Err(errno @ (Errno::ENOENT | Errno::EBADF | Errno::EIO)) => errno,
-            Err(e) => return Err(e),
-        };
-        if let Some(ref ns) = self.namespace {
-            let cookie = tidefs_dir_index::DirCookie(offset);
-            match self.dispatch_readdir_via_namespace(ns, ino, fh, cookie) {
-                Ok(entries) => {
-                    self.maybe_update_dir_read_atime(ctx, ino);
-                    return Ok(entries);
-                }
-                Err(Errno::ENOENT) | Err(Errno::EIO) => {} // fall through to engine error
-                Err(e) => return Err(e),
-            }
-        }
-        Err(engine_error)
+        let entries = self.dispatch_readdir_via_engine(ctx, ino, fh, offset)?;
+        self.maybe_update_dir_read_atime(ctx, ino);
+        Ok(entries)
     }
 
-    fn merge_namespace_readdir_entries(
-        &self,
-        ns: &Namespace,
-        ino: u64,
-        fh: u64,
-        offset: u64,
-        engine_entries: (Vec<DirEntry>, bool),
-    ) -> Result<(Vec<DirEntry>, bool), Errno> {
-        let (mut entries, engine_has_more) = engine_entries;
-        if offset != 0 || engine_has_more {
-            return Ok((entries, engine_has_more));
-        }
-
-        let (namespace_entries, namespace_has_more) =
-            match self.dispatch_readdir_via_namespace(ns, ino, fh, DirCookie::START) {
-                Ok(entries) => entries,
-                Err(Errno::ENOENT | Errno::EIO) => return Ok((entries, engine_has_more)),
-                Err(e) => return Err(e),
-            };
-
-        let mut seen_names: HashSet<Vec<u8>> =
-            entries.iter().map(|entry| entry.name.clone()).collect();
-        for entry in namespace_entries {
-            if seen_names.insert(entry.name.clone()) {
-                entries.push(entry);
-            }
-        }
-
-        for (index, entry) in entries.iter_mut().enumerate() {
-            entry.cookie = u64::try_from(index + 1).map_err(|_| Errno::EOVERFLOW)?;
-        }
-
-        let entries = if offset == 0 {
-            entries
-        } else {
-            entries
-                .into_iter()
-                .filter(|entry| entry.cookie > offset)
-                .collect()
-        };
-        Ok((entries, engine_has_more || namespace_has_more))
-    }
-
-    /// Namespace-backed readdir: iterate [`tidefs_namespace::Namespace`]
-    /// entries with count-based cookie pagination.
-    ///
-    /// Synthetic `.` and `..` entries are emitted at FUSE cookies 1 and 2.
-    /// Real directory entries are filtered from namespace results (the
-    /// Namespace's DirIndex contains its own `.` and `..` entries) and
-    /// assigned sequential cookies starting at 3.
-    ///
-    /// The FUSE `cookie` (offset) is treated as a sequential count:
-    /// - 0 (START): emit `.` and `..`, then real entries from index 0.
-    /// - 1: only `.` was emitted previously; emit `..`, then real entries from index 0.
-    /// - >= 2: synthetics already emitted; skip `cookie - 2` real entries.
-    fn dispatch_readdir_via_namespace(
-        &self,
-        ns: &Namespace,
-        ino: u64,
-        fh: u64,
-        cookie: DirCookie,
-    ) -> Result<(Vec<DirEntry>, bool), Errno> {
-        let handle = self
-            .dir_handles
-            .lock()
-            .unwrap()
-            .get(fh)
-            .ok_or(Errno::EBADF)?;
-        if handle.dh.inode_id.get() != ino {
-            return Err(Errno::EBADF);
-        }
-
-        let mut entries: Vec<DirEntry> = Vec::new();
-
-        // Synthetic . and .. entries (FUSE cookies 1 and 2).
-        if cookie == DirCookie::START {
-            entries.push(DirEntry::new(
-                b".".to_vec(),
-                InodeId::new(ino),
-                NodeKind::Dir,
-                Generation::new(0),
-                1,
-            ));
-            entries.push(DirEntry::new(
-                b"..".to_vec(),
-                InodeId::new(ns.lookup(ino, "..").ok().flatten().unwrap_or(ino)),
-                NodeKind::Dir,
-                Generation::new(0),
-                2,
-            ));
-        } else if cookie.0 == 1 {
-            // Only `.` was emitted previously; still need `..`.
-            entries.push(DirEntry::new(
-                b"..".to_vec(),
-                InodeId::new(ns.lookup(ino, "..").ok().flatten().unwrap_or(ino)),
-                NodeKind::Dir,
-                Generation::new(0),
-                2,
-            ));
-        }
-
-        // Compute how many real entries to skip (excluding synthetics).
-        let real_skip: u64 = cookie.0.saturating_sub(2);
-
-        // Read real entries from namespace with count-based skip.
-        let (ns_entries, _ns_next_cookie) = ns
-            .read_dir(ino, tidefs_dir_index::DirCookie(real_skip))
-            .map_err(|e| match e {
-                tidefs_namespace::NamespaceError::InodeNotFound => Errno::ENOENT,
-                tidefs_namespace::NamespaceError::NotDirectory => Errno::ENOTDIR,
-                _ => Errno::EIO,
-            })?;
-
-        // Filter out `.` and `..` entries (already handled synthetically above).
-        // Assign sequential FUSE cookies starting after the synthetics.
-        let cookie_start: u64 = entries.last().map(|e| e.cookie).unwrap_or(0) + 1;
-        let mut pushed: u64 = 0;
-        for ns_entry in &ns_entries {
-            if ns_entry.name == b"." || ns_entry.name == b".." {
-                continue;
-            }
-            let kind = namespace_kind_to_node_kind(ns_entry.kind);
-            entries.push(DirEntry::new(
-                ns_entry.name.clone(),
-                InodeId::new(ns_entry.inode_id),
-                kind,
-                Generation::new(ns_entry.generation),
-                cookie_start + pushed,
-            ));
-            pushed += 1;
-        }
-
-        // has_more: ns_read_dir caps at 128 entries per page.
-        // When exactly 128 were returned there may be more;
-        // when fewer than 128 the directory is exhausted.
-        let has_more = ns_entries.len() >= 128;
-        Ok((entries, has_more))
-    }
-
-    /// Engine-backed readdir (original implementation).
+    /// Enumerate the mounted engine directory and add adapter-owned entries.
     fn dispatch_readdir_via_engine(
         &self,
         ctx: &RequestCtx,
@@ -9244,9 +8347,9 @@ impl FuseVfsAdapter {
         Ok((entries, has_more))
     }
 
-    /// Dispatch `readdirplus`, preferring namespace when available.
+    /// Dispatch `readdirplus` through the mounted engine.
     ///
-    /// Same enumeration logic as [`dispatch_readdir`] but also resolves
+    /// Uses the same enumeration logic as [`dispatch_readdir`] and resolves
     /// [`InodeAttr`] for each returned entry so the FUSE `readdirplus`
     /// reply can carry full attributes without a per-entry `lookup`.
     /// Entries whose attributes cannot be resolved are silently skipped.
@@ -9264,34 +8367,9 @@ impl FuseVfsAdapter {
         for entry in candidate_entries {
             if let Ok(attr) = e.getattr(entry.inode_id, None, ctx) {
                 pairs.push((entry, attr));
-                continue;
-            }
-            if let Some(ref ns) = self.namespace {
-                if let Some(ns_attrs) = ns.get_attrs(entry.inode_id.get()) {
-                    pairs.push((entry, namespace_attrs_to_inode_attr(&ns_attrs)));
-                }
             }
         }
         Ok((pairs, has_more))
-    }
-    /// Namespace-backed opendir: validate the inode is a directory through
-    /// [`tidefs_namespace::Namespace::get_attrs`] and allocate a synthetic
-    /// [`EngineDirHandle`] tracked in `dir_handles`.
-    fn dispatch_opendir_via_namespace(
-        &self,
-        ns: &Namespace,
-        ino: u64,
-    ) -> Result<EngineDirHandle, Errno> {
-        let attrs = ns.get_attrs(ino).ok_or(Errno::ENOENT)?;
-        if attrs.mode & 0o170000 != 0o040000 {
-            return Err(Errno::ENOTDIR);
-        }
-        let dh = EngineDirHandle::new(
-            InodeId::new(ino),
-            tidefs_types_vfs_core::DirHandleId::new(namespace_dir_handle_id(ino)),
-        );
-        self.dir_handles.lock().unwrap().insert_namespace(dh);
-        Ok(dh)
     }
 
     #[tracing::instrument(skip(self, ctx), fields(ino = %ino, op = "opendir"))]
@@ -9311,30 +8389,10 @@ impl FuseVfsAdapter {
                     Err(Errno::ENODATA) => None,
                     Err(_) => None,
                 };
-            let attr = match e.getattr(InodeId::new(ino), None, ctx) {
-                Ok(attr) => attr,
-                Err(Errno::ENOENT) | Err(Errno::EIO) => {
-                    drop(e);
-                    if let Some(ref ns) = self.namespace {
-                        return self.dispatch_opendir_via_namespace(ns, ino);
-                    }
-                    return Err(Errno::ENOENT);
-                }
-                Err(errno) => return Err(errno),
-            };
+            let attr = e.getattr(InodeId::new(ino), None, ctx)?;
             plan_fuse_access_result(Ok(attr), ctx, ACCESS_READ, acl.as_deref(), &mount_identity)?;
         }
-        let dh = match e.opendir(InodeId::new(ino), ctx) {
-            Ok(dh) => dh,
-            Err(Errno::ENOENT) | Err(Errno::EIO) => {
-                drop(e);
-                if let Some(ref ns) = self.namespace {
-                    return self.dispatch_opendir_via_namespace(ns, ino);
-                }
-                return Err(Errno::ENOENT);
-            }
-            Err(errno) => return Err(errno),
-        };
+        let dh = e.opendir(InodeId::new(ino), ctx)?;
         self.dir_handles.lock().unwrap().insert(dh);
         Ok(dh)
     }
@@ -9345,9 +8403,6 @@ impl FuseVfsAdapter {
             .unwrap()
             .remove(fh)
             .ok_or(Errno::EBADF)?;
-        if handle.backing == AdapterDirHandleBacking::Namespace {
-            return Ok(());
-        }
         let dh = handle.dh;
         let e = self.engine.lock().unwrap();
         e.releasedir(&dh)
@@ -9369,29 +8424,16 @@ impl FuseVfsAdapter {
         self.check_not_read_only()?;
         let e = self.engine.lock().unwrap();
         let inode_id = InodeId::new(ino);
-        let engine_attr = match e.getattr(inode_id, None, ctx) {
-            Ok(attr) => Some(attr),
-            Err(Errno::ENOENT | Errno::EIO) => None,
-            Err(errno) => return Err(errno),
-        };
+        let engine_attr = e.getattr(inode_id, None, ctx)?;
         // POSIX ACL xattrs require file owner or CAP_FOWNER (root) to modify.
         if is_posix_acl_xattr_name(name) && ctx.uid != 0 {
-            let owner_uid = if let Some(ref attr) = engine_attr {
-                attr.posix.uid
-            } else if let Some(ref ns) = self.namespace {
-                ns.get_attrs(ino)
-                    .map(|attrs| namespace_attrs_to_inode_attr(&attrs).posix.uid)
-                    .ok_or(Errno::ESTALE)?
-            } else {
-                return Err(Errno::ENOENT);
-            };
-            if ctx.uid != owner_uid {
+            if ctx.uid != engine_attr.posix.uid {
                 return Err(Errno::EACCES);
             }
         }
         e.setxattr(inode_id, name, value, flags, ctx)?;
 
-        let mut updated = e.getattr(inode_id, None, ctx)?;
+        let updated = e.getattr(inode_id, None, ctx)?;
         if name == b"system.posix_acl_access"
             && updated.posix.mode & S_ISGID != 0
             && !caller_can_keep_sgid(ctx, updated.posix.gid)
@@ -9399,11 +8441,11 @@ impl FuseVfsAdapter {
             let mut clear_sgid = SetAttr::new();
             clear_sgid.valid = FATTR_MODE;
             clear_sgid.mode = updated.posix.mode & !S_ISGID;
-            updated = e.setattr(inode_id, &clear_sgid, None, ctx)?;
+            e.setattr(inode_id, &clear_sgid, None, ctx)?;
         }
         drop(e);
 
-        self.sync_namespace_attrs_after_engine_write(ino, &updated);
+        self.invalidate_inode_metadata_after_engine_write(ino);
         Ok(())
     }
 
@@ -9442,14 +8484,8 @@ impl FuseVfsAdapter {
         let e = self.engine.lock().unwrap();
         let inode_id = InodeId::new(ino);
         e.removexattr(inode_id, name, ctx)?;
-        let updated = e.getattr(inode_id, None, ctx).ok();
         drop(e);
-
-        if let Some(updated) = updated {
-            self.sync_namespace_attrs_after_engine_write(ino, &updated);
-        } else {
-            self.invalidate_inode_metadata_after_engine_write(ino);
-        }
+        self.invalidate_inode_metadata_after_engine_write(ino);
         Ok(())
     }
     /// Dispatch a `statfs` request through the VFS engine.
@@ -9944,15 +8980,6 @@ impl FuseVfsAdapter {
         ino: u64,
         _mask: u32,
     ) -> Result<StatxReply, Errno> {
-        // Route through namespace when available; fall through
-        // to engine on stale entries (fresh pool with empty namespace).
-        if let Some(ref ns) = self.namespace {
-            if let Some(attrs) = ns.get_attrs(ino) {
-                let inode_attr = namespace_attrs_to_inode_attr(&attrs);
-                let xattr_meta = self.collect_xattr_metadata(ctx, ino)?;
-                return Ok(statx_reply_from_inode_attr(&inode_attr, &xattr_meta));
-            }
-        }
         let e = self.engine.lock().unwrap();
         let attr = match e.getattr(InodeId::new(ino), None, ctx) {
             Ok(attr) => attr,
@@ -10839,19 +9866,8 @@ impl Filesystem for FuseVfsAdapter {
             match self.resolve_dir_handle(ino, fh, &ctx, &**e) {
                 Ok(handle) => handle.requested_offset(offset as u64),
                 Err(engine_errno) => {
-                    drop(e);
-                    if let Some(ref ns) = self.namespace {
-                        let attrs = ns.get_attrs(ino);
-                        if attrs.is_some_and(|attrs| (attrs.mode & 0o170000) == 0o040000) {
-                            offset as u64
-                        } else {
-                            reply.reply_errno(engine_errno);
-                            return;
-                        }
-                    } else {
-                        reply.reply_errno(engine_errno);
-                        return;
-                    }
+                    reply.reply_errno(engine_errno);
+                    return;
                 }
             }
         };
@@ -10918,19 +9934,8 @@ impl Filesystem for FuseVfsAdapter {
             match self.resolve_dir_handle(ino, fh, &ctx, &**e) {
                 Ok(handle) => handle.requested_offset(offset as u64),
                 Err(engine_errno) => {
-                    drop(e);
-                    if let Some(ref ns) = self.namespace {
-                        let attrs = ns.get_attrs(ino);
-                        if attrs.is_some_and(|attrs| (attrs.mode & 0o170000) == 0o040000) {
-                            offset as u64
-                        } else {
-                            reply.reply_errno(engine_errno);
-                            return;
-                        }
-                    } else {
-                        reply.reply_errno(engine_errno);
-                        return;
-                    }
+                    reply.reply_errno(engine_errno);
+                    return;
                 }
             }
         };
@@ -11960,26 +10965,6 @@ mod tests {
             .mkdir(root, name, 0o777, &root_ctx)
             .expect("create writable test parent")
             .inode_id
-    }
-
-    fn adapter_fixture_with_namespace() -> AdapterFixture {
-        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "tidefs-vfs-adapter-ns-{}-{temp_id}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create temp root");
-        let local_fs = LocalFileSystem::open_with_root_authentication_key(
-            &root,
-            StoreOptions::test_fast(),
-            RootAuthenticationKey::demo_key(),
-        )
-        .expect("open local filesystem");
-        let engine = VfsLocalFileSystem::new(local_fs);
-        let adapter = FuseVfsAdapter::new(Box::new(engine))
-            .expect("create adapter")
-            .with_namespace(Arc::new(Namespace::new()));
-        AdapterFixture { adapter, root }
     }
 
     fn adapter_fixture_with_txg_store_root() -> AdapterFixture {
@@ -13092,27 +12077,14 @@ mod tests {
     }
 
     #[test]
-    fn cached_read_syncs_namespace_atime_without_ctime() {
-        let mut fixture = adapter_fixture_with_namespace();
+    fn cached_read_advances_engine_atime_without_ctime() {
+        let mut fixture = adapter_fixture();
         fixture.adapter.timestamp_policy = TimestampPolicy::StrictAtime;
         let ctx = root_ctx();
-        let payload = b"namespace cached read atime";
-        let name = b"namespace-cache-atime.txt";
+        let payload = b"cached read atime";
+        let name = b"cache-atime.txt";
         let (inode, adapter_fh, engine_fh) =
             create_adapter_file_handle(&fixture.adapter, &ctx, name, libc::O_RDWR as u32);
-        let ns = fixture
-            .adapter
-            .namespace
-            .as_ref()
-            .expect("attached namespace");
-        let ns_ino = ns
-            .create_file(
-                1,
-                std::str::from_utf8(name).expect("test name is utf8"),
-                tidefs_namespace::InodeAttributes::new_file(0),
-            )
-            .expect("seed namespace mirror");
-        assert_eq!(ns_ino, inode.get());
 
         {
             let engine = fixture.adapter.engine.lock().unwrap();
@@ -13140,9 +12112,7 @@ mod tests {
                 .getattr(inode, None, &ctx)
                 .expect("getattr before cached read")
         };
-        let ns_before = ns.get_attrs(inode.get()).expect("namespace attrs before");
         assert_eq!(before.posix.atime_ns, 1);
-        assert_eq!(system_time_to_ns(ns_before.atime), 1);
 
         std::thread::sleep(Duration::from_millis(1));
         let second = fixture
@@ -13157,7 +12127,6 @@ mod tests {
                 .getattr(inode, None, &ctx)
                 .expect("getattr after cached read")
         };
-        let ns_after = ns.get_attrs(inode.get()).expect("namespace attrs after");
         assert!(
             after.posix.atime_ns > before.posix.atime_ns,
             "cached reads must advance engine atime"
@@ -13166,38 +12135,15 @@ mod tests {
             after.posix.ctime_ns, before.posix.ctime_ns,
             "cached read atime must not advance engine ctime"
         );
-        assert_eq!(
-            system_time_to_ns(ns_after.atime),
-            after.posix.atime_ns,
-            "cached reads must sync namespace atime from the engine"
-        );
-        assert_eq!(
-            system_time_to_ns(ns_after.ctime),
-            after.posix.ctime_ns,
-            "cached read namespace ctime must stay aligned with engine ctime"
-        );
     }
 
     #[test]
     fn lookup_does_not_advance_parent_dir_atime() {
-        let fixture = adapter_fixture_with_namespace();
+        let fixture = adapter_fixture();
         let ctx = root_ctx();
-        let name = b"namespace-lookup-atime.txt";
+        let name = b"lookup-atime.txt";
         let (inode, _adapter_fh, _engine_fh) =
             create_adapter_file_handle(&fixture.adapter, &ctx, name, libc::O_RDWR as u32);
-        let ns = fixture
-            .adapter
-            .namespace
-            .as_ref()
-            .expect("attached namespace");
-        let ns_ino = ns
-            .create_file(
-                1,
-                std::str::from_utf8(name).expect("test name is utf8"),
-                tidefs_namespace::InodeAttributes::new_file(0),
-            )
-            .expect("seed namespace mirror");
-        assert_eq!(ns_ino, inode.get());
 
         let mut stale_atime = SetAttr::new();
         stale_atime.valid = FATTR_ATIME;
@@ -13218,7 +12164,7 @@ mod tests {
         fixture
             .adapter
             .dispatch_lookup(&ctx, 1, name)
-            .expect("namespace lookup");
+            .expect("engine lookup");
         let after = {
             let engine = fixture.adapter.engine.lock().unwrap();
             engine
@@ -16419,13 +15365,13 @@ mod tests {
     }
 
     #[test]
-    fn vfs_adapter_dispatch_access_with_namespace_falls_back_to_engine_attrs() {
-        let fixture = adapter_fixture_with_namespace();
+    fn vfs_adapter_dispatch_access_uses_engine_attrs() {
+        let fixture = adapter_fixture();
         let root = root_ctx();
         let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
             &root,
-            b"engine-access-with-stale-namespace.txt",
+            b"engine-access.txt",
             libc::O_RDWR as u32,
         );
 
@@ -21756,30 +20702,6 @@ mod tests {
     }
 
     #[test]
-    fn namespace_dir_handle_ids_use_tagged_adapter_space() {
-        let namespace_dh = EngineDirHandle::new(
-            InodeId::new(1),
-            DirHandleId::new(namespace_dir_handle_id(1)),
-        );
-        let mut table = AdapterDirHandleTable::default();
-
-        table.insert(test_dir_handle(1, 1));
-        table.insert_namespace(namespace_dh);
-
-        assert_eq!(
-            table.get(1).expect("engine handle").backing,
-            AdapterDirHandleBacking::Engine
-        );
-        assert_eq!(
-            table
-                .get(namespace_dir_handle_id(1))
-                .expect("namespace handle")
-                .backing,
-            AdapterDirHandleBacking::Namespace
-        );
-    }
-
-    #[test]
     fn dir_handle_cursor_supports_kernel_seek_and_empty_page() {
         let dh = test_dir_handle(78, 10);
         let mut handle = AdapterDirHandle::new(dh);
@@ -23602,46 +22524,6 @@ mod tests {
         assert_eq!(value, b"symval");
     }
 
-    #[test]
-    fn vfs_adapter_dispatch_symlink_with_namespace_uses_engine_for_xattrs() {
-        let fixture = adapter_fixture_with_namespace();
-        let ctx = root_ctx();
-        let root = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine.get_root_inode(&ctx).expect("root inode")
-        };
-
-        let attr = fixture
-            .adapter
-            .dispatch_symlink(&ctx, root.get(), b"engine-symlink", b"some/target")
-            .expect("symlink");
-
-        {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            let lookup = engine
-                .lookup(root, b"engine-symlink", &ctx)
-                .expect("symlink must be engine-visible");
-            assert_eq!(lookup.inode_id, attr.inode_id);
-            assert_eq!(lookup.kind, NodeKind::Symlink);
-        }
-
-        fixture
-            .adapter
-            .dispatch_setxattr(&ctx, attr.inode_id.get(), b"user.symattr", b"symval", 0)
-            .expect("setxattr on engine symlink");
-        let value = fixture
-            .adapter
-            .dispatch_getxattr(&ctx, attr.inode_id.get(), b"user.symattr")
-            .expect("getxattr on engine symlink");
-        assert_eq!(value, b"symval");
-
-        let target = fixture
-            .adapter
-            .dispatch_readlink(&ctx, attr.inode_id.get())
-            .expect("readlink engine symlink");
-        assert_eq!(target, b"some/target");
-    }
-
     // ── dispatch_xattr unit tests (continued) ──────────────────────────────────
 
     #[test]
@@ -23663,29 +22545,15 @@ mod tests {
     }
 
     #[test]
-    fn vfs_adapter_dispatch_setattr_and_acl_use_engine_owner_when_namespace_is_stale() {
-        let fixture = adapter_fixture_with_namespace();
+    fn vfs_adapter_dispatch_setattr_and_acl_use_engine_owner() {
+        let fixture = adapter_fixture();
         let ctx = root_ctx();
-        let ns = fixture
-            .adapter
-            .namespace
-            .as_ref()
-            .expect("namespace")
-            .clone();
         let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
             &ctx,
-            b"stale-ns-owner.txt",
+            b"engine-owner.txt",
             libc::O_RDWR as u32,
         );
-        let ns_ino = ns
-            .create_file(
-                1,
-                "stale-ns-owner.txt",
-                tidefs_namespace::InodeAttributes::new_file(0),
-            )
-            .expect("create stale namespace entry");
-        assert_eq!(ns_ino, inode.get());
 
         let mut chown = SetAttr::new();
         chown.valid = FATTR_UID | FATTR_GID;
@@ -23696,12 +22564,6 @@ mod tests {
             .dispatch_setattr(&ctx, 18_100, inode.get(), &chown, None)
             .expect("engine chown");
 
-        let mut stale = ns.get_attrs(inode.get()).expect("namespace attrs");
-        stale.uid = 0;
-        stale.gid = 0;
-        ns.update_attrs(inode.get(), stale)
-            .expect("make namespace owner stale");
-
         let owner = access_ctx(100, 100, &[100]);
         let mut chmod = SetAttr::new();
         chmod.valid = FATTR_MODE;
@@ -23710,12 +22572,6 @@ mod tests {
             .adapter
             .dispatch_setattr(&owner, 18_101, inode.get(), &chmod, None)
             .expect("owner chmod uses engine owner");
-
-        let mut stale = ns.get_attrs(inode.get()).expect("namespace attrs");
-        stale.uid = 0;
-        stale.gid = 0;
-        ns.update_attrs(inode.get(), stale)
-            .expect("make namespace owner stale again");
 
         let acl = tidefs_posix_acl::minimal_access_acl_from_mode(0o640);
         let encoded = tidefs_permission::encode_posix_acl_xattr(&acl);
@@ -31186,8 +30042,8 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_readdir_with_attached_namespace_lists_engine_created_children() {
-        let mut fixture = adapter_fixture_with_namespace();
+    fn dispatch_readdir_lists_engine_created_children() {
+        let mut fixture = adapter_fixture();
         let ctx = root_ctx();
         let root = {
             let engine = fixture.adapter.engine.lock().unwrap();
@@ -31227,7 +30083,7 @@ mod tests {
         let (entries, has_more) = fixture
             .adapter
             .dispatch_readdir(&ctx, root.get(), dh.dh_id.get(), 0)
-            .expect("readdir root with namespace attached");
+            .expect("readdir root");
 
         assert!(!has_more);
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_slice()).collect();
@@ -31237,7 +30093,7 @@ mod tests {
         let (pairs, _) = fixture
             .adapter
             .dispatch_readdirplus(&ctx, root.get(), dh.dh_id.get(), 0)
-            .expect("readdirplus root with namespace attached");
+            .expect("readdirplus root");
         let file_pair = pairs
             .iter()
             .find(|(entry, _)| entry.name == b"engine-visible.txt")
@@ -31258,10 +30114,10 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_readdir_with_attached_namespace_resumes_engine_pages() {
+    fn dispatch_readdir_resumes_engine_pages() {
         let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let fixture_root = std::env::temp_dir().join(format!(
-            "tidefs-vfs-adapter-ns-bulk-{}-{temp_id}",
+            "tidefs-vfs-adapter-bulk-{}-{temp_id}",
             std::process::id()
         ));
         std::fs::create_dir_all(&fixture_root).expect("create temp root");
@@ -31286,9 +30142,7 @@ mod tests {
                 .expect("insert bulk entry");
         }
         let engine = VfsLocalFileSystem::new(local_fs);
-        let adapter = FuseVfsAdapter::new(Box::new(engine))
-            .expect("create adapter")
-            .with_namespace(Arc::new(Namespace::new()));
+        let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
         let mut fixture = AdapterFixture {
             adapter,
             root: fixture_root,
@@ -31334,43 +30188,6 @@ mod tests {
             .adapter
             .dispatch_releasedir(dh.dh_id.get())
             .expect("releasedir");
-    }
-
-    #[test]
-    fn namespace_releasedir_does_not_close_engine_handle() {
-        let mut fixture = adapter_fixture_with_namespace();
-        let ctx = root_ctx();
-        let root = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine.get_root_inode(&ctx).expect("root inode")
-        };
-        let engine_dh = fixture
-            .adapter
-            .dispatch_opendir(&ctx, root.get())
-            .expect("engine opendir root");
-        let namespace = fixture
-            .adapter
-            .namespace_handle()
-            .expect("namespace attached");
-        let namespace_dh = fixture
-            .adapter
-            .dispatch_opendir_via_namespace(&namespace, root.get())
-            .expect("namespace opendir root");
-
-        assert_ne!(engine_dh.dh_id.get(), namespace_dh.dh_id.get());
-
-        fixture
-            .adapter
-            .dispatch_releasedir(namespace_dh.dh_id.get())
-            .expect("release namespace handle");
-        fixture
-            .adapter
-            .dispatch_readdir(&ctx, root.get(), engine_dh.dh_id.get(), 0)
-            .expect("engine handle remains open after namespace release");
-        fixture
-            .adapter
-            .dispatch_releasedir(engine_dh.dh_id.get())
-            .expect("release engine handle");
     }
 
     #[test]
@@ -35639,209 +34456,8 @@ mod tests {
         assert_eq!(ctx.pid, 99);
     }
 
-    // ── Namespace-based mkdir/rmdir dispatch tests ────────────────
-
     #[test]
-    fn ns_dispatch_mkdir_creates_directory_and_visible_in_readdir() {
-        let fixture = adapter_fixture();
-        let _ctx = root_ctx();
-        let ns = Namespace::new();
-        let root_ino = tidefs_namespace::ROOT_INODE;
-
-        // Use namespace-based mkdir
-        let attr = fixture
-            .adapter
-            .dispatch_mkdir_via_namespace(&ns, root_ino, b"ns-testdir", 0o755)
-            .expect("namespace mkdir");
-        assert!(attr.posix.is_dir());
-        assert_ne!(attr.inode_id.get(), root_ino);
-
-        // Verify the directory appears in namespace readdir
-        let (entries, _) = ns.read_dir(root_ino, DirCookie(0)).expect("read_dir");
-        let found = entries.iter().any(|e| e.name == b"ns-testdir");
-        assert!(found, "created directory must appear in readdir");
-    }
-
-    #[test]
-    fn ns_dispatch_mkdir_returns_eexist_on_duplicate() {
-        let fixture = adapter_fixture();
-        let ns = Namespace::new();
-        let root_ino = tidefs_namespace::ROOT_INODE;
-
-        fixture
-            .adapter
-            .dispatch_mkdir_via_namespace(&ns, root_ino, b"dup-ns-dir", 0o755)
-            .expect("first mkdir");
-
-        let err = fixture
-            .adapter
-            .dispatch_mkdir_via_namespace(&ns, root_ino, b"dup-ns-dir", 0o755)
-            .unwrap_err();
-        assert_eq!(err, Errno::EEXIST);
-    }
-
-    #[test]
-    fn ns_dispatch_rmdir_removes_empty_directory() {
-        let fixture = adapter_fixture();
-        let ns = Namespace::new();
-        let root_ino = tidefs_namespace::ROOT_INODE;
-
-        fixture
-            .adapter
-            .dispatch_mkdir_via_namespace(&ns, root_ino, b"rm-me", 0o755)
-            .expect("mkdir");
-
-        let ctx = RequestCtx::new_root();
-        fixture
-            .adapter
-            .dispatch_rmdir_via_namespace(&ns, root_ino, b"rm-me", &ctx)
-            .expect("rmdir");
-
-        // Verify it is gone
-        let (entries, _) = ns
-            .read_dir(root_ino, DirCookie(0))
-            .expect("read_dir post-rmdir");
-        assert!(!entries.iter().any(|e| e.name == b"rm-me"));
-    }
-
-    #[test]
-    fn ns_dispatch_rmdir_enotempty_on_nonempty_directory() {
-        let fixture = adapter_fixture();
-        let ns = Namespace::new();
-        let root_ino = tidefs_namespace::ROOT_INODE;
-
-        let dir_attrs = fixture
-            .adapter
-            .dispatch_mkdir_via_namespace(&ns, root_ino, b"nonempty-ns", 0o755)
-            .expect("mkdir");
-
-        // Create a file inside the directory
-        let file_attrs = tidefs_namespace::InodeAttributes::new_file(0);
-        let _child = ns
-            .create_file(dir_attrs.inode_id.get(), "child", file_attrs)
-            .expect("create child file");
-
-        let ctx = RequestCtx::new_root();
-        let err = fixture
-            .adapter
-            .dispatch_rmdir_via_namespace(&ns, root_ino, b"nonempty-ns", &ctx)
-            .unwrap_err();
-        assert_eq!(err, Errno::ENOTEMPTY);
-    }
-
-    #[test]
-    fn ns_dispatch_rmdir_enoent_on_nonexistent() {
-        let fixture = adapter_fixture();
-        let ns = Namespace::new();
-        let root_ino = tidefs_namespace::ROOT_INODE;
-
-        let ctx = RequestCtx::new_root();
-        let err = fixture
-            .adapter
-            .dispatch_rmdir_via_namespace(&ns, root_ino, b"noexist-ns", &ctx)
-            .unwrap_err();
-        assert_eq!(err, Errno::ENOENT);
-    }
-
-    #[test]
-    fn ns_dispatch_mkdir_creates_child_with_dot_and_dotdot_entries() {
-        let fixture = adapter_fixture();
-        let ns = Namespace::new();
-        let root_ino = tidefs_namespace::ROOT_INODE;
-
-        let attr = fixture
-            .adapter
-            .dispatch_mkdir_via_namespace(&ns, root_ino, b"dotdot-check", 0o755)
-            .expect("mkdir");
-        let child_ino = attr.inode_id.get();
-
-        let (entries, _) = ns
-            .read_dir(child_ino, DirCookie(0))
-            .expect("read_dir child");
-
-        assert_eq!(entries[0].name, b".");
-        assert_eq!(entries[0].inode_id, child_ino);
-        assert_eq!(entries[1].name, b"..");
-        assert_eq!(entries[1].inode_id, root_ino);
-    }
-
-    // ── Namespace opendir/releasedir dispatch tests ────────────────
-
-    #[test]
-    fn ns_opendir_validates_directory_and_returns_handle() {
-        let fixture = adapter_fixture();
-        let ns = Namespace::new();
-        let root_ino = tidefs_namespace::ROOT_INODE;
-
-        // Root directory should open successfully
-        let dh = fixture
-            .adapter
-            .dispatch_opendir_via_namespace(&ns, root_ino)
-            .expect("opendir root");
-        assert!(dh.dh_id.get() > 0);
-
-        // A non-existent inode should fail
-        let err = fixture
-            .adapter
-            .dispatch_opendir_via_namespace(&ns, 999999)
-            .unwrap_err();
-        assert_eq!(err, Errno::ENOENT);
-    }
-
-    #[test]
-    fn ns_opendir_rejects_file_inode() {
-        let fixture = adapter_fixture();
-        let ns = Namespace::new();
-        let root_ino = tidefs_namespace::ROOT_INODE;
-
-        // Create a file in the namespace
-        let file_attrs = tidefs_namespace::InodeAttributes::new_file(0);
-        let file_ino = ns
-            .create_file(root_ino, "testfile", file_attrs)
-            .expect("create file");
-
-        let err = fixture
-            .adapter
-            .dispatch_opendir_via_namespace(&ns, file_ino)
-            .unwrap_err();
-        assert_eq!(err, Errno::ENOTDIR);
-    }
-
-    #[test]
-    fn ns_opendir_releasedir_lifecycle() {
-        let mut fixture = adapter_fixture();
-        let ns = Namespace::new();
-        let root_ino = tidefs_namespace::ROOT_INODE;
-
-        let dh = fixture
-            .adapter
-            .dispatch_opendir_via_namespace(&ns, root_ino)
-            .expect("opendir");
-        let fh = dh.dh_id.get();
-
-        // Handle should be tracked
-        assert!(fixture
-            .adapter
-            .dir_handles
-            .lock()
-            .unwrap()
-            .get(fh)
-            .is_some());
-
-        fixture.adapter.dispatch_releasedir(fh).expect("releasedir");
-
-        // Handle should be released
-        assert!(fixture
-            .adapter
-            .dir_handles
-            .lock()
-            .unwrap()
-            .get(fh)
-            .is_none());
-    }
-
-    #[test]
-    fn ns_releasedir_ebadf_on_unknown_handle() {
+    fn dispatch_releasedir_ebadf_on_unknown_handle() {
         let mut fixture = adapter_fixture();
 
         let err = fixture.adapter.dispatch_releasedir(999999).unwrap_err();
@@ -37237,808 +35853,6 @@ mod tests {
         );
     }
 
-    // ── Namespace-backed dispatch tests ────────────────────────────────────
-
-    fn namespace_fixture() -> (Arc<Namespace>, AdapterFixture) {
-        let ns = Arc::new(Namespace::new());
-        let mut fixture = adapter_fixture();
-        fixture.adapter.namespace = Some(Arc::clone(&ns));
-        (ns, fixture)
-    }
-
-    #[test]
-    fn namespace_dispatch_mkdir_and_lookup() {
-        let (ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let root_ino = 1u64;
-
-        let attr = fixture
-            .adapter
-            .dispatch_mkdir(&ctx, root_ino, b"mydir", 0o755)
-            .expect("mkdir");
-        assert!(attr.inode_id.get() > 1);
-        assert_eq!(attr.kind, NodeKind::Dir);
-
-        let child_ino = attr.inode_id.get();
-
-        let lookup_attr = fixture
-            .adapter
-            .dispatch_lookup(&ctx, root_ino, b"mydir")
-            .expect("lookup engine-created directory through adapter");
-        assert_eq!(lookup_attr.inode_id.get(), child_ino);
-        assert_eq!(lookup_attr.kind, NodeKind::Dir);
-        assert!(
-            ns.get_attrs(child_ino).is_none(),
-            "engine-authoritative mkdir must not make the namespace projection own child lifetime"
-        );
-    }
-
-    #[test]
-    fn namespace_lookup_uses_engine_attrs_when_namespace_timestamps_are_stale() {
-        let fixture = adapter_fixture_with_namespace();
-        let ctx = root_ctx();
-        let ns = fixture.adapter.namespace_handle().expect("namespace");
-        let root_ino_id = fixture
-            .adapter
-            .engine
-            .lock()
-            .unwrap()
-            .get_root_inode(&ctx)
-            .expect("root inode");
-
-        let (created_attr, create_fh) = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine
-                .create(root_ino_id, b"stale-lookup-ctime.txt", 0o644, 0, &ctx)
-                .expect("create engine file")
-        };
-        {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine.release(&create_fh).expect("release create handle");
-        }
-        let engine_attr = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine
-                .getattr(created_attr.inode_id, None, &ctx)
-                .expect("engine getattr")
-        };
-
-        let ns_ino = ns
-            .create_file(
-                root_ino_id.get(),
-                "stale-lookup-ctime.txt",
-                tidefs_namespace::InodeAttributes::new_file(created_attr.inode_id.get()),
-            )
-            .expect("create namespace dentry");
-        assert_eq!(ns_ino, created_attr.inode_id.get());
-
-        let mut stale = ns.get_attrs(ns_ino).expect("namespace attrs");
-        stale.atime = UNIX_EPOCH;
-        stale.mtime = UNIX_EPOCH;
-        stale.ctime = UNIX_EPOCH;
-        ns.update_attrs(ns_ino, stale)
-            .expect("make namespace timestamps stale");
-
-        let attr = fixture
-            .adapter
-            .dispatch_lookup(&ctx, root_ino_id.get(), b"stale-lookup-ctime.txt")
-            .expect("lookup via namespace");
-
-        assert_eq!(attr.inode_id, engine_attr.inode_id);
-        assert_eq!(attr.posix.ctime_ns, engine_attr.posix.ctime_ns);
-        assert_ne!(attr.posix.ctime_ns, 0);
-
-        let mut cache = fixture.adapter.path_lookup_cache.lock().unwrap();
-        let entry = cache
-            .get(root_ino_id.get(), b"stale-lookup-ctime.txt")
-            .expect("lookup caches engine attr");
-        assert_eq!(entry.value.posix.ctime_ns, engine_attr.posix.ctime_ns);
-        drop(cache);
-
-        let repaired = ns.get_attrs(ns_ino).expect("repaired namespace attrs");
-        assert_eq!(
-            system_time_to_ns(repaired.ctime),
-            engine_attr.posix.ctime_ns
-        );
-    }
-
-    #[test]
-    fn namespace_lookup_uses_engine_parent_lookup_when_direct_getattr_is_cold() {
-        let ctx = root_ctx();
-        let name = b"cold-lookup-ctime.txt";
-        let namespace = Arc::new(Namespace::new());
-        let ns_ino = namespace
-            .create_file(
-                1,
-                std::str::from_utf8(name).expect("test name is utf8"),
-                tidefs_namespace::InodeAttributes::new_file(0),
-            )
-            .expect("seed namespace entry");
-
-        let mut stale = namespace.get_attrs(ns_ino).expect("namespace attrs");
-        stale.atime = UNIX_EPOCH;
-        stale.mtime = UNIX_EPOCH;
-        stale.ctime = UNIX_EPOCH;
-        namespace
-            .update_attrs(ns_ino, stale)
-            .expect("make namespace timestamps stale");
-
-        let engine_attr = test_attr(ns_ino, 7);
-        let adapter = make_adapter(
-            AclMockEngine::new()
-                .with_root(1)
-                .with_getattr_result(Err(Errno::ESTALE))
-                .with_lookup_result(Ok(engine_attr)),
-        )
-        .with_namespace(Arc::clone(&namespace));
-
-        let looked_up = adapter
-            .dispatch_lookup(&ctx, 1, name)
-            .expect("lookup through engine parent/name fallback");
-        assert_eq!(looked_up.inode_id, engine_attr.inode_id);
-        assert_eq!(
-            looked_up.posix.ctime_ns, engine_attr.posix.ctime_ns,
-            "namespace lookup must return authoritative engine ctime"
-        );
-
-        let repaired = namespace
-            .get_attrs(engine_attr.inode_id.get())
-            .expect("namespace attrs repaired after lookup");
-        assert_eq!(
-            system_time_to_ns(repaired.ctime),
-            engine_attr.posix.ctime_ns
-        );
-    }
-
-    #[test]
-    fn namespace_dispatch_symlink_and_readlink() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let root_ino = 1u64;
-
-        let attr = fixture
-            .adapter
-            .dispatch_symlink(&ctx, root_ino, b"mylink", b"/some/target")
-            .expect("symlink");
-        assert_eq!(attr.kind, NodeKind::Symlink);
-        let sym_ino = attr.inode_id.get();
-
-        // Read the symlink target
-        let target = fixture
-            .adapter
-            .dispatch_readlink(&ctx, sym_ino)
-            .expect("readlink");
-        assert_eq!(target, b"/some/target");
-    }
-
-    #[test]
-    fn namespace_dispatch_readlink_falls_back_for_namespace_only_inode() {
-        let (ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let root_ino = 1u64;
-
-        let attr = fixture
-            .adapter
-            .dispatch_symlink_via_namespace(&ns, root_ino, b"legacy-link", b"/legacy/target")
-            .expect("namespace symlink");
-
-        let target = fixture
-            .adapter
-            .dispatch_readlink(&ctx, attr.inode_id.get())
-            .expect("readlink namespace-only inode");
-        assert_eq!(target, b"/legacy/target");
-    }
-
-    #[test]
-    fn namespace_dispatch_symlink_empty_target_returns_einval() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let root_ino = 1u64;
-
-        let err = fixture
-            .adapter
-            .dispatch_symlink(&ctx, root_ino, b"badlink", b"")
-            .unwrap_err();
-        assert_eq!(err, Errno::EINVAL);
-    }
-
-    #[test]
-    fn namespace_dispatch_readlink_non_symlink_returns_einval() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let root_ino = 1u64;
-
-        // Create a regular file first
-        let attr = fixture
-            .adapter
-            .dispatch_mkdir(&ctx, root_ino, b"adir", 0o755)
-            .expect("mkdir");
-        let dir_ino = attr.inode_id.get();
-
-        let err = fixture
-            .adapter
-            .dispatch_readlink(&ctx, dir_ino)
-            .unwrap_err();
-        assert_eq!(err, Errno::EINVAL);
-    }
-
-    #[test]
-    fn namespace_dispatch_link_creates_hard_link() {
-        let (ns, fixture) = namespace_fixture();
-        let root_ino = 1u64;
-
-        let sym_attr = fixture
-            .adapter
-            .dispatch_symlink_via_namespace(&ns, root_ino, b"origin", b"/target")
-            .expect("symlink");
-        let target_ino = sym_attr.inode_id.get();
-
-        let link_attr = fixture
-            .adapter
-            .dispatch_link_via_namespace(&ns, target_ino, root_ino, b"alias")
-            .expect("link");
-        assert_eq!(link_attr.inode_id.get(), target_ino);
-
-        // Verify nlink incremented
-        let ns_attrs = ns.get_attrs(target_ino).expect("ns get_attrs");
-        assert_eq!(ns_attrs.nlink, 2);
-
-        let cached = fixture
-            .adapter
-            .getattr_cache
-            .lock()
-            .unwrap()
-            .get(&target_ino)
-            .map(|(attr_out, _expiry)| *attr_out)
-            .expect("namespace hard link refreshed getattr cache");
-        assert_eq!(cached.attr.ino, target_ino);
-        assert_eq!(cached.attr.nlink, 2);
-    }
-
-    #[test]
-    fn namespace_dispatch_link_directory_returns_eisdir() {
-        let (ns, fixture) = namespace_fixture();
-        let root_ino = 1u64;
-
-        let attr = fixture
-            .adapter
-            .dispatch_mkdir_via_namespace(&ns, root_ino, b"somedir", 0o755)
-            .expect("mkdir");
-        let dir_ino = attr.inode_id.get();
-
-        let err = fixture
-            .adapter
-            .dispatch_link_via_namespace(&ns, dir_ino, root_ino, b"dir-link")
-            .unwrap_err();
-        assert_eq!(err, Errno::EISDIR);
-    }
-
-    #[test]
-    fn namespace_dispatch_unlink_removes_entry() {
-        let (ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let root_ino = 1u64;
-
-        let attr = fixture
-            .adapter
-            .dispatch_symlink(&ctx, root_ino, b"toremove", b"/target")
-            .expect("symlink");
-        let ino = attr.inode_id.get();
-
-        fixture
-            .adapter
-            .dispatch_unlink(&ctx, root_ino, b"toremove")
-            .expect("unlink");
-
-        // Inode should be freed
-        assert!(ns.get_attrs(ino).is_none());
-    }
-
-    #[test]
-    fn namespace_dispatch_rmdir_empty_dir() {
-        let (ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let root_ino = 1u64;
-
-        let attr = fixture
-            .adapter
-            .dispatch_mkdir(&ctx, root_ino, b"emptydir", 0o755)
-            .expect("mkdir");
-        let dir_ino = attr.inode_id.get();
-
-        fixture
-            .adapter
-            .dispatch_rmdir(&ctx, root_ino, b"emptydir")
-            .expect("rmdir");
-
-        // Directory inode should be freed
-        assert!(ns.get_attrs(dir_ino).is_none());
-    }
-
-    #[test]
-    fn namespace_dispatch_unlink_nonexistent_returns_enoent() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let root_ino = 1u64;
-
-        let err = fixture
-            .adapter
-            .dispatch_unlink(&ctx, root_ino, b"no-such-file")
-            .unwrap_err();
-        assert_eq!(err, Errno::ENOENT);
-    }
-
-    #[test]
-    fn namespace_dispatch_symlink_name_with_slash_returns_einval() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let root_ino = 1u64;
-
-        let err = fixture
-            .adapter
-            .dispatch_symlink(&ctx, root_ino, b"bad/name", b"/target")
-            .unwrap_err();
-        assert_eq!(err, Errno::EINVAL);
-    }
-
-    #[test]
-    fn namespace_dispatch_symlink_empty_name_returns_einval() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let root_ino = 1u64;
-
-        let err = fixture
-            .adapter
-            .dispatch_symlink(&ctx, root_ino, b"", b"/target")
-            .unwrap_err();
-        assert_eq!(err, Errno::EINVAL);
-    }
-
-    #[test]
-    fn namespace_kind_to_node_kind_maps_special_entries() {
-        let cases = [
-            (tidefs_namespace::KIND_FIFO, NodeKind::Fifo),
-            (tidefs_namespace::KIND_SOCKET, NodeKind::Socket),
-            (tidefs_namespace::KIND_CHAR, NodeKind::CharDev),
-            (tidefs_namespace::KIND_BLOCK, NodeKind::BlockDev),
-        ];
-
-        for (raw, expected) in cases {
-            assert_eq!(namespace_kind_to_node_kind(raw), expected);
-        }
-    }
-
-    #[test]
-    fn namespace_dispatch_mknod_special_nodes_preserve_lookup_getattr_and_listing() {
-        let (ns, mut fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let root_ino = 1u64;
-        let cases: &[(&str, u32, u32, NodeKind, u32)] = &[
-            (
-                "pipe",
-                libc::S_IFIFO | 0o644,
-                0,
-                NodeKind::Fifo,
-                tidefs_namespace::KIND_FIFO,
-            ),
-            (
-                "null",
-                libc::S_IFCHR | 0o660,
-                0x0103,
-                NodeKind::CharDev,
-                tidefs_namespace::KIND_CHAR,
-            ),
-            (
-                "sda1",
-                libc::S_IFBLK | 0o660,
-                0x0801,
-                NodeKind::BlockDev,
-                tidefs_namespace::KIND_BLOCK,
-            ),
-            (
-                "sock",
-                libc::S_IFSOCK | 0o700,
-                0,
-                NodeKind::Socket,
-                tidefs_namespace::KIND_SOCKET,
-            ),
-        ];
-
-        for (idx, (name, mode, rdev, kind, namespace_kind)) in cases.iter().enumerate() {
-            let attr = fixture
-                .adapter
-                .dispatch_mknod_via_namespace(&ns, root_ino, name.as_bytes(), *mode, *rdev)
-                .expect("namespace mknod");
-            assert_eq!(attr.kind, *kind, "created kind for {name}");
-            assert_eq!(
-                attr.posix.mode & libc::S_IFMT,
-                *mode & libc::S_IFMT,
-                "created mode type for {name}"
-            );
-            assert_eq!(attr.posix.rdev, *rdev, "created rdev for {name}");
-
-            let ns_attrs = ns.get_attrs(attr.inode_id.get()).expect("namespace attrs");
-            assert_eq!(
-                ns_attrs.mode & libc::S_IFMT,
-                *mode & libc::S_IFMT,
-                "namespace mode type for {name}"
-            );
-            assert_eq!(ns_attrs.rdev, *rdev, "namespace rdev for {name}");
-
-            let ns_entry = ns
-                .read_dir(root_ino, tidefs_dir_index::DirCookie(0))
-                .expect("namespace readdir")
-                .0
-                .into_iter()
-                .find(|entry| entry.name.as_slice() == name.as_bytes())
-                .expect("namespace directory entry");
-            assert_eq!(
-                ns_entry.kind, *namespace_kind,
-                "namespace entry kind for {name}"
-            );
-
-            let looked_up = fixture
-                .adapter
-                .dispatch_lookup(&ctx, root_ino, name.as_bytes())
-                .expect("namespace lookup");
-            assert_eq!(looked_up.kind, *kind, "lookup kind for {name}");
-            assert_eq!(looked_up.posix.rdev, *rdev, "lookup rdev for {name}");
-
-            let attr_out = fixture
-                .adapter
-                .dispatch_getattr(&ctx, attr.inode_id.get(), 10_000 + idx as u64, None)
-                .expect("namespace getattr");
-            assert_eq!(
-                attr_out.attr.mode & libc::S_IFMT,
-                *mode & libc::S_IFMT,
-                "getattr mode type for {name}"
-            );
-            assert_eq!(attr_out.attr.rdev, *rdev, "getattr rdev for {name}");
-        }
-
-        let dh = fixture
-            .adapter
-            .dispatch_opendir(&ctx, root_ino)
-            .expect("namespace opendir");
-        let (entries, has_more) = fixture
-            .adapter
-            .dispatch_readdir(&ctx, root_ino, dh.dh_id.get(), 0)
-            .expect("namespace readdir");
-        assert!(!has_more);
-        let (plus_entries, plus_has_more) = fixture
-            .adapter
-            .dispatch_readdirplus(&ctx, root_ino, dh.dh_id.get(), 0)
-            .expect("namespace readdirplus");
-        assert!(!plus_has_more);
-
-        for (name, _mode, rdev, kind, _namespace_kind) in cases {
-            let entry = entries
-                .iter()
-                .find(|entry| entry.name.as_slice() == name.as_bytes())
-                .expect("FUSE readdir entry");
-            assert_eq!(entry.kind, *kind, "readdir kind for {name}");
-
-            let (_entry, attr) = plus_entries
-                .iter()
-                .find(|(entry, _attr)| entry.name.as_slice() == name.as_bytes())
-                .expect("FUSE readdirplus entry");
-            assert_eq!(attr.kind, *kind, "readdirplus attr kind for {name}");
-            assert_eq!(attr.posix.rdev, *rdev, "readdirplus attr rdev for {name}");
-        }
-    }
-
-    // ── Namespace-backed getattr / setattr dispatch tests ────────────────
-
-    #[test]
-    fn namespace_dispatch_getattr_root_inode() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        // Root inode (1) should exist and be a directory
-        let attr_out = fixture
-            .adapter
-            .dispatch_getattr(&ctx, 1, 100, None)
-            .expect("getattr root");
-        assert_eq!(attr_out.attr.ino, 1);
-        assert!(attr_out.attr.mode & libc::S_IFDIR != 0);
-    }
-
-    #[test]
-    fn namespace_dispatch_getattr_missing_inode_returns_estale() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        // Inode 9999 should not exist
-        let err = fixture
-            .adapter
-            .dispatch_getattr(&ctx, 9999, 101, None)
-            .unwrap_err();
-        assert_eq!(err, Errno::ESTALE);
-    }
-
-    #[test]
-    fn namespace_dispatch_getattr_created_file() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        // Create a file via namespace, then getattr it
-        let file_attr = fixture
-            .adapter
-            .dispatch_mkdir(&ctx, 1, b"testfile", 0o644)
-            .expect("mkdir");
-        let ino = file_attr.inode_id.get();
-        let attr_out = fixture
-            .adapter
-            .dispatch_getattr(&ctx, ino, 200, None)
-            .expect("getattr file");
-        assert_eq!(attr_out.attr.ino, ino);
-        assert!(attr_out.attr_valid > 0);
-    }
-
-    #[test]
-    fn namespace_dispatch_getattr_cache_returns_consistent_results() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let first = fixture
-            .adapter
-            .dispatch_getattr(&ctx, 1, 300, None)
-            .expect("first getattr");
-        let second = fixture
-            .adapter
-            .dispatch_getattr(&ctx, 1, 301, None)
-            .expect("cached getattr");
-        assert_eq!(first.attr.ino, second.attr.ino);
-        assert_eq!(first.attr.mode, second.attr.mode);
-        assert_eq!(first.attr.nlink, second.attr.nlink);
-    }
-
-    #[test]
-    fn namespace_dispatch_setattr_mode_change() {
-        let (ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let file_attr = fixture
-            .adapter
-            .dispatch_mkdir(&ctx, 1, b"chmod-test", 0o644)
-            .expect("mkdir");
-        let ino = file_attr.inode_id.get();
-
-        let mut set = SetAttr::new();
-        set.valid = FATTR_MODE;
-        set.mode = 0o600;
-        let _result = fixture
-            .adapter
-            .dispatch_setattr(&ctx, 400, ino, &set, None)
-            .expect("setattr mode");
-
-        // Verify mode change persisted via namespace
-        let attrs = ns.get_attrs(ino).expect("get_attrs after setattr");
-        assert_eq!(attrs.mode & 0o777, 0o600);
-    }
-
-    #[test]
-    fn namespace_dispatch_setattr_uid_gid_change() {
-        let (ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let file_attr = fixture
-            .adapter
-            .dispatch_mkdir(&ctx, 1, b"chown-test", 0o644)
-            .expect("mkdir");
-        let ino = file_attr.inode_id.get();
-
-        let mut set = SetAttr::new();
-        set.valid = FATTR_UID | FATTR_GID;
-        set.uid = 1000;
-        set.gid = 500;
-        fixture
-            .adapter
-            .dispatch_setattr(&ctx, 500, ino, &set, None)
-            .expect("setattr uid/gid");
-
-        let attrs = ns.get_attrs(ino).expect("get_attrs after setattr");
-        assert_eq!(attrs.uid, 1000);
-        assert_eq!(attrs.gid, 500);
-    }
-
-    #[test]
-    fn namespace_dispatch_setattr_size_change() {
-        let (ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        // Create a regular file via namespace so it is visible to both
-        // ns.get_attrs() and dispatch_setattr. dispatch_mkdir creates a
-        // directory, and truncate on a directory correctly returns EISDIR.
-        let file_attrs = tidefs_namespace::InodeAttributes::new_file(0);
-        let ino = ns
-            .create_file(1, "trunc-test", file_attrs)
-            .expect("create file in ns");
-
-        let mut set = SetAttr::new();
-        set.valid = FATTR_SIZE;
-        set.size = 4096;
-        fixture
-            .adapter
-            .dispatch_setattr(&ctx, 600, ino, &set, None)
-            .expect("setattr size");
-
-        let attrs = ns.get_attrs(ino).expect("get_attrs after setattr");
-        assert_eq!(attrs.size, 4096);
-    }
-
-    /// EISDIR: dispatch_setattr with FATTR_SIZE on a directory
-    /// must return EISDIR per POSIX.
-    #[test]
-    fn namespace_dispatch_setattr_truncate_dir_returns_eisdir() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let dir_attr = fixture
-            .adapter
-            .dispatch_mkdir(&ctx, 1, b"some-dir", 0o755)
-            .expect("mkdir");
-        let ino = dir_attr.inode_id.get();
-
-        let mut set = SetAttr::new();
-        set.valid = FATTR_SIZE;
-        set.size = 100;
-        let err = fixture
-            .adapter
-            .dispatch_setattr(&ctx, 9990, ino, &set, None)
-            .unwrap_err();
-        assert_eq!(
-            err,
-            Errno::EISDIR,
-            "truncate on directory must return EISDIR"
-        );
-    }
-
-    #[test]
-    fn namespace_dispatch_setattr_atime_mtime_explicit() {
-        let (ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let file_attrs = tidefs_namespace::InodeAttributes::new_file(0);
-        let ino = ns
-            .create_file(1, "utimens-test", file_attrs)
-            .expect("create file in ns");
-
-        let mut set = SetAttr::new();
-        set.valid = FATTR_ATIME | FATTR_MTIME;
-        set.atime_ns = 1_000_000_000;
-        set.mtime_ns = 2_000_000_000;
-        fixture
-            .adapter
-            .dispatch_setattr(&ctx, 700, ino, &set, None)
-            .expect("setattr utimens");
-
-        let attrs = ns.get_attrs(ino).expect("get_attrs after setattr");
-        let atime_ns = attrs
-            .atime
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let mtime_ns = attrs
-            .mtime
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        assert_eq!(atime_ns, 1_000_000_000);
-        assert_eq!(mtime_ns, 2_000_000_000);
-    }
-
-    #[test]
-    fn namespace_dispatch_setattr_atime_now_mtime_now() {
-        let (ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let file_attrs = tidefs_namespace::InodeAttributes::new_file(0);
-        let ino = ns
-            .create_file(1, "now-test", file_attrs)
-            .expect("create file in ns");
-        let before = std::time::SystemTime::now();
-
-        let mut set = SetAttr::new();
-        set.valid = FATTR_ATIME_NOW | FATTR_MTIME_NOW;
-        fixture
-            .adapter
-            .dispatch_setattr(&ctx, 800, ino, &set, None)
-            .expect("setattr ATIME_NOW+MTIME_NOW");
-
-        let attrs = ns.get_attrs(ino).expect("get_attrs after setattr");
-        assert!(attrs.atime >= before, "atime should advance");
-        assert!(attrs.mtime >= before, "mtime should advance");
-    }
-
-    #[test]
-    fn namespace_dispatch_setattr_partial_mask_preserves_other_fields() {
-        let (ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let file_attr = fixture
-            .adapter
-            .dispatch_mkdir(&ctx, 1, b"partial-test", 0o755)
-            .expect("mkdir");
-        let ino = file_attr.inode_id.get();
-
-        // Set initial uid then change only gid — uid should be preserved
-        let mut set1 = SetAttr::new();
-        set1.valid = FATTR_UID;
-        set1.uid = 42;
-        fixture
-            .adapter
-            .dispatch_setattr(&ctx, 900, ino, &set1, None)
-            .expect("setattr uid");
-
-        let mut set2 = SetAttr::new();
-        set2.valid = FATTR_GID;
-        set2.gid = 99;
-        fixture
-            .adapter
-            .dispatch_setattr(&ctx, 901, ino, &set2, None)
-            .expect("setattr gid");
-
-        let attrs = ns.get_attrs(ino).expect("get_attrs after partial setattr");
-        assert_eq!(attrs.uid, 42, "uid preserved across partial setattr");
-        assert_eq!(attrs.gid, 99, "gid updated");
-        assert_eq!(attrs.mode & 0o777, 0o755, "mode preserved");
-    }
-
-    #[test]
-    fn namespace_dispatch_setattr_noop_does_not_change_ctime() {
-        let (ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let file_attr = fixture
-            .adapter
-            .dispatch_mkdir(&ctx, 1, b"noop-test", 0o644)
-            .expect("mkdir");
-        let ino = file_attr.inode_id.get();
-
-        let before = ns.get_attrs(ino).expect("get_attrs before noop");
-        let set = SetAttr::new(); // valid == 0, no changes
-        fixture
-            .adapter
-            .dispatch_setattr(&ctx, 1000, ino, &set, None)
-            .expect("setattr noop");
-
-        let after = ns.get_attrs(ino).expect("get_attrs after noop");
-        // Ctime and other fields unchanged since no valid bits set
-        let before_ctime_ns = before
-            .ctime
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let after_ctime_ns = after
-            .ctime
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        assert_eq!(after_ctime_ns, before_ctime_ns, "ctime unchanged on noop");
-    }
-
-    #[test]
-    fn namespace_dispatch_setattr_missing_inode_returns_estale() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
-        let mut set = SetAttr::new();
-        set.valid = FATTR_MODE;
-        set.mode = 0o600;
-        let err = fixture
-            .adapter
-            .dispatch_setattr(&ctx, 1100, 99999, &set, None)
-            .unwrap_err();
-        assert_eq!(err, Errno::ESTALE);
-    }
-
-    // ── Namespace-backed setattr error path tests ────────────────────────
-
-    #[test]
-    fn namespace_dispatch_setattr_read_only_mount_rejects_mutation() {
-        let (_ns, mut fixture) = namespace_fixture();
-        fixture.adapter.set_read_only();
-        let ctx = root_ctx();
-        let mut set = SetAttr::new();
-        set.valid = FATTR_MODE;
-        set.mode = 0o600;
-        let err = fixture
-            .adapter
-            .dispatch_setattr(&ctx, 1200, 1, &set, None)
-            .unwrap_err();
-        assert_eq!(err, Errno::EROFS);
-    }
-
-    // ── Engine-backed read-only mount rejection tests ───────────────────
-
     #[test]
     fn read_only_mount_rejects_create_mkdir_unlink() {
         let adapter = fresh_test_adapter().with_read_only();
@@ -38165,100 +35979,6 @@ mod tests {
             Errno::EROFS
         );
     }
-    #[test]
-    fn namespace_dispatch_setattr_non_root_chown_rejected() {
-        let (_ns, fixture) = namespace_fixture();
-        // Create a file owned by root
-        let file_attr = fixture
-            .adapter
-            .dispatch_mkdir(&root_ctx(), 1, b"owned-by-root", 0o644)
-            .expect("mkdir");
-        let ino = file_attr.inode_id.get();
-
-        // Non-root context trying to chown
-        let non_root_ctx = RequestCtx {
-            uid: 1000,
-            gid: 1000,
-            pid: 42,
-            umask: 0o022,
-            groups: vec![1000],
-        };
-        let mut set = SetAttr::new();
-        set.valid = FATTR_UID;
-        set.uid = 2000;
-        let err = fixture
-            .adapter
-            .dispatch_setattr(&non_root_ctx, 1300, ino, &set, None)
-            .unwrap_err();
-        assert_eq!(err, Errno::EPERM);
-    }
-
-    #[test]
-    fn namespace_dispatch_setattr_non_root_chmod_on_others_file_rejected() {
-        let (_ns, fixture) = namespace_fixture();
-        // Create a file owned by root (uid 0)
-        let file_attr = fixture
-            .adapter
-            .dispatch_mkdir(&root_ctx(), 1, b"roots-file", 0o644)
-            .expect("mkdir");
-        let ino = file_attr.inode_id.get();
-
-        // Non-root context trying to chmod on root's file
-        let non_root_ctx = RequestCtx {
-            uid: 1000,
-            gid: 1000,
-            pid: 42,
-            umask: 0o022,
-            groups: vec![1000],
-        };
-        let mut set = SetAttr::new();
-        set.valid = FATTR_MODE;
-        set.mode = 0o777;
-        let err = fixture
-            .adapter
-            .dispatch_setattr(&non_root_ctx, 1400, ino, &set, None)
-            .unwrap_err();
-        assert_eq!(err, Errno::EPERM);
-    }
-
-    #[test]
-    fn namespace_dispatch_setattr_non_root_chgrp_to_non_member_group_rejected() {
-        let (_ns, fixture) = namespace_fixture();
-        let mut set_owner = SetAttr::new();
-        set_owner.valid = FATTR_UID | FATTR_GID;
-        set_owner.uid = 1000;
-        set_owner.gid = 1000;
-        let file_attr = fixture
-            .adapter
-            .dispatch_mkdir(&root_ctx(), 1, b"user-file", 0o644)
-            .expect("mkdir");
-        let ino = file_attr.inode_id.get();
-        // Set initial ownership to uid=1000, gid=1000 (as root)
-        fixture
-            .adapter
-            .dispatch_setattr(&root_ctx(), 1500, ino, &set_owner, None)
-            .expect("setattr owner");
-
-        // Non-root context (uid=1000) trying to chgrp to group 9999 (non-member)
-        let non_root_ctx = RequestCtx {
-            uid: 1000,
-            gid: 1000,
-            pid: 42,
-            umask: 0o022,
-            groups: vec![1000],
-        };
-        let mut set = SetAttr::new();
-        set.valid = FATTR_GID;
-        set.gid = 9999;
-        let err = fixture
-            .adapter
-            .dispatch_setattr(&non_root_ctx, 1501, ino, &set, None)
-            .unwrap_err();
-        assert_eq!(err, Errno::EPERM);
-    }
-
-    // ── Engine-path dispatch tests (no namespace) ──────────────────────────
-
     #[test]
     fn engine_dispatch_symlink_and_readlink_roundtrip() {
         let fixture = adapter_fixture();
@@ -42702,27 +40422,6 @@ mod tests {
         AdapterFixture { adapter, root }
     }
 
-    fn adapter_fixture_with_namespace_writeback_cache() -> AdapterFixture {
-        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "tidefs-vfs-adapter-ns-wb-{}-{temp_id}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create temp root");
-        let local_fs = LocalFileSystem::open_with_root_authentication_key(
-            &root,
-            StoreOptions::test_fast(),
-            RootAuthenticationKey::demo_key(),
-        )
-        .expect("open local filesystem");
-        let engine = VfsLocalFileSystem::new(local_fs);
-        let adapter = FuseVfsAdapter::new(Box::new(engine))
-            .expect("create adapter")
-            .with_namespace(Arc::new(Namespace::new()))
-            .with_writeback_cache_enabled();
-        AdapterFixture { adapter, root }
-    }
-
     fn adapter_fixture_with_writeback_cache_strict_atime() -> AdapterFixture {
         let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -43258,147 +40957,6 @@ mod tests {
                 .is_dirty(ino),
             Some(false),
             "clean write-through writes remain clean without populating page cache"
-        );
-    }
-
-    #[test]
-    fn writeback_cached_overwrites_defer_namespace_attr_sync() {
-        assert!(
-            !FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 512),
-            "writeback-cache overwrites can defer namespace mirror refresh to getattr or lookup"
-        );
-        assert!(
-            FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 3840, 512),
-            "writeback-cache size extension must sync namespace mirror"
-        );
-        assert!(
-            FuseVfsAdapter::write_requires_namespace_attr_sync(false, false, 0, 4096, 1024, 512),
-            "non-writeback writes keep immediate namespace mirror sync"
-        );
-        assert!(
-            FuseVfsAdapter::write_requires_namespace_attr_sync(true, true, 0, 4096, 1024, 512),
-            "direct I/O keeps immediate namespace mirror sync"
-        );
-        assert!(
-            FuseVfsAdapter::write_requires_namespace_attr_sync(
-                true,
-                false,
-                FUSE_WRITE_KILL_PRIV,
-                4096,
-                1024,
-                512,
-            ),
-            "killpriv writes keep immediate namespace mirror sync"
-        );
-        assert!(
-            !FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 0),
-            "zero-byte writes do not need namespace mirror sync"
-        );
-    }
-
-    #[test]
-    fn writeback_cached_overwrite_keeps_getattr_fresh_while_namespace_mirror_stale() {
-        let fixture = adapter_fixture_with_namespace_writeback_cache();
-        let ctx = root_ctx();
-        let ns = fixture.adapter.namespace_handle().expect("namespace");
-        let root = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine.get_root_inode(&ctx).expect("root inode")
-        };
-        let name = b"wb-overwrite-deferred-namespace-attrs.txt";
-        let created = fixture
-            .adapter
-            .dispatch_create_entry(&ctx, root.get(), name, 0o644, libc::O_RDWR as u32)
-            .expect("create writeback-cache file");
-        let ino = created.attr.inode_id.get();
-        let ns_ino = ns
-            .create_file(
-                root.get(),
-                std::str::from_utf8(name).expect("test name is utf8"),
-                tidefs_namespace::InodeAttributes::new_file(ino),
-            )
-            .expect("seed namespace mirror");
-        assert_eq!(ns_ino, ino);
-
-        let seed = b"abcdefgh";
-        let written = fixture
-            .adapter
-            .dispatch_write(&ctx, ino, created.adapter_fh, 0, seed, FUSE_WRITE_CACHE)
-            .expect("seed write extends file");
-        assert_eq!(written, seed.len() as u32);
-
-        let mut stale = ns.get_attrs(ino).expect("namespace attrs");
-        stale.mtime = UNIX_EPOCH;
-        stale.ctime = UNIX_EPOCH;
-        ns.update_attrs(ino, stale)
-            .expect("make namespace timestamps stale");
-
-        std::thread::sleep(Duration::from_millis(1));
-        let overwrite = b"ZZ";
-        let written = fixture
-            .adapter
-            .dispatch_write(
-                &ctx,
-                ino,
-                created.adapter_fh,
-                2,
-                overwrite,
-                FUSE_WRITE_CACHE,
-            )
-            .expect("writeback-cache overwrite");
-        assert_eq!(written, overwrite.len() as u32);
-
-        let ns_after_write = ns.get_attrs(ino).expect("namespace attrs after write");
-        assert_eq!(
-            system_time_to_ns(ns_after_write.mtime),
-            0,
-            "overwrite should not immediately refresh namespace mtime"
-        );
-        assert_eq!(
-            system_time_to_ns(ns_after_write.ctime),
-            0,
-            "overwrite should not immediately refresh namespace ctime"
-        );
-
-        let engine_after_write = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine
-                .getattr(InodeId::new(ino), None, &ctx)
-                .expect("engine getattr after overwrite")
-        };
-        assert!(
-            engine_after_write.posix.mtime_ns > 0,
-            "engine write path must still advance authoritative mtime"
-        );
-
-        let attr_out = fixture
-            .adapter
-            .dispatch_getattr(&ctx, ino, 40_099, Some(created.adapter_fh))
-            .expect("dispatch getattr after deferred namespace sync");
-        assert_eq!(attr_out.attr.size, seed.len() as u64);
-        assert_eq!(
-            attr_out.attr.mtime,
-            (engine_after_write.posix.mtime_ns / 1_000_000_000) as u64
-        );
-        assert_eq!(
-            attr_out.attr.mtimensec,
-            (engine_after_write.posix.mtime_ns % 1_000_000_000) as u32
-        );
-
-        let lookup = fixture
-            .adapter
-            .dispatch_lookup(&ctx, root.get(), name)
-            .expect("lookup repairs namespace attrs from engine");
-        assert_eq!(lookup.inode_id.get(), ino);
-
-        let ns_after_lookup = ns.get_attrs(ino).expect("namespace attrs after lookup");
-        assert_eq!(
-            system_time_to_ns(ns_after_lookup.mtime),
-            engine_after_write.posix.mtime_ns
-        );
-        assert_eq!(
-            system_time_to_ns(ns_after_lookup.ctime),
-            engine_after_write.posix.ctime_ns
         );
     }
 
