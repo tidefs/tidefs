@@ -40,7 +40,6 @@ tidefs-erasure-coding = { workspace = true }
 tidefs-performance-contract = { workspace = true, features = ["alloc"] }
 tidefs-types-polymorphic-xattr-core = { workspace = true, features = ["alloc"] }
 tidefs-posix-acl = { workspace = true, features = ["alloc"] }
-tidefs-inode-table = { workspace = true }
 tidefs-inode-attributes = { workspace = true }
 tidefs-commit_group = { workspace = true }
 tidefs-cleanup-engine = { workspace = true }
