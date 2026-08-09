@@ -3,9 +3,10 @@
 //! [`tidefs_local_filesystem::capacity_authority::CapacityAuthority`].
 //!
 //! Replaces the retired CapacityFacade-based smoke path.
-//! Covers construction, ENOSPC gating, allocation accounting,
-//! statfs derivation, root-reserve visibility, and capacity
-//! mutation.
+//! Covers construction, ENOSPC gating, committed-usage projection,
+//! statfs derivation, root-reserve visibility, and capacity geometry.
+//! Private mutation helpers are covered by inline local-filesystem tests;
+//! this cross-crate smoke stays on the public authority boundary.
 //!
 //! Gated on `feature = "fuse"`.
 
@@ -24,14 +25,14 @@ pub fn run_capacity_smoke() -> SmokeHarness {
     smoke_authority_construction_and_accessors(&mut h);
     smoke_enospc_gating(&mut h);
     smoke_enospc_with_root_reserve(&mut h);
-    smoke_enospc_after_allocation(&mut h);
-    smoke_allocation_accounting(&mut h);
-    smoke_record_free_accounting(&mut h);
+    smoke_enospc_after_committed_usage(&mut h);
+    smoke_committed_usage_accounting(&mut h);
+    smoke_committed_usage_reduction(&mut h);
     smoke_statfs_derivation(&mut h);
-    smoke_statfs_derivation_after_allocation(&mut h);
+    smoke_statfs_derivation_with_committed_usage(&mut h);
     smoke_statfs_derivation_zero_block_size(&mut h);
     smoke_block_rounding_helpers(&mut h);
-    smoke_setters_and_mutation(&mut h);
+    smoke_capacity_geometry_variants(&mut h);
     smoke_statfs_reply_encoding(&mut h);
     h.scenario_end("capacity/smoke");
 
@@ -154,84 +155,77 @@ fn smoke_enospc_with_root_reserve(h: &mut SmokeHarness) {
     );
 }
 
-fn smoke_enospc_after_allocation(h: &mut SmokeHarness) {
-    let ca = CapacityAuthority::new(4096 * 8, 0, 4096, 0);
+fn smoke_enospc_after_committed_usage(h: &mut SmokeHarness) {
+    let ca = CapacityAuthority::new(4096 * 8, 4096 * 7, 4096, 0);
     record_capacity_op(
         h,
-        "capacity.check_enospc.after_alloc",
+        "capacity.check_enospc.committed_usage",
         0,
         b"use 7 of 8 blocks",
     );
 
-    ca.record_allocation(4096 * 7);
-    h.assert_eq_ev("after 7 allocs: used", ca.used_bytes(), 4096 * 7);
-    h.assert_eq_ev("after 7 allocs: free", ca.free_bytes(), 4096);
+    h.assert_eq_ev("7 committed blocks: used", ca.used_bytes(), 4096 * 7);
+    h.assert_eq_ev("7 committed blocks: free", ca.free_bytes(), 4096);
     h.assert_eq_ev("one block still ok", ca.check_enospc(4096), Ok(()));
 
-    ca.record_allocation(4096);
-    h.assert_eq_ev("after 8 allocs: used", ca.used_bytes(), 4096 * 8);
-    h.assert_eq_ev("after 8 allocs: free", ca.free_bytes(), 0);
+    let full = CapacityAuthority::new(4096 * 8, 4096 * 8, 4096, 0);
+    h.assert_eq_ev("8 committed blocks: used", full.used_bytes(), 4096 * 8);
+    h.assert_eq_ev("8 committed blocks: free", full.free_bytes(), 0);
     h.assert_eq_ev(
         "full capacity fails enospc",
-        ca.check_enospc(1),
+        full.check_enospc(1),
         Err(Errno::ENOSPC),
     );
 }
 
-// ── Allocation accounting ───────────────────────────────────────────────
+// ── Committed-usage accounting ─────────────────────────────────────────
 
-fn smoke_allocation_accounting(h: &mut SmokeHarness) {
-    let ca = CapacityAuthority::new(4096 * 64, 0, 4096, 0);
+fn smoke_committed_usage_accounting(h: &mut SmokeHarness) {
+    let ca = CapacityAuthority::new(4096 * 64, 4096 * 4, 4096, 0);
 
-    record_capacity_op(h, "capacity.record_allocation", 0, b"4 blocks");
-    ca.record_allocation(4096 * 4);
+    record_capacity_op(h, "capacity.committed_usage", 0, b"4 blocks");
+    h.assert_eq_ev("committed usage is visible", ca.used_bytes(), 4096 * 4);
+    h.assert_eq_ev("committed usage reduces free", ca.free_bytes(), 4096 * 60);
     h.assert_eq_ev(
-        "record_allocation increases used",
-        ca.used_bytes(),
-        4096 * 4,
-    );
-    h.assert_eq_ev(
-        "record_allocation decreases free",
-        ca.free_bytes(),
-        4096 * 60,
-    );
-    h.assert_eq_ev(
-        "record_allocation decreases avail",
+        "committed usage reduces available",
         ca.available_bytes(),
         4096 * 60,
     );
 
-    record_capacity_op(h, "capacity.record_allocation.more", 0, b"10 more blocks");
-    ca.record_allocation(4096 * 10);
-    h.assert_eq_ev("cumulative used", ca.used_bytes(), 4096 * 14);
-    h.assert_eq_ev("cumulative free", ca.free_bytes(), 4096 * 50);
+    record_capacity_op(h, "capacity.committed_usage.more", 0, b"14 blocks");
+    let more = CapacityAuthority::new(4096 * 64, 4096 * 14, 4096, 0);
+    h.assert_eq_ev("larger committed usage", more.used_bytes(), 4096 * 14);
+    h.assert_eq_ev("larger usage reduces free", more.free_bytes(), 4096 * 50);
 }
 
-fn smoke_record_free_accounting(h: &mut SmokeHarness) {
-    let ca = CapacityAuthority::new(4096 * 64, 4096 * 16, 4096, 0);
-    record_capacity_op(h, "capacity.record_free", 0, b"free 8 of 16 blocks");
+fn smoke_committed_usage_reduction(h: &mut SmokeHarness) {
+    let ca = CapacityAuthority::new(4096 * 64, 4096 * 8, 4096, 0);
+    record_capacity_op(
+        h,
+        "capacity.committed_usage.reduced",
+        0,
+        b"8 blocks remain committed",
+    );
 
-    ca.record_free(4096 * 8);
-    h.assert_eq_ev("record_free decreases used", ca.used_bytes(), 4096 * 8);
-    h.assert_eq_ev("record_free increases free", ca.free_bytes(), 4096 * 56);
+    h.assert_eq_ev("reduced committed usage", ca.used_bytes(), 4096 * 8);
+    h.assert_eq_ev("reduced usage increases free", ca.free_bytes(), 4096 * 56);
     h.assert_eq_ev(
-        "record_free increases avail",
+        "reduced usage increases available",
         ca.available_bytes(),
         4096 * 56,
     );
 
-    // Free beyond used: saturates at 0.
     record_capacity_op(
         h,
-        "capacity.record_free.saturate",
+        "capacity.committed_usage.empty",
         0,
-        b"free 16 blocks from 8 used",
+        b"no committed usage",
     );
-    ca.record_free(4096 * 16);
-    h.assert_eq_ev("record_free saturates used at 0", ca.used_bytes(), 0);
+    let empty = CapacityAuthority::new(4096 * 64, 0, 4096, 0);
+    h.assert_eq_ev("empty committed usage is zero", empty.used_bytes(), 0);
     h.assert_eq_ev(
-        "total unchanged after free saturation",
-        ca.total_bytes(),
+        "total unchanged for empty usage",
+        empty.total_bytes(),
         4096 * 64,
     );
 }
@@ -257,16 +251,15 @@ fn smoke_statfs_derivation(h: &mut SmokeHarness) {
     h.assert_eq_ev("derive_statfs name_max", statfs.name_max, 255);
 }
 
-fn smoke_statfs_derivation_after_allocation(h: &mut SmokeHarness) {
-    let ca = CapacityAuthority::new(4096 * 64, 0, 4096, 0);
+fn smoke_statfs_derivation_with_committed_usage(h: &mut SmokeHarness) {
+    let ca = CapacityAuthority::new(4096 * 64, 4096 * 10, 4096, 0);
     record_capacity_op(
         h,
-        "capacity.derive_statfs.after_alloc",
+        "capacity.derive_statfs.committed_usage",
         0,
-        b"allocate 10 blocks",
+        b"10 committed blocks",
     );
 
-    ca.record_allocation(4096 * 10);
     let statfs = ca.derive_statfs(500, 400, 255);
     h.assert_eq_ev("total_blocks unchanged", statfs.total_blocks, 64);
     h.assert_eq_ev("free_blocks after alloc", statfs.free_blocks, 54);
@@ -287,7 +280,7 @@ fn smoke_statfs_derivation_zero_block_size(h: &mut SmokeHarness) {
     h.assert_eq_ev("default name_max zero", cs.name_max, 0);
 }
 
-// ── Setters and mutation ────────────────────────────────────────────────
+// ── Capacity geometry variants ─────────────────────────────────────────
 
 // ── Block rounding helpers (production methods on CapacityAuthority) ──
 
@@ -330,43 +323,41 @@ fn smoke_block_rounding_helpers(h: &mut SmokeHarness) {
     );
 }
 
-fn smoke_setters_and_mutation(h: &mut SmokeHarness) {
-    let ca = CapacityAuthority::new(4096 * 64, 4096 * 8, 4096, 4096 * 4);
+fn smoke_capacity_geometry_variants(h: &mut SmokeHarness) {
+    let expanded = CapacityAuthority::new(4096 * 128, 4096 * 8, 4096, 4096 * 4);
 
-    record_capacity_op(h, "capacity.set_total_bytes", 0, b"64->128 blocks");
-    ca.set_total_bytes(4096 * 128);
+    record_capacity_op(h, "capacity.geometry.expanded", 0, b"128 blocks");
     h.assert_eq_ev(
-        "set_total_bytes updates total",
-        ca.total_bytes(),
+        "expanded geometry updates total",
+        expanded.total_bytes(),
         4096 * 128,
     );
-    h.assert_eq_ev("set_total_bytes expands free", ca.free_bytes(), 4096 * 120);
     h.assert_eq_ev(
-        "set_total_bytes expands avail",
-        ca.available_bytes(),
+        "expanded geometry reports free",
+        expanded.free_bytes(),
+        4096 * 120,
+    );
+    h.assert_eq_ev(
+        "expanded geometry reports available",
+        expanded.available_bytes(),
         4096 * 116,
     );
 
-    record_capacity_op(
-        h,
-        "capacity.set_root_reserve_bytes",
-        0,
-        b"4->16 blocks reserve",
-    );
-    ca.set_root_reserve_bytes(4096 * 16);
+    record_capacity_op(h, "capacity.geometry.root_reserve", 0, b"16-block reserve");
+    let reserved = CapacityAuthority::new(4096 * 128, 4096 * 8, 4096, 4096 * 16);
     h.assert_eq_ev(
-        "set_root_reserve updates value",
-        ca.root_reserve_bytes(),
+        "geometry sets root reserve",
+        reserved.root_reserve_bytes(),
         4096 * 16,
     );
     h.assert_eq_ev(
-        "set_root_reserve reduces avail",
-        ca.available_bytes(),
+        "root reserve reduces available",
+        reserved.available_bytes(),
         4096 * 104,
     );
     h.assert_eq_ev(
-        "set_root_reserve preserves free",
-        ca.free_bytes(),
+        "root reserve preserves free",
+        reserved.free_bytes(),
         4096 * 120,
     );
 }
