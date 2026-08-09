@@ -6635,6 +6635,39 @@ mod tests {
     }
 
     #[test]
+    fn fdatasync_inode_accepts_pool_placed_buffered_content() {
+        let (engine, _td, _devices) = temp_fs_with_block_devices(2);
+        let root = engine.get_root_inode(&ctx()).expect("root inode");
+        let (_attr, fh) = engine
+            .create(root, b"pool-fdatasync.txt", 0o644, O_RDWR, &ctx())
+            .expect("create file");
+        let payload = b"buffered content placed through the mounted Pool";
+
+        assert_eq!(
+            engine.write(&fh, 0, payload, &ctx()).expect("buffer write"),
+            payload.len() as u32,
+        );
+        engine
+            .fdatasync_inode(&fh, true, &ctx())
+            .expect("fdatasync Pool-placed content");
+
+        assert_eq!(
+            engine
+                .read(&fh, 0, payload.len() as u32, &ctx())
+                .expect("read Pool-placed content"),
+            payload,
+        );
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .current_content_object_exists_for_diagnostic("/pool-fdatasync.txt")
+                .expect("Pool content diagnostic"),
+            "fdatasync must retain a current receipt-backed content object",
+        );
+    }
+
+    #[test]
     fn mutation_fence_precedes_live_admin_validation_but_preserves_read_only_modes() {
         let (engine, _td) = temp_fs();
         engine.fs.borrow_mut().arm_mutation_reopen_fence();
