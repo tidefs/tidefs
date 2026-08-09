@@ -466,15 +466,22 @@ fi
 
 QUEUE_DEPTH_ARTIFACT="__QUEUE_DEPTH_ARTIFACT__"
 mkdir -p "$(dirname "$QUEUE_DEPTH_ARTIFACT")"
+SMOKE_OUTPUT=/tmp/smoke-mount-output.txt
+SMOKE_STREAM=/tmp/smoke-mount-output.fifo
+rm -f "$SMOKE_OUTPUT" "$SMOKE_STREAM"
+/bin/busybox mkfifo "$SMOKE_STREAM"
+tee "$SMOKE_OUTPUT" <"$SMOKE_STREAM" &
+SMOKE_TEE_PID=$!
 TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141 \
   tidefs-posix-filesystem-adapter-daemon smoke-mount \
   --profile quick \
   --queue-depth-artifact "$QUEUE_DEPTH_ARTIFACT" \
-  >/tmp/smoke-mount-output.txt 2>&1
+  >"$SMOKE_STREAM" 2>&1
 SMOKE_RC=$?
-cat /tmp/smoke-mount-output.txt
+wait "$SMOKE_TEE_PID"
+rm -f "$SMOKE_STREAM"
 
-SMOKE_SUMMARY=$(sed -n 's/.*smoke-mount:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*passed,[[:space:]]*\([0-9][0-9]*\)[[:space:]]*failed.*/\1 \2/p' /tmp/smoke-mount-output.txt | tail -1)
+SMOKE_SUMMARY=$(sed -n 's/.*smoke-mount:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*passed,[[:space:]]*\([0-9][0-9]*\)[[:space:]]*failed.*/\1 \2/p' "$SMOKE_OUTPUT" | tail -1)
 SMOKE_FAILED=1
 if [ -n "$SMOKE_SUMMARY" ]; then
     SMOKE_FAILED=$(echo "$SMOKE_SUMMARY" | cut -d' ' -f2)
