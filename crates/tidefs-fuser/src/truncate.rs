@@ -69,11 +69,8 @@ pub fn check_truncate_permission(
         mode,
         file_uid,
         file_gid,
-        caller_uid,
-        caller_gid,
-        caller_groups,
+        crate::access::FuseCaller::new(caller_uid, caller_gid, caller_groups, mount_identity),
         crate::access::ACCESS_WRITE,
-        mount_identity,
     )
 }
 

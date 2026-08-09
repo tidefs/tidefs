@@ -178,11 +178,8 @@ pub fn check_readdir_permission(
         dir_mode,
         dir_uid,
         dir_gid,
-        caller_uid,
-        caller_gid,
-        caller_groups,
+        crate::access::FuseCaller::new(caller_uid, caller_gid, caller_groups, mount_identity),
         crate::access::ACCESS_READ,
-        mount_identity,
     )
     .map_err(|_e| ReadDirError::PermissionDenied)
 }

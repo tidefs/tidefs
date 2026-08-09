@@ -189,11 +189,8 @@ pub fn check_open_permission(
     mode: u32,
     file_uid: u32,
     file_gid: u32,
-    caller_uid: u32,
-    caller_gid: u32,
-    caller_groups: &[u32],
+    caller: crate::access::FuseCaller<'_>,
     access_mode: u32,
-    mount_identity: &tidefs_permission::MountIdentity,
 ) -> Result<(), OpenError> {
     let requested = crate::access::fuse_access_requested_from_mask(match access_mode as i32 {
         libc::O_RDONLY => libc::R_OK,
@@ -203,17 +200,8 @@ pub fn check_open_permission(
     })
     .map_err(|_e| OpenError::InvalidAccessMode)?;
 
-    crate::access::check_fuse_access(
-        mode,
-        file_uid,
-        file_gid,
-        caller_uid,
-        caller_gid,
-        caller_groups,
-        requested,
-        mount_identity,
-    )
-    .map_err(|_e| OpenError::PermissionDenied)
+    crate::access::check_fuse_access(mode, file_uid, file_gid, caller, requested)
+        .map_err(|_e| OpenError::PermissionDenied)
 }
 
 // ── plan_open — validated open-intent ────────────────────────────────────
@@ -318,7 +306,6 @@ pub fn format_open_reply(
 ///
 /// Returns [`OpenError`] when flag validation, file-type checking,
 /// or permission checks fail.
-#[allow(clippy::too_many_arguments)]
 pub fn handle_open(
     flags: u32,
     is_dir: bool,
@@ -326,23 +313,11 @@ pub fn handle_open(
     mode: u32,
     file_uid: u32,
     file_gid: u32,
-    caller_uid: u32,
-    caller_gid: u32,
-    caller_groups: &[u32],
-    mount_identity: &tidefs_permission::MountIdentity,
+    caller: crate::access::FuseCaller<'_>,
 ) -> Result<OpenPlan, OpenError> {
     let plan = plan_open(flags)?;
     check_open_file_type(is_dir, is_file)?;
-    check_open_permission(
-        mode,
-        file_uid,
-        file_gid,
-        caller_uid,
-        caller_gid,
-        caller_groups,
-        plan.access_mode,
-        mount_identity,
-    )?;
+    check_open_permission(mode, file_uid, file_gid, caller, plan.access_mode)?;
     Ok(plan)
 }
 
@@ -700,10 +675,7 @@ mod tests {
             0o644,
             1000,
             1000,
-            1000,
-            1000,
-            &[],
-            &VALID_MOUNT,
+            crate::access::FuseCaller::new(1000, 1000, &[], &VALID_MOUNT),
         )
         .unwrap();
         assert_eq!(plan.access_mode, O_RDONLY);
@@ -719,10 +691,7 @@ mod tests {
             0o644,
             1000,
             1000,
-            1000,
-            1000,
-            &[],
-            &VALID_MOUNT,
+            crate::access::FuseCaller::new(1000, 1000, &[], &VALID_MOUNT),
         )
         .unwrap();
         assert_eq!(plan.access_mode, O_WRONLY);
@@ -738,10 +707,7 @@ mod tests {
             0o644,
             1000,
             1000,
-            1000,
-            1000,
-            &[],
-            &VALID_MOUNT,
+            crate::access::FuseCaller::new(1000, 1000, &[], &VALID_MOUNT),
         )
         .unwrap();
         assert_eq!(plan.access_mode, O_RDWR);
@@ -757,10 +723,7 @@ mod tests {
             0o755,
             1000,
             1000,
-            1000,
-            1000,
-            &[],
-            &VALID_MOUNT,
+            crate::access::FuseCaller::new(1000, 1000, &[], &VALID_MOUNT),
         )
         .unwrap_err();
         assert_eq!(err, OpenError::IsDirectory);
@@ -775,10 +738,7 @@ mod tests {
             0o644,
             1000,
             1000,
-            1000,
-            1000,
-            &[],
-            &VALID_MOUNT,
+            crate::access::FuseCaller::new(1000, 1000, &[], &VALID_MOUNT),
         )
         .unwrap_err();
         assert_eq!(err, OpenError::NotAFile);
@@ -793,10 +753,7 @@ mod tests {
             0o644,
             1000,
             1000,
-            1000,
-            1000,
-            &[],
-            &VALID_MOUNT,
+            crate::access::FuseCaller::new(1000, 1000, &[], &VALID_MOUNT),
         )
         .unwrap();
         assert_eq!(plan.reply_flags, FOPEN_DIRECT_IO);

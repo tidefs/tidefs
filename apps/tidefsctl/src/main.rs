@@ -238,6 +238,7 @@ fn handle_mount(
         encryption: encryption_config,
         snapshot_name: None,
         mount_authority: MountAuthority::standalone(),
+        runtime: tidefs_posix_filesystem_adapter_daemon::MountRuntimeOptions::default(),
     };
 
     if let Err(err) = tidefs_posix_filesystem_adapter_daemon::run_mount(config) {

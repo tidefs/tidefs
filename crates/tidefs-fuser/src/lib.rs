@@ -52,8 +52,8 @@ pub use reply::{
     CapturingSender, Reply, ReplyAttr, ReplyData, ReplyEmpty, ReplyEntry, ReplyOpen, ReplySender,
 };
 pub use reply::{
-    ReplyBmap, ReplyCreate, ReplyDirectory, ReplyDirectoryPlus, ReplyIoctl, ReplyLock, ReplyLseek,
-    ReplyStatfs, ReplyWrite,
+    DirectoryEntryTtls, ReplyBmap, ReplyCreate, ReplyDirectory, ReplyDirectoryPlus, ReplyIoctl,
+    ReplyLock, ReplyLseek, ReplyStatfs, ReplyWrite,
 };
 pub use request::Request;
 pub use session::{BackgroundSession, Session};

@@ -12291,11 +12291,12 @@ impl LocalFileSystem {
             .ok_or(FileSystemError::NotFound {
                 path: format!("inode {inode_id:?}"),
             })?;
-        ensure_versioned_content_object(
-            self.store.raw_primary_store_mut(),
-            record,
-            &self.content_compression_policy,
-        )?;
+        // Buffered mounted writes publish their versioned content through
+        // PoolStoreMut together with placement receipts. Validate that same
+        // Pool authority before syncing; the raw primary store is not a
+        // mounted-content namespace and may legitimately lack the logical
+        // object even though the Pool can read it.
+        let _ = self.read_committed_content_layout(inode_id, record)?;
         self.store.sync_data().map_err(FileSystemError::from)?;
         self.mark_content_clean(inode_id);
         self.record_full_local_placement_ack_receipt(

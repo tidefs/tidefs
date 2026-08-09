@@ -73,8 +73,8 @@ Pool-backed filesystem root before accepting mounted work.
 |---|---|---|---|
 | Create | `apps/tidefsctl/src/commands/pool.rs`, `crates/tidefs-pool-import/src/create.rs` | Writes dual labels plus initial fixed-region VBCR/VRBT bootstrap state and leaves the pool exported. | Keep label/bootstrap creation; stop treating the fixed-region root as mounted filesystem state authority. |
 | Import for mount | `apps/tidefsctl/src/commands/mount.rs`, `crates/tidefs-pool-import/src/lib.rs` | Validates label, feature, encryption, topology, and pool-state agreement; acquires the exact import lock; opens devices in the requested mode; activates only labels for writable ownership; reports removal state; and retains matching export/release. It does not select a fixed-region root, apply `min_epoch`, replay transactions, mount a placeholder namespace, or initialize VRBT. | Keep as mounted device admission only. Pool-backed filesystem root selection and replay belong below `run_mount`; full explicit `pool_import` retains its separate recovery behavior. |
-| Carrier open | `apps/tidefs-posix-filesystem-adapter-daemon/src/lib.rs::run_mount` | Opens `LocalFileSystem` on the runtime metadata directory plus the devices, resolves the dataset, disables auto-commit, wraps VFS and FUSE, and publishes a live owner. | This is the only selected production local mount path. |
-| Duplicate mount | `apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs::mount_vfs` | Separately opens recovery, namespace, commit-cycle, scrub, and signal/shutdown machinery and is invoked by validation and smoke commands. | Migrate useful tests to the carrier, then delete the duplicate runtime. Do not preserve two production architectures. |
+| Carrier open | `apps/tidefs-posix-filesystem-adapter-daemon/src/lib.rs::run_mount` | Opens `LocalFileSystem` on the runtime metadata directory plus the devices, resolves the dataset, applies the selected sync, timestamp, capacity, writeback, maintenance, transform, and validation controls, wraps the one VFS/FUSE session, and publishes a live owner. | This is the only local mount runtime implementation. |
+| Transitional mount CLI | `apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs::mount_vfs` | Parses the retained validation CLI and translates every consumed option into `MountConfig`, then calls `run_mount`. It does not open storage, select or validate roots, replay transactions, load a placeholder namespace, construct VFS/FUSE, or own shutdown. | Keep only until current validation consumers migrate to `tidefsctl` or focused direct tests, then delete the command wrapper. |
 | Object authority | `crates/tidefs-local-object-store/src/pool/mod.rs` | Opens the same labeled devices as a `Pool`, owns placement/device I/O, and persists object records and pool labels. | Keep as the only object/device I/O authority. |
 | Filesystem root/recovery | `crates/tidefs-local-filesystem/src/{lib,recovery}.rs` | Selects Pool-backed root-slot records, validates content through Pool receipts, replays intent and commit-group state, and constructs live filesystem state. | Keep and focus as the single mounted transaction/root/recovery authority. |
 | Dataset/inode/namespace | `FileSystemState`, `DatasetInodeAuthority`, `tidefs-namespace`, `tidefs-inode-table`, FUSE maps | Durable maps and allocator state exist in local-filesystem while namespace, inode-table, and FUSE maintain additional allocators, mirrors, and fallbacks. | Durable decisions stay in the dataset authority; all others become projections or are removed from the carrier. |
@@ -99,11 +99,13 @@ ones in the default graph:
   filesystem path from replication, send/receive, and policy subsystems.
 - `fuse_vfs_adapter.rs` is 46,314 lines, `local-filesystem/src/lib.rs` is
   17,534, `vfs_engine_impl.rs` is 16,488, and the binary daemon `main.rs` is
-  4,763 lines. The size is concentrated in four mixed-authority carriers.
-- Pool import and local-filesystem both select roots and replay logs, but only
-  the local-filesystem path loads the state served by mounted VFS operations.
-- The library carrier and binary validation carrier construct different
-  recovery, namespace, scheduler, and shutdown stacks.
+  about 3,900 lines. The remaining size is concentrated in three
+  mixed-authority carriers plus validation and smoke command source.
+- Mounted pool admission no longer selects fixed roots or replays filesystem
+  transactions; Pool-backed local-filesystem recovery owns mounted state.
+- The daemon validation CLI now reaches the same library runtime as
+  `tidefsctl`; it no longer constructs a second recovery, namespace, FUSE, or
+  shutdown stack.
 - The adapter's direct normal dependencies include cluster, block, validation,
   workload, performance-contract, schema, namespace, and inode-table families.
   `tidefsctl` directly depends on block, cluster, transport, validation, and
@@ -423,9 +425,10 @@ then delete the duplicate runtime path rather than keeping two architectures.
    local-filesystem authority.
 4. Make dataset inode authority the only durable namespace identity and remove
    namespace/inode-table/FUSE fallbacks that can decide durable truth.
-5. Move validation from the binary `mount-vfs` stack to `tidefsctl` plus
-   `run_mount`; then delete the duplicate mount and demo paths with their stale
-   dependencies and policy checks.
+5. Keep the binary `mount-vfs` command only as a temporary translator into
+   `run_mount`; move its validation consumers to `tidefsctl` or focused direct
+   tests, then delete the wrapper, smoke/demo paths, stale dependencies, and
+   policy checks.
 6. Exercise create, mount, real I/O, `fsync`/`fdatasync`, rename, clean stop,
    crash, reopen, status, unmount/export, and reimport through the one carrier.
    Fix failures in the owner selected above rather than reintroducing another

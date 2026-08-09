@@ -57,8 +57,10 @@ may use non-secret repository variables for scheduling gates, such as
 - `Clippy` runs on the TideFS self-hosted runner VMs through the same repo
   `.#ci` Nix development shell. On pull requests it selects changed workspace
   crates from locked Cargo metadata and the merge-base diff, then runs direct
-  `cargo clippy -p <crate> --locked --all-targets` checks. Cargo failures fail
-  the job and ordinary diagnostics remain in the job log; no warning-count
+  `cargo clippy -p <crate> --locked --all-targets --no-deps` checks. Dependencies
+  still compile, while Clippy lints only the selected package; whole-workspace
+  mode selects and lints every workspace package explicitly. Cargo failures
+  fail the job and ordinary diagnostics remain in the job log; no warning-count
   snapshot or result artifact is maintained. Root workspace, Cargo
   configuration, lockfile, and toolchain changes select the whole workspace.
   Manual dispatch can run either changed-crate or full-workspace checks
