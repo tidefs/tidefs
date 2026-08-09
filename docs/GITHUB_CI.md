@@ -142,7 +142,8 @@ may use non-secret repository variables for scheduling gates, such as
   `target` choice for `kmod-xfstests-smoke`, `kernel-fsync-validation`,
   `kernel-mmap-validation`, `kernel-teardown-validation`,
   `kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
-  `fuse-vm-test`, `fuse-inode-metadata-validation`, `qemu-ublk-smoke`,
+  `fuse-vm-test`, `fuse-inode-metadata-validation`,
+  `pool-remount-lifecycle-validation`, `qemu-ublk-smoke`,
   `qemu-ublk-qid-tag-runtime`, `storage-intent-ack-fault-matrix`,
   `receipt-bound-reclaim-runtime`, `scrub-foreground-read-runtime`, and `all`;
   `.github/workflows/qemu-smoke.yml` remains the exact source for target
@@ -152,6 +153,11 @@ may use non-secret repository variables for scheduling gates, such as
   the complete set. Except for the standing `master` smoke target, non-default
   targets and `all` are manual validation tiers; dispatch them only when the
   issue or pull request validation tier names the row set. QEMU Smoke
+  `pool-remount-lifecycle-validation` exercises `tidefsctl` pool create,
+  import, and mount; mounted write plus fsync; clean export, reimport, and
+  remount; startup-unwind retry; and crash/stale-lock recovery. It is focused
+  outer lifecycle evidence, not broad filesystem or release-readiness
+  evidence. QEMU Smoke
   artifacts are not xfstests, RDMA, release-candidate, broad filesystem
   correctness, product-readiness, performance-comparator, or
   successor/comparator evidence unless the relevant validation tier and
