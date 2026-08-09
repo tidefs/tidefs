@@ -2186,14 +2186,8 @@ impl Pool {
                 decode_device_layout_v1(&layout_bytes).map_err(|_| StoreError::InvalidOptions {
                     reason: "pool label DeviceLayoutV1 record is corrupt",
                 })?;
-            if mode == PoolOpenMode::ReadOnlyExisting
-                && (label.device_capacity_bytes != device_layout.device_size_bytes
-                    || label.system_area_pointer != device_layout.system_area_offset
-                    || label.system_area_size != device_layout.system_area_len)
-            {
-                return Err(StoreError::InvalidOptions {
-                    reason: "read-only pool label geometry disagrees with DeviceLayoutV1",
-                });
+            if mode == PoolOpenMode::ReadOnlyExisting {
+                validate_read_only_label_geometry(&label, &device_layout)?;
             }
             let recovered_redundancy_policy =
                 PoolRedundancyPolicy::from_label_policy(label.redundancy_policy);
@@ -6589,6 +6583,41 @@ fn normalize_imported_device_layout(
     })
 }
 
+fn validate_read_only_label_geometry(
+    label: &pool_label::PoolLabelV1,
+    layout: &DeviceLayoutV1,
+) -> Result<()> {
+    if label.device_capacity_bytes != layout.device_size_bytes {
+        return Err(StoreError::InvalidOptions {
+            reason: "read-only pool label capacity disagrees with DeviceLayoutV1",
+        });
+    }
+
+    let layout_system_end = layout
+        .system_area_offset
+        .checked_add(layout.system_area_len)
+        .ok_or(StoreError::InvalidOptions {
+            reason: "read-only pool DeviceLayoutV1 system area overflows",
+        })?;
+    let label_system_end = label
+        .system_area_pointer
+        .checked_add(label.system_area_size)
+        .ok_or(StoreError::InvalidOptions {
+            reason: "read-only pool label committed-root extent overflows",
+        })?;
+    if label.system_area_size == 0
+        || label.system_area_pointer < layout.system_area_offset
+        || label_system_end > layout_system_end
+    {
+        return Err(StoreError::InvalidOptions {
+            reason:
+                "read-only pool label committed-root extent lies outside DeviceLayoutV1 system area",
+        });
+    }
+
+    Ok(())
+}
+
 fn validate_device_layout_policy_record(layout: &DeviceLayoutV1) -> Result<DeviceLayoutPolicy> {
     let policy = match layout.policy {
         DeviceLayoutPolicyDiscriminant::Slice0Small => DeviceLayoutPolicy::Slice0Small,
@@ -6984,6 +7013,36 @@ mod tests {
         pool.persisted_label_epoch = None;
         pool.persist_active_labels_if_needed()
             .expect("persist deterministic test device GUID labels");
+    }
+
+    #[test]
+    fn read_only_geometry_accepts_committed_root_extent_inside_layout_system_area() {
+        let layout = DeviceLayoutPolicy::Slice0Small
+            .compute(300 * 1024 * 1024)
+            .expect("device layout");
+        let mut label = pool_label::PoolLabelV1::new([0x11; 16], [0x22; 16], "geometry");
+        label.device_capacity_bytes = layout.device_size_bytes;
+        label.system_area_pointer = 200 * 1024;
+        label.system_area_size = 16 * 1024;
+
+        validate_read_only_label_geometry(&label, &layout)
+            .expect("committed-root extent within the persisted system region");
+    }
+
+    #[test]
+    fn read_only_geometry_rejects_committed_root_extent_outside_layout_system_area() {
+        let layout = DeviceLayoutPolicy::Slice0Small
+            .compute(300 * 1024 * 1024)
+            .expect("device layout");
+        let mut label = pool_label::PoolLabelV1::new([0x11; 16], [0x22; 16], "geometry");
+        label.device_capacity_bytes = layout.device_size_bytes;
+        label.system_area_pointer = layout.system_area_len - 8 * 1024;
+        label.system_area_size = 16 * 1024;
+
+        assert_invalid_options_reason_contains(
+            validate_read_only_label_geometry(&label, &layout),
+            "outside DeviceLayoutV1 system area",
+        );
     }
 
     fn replace_planner_replay_receipt(
