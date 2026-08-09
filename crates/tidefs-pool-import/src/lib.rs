@@ -285,6 +285,7 @@ pub struct PoolImportOwner {
     imported: ImportedPool,
     device_paths: Vec<PathBuf>,
     lock_dir: PathBuf,
+    read_only: bool,
 }
 
 impl PoolImportOwner {
@@ -296,7 +297,11 @@ impl PoolImportOwner {
 
     /// Export this owner's pool and release its import exclusion.
     pub fn export(self) -> Result<(), ImportError> {
-        pool_export(&self.device_paths, &self.lock_dir, false)
+        if self.read_only {
+            release_import_lock(&self.lock_dir, &self.imported.config.pool_uuid)
+        } else {
+            pool_export(&self.device_paths, &self.lock_dir, false)
+        }
     }
 }
 
@@ -404,11 +409,24 @@ pub fn pool_import_owned(
         imported,
         device_paths: device_paths.to_vec(),
         lock_dir: lock_dir.to_path_buf(),
+        read_only,
     })
 }
 // ---------------------------------------------------------------------------
 // pool_export — public entry point
 // ---------------------------------------------------------------------------
+
+fn release_import_lock(lock_dir: &Path, pool_uuid: &[u8; 16]) -> Result<(), ImportError> {
+    let lock_path = lock_dir.join(hex_uuid(pool_uuid));
+    match fs::remove_file(&lock_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(ImportError::Io {
+            device_path: Some(lock_path),
+            msg: format!("remove import lock: {err}"),
+        }),
+    }
+}
 
 fn rollback_export_labels(devices: &mut [DeviceHandle], prior_labels: &[(u32, Vec<u8>)]) {
     for (written_index, prior_label) in prior_labels.iter().rev() {
@@ -501,15 +519,7 @@ pub fn pool_export(
     }
 
     // 4. Remove the import lock file.
-    let lock_path = lock_dir.join(hex_uuid(&config.pool_uuid));
-    if lock_path.exists() {
-        fs::remove_file(&lock_path).map_err(|e| ImportError::Io {
-            device_path: Some(lock_path.clone()),
-            msg: format!("remove import lock: {e}"),
-        })?;
-    }
-
-    Ok(())
+    release_import_lock(lock_dir, &config.pool_uuid)
 }
 
 // ---------------------------------------------------------------------------
@@ -3473,6 +3483,76 @@ mod tests {
         assert!(cleared.iter().all(|b| *b == 0));
     }
     // -- pool_export tests --
+
+    #[test]
+    fn read_only_owner_export_only_releases_import_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("device0");
+        let renamed_dev_path = dir.path().join("device0-renamed");
+        {
+            let f = File::create(&dev_path).unwrap();
+            f.set_len(2 * 1024 * 1024).unwrap();
+        }
+
+        let pool_guid = [0xD1u8; 16];
+        let config = crate::create::PoolCreateConfig {
+            pool_name: "read_only_owner_release".into(),
+            pool_guid: Some(pool_guid),
+            redundancy: crate::create::RedundancyPolicy::replicated(1),
+            encryption_key: None,
+            clustered: false,
+        };
+        crate::create::PoolCreator::create_pool(&[dev_path.clone()], &config).unwrap();
+        let before = fs::read(&dev_path).unwrap();
+
+        let label = tidefs_types_pool_label_core::decode_label(
+            &before[..tidefs_types_pool_label_core::POOL_LABEL_SIZE],
+        )
+        .unwrap();
+        let committed_root_start = crate::committed_root::COMMIT_RECORD_REGION_OFFSET as usize;
+        let committed_root_end =
+            committed_root_start + crate::committed_root::COMMIT_RECORD_REGION_MAX as usize;
+        let vrbt_start = label.system_area_pointer as usize + (VRBT_BLOCK_INDEX as usize * 4096);
+        let vrbt_end = vrbt_start + VRBT_WIRE_SIZE;
+
+        let lock_dir = dir.path().join("locks");
+        let owner = pool_import_owned(&[dev_path.clone()], &lock_dir, true, None, None).unwrap();
+        assert!(owner.imported().stats.read_only);
+
+        let lock_path = lock_dir.join(hex_uuid(&pool_guid));
+        assert!(
+            lock_path.exists(),
+            "read-only owner must hold import exclusion"
+        );
+
+        fs::rename(&dev_path, &renamed_dev_path).unwrap();
+        owner.export().unwrap();
+
+        assert!(
+            !lock_path.exists(),
+            "read-only owner export must release its exact import exclusion"
+        );
+        let after = fs::read(&renamed_dev_path).unwrap();
+        assert_eq!(
+            &after[..POOL_LABEL_V1_EXT_WIRE_SIZE],
+            &before[..POOL_LABEL_V1_EXT_WIRE_SIZE],
+            "read-only owner export must not rewrite the primary pool label"
+        );
+        assert_eq!(
+            &after[committed_root_start..committed_root_end],
+            &before[committed_root_start..committed_root_end],
+            "read-only owner export must not rewrite the committed-root region"
+        );
+        assert_eq!(
+            &after[vrbt_start..vrbt_end],
+            &before[vrbt_start..vrbt_end],
+            "read-only owner export must not rewrite the VRBT"
+        );
+        assert_eq!(
+            after, before,
+            "read-only owner import and export must preserve every device byte"
+        );
+    }
 
     #[test]
     fn pool_export_transitions_to_exported() {
