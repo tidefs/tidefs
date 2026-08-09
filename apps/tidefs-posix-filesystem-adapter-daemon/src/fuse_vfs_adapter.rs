@@ -3285,6 +3285,11 @@ impl FuseVfsAdapter {
     fn admit_fuse_request(&self, op: FuseAdmissionOp) -> Result<(), Errno> {
         use crate::observability::FuseAdmissionReason;
 
+        let class = op.class();
+        if self.read_only && class == FuseAdmissionClass::Mutating {
+            return Err(Errno::EROFS);
+        }
+
         if self.governor.backpressure(BudgetCategory::InodeState) != BackpressureSignal::None {
             let _ = self.emit_governor_prune_notifications();
         }
@@ -3293,7 +3298,6 @@ impl FuseVfsAdapter {
             self.governor.backpressure(op.category()),
             self.governor.global_backpressure(),
         );
-        let class = op.class();
 
         let rejection = match (signal, class, self.fuse_admission_hard_policy) {
             (BackpressureSignal::HardPressure, FuseAdmissionClass::AlwaysAdmit, _) => None,
@@ -12094,6 +12098,19 @@ mod tests {
 
         let after = crate::observability::fuse_admission_reason_snapshot();
         assert!(after.hard_refused_mutating >= before.hard_refused_mutating + 1);
+    }
+
+    #[test]
+    fn fuse_admission_read_only_fence_precedes_governor_pressure() {
+        let governor = governor_with_used(BudgetCategory::MetaCache, 950);
+        let adapter = fresh_test_adapter()
+            .with_governor(governor)
+            .with_read_only();
+
+        assert_eq!(
+            adapter.admit_fuse_request(FuseAdmissionOp::Unlink),
+            Err(Errno::EROFS)
+        );
     }
 
     #[test]
