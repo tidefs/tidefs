@@ -690,8 +690,9 @@ fn run_xfstests_harness(config: &xfstests_harness::XfstestsConfig) -> Result<(),
 }
 /// Run a self-contained FUSE mount smoke test.
 ///
-/// Forks a background daemon running `mount-vfs`, polls for the mountpoint,
-/// exercises basic POSIX operations, and cleans up. Returns Ok on success.
+/// Forks a background daemon running `mount-vfs`, waits for the canonical
+/// runtime's mounted-ready signal, exercises basic POSIX operations, and
+/// cleans up. Returns Ok on success.
 /// Run a self-contained FUSE mount smoke test that exercises teardown,
 /// remount, data persistence, and stale-handle behavior.
 ///
@@ -745,7 +746,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
         };
     }
 
-    // ── Helper: spawn daemon and wait for mountpoint ──────────────────
+    // ── Helper: spawn daemon and wait for canonical readiness ────────
     fn spawn_and_mount(
         exe: &std::path::Path,
         store_root: &str,
@@ -808,7 +809,6 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
         });
 
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut mountpoint_ready = false;
         let mut daemon_ready = false;
         while Instant::now() < deadline {
             match child.try_wait() {
@@ -817,15 +817,6 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                 }
                 Ok(None) => {}
                 Err(e) => return Err(format!("wait daemon: {e}")),
-            }
-            if !mountpoint_ready {
-                let check = Command::new("mountpoint")
-                    .arg("-q")
-                    .arg(mountpoint)
-                    .status();
-                if check.is_ok_and(|s| s.success()) {
-                    mountpoint_ready = true;
-                }
             }
             if !daemon_ready {
                 match ready_rx.try_recv() {
@@ -838,12 +829,12 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                     }
                 }
             }
-            if mountpoint_ready && daemon_ready {
+            if daemon_ready {
                 break;
             }
             thread::sleep(Duration::from_millis(100));
         }
-        if !mountpoint_ready || !daemon_ready {
+        if !daemon_ready {
             let _ = child.kill();
             for _ in 0..50 {
                 match child.try_wait() {
@@ -851,9 +842,9 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                     Ok(None) => thread::sleep(Duration::from_millis(100)),
                 }
             }
-            return Err(format!(
-                "mountpoint did not become ready within 60s (mountpoint_ready={mountpoint_ready}, daemon_ready={daemon_ready})"
-            ));
+            return Err(
+                "daemon did not report canonical mounted-ready state within 60s".to_string(),
+            );
         }
         // Post-mount liveness check.
         match child.try_wait() {
