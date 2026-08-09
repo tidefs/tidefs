@@ -45,8 +45,9 @@ The selected first architecture is one foreground owner process reached through
    transaction publication, committed-root selection, replay, and reopen.
 5. The dataset-scoped inode authority selected by
    `docs/INODE_NAMESPACE_AUTHORITY.md` owns durable dataset, root inode, inode,
-   and directory identity. Namespace and inode-table crates may remain only as
-   consumers or projections of that authority.
+   and directory identity. The selected mounted carrier does not attach a
+   `Namespace` or an inode-table durability projection; those crates may remain
+   only for distinct consumers or derived reference projections.
 6. `VfsLocalFileSystem` is the mounted semantic authority. It translates VFS
    operations into the durable filesystem owner without another namespace or
    recovery decision.
@@ -77,8 +78,8 @@ Pool-backed filesystem root before accepting mounted work.
 | Transitional mount CLI | `apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs::mount_vfs` | Parses the retained validation CLI and translates every consumed option into `MountConfig`, then calls `run_mount`. It does not open storage, select or validate roots, replay transactions, load a placeholder namespace, construct VFS/FUSE, or own shutdown. | Keep only until current validation consumers migrate to `tidefsctl` or focused direct tests, then delete the command wrapper. |
 | Object authority | `crates/tidefs-local-object-store/src/pool/mod.rs` | Opens the same labeled devices as a `Pool`, owns placement/device I/O, and persists object records and pool labels. | Keep as the only object/device I/O authority. |
 | Filesystem root/recovery | `crates/tidefs-local-filesystem/src/{lib,recovery}.rs` | Selects Pool-backed root-slot records, validates content through Pool receipts, replays intent and commit-group state, and constructs live filesystem state. | Keep and focus as the single mounted transaction/root/recovery authority. |
-| Dataset/inode/namespace | `FileSystemState`, `DatasetInodeAuthority`, `tidefs-namespace`, `tidefs-inode-table`, FUSE maps | Durable maps and allocator state exist in local-filesystem while namespace, inode-table, and FUSE maintain additional allocators, mirrors, and fallbacks. | Durable decisions stay in the dataset authority; all others become projections or are removed from the carrier. |
-| VFS/FUSE | `vfs_engine_impl.rs`, `fuse_vfs_adapter.rs` | VFS calls local-filesystem, while the adapter also contains namespace-first fallbacks, inode/cache mirrors, and operation policy. | VFS owns semantics; FUSE owns only transport, handles, replies, and derived cache state. |
+| Dataset/inode/namespace | `FileSystemState`, `DatasetInodeAuthority`, `tidefs-namespace`, `tidefs-inode-table`, FUSE maps | Local-filesystem owns durable dataset, root, inode, and directory state. `VfsLocalFileSystem` has no inode-table projection, and the selected adapter has no `Namespace` attachment or fallback. The older adapter inode table remains only in the distinct lookup/forget reference projection. | Keep every durable decision in the dataset authority; keep non-carrier namespace users and kernel-reference projections outside mounted truth. |
+| VFS/FUSE | `vfs_engine_impl.rs`, `fuse_vfs_adapter.rs` | VFS calls local-filesystem for lookup and mutation semantics. The adapter projects engine results, handles, lookup references, caches, replies, and FUSE lifecycle without another namespace owner, merged directory view, or mutation fallback. | Keep VFS as the semantic owner and FUSE as a derived kernel transport projection. |
 | Status/admin | `live_owner.rs`, `apps/tidefsctl/src/commands/live_owner.rs` | The owner socket delegates live work to the mounted engine and refuses reopening active devices behind it. | Keep and thin; status must describe the same engine and root selected for mounted I/O. |
 | Shutdown/export | `run_mount`, `fuser::BackgroundSession::join`, adapter `destroy`, `pool_export`, live-owner `stop` | `join` drops the mount first; adapter destroy drains/syncs; labels export afterward; endpoint cleanup is last. | Preserve this order and make every failure explicit to the operator. |
 
@@ -97,9 +98,9 @@ ones in the default graph:
   `tidefs-local-filesystem` itself. Gating only CLI commands or the daemon
   binary cannot contract the carrier; the core package must separate its local
   filesystem path from replication, send/receive, and policy subsystems.
-- `fuse_vfs_adapter.rs` is 46,314 lines, `local-filesystem/src/lib.rs` is
-  17,534, `vfs_engine_impl.rs` is 16,488, and the binary daemon `main.rs` is
-  about 3,900 lines. The remaining size is concentrated in three
+- `fuse_vfs_adapter.rs` is 43,876 lines, `local-filesystem/src/lib.rs` is
+  17,692, `vfs_engine_impl.rs` is 16,391, and the binary daemon `main.rs` is
+  3,900 lines. The remaining size is concentrated in three
   mixed-authority carriers plus validation and smoke command source.
 - Mounted pool admission no longer selects fixed roots or replays filesystem
   transactions; Pool-backed local-filesystem recovery owns mounted state.
@@ -107,7 +108,7 @@ ones in the default graph:
   `tidefsctl`; it no longer constructs a second recovery, namespace, FUSE, or
   shutdown stack.
 - The adapter's direct normal dependencies include cluster, block, validation,
-  workload, performance-contract, schema, namespace, and inode-table families.
+  workload, performance-contract, schema, and inode-table families.
   `tidefsctl` directly depends on block, cluster, transport, validation, and
   storage-policy families.
 
