@@ -37,6 +37,7 @@ on:
           - two-node-carrier-validation
           - fuse-vm-test
           - fuse-inode-metadata-validation
+          - pool-remount-lifecycle-validation
           - qemu-ublk-smoke
           - qemu-ublk-qid-tag-runtime
           - storage-intent-ack-fault-matrix
@@ -65,7 +66,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        id: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.target == 'all' && '["kmod-xfstests-smoke","kernel-fsync-validation","kernel-mmap-validation","kernel-teardown-validation","kernel-no-daemon-teardown-validation","two-node-carrier-validation","fuse-vm-test","fuse-inode-metadata-validation","qemu-ublk-smoke","qemu-ublk-qid-tag-runtime","storage-intent-ack-fault-matrix","receipt-bound-reclaim-runtime","scrub-foreground-read-runtime"]' || format('["{0}"]', github.event_name == 'workflow_dispatch' && inputs.target || 'kmod-xfstests-smoke')) }}
+        id: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.target == 'all' && '["kmod-xfstests-smoke","kernel-fsync-validation","kernel-mmap-validation","kernel-teardown-validation","kernel-no-daemon-teardown-validation","two-node-carrier-validation","fuse-vm-test","fuse-inode-metadata-validation","pool-remount-lifecycle-validation","qemu-ublk-smoke","qemu-ublk-qid-tag-runtime","storage-intent-ack-fault-matrix","receipt-bound-reclaim-runtime","scrub-foreground-read-runtime"]' || format('["{0}"]', github.event_name == 'workflow_dispatch' && inputs.target || 'kmod-xfstests-smoke')) }}
 
     steps:
       - name: Checkout
@@ -102,6 +103,9 @@ jobs:
               ;;
             fuse-inode-metadata-validation)
               command='TIDEFS_SOURCE_COMMIT="$(git rev-parse HEAD)" TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=0000000000000000000000000000000000000000000000000000000000000001 nix run .#fuse-inode-metadata-validation -- --timeout 900 --validation-dir /tmp/tidefs-validation/fuse-inode-metadata-validation --keep-tmp'
+              ;;
+            pool-remount-lifecycle-validation)
+              command='TIDEFS_VALIDATION_RUNS_DIR=/tmp/tidefs-validation/pool-remount-lifecycle-validation nix run .#pool-remount-lifecycle-validation -- --timeout 600'
               ;;
             qemu-ublk-smoke)
               command='nix run .#qemu-ublk-smoke -- --timeout 3600'
