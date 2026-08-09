@@ -778,8 +778,13 @@ CRASH_UNCOMMITTED_HOLDER=""
 
 if [ "$CRASH_CYCLE_MOUNTED" -eq 1 ]; then
     echo "$CRASH_COMMITTED_CONTENT" > "$CRASH_COMMITTED_FILE" 2>/dev/null
-    sync "$CRASH_COMMITTED_FILE" 2>/dev/null || sync
-    [ -f "$CRASH_COMMITTED_FILE" ] && pass "crash_cycle_write_committed" || fail "crash_cycle_write_committed" "write failed"
+    if [ ! -f "$CRASH_COMMITTED_FILE" ]; then
+        fail "crash_cycle_write_committed" "write failed"
+    elif sync "$CRASH_COMMITTED_FILE" 2>/tmp/crash_fsync.err; then
+        pass "crash_cycle_write_committed"
+    else
+        fail "crash_cycle_write_committed" "per-file fsync failed: $(cat /tmp/crash_fsync.err 2>/dev/null)"
+    fi
     echo "  committed file stat before crash:"
     stat "$CRASH_COMMITTED_FILE" 2>/dev/null || true
     CRASH_PRE_COMMITTED=$(cat "$CRASH_COMMITTED_FILE" 2>/dev/null || true)
