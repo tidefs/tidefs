@@ -164,7 +164,9 @@ impl PoolRedundancyPolicy {
         }
     }
 
-    fn from_label_policy(policy: pool_label::PoolRedundancyPolicy) -> Self {
+    /// Reconstruct the allocation policy persisted in a pool label.
+    #[must_use]
+    pub const fn from_label_policy(policy: pool_label::PoolRedundancyPolicy) -> Self {
         match policy {
             pool_label::PoolRedundancyPolicy::Replicated { copies } => Self::Replicated { copies },
             pool_label::PoolRedundancyPolicy::Erasure {

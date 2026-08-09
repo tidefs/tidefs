@@ -28,7 +28,7 @@ use std::process;
 use clap::Parser;
 use tidefs_dataset_properties;
 use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy};
-use tidefs_local_object_store::StoreOptions;
+use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
 #[derive(Parser, Debug)]
@@ -1731,6 +1731,8 @@ fn open_pool_property_filesystem_with_live_args(
     match LocalFileSystem::open_with_block_devices_and_recovery_policy(
         &metadata_dir,
         devs,
+        pool,
+        PoolRedundancyPolicy::from_label_policy(config.redundancy_policy),
         StoreOptions::default(),
         root_auth_key,
         recovery_policy,

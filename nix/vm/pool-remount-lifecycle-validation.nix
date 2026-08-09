@@ -139,7 +139,7 @@ USAGE
     for applet in sh ls cat echo mount umount grep insmod rmmod dmesg sleep poweroff \
                     reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync \
                     expr head tail cut kill ps test seq blockdev mountpoint du \
-                    uname date hexdump sed timeout; do
+                    uname date hexdump sed sha256sum timeout; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
@@ -206,6 +206,11 @@ if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
              startup_retry_mount pool_import mount \
              write_data fsync_data read_verify unmount pool_export reimport remount \
              persist_verify committed_root_advance intent_log_consistency \
+             readonly_prep_release readonly_mount readonly_kernel_ro readonly_read \
+             readonly_create_erofs readonly_write_erofs readonly_truncate_erofs \
+             readonly_unlink_erofs readonly_rename_erofs readonly_mkdir_erofs \
+             readonly_setattr_erofs readonly_content_unchanged \
+             readonly_release readonly_bytes_preserved \
              crash_cycle_export_prep crash_cycle_preimport crash_cycle_premount \
              crash_cycle_write_committed crash_cycle_write_uncommitted \
              crash_cycle_committed_pre_crash_read crash_cycle_sigkill \
@@ -521,16 +526,148 @@ else
     blocked "intent_log_consistency" "remount failed"
 fi
 
-# Cleanup remount daemon
-if [ -n "$RPID" ]; then
+# Cleanly release the writable remount before taking the read-only byte baseline.
+READONLY_PREP_OK=0
+if [ "$REMOUNTED" -eq 1 ] && [ -n "$RPID" ]; then
     kill "$RPID" 2>/dev/null || true
-    sleep 1
+    for _ in $(seq 1 10); do
+        ! kill -0 "$RPID" 2>/dev/null && break
+        sleep 1
+    done
+    if kill -0 "$RPID" 2>/dev/null; then
+        kill -KILL "$RPID" 2>/dev/null || true
+        wait "$RPID" 2>/dev/null || true
+        fail "readonly_prep_release" "writable remount did not release cleanly"
+    else
+        wait "$RPID" 2>/dev/null || true
+        pass "readonly_prep_release"
+        READONLY_PREP_OK=1
+    fi
     umount "$MNT" 2>/dev/null || true
+else
+    blocked "readonly_prep_release" "writable remount was not active"
+fi
+
+echo ""
+echo "--- Phase 14: End-to-end read-only mount ---"
+
+READONLY_MOUNTED=0
+READONLY_PID=""
+READONLY_HASH_BEFORE=""
+READONLY_HASH_AFTER=""
+
+expect_readonly_failure() {
+    OP="$1"
+    shift
+    if "$@" > "/tmp/$OP.out" 2> "/tmp/$OP.err"; then
+        fail "$OP" "mutation unexpectedly succeeded"
+    elif grep -qi 'read-only file system' "/tmp/$OP.err" 2>/dev/null; then
+        pass "$OP"
+    else
+        fail "$OP" "expected EROFS: $(cat "/tmp/$OP.err" 2>/dev/null)"
+    fi
+}
+
+if [ "$READONLY_PREP_OK" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
+    READONLY_HASH_BEFORE=$(sha256sum "$DEV0" "$DEV1" 2>/dev/null || true)
+    tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV0" "$DEV1" --read-only \
+        > /tmp/readonly_mount.log 2>&1 &
+    READONLY_PID=$!
+    for _ in $(seq 1 45); do
+        mountpoint -q "$MNT" 2>/dev/null && { READONLY_MOUNTED=1; break; }
+        ! kill -0 "$READONLY_PID" 2>/dev/null && break
+        sleep 1
+    done
+    if [ "$READONLY_MOUNTED" -eq 1 ]; then
+        pass "readonly_mount"
+        if grep -q "[[:space:]]$MNT[[:space:]]ro" /proc/self/mountinfo 2>/dev/null; then
+            pass "readonly_kernel_ro"
+        else
+            fail "readonly_kernel_ro" "mountinfo does not report a read-only mount"
+        fi
+
+        READONLY_CONTENT=$(cat "$TF" 2>/dev/null || true)
+        if [ "$READONLY_CONTENT" = "$TC" ]; then
+            pass "readonly_read"
+        else
+            fail "readonly_read" "expected '$TC' got '$READONLY_CONTENT'"
+        fi
+
+        expect_readonly_failure readonly_create_erofs \
+            sh -c 'printf "x\n" > "$1"' sh "$MNT/readonly-create"
+        expect_readonly_failure readonly_write_erofs \
+            sh -c 'printf "x\n" >> "$1"' sh "$TF"
+        expect_readonly_failure readonly_truncate_erofs \
+            sh -c ': > "$1"' sh "$TF"
+        expect_readonly_failure readonly_unlink_erofs rm "$TF"
+        expect_readonly_failure readonly_rename_erofs mv "$TF" "$MNT/readonly-renamed"
+        expect_readonly_failure readonly_mkdir_erofs mkdir "$MNT/readonly-dir"
+        expect_readonly_failure readonly_setattr_erofs touch "$TF"
+
+        READONLY_CONTENT_AFTER=$(cat "$TF" 2>/dev/null || true)
+        if [ "$READONLY_CONTENT_AFTER" = "$TC" ]; then
+            pass "readonly_content_unchanged"
+        else
+            fail "readonly_content_unchanged" "expected '$TC' got '$READONLY_CONTENT_AFTER'"
+        fi
+    else
+        fail "readonly_mount" "$(tail -40 /tmp/readonly_mount.log 2>/dev/null)"
+        for op in readonly_kernel_ro readonly_read readonly_create_erofs \
+                  readonly_write_erofs readonly_truncate_erofs readonly_unlink_erofs \
+                  readonly_rename_erofs readonly_mkdir_erofs readonly_setattr_erofs \
+                  readonly_content_unchanged; do
+            blocked "$op" "read-only mount failed"
+        done
+    fi
+else
+    blocked "readonly_mount" "writable release or FUSE not ready"
+    for op in readonly_kernel_ro readonly_read readonly_create_erofs \
+              readonly_write_erofs readonly_truncate_erofs readonly_unlink_erofs \
+              readonly_rename_erofs readonly_mkdir_erofs readonly_setattr_erofs \
+              readonly_content_unchanged; do
+        blocked "$op" "read-only mount not runnable"
+    done
+fi
+
+if [ -n "$READONLY_PID" ]; then
+    kill "$READONLY_PID" 2>/dev/null || true
+    for _ in $(seq 1 10); do
+        ! kill -0 "$READONLY_PID" 2>/dev/null && break
+        sleep 1
+    done
+    if kill -0 "$READONLY_PID" 2>/dev/null; then
+        kill -KILL "$READONLY_PID" 2>/dev/null || true
+        wait "$READONLY_PID" 2>/dev/null || true
+        fail "readonly_release" "read-only mount did not release cleanly"
+    else
+        wait "$READONLY_PID" 2>/dev/null || true
+        umount "$MNT" 2>/dev/null || true
+        if mountpoint -q "$MNT" 2>/dev/null; then
+            fail "readonly_release" "read-only mount remains attached"
+        elif find /run/tidefs/import -type f 2>/dev/null | grep -q .; then
+            fail "readonly_release" "read-only import lock remains"
+        else
+            pass "readonly_release"
+        fi
+    fi
+else
+    blocked "readonly_release" "read-only daemon was not started"
+fi
+
+if [ -n "$READONLY_HASH_BEFORE" ]; then
+    READONLY_HASH_AFTER=$(sha256sum "$DEV0" "$DEV1" 2>/dev/null || true)
+    if [ "$READONLY_HASH_AFTER" = "$READONLY_HASH_BEFORE" ]; then
+        pass "readonly_bytes_preserved"
+    else
+        fail "readonly_bytes_preserved" "complete device hashes changed"
+    fi
+else
+    blocked "readonly_bytes_preserved" "read-only byte baseline unavailable"
 fi
 
 
 echo ""
-echo "--- Phase 14: Suspect log persistence validation ---"
+echo "--- Phase 15: Suspect log persistence validation ---"
 
 # The suspect log is persisted to $store_dir/segments/suspect_log in VSUS format
 # with BLAKE3-256 integrity. Scrub findings are durably written on every tick
@@ -554,7 +691,7 @@ else
 fi
 
 echo ""
-echo "--- Phase 15: Crash-cycle (SIGKILL without export) ---"
+echo "--- Phase 16: Crash-cycle (SIGKILL without export) ---"
 
 # This phase exercises the storage durability/recovery spine:
 # - Write fsynced data (committed through txg commit boundary)
@@ -761,7 +898,7 @@ echo "=== Validation Summary ==="
 echo "validation_tier=qemu guest"
 echo "kernel=$(uname -r 2>/dev/null || echo unknown)"
 echo "backend=virtio_blk_raw_disks"
-echo "mode=pool_remount_lifecycle_userspace_fuse_with_crash_cycle"
+echo "mode=pool_remount_lifecycle_userspace_fuse_with_read_only_and_crash_cycle"
 echo "pool_name=$POOL_NAME"
 echo "pool_uuid=$POOL_UUID"
 echo "dev0=$DEV0 dev0_size=$D0SIZE"
@@ -812,6 +949,11 @@ INITSCRIPT
       pool_import mount write_data fsync_data read_verify \
       unmount pool_export reimport remount persist_verify \
       committed_root_advance intent_log_consistency \
+      readonly_prep_release readonly_mount readonly_kernel_ro readonly_read \
+      readonly_create_erofs readonly_write_erofs readonly_truncate_erofs \
+      readonly_unlink_erofs readonly_rename_erofs readonly_mkdir_erofs \
+      readonly_setattr_erofs readonly_content_unchanged \
+      readonly_release readonly_bytes_preserved \
       suspect_log_persistence \
       crash_cycle_export_prep crash_cycle_preimport crash_cycle_premount \
       crash_cycle_write_committed crash_cycle_write_uncommitted \

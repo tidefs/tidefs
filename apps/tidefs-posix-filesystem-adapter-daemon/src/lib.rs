@@ -250,12 +250,17 @@ pub struct MountConfig {
     /// When present with [`pool_uuid`], the daemon publishes a live-owner
     /// endpoint so `tidefsctl <pool>` commands can talk to this runtime.
     pub pool_name: Option<String>,
+    /// Pool-wide allocation policy reconstructed from the imported labels.
+    pub pool_redundancy_policy: tidefs_local_object_store::PoolRedundancyPolicy,
     /// Pool UUID for a pool-aware mounted owner.
     pub pool_uuid: Option<[u8; 16]>,
     /// Run in foreground (default true for CLI workflows).
     pub foreground: bool,
     /// Enable debug logging to stderr.
     pub debug: bool,
+    /// Mount the live filesystem through read-only storage, recovery, VFS,
+    /// adapter, and kernel FUSE authorities.
+    pub read_only: bool,
     /// Enable FUSE writeback cache for mmap support.
     /// When true, FUSE_WRITE_CACHE flagged writes are accepted and
     /// the kernel page cache is used for buffered writes, enabling
@@ -297,6 +302,79 @@ pub struct MountConfig {
     /// Authority used to admit the mount as standalone/local or
     /// cluster-lease-authorized.
     pub mount_authority: MountAuthority,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EffectiveMountMode {
+    read_only: bool,
+    writeback_cache: bool,
+}
+
+fn effective_mount_mode(config: &MountConfig) -> EffectiveMountMode {
+    let read_only = config.read_only || config.snapshot_name.is_some();
+    EffectiveMountMode {
+        read_only,
+        writeback_cache: config.writeback_cache && !read_only,
+    }
+}
+
+#[cfg(test)]
+mod effective_mount_mode_tests {
+    use super::*;
+
+    fn config(read_only: bool, snapshot_name: Option<&str>, writeback_cache: bool) -> MountConfig {
+        MountConfig {
+            encryption: None,
+            backing_dir: PathBuf::from("/existing/store"),
+            mountpoint: PathBuf::from("/mountpoint"),
+            pool_name: Some("named-pool".into()),
+            pool_redundancy_policy: tidefs_local_object_store::PoolRedundancyPolicy::default(),
+            pool_uuid: Some([0x42; 16]),
+            foreground: true,
+            debug: false,
+            read_only,
+            writeback_cache,
+            coherency_profile: crate::coherency_profile::CoherencyProfile::Writeback,
+            block_devices: None,
+            import_owner: None,
+            dataset_path: Some("root".into()),
+            snapshot_name: snapshot_name.map(str::to_string),
+            mount_authority: MountAuthority::standalone(),
+        }
+    }
+
+    #[test]
+    fn ordinary_read_only_mount_suppresses_writeback() {
+        assert_eq!(
+            effective_mount_mode(&config(true, None, true)),
+            EffectiveMountMode {
+                read_only: true,
+                writeback_cache: false,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_export_forces_read_only_mode() {
+        assert_eq!(
+            effective_mount_mode(&config(false, Some("snap0"), true)),
+            EffectiveMountMode {
+                read_only: true,
+                writeback_cache: false,
+            }
+        );
+    }
+
+    #[test]
+    fn read_write_mount_preserves_explicit_writeback() {
+        assert_eq!(
+            effective_mount_mode(&config(false, None, true)),
+            EffectiveMountMode {
+                read_only: false,
+                writeback_cache: true,
+            }
+        );
+    }
 }
 
 /// Mount authority material accepted by the daemon admission boundary.
@@ -464,6 +542,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     use tidefs_local_filesystem::LocalFileSystem;
 
     let snapshot_export = config.snapshot_name.is_some();
+    let effective_mode = effective_mount_mode(config);
     if snapshot_export && config.mount_authority.is_cluster_authorized() {
         return Err(
             "snapshot export mount is not supported with cluster mount authority".to_string(),
@@ -535,45 +614,40 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         let dataset_id: Option<DatasetId> = None;
         (engine, None, dataset_id)
     } else {
-        let mut lfs = if let Some(ref devices) = config.block_devices {
-            // Block-device-backed pool: use metadata dir + block devices.
+        use tidefs_local_filesystem::{LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy};
+        use tidefs_recovery_loop::RecoveryPolicy;
+
+        if let Some(ref devices) = config.block_devices {
             eprintln!(
                 "tidefsctl: opening block-device-backed pool with {} device(s)",
                 devices.len()
             );
-            if let Some(ref enc) = config.encryption {
-                eprintln!("tidefsctl: encryption enabled (key fingerprint not logged)");
-                LocalFileSystem::open_with_block_devices_and_encryption(
-                    &config.backing_dir,
-                    devices,
-                    StoreOptions::default(),
-                    root_auth_key,
-                    enc.clone(),
-                )
-            } else {
-                LocalFileSystem::open_with_block_devices(
-                    &config.backing_dir,
-                    devices,
-                    StoreOptions::default(),
-                    root_auth_key,
-                )
-            }
-        } else if let Some(ref enc) = config.encryption {
-            eprintln!("tidefsctl: encryption enabled (key fingerprint not logged)");
-            LocalFileSystem::open_with_root_authentication_key_and_encryption(
-                &config.backing_dir,
-                StoreOptions::default(),
-                root_auth_key,
-                enc.clone(),
-            )
-        } else {
-            LocalFileSystem::open_with_root_authentication_key(
-                &config.backing_dir,
-                StoreOptions::default(),
-                root_auth_key,
-            )
         }
-        .map_err(|e| format!("open store: {e}"))?;
+        if config.encryption.is_some() {
+            eprintln!("tidefsctl: encryption enabled (key fingerprint not logged)");
+        }
+        let recovery_policy = if effective_mode.read_only {
+            RecoveryPolicy::ReadOnly
+        } else {
+            RecoveryPolicy::default()
+        };
+        let mut lfs =
+            LocalFileSystem::open_named_pool_with_allocator_policy_and_root_authentication_key(
+                &config.backing_dir,
+                config.pool_name.as_deref().unwrap_or("tidefs"),
+                config.pool_redundancy_policy,
+                LocalFileSystemOpenConfig {
+                    options: StoreOptions::default(),
+                    allocator_policy: LocalStorageAllocatorPolicy::default(),
+                    root_authentication_key: root_auth_key,
+                    encryption: config.encryption.clone(),
+                    compression: None,
+                    log_device_device_path: None,
+                    recovery_policy,
+                    block_devices: config.block_devices.as_deref(),
+                },
+            )
+            .map_err(|e| format!("open store: {e}"))?;
 
         // Resolve dataset path through the canonical catalog.
         let dataset_id: Option<DatasetId> = if let Some(ref ds_path) = config.dataset_path {
@@ -604,26 +678,39 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                 ));
             }
         }
-        if let Some(ds_id) = dataset_id {
-            lfs.set_mounted_dataset_id(*ds_id.as_bytes())
-                .map_err(|e| format!("set mounted dataset identity: {e}"))?;
+        if !effective_mode.read_only {
+            if let Some(ds_id) = dataset_id {
+                lfs.set_mounted_dataset_id(*ds_id.as_bytes())
+                    .map_err(|e| format!("set mounted dataset identity: {e}"))?;
+            }
         }
 
-        lfs.set_write_buffer_flush_threshold_bytes(MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES)
-            .map_err(|e| format!("set mounted write-buffer threshold: {e}"))?;
-        lfs.set_auto_commit(false)
-            .map_err(|e| format!("set mounted auto-commit policy: {e}"))?;
-        lfs.set_commit_group_throughput_profile()
-            .map_err(|e| format!("set mounted commit-group profile: {e}"))?;
-        lfs.set_max_uncommitted_mutations(MOUNT_MAX_UNCOMMITTED_MUTATIONS)
-            .map_err(|e| format!("set mounted mutation threshold: {e}"))?;
+        let tracker = if effective_mode.read_only {
+            None
+        } else {
+            lfs.set_write_buffer_flush_threshold_bytes(MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES)
+                .map_err(|e| format!("set mounted write-buffer threshold: {e}"))?;
+            lfs.set_auto_commit(false)
+                .map_err(|e| format!("set mounted auto-commit policy: {e}"))?;
+            lfs.set_commit_group_throughput_profile()
+                .map_err(|e| format!("set mounted commit-group profile: {e}"))?;
+            lfs.set_max_uncommitted_mutations(MOUNT_MAX_UNCOMMITTED_MUTATIONS)
+                .map_err(|e| format!("set mounted mutation threshold: {e}"))?;
 
-        let tracker = lfs
-            .clone_writeback_range_tracker()
-            .map_err(|e| format!("attach mounted writeback tracker: {e}"))?;
+            Some(
+                lfs.clone_writeback_range_tracker()
+                    .map_err(|e| format!("attach mounted writeback tracker: {e}"))?,
+            )
+        };
 
         // Build the base VfsLocalFileSystem, optionally scoped to a dataset root.
         let mut engine = VfsLocalFileSystem::new(lfs);
+        if effective_mode.read_only {
+            engine
+                .set_timestamp_policy(tidefs_inode_attributes::timestamp::TimestampPolicy::Noatime)
+                .map_err(|e| format!("set read-only timestamp policy: {e}"))?;
+            engine = engine.with_read_only();
+        }
         // When mounting a non-root dataset, scope path resolution to the
         // dataset directory within the pool so the FUSE mount root exposes
         // only that dataset's contents.
@@ -636,7 +723,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                 engine = engine.with_dataset_root(&dataset_fs_path);
             }
         }
-        (engine, Some(tracker), dataset_id)
+        (engine, tracker, dataset_id)
     };
 
     // When cluster-authorized, wrap the engine in a placement-recording layer.
@@ -663,9 +750,9 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         adapter = adapter.with_dataset_id(ds_id);
     }
 
-    if snapshot_export {
+    if effective_mode.read_only {
         adapter = adapter.with_writeback_cache_disabled();
-    } else if config.writeback_cache {
+    } else if effective_mode.writeback_cache {
         adapter = adapter
             .with_writeback_cache_enabled()
             .with_writeback_range_tracker(
@@ -674,19 +761,27 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     } else {
         adapter = adapter.with_writeback_cache_disabled();
     }
+    if effective_mode.read_only {
+        adapter = adapter.with_read_only();
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     install_signal_handlers(Arc::clone(&shutdown)).map_err(|e| format!("signal handler: {e}"))?;
     let live_owner_engine = adapter.engine_handle();
 
     let mut options = vec![
+        if effective_mode.read_only {
+            fuser::MountOption::RO
+        } else {
+            fuser::MountOption::RW
+        },
         fuser::MountOption::FSName("tidefs".into()),
         fuser::MountOption::NoAtime,
     ];
     if !config.foreground {
         options.push(fuser::MountOption::AllowOther);
     }
-    if !snapshot_export && config.writeback_cache {
+    if effective_mode.writeback_cache {
         options.push(fuser::MountOption::WritebackCache);
     }
 

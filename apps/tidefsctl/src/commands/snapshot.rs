@@ -15,7 +15,7 @@ use tidefs_local_filesystem::{
     LocalStorageAllocatorPolicy, RecoveryPolicy, RootAuthenticationKey, SnapshotDescriptor,
     SnapshotKind, SnapshotRetentionPolicy, SnapshotRetentionReport, SnapshotSummary,
 };
-use tidefs_local_object_store::StoreOptions;
+use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
@@ -943,13 +943,16 @@ fn open_filesystem_with_live_args(
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let pool_name = pool.unwrap_or("<unnamed>");
-        let metadata_dir = import_devices_metadata_dir(devs, pool_name, operation, live_args);
+        let (metadata_dir, pool_redundancy_policy) =
+            import_devices_metadata_dir(devs, pool_name, operation, live_args);
 
         let root_auth_key =
             super::root_authentication_key_or_exit(&format!("snapshot {operation}"));
         return match LocalFileSystem::open_with_block_devices_and_recovery_policy(
             &metadata_dir,
             devs,
+            pool_name,
+            pool_redundancy_policy,
             StoreOptions::default(),
             root_auth_key,
             recovery_policy,
@@ -1011,7 +1014,7 @@ fn import_devices_metadata_dir(
     pool_name: &str,
     operation: &str,
     live_args: LivePoolAdminArgs,
-) -> PathBuf {
+) -> (PathBuf, PoolRedundancyPolicy) {
     let config = scan_device_pool_config(pool_name, devices, operation);
     super::live_owner::route_or_refuse_active_for_uuid_with_args(
         "snapshot",
@@ -1022,7 +1025,10 @@ fn import_devices_metadata_dir(
         live_args,
     );
 
-    super::offline_pool::metadata_dir("snapshot", operation, &config.pool_uuid)
+    (
+        super::offline_pool::metadata_dir("snapshot", operation, &config.pool_uuid),
+        PoolRedundancyPolicy::from_label_policy(config.redundancy_policy),
+    )
 }
 
 fn scan_device_pool_config(
@@ -1971,9 +1977,11 @@ fn handle_export(args: SnapshotExportArgs) {
         backing_dir,
         mountpoint: args.export_path.clone(),
         pool_name: Some(pool_name),
+        pool_redundancy_policy: tidefs_local_object_store::PoolRedundancyPolicy::default(),
         pool_uuid: None,
         foreground: true,
         debug: false,
+        read_only: false,
         writeback_cache: false,
         coherency_profile:
             tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile::Writeback,
