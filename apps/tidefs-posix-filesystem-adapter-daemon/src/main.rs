@@ -771,6 +771,8 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                 "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX",
                 "4141414141414141414141414141414141414141414141414141414141414141",
             )
+            .env("TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS", "1")
+            .env("TIDEFS_FUSE_OP_DIAGNOSTICS", "1")
             .stderr(Stdio::piped());
         if let Some(path) = queue_depth_artifact {
             command.arg("--queue-depth-artifact").arg(path);
