@@ -151,6 +151,7 @@ USAGE
     cat > "$RUN_DIR/init" << 'INITSCRIPT'
 #!/bin/sh
 export PATH=/bin
+export TIDEFS_FUSE_OP_DIAGNOSTICS=1
 
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
