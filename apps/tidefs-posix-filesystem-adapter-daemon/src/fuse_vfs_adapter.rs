@@ -46212,7 +46212,7 @@ mod tests {
 
         assert_eq!(
             adapter.dentry_policy.positive_entry_ttl,
-            Duration::ZERO
+            Duration::from_secs(5)
         );
         assert_eq!(
             adapter.dentry_policy.positive_attr_ttl,
@@ -46251,7 +46251,7 @@ mod tests {
 
         assert_eq!(
             adapter.dentry_policy.positive_entry_ttl,
-            Duration::from_secs(5)
+            Duration::ZERO
         );
         assert_eq!(adapter.dentry_policy.positive_attr_ttl, Duration::ZERO);
         assert_eq!(adapter.dentry_policy.positive_reply_ttl(), Duration::ZERO);
