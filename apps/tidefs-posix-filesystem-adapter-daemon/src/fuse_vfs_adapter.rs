@@ -46249,10 +46249,7 @@ mod tests {
 
         adapter.set_read_only();
 
-        assert_eq!(
-            adapter.dentry_policy.positive_entry_ttl,
-            Duration::ZERO
-        );
+        assert_eq!(adapter.dentry_policy.positive_entry_ttl, Duration::ZERO);
         assert_eq!(adapter.dentry_policy.positive_attr_ttl, Duration::ZERO);
         assert_eq!(adapter.dentry_policy.positive_reply_ttl(), Duration::ZERO);
     }
