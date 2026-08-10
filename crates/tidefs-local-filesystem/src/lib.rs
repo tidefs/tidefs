@@ -7643,10 +7643,6 @@ impl LocalFileSystem {
         self.read_file_by_inode_with_target(inode_id, path)
     }
 
-    pub(crate) fn read_file_by_inode(&self, inode_id: InodeId) -> Result<Vec<u8>> {
-        self.read_file_by_inode_with_target(inode_id, &format!("inode:{}", inode_id.get()))
-    }
-
     fn read_file_by_inode_with_target(&self, inode_id: InodeId, target: &str) -> Result<Vec<u8>> {
         let record = self.inode(inode_id)?;
         if record.kind() != NodeKind::File {

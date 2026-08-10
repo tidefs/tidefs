@@ -2337,6 +2337,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tidefs-block-allocator",
+ "tidefs-local-object-store",
  "tidefs-locator-table",
  "tidefs-membership-epoch",
  "tidefs-pool-scan",

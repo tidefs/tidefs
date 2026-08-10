@@ -609,19 +609,6 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn apply_metadata_setattr(
-        fs: &mut LocalFileSystem,
-        path: &str,
-        attr: &SetAttr,
-        size_changed: bool,
-    ) -> std::result::Result<(), Errno> {
-        if Self::metadata_setattr_is_noop(attr, size_changed) {
-            return Ok(());
-        }
-        let inode_id = fs.lookup(path).map_err(|e| map_errno(&e))?;
-        Self::apply_metadata_setattr_to_inode(fs, inode_id, attr, size_changed)
-    }
-
     fn metadata_setattr_is_noop(attr: &SetAttr, size_changed: bool) -> bool {
         const METADATA_SETATTR_BITS: u32 = FATTR_MODE
             | FATTR_UID
