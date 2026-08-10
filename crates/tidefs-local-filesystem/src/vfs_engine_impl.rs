@@ -13,7 +13,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tidefs_local_object_store::{IntegrityDigest64, StoreError};
+#[cfg(feature = "replication-io")]
+use tidefs_local_object_store::IntegrityDigest64;
+use tidefs_local_object_store::StoreError;
 use tidefs_types_extent_map_core::ExtentMapOps;
 use tidefs_types_vfs_core::{
     DirEntry, DirHandleId, EngineDirHandle, EngineFileHandle, Errno, Generation, InodeAttr,
@@ -39,7 +41,9 @@ use crate::fuse_statfs;
 use crate::helpers::{kind_bits, validate_name};
 use crate::open_dispatch::{self, FileHandleState, FileHandleTable};
 use crate::release_dispatch;
-use crate::types::{CommittedRootSummary, InodeRecord, IntentLogReplyState, NamespaceEntry};
+#[cfg(feature = "replication-io")]
+use crate::types::CommittedRootSummary;
+use crate::types::{InodeRecord, IntentLogReplyState, NamespaceEntry};
 use crate::xattr_dispatch;
 use crate::ContentLayout;
 use tidefs_inode_attributes::timestamp::{TimestampPolicy, TimestampUpdate};
@@ -4481,6 +4485,7 @@ impl VfsLocalFileSystem {
         let (planned_entries, allocation_bytes, materialized_bytes) = fs
             .reflink_clone_content_plan(source_fh.inode_id, &source_record, &dest_record)
             .map_err(|e| map_errno(&e))?;
+        #[cfg(feature = "policy-observation")]
         let new_blocks = allocation_bytes / u64::from(crate::constants::content_chunk_size());
         #[cfg(feature = "policy-observation")]
         fs.ensure_obligation_capacity("staging_dirty", new_blocks, Some(dest_fh.inode_id))

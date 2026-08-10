@@ -197,6 +197,7 @@ pub(crate) fn ensure_versioned_content_object(
         inode,
         &content,
         &mut DedupIndex::new(),
+        #[cfg(feature = "quorum-write")]
         None,
         compression_policy,
     )

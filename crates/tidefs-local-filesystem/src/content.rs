@@ -1182,11 +1182,11 @@ fn validate_dedup_canonical_payload(
 
 fn encode_chunk_with_dedup<S: ContentWriteStore>(
     dedup_enabled: bool,
-    store: &mut S,
+    _store: &mut S,
     record: &InodeRecord,
     chunk_index: u64,
     chunk_bytes: &[u8],
-    dedup_index: &mut DedupIndex,
+    _dedup_index: &mut DedupIndex,
     #[cfg(feature = "quorum-write")] quorum_store: &mut Option<
         &mut tidefs_quorum_write_runtime::QuorumObjectStore,
     >,
@@ -1211,8 +1211,8 @@ fn encode_chunk_with_dedup<S: ContentWriteStore>(
         let decision = decide_inline_dedup(
             &hash,
             canonical_key,
-            |candidate| dedup_index.lookup_hash(candidate),
-            |candidate| match store.get(candidate) {
+            |candidate| _dedup_index.lookup_hash(candidate),
+            |candidate| match _store.get(candidate) {
                 Ok(Some(bytes)) => {
                     match validate_dedup_canonical_payload(candidate, &bytes, fingerprint) {
                         Ok(_) => true,
@@ -1235,32 +1235,32 @@ fn encode_chunk_with_dedup<S: ContentWriteStore>(
 
         match decision {
             InlineDedupDecision::SessionHit { canonical } => {
-                dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
+                _dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
                 let _ = crate::dedup_refcount::DedupRefCount::increment(
-                    store.raw_store_mut(),
+                    _store.raw_store_mut(),
                     &fingerprint,
                 );
                 Ok(crate::encoding::encode_dedup_redirect(canonical))
             }
             InlineDedupDecision::CanonicalStoreHit { canonical } => {
-                dedup_index.insert(fingerprint, canonical);
-                dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
+                _dedup_index.insert(fingerprint, canonical);
+                _dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
                 let _ = crate::dedup_refcount::DedupRefCount::increment(
-                    store.raw_store_mut(),
+                    _store.raw_store_mut(),
                     &fingerprint,
                 );
                 Ok(crate::encoding::encode_dedup_redirect(canonical))
             }
             InlineDedupDecision::StaleSessionEntry { .. } => {
-                dedup_index.remove(&fingerprint);
+                _dedup_index.remove(&fingerprint);
                 encode_new_canonical_chunk(
-                    store,
+                    _store,
                     record,
                     chunk_index,
                     chunk_bytes,
                     fingerprint,
                     canonical_key,
-                    dedup_index,
+                    _dedup_index,
                     #[cfg(feature = "quorum-write")]
                     quorum_store,
                     compression_policy,
@@ -1269,13 +1269,13 @@ fn encode_chunk_with_dedup<S: ContentWriteStore>(
                 )
             }
             InlineDedupDecision::Miss { canonical } => encode_new_canonical_chunk(
-                store,
+                _store,
                 record,
                 chunk_index,
                 chunk_bytes,
                 fingerprint,
                 canonical,
-                dedup_index,
+                _dedup_index,
                 #[cfg(feature = "quorum-write")]
                 quorum_store,
                 compression_policy,

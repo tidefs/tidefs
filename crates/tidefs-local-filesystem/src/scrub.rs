@@ -450,7 +450,7 @@ fn nonzero_receipt_generation(generation: u64) -> Option<u64> {
 fn placement_evidence_for_content_key(
     pool: Option<&Pool>,
     key: Option<ObjectKey>,
-    subject_id: u64,
+    _subject_id: u64,
     expected_generation: Option<u64>,
 ) -> MountedContentPlacementEvidence {
     let Some(key) = key else {
@@ -471,7 +471,7 @@ fn placement_evidence_for_content_key(
         Ok(Some(receipt)) => match expected_generation {
             Some(expected_generation) if receipt.generation == expected_generation => {
                 #[cfg(feature = "distributed-repair")]
-                match receipt.shared_receipt_ref_for_subject(subject_id) {
+                match receipt.shared_receipt_ref_for_subject(_subject_id) {
                     Ok(placement_receipt_ref) => MountedContentPlacementEvidence::ReceiptVerified {
                         generation: expected_generation,
                         placement_receipt_ref,

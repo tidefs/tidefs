@@ -7112,6 +7112,7 @@ impl LocalFileSystem {
 
         let (planned_entries, allocation_bytes, materialized_bytes) =
             self.reflink_clone_content_plan(source_inode_id, &source_record, &dest_record)?;
+        #[cfg(feature = "policy-observation")]
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
         #[cfg(feature = "policy-observation")]
         self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(planned_inode_id))?;
@@ -7682,12 +7683,15 @@ impl LocalFileSystem {
             &content_patches,
             allow_holes,
         )?;
+        #[cfg(feature = "policy-observation")]
         let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode_pool(
             &self.store,
             &old_record,
         )?)?;
+        #[cfg(feature = "policy-observation")]
         let allocation_bytes = allocation_bytes(&planned_entries)?;
         let dirty_allocation_bytes = dirty_patch_batch_allocation_bytes(new_size, patches)?;
+        #[cfg(feature = "policy-observation")]
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
         let patch_ranges = self.coalesced_patch_ranges(patches)?;
         let replaced_data_bytes =
@@ -8154,10 +8158,10 @@ impl LocalFileSystem {
 
     fn account_new_file_content(
         &mut self,
-        inode_id: InodeId,
+        _inode_id: InodeId,
         content_bytes: u64,
-        allocation_bytes: u64,
-        tick: u64,
+        _allocation_bytes: u64,
+        _tick: u64,
     ) -> Result<()> {
         if content_bytes > 0 {
             let handle = self.reserve_with_hierarchy(content_bytes)?;
@@ -8170,9 +8174,11 @@ impl LocalFileSystem {
                 .track_physical_write(content_bytes);
         }
 
-        let new_blocks = allocation_bytes / content_chunk_size() as u64;
         #[cfg(feature = "policy-observation")]
-        self.record_policy_allocation_claim(inode_id, new_blocks, tick);
+        {
+            let new_blocks = _allocation_bytes / content_chunk_size() as u64;
+            self.record_policy_allocation_claim(_inode_id, new_blocks, _tick);
+        }
 
         Ok(())
     }
@@ -11075,9 +11081,10 @@ impl LocalFileSystem {
         dest_record.data_version = planned_tick;
         dest_record.metadata_version = planned_tick;
 
-        let (planned_entries, allocation_bytes, _materialized_bytes) =
+        let (planned_entries, _allocation_bytes, _materialized_bytes) =
             self.reflink_clone_content_plan(source_inode_id, &source_record, &dest_record)?;
-        let new_blocks = allocation_bytes / content_chunk_size() as u64;
+        #[cfg(feature = "policy-observation")]
+        let new_blocks = _allocation_bytes / content_chunk_size() as u64;
         #[cfg(feature = "policy-observation")]
         self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(dest_inode_id))?;
         self.ensure_content_capacity_with_planned_inode(
@@ -11135,11 +11142,14 @@ impl LocalFileSystem {
         planned_record.data_version = planned_tick;
         planned_record.metadata_version = planned_tick;
         let planned_entries = planned_chunk_allocation_entries_for_full_content(&planned_record)?;
+        #[cfg(feature = "policy-observation")]
         let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode_pool(
             &self.store,
             &record,
         )?)?;
+        #[cfg(feature = "policy-observation")]
         let allocation_bytes = allocation_bytes(&planned_entries)?;
+        #[cfg(feature = "policy-observation")]
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
         #[cfg(feature = "policy-observation")]
         if allocation_bytes > old_allocation_bytes {
@@ -11229,14 +11239,17 @@ impl LocalFileSystem {
             overlay_bytes,
             allow_holes,
         )?;
+        #[cfg(feature = "policy-observation")]
         let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode_pool(
             &self.store,
             &old_record,
         )?)?;
         // Pre-check obligation ledger before allocator (Design rule Rule 3: authority is scarce)
+        #[cfg(feature = "policy-observation")]
         let allocation_bytes = allocation_bytes(&planned_entries)?;
         let dirty_allocation_bytes =
             dirty_overlay_allocation_bytes(new_size, overlay_offset, overlay_bytes)?;
+        #[cfg(feature = "policy-observation")]
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
         let replaced_data_bytes = if overlay_bytes.is_empty() {
             0
@@ -13013,7 +13026,9 @@ impl LocalFileSystem {
             self.capacity_authority
                 .restore_from_snapshot(&delta.old_capacity_authority);
             #[cfg(feature = "policy-observation")]
-            self.obligation_ledger = delta.old_obligation_ledger;
+            {
+                self.obligation_ledger = delta.old_obligation_ledger;
+            }
             self.extent_allocator = delta.old_extent_allocator;
             // Restore dirty-page tracker ranges.
             if let Ok(mut tracker) = self.writeback_range_tracker.lock() {

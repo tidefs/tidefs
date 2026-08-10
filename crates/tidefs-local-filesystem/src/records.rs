@@ -7,6 +7,7 @@ use tidefs_local_object_store::{IntegrityDigest64, ObjectKey};
 use tidefs_types_vfs_core::InodeId;
 
 use crate::types::*;
+#[cfg(feature = "replication-io")]
 use crate::FileSystemState;
 /// Distinguishes the purpose of a snapshot catalog entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

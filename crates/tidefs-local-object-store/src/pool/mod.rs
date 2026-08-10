@@ -192,6 +192,30 @@ impl PoolRedundancyPolicy {
         }
     }
 
+    /// Number of physical placement targets required by this local policy.
+    #[must_use]
+    pub const fn target_width(self) -> u16 {
+        match self {
+            Self::Replicated { copies } => copies as u16,
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => data_shards as u16 + parity_shards as u16,
+        }
+    }
+
+    /// Whether this policy can describe a usable local placement.
+    #[must_use]
+    pub const fn is_well_formed(self) -> bool {
+        match self {
+            Self::Replicated { copies } => copies > 0,
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => data_shards > 0 && parity_shards > 0,
+        }
+    }
+
     /// Project this local pool policy into the shared distributed receipt
     /// policy identity.
     #[must_use]

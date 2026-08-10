@@ -1161,16 +1161,15 @@ pub fn classify_read_receipt(
         };
     }
 
-    // Check policy well-formedness via projection to the shared receipt model.
-    let rp = receipt.policy.to_receipt_redundancy_policy();
-    if !rp.is_well_formed() {
+    // Check the local receipt's recorded placement policy directly.
+    if !receipt.policy.is_well_formed() {
         return ReadReceiptEvidence::MalformedPolicy {
             generation: receipt.generation,
         };
     }
 
     // Check target width.
-    let required_width = rp.target_width();
+    let required_width = receipt.policy.target_width();
     let target_count = u16::try_from(receipt.targets.len()).unwrap_or(u16::MAX);
     if target_count < required_width {
         return ReadReceiptEvidence::UnderWidth {

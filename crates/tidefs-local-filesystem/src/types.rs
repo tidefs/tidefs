@@ -1403,6 +1403,12 @@ impl SnapshotRollbackReport {
     }
 }
 
+/// Decode error for object-role `TryFrom<u16>` — preserves the rejected raw tag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalFilesystemDecodeError {
+    UnknownObjectRole(u16),
+}
+
 #[cfg(feature = "replication-io")]
 mod replication_types {
     use super::*;
@@ -1474,12 +1480,6 @@ mod replication_types {
                 }
             }
         }
-    }
-
-    /// Decode error for object-role `TryFrom<u16>` — preserves the rejected raw tag.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum LocalFilesystemDecodeError {
-        UnknownObjectRole(u16),
     }
 
     impl TryFrom<u16> for ChangedRecordObjectRole {
