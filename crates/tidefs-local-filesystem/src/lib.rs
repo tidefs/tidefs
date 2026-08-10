@@ -15304,13 +15304,11 @@ mod orphan_index_integration_tests {
             refcount_before,
             "a failed redirect delete must not consume canonical lifetime"
         );
-        assert!(
-            fs.store
-                .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
-                .expect("strict redirect read after ambiguous delete")
-                .is_none(),
-            "the injected bookkeeping failure occurs after Pool deletion"
-        );
+        let redirect_was_absent_after_failure = fs
+            .store
+            .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
+            .expect("strict redirect read after ambiguous delete")
+            .is_none();
 
         fs.drain_local_reclaim_queue_into_store()
             .expect("drain local reclaim queue");
@@ -15325,7 +15323,9 @@ mod orphan_index_integration_tests {
             .store
             .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
             .expect("strict redirect read after successful retry")
-            .is_none());
+            .is_none(),
+            "retry must converge whether the injected failure preceded or followed Pool deletion (absent after failure: {redirect_was_absent_after_failure})"
+        );
         assert!(fs
             .reclaim_queue
             .lock()

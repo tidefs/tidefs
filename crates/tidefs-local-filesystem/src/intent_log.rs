@@ -3844,7 +3844,7 @@ mod tests {
     }
 
     #[test]
-    fn load_missing_entry_below_head_stops_at_gap() {
+    fn load_missing_entry_below_head_fails_closed() {
         let (mut store, _dir) = test_store();
         let entry0 = sync_write_raw_record(0);
         let entry2 = sync_write_raw_record(2);
@@ -3861,11 +3861,14 @@ mod tests {
             .put(intent_log_head_object_key(), &3u64.to_le_bytes())
             .expect("store head");
 
-        let log = IntentLog::load(&store).expect("load with gap");
+        let result = IntentLog::load(&store);
 
-        assert_eq!(log.len(), 1);
-        assert_eq!(log.next_entry_id(), 1);
-        assert_eq!(log.entries[0].entry_id, 0);
+        assert!(matches!(
+            result,
+            Err(FileSystemError::CorruptState {
+                reason: "intent log contains a gap before its durable head"
+            })
+        ));
     }
 
     #[test]

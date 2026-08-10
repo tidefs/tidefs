@@ -10,7 +10,7 @@ use tidefs_types_vfs_core::InodeId;
 
 use crate::error::FileSystemError;
 use crate::helpers::parse_absolute_path;
-use crate::recovery::{load_state_from_transaction, root_commit_from_summary};
+use crate::recovery::{load_state_from_transaction_pool, root_commit_from_summary};
 use crate::types::{CommittedRootSummary, SnapshotSummary};
 use crate::vfs_engine_impl::VfsLocalFileSystem;
 use crate::{FileSystemState, LocalFileSystem, LocalFileSystemOpenConfig, Result};
@@ -95,7 +95,11 @@ impl LocalFileSystem {
                 });
             }
         }
-        config.recovery_policy = RecoveryPolicy::ReadOnly;
+        // The exported engine is read-only, but the source Pool must remain
+        // writable long enough to publish and later release its durable
+        // snapshot hold. ReplayOnly is the narrow recovery policy that permits
+        // that bookkeeping without admitting repair writeback.
+        config.recovery_policy = RecoveryPolicy::ReplayOnly;
         config.log_device_device_path = None;
 
         let root_path = root.to_path_buf();
@@ -141,7 +145,10 @@ impl LocalFileSystem {
                 });
             }
         }
-        config.recovery_policy = RecoveryPolicy::ReadOnly;
+        // Extraction holds the snapshot while swapping the live state, so its
+        // source Pool needs the same narrow writable recovery policy as an
+        // export session. The temporary snapshot view below is still read-only.
+        config.recovery_policy = RecoveryPolicy::ReplayOnly;
         config.log_device_device_path = None;
 
         let mut fs = Self::open_with_allocator_policy_and_root_authentication_key(root, config)?;
@@ -198,11 +205,8 @@ impl LocalFileSystem {
         let snapshot = self.snapshot_summary(snapshot_name)?;
         let exported_root = snapshot.source_root.clone();
         let root = root_commit_from_summary(&exported_root);
-        let exported_state = load_state_from_transaction(
-            self.store.raw_primary_store_mut(),
-            &root,
-            self.root_authentication_key,
-        )?;
+        let exported_state =
+            load_state_from_transaction_pool(&self.store, &root, self.root_authentication_key)?;
         let summary = SnapshotExportSummary {
             snapshot,
             exported_root,
