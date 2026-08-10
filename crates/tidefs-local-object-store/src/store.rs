@@ -974,17 +974,16 @@ impl LocalObjectStore {
                 payload_checksum: record.payload_checksum,
             };
 
+            // History is the physical put-record sequence. A prior live
+            // location was already recorded when its put was scanned, so an
+            // overwrite or delete must not append that location again.
             match record.kind {
                 RecordKind::Put => {
-                    if let Some(old) = index.insert(record.key, location) {
-                        history.entry(record.key).or_default().push(old);
-                    }
+                    index.insert(record.key, location);
                     history.entry(record.key).or_default().push(location);
                 }
                 RecordKind::Delete => {
-                    if let Some(old) = index.remove(&record.key) {
-                        history.entry(record.key).or_default().push(old);
-                    }
+                    index.remove(&record.key);
                 }
             }
 
@@ -7811,6 +7810,47 @@ mod block_device_open_tests {
             err,
             StoreError::InvalidOptions { reason } if reason.contains("directory")
         ));
+    }
+
+    #[test]
+    fn block_device_replay_records_each_physical_version_once() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let key = ObjectKey::from_name(b"block-device/version-history");
+
+        {
+            let mut store = LocalObjectStore::open_block_device(&image, StoreOptions::test_fast())
+                .expect("open block image");
+            for payload in [b"version-1".as_slice(), b"version-2", b"version-3"] {
+                store.put(key, payload).expect("write version");
+            }
+            store.sync_all().expect("sync versions");
+        }
+
+        let reopened = LocalObjectStore::open_block_device(&image, StoreOptions::test_fast())
+            .expect("reopen block image");
+        let versions = reopened.version_locations_of(key);
+        assert_eq!(versions.len(), 3, "one location per physical put record");
+        assert_eq!(
+            versions
+                .iter()
+                .map(|location| location.record_offset)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            versions.len(),
+            "version history must not repeat a physical record"
+        );
+        for (location, expected) in versions
+            .iter()
+            .zip([b"version-1", b"version-2", b"version-3"])
+        {
+            assert_eq!(
+                reopened
+                    .get_at_location(*location)
+                    .expect("read physical version"),
+                expected
+            );
+        }
     }
 
     #[test]
