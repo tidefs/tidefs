@@ -713,14 +713,9 @@ fn send_live_owner_request_at(
             #[cfg(feature = "distributed-repair")]
             validate_required_owner_evidence(route, &response_json)?;
             if route.json {
-                let out = serde_json::json!({
-                    "ok": true,
-                    "bytes": bytes.len(),
-                    "bytes_hex": bytes_hex,
-                });
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&out).map_err(|err| {
+                    serde_json::to_string_pretty(&response_json).map_err(|err| {
                         LiveOwnerRequestError::Owner {
                             exit_code: 2,
                             message: format!("format live-owner bytes JSON: {err}"),
