@@ -1184,8 +1184,9 @@ fn build_class_map(classes: &[DeviceClass]) -> ClassMap {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OldReceiptPolicy {
+enum OldReceiptPolicy<'a> {
     RequireValid,
+    KnownCurrent(&'a PlacementReceipt),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3291,7 +3292,7 @@ impl Pool {
         key: ObjectKey,
         payload: &[u8],
         indices: &[usize],
-        old_receipt_policy: OldReceiptPolicy,
+        old_receipt_policy: OldReceiptPolicy<'_>,
     ) -> Result<(StoredObject, PlacementReceipt)> {
         let old_receipt = match old_receipt_policy {
             OldReceiptPolicy::RequireValid => {
@@ -3304,6 +3305,16 @@ impl Pool {
                     }
                     None => None,
                 }
+            }
+            OldReceiptPolicy::KnownCurrent(receipt) => {
+                if receipt.object_key != key || receipt.epoch == 0 || receipt.generation == 0 {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "known current placement receipt has invalid identity",
+                    });
+                }
+                self.ensure_receipt_replay_authority(receipt)?;
+                validate_strict_receipt_structure(receipt)?;
+                Some(receipt.clone())
             }
         };
         let mut receipt = self.plan_pool_wide_placement(class, key, payload.len(), indices)?;
@@ -5202,7 +5213,7 @@ impl Pool {
                 receipt.object_key,
                 &data,
                 &surviving_indices,
-                OldReceiptPolicy::RequireValid,
+                OldReceiptPolicy::KnownCurrent(&receipt),
             ) {
                 Ok((_stored, receipt)) => receipt,
                 Err(_) => {
