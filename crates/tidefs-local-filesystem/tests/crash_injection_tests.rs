@@ -16,7 +16,8 @@ use std::fs;
 use std::{env, sync::Once};
 
 use tidefs_local_filesystem::{
-    LocalFileSystem, DEFAULT_DIRECTORY_PERMISSIONS, DEFAULT_FILE_PERMISSIONS,
+    content_object_key_for_version, LocalFileSystem, DEFAULT_DIRECTORY_PERMISSIONS,
+    DEFAULT_FILE_PERMISSIONS,
 };
 use tidefs_local_object_store::{
     CrashInjectionConfig, FaultInjectionConfig, LocalObjectStore, ObjectKey, ObjectLocation,
@@ -346,6 +347,7 @@ fn corrupt_segment_byte(seg_path: &std::path::Path, offset: u64) {
     buf[0] ^= 0xFF;
     file.seek(SeekFrom::Start(offset)).expect("seek back");
     file.write_all(&buf).expect("write corrupted byte");
+    file.sync_data().expect("persist corrupted byte");
 }
 
 fn object_record_path(store: &LocalObjectStore, location: ObjectLocation) -> std::path::PathBuf {
@@ -433,7 +435,7 @@ fn scrub_detects_injected_byte_corruption() {
     let root = temp_root("scrub-fault");
 
     // Phase 1: create committed filesystem content with known checksums.
-    {
+    let content_key = {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
         fs.create_dir("/scrub", DEFAULT_DIRECTORY_PERMISSIONS)
             .expect("mkdir scrub");
@@ -446,7 +448,9 @@ fn scrub_detects_injected_byte_corruption() {
                 .expect("write data file");
         }
         fs.sync_all().expect("sync clean");
-    }
+        let inode = fs.stat("/scrub/data_0.txt").expect("stat scrub file");
+        content_object_key_for_version(inode.inode_id, inode.data_version)
+    };
 
     // Phase 2: corrupt segment bytes on disk to trigger checksum mismatches.
     // The online verifier must detect these and report IssuesFound.
@@ -455,22 +459,16 @@ fn scrub_detects_injected_byte_corruption() {
         let pool = LocalFileSystem::default_development_pool(&root, &store_options, None, None)
             .expect("open Pool for corruption");
         let store = pool.raw_primary_store();
-        let keys = store.list_keys();
-        let mut corrupted: u32 = 0;
-        for key in &keys {
-            let locs = store.version_locations_of(*key);
-            for loc in &locs {
-                let seg_path = object_record_path(store, *loc);
-                // Corrupt a single byte in the payload, invalidating the checksum.
-                corrupt_segment_byte(&seg_path, loc.payload_offset);
-                corrupted += 1;
-                if corrupted >= 3 {
-                    break;
-                }
-            }
-            if corrupted >= 3 {
-                break;
-            }
+        let locations = store.version_locations_of(content_key);
+        assert!(
+            !locations.is_empty(),
+            "selected live content object must have physical records"
+        );
+        for location in locations {
+            let seg_path = object_record_path(store, location);
+            // Corrupt every retained version so append-only local fallback
+            // cannot legitimately recover the selected content object.
+            corrupt_segment_byte(&seg_path, location.payload_offset);
         }
     }
 

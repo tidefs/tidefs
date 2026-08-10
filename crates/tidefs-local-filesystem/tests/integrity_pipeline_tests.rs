@@ -93,12 +93,23 @@ fn corrupt_bytes(path: &Path, offset: u64, len: u64) {
     }
     file.seek(SeekFrom::Start(offset)).expect("seek back");
     file.write_all(&buf).expect("write corrupted bytes");
+    file.sync_data().expect("persist corrupted bytes");
 }
 
 fn corrupt_object_payload(store: &LocalObjectStore, key: ObjectKey) {
     let loc = store.location_of(key).expect("object location");
     let path = seg_path(store.segments_dir(), loc.segment_id);
     corrupt_bytes(&path, loc.payload_offset, (loc.payload_len / 2).max(1));
+}
+
+fn corrupt_all_object_payload_versions(store: &LocalObjectStore, key: ObjectKey) {
+    let locations = store.version_locations_of(key);
+    assert!(!locations.is_empty(), "object versions must exist");
+    for location in locations {
+        assert!(location.payload_len > 0, "object payload must be non-empty");
+        let path = seg_path(store.segments_dir(), location.segment_id);
+        corrupt_bytes(&path, location.payload_offset + location.payload_len / 2, 1);
+    }
 }
 
 fn corrupt_record_trailer(store: &LocalObjectStore, key: ObjectKey) {
@@ -224,7 +235,7 @@ fn content_chunk_corruption_detected_in_chain() {
             store.location_of(chunk_key).is_some(),
             "chunk 1 must exist for big.bin (3+ chunks)"
         );
-        corrupt_object_payload(store, chunk_key);
+        corrupt_all_object_payload_versions(store, chunk_key);
     }
 
     // Corruption must be caught.
@@ -305,7 +316,7 @@ fn content_manifest_corruption_detected() {
             store.location_of(content_key).is_some(),
             "content object must exist"
         );
-        corrupt_object_payload(store, content_key);
+        corrupt_all_object_payload_versions(store, content_key);
     }
 
     match verify_online(&root, opts()) {
