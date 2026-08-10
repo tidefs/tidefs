@@ -12762,6 +12762,8 @@ impl LocalFileSystem {
     }
 
     pub(crate) fn do_commit(&mut self) -> Result<()> {
+        #[cfg(test)]
+        eprintln!("do-commit milestone: enter");
         self.ensure_mutation_allowed("commit mounted filesystem state")?;
         #[cfg(not(feature = "data-policy"))]
         if feature_flags_select_data_policy(&self.feature_flags) {
@@ -12775,6 +12777,8 @@ impl LocalFileSystem {
         self.write_admission.advance_tick();
         let write_buffers_before = self.write_buffers.len();
         self.flush_all_write_buffers()?;
+        #[cfg(test)]
+        eprintln!("do-commit milestone: write buffers flushed");
         let flushed_write_buffers = self.write_buffers.len() < write_buffers_before;
         // Per #863: clearing the intent log without a state commit is
         // silent data loss — acknowledged intents are dropped without
@@ -12800,6 +12804,8 @@ impl LocalFileSystem {
                 &committed_base,
             )?;
         }
+        #[cfg(test)]
+        eprintln!("do-commit milestone: intent replay complete");
         let must_persist =
             self.is_state_dirty() || intent_log_requires_commit || flushed_write_buffers;
 
@@ -12830,12 +12836,18 @@ impl LocalFileSystem {
             }
         }
         if must_persist {
+            #[cfg(test)]
+            eprintln!("do-commit milestone: sync extent allocator");
             self.sync_extent_allocator_to_state();
+            #[cfg(test)]
+            eprintln!("do-commit milestone: extent allocator synced");
             // Reclaim obligations created by this mutation must reach Pool
             // placement authority before the transaction sync and committed
             // root can make their source objects unreachable. The transaction
             // object sync inside persist_state_with_pool orders both writes.
             self.persist_local_reclaim_queue(false)?;
+            #[cfg(test)]
+            eprintln!("do-commit milestone: reclaim queue persisted");
             if let Err(error) =
                 persist_state_with_pool(&mut self.store, &self.state, self.root_authentication_key)
             {
@@ -12844,6 +12856,8 @@ impl LocalFileSystem {
                 }
                 return Err(error);
             }
+            #[cfg(test)]
+            eprintln!("do-commit milestone: state persisted");
             check_crash_hook(CrashInjectionPoint::CommitGroupAfterAppendData);
             // Re-verify the stored root commit (#870).
             check_crash_hook(CrashInjectionPoint::CommitGroupBeforeCommit);
@@ -12879,18 +12893,26 @@ impl LocalFileSystem {
                 }
             };
             let stored_root = decode_root_commit(&stored_bytes)?;
+            #[cfg(test)]
+            eprintln!("do-commit milestone: root decoded");
             let _ = load_state_from_transaction_pool(
                 &mut self.store,
                 &stored_root,
                 self.root_authentication_key,
             )?;
+            #[cfg(test)]
+            eprintln!("do-commit milestone: state reloaded");
             // The new root is now durable and has passed the same Pool-backed
             // validation as mount.  Revoke caller-side rollback authority
             // before any fallible post-commit maintenance: later failures can
             // be retried, but must not restore live state behind this root.
             self.discard_mutation_delta();
+            #[cfg(test)]
+            eprintln!("do-commit milestone: mutation delta discarded");
             check_crash_hook(CrashInjectionPoint::CommitGroupAfterCommit);
             self.mark_metalogue_clean()?;
+            #[cfg(test)]
+            eprintln!("do-commit milestone: metalogue clean");
         }
         // Persist quota table alongside committed state
         self.store.put(
@@ -12963,10 +12985,14 @@ impl LocalFileSystem {
                 .notify_committed(CommitGroupId(commit_log.commit_group.0));
         }
         check_crash_hook(CrashInjectionPoint::CommitGroupAfterFlush);
+        #[cfg(test)]
+        eprintln!("do-commit milestone: side state persisted");
         // Progress background services after each commit so that
         // orphan reclamation and other deferred work advances
         // under per-tick budget without blocking mount or I/O.
         self.tick_background_services()?;
+        #[cfg(test)]
+        eprintln!("do-commit milestone: background services complete");
 
         // ── Space pressure update after commit ──────────────────────────
         // Update space pressure tracking from current pool capacity stats.
