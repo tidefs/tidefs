@@ -5,7 +5,7 @@
 //!
 //! - **Engine-level** (`engine_release`): validate the handle, remove it
 //!   from the [`FileHandleTable`],
-//!   and return the owning inode ID for tmpfile reclamation.
+//!   and return the owning inode ID for canonical zero-link finalization.
 //! - **FUSE-level** (`dispatch_release`): wrap engine_release with FUSE
 //!   protocol semantics (flush-before-close notification, error mapping).
 
@@ -20,9 +20,8 @@ use crate::open_dispatch::FileHandleTable;
 /// Release a file handle.
 ///
 /// Validates the handle exists in `table`, removes the entry, and returns
-/// the inode ID that was associated with the handle.  The caller can use
-/// this to perform tmpfile reclamation if the inode is an anonymous
-/// temporary file with no remaining open handles.
+/// the inode ID that was associated with the handle. The caller uses this to
+/// finalize a retained zero-link inode when no engine handle remains.
 ///
 /// Idempotent on already-released handles: returns `EBADF` if the handle
 /// is not found or does not match.

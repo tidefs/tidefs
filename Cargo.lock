@@ -2829,7 +2829,6 @@ dependencies = [
  "tidefs-dir-index",
  "tidefs-intent-log",
  "tidefs-local-filesystem",
- "tidefs-orphan-index",
  "tidefs-types-polymorphic-directory-index-core",
  "tidefs-types-vfs-core",
 ]
@@ -3046,7 +3045,6 @@ dependencies = [
  "tidefs-local-filesystem",
  "tidefs-local-object-store",
  "tidefs-lock-service",
- "tidefs-orphan-index",
  "tidefs-performance-contract",
  "tidefs-permission",
  "tidefs-pool-import",

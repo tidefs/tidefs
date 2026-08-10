@@ -400,7 +400,7 @@ use tidefs_local_object_store::{
     PoolRedundancyPolicy, StoreEncryptionKey, StoreError, StoreOptions, SuspectLogStats,
     DEFAULT_MAX_SEGMENT_BYTES, FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME, RECORD_OVERHEAD_BYTES,
 };
-use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex};
+use tidefs_orphan_index::OrphanIndex;
 #[cfg(feature = "quorum-write")]
 use tidefs_quorum_write_runtime::{QuorumConfig, QuorumObjectStore};
 #[cfg(feature = "policy-observation")]
@@ -974,10 +974,6 @@ impl FileSystemState {
         let inode_id = self.inode_authority.allocate();
         self.known_inode_ids.insert(inode_id);
         inode_id
-    }
-
-    pub(crate) fn reserve_inode_id(&mut self) -> InodeId {
-        self.inode_authority.allocate()
     }
 
     pub(crate) fn observe_explicit_inode_id(&mut self, inode_id: InodeId) {
@@ -4371,6 +4367,7 @@ impl LocalFileSystem {
         // durable before the cleanup root; no raw content scan participates.
         // BackgroundOrphanReclamation handles incremental runtime orphans.
         if recovery_policy.allows_any_mutation() {
+            fs.reconcile_zero_link_orphans();
             let cleanup = fs.cleanup_orphans()?;
             if !cleanup.is_idle() {
                 fs.do_commit()?;
@@ -4858,69 +4855,117 @@ impl LocalFileSystem {
         self.release_optional_metadata_admission_permit(permit.take())
     }
 
-    /// Mark an inode as orphaned after its namespace link count reaches zero.
+    /// Create an unnamed regular file directly in mounted inode authority.
     ///
-    /// Returns `true` when the inode was newly inserted into the persistent
-    /// orphan index and `false` when it was already tracked.
-    pub fn track_orphan(&mut self, inode_id: InodeId) -> Result<bool> {
-        self.ensure_mutation_allowed("track orphan inode")?;
-        let (generation, nlink, is_dir) = {
-            if let Some(record) = self.state.inodes.get(&inode_id) {
-                (record.generation.get(), record.nlink, record.is_directory())
-            } else {
-                (0, 0, false)
-            }
-        };
-        let flags = if is_dir {
-            OrphanEntryFlags::IS_DIRECTORY
-        } else {
-            OrphanEntryFlags::NONE
-        };
-        let entry = OrphanEntry::new(inode_id.get(), generation, nlink, flags);
-        let orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
-        let inserted = {
-            let mut orphan_index = self.orphan_index.lock().unwrap();
-            orphan_index.insert(inode_id.get(), entry)
-        };
-        self.release_metadata_admission_permit(orphan_md_permit)?;
-        Ok(inserted)
-    }
-
-    /// Mark an anonymous O_TMPFILE inode as orphaned at creation time.
-    pub fn track_tmpfile_orphan(
+    /// The file starts with `nlink == 0` and a derivative orphan-index entry,
+    /// so all handle I/O immediately uses the same Pool-backed inode/content
+    /// path as named files. Linking publishes this inode into a directory;
+    /// last close finalizes it through [`finalize_orphan_inode`].
+    pub(crate) fn create_unlinked_regular_file(
         &mut self,
-        inode_id: InodeId,
-        generation: u64,
-        creating_pid: u32,
-    ) -> Result<bool> {
-        self.ensure_mutation_allowed("track temporary-file orphan")?;
-        let orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
-        let inserted = {
-            let mut orphan_index = self.orphan_index.lock().unwrap();
-            orphan_index.insert_tmpfile(inode_id.get(), generation, creating_pid, 0)
+        parent_id: InodeId,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        xattrs: BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<InodeRecord> {
+        self.ensure_mutation_allowed("create unnamed mounted regular file")?;
+        let parent = self.inode(parent_id)?;
+        if !parent.is_directory() {
+            return Err(FileSystemError::NotDirectory {
+                path: format!("inode:{}", parent_id.get()),
+            });
+        }
+
+        let inode_ancestors = self.quota_ancestors_for_parent(parent_id);
+        let inode_bytes = crate::quota::allocation_grains_for_len(0);
+        let decision = self.state.quota_table.check_delta(
+            &inode_ancestors,
+            inode_bytes,
+            1,
+            self.pool_free_bytes_for_quota(),
+        );
+        if decision.is_refusal() {
+            return Err(FileSystemError::from(decision));
+        }
+        self.ensure_inode_capacity_for_new_inode()?;
+
+        let mut orphan_md_permit = Some(self.write_admission.try_admit_metadata_mutation()?);
+        self.begin_mutation("create unnamed mounted regular file")?;
+        if !self.state.inodes.contains_key(&parent_id) {
+            let release_result =
+                self.release_optional_metadata_admission_permit(orphan_md_permit.take());
+            self.rollback_mutation_delta();
+            release_result?;
+            return Err(FileSystemError::NotFound {
+                path: format!("inode:{}", parent_id.get()),
+            });
+        }
+
+        let tick = self.bump_generation();
+        let inode_id = self.allocate_inode_id();
+        let record = InodeRecord {
+            rdev: 0,
+            inode_id,
+            generation: Generation::new(tick),
+            facets: NodeKind::File.to_facets(),
+            mode,
+            uid,
+            gid,
+            nlink: 0,
+            size: 0,
+            data_version: tick,
+            metadata_version: tick,
+            posix_time: crate::types::PosixTimeRecord::now(),
+            xattrs,
+            dir_storage_kind: 0,
+            xattr_storage_kind: 0,
+            dir_rev: 0,
+            subtree_rev: 0,
         };
-        self.release_metadata_admission_permit(orphan_md_permit)?;
-        Ok(inserted)
+        self.orphan_index.lock().unwrap().insert(inode_id.get());
+        self.release_metadata_admission_permit(orphan_md_permit.take().ok_or(
+            FileSystemError::CorruptState {
+                reason: "missing unnamed-file orphan metadata admission permit",
+            },
+        )?)?;
+        self.mark_inode_metadata_dirty(inode_id);
+        Arc::make_mut(&mut self.state.inodes).insert(inode_id, record.clone());
+        self.inode_cache.borrow_mut().invalidate(inode_id);
+        let record = self.commit_mutation(record)?;
+        self.state
+            .quota_table
+            .apply_delta(&inode_ancestors, inode_bytes, 1);
+        Ok(record)
     }
 
-    /// Remove an anonymous O_TMPFILE inode from the orphan index after linkat.
-    pub fn remove_tmpfile_orphan_on_link(&mut self, inode_id: InodeId) -> Result<bool> {
-        self.ensure_mutation_allowed("remove temporary-file orphan")?;
-        let orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
-        let removed = {
-            let mut orphan_index = self.orphan_index.lock().unwrap();
-            orphan_index.remove_on_link(inode_id.get(), 0)
-        };
-        self.release_metadata_admission_permit(orphan_md_permit)?;
-        Ok(removed)
+    /// Rebuild missing orphan-index entries from the committed inode state.
+    /// The index accelerates cleanup; `nlink == 0` in the selected root is the
+    /// reachability authority and therefore survives a crash between root and
+    /// auxiliary-index publication.
+    fn reconcile_zero_link_orphans(&mut self) -> usize {
+        let zero_link_records = self
+            .state
+            .inodes
+            .values()
+            .filter(|record| record.nlink == 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut index = self.orphan_index.lock().unwrap();
+        let mut inserted = 0;
+        for record in zero_link_records {
+            if index.contains(record.inode_id.get()) {
+                continue;
+            }
+            inserted += usize::from(index.insert(record.inode_id.get()));
+        }
+        inserted
     }
 
-    /// Queue an already tracked orphan for deferred background reclamation.
-    ///
-    /// This is intentionally idempotent so adapter release paths can call it
-    /// when the final file handle closes without double-enqueueing work.
-    pub fn release_orphan(&self, inode_id: InodeId) -> Result<bool> {
-        self.ensure_mutation_allowed("queue orphan reclaim")?;
+    /// Queue retirement of a derivative orphan marker after canonical inode
+    /// and namespace state no longer classify the inode as zero-link.
+    fn queue_orphan_marker_retirement(&self, inode_id: InodeId) -> Result<bool> {
+        self.ensure_mutation_allowed("queue orphan-marker retirement")?;
         let raw_inode_id = inode_id.get();
         if !self.orphan_index.lock().unwrap().contains(raw_inode_id) {
             return Ok(false);
@@ -5669,11 +5714,19 @@ impl LocalFileSystem {
         if !pending.is_empty() {
             let mut idx = self.orphan_index.lock().unwrap();
             for &inode_id_raw in &pending {
-                // Runtime unlink already queued exact manifest/chunk/inode
-                // keys before publishing the root that removed this inode.
-                // This scheduler duty retires only the orphan marker; it must
-                // not guess content versions after the inode record is gone.
-                idx.remove(inode_id_raw);
+                let inode_id = InodeId::new(inode_id_raw);
+                // A committed nlink==0 inode may still have live VFS handles.
+                // Keep its marker until last close removes the inode. A linked
+                // or absent inode makes the derivative marker stale and safe
+                // to retire.
+                let retain = self
+                    .state
+                    .inodes
+                    .get(&inode_id)
+                    .is_some_and(|record| record.nlink == 0);
+                if !retain {
+                    idx.remove(inode_id_raw);
+                }
             }
         }
 
@@ -5715,15 +5768,6 @@ impl LocalFileSystem {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    // INTENT: kept for planned architecture; callers in test modules or pending wiring into FUSE dispatch
-    /// Mount-time orphan recovery through the mounted Pool and metadata
-    /// cleanup authorities.
-    fn recover_orphans(&mut self) -> Result<()> {
-        let _stats = self.cleanup_orphans()?;
-        Ok(())
-    }
-
     /// Prepare exact content and inode reclaim entries for every orphan whose
     /// inode record is still present. All strict Pool reads complete before
     /// the in-memory queue changes, so an uncertain manifest leaves namespace
@@ -5731,6 +5775,7 @@ impl LocalFileSystem {
     fn prepare_orphan_reclaim_entries(&mut self) -> Result<usize> {
         let orphan_ids = self.orphan_index.lock().unwrap().collect_inode_ids();
         let mut prepared = BTreeMap::new();
+        let mut retained_records = Vec::new();
 
         for inode_id_raw in orphan_ids {
             let inode_id = InodeId::new(inode_id_raw);
@@ -5739,13 +5784,12 @@ impl LocalFileSystem {
                 // its already-persisted exact queue remains the authority.
                 continue;
             };
-            let has_directory_entry = self
-                .state
-                .directories
-                .values()
-                .any(|dir| dir.values().any(|entry| entry.inode_id == inode_id));
-            if record.nlink > 0 && !has_directory_entry {
+            if record.nlink > 0 {
                 continue;
+            }
+
+            if record.nlink == 0 {
+                retained_records.push(record.clone());
             }
 
             if record.is_file_like() {
@@ -5766,6 +5810,10 @@ impl LocalFileSystem {
         let mut inserted = 0;
         for entry in prepared.into_values() {
             inserted += usize::from(queue.insert(entry));
+        }
+        drop(queue);
+        for record in &retained_records {
+            self.account_final_orphan_release(record);
         }
         Ok(inserted)
     }
@@ -7152,6 +7200,27 @@ impl LocalFileSystem {
         let parent_id = pre.new_parent_id;
         let name = pre.new_name;
 
+        self.link_file_by_inode(inode_id, parent_id, &name, new_path)
+    }
+
+    pub(crate) fn link_file_by_inode(
+        &mut self,
+        inode_id: InodeId,
+        parent_id: InodeId,
+        name: &[u8],
+        path_for_error: &str,
+    ) -> Result<InodeRecord> {
+        self.ensure_mutation_allowed("create hard link by inode")?;
+        validate_name(name)?;
+        if self
+            .dir_entry_by_inode(parent_id, name, path_for_error)?
+            .is_some()
+        {
+            return Err(FileSystemError::AlreadyExists {
+                path: path_for_error.to_string(),
+            });
+        }
+
         self.flush_write_buffer(inode_id)?;
         let source_record = self.inode(inode_id)?.clone();
         // Extra guard: only regular files supported in this MVP.
@@ -7161,20 +7230,12 @@ impl LocalFileSystem {
                 reason: "this MVP only hard-links regular files",
             });
         }
-        let mut orphan_md_permit = if source_record.nlink == 0 {
-            Some(self.write_admission.try_admit_metadata_mutation()?)
-        } else {
-            None
-        };
         self.begin_mutation("create hard link")?;
         // Re-verify parent exists after lock acquisition
         if !self.state.inodes.contains_key(&parent_id) {
-            let release_result =
-                self.release_optional_metadata_admission_permit(orphan_md_permit.take());
             self.rollback_mutation_delta();
-            release_result?;
             return Err(FileSystemError::NotFound {
-                path: new_path.to_string(),
+                path: path_for_error.to_string(),
             });
         }
         let tick = self.bump_generation();
@@ -7184,7 +7245,7 @@ impl LocalFileSystem {
                 tidefs_intent_log::IntentLogRecord::HardLink {
                     ino: inode_id.get(),
                     new_parent: parent_id.get(),
-                    new_name: name.clone(),
+                    new_name: name.to_vec(),
                 },
                 0,
             );
@@ -7193,30 +7254,16 @@ impl LocalFileSystem {
         updated.nlink = updated.nlink.saturating_add(1);
         updated.posix_time.ctime_ns = Self::next_metadata_ctime_ns(updated.posix_time.ctime_ns);
         updated.metadata_version = tick;
-        // If nlink transitions from 0 to 1, the inode is no longer orphaned.
-        if updated.nlink == 1 {
-            let orphan_md_permit =
-                orphan_md_permit
-                    .take()
-                    .ok_or(FileSystemError::CorruptState {
-                        reason: "missing orphan-index metadata admission permit",
-                    })?;
-            {
-                let mut orphan_index = self.orphan_index.lock().unwrap();
-                orphan_index.remove(inode_id.get());
-            }
-            self.release_metadata_admission_permit(orphan_md_permit)?;
-        }
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, updated.clone());
         self.inode_cache.borrow_mut().invalidate(inode_id);
         let entry = NamespaceEntry {
-            name: name.clone(),
+            name: name.to_vec(),
             inode_id,
             generation: updated.generation,
             facets: updated.facets,
             mode: updated.mode,
         };
-        if let Err(err) = self.insert_directory_entry(parent_id, name, entry, tick) {
+        if let Err(err) = self.insert_directory_entry(parent_id, name.to_vec(), entry, tick) {
             self.rollback_mutation_delta();
             return Err(err);
         }
@@ -7224,7 +7271,11 @@ impl LocalFileSystem {
         self.mark_inode_metadata_dirty(inode_id);
         self.mark_dir_dirty(parent_id);
         self.mark_inode_metadata_dirty(parent_id);
-        self.commit_mutation(updated)
+        let linked = self.commit_mutation(updated)?;
+        // Retire the derivative orphan marker only after the live inode and
+        // namespace mutation are ready for committed-root publication.
+        let _ = self.queue_orphan_marker_retirement(inode_id)?;
+        Ok(linked)
     }
 
     /// Create a reflink clone of a regular file.
@@ -7589,15 +7640,23 @@ impl LocalFileSystem {
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        self.read_file_by_inode_with_target(inode_id, path)
+    }
+
+    pub(crate) fn read_file_by_inode(&self, inode_id: InodeId) -> Result<Vec<u8>> {
+        self.read_file_by_inode_with_target(inode_id, &format!("inode:{}", inode_id.get()))
+    }
+
+    fn read_file_by_inode_with_target(&self, inode_id: InodeId, target: &str) -> Result<Vec<u8>> {
         let record = self.inode(inode_id)?;
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
-                    path: path.to_string(),
+                    path: target.to_string(),
                 });
             }
             return Err(FileSystemError::NotFile {
-                path: path.to_string(),
+                path: target.to_string(),
                 kind: record.kind(),
             });
         }
@@ -7613,15 +7672,39 @@ impl LocalFileSystem {
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        self.read_file_range_by_inode_with_target(inode_id, path, offset, length)
+    }
+
+    pub(crate) fn read_file_range_by_inode(
+        &self,
+        inode_id: InodeId,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        self.read_file_range_by_inode_with_target(
+            inode_id,
+            &format!("inode:{}", inode_id.get()),
+            offset,
+            length,
+        )
+    }
+
+    fn read_file_range_by_inode_with_target(
+        &self,
+        inode_id: InodeId,
+        target: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
         let record = self.inode(inode_id)?;
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
-                    path: path.to_string(),
+                    path: target.to_string(),
                 });
             }
             return Err(FileSystemError::NotFile {
-                path: path.to_string(),
+                path: target.to_string(),
                 kind: record.kind(),
             });
         }
@@ -8639,19 +8722,47 @@ impl LocalFileSystem {
         offset: u64,
         bytes: &[u8],
     ) -> Result<InodeRecord> {
-        self.ensure_mutation_allowed("write mounted file")?;
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
+        self.write_file_by_inode_with_ancestors(inode_id, &inode_ancestors, path, offset, bytes)
+    }
+
+    pub(crate) fn write_file_by_inode(
+        &mut self,
+        inode_id: InodeId,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<InodeRecord> {
+        let inode_ancestors = self.quota_ancestors_for_inode(inode_id);
+        self.write_file_by_inode_with_ancestors(
+            inode_id,
+            &inode_ancestors,
+            &format!("inode:{}", inode_id.get()),
+            offset,
+            bytes,
+        )
+    }
+
+    fn write_file_by_inode_with_ancestors(
+        &mut self,
+        inode_id: InodeId,
+        inode_ancestors: &[InodeId],
+        target: &str,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<InodeRecord> {
+        self.ensure_mutation_allowed("write mounted file by inode")?;
         let record = self.inode(inode_id)?.clone();
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
-                    path: path.to_string(),
+                    path: target.to_string(),
                 });
             }
             return Err(FileSystemError::NotFile {
-                path: path.to_string(),
+                path: target.to_string(),
                 kind: record.kind(),
             });
         }
@@ -8683,12 +8794,11 @@ impl LocalFileSystem {
         let new_grains = crate::quota::allocation_grains_for_len(new_size);
         let delta_bytes = new_grains.saturating_sub(old_grains);
         if delta_bytes > 0 {
-            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
             let pool_free = self.pool_free_bytes_for_quota();
             let decision =
                 self.state
                     .quota_table
-                    .check_delta(&inode_ancestors, delta_bytes, 0, pool_free);
+                    .check_delta(inode_ancestors, delta_bytes, 0, pool_free);
             if decision.is_refusal() {
                 return Err(FileSystemError::from(decision));
             }
@@ -8866,10 +8976,9 @@ impl LocalFileSystem {
 
         let result = self.inode(inode_id)?.clone();
         if delta_bytes > 0 {
-            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
             self.state
                 .quota_table
-                .apply_delta(&inode_ancestors, delta_bytes, 0);
+                .apply_delta(inode_ancestors, delta_bytes, 0);
         }
         // Capacity admission uses worst-case physical write pressure, while
         // committed logical usage only grows when the file grows.
@@ -9084,19 +9193,53 @@ impl LocalFileSystem {
         offset: u64,
         length: u64,
     ) -> Result<InodeRecord> {
-        self.ensure_mutation_allowed("allocate file range")?;
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
+        self.fallocate_file_by_inode_with_ancestors(
+            inode_id,
+            &inode_ancestors,
+            path,
+            offset,
+            length,
+        )
+    }
+
+    pub(crate) fn fallocate_file_by_inode(
+        &mut self,
+        inode_id: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> Result<InodeRecord> {
+        let inode_ancestors = self.quota_ancestors_for_inode(inode_id);
+        self.fallocate_file_by_inode_with_ancestors(
+            inode_id,
+            &inode_ancestors,
+            &format!("inode:{}", inode_id.get()),
+            offset,
+            length,
+        )
+    }
+
+    fn fallocate_file_by_inode_with_ancestors(
+        &mut self,
+        inode_id: InodeId,
+        inode_ancestors: &[InodeId],
+        target: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<InodeRecord> {
+        self.ensure_mutation_allowed("allocate file range by inode")?;
         let record = self.inode(inode_id)?.clone();
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
-                    path: path.to_string(),
+                    path: target.to_string(),
                 });
             }
             return Err(FileSystemError::NotFile {
-                path: path.to_string(),
+                path: target.to_string(),
                 kind: record.kind(),
             });
         }
@@ -9127,12 +9270,11 @@ impl LocalFileSystem {
         // reservations. Bytes already represented by DATA/UNWRITTEN extents
         // have already consumed quota and capacity.
         if reserve_bytes > 0 {
-            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
             let pool_free = self.pool_free_bytes_for_quota();
             let decision =
                 self.state
                     .quota_table
-                    .check_delta(&inode_ancestors, reserve_bytes, 0, pool_free);
+                    .check_delta(inode_ancestors, reserve_bytes, 0, pool_free);
             if decision.is_refusal() {
                 return Err(FileSystemError::from(decision));
             }
@@ -9158,10 +9300,9 @@ impl LocalFileSystem {
         }
         check_crash_hook(CrashInjectionPoint::OpAllocateBeforeSpaceUpdate);
         if reserve_bytes > 0 {
-            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
             self.state
                 .quota_table
-                .apply_delta(&inode_ancestors, reserve_bytes, 0);
+                .apply_delta(inode_ancestors, reserve_bytes, 0);
         }
         // Accumulate space delta: fallocate is a reservation
         if reserve_bytes > 0 {
@@ -9231,19 +9372,53 @@ impl LocalFileSystem {
         offset: u64,
         length: u64,
     ) -> Result<InodeRecord> {
-        self.ensure_mutation_allowed("reserve unwritten file range")?;
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
+        self.reserve_unwritten_by_inode_with_ancestors(
+            inode_id,
+            &inode_ancestors,
+            path,
+            offset,
+            length,
+        )
+    }
+
+    pub(crate) fn reserve_unwritten_by_inode(
+        &mut self,
+        inode_id: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> Result<InodeRecord> {
+        let inode_ancestors = self.quota_ancestors_for_inode(inode_id);
+        self.reserve_unwritten_by_inode_with_ancestors(
+            inode_id,
+            &inode_ancestors,
+            &format!("inode:{}", inode_id.get()),
+            offset,
+            length,
+        )
+    }
+
+    fn reserve_unwritten_by_inode_with_ancestors(
+        &mut self,
+        inode_id: InodeId,
+        inode_ancestors: &[InodeId],
+        target: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<InodeRecord> {
+        self.ensure_mutation_allowed("reserve unwritten file range by inode")?;
         let record = self.inode(inode_id)?.clone();
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
-                    path: path.to_string(),
+                    path: target.to_string(),
                 });
             }
             return Err(FileSystemError::NotFile {
-                path: path.to_string(),
+                path: target.to_string(),
                 kind: record.kind(),
             });
         }
@@ -9271,12 +9446,11 @@ impl LocalFileSystem {
         // UNWRITTEN reservations. Existing DATA/UNWRITTEN extents already
         // consumed quota and capacity when they were first allocated.
         if reserve_bytes > 0 {
-            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
             let pool_free = self.pool_free_bytes_for_quota();
             let decision =
                 self.state
                     .quota_table
-                    .check_delta(&inode_ancestors, reserve_bytes, 0, pool_free);
+                    .check_delta(inode_ancestors, reserve_bytes, 0, pool_free);
             if decision.is_refusal() {
                 return Err(FileSystemError::from(decision));
             }
@@ -9321,10 +9495,9 @@ impl LocalFileSystem {
         }
 
         if reserve_bytes > 0 {
-            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
             self.state
                 .quota_table
-                .apply_delta(&inode_ancestors, reserve_bytes, 0);
+                .apply_delta(inode_ancestors, reserve_bytes, 0);
         }
 
         if reserve_bytes > 0 {
@@ -9363,19 +9536,40 @@ impl LocalFileSystem {
     }
 
     pub fn truncate_file(&mut self, path: impl AsRef<str>, size: u64) -> Result<InodeRecord> {
-        self.ensure_mutation_allowed("truncate file")?;
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        self.truncate_file_by_inode_with_target(inode_id, path, size)
+    }
+
+    pub(crate) fn truncate_file_by_inode(
+        &mut self,
+        inode_id: InodeId,
+        size: u64,
+    ) -> Result<InodeRecord> {
+        self.truncate_file_by_inode_with_target(
+            inode_id,
+            &format!("inode:{}", inode_id.get()),
+            size,
+        )
+    }
+
+    fn truncate_file_by_inode_with_target(
+        &mut self,
+        inode_id: InodeId,
+        target: &str,
+        size: u64,
+    ) -> Result<InodeRecord> {
+        self.ensure_mutation_allowed("truncate file by inode")?;
         let record = self.inode(inode_id)?.clone();
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
-                    path: path.to_string(),
+                    path: target.to_string(),
                 });
             }
             return Err(FileSystemError::NotFile {
-                path: path.to_string(),
+                path: target.to_string(),
                 kind: record.kind(),
             });
         }
@@ -9438,7 +9632,7 @@ impl LocalFileSystem {
             self.rewrite_content_with_overlay(inode_id, record, 0, &[], size, true)?
         };
         let result = if size == 0 {
-            self.clear_xattrs_after_zero_truncate(inode_id, result, path)?
+            self.clear_xattrs_after_zero_truncate(inode_id, result, target)?
         } else {
             result
         };
@@ -9562,20 +9756,44 @@ impl LocalFileSystem {
         offset: u64,
         length: u64,
     ) -> Result<InodeRecord> {
-        self.ensure_mutation_allowed("punch file hole")?;
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        self.punch_hole_by_inode_with_target(inode_id, path, offset, length)
+    }
+
+    pub(crate) fn punch_hole_by_inode(
+        &mut self,
+        inode_id: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> Result<InodeRecord> {
+        self.punch_hole_by_inode_with_target(
+            inode_id,
+            &format!("inode:{}", inode_id.get()),
+            offset,
+            length,
+        )
+    }
+
+    fn punch_hole_by_inode_with_target(
+        &mut self,
+        inode_id: InodeId,
+        target: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<InodeRecord> {
+        self.ensure_mutation_allowed("punch file hole by inode")?;
         let logical_size = self.effective_file_size(inode_id);
         let mut record = self.committed_inode_record(inode_id)?;
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
-                    path: path.to_string(),
+                    path: target.to_string(),
                 });
             }
             return Err(FileSystemError::NotFile {
-                path: path.to_string(),
+                path: target.to_string(),
                 kind: record.kind(),
             });
         }
@@ -9694,12 +9912,11 @@ impl LocalFileSystem {
                 ContentLayout::Chunked(manifest) => {
                     let chunk_size = u64::from(manifest.chunk_size);
                     for chunk_ref in manifest.chunks.iter().filter(|chunk| !chunk.is_hole()) {
-                        let start = chunk_ref
-                            .chunk_index
-                            .checked_mul(chunk_size)
-                            .ok_or(FileSystemError::SizeOverflow {
+                        let start = chunk_ref.chunk_index.checked_mul(chunk_size).ok_or(
+                            FileSystemError::SizeOverflow {
                                 requested: u64::MAX,
-                            })?;
+                            },
+                        )?;
                         let end = start
                             .checked_add(u64::from(chunk_ref.len))
                             .ok_or(FileSystemError::SizeOverflow {
@@ -9780,20 +9997,44 @@ impl LocalFileSystem {
         offset: u64,
         length: u64,
     ) -> Result<InodeRecord> {
-        self.ensure_mutation_allowed("zero file range")?;
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        self.zero_range_by_inode_with_target(inode_id, path, offset, length)
+    }
+
+    pub(crate) fn zero_range_by_inode(
+        &mut self,
+        inode_id: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> Result<InodeRecord> {
+        self.zero_range_by_inode_with_target(
+            inode_id,
+            &format!("inode:{}", inode_id.get()),
+            offset,
+            length,
+        )
+    }
+
+    fn zero_range_by_inode_with_target(
+        &mut self,
+        inode_id: InodeId,
+        target: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<InodeRecord> {
+        self.ensure_mutation_allowed("zero file range by inode")?;
         let logical_size = self.effective_file_size(inode_id);
         let mut record = self.committed_inode_record(inode_id)?;
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
-                    path: path.to_string(),
+                    path: target.to_string(),
                 });
             }
             return Err(FileSystemError::NotFile {
-                path: path.to_string(),
+                path: target.to_string(),
                 kind: record.kind(),
             });
         }
@@ -9972,21 +10213,45 @@ impl LocalFileSystem {
         offset: u64,
         length: u64,
     ) -> Result<InodeRecord> {
-        self.ensure_mutation_allowed("collapse file range")?;
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        self.collapse_range_by_inode_with_target(inode_id, path, offset, length)
+    }
+
+    pub(crate) fn collapse_range_by_inode(
+        &mut self,
+        inode_id: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> Result<InodeRecord> {
+        self.collapse_range_by_inode_with_target(
+            inode_id,
+            &format!("inode:{}", inode_id.get()),
+            offset,
+            length,
+        )
+    }
+
+    fn collapse_range_by_inode_with_target(
+        &mut self,
+        inode_id: InodeId,
+        target: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<InodeRecord> {
+        self.ensure_mutation_allowed("collapse file range by inode")?;
         // Flush any buffered writes before reading the record.
         self.flush_write_buffer(inode_id)?;
         let record = self.inode(inode_id)?.clone();
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
-                    path: path.to_string(),
+                    path: target.to_string(),
                 });
             }
             return Err(FileSystemError::NotFile {
-                path: path.to_string(),
+                path: target.to_string(),
                 kind: record.kind(),
             });
         }
@@ -10059,21 +10324,49 @@ impl LocalFileSystem {
         offset: u64,
         length: u64,
     ) -> Result<InodeRecord> {
-        self.ensure_mutation_allowed("insert file range")?;
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
+        self.insert_range_by_inode_with_ancestors(inode_id, &inode_ancestors, path, offset, length)
+    }
+
+    pub(crate) fn insert_range_by_inode(
+        &mut self,
+        inode_id: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> Result<InodeRecord> {
+        let inode_ancestors = self.quota_ancestors_for_inode(inode_id);
+        self.insert_range_by_inode_with_ancestors(
+            inode_id,
+            &inode_ancestors,
+            &format!("inode:{}", inode_id.get()),
+            offset,
+            length,
+        )
+    }
+
+    fn insert_range_by_inode_with_ancestors(
+        &mut self,
+        inode_id: InodeId,
+        inode_ancestors: &[InodeId],
+        target: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<InodeRecord> {
+        self.ensure_mutation_allowed("insert file range by inode")?;
         // Flush any buffered writes before reading the record.
         self.flush_write_buffer(inode_id)?;
         let record = self.inode(inode_id)?.clone();
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
-                    path: path.to_string(),
+                    path: target.to_string(),
                 });
             }
             return Err(FileSystemError::NotFile {
-                path: path.to_string(),
+                path: target.to_string(),
                 kind: record.kind(),
             });
         }
@@ -10099,12 +10392,11 @@ impl LocalFileSystem {
         let new_grains = crate::quota::allocation_grains_for_len(new_size);
         let delta_bytes = new_grains.saturating_sub(old_grains);
         if delta_bytes > 0 {
-            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
             let pool_free = self.pool_free_bytes_for_quota();
             let decision =
                 self.state
                     .quota_table
-                    .check_delta(&inode_ancestors, delta_bytes, 0, pool_free);
+                    .check_delta(inode_ancestors, delta_bytes, 0, pool_free);
             if decision.is_refusal() {
                 return Err(FileSystemError::from(decision));
             }
@@ -10127,10 +10419,9 @@ impl LocalFileSystem {
         let result = self.replace_content(inode_id, record, new_content)?;
         // Apply quota delta
         if delta_bytes > 0 {
-            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
             self.state
                 .quota_table
-                .apply_delta(&inode_ancestors, delta_bytes, 0);
+                .apply_delta(inode_ancestors, delta_bytes, 0);
         }
         // Accumulate space delta: insert_range allocates new bytes
         self.state
@@ -10194,6 +10485,31 @@ impl LocalFileSystem {
         name: &[u8],
         path_for_error: &str,
     ) -> Result<()> {
+        self.unlink_child_by_inode_with_retention(parent_id, name, path_for_error, false)
+    }
+
+    /// Remove a namespace entry while retaining a last-link inode for live
+    /// file handles. The inode, content layout, xattrs, capacity charge, and
+    /// sparse extent state remain in the canonical mounted filesystem until
+    /// [`finalize_orphan_inode`](Self::finalize_orphan_inode) runs on last
+    /// close. A crash leaves the committed `nlink == 0` inode for mount-time
+    /// orphan recovery.
+    pub(crate) fn unlink_child_retaining_inode(
+        &mut self,
+        parent_id: InodeId,
+        name: &[u8],
+        path_for_error: &str,
+    ) -> Result<()> {
+        self.unlink_child_by_inode_with_retention(parent_id, name, path_for_error, true)
+    }
+
+    fn unlink_child_by_inode_with_retention(
+        &mut self,
+        parent_id: InodeId,
+        name: &[u8],
+        path_for_error: &str,
+        retain_last_link_inode: bool,
+    ) -> Result<()> {
         self.ensure_mutation_allowed("unlink mounted namespace child")?;
         let entry = self
             .dir_entry_by_inode(parent_id, name, path_for_error)?
@@ -10219,7 +10535,7 @@ impl LocalFileSystem {
                                                         // Accumulate space delta for unlink only when this removes the last link.
                                                         // File size can include sparse holes; only data extents release logical
                                                         // bytes, while unwritten extents release reservation bytes.
-        if !was_multilinked && record.size > 0 {
+        if !was_multilinked && !retain_last_link_inode && record.size > 0 {
             let (data_bytes, reserved_bytes) =
                 self.accounted_extent_bytes(entry.inode_id, 0, record.size);
             let projected = self
@@ -10289,17 +10605,6 @@ impl LocalFileSystem {
             // Insert into orphan index for crash-safe extent reclamation.
             // This inode's extents will be freed during the next mount
             // recovery or background orphan sweep.
-            let orphan_flags = if record.kind() == NodeKind::Dir {
-                OrphanEntryFlags::IS_DIRECTORY
-            } else {
-                OrphanEntryFlags::NONE
-            };
-            let orphan_entry = OrphanEntry::new(
-                entry.inode_id.get(),
-                record.generation.get(),
-                record.nlink,
-                orphan_flags,
-            );
             let orphan_md_permit =
                 orphan_md_permit
                     .take()
@@ -10308,13 +10613,21 @@ impl LocalFileSystem {
                     })?;
             {
                 let mut orphan_index = self.orphan_index.lock().unwrap();
-                orphan_index.insert(entry.inode_id.get(), orphan_entry);
+                orphan_index.insert(entry.inode_id.get());
             }
             self.release_metadata_admission_permit(orphan_md_permit)?;
             // Record nlink=0 in state so record_reclaim_delta can iterate
             // chunk keys for dedup refcount decrement (#6167).
             if let Some(stored) = Arc::make_mut(&mut self.state.inodes).get_mut(&entry.inode_id) {
                 stored.nlink = 0;
+                stored.posix_time.ctime_ns =
+                    Self::next_metadata_ctime_ns(stored.posix_time.ctime_ns);
+                stored.metadata_version = tick;
+                Self::advance_subtree_revision(stored);
+            }
+            self.inode_cache.borrow_mut().invalidate(entry.inode_id);
+            if retain_last_link_inode {
+                return self.commit_mutation(());
             }
             self.record_reclaim_delta(entry.inode_id, record.size);
             self.record_inode_tombstone(entry.inode_id);
@@ -10330,6 +10643,63 @@ impl LocalFileSystem {
             self.forget_removed_inode_state(entry.inode_id);
         }
         self.commit_mutation(())
+    }
+
+    fn account_final_orphan_release(&mut self, record: &InodeRecord) {
+        if record.size == 0 {
+            return;
+        }
+        let (data_bytes, reserved_bytes) =
+            self.accounted_extent_bytes(record.inode_id, 0, record.size);
+        let projected = self
+            .state
+            .space_accounting
+            .projected_counters_after_pending();
+        let logical_free = data_bytes.min(projected.logical_used_bytes);
+        let reserved_free = reserved_bytes.min(projected.reserved_bytes);
+        if logical_free > 0 || reserved_free > 0 {
+            self.state
+                .space_accounting
+                .accumulate_delta(SpaceDelta::new_punch_hole(logical_free, reserved_free));
+        }
+        let physical_free = data_bytes.saturating_add(reserved_bytes);
+        if physical_free > 0 {
+            self.state
+                .space_accounting
+                .track_physical_free(physical_free);
+            self.capacity_authority.record_free(physical_free);
+        }
+    }
+
+    /// Finalize a retained `nlink == 0` inode after its last live handle
+    /// closes. Exact Pool reclaim entries are recorded before the inode is
+    /// removed from the next committed root; the orphan marker is retired only
+    /// after state no longer carries the inode.
+    pub(crate) fn finalize_orphan_inode(&mut self, inode_id: InodeId) -> Result<bool> {
+        self.ensure_mutation_allowed("finalize mounted orphan inode")?;
+        self.flush_write_buffer(inode_id)?;
+        let record = match self.inode(inode_id) {
+            Ok(record) => record,
+            Err(FileSystemError::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if record.nlink != 0 {
+            return Ok(false);
+        }
+
+        self.begin_mutation("finalize mounted orphan inode")?;
+        self.account_final_orphan_release(&record);
+        self.record_reclaim_delta(inode_id, record.size);
+        self.record_inode_tombstone(inode_id);
+        if let Some(stored) = Arc::make_mut(&mut self.state.inodes).get_mut(&inode_id) {
+            stored.xattrs.clear();
+        }
+        self.page_cache_evict_inode_unchecked(inode_id);
+        Arc::make_mut(&mut self.state.inodes).remove(&inode_id);
+        self.forget_removed_inode_state(inode_id);
+        self.commit_mutation(())?;
+        let _ = self.queue_orphan_marker_retirement(inode_id)?;
+        Ok(true)
     }
 
     pub fn remove_dir(&mut self, path: impl AsRef<str>) -> Result<()> {
@@ -13774,6 +14144,21 @@ impl LocalFileSystem {
         ancestors
     }
 
+    fn quota_ancestors_for_inode(&self, inode_id: InodeId) -> Vec<InodeId> {
+        for (&parent_id, directory) in self.state.directories.iter() {
+            if directory.values().any(|entry| entry.inode_id == inode_id) {
+                let mut ancestors = self.quota_ancestors_for_parent(parent_id);
+                if !ancestors.contains(&parent_id) {
+                    ancestors.push(parent_id);
+                }
+                return ancestors;
+            }
+        }
+        // Unnamed and open-unlinked inodes remain charged to the mounted
+        // dataset root while no directory lineage exists.
+        vec![ROOT_INODE_ID]
+    }
+
     fn pool_free_bytes_for_quota(&self) -> u64 {
         self.capacity_authority.free_bytes()
     }
@@ -14041,11 +14426,6 @@ impl LocalFileSystem {
 
     fn allocate_inode_id(&mut self) -> InodeId {
         self.state.allocate_inode_id()
-    }
-
-    fn reserve_inode_id(&mut self) -> Result<InodeId> {
-        self.ensure_mutation_allowed("reserve anonymous mounted inode")?;
-        Ok(self.state.reserve_inode_id())
     }
 
     fn bump_generation(&mut self) -> u64 {
@@ -14872,21 +15252,6 @@ mod orphan_index_integration_tests {
     }
 
     #[test]
-    fn mount_time_recover_orphans_reclaims_extents() {
-        let (_root, mut fs) = make_test_fs("oi_test_recover").expect("open");
-        fs.create_file("/doomed", 0o644).expect("create_file");
-        fs.unlink("/doomed").expect("unlink");
-        assert!(!fs.orphan_index.lock().unwrap().is_empty());
-
-        let result = fs.recover_orphans();
-        assert!(result.is_ok(), "recover_orphans should succeed");
-        assert!(
-            fs.orphan_index.lock().unwrap().is_empty(),
-            "orphan index should be cleared after recovery"
-        );
-    }
-
-    #[test]
     fn orphan_index_validate_structural() {
         let (_root, mut fs) = make_test_fs("oi_test_validate").expect("open");
         fs.stop_background_scheduler();
@@ -14904,44 +15269,6 @@ mod orphan_index_integration_tests {
             fs.orphan_index.lock().unwrap().validate().is_ok(),
             "B+tree structure should remain valid"
         );
-    }
-
-    #[test]
-    fn public_orphan_reclaim_api_tracks_and_releases() {
-        let (_root, mut fs) = make_test_fs("oi_test_public_api").expect("open");
-        let inode_id = InodeId::new(88_001);
-        assert!(fs.reclaim_stats().is_idle());
-
-        assert!(
-            fs.track_orphan(inode_id).expect("track orphan"),
-            "first track inserts orphan"
-        );
-        assert!(
-            !fs.track_orphan(inode_id).expect("track orphan again"),
-            "second track is idempotent"
-        );
-        let stats = fs.reclaim_stats();
-        assert_eq!(stats.orphan_index_entries, 1);
-        assert_eq!(stats.pending_orphan_deletions, 0);
-        assert_eq!(stats.reclaim_queue_entries, 0);
-        assert!(!stats.is_idle());
-
-        assert!(
-            fs.release_orphan(inode_id).expect("queue tracked orphan"),
-            "tracked orphan is queued"
-        );
-        assert!(
-            !fs.release_orphan(inode_id).expect("repeat orphan release"),
-            "second release is idempotent"
-        );
-        let stats = fs.reclaim_stats();
-        assert_eq!(stats.orphan_index_entries, 1);
-        assert_eq!(stats.pending_orphan_deletions, 1);
-        assert_eq!(stats.queued_work_items(), 2);
-
-        assert!(!fs
-            .release_orphan(InodeId::new(88_002))
-            .expect("release unknown orphan"));
     }
 
     #[cfg(test)]
@@ -16397,7 +16724,7 @@ mod orphan_index_integration_tests {
 
         fs.unlink("/linked.txt").expect("unlink linked");
         assert!(!fs.orphan_index.lock().unwrap().is_empty());
-        fs.recover_orphans().expect("recover orphans");
+        fs.cleanup_orphans().expect("clean orphan marker");
         assert!(fs.orphan_index.lock().unwrap().is_empty());
     }
 
@@ -17048,21 +17375,34 @@ mod orphan_index_integration_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Verify committed orphan persists and is reclaimed on reopen.
+    /// Verify a committed zero-link inode is reconstructed as an orphan and
+    /// reclaimed before reopen accepts I/O.
     #[test]
-    fn committed_orphan_persists_across_reopen() {
+    fn committed_zero_link_inode_is_reclaimed_on_reopen() {
         let root = std::env::temp_dir().join("oi_wm_persist");
         if root.exists() {
             let _ = std::fs::remove_dir_all(&root);
         }
+        let inode_id;
         {
             let mut fs = LocalFileSystem::open(&root).expect("open");
-            fs.create_file("/persist_me", 0o644).expect("create_file");
-            fs.unlink("/persist_me").expect("unlink");
+            let record = fs
+                .create_unlinked_regular_file(
+                    ROOT_INODE_ID,
+                    tidefs_types_vfs_core::S_IFREG | 0o600,
+                    1000,
+                    1000,
+                    BTreeMap::new(),
+                )
+                .expect("create committed zero-link inode");
+            inode_id = record.inode_id;
+            assert_eq!(record.nlink, 0);
+            assert!(fs.state.inodes.contains_key(&inode_id));
             fs.do_commit().expect("commit");
             assert_eq!(fs.orphan_index.lock().unwrap().len(), 1);
         }
         let fs2 = LocalFileSystem::open(&root).expect("reopen");
+        assert!(!fs2.state.inodes.contains_key(&inode_id));
         assert!(fs2.orphan_index.lock().unwrap().is_empty());
         drop(fs2);
         let _ = std::fs::remove_dir_all(&root);
@@ -18070,8 +18410,7 @@ mod recovery_integration_tests {
             let pool =
                 LocalFileSystem::default_development_pool(&root, &test_options(), None, None)
                     .expect("reopen development pool for verification");
-            let intent_log =
-                IntentLog::load(pool.raw_primary_store()).expect("load intent log");
+            let intent_log = IntentLog::load(pool.raw_primary_store()).expect("load intent log");
             assert!(
                 !intent_log.is_empty(),
                 "ReadOnly open must not replay intent-log entries; pending entries should remain"

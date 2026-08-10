@@ -211,7 +211,7 @@ stub placeholders.
 
 | Opcode | Protocol | Needed for | Deferral reason |
 |---|---|---|---|
-| `FUSE_TMPFILE` | ≥ 7.9 | xfstests O_TMPFILE | No distinct fuser callback in the current daemon; `O_TMPFILE` is handled as an open-flag adjunct, while broader orphan-index lifecycle authority remains separate |
+| `FUSE_TMPFILE` | ≥ 7.9 | xfstests O_TMPFILE | No distinct fuser callback in the current daemon; `O_TMPFILE` is handled as an open-flag adjunct and uses the same Pool-backed zero-link inode lifetime as open-unlinked files |
 | `FUSE_COPY_FILE_RANGE_64` | ≥ 7.45 | Large file clone | No distinct daemon callback in the current fuser surface; current `copy_file_range()` is implemented and tested |
 
 ---

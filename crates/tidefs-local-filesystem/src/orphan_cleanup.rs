@@ -57,8 +57,9 @@ impl OrphanCleanupStats {
 /// Called from `LocalFileSystem::open` after intent log replay and before
 /// background services start.  For each orphaned inode:
 ///
-/// 1. If the inode still exists in the inode table with nlink > 0 but no
-///    directory entry points at it, treat only the orphan-index entry as stale.
+/// 1. If the inode still exists in the inode table with nlink > 0, treat only
+///    the orphan-index entry as stale. The committed inode and namespace own
+///    reachability; this index is a reconstructible cleanup accelerator.
 /// 2. If the inode still exists in the inode table with nlink==0, remove it.
 /// 3. Scan all directories for stale entries pointing to this inode and
 ///    remove them.
@@ -66,10 +67,9 @@ impl OrphanCleanupStats {
 /// 5. Remove the orphan index entry.
 ///
 /// Inodes with nlink > 0 that appear in the orphan index are inconsistent.
-/// If they still have directory entries, the orphan index wins and the entries
-/// are stale unlink remnants. If they have no directory entry, cleanup leaves
-/// the inode content alone to avoid destroying an unreachable but still-linked
-/// record and removes only the orphan index entry.
+/// Cleanup leaves the committed inode and namespace untouched and removes only
+/// the stale index entry. An auxiliary index must never overrule a committed
+/// live inode and delete reachable data.
 pub(crate) fn cleanup_orphans(
     state: &mut crate::FileSystemState,
     orphan_index: &Arc<Mutex<OrphanIndex>>,
@@ -99,12 +99,7 @@ pub(crate) fn cleanup_orphans(
         //    removed. The mounted caller already queued exact content and
         //    inode keys through Pool authority; remove only metadata here.
         if let Some(record) = state.inodes.get(&inode_id) {
-            let has_directory_entry = state
-                .directories
-                .values()
-                .any(|dir| dir.values().any(|entry| entry.inode_id == inode_id));
-
-            if record.nlink == 0 || has_directory_entry {
+            if record.nlink == 0 {
                 let was_directory = record.carries_child_namespace();
 
                 Arc::make_mut(&mut state.inodes).remove(&inode_id);
@@ -119,8 +114,8 @@ pub(crate) fn cleanup_orphans(
                 }
                 stats.inodes_removed_from_state += 1;
             } else {
-                // nlink > 0 with no directory entry: inconsistent but no
-                // reachable stale name exists. Remove only the orphan marker.
+                // A live committed inode always wins over a stale derivative
+                // orphan marker, whether or not a directory entry is visible.
                 orphan_index.lock().unwrap().remove(inode_id_raw);
                 stats.orphans_cleaned += 1;
                 continue;
@@ -221,11 +216,6 @@ fn reconcile_directory_topology(state: &mut crate::FileSystemState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags};
-
-    fn orphan_entry(inode_id: u64) -> OrphanEntry {
-        OrphanEntry::new(inode_id, inode_id, 0, OrphanEntryFlags::NONE)
-    }
     use std::collections::BTreeMap;
     use std::sync::Arc as StdArc;
 
@@ -308,7 +298,7 @@ mod tests {
         let mut state = make_cleanup_state();
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(999, orphan_entry(999));
+            idx.insert(999);
             idx
         }));
         let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
@@ -347,7 +337,7 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(42, orphan_entry(42));
+            idx.insert(42);
             idx
         }));
         let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
@@ -360,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_with_nlink_positive_and_directory_entry_is_reclaimed() {
+    fn stale_orphan_marker_does_not_delete_linked_inode() {
         let mut state = make_cleanup_state();
         let orphan_inode_id = InodeId::new(77);
         let orphan_inode = InodeRecord {
@@ -371,7 +361,7 @@ mod tests {
             mode: 0o644,
             uid: 1000,
             gid: 1000,
-            nlink: 1, // stale positive nlink; orphan index is authoritative
+            nlink: 1,
             size: 1024,
             data_version: 3,
             metadata_version: 3,
@@ -400,23 +390,29 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(77, orphan_entry(77));
+            idx.insert(77);
             idx
         }));
         let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
 
         assert_eq!(stats.orphans_found, 1);
         assert_eq!(stats.orphans_cleaned, 1);
-        assert_eq!(stats.inodes_removed_from_state, 1);
-        assert_eq!(stats.directory_entries_removed, 1);
-        assert!(!state.inodes.contains_key(&orphan_inode_id));
+        assert_eq!(stats.inodes_removed_from_state, 0);
+        assert_eq!(stats.directory_entries_removed, 0);
+        assert!(state.inodes.contains_key(&orphan_inode_id));
         let root_dir = state.directories.get(&ROOT_INODE_ID).unwrap();
-        assert!(!root_dir.contains_key(b"linked.txt".as_slice()));
+        assert_eq!(
+            root_dir
+                .get(b"linked.txt".as_slice())
+                .expect("linked entry must survive stale orphan marker")
+                .inode_id,
+            orphan_inode_id
+        );
         assert!(orphan_index.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn orphan_directory_reconciles_parent_link_count() {
+    fn stale_orphan_marker_does_not_delete_linked_directory() {
         let mut state = make_cleanup_state();
         let orphan_inode_id = InodeId::new(88);
         let orphan_inode = InodeRecord {
@@ -461,17 +457,25 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(88, orphan_entry(88));
+            idx.insert(88);
             idx
         }));
         let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
 
-        assert_eq!(stats.directory_entries_removed, 1);
-        assert!(!state.inodes.contains_key(&orphan_inode_id));
-        assert!(!state.directories.contains_key(&orphan_inode_id));
+        assert_eq!(stats.inodes_removed_from_state, 0);
+        assert_eq!(stats.directory_entries_removed, 0);
+        assert!(state.inodes.contains_key(&orphan_inode_id));
+        assert!(state.directories.contains_key(&orphan_inode_id));
         let root = state.inodes.get(&ROOT_INODE_ID).unwrap();
-        assert_eq!(root.size, 0);
-        assert_eq!(root.nlink, 2);
+        assert_eq!(root.nlink, 3);
+        assert_eq!(
+            state.directories[&ROOT_INODE_ID]
+                .get(b"stale-dir".as_slice())
+                .expect("linked directory must survive stale orphan marker")
+                .inode_id,
+            orphan_inode_id
+        );
+        assert!(orphan_index.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -502,7 +506,7 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(78, orphan_entry(78));
+            idx.insert(78);
             idx
         }));
         let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
@@ -537,7 +541,7 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(55, orphan_entry(55));
+            idx.insert(55);
             idx
         }));
         let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
@@ -564,7 +568,7 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(33, orphan_entry(33));
+            idx.insert(33);
             idx
         }));
         let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
@@ -584,7 +588,7 @@ mod tests {
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
             for i in 1..=50u64 {
-                idx.insert(i, orphan_entry(i));
+                idx.insert(i);
             }
             idx
         }));
@@ -600,8 +604,8 @@ mod tests {
         let mut state = make_cleanup_state();
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(1, orphan_entry(1));
-            idx.insert(2, orphan_entry(2));
+            idx.insert(1);
+            idx.insert(2);
             idx
         }));
         let stats1 = cleanup_orphans(&mut state, &orphan_index).expect("first cleanup");
@@ -630,7 +634,7 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(42, orphan_entry(42));
+            idx.insert(42);
             idx
         }));
         let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");

@@ -5,8 +5,9 @@
 //! under per-tick budget control. On each `tick()`, the service scans
 //! the orphan index for inode IDs, stores them in a shared pending-deletions
 //! buffer, and advances the cursor. The owning `LocalFileSystem` drains
-//! the buffer after each scheduler cycle and performs the actual
-//! content-object deletion.
+//! the buffer after each scheduler cycle and retires only markers whose
+//! canonical committed inode state is linked or absent. A zero-link inode is
+//! retained until final engine-handle close or mount recovery finalizes it.
 //!
 //! ## Orphan recovery model
 //!
@@ -26,8 +27,8 @@ use tidefs_types_orphan_index_core::{OrphanCursor, OrphanRecoveryBudget};
 ///
 /// Holds a shared reference to the orphan index and a shared pending-deletions
 /// buffer. On each tick, scans the index under budget and pushes recovered
-/// inode IDs to the buffer. The filesystem drains the buffer and performs
-/// content-object deletion after each scheduler cycle.
+/// inode IDs to the buffer. The filesystem drains the buffer and retires stale
+/// derivative markers after consulting committed inode state.
 pub struct BackgroundOrphanReclamation {
     orphan_index: Arc<Mutex<OrphanIndex>>,
     pending_deletions: Arc<Mutex<Vec<u64>>>,
@@ -127,11 +128,6 @@ impl BackgroundService for BackgroundOrphanReclamation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags};
-
-    fn orphan_entry(inode_id: u64) -> OrphanEntry {
-        OrphanEntry::new(inode_id, inode_id, 0, OrphanEntryFlags::NONE)
-    }
 
     #[test]
     fn service_starts_with_has_work_false_on_empty_index() {
@@ -144,7 +140,7 @@ mod tests {
     #[test]
     fn has_work_true_when_orphans_present() {
         let mut idx = OrphanIndex::new();
-        idx.insert(42, orphan_entry(42));
+        idx.insert(42);
         let idx = Arc::new(Mutex::new(idx));
         let pending = Arc::new(Mutex::new(Vec::new()));
         let svc = BackgroundOrphanReclamation::new(idx, pending);
@@ -155,7 +151,7 @@ mod tests {
     fn tick_populates_pending_deletions() {
         let mut idx = OrphanIndex::new();
         for i in 1..=5u64 {
-            idx.insert(i, orphan_entry(i));
+            idx.insert(i);
         }
         let idx = Arc::new(Mutex::new(idx));
         let pending = Arc::new(Mutex::new(Vec::new()));
@@ -187,7 +183,7 @@ mod tests {
     fn cursor_advances_across_ticks() {
         let mut idx = OrphanIndex::new();
         for i in 1..31u64 {
-            idx.insert(i, orphan_entry(i));
+            idx.insert(i);
         }
         let idx = Arc::new(Mutex::new(idx));
         let pending = Arc::new(Mutex::new(Vec::new()));

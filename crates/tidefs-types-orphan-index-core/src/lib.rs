@@ -807,9 +807,9 @@ impl OrphanRecoveryBudget {
 
 /// Outcome of a single bounded-batch recovery pass.
 ///
-/// Returned by `recover_orphans()` (Phase 2+ implementation).  The
-/// structure is defined here because the stats and cursor types are
-/// needed by callers for progress reporting and observability.
+/// Returned by `OrphanIndex::batch_recover()`. The structure is defined here
+/// because callers need the stats and cursor for bounded progress reporting
+/// and observability.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OrphanRecoveryOutcome {
     /// Statistics for this batch.

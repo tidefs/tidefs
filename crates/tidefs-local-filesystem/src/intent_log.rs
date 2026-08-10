@@ -2685,13 +2685,11 @@ fn selected_for_pool_replay(
     committed_base: &IntentLogRootAnchor,
 ) -> bool {
     match selection {
-        PoolReplaySelection::AfterCommittedBase => pool_replay_target_generation(
-            &entry.entry_kind,
-        )
-        .map_or_else(
-            || entry.root_anchor.transaction_id > committed_base.transaction_id,
-            |target_generation| target_generation > committed_base.generation,
-        ),
+        PoolReplaySelection::AfterCommittedBase => pool_replay_target_generation(&entry.entry_kind)
+            .map_or_else(
+                || entry.root_anchor.transaction_id > committed_base.transaction_id,
+                |target_generation| target_generation > committed_base.generation,
+            ),
         PoolReplaySelection::LiveDataOnly => match &entry.entry_kind {
             IntentLogEntryKind::SyncWriteRange { data_version, .. }
             | IntentLogEntryKind::OdsyncDataRange { data_version, .. }

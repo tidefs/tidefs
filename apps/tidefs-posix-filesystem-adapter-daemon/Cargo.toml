@@ -35,7 +35,6 @@ tidefs-posix-semantics = { workspace = true }
 tidefs-background-scheduler = { workspace = true }
 tidefs-performance-contract = { workspace = true, features = ["serde"], optional = true }
 tidefs-local-object-store = { workspace = true }
-tidefs-orphan-index = { workspace = true }
 
 tidefs-recovery-loop = { workspace = true }
 

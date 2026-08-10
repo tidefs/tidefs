@@ -470,9 +470,10 @@ projection slice:
   `legacy_from_versions` to fabricate POSIX timestamps from storage fields.
   Version < 5 inode records now produce a clean decode error per
   `docs/UNRELEASED_AUTHORITY_POLICY.md`.
-- **Fixed**: `update_anonymous_size` in the VFS engine no longer derives a
-  synthetic version counter from `mtime_ns`.  It uses wall-clock time for
-  POSIX timestamp advancement and a separate counter for `subtree_rev`.
+- **Removed**: the VFS-only `update_anonymous_size` path and its separate
+  temporary-file state. `O_TMPFILE` and open-unlinked handles retain the
+  canonical `InodeRecord`; ordinary LocalFileSystem mutations own POSIX time,
+  data/metadata versions, and subtree revision updates.
 - **Verified**: `InodeRecord::to_inode_attr` correctly projects `posix_time`
   fields into POSIX attributes and `data_version` / `metadata_version` into
   storage identity fields.  The encode path (`encode_inode`) always writes

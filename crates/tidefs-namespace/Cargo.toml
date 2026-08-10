@@ -21,7 +21,6 @@ that the FUSE adapter and higher-level filesystem consumers call.
 tidefs-btree = { workspace = true }
 tidefs-dir-index = { workspace = true }
 tidefs-types-polymorphic-directory-index-core = { workspace = true, features = ["alloc"] }
-tidefs-orphan-index = { workspace = true }
 tidefs-types-vfs-core = { workspace = true }
 tidefs-intent-log = { workspace = true }
 rustc-hash = "2"
