@@ -116,7 +116,8 @@ proptest! {
         fs.truncate_file("/data.bin", trunc_len).expect("truncate file");
 
         let read_back = fs.read_file("/data.bin").expect("read file");
-        let expected: Vec<u8> = initial.iter().take(trunc_len as usize).copied().collect();
+        let mut expected = initial;
+        expected.resize(trunc_len as usize, 0);
         prop_assert_eq!(read_back, expected);
 
         prop_cleanup(&root);
