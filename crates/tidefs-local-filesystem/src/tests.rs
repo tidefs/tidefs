@@ -4842,7 +4842,7 @@ fn rollback_without_transaction_is_rejected() {
 }
 
 #[test]
-fn fsync_data_only_persists_content_without_metadata() {
+fn fsync_data_only_persists_content_and_required_reachability() {
     let root = temp_root("fsync-data-only");
     let content = b"dsync content";
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
@@ -4855,20 +4855,16 @@ fn fsync_data_only_persists_content_without_metadata() {
     // Metadata is dirty (new inode, dir entry), content is dirty.
     assert!(fs.has_dirty_metadata());
     fs.fsync_data_only().expect("fsync data only");
-    // Content was synced to disk but metadata may still be dirty.
-    // Data survives reopen if we force-commit via another path.
+    // fdatasync may omit unrelated metadata, but it must preserve the inode
+    // and namespace state required to retrieve every acknowledged byte.
     drop(fs);
-    // Without a metadata commit, the file may not be reachable.
-    // But if we reopen and commit, the content objects are present.
-    // Test: reopen and verify that a subsequent metadata commit
-    // makes the file reachable.
-    {
-        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        fs.set_auto_commit(false)
-            .expect("test setup mutation must be admitted");
-        // File should not be reachable yet (metadata wasn't committed).
-        assert!(fs.lookup("/dsync.txt").is_err());
-    }
+    let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        fs.read_file("/dsync.txt")
+            .expect("read fdatasync content after reopen"),
+        content.to_vec()
+    );
+    drop(fs);
     cleanup(&root);
 }
 
