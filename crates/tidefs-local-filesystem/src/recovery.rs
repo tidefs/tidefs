@@ -3219,9 +3219,13 @@ pub(crate) fn validate_namespace_invariants(
                 return Err(FileSystemError::CorruptState { reason: "mount invariant gate: directory link count does not match child-directory topology" });
             }
         } else {
-            if refs == 0 {
+            // A live handle may retain a canonical file-like inode after its
+            // last directory entry is removed. Its committed nlink == 0 state
+            // is the crash-recovery authority; mount-time orphan cleanup
+            // removes it before accepting new handles.
+            if refs == 0 && inode.nlink != 0 {
                 return Err(FileSystemError::CorruptState {
-                    reason: "mount invariant gate: non-directory inode is unreachable",
+                    reason: "mount invariant gate: linked non-directory inode is unreachable",
                 });
             }
             if u64::from(inode.nlink) != refs {
@@ -3231,7 +3235,13 @@ pub(crate) fn validate_namespace_invariants(
     }
 
     let reachable = reachable_inodes_from_root(inodes, directories)?;
-    if reachable.len() != inodes.len() {
+    // Zero-link file-like inodes are intentionally outside namespace
+    // reachability while an open handle keeps them live.
+    let zero_link_orphans = inodes
+        .values()
+        .filter(|inode| !inode.carries_child_namespace() && inode.nlink == 0)
+        .count();
+    if reachable.len().saturating_add(zero_link_orphans) != inodes.len() {
         return Err(FileSystemError::CorruptState {
             reason: "mount invariant gate: committed root contains unreachable inode records",
         });
