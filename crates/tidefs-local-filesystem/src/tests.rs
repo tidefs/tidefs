@@ -4454,13 +4454,14 @@ fn invalid_newer_same_slot_root_falls_back_to_previous_version_without_operator_
     let same_slot = root_slot_for_transaction(bad_transaction_id);
     assert_eq!(same_slot, root_slot_for_transaction(committed_generation));
     fs.store
+        .raw_primary_store_mut()
         .put(
-            DeviceIoClass::Data,
             root_slot_object_key(same_slot),
             b"newer same-slot root candidate with invalid filesystem meaning",
         )
         .expect("write invalid same-slot root candidate");
     fs.store
+        .raw_primary_store_mut()
         .sync_all()
         .expect("sync invalid same-slot root candidate");
     drop(fs);
