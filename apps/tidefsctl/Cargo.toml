@@ -26,6 +26,7 @@ cluster = [
     "dep:tidefs-cluster",
     "dep:tidefs-membership-epoch",
     "dep:tidefs-transport",
+    "tidefs-local-object-store/cluster-import",
     "tidefs-posix-filesystem-adapter-daemon/cluster",
 ]
 diagnostics = ["dep:tidefs-validation"]

@@ -49,8 +49,9 @@ tracing = { workspace = true }
 
 [features]
 default = []
+cluster-import = ["dep:tidefs-cluster"]
 distributed-repair = [
-    "dep:tidefs-cluster",
+    "cluster-import",
     "dep:tidefs-membership-epoch",
     "dep:tidefs-replication-model",
     "dep:tidefs-erasure-coding",
