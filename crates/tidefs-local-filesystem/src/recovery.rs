@@ -595,11 +595,22 @@ fn verify_online_source<S: CommittedRootRecoverySource>(
                         .saturating_add(root_report.verified_snapshot_roots);
                     report.verified_committed_roots.push(root_report);
                     for mut issue in slot_issues.drain(..) {
-                        issue.severity = OnlineVerifierIssueSeverity::Warning;
-                        issue.reason = format!(
-                            "stale same-slot root candidate ignored after validating fallback root: {}",
-                            issue.reason
-                        );
+                        if matches!(
+                            issue.kind,
+                            OnlineVerifierIssueKind::RootCommitValidation
+                                | OnlineVerifierIssueKind::SnapshotRootValidation
+                        ) {
+                            issue.reason = format!(
+                                "newer committed root failed validation before fallback root was selected: {}",
+                                issue.reason
+                            );
+                        } else {
+                            issue.severity = OnlineVerifierIssueSeverity::Warning;
+                            issue.reason = format!(
+                                "stale same-slot root candidate ignored after validating fallback root: {}",
+                                issue.reason
+                            );
+                        }
                         report.issues.push(issue);
                     }
                     slot_verified = true;

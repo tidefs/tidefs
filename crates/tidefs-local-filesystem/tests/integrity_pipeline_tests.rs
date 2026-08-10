@@ -110,6 +110,10 @@ fn corrupt_all_object_payload_versions(store: &LocalObjectStore, key: ObjectKey)
         let path = seg_path(store.segments_dir(), location.segment_id);
         corrupt_bytes(&path, location.payload_offset + location.payload_len / 2, 1);
     }
+    assert!(
+        store.get(key).is_err(),
+        "corruption injection must invalidate the selected current object"
+    );
 }
 
 fn corrupt_record_trailer(store: &LocalObjectStore, key: ObjectKey) {
