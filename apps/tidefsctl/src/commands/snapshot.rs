@@ -5,6 +5,7 @@
 //! create, list, destroy, send, and receive point-in-time snapshot state.
 
 use std::fs;
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process;
@@ -16,6 +17,7 @@ use tidefs_local_filesystem::{
     SnapshotKind, SnapshotRetentionPolicy, SnapshotRetentionReport, SnapshotSummary,
 };
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
@@ -23,16 +25,26 @@ use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 // Snapshot network transfer protocol (simple VFSSEND1 push/pull via VSNP)
 // ---------------------------------------------------------------------------
 
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 const SNAP_NET_MAGIC: &[u8; 4] = b"VSNP";
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 const SNAP_KIND_ERROR: u8 = 0;
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 const SNAP_KIND_PUSH: u8 = 1;
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 const SNAP_KIND_PULL_REQUEST: u8 = 2;
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 const SNAP_KIND_PULL_RESPONSE: u8 = 3;
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 pub(crate) const SNAP_KIND_ACK: u8 = 4;
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 pub(crate) const SNAP_KIND_BLOCK_PUSH: u8 = 5;
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 pub(crate) const SNAP_KIND_BLOCK_PULL_REQUEST: u8 = 6;
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 pub(crate) const SNAP_KIND_BLOCK_PULL_RESPONSE: u8 = 7;
 
+#[cfg(feature = "remote-snapshot")]
 pub(crate) fn build_push_message(export: &[u8], auth_key: &[u8; 32]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(4 + 1 + 4 + 32 + 4 + export.len());
     msg.extend_from_slice(SNAP_NET_MAGIC);
@@ -45,6 +57,7 @@ pub(crate) fn build_push_message(export: &[u8], auth_key: &[u8; 32]) -> Vec<u8> 
 }
 
 #[allow(dead_code)]
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 pub(crate) fn build_ack(message: &str) -> Vec<u8> {
     let b = message.as_bytes();
     let mut msg = Vec::with_capacity(4 + 1 + 4 + b.len());
@@ -56,7 +69,7 @@ pub(crate) fn build_ack(message: &str) -> Vec<u8> {
 }
 
 #[allow(dead_code)]
-
+#[cfg(feature = "block-volume")]
 pub(crate) fn build_block_push_message(
     block_data: &[u8],
     device_name: &str,
@@ -75,6 +88,7 @@ pub(crate) fn build_block_push_message(
     msg
 }
 
+#[cfg(feature = "block-volume")]
 pub(crate) fn build_block_pull_request(device_name: &str, auth_key: &[u8; 32]) -> Vec<u8> {
     let name_bytes = device_name.as_bytes();
     let mut msg = Vec::with_capacity(4 + 1 + 4 + 32 + 4 + name_bytes.len());
@@ -88,6 +102,7 @@ pub(crate) fn build_block_pull_request(device_name: &str, auth_key: &[u8; 32]) -
 }
 
 #[allow(dead_code)]
+#[cfg(feature = "block-volume")]
 pub(crate) fn build_block_pull_response(block_data: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(4 + 1 + 4 + block_data.len());
     msg.extend_from_slice(SNAP_NET_MAGIC);
@@ -98,6 +113,7 @@ pub(crate) fn build_block_pull_response(block_data: &[u8]) -> Vec<u8> {
 }
 
 #[allow(dead_code)]
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 pub(crate) fn build_error(message: &str) -> Vec<u8> {
     let b = message.as_bytes();
     let mut msg = Vec::with_capacity(4 + 1 + 4 + b.len());
@@ -109,6 +125,7 @@ pub(crate) fn build_error(message: &str) -> Vec<u8> {
 }
 
 #[allow(dead_code)]
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 pub(crate) enum SnapNetMessage {
     Push { auth_key: [u8; 32], export: Vec<u8> },
     PullRequest { auth_key: [u8; 32] },
@@ -117,6 +134,7 @@ pub(crate) enum SnapNetMessage {
     Error { message: String },
 }
 
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 pub(crate) fn parse_snap_net_message(data: &[u8]) -> Result<SnapNetMessage, String> {
     if data.len() < 9 {
         return Err("message too short for VSNP header".into());
@@ -216,6 +234,7 @@ pub(crate) fn parse_snap_net_message(data: &[u8]) -> Result<SnapNetMessage, Stri
     }
 }
 
+#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 pub(crate) fn transport_request(
     local_node_id: u64,
     remote_node_id: u64,
@@ -735,6 +754,7 @@ pub struct SnapshotSendArgs {
     #[arg(long = "output", short = 'o')]
     pub output: Option<PathBuf>,
 
+    #[cfg(feature = "remote-snapshot")]
     /// Push the stream to a remote storage-node via transport.
     #[arg(
         long = "target-addr",
@@ -743,9 +763,11 @@ pub struct SnapshotSendArgs {
     )]
     pub target_addr: Option<SocketAddr>,
 
+    #[cfg(feature = "remote-snapshot")]
     #[arg(long = "node-id", requires = "target-addr")]
     pub node_id: Option<u64>,
 
+    #[cfg(feature = "remote-snapshot")]
     #[arg(long = "server-node-id", requires = "target-addr")]
     pub server_node_id: Option<u64>,
 
@@ -790,6 +812,7 @@ pub struct SnapshotReceiveArgs {
     #[arg(long = "input", short = 'i')]
     pub input: Option<PathBuf>,
 
+    #[cfg(feature = "remote-snapshot")]
     /// Pull a stream from a remote storage-node via transport.
     #[arg(
         long = "source-addr",
@@ -798,9 +821,11 @@ pub struct SnapshotReceiveArgs {
     )]
     pub source_addr: Option<SocketAddr>,
 
+    #[cfg(feature = "remote-snapshot")]
     #[arg(long = "node-id", requires = "source_addr")]
     pub node_id: Option<u64>,
 
+    #[cfg(feature = "remote-snapshot")]
     #[arg(long = "server-node-id", requires = "source_addr")]
     pub server_node_id: Option<u64>,
 
@@ -2056,16 +2081,19 @@ fn handle_send(args: SnapshotSendArgs) {
                 args.output.as_ref().map(|path| path.display().to_string()),
             ),
         ),
+        #[cfg(feature = "remote-snapshot")]
         (
             "target_addr",
             super::live_owner::live_admin_optional_string(
                 args.target_addr.map(|addr| addr.to_string()),
             ),
         ),
+        #[cfg(feature = "remote-snapshot")]
         (
             "node_id",
             super::live_owner::live_admin_optional_u64(args.node_id),
         ),
+        #[cfg(feature = "remote-snapshot")]
         (
             "server_node_id",
             super::live_owner::live_admin_optional_u64(args.server_node_id),
@@ -2175,6 +2203,7 @@ fn handle_send(args: SnapshotSendArgs) {
     };
 
     // Network push: send the encoded export + auth key to a remote storage-node.
+    #[cfg(feature = "remote-snapshot")]
     if let Some(addr) = args.target_addr {
         let node_id = args.node_id.unwrap_or(1);
         let server_node_id = args.server_node_id.unwrap_or(2);
@@ -2223,7 +2252,10 @@ fn handle_send(args: SnapshotSendArgs) {
     let output = match &args.output {
         Some(p) => p.clone(),
         None => {
+            #[cfg(feature = "remote-snapshot")]
             eprintln!("tidefsctl snapshot send: --output or --target-addr required");
+            #[cfg(not(feature = "remote-snapshot"))]
+            eprintln!("tidefsctl snapshot send: --output required");
             process::exit(1);
         }
     };
@@ -2268,16 +2300,19 @@ fn snapshot_receive_live_args(args: &SnapshotReceiveArgs) -> LivePoolAdminArgs {
                 args.input.as_ref().map(|path| path.display().to_string()),
             ),
         ),
+        #[cfg(feature = "remote-snapshot")]
         (
             "source_addr",
             super::live_owner::live_admin_optional_string(
                 args.source_addr.map(|addr| addr.to_string()),
             ),
         ),
+        #[cfg(feature = "remote-snapshot")]
         (
             "node_id",
             super::live_owner::live_admin_optional_u64(args.node_id),
         ),
+        #[cfg(feature = "remote-snapshot")]
         (
             "server_node_id",
             super::live_owner::live_admin_optional_u64(args.server_node_id),
@@ -2403,8 +2438,11 @@ mod tests {
             pool: None,
             devices: None,
             output: Some(PathBuf::from("/tmp/stream.vfssend1")),
+            #[cfg(feature = "remote-snapshot")]
             target_addr: None,
+            #[cfg(feature = "remote-snapshot")]
             node_id: None,
+            #[cfg(feature = "remote-snapshot")]
             server_node_id: None,
             format: "vfssend1".into(),
             incremental: false,
@@ -2414,6 +2452,7 @@ mod tests {
         };
         assert_eq!(args.backing_dir, Some(PathBuf::from("/tmp/pool")));
         assert_eq!(args.output, Some(PathBuf::from("/tmp/stream.vfssend1")));
+        #[cfg(feature = "remote-snapshot")]
         assert!(args.target_addr.is_none());
     }
 
@@ -2423,17 +2462,22 @@ mod tests {
             pool: "mypool".into(),
             backing_dir: None,
             input: Some(PathBuf::from("/tmp/stream.vfssend1")),
+            #[cfg(feature = "remote-snapshot")]
             source_addr: None,
+            #[cfg(feature = "remote-snapshot")]
             node_id: None,
+            #[cfg(feature = "remote-snapshot")]
             server_node_id: None,
             merge_policy: None,
         };
         assert_eq!(args.pool, "mypool");
         assert_eq!(args.backing_dir, None);
         assert_eq!(args.input, Some(PathBuf::from("/tmp/stream.vfssend1")));
+        #[cfg(feature = "remote-snapshot")]
         assert!(args.source_addr.is_none());
     }
 
+    #[cfg(feature = "remote-snapshot")]
     #[test]
     fn snapshot_receive_live_args_exclude_offline_media() {
         let args = SnapshotReceiveArgs {

@@ -158,6 +158,16 @@ be migrated into that carrier, not independent product architectures. Ordinary
 development is selected by this contract, current source, and live issues and
 pull requests; publication claims do not select or block that work.
 
+The default `tidefsctl` build is this local pool, mount, device, dataset,
+snapshot, defrag, live-owner, and status carrier. Block-volume commands,
+cluster authority, remote snapshot transport, kernel/validation diagnostics,
+receive-merge inspection, and storage-intent policy inspection remain in the
+same CLI source behind the explicit `block-volume`, `cluster`,
+`remote-snapshot`, `diagnostics`, `receive-merge`, and `storage-intent`
+features. Packaging that needs every retained development surface selects the
+`full` feature explicitly; the default does not carry unavailable commands in
+its parser, help, or command-classification registry.
+
 ## Current Policy
 
 - License: `GPL-2.0-only WITH Linux-syscall-note`.

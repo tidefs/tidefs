@@ -10,13 +10,16 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::Args;
+#[cfg(feature = "cluster")]
 use std::net::SocketAddr;
+#[cfg(feature = "cluster")]
 use tidefs_cluster::pool_lease_token::PoolLeaseToken;
+#[cfg(feature = "cluster")]
 use tidefs_cluster::pool_protocol::{ClusterPoolLeaseRequest, ClusterPoolMessage};
 use tidefs_encryption;
 use tidefs_local_filesystem::RootAuthenticationKey;
+#[cfg(feature = "cluster")]
 use tidefs_transport::{NodeInfo, Transport, TransportAddr};
-use tidefs_types_pool_label_core::features;
 use tidefs_vfs_engine::LivePoolAdminArg;
 
 /// `pool mount <pool_name> <mount_point> [--devices <dev>...] [--read-only] [--relatime]`
@@ -75,17 +78,20 @@ pub struct PoolMountArgs {
     #[arg(long = "encryption-salt")]
     pub encryption_salt: Option<String>,
 
+    #[cfg(feature = "cluster")]
     /// Request cluster-authoritative mount. When set, the pool must have
     /// CLUSTER_POOL_INCOMPAT labels and the mount must go through cluster
     /// authority instead of offline local storage.
     #[arg(long = "cluster", default_value_t = false)]
     pub cluster: bool,
 
+    #[cfg(feature = "cluster")]
     /// Cluster storage-node address for lease acquisition and authority.
     /// Required when --cluster is set. Format: host:port.
     #[arg(long = "cluster-node-addr")]
     pub cluster_node_addr: Option<String>,
 
+    #[cfg(feature = "cluster")]
     /// Node identifier for this cluster client (nonzero).
     /// Required when --cluster is set.
     #[arg(long = "cluster-node-id")]
@@ -231,6 +237,7 @@ pub fn handle_mount(args: PoolMountArgs) {
         ("dataset", LivePoolAdminArg::String(args.dataset.clone())),
     ]);
 
+    #[cfg(feature = "cluster")]
     // Cluster mount parameter validation: when --cluster is set,
     // refuse missing or invalid parameters before any pool work.
     if args.cluster {
@@ -324,6 +331,7 @@ pub fn handle_mount(args: PoolMountArgs) {
         println!("  options: {}", mount_options.join(","));
     }
     // Cluster label validation and lease acquisition.
+    #[cfg(feature = "cluster")]
     let mount_authority = if args.cluster {
         match validate_cluster_pool_labels(&backing_dir, &args.devices) {
             Ok(()) => {
@@ -488,6 +496,8 @@ pub fn handle_mount(args: PoolMountArgs) {
     } else {
         tidefs_posix_filesystem_adapter_daemon::MountAuthority::standalone()
     };
+    #[cfg(not(feature = "cluster"))]
+    let mount_authority = tidefs_posix_filesystem_adapter_daemon::MountAuthority::standalone();
 
     let import_owner = match tidefs_pool_import::pool_import_owned(
         devices,
@@ -687,6 +697,7 @@ fn hex_decode_salt(hex: &str) -> Result<[u8; tidefs_encryption::key_hierarchy::S
 ///
 /// Used during cluster mount to correlate the lease request with the
 /// correct pool on the storage-node.
+#[cfg(feature = "cluster")]
 fn read_pool_guid(
     backing_dir: &std::path::Path,
     devices: &Option<Vec<std::path::PathBuf>>,
@@ -720,6 +731,7 @@ fn read_pool_guid(
 /// Scans device-label files in the backing directory or the provided
 /// device paths. Returns Ok(()) when all labels are clustered, or Err
 /// with a message when labels are missing, not clustered, or unreadable.
+#[cfg(feature = "cluster")]
 fn validate_cluster_pool_labels(
     backing_dir: &std::path::Path,
     devices: &Option<Vec<std::path::PathBuf>>,
@@ -794,8 +806,11 @@ mod tests {
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,
+            #[cfg(feature = "cluster")]
             cluster: false,
+            #[cfg(feature = "cluster")]
             cluster_node_addr: None,
+            #[cfg(feature = "cluster")]
             cluster_node_id: None,
             pool_name: "testpool".into(),
             mount_point: PathBuf::from("/mnt/tidefs"),
@@ -821,8 +836,11 @@ mod tests {
             encryption_passphrase: None,
             encryption_salt: None,
             dataset: "root".into(),
+            #[cfg(feature = "cluster")]
             cluster: false,
+            #[cfg(feature = "cluster")]
             cluster_node_addr: None,
+            #[cfg(feature = "cluster")]
             cluster_node_id: None,
         };
         assert!(args.read_only);
@@ -840,8 +858,11 @@ mod tests {
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,
+            #[cfg(feature = "cluster")]
             cluster: false,
+            #[cfg(feature = "cluster")]
             cluster_node_addr: None,
+            #[cfg(feature = "cluster")]
             cluster_node_id: None,
         };
         assert!(args.relatime);
@@ -859,8 +880,11 @@ mod tests {
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,
+            #[cfg(feature = "cluster")]
             cluster: false,
+            #[cfg(feature = "cluster")]
             cluster_node_addr: None,
+            #[cfg(feature = "cluster")]
             cluster_node_id: None,
         };
         assert_eq!(args.pool_name, "full");

@@ -35,7 +35,7 @@ use tidefs_posix_filesystem_adapter_daemon::{self, MountAuthority, MountConfig};
     version = env!("CARGO_PKG_VERSION"),
     about = "TideFS operator CLI and development harnesses",
     long_about = commands::classification::root_long_about(),
-    after_help = "Start with `tidefsctl pool --help`, `tidefsctl dataset --help`, `tidefsctl kernel --help`, or `tidefsctl diag --help`. Command classification is checked by the repo authority docs and claims gate.",
+    after_help = commands::classification::root_after_help(),
     arg_required_else_help = true,
 )]
 struct Cli {
@@ -94,6 +94,7 @@ enum Command {
         cmd: commands::dataset::DatasetCommand,
     },
 
+    #[cfg(feature = "storage-intent")]
     /// Explain supplied storage-intent policy, receipt, and evidence records
     StorageIntent {
         #[command(subcommand)]
@@ -110,29 +111,34 @@ enum Command {
         recursive: bool,
     },
 
+    #[cfg(feature = "cluster")]
     /// Manage cluster prototypes and development diagnostics
     Cluster {
         #[command(subcommand)]
         cmd: commands::cluster::ClusterCommand,
     },
 
+    #[cfg(feature = "block-volume")]
     /// Manage ublk block devices backed by a TideFS pool
     Block {
         #[command(subcommand)]
         cmd: commands::block::BlockCommand,
     },
 
+    #[cfg(feature = "diagnostics")]
     /// Inspect kernel-resident TideFS control surfaces
     Kernel {
         #[command(subcommand)]
         cmd: commands::kernel::KernelCommand,
     },
 
+    #[cfg(feature = "receive-merge")]
     /// Resolve merge conflicts for receive merge planner manual policy
     Merge {
         #[command(subcommand)]
         cmd: commands::merge::MergeCommand,
     },
+    #[cfg(feature = "diagnostics")]
     /// Collect a redacted support bundle
     Diag {
         /// Output directory for the support bundle JSON file
@@ -172,19 +178,25 @@ fn main() {
         Command::Pool { cmd } => commands::pool::handle_pool(cmd),
 
         Command::Defrag { path, recursive } => commands::defrag::handle_defrag(&path, recursive),
+        #[cfg(feature = "block-volume")]
         Command::Block { cmd } => commands::block::handle_block(cmd),
         Command::Device { cmd } => commands::device::handle_device(cmd),
         Command::Snapshot { cmd } => commands::snapshot::handle_snapshot(cmd),
         Command::Dataset { cmd } => commands::dataset::handle_dataset(cmd),
+        #[cfg(feature = "storage-intent")]
         Command::StorageIntent { cmd } => commands::storage_intent::handle_storage_intent(cmd),
 
+        #[cfg(feature = "diagnostics")]
         Command::Diag {
             output_dir,
             json,
             devices,
         } => commands::diag::handle_diag(output_dir, &devices, json),
+        #[cfg(feature = "cluster")]
         Command::Cluster { cmd } => commands::cluster::handle_cluster(cmd),
+        #[cfg(feature = "diagnostics")]
         Command::Kernel { cmd } => commands::kernel::handle_kernel(cmd),
+        #[cfg(feature = "receive-merge")]
         Command::Merge { cmd } => commands::merge::handle_merge(cmd),
     }
 }
@@ -546,6 +558,68 @@ mod tests {
     }
 
     #[test]
+    fn cli_parser_exposes_only_enabled_optional_surfaces() {
+        use clap::Parser;
+
+        #[cfg(not(feature = "block-volume"))]
+        assert!(Cli::try_parse_from(["tidefsctl", "block", "list"]).is_err());
+        #[cfg(not(feature = "cluster"))]
+        assert!(Cli::try_parse_from(["tidefsctl", "cluster", "status", "mypool"]).is_err());
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            assert!(Cli::try_parse_from(["tidefsctl", "diag"]).is_err());
+            assert!(Cli::try_parse_from(["tidefsctl", "kernel", "status"]).is_err());
+        }
+        #[cfg(not(feature = "receive-merge"))]
+        assert!(Cli::try_parse_from([
+            "tidefsctl",
+            "merge",
+            "show",
+            "--inventory",
+            "/tmp/inventory.json",
+        ])
+        .is_err());
+        #[cfg(not(feature = "storage-intent"))]
+        assert!(Cli::try_parse_from(["tidefsctl", "storage-intent"]).is_err());
+    }
+
+    #[test]
+    fn local_commands_hide_disabled_nonlocal_options() {
+        use clap::Parser;
+
+        #[cfg(not(feature = "cluster"))]
+        {
+            assert!(Cli::try_parse_from([
+                "tidefsctl",
+                "pool",
+                "mount",
+                "mypool",
+                "/mnt/tidefs",
+                "--devices",
+                "/dev/null",
+                "--cluster",
+            ])
+            .is_err());
+            assert!(Cli::try_parse_from(["tidefsctl", "dataset", "list", "--cluster"]).is_err());
+        }
+        #[cfg(not(feature = "remote-snapshot"))]
+        assert!(Cli::try_parse_from([
+            "tidefsctl",
+            "snapshot",
+            "send",
+            "mypool",
+            "--target-addr",
+            "127.0.0.1:9000",
+            "--node-id",
+            "1",
+            "--server-node-id",
+            "2",
+        ])
+        .is_err());
+    }
+
+    #[cfg(feature = "storage-intent")]
+    #[test]
     fn cli_parse_storage_intent_explain_read_only_surface() {
         use clap::Parser;
         let args = Cli::try_parse_from([
@@ -566,6 +640,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "storage-intent")]
     #[test]
     fn cli_parse_storage_intent_policy_set_surface() {
         use clap::Parser;
@@ -592,6 +667,7 @@ mod tests {
         assert!(args.is_ok(), "storage-intent policy set should parse");
     }
 
+    #[cfg(feature = "storage-intent")]
     #[test]
     fn cli_parse_storage_intent_policy_clear_and_dry_run_surfaces() {
         use clap::Parser;
@@ -636,9 +712,14 @@ mod tests {
         assert!(help.contains("Public operator commands:"));
         assert!(help.contains("Userspace harnesses:"));
         assert!(help.contains("Prototype surfaces:"));
-        assert!(help.contains("cluster placement exercise"));
-        assert!(help.contains("development-exercise"));
-        assert!(help.contains("not final distributed operator UAPI"));
+        #[cfg(feature = "cluster")]
+        {
+            assert!(help.contains("cluster placement exercise"));
+            assert!(help.contains("development-exercise"));
+            assert!(help.contains("not final distributed operator UAPI"));
+        }
+        #[cfg(not(feature = "cluster"))]
+        assert!(!help.contains("cluster placement exercise"));
         assert!(help.contains("Explicit --devices"));
     }
 
@@ -667,6 +748,7 @@ mod tests {
             .any(|line| line.trim_start().starts_with("rebuild ")));
     }
 
+    #[cfg(feature = "full")]
     #[test]
     fn preview_uapi_doc_declares_command_classification_contract() {
         let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1199,6 +1281,7 @@ mod tests {
 
     // -- Block CLI parse tests -------------------------------------------
 
+    #[cfg(feature = "block-volume")]
     #[test]
     fn cli_parse_block_attach_live_pool_positional() {
         use clap::Parser;
@@ -1209,6 +1292,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "block-volume")]
     #[test]
     fn cli_parse_block_attach_rejects_backing_dir() {
         use clap::Parser;
@@ -1223,6 +1307,7 @@ mod tests {
         assert!(args.is_err(), "block attach backing-dir must be retired");
     }
 
+    #[cfg(feature = "block-volume")]
     #[test]
     fn cli_parse_block_send_live_pool_positional() {
         use clap::Parser;
@@ -1237,6 +1322,7 @@ mod tests {
         assert!(args.is_ok(), "block send with positional pool should parse");
     }
 
+    #[cfg(feature = "block-volume")]
     #[test]
     fn cli_parse_block_send_rejects_backing_dir() {
         use clap::Parser;
@@ -1253,6 +1339,7 @@ mod tests {
         assert!(args.is_err(), "block send backing-dir must be retired");
     }
 
+    #[cfg(feature = "block-volume")]
     #[test]
     fn cli_parse_block_receive_live_pool_positional() {
         use clap::Parser;
@@ -1270,6 +1357,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "block-volume")]
     #[test]
     fn cli_parse_block_receive_rejects_backing_dir() {
         use clap::Parser;
@@ -1288,6 +1376,7 @@ mod tests {
 
     // -- Kernel CLI parse tests ------------------------------------------
 
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn cli_parse_kernel_status_default() {
         use clap::Parser;
@@ -1295,6 +1384,7 @@ mod tests {
         assert!(args.is_ok(), "kernel status should parse");
     }
 
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn cli_parse_kernel_status_json_and_control_dev() {
         use clap::Parser;
@@ -1312,6 +1402,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn cli_parse_kernel_rejects_missing_subcommand() {
         use clap::Parser;
@@ -1321,6 +1412,7 @@ mod tests {
 
     // -- Diagnostic bundle CLI parse tests --------------------------------
 
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn cli_parse_diag_json() {
         use clap::Parser;
@@ -1328,6 +1420,7 @@ mod tests {
         assert!(args.is_ok(), "diag --json should parse");
     }
 
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn cli_parse_diag_devices_are_offline_input() {
         use clap::Parser;
@@ -1342,6 +1435,7 @@ mod tests {
         assert!(args.is_ok(), "diag --devices should parse as offline input");
     }
 
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn cli_parse_diag_rejects_pool_name_path() {
         use clap::Parser;
@@ -1638,6 +1732,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cluster")]
     #[test]
     fn cli_parse_cluster_status_default() {
         use clap::Parser;
@@ -1645,6 +1740,7 @@ mod tests {
         assert!(args.is_ok(), "cluster status with pool name should parse");
     }
 
+    #[cfg(feature = "cluster")]
     #[test]
     fn cli_parse_cluster_status_json() {
         use clap::Parser;
@@ -1653,6 +1749,7 @@ mod tests {
         assert!(args.is_ok(), "cluster status --json should parse");
     }
 
+    #[cfg(feature = "cluster")]
     #[test]
     fn cli_parse_cluster_status_rejects_no_pool() {
         use clap::Parser;

@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 mod authz;
+#[cfg(feature = "block-volume")]
 pub mod block;
 pub mod classification;
+#[cfg(feature = "cluster")]
 pub mod cluster;
 pub mod dataset;
 pub mod defrag;
 pub mod device;
+#[cfg(feature = "diagnostics")]
 pub mod diag;
+#[cfg(feature = "diagnostics")]
 pub mod kernel;
 mod live_owner;
+#[cfg(feature = "receive-merge")]
 pub mod merge;
 pub mod mount;
 mod offline_pool;
 pub mod pool;
 pub mod snapshot;
+#[cfg(feature = "storage-intent")]
 pub mod storage_intent;
 
 #[cfg(test)]

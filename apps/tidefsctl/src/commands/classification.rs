@@ -479,30 +479,35 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         routing: RoutingSemantics::NoLivePoolState,
         summary: "request online extent-map defragmentation for a path",
     },
+    #[cfg(feature = "block-volume")]
     CommandSurface {
         path: "block attach",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwner,
         summary: "attach an imported pool as a ublk block device through owner authority",
     },
+    #[cfg(feature = "block-volume")]
     CommandSurface {
         path: "block detach",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::NoLivePoolState,
         summary: "detach an existing ublk device by numeric id",
     },
+    #[cfg(feature = "block-volume")]
     CommandSurface {
         path: "block list",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::NoLivePoolState,
         summary: "list attached ublk devices",
     },
+    #[cfg(feature = "block-volume")]
     CommandSurface {
         path: "block send",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwner,
         summary: "send block-volume state through live owner and transport authority",
     },
+    #[cfg(feature = "block-volume")]
     CommandSurface {
         path: "block receive",
         class: CommandClass::PublicOperator,
@@ -575,6 +580,28 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
         summary: "list dataset property definitions and effective values",
     },
+    #[cfg(feature = "receive-merge")]
+    CommandSurface {
+        path: "merge resolve",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::NoLivePoolState,
+        summary: "resolve receive conflicts into a local inventory document",
+    },
+    #[cfg(feature = "receive-merge")]
+    CommandSurface {
+        path: "merge validate",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::PassiveDiagnostic,
+        summary: "validate a resolved receive conflict inventory read-only",
+    },
+    #[cfg(feature = "receive-merge")]
+    CommandSurface {
+        path: "merge show",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::PassiveDiagnostic,
+        summary: "display a receive conflict inventory read-only",
+    },
+    #[cfg(feature = "storage-intent")]
     CommandSurface {
         path: "storage-intent explain",
         class: CommandClass::PublicOperator,
@@ -582,24 +609,28 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         summary:
             "render supplied storage-intent policy, receipt, and evidence-query records read-only",
     },
+    #[cfg(feature = "storage-intent")]
     CommandSurface {
         path: "storage-intent policy set",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::NoLivePoolState,
         summary: "stage dataset prefetch/residency policy source through #855 without activation",
     },
+    #[cfg(feature = "storage-intent")]
     CommandSurface {
         path: "storage-intent policy clear",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::NoLivePoolState,
         summary: "stage dataset prefetch/residency policy clears through #855 without activation",
     },
+    #[cfg(feature = "storage-intent")]
     CommandSurface {
         path: "storage-intent policy show",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::PassiveDiagnostic,
         summary: "render staged dataset prefetch/residency policy source documents",
     },
+    #[cfg(feature = "storage-intent")]
     CommandSurface {
         path: "storage-intent policy dry-run",
         class: CommandClass::PublicOperator,
@@ -625,36 +656,42 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
         summary: "run live-owner or explicit-device integrity diagnostics",
     },
+    #[cfg(feature = "diagnostics")]
     CommandSurface {
         path: "kernel status",
         class: CommandClass::OperatorDiagnostic,
         routing: RoutingSemantics::PassiveDiagnostic,
         summary: "passively inspect the declared kernel control endpoint",
     },
+    #[cfg(feature = "diagnostics")]
     CommandSurface {
         path: "diag",
         class: CommandClass::OperatorDiagnostic,
         routing: RoutingSemantics::PassiveDiagnostic,
         summary: "collect a redacted diagnostic support bundle",
     },
+    #[cfg(feature = "cluster")]
     CommandSurface {
         path: "cluster pool create",
         class: CommandClass::Prototype,
         routing: RoutingSemantics::PrototypeOnly,
         summary: "prototype clustered pool creation; not final distributed operator UAPI",
     },
+    #[cfg(feature = "cluster")]
     CommandSurface {
         path: "cluster placement exercise",
         class: CommandClass::DevelopmentDiagnostic,
         routing: RoutingSemantics::DevelopmentExercise,
         summary: "development diagnostic exercise for placement-map code",
     },
+    #[cfg(feature = "cluster")]
     CommandSurface {
         path: "cluster heal exercise",
         class: CommandClass::DevelopmentDiagnostic,
         routing: RoutingSemantics::DevelopmentExercise,
         summary: "development diagnostic exercise for placement-heal code",
     },
+    #[cfg(feature = "cluster")]
     CommandSurface {
         path: "cluster status",
         class: CommandClass::PublicOperator,
@@ -694,6 +731,7 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         routing: RoutingSemantics::Removed,
         summary: "directory object-store snapshot mode is retired",
     },
+    #[cfg(feature = "block-volume")]
     CommandSurface {
         path: "block --backing-dir",
         class: CommandClass::RemovedOrUnsupported,
@@ -755,6 +793,17 @@ pub(crate) fn root_long_about() -> String {
     out
 }
 
+pub(crate) fn root_after_help() -> &'static str {
+    #[cfg(feature = "diagnostics")]
+    {
+        "Start with `tidefsctl pool --help`, `tidefsctl dataset --help`, `tidefsctl kernel --help`, or `tidefsctl diag --help`. Command classification is checked by the repo authority docs and claims gate."
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        "Start with `tidefsctl pool --help`, `tidefsctl dataset --help`, or `tidefsctl snapshot --help`. Command classification is checked by the repo authority docs and claims gate."
+    }
+}
+
 fn push_help_section(out: &mut String, class: CommandClass) {
     out.push_str(class.heading());
     out.push_str(":\n");
@@ -797,7 +846,9 @@ mod tests {
             CommandClass::PublicOperator,
             CommandClass::UserspaceHarness,
             CommandClass::OperatorDiagnostic,
+            #[cfg(feature = "cluster")]
             CommandClass::Prototype,
+            #[cfg(feature = "cluster")]
             CommandClass::DevelopmentDiagnostic,
             CommandClass::RemovedOrUnsupported,
         ] {
@@ -811,6 +862,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cluster")]
     #[test]
     fn cluster_exercises_are_not_public_operator_uapi() {
         for path in ["cluster placement exercise", "cluster heal exercise"] {
@@ -856,6 +908,7 @@ mod tests {
             "snapshot prune-scheduled refusals",
             "snapshot prune-scheduled results",
             "device remove",
+            #[cfg(feature = "block-volume")]
             "block attach",
         ] {
             let surface = find_surface(path).expect("classified imported-pool command");
@@ -1096,7 +1149,11 @@ mod tests {
 
     #[test]
     fn cluster_and_device_status_are_classified_as_public_operator_live_owner() {
-        for path in ["cluster status", "device status"] {
+        for path in [
+            #[cfg(feature = "cluster")]
+            "cluster status",
+            "device status",
+        ] {
             let surface = super::find_surface(path)
                 .unwrap_or_else(|| panic!("classified command surface for {path}"));
             assert_eq!(
@@ -1119,7 +1176,11 @@ mod tests {
     #[test]
     fn status_commands_appear_in_root_help() {
         let help = super::root_long_about();
-        for path in ["cluster status", "device status"] {
+        for path in [
+            #[cfg(feature = "cluster")]
+            "cluster status",
+            "device status",
+        ] {
             assert!(
                 help.contains(path),
                 "root help must include classified command {path}"

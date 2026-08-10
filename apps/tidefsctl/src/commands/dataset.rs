@@ -10,8 +10,11 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Args, Subcommand, ValueEnum};
+#[cfg(feature = "cluster")]
 use tidefs_cluster::dataset_catalog::CatalogDelta;
+#[cfg(feature = "cluster")]
 use tidefs_cluster::pool_lease_client::ClusterLeaseClient;
+#[cfg(feature = "cluster")]
 use tidefs_cluster::pool_protocol::CatalogQueryType;
 use tidefs_dataset_lifecycle::{
     DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
@@ -165,16 +168,19 @@ pub struct DatasetCreateArgs {
     #[arg(long = "json")]
     pub json: bool,
 
+    #[cfg(feature = "cluster")]
     /// Route this operation through cluster authority instead of local pool.
     /// Requires --cluster-node-addr and --cluster-node-id.
     #[arg(long = "cluster", default_value_t = false)]
     pub cluster: bool,
 
+    #[cfg(feature = "cluster")]
     /// Cluster storage-node address. Required when --cluster is set.
     /// Format: host:port.
     #[arg(long = "cluster-node-addr")]
     pub cluster_node_addr: Option<String>,
 
+    #[cfg(feature = "cluster")]
     /// Node identifier for this cluster client (nonzero).
     /// Required when --cluster is set.
     #[arg(long = "cluster-node-id")]
@@ -204,16 +210,19 @@ pub struct DatasetListArgs {
     #[arg(long = "json")]
     pub json: bool,
 
+    #[cfg(feature = "cluster")]
     /// Route this operation through cluster authority instead of local pool.
     /// Requires --cluster-node-addr and --cluster-node-id.
     #[arg(long = "cluster", default_value_t = false)]
     pub cluster: bool,
 
+    #[cfg(feature = "cluster")]
     /// Cluster storage-node address. Required when --cluster is set.
     /// Format: host:port.
     #[arg(long = "cluster-node-addr")]
     pub cluster_node_addr: Option<String>,
 
+    #[cfg(feature = "cluster")]
     /// Node identifier for this cluster client (nonzero).
     /// Required when --cluster is set.
     #[arg(long = "cluster-node-id")]
@@ -235,16 +244,19 @@ pub struct DatasetRenameArgs {
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
+    #[cfg(feature = "cluster")]
     /// Route this operation through cluster authority instead of local pool.
     /// Requires --cluster-node-addr and --cluster-node-id.
     #[arg(long = "cluster", default_value_t = false)]
     pub cluster: bool,
 
+    #[cfg(feature = "cluster")]
     /// Cluster storage-node address. Required when --cluster is set.
     /// Format: host:port.
     #[arg(long = "cluster-node-addr")]
     pub cluster_node_addr: Option<String>,
 
+    #[cfg(feature = "cluster")]
     /// Node identifier for this cluster client (nonzero).
     /// Required when --cluster is set.
     #[arg(long = "cluster-node-id")]
@@ -268,16 +280,19 @@ pub struct DatasetDestroyArgs {
     #[arg(long = "json")]
     pub json: bool,
 
+    #[cfg(feature = "cluster")]
     /// Route this operation through cluster authority instead of local pool.
     /// Requires --cluster-node-addr and --cluster-node-id.
     #[arg(long = "cluster", default_value_t = false)]
     pub cluster: bool,
 
+    #[cfg(feature = "cluster")]
     /// Cluster storage-node address. Required when --cluster is set.
     /// Format: host:port.
     #[arg(long = "cluster-node-addr")]
     pub cluster_node_addr: Option<String>,
 
+    #[cfg(feature = "cluster")]
     /// Node identifier for this cluster client (nonzero).
     /// Required when --cluster is set.
     #[arg(long = "cluster-node-id")]
@@ -528,6 +543,7 @@ fn dataset_id_from_name(name: &str) -> DatasetId {
 // ── Cluster mode shared helpers ─────────────────────────────────────
 
 /// Resolve the pool GUID from device labels. Exits on failure.
+#[cfg(feature = "cluster")]
 fn resolve_cluster_pool_guid(devices: &[std::path::PathBuf], operation: &str) -> [u8; 16] {
     let entries = match tidefs_pool_scan::scan_labels(devices) {
         Ok(entries) => entries,
@@ -546,6 +562,7 @@ fn resolve_cluster_pool_guid(devices: &[std::path::PathBuf], operation: &str) ->
 }
 
 /// Validate cluster args and return (node_addr, node_id). Exits on failure.
+#[cfg(feature = "cluster")]
 fn validate_cluster_args<'a>(
     node_addr: &'a Option<String>,
     node_id: Option<u64>,
@@ -567,6 +584,7 @@ fn validate_cluster_args<'a>(
 }
 
 /// Require devices for cluster mode. Exits if absent.
+#[cfg(feature = "cluster")]
 fn require_devices_for_cluster<'a>(
     devices: Option<&'a [std::path::PathBuf]>,
     operation: &'a str,
@@ -579,6 +597,7 @@ fn require_devices_for_cluster<'a>(
 
 /// Submit a CatalogDelta to the cluster authority and exit on failure.
 /// Returns the new catalog version on success.
+#[cfg(feature = "cluster")]
 fn submit_cluster_delta(
     node_addr: &str,
     node_id: u64,
@@ -1019,6 +1038,7 @@ fn handle_create(args: DatasetCreateArgs) {
     }
 
     // ── Cluster-authoritative path ─────────────────────────────────
+    #[cfg(feature = "cluster")]
     if args.cluster {
         let (node_addr, node_id) =
             validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "create");
@@ -1159,6 +1179,7 @@ fn handle_list(args: DatasetListArgs) {
     let pool = list_pool_from_args(&args);
 
     // ── Cluster-authoritative path ─────────────────────────────────
+    #[cfg(feature = "cluster")]
     if args.cluster {
         let (node_addr, node_id) =
             validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "list");
@@ -1263,6 +1284,7 @@ fn handle_rename(args: DatasetRenameArgs) {
     }
 
     // ── Cluster-authoritative path ─────────────────────────────────
+    #[cfg(feature = "cluster")]
     if args.cluster {
         let (node_addr, node_id) =
             validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "rename");
@@ -1984,6 +2006,7 @@ fn handle_destroy(args: DatasetDestroyArgs) {
     }
 
     // ── Cluster-authoritative path ─────────────────────────────────
+    #[cfg(feature = "cluster")]
     if args.cluster {
         let (node_addr, node_id) =
             validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "destroy");

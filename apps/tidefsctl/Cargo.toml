@@ -12,14 +12,45 @@ authors.workspace = true
 
 description = "TideFS CLI for operator commands and development harnesses"
 
+[features]
+default = []
+block-volume = [
+    "dep:tidefs-block-volume-adapter-core",
+    "dep:tidefs-block-volume-adapter-daemon",
+    "dep:tidefs-block-volume-adapter-ublk-control-runtime",
+    "dep:tidefs-recovery-loop",
+    "dep:tidefs-transport",
+]
+cluster = [
+    "dep:tidefs-cluster",
+    "dep:tidefs-membership-epoch",
+    "dep:tidefs-transport",
+]
+diagnostics = ["dep:tidefs-validation"]
+receive-merge = []
+remote-snapshot = ["dep:tidefs-transport"]
+storage-intent = [
+    "dep:serde",
+    "dep:tidefs-storage-intent-core",
+    "dep:tidefs-storage-intent-policy",
+]
+full = [
+    "block-volume",
+    "cluster",
+    "diagnostics",
+    "receive-merge",
+    "remote-snapshot",
+    "storage-intent",
+]
+
 [dependencies]
 tidefs-auth = { workspace = true }
 tidefs-posix-filesystem-adapter-daemon = { workspace = true }
-tidefs-block-volume-adapter-core = { workspace = true }
+tidefs-block-volume-adapter-core = { workspace = true, optional = true }
 tidefs-pool-import = { workspace = true }
 tidefs-pool-scan = { workspace = true }
-tidefs-validation = { workspace = true }
-tidefs-recovery-loop = { workspace = true }
+tidefs-validation = { workspace = true, optional = true }
+tidefs-recovery-loop = { workspace = true, optional = true }
 tidefs-device-removal = { workspace = true }
 tidefs-types-pool-label-core = { workspace = true }
 tidefs-local-object-store = { workspace = true }
@@ -28,19 +59,19 @@ tidefs-dataset-lifecycle = { workspace = true }
 tidefs-dataset-properties = { workspace = true }
 tidefs-dataset-feature-flags = { workspace = true }
 tidefs-types-dataset-feature-flags-core = { workspace = true }
-tidefs-cluster = { workspace = true }
-tidefs-membership-epoch = { workspace = true }
+tidefs-cluster = { workspace = true, optional = true }
+tidefs-membership-epoch = { workspace = true, optional = true }
 blake3 = "=1.5.5"
-tidefs-transport = { workspace = true }
+tidefs-transport = { workspace = true, optional = true }
 tidefs-vfs-engine = { workspace = true }
-tidefs-block-volume-adapter-daemon = { workspace = true }
-tidefs-block-volume-adapter-ublk-control-runtime = { workspace = true }
+tidefs-block-volume-adapter-daemon = { workspace = true, optional = true }
+tidefs-block-volume-adapter-ublk-control-runtime = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
 bincode = { workspace = true }
 serde_json = { workspace = true }
-serde = { version = "1", features = ["derive"] }
-tidefs-storage-intent-core = { workspace = true, features = ["serde"] }
-tidefs-storage-intent-policy = { workspace = true }
+serde = { version = "1", features = ["derive"], optional = true }
+tidefs-storage-intent-core = { workspace = true, features = ["serde"], optional = true }
+tidefs-storage-intent-policy = { workspace = true, optional = true }
 tidefs-encryption = { workspace = true }
 
 [dev-dependencies]

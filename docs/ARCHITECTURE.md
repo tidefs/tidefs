@@ -89,15 +89,18 @@ The repository is not short of implementations; it has too many overlapping
 ones in the default graph:
 
 - 166 root-workspace packages plus four excluded fuzz packages are present.
-- The default normal dependency closure of `tidefsctl` plus the POSIX daemon is
-  118 of 166 workspace packages: all 37 keep packages, 49 of 54 consolidation
-  packages, and 32 of 73 extraction packages. Block, cluster, validation,
-  workload, and performance-policy families are therefore still coupled to
-  the local carrier; neither demo package is in the closure.
-- Twenty-five of those 32 extraction packages are reachable through
-  `tidefs-local-filesystem` itself. Gating only CLI commands or the daemon
-  binary cannot contract the carrier; the core package must separate its local
-  filesystem path from replication, send/receive, and policy subsystems.
+- The default normal dependency closure of `tidefsctl` is 112 of 166 workspace
+  packages; selecting its explicit `full` feature reaches 117. Its manifest
+  now has 18 required and 11 optional normal dependencies. The default parser,
+  help, source modules, and direct dependency edges therefore carry only the
+  local pool, mount, device, dataset, snapshot, defrag, live-owner, and status
+  families.
+- Remaining block-core, cluster, membership, transport, recovery-loop, and
+  storage-intent-core reachability has a demonstrated source path through the
+  still-required POSIX daemon, `tidefs-local-filesystem`, or their local
+  dependencies. The next daemon and LocalFileSystem slices must contract those
+  owners; the CLI slice does not hide them with placeholder types or a second
+  carrier.
 - `fuse_vfs_adapter.rs` is 43,876 lines, `local-filesystem/src/lib.rs` is
   17,692, `vfs_engine_impl.rs` is 16,391, and the binary daemon `main.rs` is
   3,900 lines. The remaining size is concentrated in three
@@ -109,8 +112,11 @@ ones in the default graph:
   shutdown stack.
 - The adapter's direct normal dependencies include cluster, block, validation,
   workload, performance-contract, and schema families.
-  `tidefsctl` directly depends on block, cluster, transport, validation, and
-  storage-policy families.
+  `tidefsctl` now owns block-volume, cluster/transport, kernel/validation
+  diagnostics, receive-merge, remote snapshot transport, and storage-intent
+  policy command families behind explicit Cargo features. The default package
+  has no direct normal edge to those optional-only packages; full and focused
+  Nix consumers select the required features explicitly.
 
 This is the governing diagnosis: TideFS's first product spine is obscured by a
 large default dependency closure and duplicate authorities. Particular defects
