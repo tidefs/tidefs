@@ -2271,6 +2271,7 @@ fn normalize_received_content_receipts(
             inode,
             &content,
             &mut dedup_index,
+            #[cfg(feature = "quorum-write")]
             None,
             &state.content_compression_policy,
         )?;

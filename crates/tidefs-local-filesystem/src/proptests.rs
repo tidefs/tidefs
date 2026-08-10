@@ -173,7 +173,7 @@ proptest! {
 
         let record_before = fs.stat("/data.bin").expect("stat before patch");
         let content_key_before = content_object_key_for_version(record_before.inode_id, record_before.data_version);
-        let bytes_before = fs.store.primary_store().get(content_key_before)
+        let bytes_before = fs.store.get(DeviceIoClass::Data, content_key_before)
             .expect("read content obj")
             .expect("content obj exists before");
         let manifest_before = decode_content_manifest(&bytes_before).expect("decode manifest before");
@@ -184,7 +184,7 @@ proptest! {
 
         let record_after = fs.stat("/data.bin").expect("stat after patch");
         let content_key_after = content_object_key_for_version(record_after.inode_id, record_after.data_version);
-        let bytes_after = fs.store.primary_store().get(content_key_after)
+        let bytes_after = fs.store.get(DeviceIoClass::Data, content_key_after)
             .expect("read content obj after")
             .expect("content obj exists after");
         let manifest_after = decode_content_manifest(&bytes_after).expect("decode manifest after");
@@ -318,7 +318,7 @@ proptest! {
 
         let record = fs.stat("/data.bin").expect("stat file");
         let content_key = content_object_key_for_version(record.inode_id, record.data_version);
-        let manifest_bytes = fs.store.primary_store().get(content_key)
+        let manifest_bytes = fs.store.get(DeviceIoClass::Data, content_key)
             .expect("read content obj")
             .expect("content obj exists");
         let manifest = decode_content_manifest(&manifest_bytes).expect("decode manifest");
@@ -373,7 +373,7 @@ proptest! {
 
             let record = fs.stat("/data.bin").expect("stat");
             let content_key = content_object_key_for_version(record.inode_id, record.data_version);
-            let raw = fs.store.primary_store().get(content_key)
+            let raw = fs.store.get(DeviceIoClass::Data, content_key)
                 .expect("read")
                 .expect("exists");
             manifest_before = decode_content_manifest(&raw).expect("decode before");
@@ -384,7 +384,7 @@ proptest! {
             let fs = LocalFileSystem::open_with_options(&root, prop_options()).expect("reopen fs");
             let record = fs.stat("/data.bin").expect("stat after reopen");
             let content_key = content_object_key_for_version(record.inode_id, record.data_version);
-            let raw = fs.store.primary_store().get(content_key)
+            let raw = fs.store.get(DeviceIoClass::Data, content_key)
                 .expect("read after reopen")
                 .expect("exists after reopen");
             let manifest_after = decode_content_manifest(&raw).expect("decode after reopen");

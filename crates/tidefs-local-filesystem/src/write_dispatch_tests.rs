@@ -182,7 +182,7 @@ proptest! {
             prop_assert_eq!(record.size, expected.len() as u64);
 
             let content_key = content_object_key_for_version(record.inode_id, record.data_version);
-            let raw = fs.store.primary_store().get(content_key)
+            let raw = fs.store.get(DeviceIoClass::Data, content_key)
                 .expect("read content obj")
                 .expect("content obj exists");
             let manifest = decode_content_manifest(&raw).expect("decode manifest");
@@ -972,8 +972,7 @@ fn wd_current_content_manifest(fs: &LocalFileSystem, path: &str) -> ContentManif
     let content_key = content_object_key_for_version(record.inode_id, record.data_version);
     let raw = fs
         .store
-        .primary_store()
-        .get(content_key)
+        .get(DeviceIoClass::Data, content_key)
         .expect("read content object")
         .expect("content object exists");
     decode_content_manifest(&raw).expect("decode manifest")
@@ -1776,18 +1775,36 @@ fn write_buffer_flush_threshold_setter_changes_autoflush_batch_size() {
     fs.write_file("/batched.bin", 0, &data)
         .expect("first chunk");
     assert_eq!(
-        fs.stat("/batched.bin").expect("stat first").data_version,
+        fs.buffered_write_base_records
+            .get(&record.inode_id)
+            .expect("first write retains Pool-readable base")
+            .data_version,
         record.data_version,
+        "first 1 MiB write must retain the prior Pool-readable version"
+    );
+    assert!(
+        fs.read_from_write_buffer(record.inode_id, 0, data.len())
+            .is_some(),
         "first 1 MiB write must stay buffered below the 2 MiB threshold"
     );
 
     fs.write_file("/batched.bin", data.len() as u64, &data)
         .expect("second chunk");
-    assert_eq!(
-        fs.stat("/batched.bin").expect("stat second").data_version,
-        record.data_version + 1,
-        "second 1 MiB write crosses the configured threshold and flushes once"
+    assert!(
+        fs.read_from_write_buffer(record.inode_id, 0, data.len() * 2)
+            .is_none(),
+        "second 1 MiB write crosses the configured threshold and drains the buffer"
     );
+    assert!(
+        !fs.buffered_write_base_records
+            .contains_key(&record.inode_id),
+        "completed writeback must retire the saved Pool base record"
+    );
+    let committed = fs.stat("/batched.bin").expect("stat committed file");
+    let bytes = MountedContentReadAuthority::new(&fs.store)
+        .read_all(record.inode_id, &committed)
+        .expect("read threshold-flushed content through Pool authority");
+    assert_eq!(bytes, [data.as_slice(), data.as_slice()].concat());
 
     drop(fs);
     wd_cleanup(&root);

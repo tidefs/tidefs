@@ -3290,15 +3290,15 @@ fn recovery_probe_reports_selected_root_without_operator_repair() {
 #[test]
 fn recovery_probe_reports_explicit_error_without_guessing_repair() {
     let root = temp_root("recovery-probe-explicit-error");
-    let mut store =
-        LocalObjectStore::open_with_options(&root, options()).expect("open object store");
+    let mut pool = LocalFileSystem::default_development_pool(&root, &options(), None, None)
+        .expect("create development Pool");
     for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
-        store
+        pool.raw_primary_store_mut()
             .put(root_slot_object_key(slot), b"invalid root slot bytes")
             .expect("write invalid root slot");
     }
-    store.sync_all().expect("sync invalid slots");
-    drop(store);
+    pool.sync_all().expect("sync invalid slots");
+    drop(pool);
 
     let report = LocalFileSystem::probe_recovery(&root, options()).expect("probe invalid roots");
     assert_eq!(
@@ -4488,15 +4488,15 @@ fn invalid_newer_same_slot_root_falls_back_to_previous_version_without_operator_
 #[test]
 fn all_root_slots_invalid_reports_explicit_integrity_error_without_fsck() {
     let root = temp_root("all-root-slots-invalid");
-    let mut store =
-        LocalObjectStore::open_with_options(&root, options()).expect("open object store");
+    let mut pool = LocalFileSystem::default_development_pool(&root, &options(), None, None)
+        .expect("create development Pool");
     for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
-        store
+        pool.raw_primary_store_mut()
             .put(root_slot_object_key(slot), b"invalid root slot bytes")
             .expect("write invalid root slot");
     }
-    store.sync_all().expect("sync invalid slots");
-    drop(store);
+    pool.sync_all().expect("sync invalid slots");
+    drop(pool);
 
     assert!(matches!(
         LocalFileSystem::open_with_options(&root, options()),

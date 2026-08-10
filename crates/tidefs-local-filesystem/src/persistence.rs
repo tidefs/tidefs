@@ -203,6 +203,17 @@ pub(crate) fn ensure_versioned_content_object(
     )
 }
 
+/// Validate that mounted content is complete and readable through the Pool
+/// authority that published its placement receipts.
+///
+/// Data-only durability paths call this after draining buffered writes. They
+/// must not reconstruct receipt-backed content in the raw primary metadata
+/// store when the Pool already owns the current logical objects.
+pub(crate) fn validate_versioned_content_with_pool(pool: &Pool, inode: &InodeRecord) -> Result<()> {
+    let _ = MountedContentReadAuthority::new(pool).read_all(inode.inode_id, inode)?;
+    Ok(())
+}
+
 pub(crate) fn transaction_manifest_entries_for_existing_content(
     store: &LocalObjectStore,
     inode: &InodeRecord,

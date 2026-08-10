@@ -8257,11 +8257,26 @@ impl LocalFileSystem {
         {
             return Ok(false);
         }
-        let layout = self.read_committed_content_layout(inode_id, record)?;
+        // The live inode advances as soon as a buffered write is accepted,
+        // while its content remains readable under the saved Pool base record
+        // until writeback. Inspect only the committed overlap; bytes beyond
+        // that record are sparse when no buffered or allocated range covers
+        // them.
+        let committed = self.committed_record_for_buffered_read(inode_id, record);
+        if offset >= committed.size {
+            return Ok(true);
+        }
+        let committed_write_len = write_end.min(committed.size).saturating_sub(offset);
+        let committed_write_len =
+            usize::try_from(committed_write_len).map_err(|_| FileSystemError::SizeOverflow {
+                requested: committed_write_len,
+            })?;
+        let layout = self.read_committed_content_layout(inode_id, &committed)?;
         let ContentLayout::Chunked(manifest) = layout else {
             return Ok(false);
         };
-        let Some((first_chunk, last_chunk)) = overlay_chunk_index_bounds(record.size, offset, len)?
+        let Some((first_chunk, last_chunk)) =
+            overlay_chunk_index_bounds(committed.size, offset, committed_write_len)?
         else {
             return Ok(false);
         };
@@ -12300,11 +12315,7 @@ impl LocalFileSystem {
                     .ok_or(FileSystemError::CorruptState {
                         reason: "dirty content inode not found in state",
                     })?;
-            ensure_versioned_content_object(
-                self.store.raw_primary_store_mut(),
-                record,
-                &self.content_compression_policy,
-            )?;
+            validate_versioned_content_with_pool(&self.store, record)?;
             self.store.sync_all().map_err(FileSystemError::from)?;
             self.mark_content_clean(attr.inode_id);
             self.record_full_local_placement_ack_receipt(
@@ -12459,11 +12470,7 @@ impl LocalFileSystem {
                 .ok_or(FileSystemError::CorruptState {
                     reason: "dirty content inode not found in state",
                 })?;
-            ensure_versioned_content_object(
-                self.store.raw_primary_store_mut(),
-                record,
-                &self.content_compression_policy,
-            )?;
+            validate_versioned_content_with_pool(&self.store, record)?;
         }
         self.store.sync_all().map_err(FileSystemError::from)?;
         for inode_id in &dirty_inodes {
@@ -12566,11 +12573,7 @@ impl LocalFileSystem {
                 .ok_or(FileSystemError::CorruptState {
                     reason: "dirty content inode not found in state during sync_inode_data_only",
                 })?;
-            ensure_versioned_content_object(
-                self.store.raw_primary_store_mut(),
-                record,
-                &self.content_compression_policy,
-            )?;
+            validate_versioned_content_with_pool(&self.store, record)?;
             self.store.sync_all().map_err(FileSystemError::from)?;
             self.mark_content_clean(inode_id);
         }
@@ -12617,11 +12620,7 @@ impl LocalFileSystem {
                 .ok_or(FileSystemError::CorruptState {
                     reason: "dirty content inode not found in state during sync_all_dirty",
                 })?;
-            ensure_versioned_content_object(
-                self.store.raw_primary_store_mut(),
-                record,
-                &self.content_compression_policy,
-            )?;
+            validate_versioned_content_with_pool(&self.store, record)?;
         }
         self.store.sync_all().map_err(FileSystemError::from)?;
         for inode_id in &dirty_inodes {
