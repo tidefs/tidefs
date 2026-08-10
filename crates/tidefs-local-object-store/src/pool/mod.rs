@@ -1325,6 +1325,7 @@ fn discover_replacement_rebuild_subject_count(
 }
 
 impl DeviceReplacementEvidenceMarker {
+    #[cfg(any(feature = "distributed-repair", test))]
     fn covers_state(&self, state: ReplacementRebuildStatusState) -> bool {
         self.state == state
             || matches!(
@@ -3646,6 +3647,7 @@ impl Pool {
         }
     }
 
+    #[cfg(any(feature = "distributed-repair", test))]
     fn cleanup_stale_erasure_shards(
         &mut self,
         key: ObjectKey,
