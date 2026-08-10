@@ -19,6 +19,7 @@ mod ingress;
 mod live_owner;
 mod lock_dispatch;
 mod maintenance;
+#[cfg(feature = "workload-telemetry")]
 mod materialized_cache;
 mod mmap_coherency;
 pub mod mount_options;
@@ -31,6 +32,7 @@ mod txg_cycle;
 mod workers_meta;
 mod workers_ns;
 mod workers_writeback;
+#[cfg(feature = "workload-telemetry")]
 mod workload_observer;
 mod write_dispatch;
 
@@ -3762,7 +3764,10 @@ mod tests {
         args.push("--scrub-runtime-observation-artifact".to_string());
         args.push("/tmp/tidefs-scrub-observation.json".to_string());
 
-        let error = parse_mount_vfs_config(args).expect_err("optional surface must be absent");
+        let error = match parse_mount_vfs_config(args) {
+            Ok(_) => panic!("optional surface must be absent"),
+            Err(error) => error,
+        };
 
         assert!(
             error.contains("unknown mount-vfs argument `--scrub-runtime-observation-artifact`"),
