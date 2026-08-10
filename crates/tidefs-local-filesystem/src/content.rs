@@ -1188,7 +1188,10 @@ fn encode_chunk_with_dedup<S: ContentWriteStore>(
     chunk_index: u64,
     chunk_bytes: &[u8],
     _dedup_index: &mut DedupIndex,
-    #[cfg(feature = "quorum-write")] quorum_store: &mut Option<
+    #[cfg(all(feature = "quorum-write", feature = "data-policy"))] quorum_store: &mut Option<
+        &mut tidefs_quorum_write_runtime::QuorumObjectStore,
+    >,
+    #[cfg(all(feature = "quorum-write", not(feature = "data-policy")))] _quorum_store: &mut Option<
         &mut tidefs_quorum_write_runtime::QuorumObjectStore,
     >,
     compression_policy: &ContentCompressionPolicy,
