@@ -6482,6 +6482,7 @@ fn open_single_device(
             )?;
             Device::open_log_device(path, options.clone())
         }
+        #[cfg(any(feature = "distributed-repair", test))]
         DeviceKind::ParityRaid1 { paths } => {
             require_legacy_directory_pool_shim(
                 config.backing,
@@ -6490,6 +6491,7 @@ fn open_single_device(
             )?;
             Device::open_parity_raid1(paths, options)
         }
+        #[cfg(any(feature = "distributed-repair", test))]
         DeviceKind::ParityRaid2 { paths } => {
             require_legacy_directory_pool_shim(
                 config.backing,
@@ -6498,6 +6500,7 @@ fn open_single_device(
             )?;
             Device::open_parity_raid2(paths, options)
         }
+        #[cfg(any(feature = "distributed-repair", test))]
         DeviceKind::ParityRaid3 { paths } => {
             require_legacy_directory_pool_shim(
                 config.backing,
@@ -6506,6 +6509,12 @@ fn open_single_device(
             )?;
             Device::open_parity_raid3(paths, options)
         }
+        #[cfg(not(any(feature = "distributed-repair", test)))]
+        DeviceKind::ParityRaid1 { .. }
+        | DeviceKind::ParityRaid2 { .. }
+        | DeviceKind::ParityRaid3 { .. } => Err(StoreError::InvalidOptions {
+            reason: "PARITY_RAID devices require the distributed-repair feature",
+        }),
         DeviceKind::Block { path } => {
             if !config.backing.is_byte_addressable_pool_member() {
                 return Err(StoreError::InvalidOptions {

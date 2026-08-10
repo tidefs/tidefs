@@ -1555,6 +1555,7 @@ impl DeviceImpl for MirrorDevice {
 
 /// PARITY_RAID1 device: N data columns + 1 parity column across N+1 child
 /// SingleDevices.  Any single child failure is reconstructed via XOR.
+#[cfg(any(feature = "distributed-repair", test))]
 #[derive(Debug)]
 pub struct ParityRaidDevice {
     pub(crate) children: Vec<SingleDevice>,
@@ -1568,6 +1569,7 @@ pub struct ParityRaidDevice {
     delete_ops: u64,
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl ParityRaidDevice {
     /// Open a PARITY_RAID device with the given parity count (1, 2, or 3).
     ///
@@ -1666,6 +1668,7 @@ impl ParityRaidDevice {
     }
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl DeviceImpl for ParityRaidDevice {
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         use crate::parity_raid::ParityRaidLayout;
@@ -2671,8 +2674,11 @@ pub enum Device {
     Compressed(CompressedDevice),
     Encrypted(EncryptedDevice),
     LogDevice(LogDevice),
+    #[cfg(any(feature = "distributed-repair", test))]
     ParityRaid1(ParityRaidDevice),
+    #[cfg(any(feature = "distributed-repair", test))]
     ParityRaid2(ParityRaidDevice),
+    #[cfg(any(feature = "distributed-repair", test))]
     ParityRaid3(ParityRaidDevice),
 }
 
@@ -2745,16 +2751,19 @@ impl Device {
     }
 
     /// Create a PARITY_RAID1 device from N+1 paths (N data + 1 parity).
+    #[cfg(any(feature = "distributed-repair", test))]
     pub fn open_parity_raid1(paths: &[PathBuf], options: &StoreOptions) -> Result<Self> {
         ParityRaidDevice::open_with_parity(paths, options, 1).map(Device::ParityRaid1)
     }
 
     /// Create a PARITY_RAID2 device from N+2 paths (N data + 2 parity).
+    #[cfg(any(feature = "distributed-repair", test))]
     pub fn open_parity_raid2(paths: &[PathBuf], options: &StoreOptions) -> Result<Self> {
         ParityRaidDevice::open_with_parity(paths, options, 2).map(Device::ParityRaid2)
     }
 
     /// Create a PARITY_RAID3 device from N+3 paths (N data + 3 parity).
+    #[cfg(any(feature = "distributed-repair", test))]
     pub fn open_parity_raid3(paths: &[PathBuf], options: &StoreOptions) -> Result<Self> {
         ParityRaidDevice::open_with_parity(paths, options, 3).map(Device::ParityRaid3)
     }
@@ -2928,6 +2937,7 @@ impl Device {
             Device::Compressed(c) => c.inner.record_checksum_error(),
             Device::LogDevice(s) => s.record_checksum_error(),
             Device::Encrypted(e) => e.inner.record_checksum_error(),
+            #[cfg(any(feature = "distributed-repair", test))]
             Device::ParityRaid1(r) | Device::ParityRaid2(r) | Device::ParityRaid3(r) => {
                 for child in &mut r.children {
                     child.record_checksum_error();
@@ -2944,6 +2954,7 @@ impl Device {
             Device::Compressed(c) => c,
             Device::LogDevice(s) => s,
             Device::Encrypted(e) => e,
+            #[cfg(any(feature = "distributed-repair", test))]
             Device::ParityRaid1(r) | Device::ParityRaid2(r) | Device::ParityRaid3(r) => r,
         }
     }
@@ -2955,6 +2966,7 @@ impl Device {
             Device::Compressed(c) => c,
             Device::LogDevice(s) => s,
             Device::Encrypted(e) => e,
+            #[cfg(any(feature = "distributed-repair", test))]
             Device::ParityRaid1(r) | Device::ParityRaid2(r) | Device::ParityRaid3(r) => r,
         }
     }
