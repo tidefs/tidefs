@@ -22,6 +22,7 @@ block-volume = [
     "dep:tidefs-transport",
 ]
 cluster = [
+    "dep:bincode",
     "dep:tidefs-cluster",
     "dep:tidefs-membership-epoch",
     "dep:tidefs-transport",
@@ -67,7 +68,7 @@ tidefs-vfs-engine = { workspace = true }
 tidefs-block-volume-adapter-daemon = { workspace = true, optional = true }
 tidefs-block-volume-adapter-ublk-control-runtime = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
-bincode = { workspace = true }
+bincode = { workspace = true, optional = true }
 serde_json = { workspace = true }
 serde = { version = "1", features = ["derive"], optional = true }
 tidefs-storage-intent-core = { workspace = true, features = ["serde"], optional = true }

@@ -61,6 +61,11 @@ pub(crate) enum RoutingSemantics {
     LiveOwnerOrOfflineInput,
     OfflineDiscoveryOrImportInput,
     UserspaceHarness,
+    #[cfg(any(
+        feature = "diagnostics",
+        feature = "receive-merge",
+        feature = "storage-intent"
+    ))]
     PassiveDiagnostic,
     PrototypeOnly,
     DevelopmentExercise,
@@ -75,6 +80,11 @@ impl RoutingSemantics {
             Self::LiveOwnerOrOfflineInput => "live-owner-or-offline-input",
             Self::OfflineDiscoveryOrImportInput => "offline-discovery-or-import-input",
             Self::UserspaceHarness => "userspace-harness",
+            #[cfg(any(
+                feature = "diagnostics",
+                feature = "receive-merge",
+                feature = "storage-intent"
+            ))]
             Self::PassiveDiagnostic => "passive-diagnostic",
             Self::PrototypeOnly => "prototype-only",
             Self::DevelopmentExercise => "development-exercise",
@@ -157,6 +167,7 @@ impl CommandSurface {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(any(feature = "diagnostics", test))]
 struct CommandRegistryDigestEntry<'a> {
     path: &'a str,
     class: &'a str,
@@ -166,6 +177,7 @@ struct CommandRegistryDigestEntry<'a> {
     summary: &'a str,
 }
 
+#[cfg(any(feature = "diagnostics", test))]
 impl<'a> CommandRegistryDigestEntry<'a> {
     fn from_surface(surface: &'a CommandSurface) -> Self {
         let admission = crate::commands::authz::command_admission(surface.path)
@@ -194,10 +206,12 @@ impl<'a> CommandRegistryDigestEntry<'a> {
 /// canonical field is length-prefixed so adjacent fields cannot alias.
 /// This ensures the digest changes when a meaningful registry field changes
 /// but remains stable across map iteration order or JSON formatting changes.
+#[cfg(any(feature = "diagnostics", test))]
 pub(crate) fn compute_command_registry_digest() -> String {
     compute_command_registry_digest_for_surfaces(COMMAND_SURFACES)
 }
 
+#[cfg(any(feature = "diagnostics", test))]
 pub(crate) fn compute_command_registry_digest_for_surfaces(surfaces: &[CommandSurface]) -> String {
     let entries = surfaces
         .iter()
@@ -206,6 +220,7 @@ pub(crate) fn compute_command_registry_digest_for_surfaces(surfaces: &[CommandSu
     compute_command_registry_digest_from_entries(entries)
 }
 
+#[cfg(any(feature = "diagnostics", test))]
 fn compute_command_registry_digest_from_entries(
     mut entries: Vec<CommandRegistryDigestEntry<'_>>,
 ) -> String {
@@ -248,11 +263,13 @@ fn compute_command_registry_digest_from_entries(
     hasher.finalize().to_hex().to_string()
 }
 
+#[cfg(any(feature = "diagnostics", test))]
 fn update_registry_digest_field(hasher: &mut blake3::Hasher, name: &str, value: &str) {
     update_registry_digest_bytes(hasher, name.as_bytes());
     update_registry_digest_bytes(hasher, value.as_bytes());
 }
 
+#[cfg(any(feature = "diagnostics", test))]
 fn update_registry_digest_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(&(bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);

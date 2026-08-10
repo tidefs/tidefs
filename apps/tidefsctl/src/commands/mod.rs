@@ -22,7 +22,7 @@ pub mod snapshot;
 #[cfg(feature = "storage-intent")]
 pub mod storage_intent;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "full"))]
 pub(crate) use authz::command_surface_authority_table;
 
 pub(crate) use offline_pool::refuse_runtime_pool_path;

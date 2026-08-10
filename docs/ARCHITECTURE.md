@@ -91,7 +91,7 @@ ones in the default graph:
 - 166 root-workspace packages plus four excluded fuzz packages are present.
 - The default normal dependency closure of `tidefsctl` is 112 of 166 workspace
   packages; selecting its explicit `full` feature reaches 117. Its manifest
-  now has 18 required and 11 optional normal dependencies. The default parser,
+  now has 17 required and 12 optional normal dependencies. The default parser,
   help, source modules, and direct dependency edges therefore carry only the
   local pool, mount, device, dataset, snapshot, defrag, live-owner, and status
   families.

@@ -557,6 +557,13 @@ mod tests {
         assert!(args.is_err(), "unknown command should fail");
     }
 
+    #[cfg(any(
+        not(feature = "block-volume"),
+        not(feature = "cluster"),
+        not(feature = "diagnostics"),
+        not(feature = "receive-merge"),
+        not(feature = "storage-intent")
+    ))]
     #[test]
     fn cli_parser_exposes_only_enabled_optional_surfaces() {
         use clap::Parser;
@@ -583,6 +590,7 @@ mod tests {
         assert!(Cli::try_parse_from(["tidefsctl", "storage-intent"]).is_err());
     }
 
+    #[cfg(any(not(feature = "cluster"), not(feature = "remote-snapshot")))]
     #[test]
     fn local_commands_hide_disabled_nonlocal_options() {
         use clap::Parser;

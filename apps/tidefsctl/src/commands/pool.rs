@@ -363,8 +363,11 @@ pub fn handle_pool(cmd: PoolCommand) {
                 encryption_envelope,
                 encryption_passphrase,
                 encryption_salt,
+                #[cfg(feature = "cluster")]
                 cluster: false,
+                #[cfg(feature = "cluster")]
                 cluster_node_addr: None,
+                #[cfg(feature = "cluster")]
                 cluster_node_id: None,
             });
         }

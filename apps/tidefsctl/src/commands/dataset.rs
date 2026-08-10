@@ -25,6 +25,7 @@ use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
+#[cfg(feature = "cluster")]
 use bincode;
 
 use crate::parser::{self, DatasetTarget, PropertyAssignment};
