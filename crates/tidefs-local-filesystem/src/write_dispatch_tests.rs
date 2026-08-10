@@ -1152,6 +1152,11 @@ fn non_contiguous_buffered_writes_in_one_chunk_flush_once() {
             .expect("read buffered chunk"),
         expected[..chunk]
     );
+    let accepted_record = fs.stat("/chunk.bin").expect("stat accepted patches");
+    assert!(
+        accepted_record.data_version > base_record.data_version,
+        "accepted buffered writes must advance the visible content identity"
+    );
 
     fs.flush_write_buffer(record.inode_id)
         .expect("flush chunk patches");
@@ -1159,8 +1164,8 @@ fn non_contiguous_buffered_writes_in_one_chunk_flush_once() {
     let patched_manifest = wd_current_content_manifest(&fs, "/chunk.bin");
     assert_eq!(
         patched_record.data_version,
-        base_record.data_version + 1,
-        "one chunk-local flush should perform one content rewrite"
+        accepted_record.data_version,
+        "one chunk-local flush must materialize the accepted content identity without inventing another"
     );
     assert_eq!(
         patched_manifest.chunks[0].data_version,
@@ -1214,6 +1219,11 @@ fn multi_chunk_writeback_batch_updates_touched_chunks_once() {
         fs.read_file("/batch.bin").expect("read buffered image"),
         expected
     );
+    let accepted_record = fs.stat("/batch.bin").expect("stat accepted patches");
+    assert!(
+        accepted_record.data_version > base_record.data_version,
+        "accepted buffered writes must advance the visible content identity"
+    );
 
     fs.flush_write_buffer(record.inode_id)
         .expect("flush batched patches");
@@ -1221,8 +1231,8 @@ fn multi_chunk_writeback_batch_updates_touched_chunks_once() {
     let patched_manifest = wd_current_content_manifest(&fs, "/batch.bin");
     assert_eq!(
         patched_record.data_version,
-        base_record.data_version + 1,
-        "multi-chunk writeback batch should publish one content version"
+        accepted_record.data_version,
+        "multi-chunk writeback must materialize the accepted content identity without inventing another"
     );
     let by_index: BTreeMap<u64, _> = patched_manifest
         .chunks
@@ -1306,6 +1316,11 @@ fn extending_writeback_batch_preserves_sparse_manifest_once() {
         .expect("write first extending patch");
     fs.write_file("/extend.bin", second_offset as u64, &second_patch)
         .expect("write second extending patch");
+    let accepted_record = fs.stat("/extend.bin").expect("stat accepted extensions");
+    assert!(
+        accepted_record.data_version > base_record.data_version,
+        "accepted extending writes must advance the visible content identity"
+    );
 
     fs.flush_write_buffer(record.inode_id)
         .expect("flush extending batch");
@@ -1313,8 +1328,8 @@ fn extending_writeback_batch_preserves_sparse_manifest_once() {
     let patched_manifest = wd_current_content_manifest(&fs, "/extend.bin");
     assert_eq!(
         patched_record.data_version,
-        base_record.data_version + 1,
-        "extending writeback batch should publish one content version"
+        accepted_record.data_version,
+        "extending writeback must materialize the accepted content identity without inventing another"
     );
 
     let by_index: BTreeMap<u64, _> = patched_manifest
@@ -1462,6 +1477,11 @@ fn holetest_style_mixed_writeback_flushes_one_coalesced_image() {
         fs.read_file("/mixed.bin").expect("read buffered image"),
         expected
     );
+    let accepted_record = fs.stat("/mixed.bin").expect("stat accepted mixed writes");
+    assert!(
+        accepted_record.data_version > base_record.data_version,
+        "accepted mixed writes must advance the visible content identity"
+    );
 
     fs.flush_write_buffer(record.inode_id)
         .expect("flush mixed writeback");
@@ -1469,8 +1489,8 @@ fn holetest_style_mixed_writeback_flushes_one_coalesced_image() {
     let patched_manifest = wd_current_content_manifest(&fs, "/mixed.bin");
     assert_eq!(
         patched_record.data_version,
-        base_record.data_version + 1,
-        "coalesced mixed writeback should perform one content rewrite"
+        accepted_record.data_version,
+        "coalesced mixed writeback must materialize the accepted content identity without inventing another"
     );
     assert!(patched_manifest
         .chunks
@@ -1527,14 +1547,20 @@ fn holetest_style_autoflush_keeps_future_markers_buffered() {
             .expect("mmap page writeback");
         expected[page_start..page_start + page_size].copy_from_slice(&page_bytes);
     }
+    let accepted_record = fs
+        .stat("/mixed.bin")
+        .expect("stat accepted autoflush writes");
+    assert!(
+        accepted_record.data_version > base_record.data_version,
+        "accepted autoflush writes must advance the visible content identity"
+    );
 
     fs.flush_write_buffer(record.inode_id)
         .expect("final explicit flush is empty");
     let patched_record = fs.stat("/mixed.bin").expect("stat patched");
     assert_eq!(
-        patched_record.data_version,
-        base_record.data_version + 3,
-        "three chunk-sized foreground batches should publish three rewrites"
+        patched_record.data_version, accepted_record.data_version,
+        "an empty final flush must not invent another content identity"
     );
     assert_eq!(fs.read_file("/mixed.bin").expect("read final"), expected);
 
