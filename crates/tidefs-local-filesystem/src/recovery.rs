@@ -4367,7 +4367,7 @@ mod receipt_validation_tests {
             chunk_index,
             data_version,
             len,
-            checksum: IntegrityDigest64(tidefs_local_object_store::checksum64(&payload)),
+            checksum: checksum64(&payload),
             placement_receipt_generation,
         }
     }
