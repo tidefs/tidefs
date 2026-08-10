@@ -6083,28 +6083,15 @@ impl VfsEngine for VfsLocalFileSystem {
         }
         let fs = self.fs.borrow();
         let mut ranges = Vec::new();
-        let mut cursor = offset;
-
-        while cursor < end {
-            let Some(data_start) = fs
-                .find_next_data_offset(fh.inode_id, cursor)
-                .map_err(|e| map_errno(&e))?
-            else {
-                break;
-            };
-            if data_start >= end {
-                break;
+        for (data_start, data_end) in fs
+            .mounted_data_ranges(fh.inode_id)
+            .map_err(|e| map_errno(&e))?
+        {
+            let clipped_start = data_start.max(offset);
+            let clipped_end = data_end.min(end);
+            if clipped_start < clipped_end {
+                ranges.push(LseekDataRange::new(clipped_start, clipped_end));
             }
-
-            let data_end = fs
-                .find_next_hole_offset(fh.inode_id, data_start)
-                .map_err(|e| map_errno(&e))?;
-            if data_end <= data_start {
-                return Err(Errno::EIO);
-            }
-
-            ranges.push(LseekDataRange::new(data_start, data_end.min(end)));
-            cursor = data_end;
         }
 
         Ok(ranges)

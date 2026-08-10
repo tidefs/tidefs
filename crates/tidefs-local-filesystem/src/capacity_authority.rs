@@ -295,9 +295,12 @@ impl CapacityAuthority {
         accounting: &SpaceAccounting,
         pool: PoolPhysicalCountersV1,
     ) {
-        self.refresh_committed_accounting(accounting, pool);
+        // Pending allocations are represented by the committed counters from
+        // this boundary onward. Clear the transient side before publishing the
+        // refreshed view so readers can never observe the same bytes twice.
         self.pending_bytes.store(0, Ordering::Release);
         self.reserved_bytes.store(0, Ordering::Release);
+        self.refresh_committed_accounting(accounting, pool);
     }
 
     /// Set the root-reserve byte count.

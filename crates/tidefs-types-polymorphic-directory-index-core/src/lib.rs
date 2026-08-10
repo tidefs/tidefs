@@ -19,7 +19,7 @@
 
 use core::fmt;
 
-#[cfg(feature = "alloc")]
+#[cfg(any(test, feature = "alloc"))]
 extern crate alloc;
 
 // ---------------------------------------------------------------------------

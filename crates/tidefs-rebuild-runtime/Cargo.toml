@@ -23,7 +23,7 @@ blake3 = "=1.5.5"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-tidefs-local-object-store = { workspace = true }
+tidefs-local-object-store = { workspace = true, features = ["distributed-repair"] }
 tempfile = { workspace = true }
 
 [lib]

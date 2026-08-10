@@ -4152,7 +4152,7 @@ impl LocalFileSystem {
             write_buffer_config: WriteBufferConfig::default(),
             pool_uuid,
             fsync_stats: FsyncStats::default(),
-            sync_gate: SyncGate::new(),
+            sync_gate: SyncGate::with_durable_commit_group(CommitGroupId(recovered_generation)),
             recovery_policy,
             capacity_authority,
             mounted_dataset_id: ROOT_DATASET_ID,
@@ -6784,6 +6784,10 @@ impl LocalFileSystem {
         self.state.inodes.get(&id)
     }
 
+    pub(crate) fn inode_id_is_allocated(&self, id: InodeId) -> bool {
+        id == ROOT_INODE_ID || self.state.known_inode_ids.contains(&id)
+    }
+
     /// Return the next inode ID that will be allocated.
     pub fn next_inode_id(&self) -> InodeId {
         self.state.next_inode_id()
@@ -7714,6 +7718,22 @@ impl LocalFileSystem {
         Ok(patches)
     }
 
+    fn coalesce_byte_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+        ranges.retain(|(start, end)| start < end);
+        ranges.sort_by_key(|(start, _)| *start);
+
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some((_, merged_end)) if start <= *merged_end => {
+                    *merged_end = (*merged_end).max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+    }
+
     fn coalesced_write_segment_ranges(
         &self,
         segments: &[(u64, Vec<u8>)],
@@ -7733,22 +7753,7 @@ impl LocalFileSystem {
                 })?;
             ranges.push((*offset, end));
         }
-        if ranges.is_empty() {
-            return Ok(Vec::new());
-        }
-        ranges.sort_by_key(|(start, _)| *start);
-
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
-        for (start, end) in ranges {
-            match merged.last_mut() {
-                Some((_, merged_end)) if start <= *merged_end => {
-                    *merged_end = (*merged_end).max(end);
-                }
-                _ => merged.push((start, end)),
-            }
-        }
-
-        merged
+        Self::coalesce_byte_ranges(ranges)
             .into_iter()
             .map(|(start, end)| {
                 let len = end
@@ -7782,22 +7787,7 @@ impl LocalFileSystem {
                 })?;
             ranges.push((patch.offset, end));
         }
-        if ranges.is_empty() {
-            return Ok(Vec::new());
-        }
-        ranges.sort_by_key(|(start, _)| *start);
-
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
-        for (start, end) in ranges {
-            match merged.last_mut() {
-                Some((_, merged_end)) if start <= *merged_end => {
-                    *merged_end = (*merged_end).max(end);
-                }
-                _ => merged.push((start, end)),
-            }
-        }
-
-        merged
+        Self::coalesce_byte_ranges(ranges)
             .into_iter()
             .map(|(start, end)| {
                 let len = end
@@ -8445,7 +8435,7 @@ impl LocalFileSystem {
         });
     }
 
-    fn record_dirty_buffer_free(&mut self, bytes: u64) {
+    fn record_dirty_buffer_discard(&mut self, bytes: u64) {
         if bytes == 0 {
             return;
         }
@@ -8509,7 +8499,7 @@ impl LocalFileSystem {
 
     fn discard_dirty_write_buffer_ranges(&mut self, inode_id: InodeId, ranges: &[(u64, u64)]) {
         let cleared = self.clear_write_buffer_ranges(inode_id, ranges);
-        self.record_dirty_buffer_free(cleared);
+        self.record_dirty_buffer_discard(cleared);
     }
 
     fn discard_dirty_write_buffer_range(&mut self, inode_id: InodeId, offset: u64, length: u64) {
@@ -8518,7 +8508,7 @@ impl LocalFileSystem {
 
     fn truncate_dirty_write_buffer_for_inode(&mut self, inode_id: InodeId, size: u64) {
         let freed = self.truncate_write_buffer_for_inode(inode_id, size);
-        self.record_dirty_buffer_free(freed);
+        self.record_dirty_buffer_discard(freed);
     }
 
     fn clear_writeback_ranges_from(&self, inode_id: InodeId, offset: u64) {
@@ -8927,7 +8917,6 @@ impl LocalFileSystem {
 
         let effective_size = adjusted_record.size;
         let mut new_size = effective_size;
-        let mut total_bytes = 0_u64;
         for (offset, bytes) in &segments {
             let bytes_len =
                 u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
@@ -8940,15 +8929,18 @@ impl LocalFileSystem {
                 })?;
             let _end_len = usize::try_from(end)
                 .map_err(|_| FileSystemError::SizeOverflow { requested: end })?;
-            total_bytes =
-                total_bytes
-                    .checked_add(bytes_len)
-                    .ok_or(FileSystemError::SizeOverflow {
-                        requested: u64::MAX,
-                    })?;
             new_size = new_size.max(end);
         }
-        self.ensure_content_write_not_over_capacity(total_bytes)?;
+        let written_ranges = self.coalesced_write_segment_ranges(&segments)?;
+        let patches = self.coalesced_write_buffer_patches(&segments)?;
+        let materialization_charge_ranges: Vec<(u64, u64)> = written_ranges
+            .iter()
+            .flat_map(|(offset, length)| {
+                self.write_buffer_uncovered_ranges(inode_id, *offset, *length)
+            })
+            .collect();
+        let physical_admit_bytes = Self::range_bytes(&materialization_charge_ranges)?;
+        self.ensure_content_write_not_over_capacity(physical_admit_bytes)?;
         let old_grains = crate::quota::allocation_grains_for_len(effective_size);
         let new_grains = crate::quota::allocation_grains_for_len(new_size);
         let delta_bytes = new_grains.saturating_sub(old_grains);
@@ -8964,11 +8956,12 @@ impl LocalFileSystem {
             }
         }
 
-        let written_ranges = self.coalesced_write_segment_ranges(&segments)?;
-        let physical_admit_bytes = total_bytes;
         let base_record = self.committed_inode_record(inode_id)?;
-        let replacement_credit_bytes =
-            self.materialized_content_bytes_in_ranges(inode_id, &base_record, &written_ranges)?;
+        let replacement_credit_bytes = self.materialized_content_bytes_in_ranges(
+            inode_id,
+            &base_record,
+            &materialization_charge_ranges,
+        )?;
         let logical_growth_bytes = new_size.saturating_sub(effective_size);
         if physical_admit_bytes > 0 {
             let handle = self.reserve_with_hierarchy_replacement_credit(
@@ -8980,7 +8973,6 @@ impl LocalFileSystem {
 
         check_crash_hook(CrashInjectionPoint::OpWriteBeforeExtentUpdate);
 
-        let patches = self.coalesced_write_buffer_patches(&segments)?;
         let was_auto_commit = self.auto_commit;
         let was_in_transaction = self.in_transaction;
         let was_max_uncommitted_mutations = self.max_uncommitted_mutations;
@@ -9024,7 +9016,17 @@ impl LocalFileSystem {
         self.max_uncommitted_mutations = was_max_uncommitted_mutations;
         self.in_transaction = was_in_transaction;
         self.auto_commit = was_auto_commit;
-        let result = result?;
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                // The direct path committed only the previously unbuffered
+                // part of this write. Its mutation rollback restores the
+                // post-reservation snapshot, so return that charge here while
+                // retaining any pre-existing dirty-buffer charge.
+                self.capacity_authority.record_free(physical_admit_bytes);
+                return Err(err);
+            }
+        };
 
         if delta_bytes > 0 {
             let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
@@ -9039,7 +9041,7 @@ impl LocalFileSystem {
         }
         self.state
             .space_accounting
-            .track_physical_write(total_bytes);
+            .track_physical_write(physical_admit_bytes);
         for (offset, bytes) in &segments {
             let bytes_len =
                 u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
@@ -9059,8 +9061,10 @@ impl LocalFileSystem {
             );
         }
         self.state.dirty_extent_maps.insert(inode_id);
-        let cleared_dirty_bytes = self.clear_write_buffer_ranges(inode_id, &written_ranges);
-        self.record_dirty_buffer_free(cleared_dirty_bytes);
+        // Clearing a materialized range transfers ownership from the dirty
+        // buffer to Pool content. Its capacity charge remains live until the
+        // commit boundary folds pending bytes into committed accounting.
+        self.clear_write_buffer_ranges(inode_id, &written_ranges);
         if !written_ranges.is_empty() {
             let mut tracker = self.writeback_range_tracker.lock().expect("locked");
             for (offset, length) in &written_ranges {
@@ -9657,89 +9661,107 @@ impl LocalFileSystem {
         self.commit_mutation(updated)
     }
 
-    /// Query the content manifest for the next hole (gap between chunks or
-    /// beyond the last chunk) starting at or after .  Returns the
-    /// byte offset of the first hole found, or  if no holes
-    /// exist between  and end-of-file.
-    ///
-    /// Holes are derived from the sparse content manifest directly.  A
-    /// missing chunk index IS a hole.  This survives remounts because
-    /// manifests are persisted (#873).
-    pub fn find_next_hole_offset(&self, inode_id: InodeId, offset: u64) -> Result<u64> {
-        let record = self.inode(inode_id)?.clone();
-        let content_reader = MountedContentReadAuthority::new(&self.store);
-        let layout = content_reader.read_layout(inode_id, &record)?;
-        match layout {
-            ContentLayout::Inline(_) => Ok(record.size),
-            ContentLayout::Chunked(manifest) => {
-                let chunk_size = FILESYSTEM_CONTENT_CHUNK_SIZE as u64;
-                let mut pos = offset;
-                for chunk_ref in &manifest.chunks {
-                    let cstart = chunk_ref.chunk_index * chunk_size;
-                    if pos < cstart {
-                        return Ok(pos);
-                    }
-                    let cend = (cstart + chunk_ref.len as u64).min(record.size);
-                    if chunk_ref.is_hole() {
-                        if pos < cend {
-                            return Ok(pos);
+    /// Derive the live file's data ranges from its Pool-readable manifest and
+    /// exact dirty-buffer overlay.
+    pub(crate) fn mounted_data_ranges(&self, inode_id: InodeId) -> Result<Vec<(u64, u64)>> {
+        let live = self.inode(inode_id)?;
+        if !live.is_file_like() {
+            return Err(FileSystemError::NotFile {
+                path: format!("inode:{}", inode_id.get()),
+                kind: live.kind(),
+            });
+        }
+        let live_size = live.size;
+        if live_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let committed = self.committed_inode_record(inode_id)?;
+        let mut ranges = Vec::new();
+        if committed.size > 0 {
+            match self.read_committed_content_layout(inode_id, &committed)? {
+                ContentLayout::Inline(content) => {
+                    let content_len = u64::try_from(content.bytes.len()).map_err(|_| {
+                        FileSystemError::SizeOverflow {
+                            requested: u64::MAX,
                         }
-                        continue;
-                    }
-                    if pos < cend {
-                        pos = cend;
+                    })?;
+                    let end = content_len.min(committed.size).min(live_size);
+                    if end > 0 {
+                        ranges.push((0, end));
                     }
                 }
-                Ok(pos.min(record.size))
+                ContentLayout::Chunked(manifest) => {
+                    let chunk_size = u64::from(manifest.chunk_size);
+                    for chunk_ref in manifest.chunks.iter().filter(|chunk| !chunk.is_hole()) {
+                        let start = chunk_ref
+                            .chunk_index
+                            .checked_mul(chunk_size)
+                            .ok_or(FileSystemError::SizeOverflow {
+                                requested: u64::MAX,
+                            })?;
+                        let end = start
+                            .checked_add(u64::from(chunk_ref.len))
+                            .ok_or(FileSystemError::SizeOverflow {
+                                requested: u64::MAX,
+                            })?
+                            .min(committed.size)
+                            .min(live_size);
+                        if start < end {
+                            ranges.push((start, end));
+                        }
+                    }
+                }
             }
         }
+        if let Some(buffer) = self.write_buffers.get(&inode_id) {
+            ranges.extend(
+                buffer
+                    .dirty_ranges()
+                    .into_iter()
+                    .filter_map(|(start, end)| {
+                        let end = end.min(live_size);
+                        (start < end).then_some((start, end))
+                    }),
+            );
+        }
+        Ok(Self::coalesce_byte_ranges(ranges))
     }
 
-    /// Query the content manifest for the next data region starting at or
-    /// after .  Returns the byte offset of the first data byte, or
-    ///  if no data exists beyond  (i.e. ENXIO).
-    ///
-    /// Like , data presence is derived from the
-    /// sparse content manifest directly.  Inline content is always fully
-    /// dense.
+    /// Query the canonical live data ranges for the next hole at or after
+    /// `offset`.
+    pub fn find_next_hole_offset(&self, inode_id: InodeId, offset: u64) -> Result<u64> {
+        let file_size = self.inode(inode_id)?.size;
+        if offset >= file_size {
+            return Ok(file_size);
+        }
+        let mut cursor = offset;
+        for (start, end) in self.mounted_data_ranges(inode_id)? {
+            if end <= cursor {
+                continue;
+            }
+            if cursor < start {
+                return Ok(cursor);
+            }
+            cursor = cursor.max(end);
+        }
+        Ok(cursor.min(file_size))
+    }
+
+    /// Query the canonical live data ranges for the next data byte at or after
+    /// `offset`.
     pub fn find_next_data_offset(&self, inode_id: InodeId, offset: u64) -> Result<Option<u64>> {
-        let record = self.inode(inode_id)?.clone();
-        if offset >= record.size {
+        let file_size = self.inode(inode_id)?.size;
+        if offset >= file_size {
             return Ok(None);
         }
-        let content_reader = MountedContentReadAuthority::new(&self.store);
-        let layout = content_reader.read_layout(inode_id, &record)?;
-        match layout {
-            ContentLayout::Inline(_) => Ok(Some(offset)),
-            ContentLayout::Chunked(manifest) => {
-                let chunk_size = FILESYSTEM_CONTENT_CHUNK_SIZE as u64;
-                let mut pos = offset;
-                for chunk_ref in &manifest.chunks {
-                    let cstart = chunk_ref.chunk_index * chunk_size;
-                    let cend = (cstart + chunk_ref.len as u64).min(record.size);
-                    if chunk_ref.is_hole() {
-                        if pos < cstart {
-                            pos = cstart;
-                        }
-                        if pos < cend {
-                            pos = cend;
-                        }
-                        continue;
-                    }
-                    if pos < cstart {
-                        if cstart < record.size {
-                            return Ok(Some(cstart));
-                        }
-                        return Ok(None);
-                    }
-                    if pos < cend {
-                        return Ok(Some(pos));
-                    }
-                    pos = cend;
-                }
-                Ok(None)
+        for (start, end) in self.mounted_data_ranges(inode_id)? {
+            if end <= offset {
+                continue;
             }
+            return Ok(Some(offset.max(start)));
         }
+        Ok(None)
     }
 
     /// Write zeros to a range within the file without changing file size.
@@ -10827,10 +10849,10 @@ impl LocalFileSystem {
     }
 
     fn xattr_metadata_record(&self, inode_id: InodeId) -> Result<InodeRecord> {
-        // Xattr mutations touch inode metadata only.  Do not force pending
-        // file-data buffers through the object store, and do not persist the
-        // stat overlay size before those bytes are flushed.
-        self.committed_inode_record(inode_id)
+        // Xattr mutations touch metadata only and must leave pending data in
+        // the write buffer. Mutate the live inode so the metadata update cannot
+        // restore the Pool predecessor's stale size or data version.
+        self.inode(inode_id)
     }
 
     fn ensure_xattr_owner_generation(
@@ -12035,11 +12057,8 @@ impl LocalFileSystem {
         inode: &InodeRecord,
     ) -> Result<IntentLogReplyState> {
         self.ensure_mutation_allowed("record namespace create intent")?;
-        let root_anchor = IntentLogRootAnchor {
-            transaction_id: self.state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID),
-            generation: self.state.generation,
-            manifest_checksum: IntegrityDigest64(0),
-        };
+        let committed_root = self.selected_committed_root_summary()?;
+        let root_anchor = IntentLogRootAnchor::from_committed_root_summary(&committed_root);
         let timestamp_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -12070,11 +12089,8 @@ impl LocalFileSystem {
         updated_inode: &InodeRecord,
     ) -> Result<IntentLogReplyState> {
         self.ensure_mutation_allowed("record metadata setattr intent")?;
-        let root_anchor = IntentLogRootAnchor {
-            transaction_id: self.state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID),
-            generation: self.state.generation,
-            manifest_checksum: IntegrityDigest64(0),
-        };
+        let committed_root = self.selected_committed_root_summary()?;
+        let root_anchor = IntentLogRootAnchor::from_committed_root_summary(&committed_root);
         let timestamp_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -13233,7 +13249,7 @@ impl LocalFileSystem {
             .map(|wb| wb.buffered_bytes() as u64)
             .unwrap_or(0);
         self.buffered_write_base_records.remove(&inode_id);
-        self.record_dirty_buffer_free(freed);
+        self.record_dirty_buffer_discard(freed);
         self.state.dirty_content.remove(&inode_id);
         self.state.dirty_inodes.remove(&inode_id);
         self.state.dirty_extent_maps.remove(&inode_id);
@@ -17989,7 +18005,7 @@ mod recovery_integration_tests {
         use crate::intent_log::{
             IntentLog, IntentLogConfig, IntentLogEntryKind, IntentLogRootAnchor,
         };
-        use crate::persistence::persist_state;
+        use crate::persistence::persist_state_with_pool;
         use crate::recovery::initial_state;
 
         let root = temp_root("readonly-intent-preserve");
@@ -17998,17 +18014,15 @@ mod recovery_integration_tests {
         // intent-log entries using low-level APIs so Drop auto-commit
         // does not consume the pending entries.
         {
-            let mut store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-                &root,
-                test_options(),
-            )
-            .expect("open store");
+            let mut pool =
+                LocalFileSystem::default_development_pool(&root, &test_options(), None, None)
+                    .expect("open development pool");
 
             // Write a committed root.
             let mut state = initial_state();
             state.generation = 2;
-            persist_state(
-                &mut store,
+            persist_state_with_pool(
+                &mut pool,
                 &state,
                 default_root_authentication_key().expect("auth key"),
             )
@@ -18026,7 +18040,7 @@ mod recovery_integration_tests {
                 ..IntentLogConfig::default()
             });
             log.append(
-                &mut store,
+                pool.raw_primary_store_mut(),
                 IntentLogEntryKind::PressureFallback,
                 anchor,
                 1, // timestamp_ns
@@ -18053,12 +18067,11 @@ mod recovery_integration_tests {
             )
             .expect("ReadOnly open should succeed");
 
-            let store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-                &root,
-                test_options(),
-            )
-            .expect("reopen store for verification");
-            let intent_log = IntentLog::load(&store).expect("load intent log");
+            let pool =
+                LocalFileSystem::default_development_pool(&root, &test_options(), None, None)
+                    .expect("reopen development pool for verification");
+            let intent_log =
+                IntentLog::load(pool.raw_primary_store()).expect("load intent log");
             assert!(
                 !intent_log.is_empty(),
                 "ReadOnly open must not replay intent-log entries; pending entries should remain"

@@ -355,7 +355,7 @@ impl DirtyFlush for LocalFsDirtyFlush<'_> {
     }
 
     fn flush_all(&self) -> Result<(), FsyncDispatchError> {
-        self.fs.borrow_mut().sync_all_dirty().map_err(|e| match e {
+        self.fs.borrow_mut().fsync_all().map_err(|e| match e {
             FileSystemError::NoSpace { .. } => FsyncDispatchError::NoSpace,
             _ => FsyncDispatchError::IoError,
         })

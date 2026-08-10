@@ -95,6 +95,18 @@ impl SyncGate {
         Self::default()
     }
 
+    /// Create a sync gate whose durable pointer starts at the commit group
+    /// selected by recovery.
+    #[must_use]
+    pub fn with_durable_commit_group(durable_commit_group: CommitGroupId) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SyncGateInner {
+                durable_commit_group,
+                ..SyncGateInner::default()
+            })),
+        }
+    }
+
     /// Return the highest durable (committed + synced) commit_group id.
     #[must_use]
     pub fn durable_commit_group(&self) -> CommitGroupId {
@@ -304,6 +316,16 @@ mod tests {
         assert_eq!(gate.durable_commit_group(), CommitGroupId(1));
         gate.notify_committed(CommitGroupId(5));
         assert_eq!(gate.durable_commit_group(), CommitGroupId(5));
+    }
+
+    #[test]
+    fn recovered_durable_commit_group_is_the_initial_floor() {
+        let gate = SyncGate::with_durable_commit_group(CommitGroupId(9));
+        assert_eq!(gate.durable_commit_group(), CommitGroupId(9));
+        gate.notify_committed(CommitGroupId(4));
+        assert_eq!(gate.durable_commit_group(), CommitGroupId(9));
+        gate.notify_committed(CommitGroupId(10));
+        assert_eq!(gate.durable_commit_group(), CommitGroupId(10));
     }
 
     #[test]

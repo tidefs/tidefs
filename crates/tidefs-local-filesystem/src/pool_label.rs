@@ -1023,7 +1023,12 @@ mod tests {
         assert_eq!(decoded.system_area_size, label.system_area_size);
         assert_eq!(decoded.features_incompat, label.features_incompat);
         assert_eq!(decoded.features_ro_compat, label.features_ro_compat);
-        assert_eq!(decoded.features_compat, label.features_compat);
+        assert_eq!(
+            decoded.features_compat,
+            label.features_compat
+                | features::DEVICE_HEALTH_STATE
+                | features::POOL_REDUNDANCY_POLICY
+        );
         assert_eq!(decoded.device_health, label.device_health);
         assert_eq!(decoded.device_read_errors, label.device_read_errors);
         assert_eq!(decoded.device_write_errors, label.device_write_errors);

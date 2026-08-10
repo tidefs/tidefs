@@ -9867,7 +9867,13 @@ fn admission_check_write_exceeding_quota_is_rejected() {
     let root = temp_root("admit_quota_reject");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/test", 0o644).expect("create file");
-    fs.state.space_accounting.set_quota(256); // tiny quota
+    fs.state.quota_table.set_quota(
+        ROOT_INODE_ID,
+        QuotaConfig {
+            hard_limit_bytes: 256,
+            ..QuotaConfig::default()
+        },
+    );
 
     let result = fs.write_file("/test", 0, &[0u8; 512]);
     assert!(result.is_err());
@@ -9913,7 +9919,13 @@ fn admission_check_sparse_truncate_expand_does_not_charge_quota() {
     let root = temp_root("admit_trunc_expand");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/test", 0o644).expect("create file");
-    fs.state.space_accounting.set_quota(512); // 512 bytes quota
+    fs.state.quota_table.set_quota(
+        ROOT_INODE_ID,
+        QuotaConfig {
+            hard_limit_bytes: crate::quota::allocation_grains_for_len(64),
+            ..QuotaConfig::default()
+        },
+    );
 
     // Create small file
     let record = fs.write_file("/test", 0, &[65u8; 64]).unwrap();

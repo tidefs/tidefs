@@ -30,7 +30,7 @@ thiserror = "2"
 [dev-dependencies]
 tempfile = { workspace = true }
 tidefs-membership-epoch = { workspace = true }
-
+tidefs-local-object-store = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

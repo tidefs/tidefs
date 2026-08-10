@@ -200,6 +200,14 @@ impl WriteBuffer {
         self.total_bytes
     }
 
+    /// Return the exact byte ranges currently owned by the dirty buffer.
+    pub(crate) fn dirty_ranges(&self) -> Vec<(u64, u64)> {
+        self.segments
+            .iter()
+            .map(|(&offset, data)| (offset, Self::segment_end(offset, data)))
+            .collect()
+    }
+
     /// Return the highest byte offset covered by any buffered segment
     /// (offset + length). Returns `None` when the buffer is empty.
     pub fn max_offset(&self) -> Option<u64> {

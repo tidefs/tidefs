@@ -19,7 +19,8 @@ use crate::encoding::*;
 use crate::error::FileSystemError;
 use crate::helpers::*;
 use crate::intent_log::{
-    replay_uncommitted, replay_uncommitted_with_pool, IntentLog, IntentLogRootAnchor,
+    intent_log_requires_commit_after, replay_uncommitted, replay_uncommitted_with_pool, IntentLog,
+    IntentLogRootAnchor,
 };
 use crate::merge_allocation_entries;
 use crate::object_keys::*;
@@ -360,7 +361,7 @@ pub(crate) fn load_latest_committed_state_pool(
             let committed_base = IntentLogRootAnchor::from_committed_root_summary(selected_root);
             let since_tx = committed_base.transaction_id;
             let mut log = IntentLog::load(pool.raw_primary_store())?;
-            if log.replay_is_needed(since_tx) {
+            if intent_log_requires_commit_after(&log, &committed_base) {
                 check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
                 let count = replay_uncommitted_with_pool(&log, &mut state, pool, &committed_base)?;
                 check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
