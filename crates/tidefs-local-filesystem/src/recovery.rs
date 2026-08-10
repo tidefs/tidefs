@@ -4234,8 +4234,8 @@ mod receipt_validation_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tidefs_local_object_store::pool::Pool;
     use tidefs_local_object_store::{
-        DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, IntegrityDigest64,
-        LocalObjectStore, PoolConfig, PoolProperties, StoreOptions,
+        DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, LocalObjectStore,
+        PoolConfig, PoolProperties, StoreOptions,
     };
     use tidefs_types_vfs_core::S_IFREG;
 
