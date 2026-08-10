@@ -562,6 +562,7 @@ mod tests {
         not(feature = "cluster"),
         not(feature = "diagnostics"),
         not(feature = "receive-merge"),
+        not(feature = "replication-io"),
         not(feature = "storage-intent")
     ))]
     #[test]
@@ -586,11 +587,19 @@ mod tests {
             "/tmp/inventory.json",
         ])
         .is_err());
+        #[cfg(not(feature = "replication-io"))]
+        {
+            assert!(Cli::try_parse_from(["tidefsctl", "snapshot", "send", "mypool"]).is_err());
+            assert!(Cli::try_parse_from(["tidefsctl", "snapshot", "receive", "mypool"]).is_err());
+        }
         #[cfg(not(feature = "storage-intent"))]
         assert!(Cli::try_parse_from(["tidefsctl", "storage-intent"]).is_err());
     }
 
-    #[cfg(any(not(feature = "cluster"), not(feature = "remote-snapshot")))]
+    #[cfg(any(
+        not(feature = "cluster"),
+        all(feature = "replication-io", not(feature = "remote-snapshot"))
+    ))]
     #[test]
     fn local_commands_hide_disabled_nonlocal_options() {
         use clap::Parser;
@@ -610,7 +619,7 @@ mod tests {
             .is_err());
             assert!(Cli::try_parse_from(["tidefsctl", "dataset", "list", "--cluster"]).is_err());
         }
-        #[cfg(not(feature = "remote-snapshot"))]
+        #[cfg(all(feature = "replication-io", not(feature = "remote-snapshot")))]
         assert!(Cli::try_parse_from([
             "tidefsctl",
             "snapshot",
@@ -1149,6 +1158,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "replication-io")]
     fn cli_parse_snapshot_receive_live_pool_positional() {
         use clap::Parser;
         let args = Cli::try_parse_from([
@@ -1166,6 +1176,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "replication-io")]
     fn cli_parse_snapshot_receive_rejects_backing_dir() {
         use clap::Parser;
         let args = Cli::try_parse_from([
@@ -1184,6 +1195,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "replication-io")]
     fn cli_parse_snapshot_receive_rejects_devices() {
         use clap::Parser;
         let args = Cli::try_parse_from([
@@ -1203,6 +1215,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "replication-io")]
     fn cli_help_snapshot_receive_is_live_owner_only() {
         #[derive(clap::Parser)]
         struct SnapshotHelpCli {

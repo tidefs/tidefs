@@ -97,7 +97,9 @@ const LOCAL_ONLY_COMMANDS: &[&str] = &[
     "snapshot export",
     "snapshot extract",
     "snapshot rollback",
+    #[cfg(feature = "replication-io")]
     "snapshot send",
+    #[cfg(feature = "replication-io")]
     "snapshot receive",
     "snapshot clone create",
     "snapshot clone delete",
@@ -192,6 +194,8 @@ fn command_is_enabled(command: &str) -> bool {
         cfg!(feature = "diagnostics")
     } else if command.starts_with("merge ") {
         cfg!(feature = "receive-merge")
+    } else if matches!(command, "snapshot send" | "snapshot receive") {
+        cfg!(feature = "replication-io")
     } else if command.starts_with("storage-intent ") {
         cfg!(feature = "storage-intent")
     } else {
@@ -439,6 +443,13 @@ mod tests {
                 "{command} should not acquire the privileged guard"
             );
         }
+    }
+
+    #[test]
+    #[cfg(not(feature = "replication-io"))]
+    fn disabled_replication_io_has_no_admission_surface() {
+        assert_eq!(command_admission("snapshot send"), None);
+        assert_eq!(command_admission("snapshot receive"), None);
     }
 
     #[test]

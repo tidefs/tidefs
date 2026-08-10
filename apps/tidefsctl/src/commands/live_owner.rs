@@ -2071,6 +2071,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "replication-io")]
     fn live_owner_byte_response_rejects_declared_length_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("owner.sock");

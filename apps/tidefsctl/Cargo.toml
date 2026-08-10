@@ -35,7 +35,11 @@ data-policy = [
 ]
 distributed-repair = ["dep:tidefs-device-removal"]
 receive-merge = []
-remote-snapshot = ["dep:tidefs-transport"]
+replication-io = [
+    "tidefs-local-filesystem/replication-io",
+    "tidefs-posix-filesystem-adapter-daemon/replication-io",
+]
+remote-snapshot = ["replication-io", "dep:tidefs-transport"]
 storage-intent = [
     "dep:serde",
     "dep:tidefs-storage-intent-core",
@@ -48,6 +52,7 @@ full = [
     "diagnostics",
     "distributed-repair",
     "receive-merge",
+    "replication-io",
     "remote-snapshot",
     "storage-intent",
 ]
@@ -63,7 +68,7 @@ tidefs-recovery-loop = { workspace = true, optional = true }
 tidefs-device-removal = { workspace = true, optional = true }
 tidefs-types-pool-label-core = { workspace = true }
 tidefs-local-object-store = { workspace = true }
-tidefs-local-filesystem = { workspace = true, features = ["replication-io"] }
+tidefs-local-filesystem = { workspace = true }
 tidefs-dataset-lifecycle = { workspace = true }
 tidefs-dataset-properties = { workspace = true }
 tidefs-dataset-feature-flags = { workspace = true }

@@ -66,11 +66,13 @@ receipt-demo = [
     "dep:tidefs-schema-codec-posix-filesystem-adapter",
     "dep:tidefs-types-package-profile-catalog",
 ]
+replication-io = ["tidefs-local-filesystem/replication-io"]
 scrub-observation = ["dep:tidefs-performance-contract"]
 workload-telemetry = ["dep:tidefs-workload"]
 full = [
     "cluster",
     "data-policy",
+    "replication-io",
     "receipt-demo",
     "scrub-observation",
     "workload-telemetry",
