@@ -180,6 +180,11 @@ proptest! {
             let fs = LocalFileSystem::open_with_options(&root, wd_options()).expect("reopen fs");
             let record = fs.stat("/data.bin").expect("stat");
             prop_assert_eq!(record.size, expected.len() as u64);
+            prop_assert_eq!(
+                fs.read_file("/data.bin").expect("read reopened file"),
+                expected.clone(),
+                "reopened Pool-backed content must preserve accepted bytes"
+            );
 
             let layout = MountedContentReadAuthority::new(&fs.store)
                 .read_layout(record.inode_id, &record)
@@ -191,11 +196,24 @@ proptest! {
             prop_assert_eq!(manifest.file_size, expected.len() as u64);
             prop_assert_eq!(manifest.chunk_size, content_chunk_size());
 
-            if !expected.is_empty() {
-                let expected_chunks = content_chunk_count(expected.len() as u64)
-                    .expect("chunk count") as usize;
-                prop_assert_eq!(manifest.chunks.len(), expected_chunks,
-                    "manifest chunk count must match expected");
+            let expected_chunks = content_chunk_count(expected.len() as u64)
+                .expect("chunk count") as usize;
+            prop_assert!(
+                manifest.chunks.len() <= expected_chunks,
+                "sparse manifest cannot exceed the logical chunk count"
+            );
+            let chunk_size = content_chunk_size() as usize;
+            for chunk_index in 0..expected_chunks {
+                let start = chunk_index * chunk_size;
+                let end = expected.len().min(start + chunk_size);
+                if find_chunk_in_manifest(&manifest, chunk_index as u64)
+                    .is_none_or(ContentChunkRef::is_hole)
+                {
+                    prop_assert!(
+                        expected[start..end].iter().all(|byte| *byte == 0),
+                        "only zero-filled logical chunks may be sparse"
+                    );
+                }
             }
         }
         wd_cleanup(&root);
