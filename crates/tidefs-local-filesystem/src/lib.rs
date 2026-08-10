@@ -7723,14 +7723,13 @@ impl LocalFileSystem {
         self.ensure_content_capacity_with_planned_inode(Some(inode_id), planned_entries.clone())?;
 
         self.begin_mutation("rewrite file content")?;
-        let tick = if uses_pending_version {
+        if uses_pending_version {
             // The buffered write already acquired its visible content version,
             // dirty accounting, and commit-group ownership at write acceptance.
             // Writeback materializes exactly that version instead of inventing
             // a later identity at flush time.
             self.mutation_recorded_commit_group_write = true;
             record = planned_record.clone();
-            planned_tick
         } else {
             let tick = self.bump_generation();
             debug_assert_eq!(tick, planned_tick);
@@ -7738,8 +7737,7 @@ impl LocalFileSystem {
             record.data_version = tick;
             record.metadata_version = tick;
             Self::advance_subtree_revision(&mut record);
-            tick
-        };
+        }
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
             let mut pool_store = self.store.pool_store_mut();
@@ -7780,7 +7778,7 @@ impl LocalFileSystem {
                 self.record_mutation_commit_group_write(dirty_allocation_bytes);
         }
         #[cfg(feature = "policy-observation")]
-        self.record_policy_allocation_claim(inode_id, new_blocks, tick);
+        self.record_policy_allocation_claim(inode_id, new_blocks, record.data_version);
 
         self.inode_cache.borrow_mut().invalidate(inode_id);
         if uses_pending_version {
@@ -8532,6 +8530,8 @@ impl LocalFileSystem {
             let old_write_buffer = self.write_buffers.get(&inode_id).cloned();
             let old_base_record = self.buffered_write_base_records.get(&inode_id).cloned();
             let old_live_record = self.state.inodes.get(&inode_id).cloned();
+            let old_extent_allocator = self.extent_allocator.clone();
+            let old_dirty_extent_maps = self.state.dirty_extent_maps.clone();
             let old_dirty_ranges = self
                 .writeback_range_tracker
                 .lock()
@@ -8541,6 +8541,8 @@ impl LocalFileSystem {
                 old_write_buffer,
                 old_base_record,
                 old_live_record,
+                old_extent_allocator,
+                old_dirty_extent_maps,
                 old_dirty_ranges,
                 self.state.generation,
                 self.state.dirty_content.clone(),
@@ -8596,12 +8598,21 @@ impl LocalFileSystem {
             .record_data_write(inode_id, physical_admit_bytes);
         let _accepted_by_commit_group =
             self.record_mutation_commit_group_write(physical_admit_bytes);
+        // PendingData must exist before a threshold-triggered foreground
+        // writeback can finalize this accepted range. Allocating it after the
+        // flush would replace the finalized extent with a new pending extent.
+        let _ = self
+            .extent_allocator
+            .allocate_extent(inode_id.0, offset, bytes_len, None);
+        self.state.dirty_extent_maps.insert(inode_id);
         if should_flush {
             if let Err(err) = self.flush_write_buffer(inode_id) {
                 if let Some((
                     old_write_buffer,
                     old_base_record,
                     old_live_record,
+                    old_extent_allocator,
+                    old_dirty_extent_maps,
                     old_dirty_ranges,
                     old_generation,
                     old_dirty_content,
@@ -8634,6 +8645,8 @@ impl LocalFileSystem {
                             Arc::make_mut(&mut self.state.inodes).remove(&inode_id);
                         }
                     }
+                    self.extent_allocator = old_extent_allocator;
+                    self.state.dirty_extent_maps = old_dirty_extent_maps;
                     self.state.generation = old_generation;
                     self.state.dirty_content = old_dirty_content;
                     self.state.dirty_inodes = old_dirty_inodes;
@@ -8668,13 +8681,8 @@ impl LocalFileSystem {
                 .space_accounting
                 .track_physical_write(physical_admit_bytes);
         }
-        // Track extent allocation for the writeback layer.
-        let _ = self
-            .extent_allocator
-            .allocate_extent(inode_id.0, offset, bytes_len, None);
         // Capacity reservation was committed inline before the write.
         // On error paths the caller must rollback via capacity_authority.record_free.
-        self.state.dirty_extent_maps.insert(inode_id);
         Ok(result)
     }
 
@@ -13193,13 +13201,23 @@ impl LocalFileSystem {
         replaced_inode: Option<InodeId>,
         planned_entries: BTreeMap<ObjectKey, u64>,
     ) -> Result<()> {
-        let mut current_entries =
-            content_allocation_entries_for_state_pool(&self.store, &self.state)?;
-        if let Some(inode_id) = replaced_inode {
-            let old_record = self.committed_inode_record(inode_id)?;
-            for key in content_allocation_entries_for_inode_pool(&self.store, &old_record)?.keys() {
-                current_entries.remove(key);
+        let mut current_entries = BTreeMap::new();
+        for live_record in self.state.inodes.values() {
+            if !live_record.is_file_like() || Some(live_record.inode_id) == replaced_inode {
+                continue;
             }
+            // Accepted buffered writes are immediately visible through
+            // state.inodes, but their new content identity is not Pool-readable
+            // until writeback. Capacity projection must therefore retain the
+            // last materialized record for every other buffered inode.
+            let pool_readable_record = self
+                .buffered_write_base_records
+                .get(&live_record.inode_id)
+                .unwrap_or(live_record);
+            merge_allocation_entries(
+                &mut current_entries,
+                content_allocation_entries_for_inode_pool(&self.store, pool_readable_record)?,
+            );
         }
         merge_allocation_entries(&mut current_entries, planned_entries);
         self.ensure_content_capacity_for_current_entries(current_entries)
