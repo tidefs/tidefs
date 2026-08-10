@@ -68,7 +68,10 @@ fn txn_allocate_extent_commit_and_lookup() {
     assert_eq!(extents.len(), 1, "one contiguous extent for 8 KiB write");
     assert_eq!(extents[0].logical_offset, 0);
     assert_eq!(extents[0].length, 8192);
-    assert!(extents[0].is_pending_data());
+    assert!(
+        extents[0].is_data(),
+        "a committed transaction must finalize its data extent"
+    );
 
     // Read the data back via the regular filesystem path.
     let data = fs.read_file("/data.bin").expect("read data.bin");
