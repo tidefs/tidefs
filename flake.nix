@@ -143,6 +143,10 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
             };
+            cargoBuildFlags = [
+              "--workspace"
+              "--features" "tidefsctl/full"
+            ];
             workspaceBins = workspaceBins;
           };
 
@@ -259,6 +263,7 @@
             cargoBuildFlags = [
               "-p" "tidefsctl"
               "-p" "tidefs-block-volume-adapter-daemon"
+              "--features" "tidefsctl/block-volume"
               "--bins"
             ];
             workspaceBins = [
@@ -279,6 +284,7 @@
               "-p" "tidefsctl"
               "-p" "tidefs-block-volume-adapter-daemon"
               "-p" "tidefs-xtask"
+              "--features" "tidefsctl/block-volume"
               "--bins"
             ];
             workspaceBins = [

@@ -94,6 +94,9 @@ product-grade.
 | `dataset get` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | read dataset properties through owner authority or explicit devices |
 | `dataset set` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | set dataset properties through owner authority or explicit devices |
 | `dataset list-props` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list dataset property definitions and effective values |
+| `merge resolve` | `public-operator` | `no-live-pool-state` | `unguarded` | `visible` | resolve receive conflicts into a local inventory document |
+| `merge validate` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | validate a resolved receive conflict inventory read-only |
+| `merge show` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | display a receive conflict inventory read-only |
 | `storage-intent explain` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | render supplied storage-intent policy, receipt, and evidence-query records read-only |
 | `storage-intent policy set` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | stage dataset prefetch/residency policy source through #855 without activation |
 | `storage-intent policy clear` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | stage dataset prefetch/residency policy clears through #855 without activation |

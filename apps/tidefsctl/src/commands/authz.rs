@@ -21,6 +21,7 @@ impl CommandAdmission {
         matches!(self, Self::LocalOnly | Self::LocalOnlyWhenMutating)
     }
 
+    #[cfg(any(feature = "diagnostics", test))]
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::LocalOnly => "local-only",
@@ -146,6 +147,9 @@ const UNGUARDED_COMMANDS: &[&str] = &[
     "storage-intent explain",
     "storage-intent policy show",
     "storage-intent policy dry-run",
+    "merge resolve",
+    "merge validate",
+    "merge show",
     "mount",
     "pool mount",
     "pool integrity-check",
@@ -166,7 +170,9 @@ const UNGUARDED_COMMANDS: &[&str] = &[
 ];
 
 pub(crate) fn command_admission(command: &str) -> Option<CommandAdmission> {
-    if LOCAL_ONLY_COMMANDS.contains(&command) {
+    if !command_is_enabled(command) {
+        None
+    } else if LOCAL_ONLY_COMMANDS.contains(&command) {
         Some(CommandAdmission::LocalOnly)
     } else if LOCAL_ONLY_WHEN_MUTATING_COMMANDS.contains(&command) {
         Some(CommandAdmission::LocalOnlyWhenMutating)
@@ -174,6 +180,22 @@ pub(crate) fn command_admission(command: &str) -> Option<CommandAdmission> {
         Some(CommandAdmission::Unguarded)
     } else {
         None
+    }
+}
+
+fn command_is_enabled(command: &str) -> bool {
+    if command.starts_with("block ") {
+        cfg!(feature = "block-volume")
+    } else if command.starts_with("cluster ") {
+        cfg!(feature = "cluster")
+    } else if matches!(command, "diag" | "kernel status") {
+        cfg!(feature = "diagnostics")
+    } else if command.starts_with("merge ") {
+        cfg!(feature = "receive-merge")
+    } else if command.starts_with("storage-intent ") {
+        cfg!(feature = "storage-intent")
+    } else {
+        true
     }
 }
 
@@ -358,7 +380,9 @@ mod tests {
             "snapshot hold",
             "snapshot release",
             "snapshot prune",
+            #[cfg(feature = "block-volume")]
             "block attach",
+            #[cfg(feature = "block-volume")]
             "block detach",
             "dataset create",
             "dataset destroy",
@@ -387,18 +411,26 @@ mod tests {
             "pool list-props",
             "snapshot list",
             "snapshot holds",
+            #[cfg(feature = "block-volume")]
             "block list",
             "dataset list",
             "dataset get",
             "dataset list-props",
+            #[cfg(feature = "storage-intent")]
             "storage-intent explain",
             "pool integrity-check",
+            #[cfg(feature = "diagnostics")]
             "kernel status",
+            #[cfg(feature = "cluster")]
             "cluster status",
             "device status",
+            #[cfg(feature = "diagnostics")]
             "diag",
+            #[cfg(feature = "cluster")]
             "cluster pool create",
+            #[cfg(feature = "cluster")]
             "cluster placement exercise",
+            #[cfg(feature = "cluster")]
             "cluster heal exercise",
         ] {
             assert_eq!(
@@ -495,6 +527,7 @@ mod tests {
             .copied()
             .chain(LOCAL_ONLY_WHEN_MUTATING_COMMANDS.iter().copied())
             .chain(UNGUARDED_COMMANDS.iter().copied())
+            .filter(|command| command_is_enabled(command))
         {
             assert!(
                 COMMAND_SURFACES
@@ -628,6 +661,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "full")]
     #[test]
     fn operator_authz_boundary_contains_exact_command_authority_table() {
         let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
