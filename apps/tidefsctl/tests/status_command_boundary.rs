@@ -32,7 +32,7 @@ fn run_status(command: &str, json: bool) -> (String, Output) {
 
 #[test]
 fn no_owner_status_is_an_operator_refusal() {
-    for command in STATUS_COMMANDS {
+    for &command in STATUS_COMMANDS {
         let (pool_name, output) = run_status(command, false);
         assert_eq!(output.status.code(), Some(1), "{command} status");
         assert!(output.stdout.is_empty(), "{command} status wrote stdout");
@@ -56,7 +56,7 @@ fn no_owner_status_is_an_operator_refusal() {
 
 #[test]
 fn no_owner_status_json_is_a_machine_refusal() {
-    for command in STATUS_COMMANDS {
+    for &command in STATUS_COMMANDS {
         let (pool_name, output) = run_status(command, true);
         assert_eq!(output.status.code(), Some(1), "{command} status --json");
         assert!(
