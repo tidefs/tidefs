@@ -27,13 +27,19 @@
 //! Recovery state is persisted to stable storage before each transition
 //! so that a crash during recovery resumes where it left off.
 
+#[cfg(any(feature = "distributed-recovery", test))]
 use std::path::Path;
 
 use tidefs_checksum_tree::DomainTag;
-use tidefs_commit_group::{RecoveryResult, RootPointer};
+#[cfg(any(feature = "distributed-recovery", test))]
+use tidefs_commit_group::RecoveryResult;
+use tidefs_commit_group::RootPointer;
+#[cfg(any(feature = "distributed-recovery", test))]
 use tidefs_intent_log::{IntentLogReader, IntentLogRecord, SegmentReadResult, SegmentRecord};
 
+#[cfg(any(feature = "distributed-recovery", test))]
 use tidefs_replica_health::state_machine::DegradationState;
+#[cfg(any(feature = "distributed-recovery", test))]
 use tidefs_replica_health::ReplicaDegradationTracker;
 
 // ── RecoveryState ────────────────────────────────────────────────────
@@ -45,6 +51,7 @@ use tidefs_replica_health::ReplicaDegradationTracker;
 ///      │                                                                              ▲
 ///      └─────────── (valid root with no uncommitted records) ─────────────────────────┘
 /// ```
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryPhase {
     /// Validate the committed root via BLAKE3 chain verification.
@@ -59,6 +66,7 @@ pub enum RecoveryPhase {
     Ready,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl RecoveryPhase {
     /// Human-readable label for logging and diagnostics.
     #[must_use]
@@ -92,6 +100,7 @@ impl RecoveryPhase {
 /// Implementations of this trait handle the actual namespace and
 /// object-store mutations during replay. A default no-op implementation
 /// is provided for testing.
+#[cfg(any(feature = "distributed-recovery", test))]
 pub trait ReplayTarget {
     /// Replay a single intent-log record.
     ///
@@ -109,11 +118,13 @@ pub trait ReplayTarget {
 
 /// A no-op replay target for testing the state machine without real
 /// namespace or object-store mutations.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Debug, Default)]
 pub struct NoOpReplayTarget {
     pub records_seen: Vec<IntentLogRecord>,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl ReplayTarget for NoOpReplayTarget {
     fn replay_record(&mut self, record: &IntentLogRecord) -> Result<(), RecoveryError> {
         self.records_seen.push(record.clone());
@@ -128,6 +139,7 @@ impl ReplayTarget for NoOpReplayTarget {
 /// Controls replay behaviour: how many records to batch before flushing
 /// intermediate state and the maximum number of intent-log records to
 /// replay before aborting (a safety guard against unbounded replay).
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Clone, Copy, Debug)]
 pub struct RecoveryLoopConfig {
     /// Number of records to replay before flushing intermediate state
@@ -142,6 +154,7 @@ pub struct RecoveryLoopConfig {
     pub max_replay_depth: usize,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl Default for RecoveryLoopConfig {
     fn default() -> Self {
         Self {
@@ -151,6 +164,7 @@ impl Default for RecoveryLoopConfig {
     }
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl RecoveryLoopConfig {
     /// Create a config with explicit values.
     #[must_use]
@@ -215,6 +229,7 @@ impl std::error::Error for RecoveryError {}
 // ── Health gate decision ──────────────────────────────────────────────
 
 /// Outcome of the health-gate decision after recovery.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HealthGateDecision {
     /// All replicas healthy; no rebuild needed.
@@ -233,6 +248,7 @@ pub enum HealthGateDecision {
 /// Queries the degradation tracker for each replica in `replica_nodes`
 /// and returns a [`HealthGateDecision`].
 #[must_use]
+#[cfg(any(feature = "distributed-recovery", test))]
 pub fn health_gate(
     tracker: &ReplicaDegradationTracker,
     replica_nodes: &[u64],
@@ -283,6 +299,7 @@ pub fn health_gate(
 // ── RecoveryLoop ──────────────────────────────────────────────────────
 
 /// Outcome of a recovery run.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Clone, Debug)]
 pub struct RecoveryOutcome {
     /// The state the loop finished in.
@@ -302,6 +319,7 @@ pub struct RecoveryOutcome {
 /// Bootstraps from a committed root pointer, validates it via BLAKE3
 /// chain verification, runs configured replay-target hooks for records
 /// since that root, and records the health-gate decision for callers.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Debug)]
 pub struct RecoveryLoop {
     /// Current phase.
@@ -320,6 +338,7 @@ pub struct RecoveryLoop {
     pub config: RecoveryLoopConfig,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl RecoveryLoop {
     /// Create a new recovery loop starting from a committed root.
     ///
@@ -643,6 +662,7 @@ pub fn anchor_recovered_root(root: RootPointer) -> [u8; 32] {
     blake3::keyed_hash(domain_key.as_bytes(), &payload).into()
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl RecoveryLoop {
     /// Anchor the recovered root after successful replay.
     ///

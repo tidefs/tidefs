@@ -17,10 +17,9 @@ fencing, and committed-root anchoring for crash-safe resume.
 """
 
 [dependencies]
-tidefs-pool-scan = { workspace = true }
+tidefs-pool-scan = { workspace = true, features = ["distributed-repair"] }
 tidefs-locator-table = { workspace = true }
 tidefs-block-allocator = { workspace = true }
-tidefs-local-object-store = { workspace = true }
 tidefs-replication-model = { workspace = true }
 tidefs-types-pool-label-core = { workspace = true }
 serde = { version = "1", features = ["derive"] }

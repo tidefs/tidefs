@@ -212,6 +212,7 @@ pub(crate) struct NamespaceCreateIntentRecord {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "replication-io")]
 pub(crate) struct PreparedChangedRecordRoot {
     pub(crate) source_root: CommittedRootSummary,
     pub(crate) state: FileSystemState,

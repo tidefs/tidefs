@@ -470,6 +470,7 @@ fn placement_evidence_for_content_key(
     match pool.placement_receipt_for_key(DeviceIoClass::Data, key) {
         Ok(Some(receipt)) => match expected_generation {
             Some(expected_generation) if receipt.generation == expected_generation => {
+                #[cfg(feature = "distributed-repair")]
                 match receipt.shared_receipt_ref_for_subject(subject_id) {
                     Ok(placement_receipt_ref) => MountedContentPlacementEvidence::ReceiptVerified {
                         generation: expected_generation,
@@ -478,6 +479,10 @@ fn placement_evidence_for_content_key(
                     Err(_) => MountedContentPlacementEvidence::ReceiptUnavailable {
                         expected_generation: Some(expected_generation),
                     },
+                }
+                #[cfg(not(feature = "distributed-repair"))]
+                MountedContentPlacementEvidence::ReceiptObservedButUnbound {
+                    generation: expected_generation,
                 }
             }
             Some(expected_generation) => MountedContentPlacementEvidence::ReceiptStale {
@@ -612,6 +617,7 @@ pub(crate) fn scrub_inodes_content_with_pool(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepairStrategy {
     /// Retry from a replica (not yet implemented — requires redundancy).
+    #[cfg(feature = "distributed-repair")]
     Reconstruct,
     /// Mark the block as corrupt and return an error to the caller.
     MarkCorrupt,
@@ -857,7 +863,6 @@ mod tests {
                 expected_generation: Some(_)
             }
         ));
-        assert!(!evidence.placement_evidence.allows_repair_dispatch());
         assert!(evidence.raw_media_diagnostic.object_key_hex.is_some());
         assert!(evidence.raw_media_diagnostic.reason.is_none());
     }
@@ -868,7 +873,8 @@ mod tests {
         let payload = b"chunk plaintext evidence".to_vec();
         let record = test_file_record(17, 4, payload.len() as u64);
         let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off())
+            .expect("encode stale-receipt chunk");
         let checksum = FastBlockChecksum::compute(&encoded);
         let (_, receipt) = pool
             .put_with_receipt(DeviceIoClass::Data, key, &encoded)
@@ -913,10 +919,6 @@ mod tests {
                 observed_generation: receipt.generation,
             }
         );
-        assert!(!scrubbed
-            .evidence
-            .placement_evidence
-            .allows_repair_dispatch());
     }
 
     #[test]
@@ -925,7 +927,8 @@ mod tests {
         let payload = b"receiptless raw chunk".to_vec();
         let record = test_file_record(18, 5, payload.len() as u64);
         let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off())
+            .expect("encode receiptless chunk");
         let checksum = FastBlockChecksum::compute(&encoded);
         pool.raw_primary_store_mut()
             .put(key, &encoded)

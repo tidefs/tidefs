@@ -18,17 +18,27 @@ tidefs-intent-log = { workspace = true }
 tidefs-checksum-tree = { workspace = true }
 tidefs-local-object-store = { workspace = true }
 blake3 = { version = "1", default-features = false }
-tidefs-replication-model = { workspace = true }
-tidefs-replica-health = { workspace = true }
-tidefs-rebuild-planner = { workspace = true }
-tidefs-flow-commit-coordinator = { workspace = true }
-tidefs-membership-epoch = { workspace = true }
+tidefs-replica-health = { workspace = true, optional = true }
+tidefs-rebuild-planner = { workspace = true, optional = true }
+tidefs-membership-epoch = { workspace = true, optional = true }
 tidefs-vfs-engine = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+
+[features]
+default = []
+distributed-recovery = [
+    "dep:tidefs-membership-epoch",
+    "dep:tidefs-rebuild-planner",
+    "dep:tidefs-replica-health",
+]
+full = ["distributed-recovery"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = "3.27.0"
+tidefs-membership-epoch = { workspace = true }
+tidefs-rebuild-planner = { workspace = true }
+tidefs-replica-health = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

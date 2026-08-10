@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::vec;
 
+#[cfg(feature = "data-policy")]
 use tidefs_dedup::{decide_inline_dedup, InlineDedupDecision};
 use tidefs_local_object_store::pool::{PlacementReceipt, PoolStoreMut};
 use tidefs_local_object_store::DeviceIoClass;
@@ -152,6 +153,7 @@ pub(crate) struct WriteChunkedContentOverlay<'a, S: ContentWriteStore> {
     pub overlay_bytes: &'a [u8],
     pub allow_holes: bool,
     pub dedup_index: &'a mut DedupIndex,
+    #[cfg(feature = "quorum-write")]
     pub quorum_store: Option<&'a mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     pub compression_policy: &'a ContentCompressionPolicy,
 }
@@ -171,6 +173,7 @@ pub(crate) struct WriteChunkedContentPatchBatch<'a, S: ContentWriteStore> {
     pub patches: &'a [ContentOverlayPatch<'a>],
     pub allow_holes: bool,
     pub dedup_index: &'a mut DedupIndex,
+    #[cfg(feature = "quorum-write")]
     pub quorum_store: Option<&'a mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     pub compression_policy: &'a ContentCompressionPolicy,
 }
@@ -182,6 +185,7 @@ pub(crate) struct PunchHoleContent<'a, S: ContentWriteStore> {
     pub new_record: &'a InodeRecord,
     pub hole_offset: u64,
     pub hole_length: u64,
+    #[cfg(feature = "quorum-write")]
     pub quorum_store: Option<&'a mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     pub compression_policy: &'a ContentCompressionPolicy,
 }
@@ -443,10 +447,22 @@ fn mounted_scrub_placement_evidence(
     }
 
     match expected_generation {
-        Some(expected_generation) => Ok(MountedContentPlacementEvidence::ReceiptVerified {
-            generation: expected_generation,
-            placement_receipt_ref: receipt.shared_receipt_ref_for_subject(subject_id)?,
-        }),
+        Some(expected_generation) => {
+            #[cfg(feature = "distributed-repair")]
+            {
+                Ok(MountedContentPlacementEvidence::ReceiptVerified {
+                    generation: expected_generation,
+                    placement_receipt_ref: receipt.shared_receipt_ref_for_subject(subject_id)?,
+                })
+            }
+            #[cfg(not(feature = "distributed-repair"))]
+            {
+                let _ = subject_id;
+                Ok(MountedContentPlacementEvidence::ReceiptObservedButUnbound {
+                    generation: expected_generation,
+                })
+            }
+        }
         None => Ok(MountedContentPlacementEvidence::ReceiptObservedButUnbound {
             generation: receipt.generation,
         }),
@@ -1128,12 +1144,15 @@ fn encode_new_canonical_chunk<S: ContentWriteStore>(
     fingerprint: ContentFingerprint,
     canonical_key: ObjectKey,
     dedup_index: &mut DedupIndex,
-    quorum_store: &mut Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
+    #[cfg(feature = "quorum-write")] quorum_store: &mut Option<
+        &mut tidefs_quorum_write_runtime::QuorumObjectStore,
+    >,
     compression_policy: &ContentCompressionPolicy,
-    replicate_to_quorum: bool,
+    #[cfg(feature = "quorum-write")] replicate_to_quorum: bool,
 ) -> Result<Vec<u8>> {
-    let encoded = encode_content_chunk(record, chunk_index, chunk_bytes, compression_policy);
+    let encoded = encode_content_chunk(record, chunk_index, chunk_bytes, compression_policy)?;
     let _ = store.put_with_receipt(canonical_key, &encoded)?;
+    #[cfg(feature = "quorum-write")]
     if replicate_to_quorum {
         if let Some(qs) = quorum_store.as_deref_mut() {
             let _ = qs.quorum_put(canonical_key, &encoded);
@@ -1168,92 +1187,102 @@ fn encode_chunk_with_dedup<S: ContentWriteStore>(
     chunk_index: u64,
     chunk_bytes: &[u8],
     dedup_index: &mut DedupIndex,
-    quorum_store: &mut Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
+    #[cfg(feature = "quorum-write")] quorum_store: &mut Option<
+        &mut tidefs_quorum_write_runtime::QuorumObjectStore,
+    >,
     compression_policy: &ContentCompressionPolicy,
 ) -> Result<Vec<u8>> {
     if !dedup_enabled {
-        return Ok(encode_content_chunk(
-            record,
-            chunk_index,
-            chunk_bytes,
-            compression_policy,
-        ));
+        return encode_content_chunk(record, chunk_index, chunk_bytes, compression_policy);
     }
 
-    let fingerprint = crate::encoding::compute_content_fingerprint(chunk_bytes);
-    let hash = fingerprint.as_dedup_hash();
-    let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
-    let mut canonical_read_error = None;
-    let decision = decide_inline_dedup(
-        &hash,
-        canonical_key,
-        |candidate| dedup_index.lookup_hash(candidate),
-        |candidate| match store.get(candidate) {
-            Ok(Some(bytes)) => {
-                match validate_dedup_canonical_payload(candidate, &bytes, fingerprint) {
-                    Ok(_) => true,
-                    Err(err) => {
-                        canonical_read_error = Some(err);
-                        false
+    #[cfg(not(feature = "data-policy"))]
+    return Err(FileSystemError::Unsupported {
+        operation: "deduplicate mounted content",
+        reason: "content deduplication requires the data-policy feature",
+    });
+
+    #[cfg(feature = "data-policy")]
+    {
+        let fingerprint = crate::encoding::compute_content_fingerprint(chunk_bytes);
+        let hash = fingerprint.as_dedup_hash();
+        let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+        let mut canonical_read_error = None;
+        let decision = decide_inline_dedup(
+            &hash,
+            canonical_key,
+            |candidate| dedup_index.lookup_hash(candidate),
+            |candidate| match store.get(candidate) {
+                Ok(Some(bytes)) => {
+                    match validate_dedup_canonical_payload(candidate, &bytes, fingerprint) {
+                        Ok(_) => true,
+                        Err(err) => {
+                            canonical_read_error = Some(err);
+                            false
+                        }
                     }
                 }
-            }
-            Ok(None) => false,
-            Err(err) => {
-                canonical_read_error = Some(err);
-                false
-            }
-        },
-    );
-    if let Some(err) = canonical_read_error {
-        return Err(err);
-    }
+                Ok(None) => false,
+                Err(err) => {
+                    canonical_read_error = Some(err);
+                    false
+                }
+            },
+        );
+        if let Some(err) = canonical_read_error {
+            return Err(err);
+        }
 
-    match decision {
-        InlineDedupDecision::SessionHit { canonical } => {
-            dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-            let _ = crate::dedup_refcount::DedupRefCount::increment(
-                store.raw_store_mut(),
-                &fingerprint,
-            );
-            Ok(crate::encoding::encode_dedup_redirect(canonical))
-        }
-        InlineDedupDecision::CanonicalStoreHit { canonical } => {
-            dedup_index.insert(fingerprint, canonical);
-            dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-            let _ = crate::dedup_refcount::DedupRefCount::increment(
-                store.raw_store_mut(),
-                &fingerprint,
-            );
-            Ok(crate::encoding::encode_dedup_redirect(canonical))
-        }
-        InlineDedupDecision::StaleSessionEntry { .. } => {
-            dedup_index.remove(&fingerprint);
-            encode_new_canonical_chunk(
+        match decision {
+            InlineDedupDecision::SessionHit { canonical } => {
+                dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
+                let _ = crate::dedup_refcount::DedupRefCount::increment(
+                    store.raw_store_mut(),
+                    &fingerprint,
+                );
+                Ok(crate::encoding::encode_dedup_redirect(canonical))
+            }
+            InlineDedupDecision::CanonicalStoreHit { canonical } => {
+                dedup_index.insert(fingerprint, canonical);
+                dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
+                let _ = crate::dedup_refcount::DedupRefCount::increment(
+                    store.raw_store_mut(),
+                    &fingerprint,
+                );
+                Ok(crate::encoding::encode_dedup_redirect(canonical))
+            }
+            InlineDedupDecision::StaleSessionEntry { .. } => {
+                dedup_index.remove(&fingerprint);
+                encode_new_canonical_chunk(
+                    store,
+                    record,
+                    chunk_index,
+                    chunk_bytes,
+                    fingerprint,
+                    canonical_key,
+                    dedup_index,
+                    #[cfg(feature = "quorum-write")]
+                    quorum_store,
+                    compression_policy,
+                    #[cfg(feature = "quorum-write")]
+                    false,
+                )
+            }
+            InlineDedupDecision::Miss { canonical } => encode_new_canonical_chunk(
                 store,
                 record,
                 chunk_index,
                 chunk_bytes,
                 fingerprint,
-                canonical_key,
+                canonical,
                 dedup_index,
+                #[cfg(feature = "quorum-write")]
                 quorum_store,
                 compression_policy,
-                false,
-            )
+                #[cfg(feature = "quorum-write")]
+                true,
+            ),
         }
-        InlineDedupDecision::Miss { canonical } => encode_new_canonical_chunk(
-            store,
-            record,
-            chunk_index,
-            chunk_bytes,
-            fingerprint,
-            canonical,
-            dedup_index,
-            quorum_store,
-            compression_policy,
-            true,
-        ),
     }
 }
 
@@ -1263,7 +1292,9 @@ pub(crate) fn write_chunked_content<S: ContentWriteStore>(
     record: &InodeRecord,
     bytes: &[u8],
     dedup_index: &mut DedupIndex,
-    mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
+    #[cfg(feature = "quorum-write")] mut quorum_store: Option<
+        &mut tidefs_quorum_write_runtime::QuorumObjectStore,
+    >,
     compression_policy: &ContentCompressionPolicy,
 ) -> Result<()> {
     let actual_size = u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
@@ -1286,12 +1317,14 @@ pub(crate) fn write_chunked_content<S: ContentWriteStore>(
             chunk_index,
             chunk_bytes,
             dedup_index,
+            #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             compression_policy,
         )?;
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
+        #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -1327,7 +1360,9 @@ fn write_same_size_sparse_overlay<S: ContentWriteStore>(
     overlay_offset: u64,
     overlay_bytes: &[u8],
     dedup_index: &mut DedupIndex,
-    mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
+    #[cfg(feature = "quorum-write")] mut quorum_store: Option<
+        &mut tidefs_quorum_write_runtime::QuorumObjectStore,
+    >,
     compression_policy: &ContentCompressionPolicy,
 ) -> Result<()> {
     let chunk_count = content_chunk_count(new_record.size)?;
@@ -1398,12 +1433,14 @@ fn write_same_size_sparse_overlay<S: ContentWriteStore>(
             chunk_index,
             &chunk_bytes,
             dedup_index,
+            #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             compression_policy,
         )?;
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
+        #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -1429,6 +1466,7 @@ fn write_same_size_sparse_overlay<S: ContentWriteStore>(
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(manifest_key, &manifest_encoded);
     }
@@ -1444,7 +1482,9 @@ fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
     new_record: &InodeRecord,
     patches: &[ContentOverlayPatch<'_>],
     dedup_index: &mut DedupIndex,
-    mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
+    #[cfg(feature = "quorum-write")] mut quorum_store: Option<
+        &mut tidefs_quorum_write_runtime::QuorumObjectStore,
+    >,
     compression_policy: &ContentCompressionPolicy,
 ) -> Result<()> {
     let chunk_count = content_chunk_count(new_record.size)?;
@@ -1506,12 +1546,14 @@ fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
             old_ref.chunk_index,
             &chunk_bytes,
             dedup_index,
+            #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             compression_policy,
         )?;
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
+        #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -1575,12 +1617,14 @@ fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
             chunk_index,
             &chunk_bytes,
             dedup_index,
+            #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             compression_policy,
         )?;
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
+        #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -1606,6 +1650,7 @@ fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(manifest_key, &manifest_encoded);
     }
@@ -1620,7 +1665,9 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
     new_record: &InodeRecord,
     patches: &[ContentOverlayPatch<'_>],
     dedup_index: &mut DedupIndex,
-    mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
+    #[cfg(feature = "quorum-write")] mut quorum_store: Option<
+        &mut tidefs_quorum_write_runtime::QuorumObjectStore,
+    >,
     compression_policy: &ContentCompressionPolicy,
 ) -> Result<()> {
     let old_chunk_count = content_chunk_count(old_record.size)?;
@@ -1670,12 +1717,14 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
                 chunk_index,
                 &chunk_bytes,
                 dedup_index,
+                #[cfg(feature = "quorum-write")]
                 &mut quorum_store,
                 compression_policy,
             )?;
             dedup_index.record_chunk_written();
             let checksum = checksum64(&encoded);
             let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
+            #[cfg(feature = "quorum-write")]
             if let Some(ref mut qs) = quorum_store {
                 let _ = qs.quorum_put(per_inode_key, &encoded);
             }
@@ -1716,6 +1765,7 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(manifest_key, &manifest_encoded);
     }
@@ -1728,7 +1778,9 @@ fn write_sparse_size_change<S: ContentWriteStore>(
     old_manifest: &ContentManifestObject,
     new_record: &InodeRecord,
     dedup_index: &mut DedupIndex,
-    mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
+    #[cfg(feature = "quorum-write")] mut quorum_store: Option<
+        &mut tidefs_quorum_write_runtime::QuorumObjectStore,
+    >,
     compression_policy: &ContentCompressionPolicy,
 ) -> Result<()> {
     let new_chunk_count = content_chunk_count(new_record.size)?;
@@ -1765,12 +1817,14 @@ fn write_sparse_size_change<S: ContentWriteStore>(
             old_ref.chunk_index,
             &chunk_bytes,
             dedup_index,
+            #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             compression_policy,
         )?;
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
+        #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -1793,6 +1847,7 @@ fn write_sparse_size_change<S: ContentWriteStore>(
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(manifest_key, &manifest_encoded);
     }
@@ -1810,7 +1865,9 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
     overlay_offset: u64,
     overlay_bytes: &[u8],
     dedup_index: &mut DedupIndex,
-    mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
+    #[cfg(feature = "quorum-write")] mut quorum_store: Option<
+        &mut tidefs_quorum_write_runtime::QuorumObjectStore,
+    >,
     compression_policy: &ContentCompressionPolicy,
 ) -> Result<()> {
     let new_chunk_count = content_chunk_count(new_record.size)?;
@@ -1863,12 +1920,14 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
             old_ref.chunk_index,
             &chunk_bytes,
             dedup_index,
+            #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             compression_policy,
         )?;
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
+        #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -1927,12 +1986,14 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
                 chunk_index,
                 &chunk_bytes,
                 dedup_index,
+                #[cfg(feature = "quorum-write")]
                 &mut quorum_store,
                 compression_policy,
             )?;
             dedup_index.record_chunk_written();
             let checksum = checksum64(&encoded);
             let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
+            #[cfg(feature = "quorum-write")]
             if let Some(ref mut qs) = quorum_store {
                 let _ = qs.quorum_put(per_inode_key, &encoded);
             }
@@ -1959,6 +2020,7 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(manifest_key, &manifest_encoded);
     }
@@ -1978,6 +2040,7 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
         overlay_bytes,
         allow_holes,
         dedup_index,
+        #[cfg(feature = "quorum-write")]
         mut quorum_store,
         compression_policy,
     } = request;
@@ -1990,6 +2053,7 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
                 old_manifest,
                 new_record,
                 dedup_index,
+                #[cfg(feature = "quorum-write")]
                 quorum_store,
                 compression_policy,
             );
@@ -2007,6 +2071,7 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
                 overlay_offset,
                 overlay_bytes,
                 dedup_index,
+                #[cfg(feature = "quorum-write")]
                 quorum_store,
                 compression_policy,
             );
@@ -2024,6 +2089,7 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
                 overlay_offset,
                 overlay_bytes,
                 dedup_index,
+                #[cfg(feature = "quorum-write")]
                 quorum_store,
                 compression_policy,
             );
@@ -2110,12 +2176,14 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
             chunk_index,
             &chunk_bytes,
             dedup_index,
+            #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             compression_policy,
         )?;
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
+        #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -2137,6 +2205,7 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(manifest_key, &manifest_encoded);
     }
@@ -2155,6 +2224,7 @@ pub(crate) fn write_chunked_content_with_patch_batch<S: ContentWriteStore>(
         patches,
         allow_holes,
         dedup_index,
+        #[cfg(feature = "quorum-write")]
         quorum_store,
         compression_policy,
     } = request;
@@ -2170,6 +2240,7 @@ pub(crate) fn write_chunked_content_with_patch_batch<S: ContentWriteStore>(
                 new_record,
                 patches,
                 dedup_index,
+                #[cfg(feature = "quorum-write")]
                 quorum_store,
                 compression_policy,
             ),
@@ -2181,6 +2252,7 @@ pub(crate) fn write_chunked_content_with_patch_batch<S: ContentWriteStore>(
                 new_record,
                 patches,
                 dedup_index,
+                #[cfg(feature = "quorum-write")]
                 quorum_store,
                 compression_policy,
             ),
@@ -2203,6 +2275,7 @@ pub(crate) fn punch_hole_content<S: ContentWriteStore>(
         new_record,
         hole_offset,
         hole_length,
+        #[cfg(feature = "quorum-write")]
         mut quorum_store,
         compression_policy,
     } = request;
@@ -2267,7 +2340,7 @@ pub(crate) fn punch_hole_content<S: ContentWriteStore>(
                 }
             }
             let encoded =
-                encode_content_chunk(new_record, chunk_index, &modified, compression_policy);
+                encode_content_chunk(new_record, chunk_index, &modified, compression_policy)?;
             let checksum = checksum64(&encoded);
             let key = content_chunk_object_key_for_version(
                 new_record.inode_id,
@@ -2275,6 +2348,7 @@ pub(crate) fn punch_hole_content<S: ContentWriteStore>(
                 chunk_index,
             );
             let chunk_receipt = store.put_with_receipt(key, &encoded)?;
+            #[cfg(feature = "quorum-write")]
             if let Some(ref mut qs) = quorum_store {
                 let _ = qs.quorum_put(key, &encoded);
             }
@@ -2302,6 +2376,7 @@ pub(crate) fn punch_hole_content<S: ContentWriteStore>(
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(manifest_key, &manifest_encoded);
     }
@@ -2779,7 +2854,7 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
                         src_chunk_ref.chunk_index,
                         &src_chunk.bytes,
                         compression_policy,
-                    );
+                    )?;
                     let chunk_receipt = store.put_with_receipt(dest_chunk_key, &dest_encoded)?;
                     dest_chunks.push(ContentChunkRef {
                         chunk_index: src_chunk_ref.chunk_index,
@@ -2839,7 +2914,7 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
                         src_chunk_ref.chunk_index,
                         &source_chunk.bytes,
                         compression_policy,
-                    );
+                    )?;
                     store.put(canonical_key, &canonical_bytes)?;
                     crate::dedup_refcount::DedupRefCount::init(
                         store.raw_store_mut(),
@@ -3002,11 +3077,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "data-policy")]
     fn inline_dedup_helper_routes_duplicate_chunk_through_dedup_authority() {
         let mut store = temp_store("inline-dedup-authority");
         let record = test_record(2, 1, u64::from(content_chunk_size()));
         let payload = vec![0x5a; content_chunk_size() as usize];
         let mut dedup_index = DedupIndex::new();
+        #[cfg(feature = "quorum-write")]
         let mut quorum_store = None;
         let compression_policy = ContentCompressionPolicy::off();
 
@@ -3017,6 +3094,7 @@ mod tests {
             0,
             &payload,
             &mut dedup_index,
+            #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             &compression_policy,
         )
@@ -3042,6 +3120,7 @@ mod tests {
             1,
             &payload,
             &mut dedup_index,
+            #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             &compression_policy,
         )
@@ -3062,13 +3141,15 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "data-policy")]
     fn inline_dedup_canonical_probe_uses_write_store_route() {
         let payload = vec![0x6b; content_chunk_size() as usize];
         let record = test_record(3, 1, payload.len() as u64);
         let fingerprint = crate::encoding::compute_content_fingerprint(&payload);
         let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
         let canonical =
-            encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+            encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off())
+                .expect("encode canonical chunk");
         let mut routed = BTreeMap::new();
         routed.insert(canonical_key, canonical);
         let mut store = RoutedReadStore {
@@ -3079,6 +3160,7 @@ mod tests {
         crate::dedup_refcount::DedupRefCount::init(&mut store.raw, &fingerprint)
             .expect("seed canonical refcount metadata");
         let mut dedup_index = DedupIndex::new();
+        #[cfg(feature = "quorum-write")]
         let mut quorum_store = None;
 
         let redirect = encode_chunk_with_dedup(
@@ -3088,6 +3170,7 @@ mod tests {
             0,
             &payload,
             &mut dedup_index,
+            #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             &ContentCompressionPolicy::off(),
         )
@@ -3113,6 +3196,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "data-policy")]
     fn pool_backed_dedup_rejects_substituted_canonical_payload() {
         let mut pool = temp_pool("dedup-substituted-canonical");
         let desired = vec![0x5c; content_chunk_size() as usize];
@@ -3121,12 +3205,14 @@ mod tests {
         let fingerprint = crate::encoding::compute_content_fingerprint(&desired);
         let canonical_key = content_dedup_object_key(&fingerprint);
         let substituted_bytes =
-            encode_content_chunk(&record, 0, &substituted, &ContentCompressionPolicy::off());
+            encode_content_chunk(&record, 0, &substituted, &ContentCompressionPolicy::off())
+                .expect("encode substituted canonical chunk");
         pool.put_with_receipt(DeviceIoClass::Data, canonical_key, &substituted_bytes)
             .expect("publish substituted canonical payload");
 
         let mut store = pool.primary_store_mut();
         let mut dedup_index = DedupIndex::new();
+        #[cfg(feature = "quorum-write")]
         let mut quorum_store = None;
         let error = encode_chunk_with_dedup(
             true,
@@ -3135,6 +3221,7 @@ mod tests {
             0,
             &desired,
             &mut dedup_index,
+            #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             &ContentCompressionPolicy::off(),
         )
@@ -3149,6 +3236,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "data-policy")]
     fn dedup_canonical_read_errors_propagate_through_write_store() {
         let payload = b"dedup canonical read failure".to_vec();
         let record = test_record(4, 2, payload.len() as u64);
@@ -3190,7 +3278,8 @@ mod tests {
         let payload = b"receipt-bound mutation source";
         let record = test_record(5, 7, payload.len() as u64);
         let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded = encode_content_chunk(&record, 0, payload, &Default::default());
+        let encoded = encode_content_chunk(&record, 0, payload, &Default::default())
+            .expect("encode receipt fixture chunk");
         let (_, original_receipt) = pool
             .put_with_receipt(DeviceIoClass::Data, key, &encoded)
             .expect("write original chunk");
@@ -3222,6 +3311,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "data-policy")]
     fn pool_backed_dedup_reflink_rejects_superseded_source_receipt() {
         let mut pool = temp_pool("dedup-reflink-stale-source-receipt");
         let payload = vec![0x7e; content_chunk_size() as usize];
@@ -3230,7 +3320,8 @@ mod tests {
         let source_chunk_key =
             content_chunk_object_key_for_version(source.inode_id, source.data_version, 0);
         let source_chunk =
-            encode_content_chunk(&source, 0, &payload, &ContentCompressionPolicy::off());
+            encode_content_chunk(&source, 0, &payload, &ContentCompressionPolicy::off())
+                .expect("encode reflink source chunk");
         let (_, original_receipt) = pool
             .put_with_receipt(DeviceIoClass::Data, source_chunk_key, &source_chunk)
             .expect("write source chunk");
@@ -3321,7 +3412,6 @@ mod tests {
                 expected_generation: None,
             }
         );
-        assert!(!read.placement_evidence.allows_repair_dispatch());
     }
 
     #[test]
@@ -3362,7 +3452,8 @@ mod tests {
         let payload = b"chunk plaintext authority".to_vec();
         let record = test_record(9, 4, payload.len() as u64);
         let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off())
+            .expect("encode mounted scrub chunk");
         let checksum = FastBlockChecksum::compute(&encoded);
         store.put(key, &encoded).expect("write chunk");
         let chunk_ref = ContentChunkRef {
@@ -3407,7 +3498,6 @@ mod tests {
                 expected_generation: None,
             }
         );
-        assert!(!read.placement_evidence.allows_repair_dispatch());
     }
 
     #[test]
@@ -3417,7 +3507,8 @@ mod tests {
         let payload = b"chunk pool plaintext authority".to_vec();
         let record = test_record(9, 5, payload.len() as u64);
         let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off())
+            .expect("encode pool scrub chunk");
         let checksum = FastBlockChecksum::compute(&encoded);
         let (_, receipt) = pool
             .put_with_receipt(DeviceIoClass::Data, key, &encoded)
@@ -3450,17 +3541,28 @@ mod tests {
                 encoded_len: encoded.len() as u64,
             }
         );
-        assert!(matches!(
+        #[cfg(feature = "distributed-repair")]
+        {
+            assert!(matches!(
+                read.placement_evidence,
+                MountedContentPlacementEvidence::ReceiptVerified {
+                    generation,
+                    ..
+                } if generation == receipt.generation
+            ));
+            assert!(read.placement_evidence.allows_repair_dispatch());
+        }
+        #[cfg(not(feature = "distributed-repair"))]
+        assert_eq!(
             read.placement_evidence,
-            MountedContentPlacementEvidence::ReceiptVerified {
-                generation,
-                ..
-            } if generation == receipt.generation
-        ));
-        assert!(read.placement_evidence.allows_repair_dispatch());
+            MountedContentPlacementEvidence::ReceiptObservedButUnbound {
+                generation: receipt.generation,
+            }
+        );
     }
 
     #[test]
+    #[cfg(feature = "data-policy")]
     fn mounted_content_scrub_authority_resolves_dedup_canonical_through_pool() {
         let raw_store = temp_store("mounted-dedup-pool-empty-raw");
         let mut pool = temp_pool("mounted-dedup-pool-authority");
@@ -3474,7 +3576,8 @@ mod tests {
             0,
             &payload,
             &ContentCompressionPolicy::off(),
-        );
+        )
+        .expect("encode dedup canonical chunk");
         pool.put_with_receipt(DeviceIoClass::Data, canonical_key, &canonical_encoded)
             .expect("write canonical chunk through pool");
 
@@ -3506,6 +3609,7 @@ mod tests {
         assert_eq!(read.plaintext_bytes, payload);
         assert_eq!(read.checksum_evidence.expected, Some(checksum));
         assert!(read.checksum_evidence.matches_expected());
+        #[cfg(feature = "distributed-repair")]
         assert!(matches!(
             read.placement_evidence,
             MountedContentPlacementEvidence::ReceiptVerified {
@@ -3513,6 +3617,13 @@ mod tests {
                 ..
             } if generation == redirect_receipt.generation
         ));
+        #[cfg(not(feature = "distributed-repair"))]
+        assert_eq!(
+            read.placement_evidence,
+            MountedContentPlacementEvidence::ReceiptObservedButUnbound {
+                generation: redirect_receipt.generation,
+            }
+        );
     }
 
     #[test]
@@ -3527,7 +3638,8 @@ mod tests {
             0,
         );
         let encoded =
-            encode_content_chunk(&stale_record, 0, &payload, &ContentCompressionPolicy::off());
+            encode_content_chunk(&stale_record, 0, &payload, &ContentCompressionPolicy::off())
+                .expect("encode stale chunk");
         let checksum = FastBlockChecksum::compute(&encoded);
         store.put(key, &encoded).expect("write stale chunk");
         let chunk_ref = ContentChunkRef {
@@ -3556,7 +3668,8 @@ mod tests {
         let payload = b"receipt-stale chunk".to_vec();
         let record = test_record(11, 5, payload.len() as u64);
         let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off())
+            .expect("encode stale-receipt chunk");
         let checksum = FastBlockChecksum::compute(&encoded);
         let (_, receipt) = pool
             .put_with_receipt(DeviceIoClass::Data, key, &encoded)
@@ -3630,7 +3743,8 @@ mod tests {
         let old_record = test_record(77, 1, payload.len() as u64);
         let new_record = test_record(77, 2, payload.len() as u64);
         let encoded =
-            encode_content_chunk(&old_record, 0, &payload, &ContentCompressionPolicy::off());
+            encode_content_chunk(&old_record, 0, &payload, &ContentCompressionPolicy::off())
+                .expect("encode sparse source chunk");
         let chunk_ref = ContentChunkRef {
             chunk_index: 0,
             data_version: old_record.data_version,
@@ -3681,6 +3795,7 @@ mod tests {
             overlay_bytes: overlay,
             allow_holes: true,
             dedup_index: &mut dedup_index,
+            #[cfg(feature = "quorum-write")]
             quorum_store: None,
             compression_policy: &ContentCompressionPolicy::off(),
         })
@@ -3717,6 +3832,7 @@ mod tests {
             overlay_bytes: &payload,
             allow_holes: true,
             dedup_index: &mut dedup_index,
+            #[cfg(feature = "quorum-write")]
             quorum_store: None,
             compression_policy: &compression_policy,
         })
@@ -4314,6 +4430,7 @@ mod rewrite_extent_trimming_tests {
             &payload,
             &ContentCompressionPolicy::off(),
         )
+        .expect("encode durable chunk fixture")
     }
 
     /// Build a ContentChunkRef with a durable receipt (via pool put_with_receipt).

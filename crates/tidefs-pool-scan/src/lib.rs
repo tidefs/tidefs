@@ -31,7 +31,9 @@ pub use label::{
 };
 pub use label_writer::{LabelWriteError, PoolLabelWriter};
 pub use rebuild::{RebuildAction, RebuildKind, RebuildPlan, RebuildScheduler};
-pub use result::{CommittedMemberEvidence, DeviceScanInfo, PoolScanResult, PoolScanner};
+#[cfg(any(feature = "distributed-repair", test))]
+pub use result::CommittedMemberEvidence;
+pub use result::{DeviceScanInfo, PoolScanResult, PoolScanner};
 pub use segment::{
     SegmentDescriptor, SegmentScanError, SegmentState, SegmentTable, SegmentTableReader,
 };
@@ -50,8 +52,10 @@ use tidefs_types_pool_label_core::{
     POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 
+#[cfg(any(feature = "distributed-repair", test))]
 pub mod device_removal;
 pub mod scanner;
+#[cfg(any(feature = "distributed-repair", test))]
 pub use device_removal::{
     build_object_placements, check_removal_redundancy, run_device_removal,
     verify_no_receipts_reference_node, DeviceObjectMap, DeviceRemovalError, DeviceRemovalExecutor,
@@ -2537,6 +2541,7 @@ impl PoolAssembler {
 /// via the authoritative `storage_tier_from_device_class` mapping, and returns
 /// a tier policy. Auto-promotion and auto-demotion default to disabled.
 #[must_use]
+#[cfg(any(feature = "data-policy", test))]
 pub fn build_tier_policy_from_device_tree(
     device_tree: &DeviceType,
 ) -> tidefs_membership_epoch::StorageTierPolicy {

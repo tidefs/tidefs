@@ -34,7 +34,7 @@ use crate::commit_group::DurabilityClass;
 /// - None dirty: do_commit() returns immediately (unless intent log
 ///   is non-empty)
 ///   tidefs-queue-root: local_fs.dirty_set
-///   admission: AdmissionPermit  service_curve: ServiceCurve
+///   admission: LocalAdmissionPermit  service_curve: filesystem-owned bounded work
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DirtySet {
     /// Total data dirty bytes (padded record bytes) since last commit.

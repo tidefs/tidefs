@@ -8,7 +8,9 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use tidefs_local_filesystem::{ChangedRecordObjectRole, LocalFileSystem, DEFAULT_FILE_PERMISSIONS};
+#[cfg(feature = "replication-io")]
+use tidefs_local_filesystem::ChangedRecordObjectRole;
+use tidefs_local_filesystem::{LocalFileSystem, DEFAULT_FILE_PERMISSIONS};
 use tidefs_local_object_store::StoreOptions;
 
 // ── helpers ──
@@ -73,17 +75,20 @@ fn txn_allocate_extent_commit_and_lookup() {
     assert_eq!(data.len(), 8192);
     assert_eq!(&data[0..4], &[0xABu8; 4]);
 
-    // Verify extent map records exist in the changed record export.
-    let export = fs.export_changed_records().expect("export changed records");
-    let has_ext_map_role = export.roots.iter().any(|root| {
-        root.records
-            .iter()
-            .any(|r| r.role == ChangedRecordObjectRole::TransactionExtentMap)
-    });
-    assert!(
-        has_ext_map_role,
-        "changed record export must contain TransactionExtentMap entries"
-    );
+    #[cfg(feature = "replication-io")]
+    {
+        // Verify extent map records exist in the optional replication export.
+        let export = fs.export_changed_records().expect("export changed records");
+        let has_ext_map_role = export.roots.iter().any(|root| {
+            root.records
+                .iter()
+                .any(|r| r.role == ChangedRecordObjectRole::TransactionExtentMap)
+        });
+        assert!(
+            has_ext_map_role,
+            "changed record export must contain TransactionExtentMap entries"
+        );
+    }
 
     drop(fs);
     cleanup(&root);
@@ -181,21 +186,24 @@ fn txn_allocate_commit_free_commit_verify_gone() {
         "file content should be empty after truncate"
     );
 
-    // Export changed records and verify we see TransactionExtentMap entries.
-    let export = fs.export_changed_records().expect("export changed records");
-    assert!(
-        !export.roots.is_empty(),
-        "export should have at least one root"
-    );
-    let has_ext_map = export.roots.iter().any(|root| {
-        root.records
-            .iter()
-            .any(|r| r.role == ChangedRecordObjectRole::TransactionExtentMap)
-    });
-    assert!(
-        has_ext_map,
-        "changed records must contain TransactionExtentMap"
-    );
+    #[cfg(feature = "replication-io")]
+    {
+        // Verify the optional replication export carries the extent-map role.
+        let export = fs.export_changed_records().expect("export changed records");
+        assert!(
+            !export.roots.is_empty(),
+            "export should have at least one root"
+        );
+        let has_ext_map = export.roots.iter().any(|root| {
+            root.records
+                .iter()
+                .any(|r| r.role == ChangedRecordObjectRole::TransactionExtentMap)
+        });
+        assert!(
+            has_ext_map,
+            "changed records must contain TransactionExtentMap"
+        );
+    }
 
     drop(fs);
     cleanup(&root);
@@ -234,12 +242,15 @@ fn txn_allocate_free_via_unlink() {
     // File lookup should fail after unlink.
     assert!(fs.lookup("/doomed.bin").is_err());
 
-    // Export changed records: should reflect the unlink in the transaction log.
-    let export = fs.export_changed_records().expect("export changed records");
-    assert!(
-        !export.roots.is_empty(),
-        "export should contain transaction roots after unlink"
-    );
+    #[cfg(feature = "replication-io")]
+    {
+        // The optional replication export should reflect the unlink.
+        let export = fs.export_changed_records().expect("export changed records");
+        assert!(
+            !export.roots.is_empty(),
+            "export should contain transaction roots after unlink"
+        );
+    }
 
     drop(fs);
     cleanup(&root);
@@ -294,18 +305,20 @@ fn extent_map_data_survives_reopen_via_read_path() {
         let names: Vec<String> = listing.iter().map(|e| e.name_lossy()).collect();
         assert!(names.contains(&"persist.bin".to_string()));
 
-        // Export changed records from the reopened filesystem to confirm
-        // the transaction log includes extent map records.
-        let export = fs.export_changed_records().expect("export changed records");
-        let has_ext_map = export.roots.iter().any(|root| {
-            root.records
-                .iter()
-                .any(|r| r.role == ChangedRecordObjectRole::TransactionExtentMap)
-        });
-        assert!(
-            has_ext_map,
-            "reopened filesystem export must contain TransactionExtentMap records"
-        );
+        #[cfg(feature = "replication-io")]
+        {
+            // Confirm the optional replication export includes extent maps.
+            let export = fs.export_changed_records().expect("export changed records");
+            let has_ext_map = export.roots.iter().any(|root| {
+                root.records
+                    .iter()
+                    .any(|r| r.role == ChangedRecordObjectRole::TransactionExtentMap)
+            });
+            assert!(
+                has_ext_map,
+                "reopened filesystem export must contain TransactionExtentMap records"
+            );
+        }
     }
 
     cleanup(&root);
@@ -316,6 +329,7 @@ fn extent_map_data_survives_reopen_via_read_path() {
 // ───────────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "replication-io")]
 fn changed_record_role_includes_transaction_extent_map() {
     set_test_key();
     let root = temp_dir("changed-record-role");
@@ -380,6 +394,7 @@ fn changed_record_role_includes_transaction_extent_map() {
 }
 
 #[test]
+#[cfg(feature = "replication-io")]
 fn allocate_then_free_produces_distinct_changed_records() {
     set_test_key();
     let root = temp_dir("changed-record-alloc-free");
@@ -689,6 +704,7 @@ fn rollback_transaction_discards_extent_allocation() {
 }
 
 #[test]
+#[cfg(feature = "replication-io")]
 fn allocate_commit_reopen_data_survives_with_changed_records() {
     set_test_key();
     let root = temp_dir("edge-reopen-records");

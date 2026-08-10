@@ -25,16 +25,19 @@ tidefs-btree = { workspace = true }
 blake3 = { version = "1", default-features = false }
 tidefs-kernel-storage-io = { workspace = true, default-features = false, optional = true }
 tidefs-types-vfs-core = { workspace = true, optional = true }
-tidefs-shard-group = { workspace = true }
+tidefs-shard-group = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
 std = []
 kernel = ["tidefs-kernel-storage-io", "tidefs-types-vfs-core"]
+data-policy = ["dep:tidefs-shard-group"]
+full = ["data-policy"]
 
 [dev-dependencies]
 tidefs-local-object-store = { workspace = true }
 tidefs-types-extent-map-core = { workspace = true }
+tidefs-shard-group = { workspace = true }
 
 [[test]]
 name = "v1_vs_v2_bench"

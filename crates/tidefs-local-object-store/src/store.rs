@@ -10535,11 +10535,10 @@ mod segment_cleaner_integration_tests {
 mod reserve_ledger_integration_tests {
     use super::*;
     use tempfile::tempdir;
-    use tidefs_reserve_ledger::{BudgetDomainId, ReserveClass};
+    use tidefs_reserve_ledger::ReserveClass;
 
     fn make_ledger(capacity: u64) -> ReserveLedger {
-        let id = BudgetDomainId::from_str("test");
-        let mut rl = ReserveLedger::new(1u64, id, ReserveClass::Rebuild, 100_000, 200_000);
+        let mut rl = ReserveLedger::new(1u64, ReserveClass::Rebuild, 100_000, 200_000);
         rl.set_capacity(capacity);
         rl
     }

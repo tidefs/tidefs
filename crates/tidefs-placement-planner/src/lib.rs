@@ -19,12 +19,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 pub mod constraint;
+#[cfg(any(feature = "data-policy", test))]
 pub mod intent_planning;
 pub mod node_placement;
 pub mod placement_plan;
 use tidefs_durability_layout::{
     DurabilityLayoutV1, DurabilityPolicy, FailureDomainLevel, FailureDomainV1,
 };
+#[cfg(any(feature = "membership", test))]
 use tidefs_membership_epoch::{
     AntiAffinityClass, DomainId, EpochId, FailureDomainClass, FailureDomainPlacementPlan,
     FailureDomainPlacementPolicy, FailureDomainRecord, HealthClass, MemberId,
@@ -46,6 +48,7 @@ use tidefs_membership_epoch::{
 /// the planner emits a non-blocking `TierGoalIsNotStorageIntentModel` reason
 /// to make the legacy intent visible to explanation and performance consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg(any(feature = "membership", feature = "data-policy", test))]
 pub enum TierGoal {
     /// Primary replicas — full data set, strictest anti-affinity.  Prefer
     /// [`StorageIntentPlacementRole::DurableFullPlacement`] for new code.
@@ -60,6 +63,7 @@ pub enum TierGoal {
 }
 
 /// A single selected replica placement target.
+#[cfg(any(feature = "membership", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaTarget {
     /// The member selected to host a replica.
@@ -91,6 +95,7 @@ pub enum PlacementError {
 ///
 /// A weight of `0` excludes the member from keyed placement. Missing members
 /// default to weight `1`.
+#[cfg(any(feature = "membership", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemberPlacementWeight {
     /// Member whose draw weight is being overridden.
@@ -114,6 +119,7 @@ pub struct MemberPlacementWeight {
 /// The `committed_at` field uses a raw `u64` to avoid a dependency cycle
 /// with `tidefs-commit_group`; callers in crates that already depend on
 /// `tidefs-commit_group` can convert with `CommitGroupId(committed_at)`.
+#[cfg(any(feature = "membership", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedPlacementPlan {
     /// The placement plan produced from committed evidence.
@@ -122,6 +128,7 @@ pub struct CommittedPlacementPlan {
     pub committed_at: u64,
 }
 
+#[cfg(any(feature = "membership", test))]
 impl CommittedPlacementPlan {
     /// Returns `true` if the evidence backing this plan is stale relative
     /// to a newer commit group.
@@ -151,6 +158,7 @@ impl CommittedPlacementPlan {
 ///
 /// Returns `PlacementError` if there are insufficient domains or members
 /// to satisfy the policy.
+#[cfg(any(feature = "membership", test))]
 pub fn compute_replica_target_set(
     policy: &FailureDomainPlacementPolicy,
     failure_domains: &[FailureDomainRecord],
@@ -319,6 +327,7 @@ pub fn compute_replica_target_set(
 /// Identical to [`compute_replica_target_set`] except the returned plan is
 /// wrapped in a [`CommittedPlacementPlan`] that records `committed_at` and
 /// supports staleness checks.
+#[cfg(any(feature = "membership", test))]
 pub fn compute_committed_replica_target_set(
     policy: &FailureDomainPlacementPolicy,
     failure_domains: &[FailureDomainRecord],
@@ -336,6 +345,7 @@ pub fn compute_committed_replica_target_set(
 /// Identical to [`compute_keyed_replica_target_set`] except the returned plan
 /// is wrapped in a [`CommittedPlacementPlan`] that records `committed_at` and
 /// supports staleness checks.
+#[cfg(any(feature = "membership", test))]
 pub fn compute_committed_keyed_replica_target_set(
     policy: &FailureDomainPlacementPolicy,
     failure_domains: &[FailureDomainRecord],
@@ -366,6 +376,7 @@ pub fn compute_committed_keyed_replica_target_set(
 ///
 /// `member_weights` is optional: absent members use weight `1`, and weight `0`
 /// excludes a member from new placement.
+#[cfg(any(feature = "membership", test))]
 pub fn compute_keyed_replica_target_set(
     policy: &FailureDomainPlacementPolicy,
     failure_domains: &[FailureDomainRecord],
@@ -533,6 +544,7 @@ pub fn compute_keyed_replica_target_set(
 // ---------------------------------------------------------------------------
 
 /// Determine whether a domain's health class is acceptable for the given tier.
+#[cfg(any(feature = "membership", test))]
 fn acceptable_health(health: HealthClass, tier: TierGoal) -> bool {
     match tier {
         TierGoal::Primary | TierGoal::Secondary => {
@@ -542,6 +554,7 @@ fn acceptable_health(health: HealthClass, tier: TierGoal) -> bool {
     }
 }
 
+#[cfg(any(feature = "membership", test))]
 fn strict_for_tier(
     policy: &FailureDomainPlacementPolicy,
     tier_goal: TierGoal,
@@ -567,18 +580,21 @@ const fn derive_record_id(left: u64, right: u64, salt: u64) -> u64 {
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+#[cfg(any(feature = "membership", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DomainCandidate {
     domain_id: DomainId,
     members: Vec<(MemberId, u32)>,
 }
 
+#[cfg(any(feature = "membership", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PickedMember {
     member_id: MemberId,
     domain_id: DomainId,
 }
 
+#[cfg(any(feature = "membership", test))]
 fn member_weight_map(weights: &[MemberPlacementWeight]) -> BTreeMap<MemberId, u32> {
     weights
         .iter()
@@ -586,10 +602,12 @@ fn member_weight_map(weights: &[MemberPlacementWeight]) -> BTreeMap<MemberId, u3
         .collect()
 }
 
+#[cfg(any(feature = "membership", test))]
 fn member_weight(member_id: MemberId, weights: &BTreeMap<MemberId, u32>) -> u32 {
     weights.get(&member_id).copied().unwrap_or(1)
 }
 
+#[cfg(any(feature = "membership", test))]
 fn pick_keyed_member(
     candidates: &[DomainCandidate],
     used_member_ids: &BTreeSet<MemberId>,
@@ -637,6 +655,7 @@ fn pick_keyed_member(
     best.map(|(_, picked)| picked)
 }
 
+#[cfg(any(feature = "membership", test))]
 fn keyed_draw_score(
     placement_key: u64,
     replica_index: u64,

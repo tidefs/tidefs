@@ -24,6 +24,7 @@ use tidefs_binary_schema_checksum::blake3_domain_digest;
 use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
 use tidefs_btree::{BPlusTree, BTreeError};
 use tidefs_commit_group::store::CommitGroupStore;
+#[cfg(any(feature = "policy-observation", test))]
 use tidefs_performance_contract::{AdmissionPermit, ResourceDomain, WorkClass};
 use tidefs_types_orphan_index_core::{
     OrphanCursor, OrphanKey, OrphanLogIncompleteTail, OrphanLogRecoveryReport,
@@ -230,6 +231,7 @@ impl OrphanEntry {
 }
 
 /// Orphan-index admission permit validation failure.
+#[cfg(any(feature = "policy-observation", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrphanIndexAdmissionError {
     WrongWorkClass {
@@ -242,6 +244,7 @@ pub enum OrphanIndexAdmissionError {
     },
 }
 
+#[cfg(any(feature = "policy-observation", test))]
 impl fmt::Display for OrphanIndexAdmissionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -261,8 +264,10 @@ impl fmt::Display for OrphanIndexAdmissionError {
     }
 }
 
+#[cfg(any(feature = "policy-observation", test))]
 impl std::error::Error for OrphanIndexAdmissionError {}
 
+#[cfg(any(feature = "policy-observation", test))]
 fn validate_orphan_index_permit(permit: &AdmissionPermit) -> Result<(), OrphanIndexAdmissionError> {
     let charge = permit.charge();
     if charge.work_class != WorkClass::MetadataMutation {
@@ -367,6 +372,7 @@ impl OrphanIndex {
     }
 
     /// Insert an inode entry after validating an orphan-index metadata permit.
+    #[cfg(any(feature = "policy-observation", test))]
     pub fn insert_admitted(
         &mut self,
         inode_id: u64,
@@ -390,6 +396,7 @@ impl OrphanIndex {
     }
 
     /// Remove an inode entry after validating an orphan-index metadata permit.
+    #[cfg(any(feature = "policy-observation", test))]
     pub fn remove_admitted(
         &mut self,
         inode_id: u64,
@@ -460,6 +467,7 @@ impl OrphanIndex {
     }
 
     /// Insert an O_TMPFILE entry after validating an orphan-index metadata permit.
+    #[cfg(any(feature = "policy-observation", test))]
     pub fn insert_tmpfile_admitted(
         &mut self,
         inode_id: u64,
@@ -485,6 +493,7 @@ impl OrphanIndex {
     }
 
     /// Remove an O_TMPFILE entry after validating an orphan-index metadata permit.
+    #[cfg(any(feature = "policy-observation", test))]
     pub fn remove_on_link_admitted(
         &mut self,
         inode_id: u64,

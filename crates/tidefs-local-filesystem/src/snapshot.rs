@@ -24,12 +24,14 @@ use crate::LocalFileSystem;
 use crate::Result;
 use crate::ROOT_INODE_ID;
 use std::collections::BTreeSet;
+#[cfg(feature = "replication-io")]
 use std::fmt::Write as _;
 use tidefs_dataset_lifecycle::{
     DatasetCatalog, DatasetFlags, DatasetId, DatasetType, LifecycleRootIdentityV1, SyncGuarantee,
     TraversalRoot, TraversalRootType,
 };
 use tidefs_local_object_store::SnapshotDeadObjectCandidate;
+#[cfg(feature = "replication-io")]
 use tidefs_send_stream::{Id128 as Vfssend2Id128, SnapshotMutation, SnapshotMutationKind};
 use tidefs_types_vfs_core::{Generation, InodeId, SNAPSHOT_NAMESPACE_ROOT_INODE_ID};
 
@@ -76,6 +78,7 @@ pub struct PromoteReport {
 
 /// Deferred deletion reported when a received snapshot mutation hits a hold.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 pub struct SnapshotDeletionDeferral {
     pub name: String,
     pub root_id: Vfssend2Id128,
@@ -86,6 +89,7 @@ pub struct SnapshotDeletionDeferral {
 
 /// Deadlist derivation failure recorded after a received delete committed.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 pub struct SnapshotDeletionDeadlistDeferral {
     pub name: String,
     pub root_id: Vfssend2Id128,
@@ -97,6 +101,7 @@ pub struct SnapshotDeletionDeadlistDeferral {
 
 /// Result of applying a received VFSSEND2 snapshot-record mutation.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 pub enum SnapshotMutationApplyReport {
     Promoted(PromoteReport),
     Deleted(SnapshotSummary),
@@ -184,6 +189,7 @@ pub(crate) fn snapshot_record_display_name(record: &SnapshotRecord) -> String {
     String::from_utf8_lossy(&record.name).into_owned()
 }
 
+#[cfg(feature = "replication-io")]
 pub(crate) fn snapshot_record_root_id(record: &SnapshotRecord) -> Vfssend2Id128 {
     let mut id = [0u8; 16];
     id[0..8].copy_from_slice(&record.root.transaction_id.to_le_bytes());
@@ -191,6 +197,7 @@ pub(crate) fn snapshot_record_root_id(record: &SnapshotRecord) -> Vfssend2Id128 
     id
 }
 
+#[cfg(feature = "replication-io")]
 fn snapshot_root_id_hex(root_id: &Vfssend2Id128) -> String {
     let mut out = String::with_capacity(32);
     for byte in root_id {
@@ -773,6 +780,7 @@ impl LocalFileSystem {
         })
     }
 
+    #[cfg(feature = "replication-io")]
     fn finish_received_snapshot_deletion(
         &mut self,
         summary: SnapshotSummary,
@@ -796,6 +804,7 @@ impl LocalFileSystem {
     }
 
     /// Apply a VFSSEND2 snapshot-record mutation through the local lifecycle.
+    #[cfg(feature = "replication-io")]
     pub fn apply_vfssend2_snapshot_mutation(
         &mut self,
         mutation: &SnapshotMutation,
@@ -852,6 +861,7 @@ impl LocalFileSystem {
         }
     }
 
+    #[cfg(feature = "replication-io")]
     fn vfssend2_mutation_target(
         &self,
         mutation: &SnapshotMutation,
@@ -1852,6 +1862,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn vfssend2_promotion_mutation_uses_clone_lifecycle() {
         let dir = temp_dir();
@@ -1884,6 +1895,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn vfssend2_promotion_rejects_unknown_clone_root() {
         let dir = temp_dir();
@@ -1920,6 +1932,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn vfssend2_deletion_mutation_defers_held_snapshot() {
         let dir = temp_dir();
@@ -1959,6 +1972,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn vfssend2_deletion_mutation_uses_clone_delete_lifecycle() {
         let dir = temp_dir();
@@ -1982,6 +1996,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn vfssend2_deletion_mutation_records_deadlist_failure_without_blocking_receive() {
         let dir = temp_dir();
@@ -2078,6 +2093,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn send_export_rejects_snapshot_pin_authority_mismatch() {
         let dir = temp_dir();

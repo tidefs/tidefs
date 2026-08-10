@@ -18,6 +18,7 @@ use tidefs_types_extent_map_core::{
     ExtentId, ExtentLifecycleState, ExtentMapEntryV2, ExtentMapError, ExtentMapOps, LocatorId,
 };
 
+#[cfg(any(feature = "data-policy", test))]
 use tidefs_shard_group::{ExtentScan, IngestExtent, ReplicaLifecycle};
 
 use crate::{split_into_recordsize_chunks, InlineExtentMap, RecordsizePolicy};
@@ -424,6 +425,7 @@ impl ExtentAllocator {
     }
 }
 
+#[cfg(any(feature = "data-policy", test))]
 impl ExtentScan for ExtentAllocator {
     fn list_rebake_candidates(&self) -> Result<Vec<IngestExtent>, String> {
         let candidates = self.ingest_candidates();

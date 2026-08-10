@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::BTreeMap;
 
+#[cfg(feature = "data-policy")]
 use tidefs_dedup::DedupHash;
 use tidefs_local_object_store::ObjectKey;
 
@@ -49,7 +50,7 @@ impl DedupStats {
 /// sessions; this index accelerates same-session dedup hits only.
 #[derive(Clone, Debug, Default)]
 pub struct DedupIndex {
-    map: BTreeMap<DedupHash, (ObjectKey, u64)>,
+    map: BTreeMap<ContentFingerprint, (ObjectKey, u64)>,
     stats: DedupStats,
 }
 
@@ -61,14 +62,16 @@ impl DedupIndex {
         }
     }
 
+    #[cfg(feature = "data-policy")]
     pub fn lookup_hash(&self, hash: &DedupHash) -> Option<ObjectKey> {
-        self.map.get(hash).map(|(key, _)| *key)
+        self.map
+            .get(&ContentFingerprint::from_dedup_hash(*hash))
+            .map(|(key, _)| *key)
     }
 
     pub fn insert(&mut self, fingerprint: ContentFingerprint, canonical_key: ObjectKey) {
-        let hash = fingerprint.as_dedup_hash();
         self.map
-            .entry(hash)
+            .entry(fingerprint)
             .and_modify(|(_key, count)| *count += 1)
             .or_insert((canonical_key, 1));
     }
@@ -77,7 +80,7 @@ impl DedupIndex {
     /// Removes the entry when the count reaches zero.
     pub fn remove(&mut self, fingerprint: &ContentFingerprint) {
         use std::collections::btree_map::Entry;
-        if let Entry::Occupied(mut entry) = self.map.entry(fingerprint.as_dedup_hash()) {
+        if let Entry::Occupied(mut entry) = self.map.entry(*fingerprint) {
             let (_key, count) = entry.get_mut();
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -100,7 +103,7 @@ impl DedupIndex {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "data-policy"))]
 mod tests {
     use super::*;
 

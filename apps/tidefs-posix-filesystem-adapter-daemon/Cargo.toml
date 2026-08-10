@@ -61,6 +61,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 [features]
 default = []
 cluster = ["dep:bincode", "dep:tidefs-cluster"]
+data-policy = ["tidefs-local-filesystem/data-policy"]
 receipt-demo = [
     "tidefs-types-posix-filesystem-adapter-core/wake-receipt",
     "dep:tidefs-schema-codec-posix-filesystem-adapter",
@@ -70,6 +71,7 @@ scrub-observation = ["dep:tidefs-performance-contract"]
 workload-telemetry = ["dep:tidefs-workload"]
 full = [
     "cluster",
+    "data-policy",
     "receipt-demo",
     "scrub-observation",
     "workload-telemetry",

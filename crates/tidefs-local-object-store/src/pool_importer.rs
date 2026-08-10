@@ -534,6 +534,7 @@ impl PoolImporter {
     /// - `epoch > EpochId(0)` must hold.
     /// - `lease_id > 0` must hold.
     /// - `pool_guid` in the token must match the resolved pool.
+    #[cfg(any(feature = "distributed-repair", test))]
     pub fn import_pool_clustered(
         device_paths: &[PathBuf],
         pool_guid: Option<[u8; 16]>,

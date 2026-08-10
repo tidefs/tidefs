@@ -2204,8 +2204,6 @@ fn mounted_partial_range_rejects_receiptless_raw_chunk_after_open() {
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.set_auto_commit(false)
         .expect("test setup mutation must be admitted");
-    fs.set_dedup_enabled(false)
-        .expect("test setup mutation must be admitted");
     fs.create_file("/data.bin", 0o644).expect("create file");
     let payload = vec![0x5a; content_chunk_size() as usize];
     fs.write_file("/data.bin", 0, &payload)
@@ -2275,6 +2273,7 @@ fn receiptless_newer_root_falls_back_to_older_authenticated_root() {
 }
 
 #[test]
+#[cfg(feature = "data-policy")]
 fn dedup_canonical_payload_substitution_falls_back_to_older_root() {
     let root = temp_root("dedup-canonical-content-address-fallback");
     let older_generation;
@@ -2322,7 +2321,8 @@ fn dedup_canonical_payload_substitution_falls_back_to_older_root() {
             chunk_ref.chunk_index,
             &replacement_payload,
             &ContentCompressionPolicy::off(),
-        );
+        )
+        .expect("encode substituted canonical payload");
         fs.store
             .put(DeviceIoClass::Data, canonical_key, &replacement)
             .expect("publish substituted canonical payload");
@@ -2356,8 +2356,6 @@ fn mounted_partial_mutation_does_not_launder_receiptless_chunk() {
     let root = temp_root("mounted-partial-mutation-receiptless-chunk");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.set_auto_commit(false)
-        .expect("test setup mutation must be admitted");
-    fs.set_dedup_enabled(false)
         .expect("test setup mutation must be admitted");
     fs.create_file("/data.bin", 0o644).expect("create file");
     let payload: Vec<u8> = (0..content_chunk_size() as usize)
@@ -2816,6 +2814,10 @@ fn fallocate_extends_through_allocator_and_reports_statfs() {
     let err = fs
         .fallocate_file("/prealloc.bin", content_chunk_size() as u64 * 2, 1)
         .expect_err("third grain exceeds capacity");
+    #[cfg(feature = "policy-observation")]
+    let policy_rejected = matches!(err, FileSystemError::ClaimRejected { .. });
+    #[cfg(not(feature = "policy-observation"))]
+    let policy_rejected = false;
     assert!(
         matches!(
             err,
@@ -2823,7 +2825,7 @@ fn fallocate_extends_through_allocator_and_reports_statfs() {
                 resource: LocalStorageResource::ContentBytes,
                 ..
             }
-        ) || matches!(err, FileSystemError::ClaimRejected { .. })
+        ) || policy_rejected
     );
     cleanup(&root);
 }
@@ -3634,6 +3636,7 @@ fn safe_reclamation_preserves_snapshot_roots_for_later_rollback() {
     cleanup(&root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn changed_record_send_receive_round_trips_current_root_and_snapshot() {
     let source_root = temp_root("send-receive-source");
@@ -3779,6 +3782,7 @@ fn changed_record_send_receive_round_trips_current_root_and_snapshot() {
     cleanup(&target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn changed_record_send_receive_excludes_unlinked_extent_maps() {
     let source_root = temp_root("changed-record-send-receive-unlinked-extent-map-source");
@@ -3846,6 +3850,7 @@ fn changed_record_send_receive_excludes_unlinked_extent_maps() {
     cleanup(&target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn changed_record_import_rejects_corrupt_payload_before_publish() {
     let source_root = temp_root("send-receive-corrupt-source");
@@ -5595,6 +5600,7 @@ fn safe_reclamation_preserves_retained_roots_and_reopens() {
     cleanup(&root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn changed_record_object_role_preserves_decode_tag() {
     assert_eq!(
@@ -6105,6 +6111,10 @@ fn update_allocator_policy_shrink_below_allocation_triggers_enospc() {
     let err = fs
         .write_file("/f.txt", 1, b"X")
         .expect_err("write should be rejected under shrunk capacity");
+    #[cfg(feature = "policy-observation")]
+    let policy_rejected = matches!(err, FileSystemError::ClaimRejected { .. });
+    #[cfg(not(feature = "policy-observation"))]
+    let policy_rejected = false;
     assert!(
         matches!(
             err,
@@ -6112,7 +6122,7 @@ fn update_allocator_policy_shrink_below_allocation_triggers_enospc() {
                 resource: LocalStorageResource::ContentBytes,
                 ..
             }
-        ) || matches!(err, FileSystemError::ClaimRejected { .. })
+        ) || policy_rejected
     );
 
     cleanup(&root);
@@ -6912,6 +6922,7 @@ fn do_commit_clears_intent_log_after_state_persist() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn claim_ledger_tracks_write_allocations() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6967,6 +6978,7 @@ fn claim_ledger_tracks_write_allocations() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn claim_ledger_releases_on_overwrite() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7057,6 +7069,7 @@ fn rename_overwrite_releases_replaced_file_capacity() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn claim_ledger_reports_non_authoritative() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7087,6 +7100,7 @@ fn claim_ledger_reports_non_authoritative() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn claim_ledger_policy_update_resets_ledger() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7121,6 +7135,7 @@ fn claim_ledger_policy_update_resets_ledger() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn authority_scarcity_gates_write_when_ledger_exhausted() {
     // Design rule Rule 3: a write must be rejected by the obligation ledger
     // before the allocator runs, even if physical space is available.
@@ -7175,6 +7190,7 @@ fn authority_scarcity_gates_write_when_ledger_exhausted() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn authority_scarcity_allows_write_after_claim_release() {
     // Releasing a claim (overwrite with smaller data) frees obligation
     // capacity, allowing a new claim.
@@ -7229,6 +7245,7 @@ fn authority_scarcity_allows_write_after_claim_release() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn obligation_ledger_total_blocks_matches_policy_capacity() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7271,6 +7288,7 @@ fn obligation_ledger_total_blocks_matches_policy_capacity() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn authority_scarcity_preserves_write_order_under_contention() {
     // When two small writes fit within the same budget domain, both
     // should succeed in order.
@@ -8150,6 +8168,7 @@ fn device_transform_open_config_rejects_before_pool_creation() {
 }
 
 #[test]
+#[cfg(feature = "data-policy")]
 fn cross_session_dedup_reuses_canonical_objects() {
     let root = temp_root("cross-session-dedup");
     let opts = StoreOptions {
@@ -8202,6 +8221,7 @@ fn cross_session_dedup_reuses_canonical_objects() {
 /// Within-session dedup: two files with identical content written in the same
 /// session should share canonical objects via the in-memory DedupIndex.
 #[test]
+#[cfg(feature = "data-policy")]
 fn within_session_dedup_shares_canonical_objects() {
     let root = temp_root("within-session-dedup");
     let opts = StoreOptions {
@@ -8251,6 +8271,7 @@ fn within_session_dedup_shares_canonical_objects() {
     cleanup(&root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_send_receive_skips_unchanged_objects() {
     let source_root = temp_root("incr-send-source");
@@ -8358,6 +8379,7 @@ struct IncrementalReceiveFixture {
     new_data: Vec<u8>,
 }
 
+#[cfg(feature = "replication-io")]
 fn make_incremental_receive_fixture(
     name: &str,
     retain_base_snapshot: bool,
@@ -8447,6 +8469,7 @@ fn make_incremental_receive_fixture(
     }
 }
 
+#[cfg(feature = "replication-io")]
 fn selected_root_for_test(root: &Path, key: RootAuthenticationKey) -> CommittedRootSummary {
     let mut fs = LocalFileSystem::open_with_root_authentication_key(root, options(), key)
         .expect("open target for selected root");
@@ -8454,6 +8477,7 @@ fn selected_root_for_test(root: &Path, key: RootAuthenticationKey) -> CommittedR
         .expect("selected current root")
 }
 
+#[cfg(feature = "replication-io")]
 fn assert_incremental_receive_base_root_conflict(
     err: FileSystemError,
     expected_from_root: &CommittedRootSummary,
@@ -8512,6 +8536,7 @@ fn assert_incremental_receive_base_root_conflict(
     }
 }
 
+#[cfg(feature = "replication-io")]
 fn assert_receive_merge_no_common_ancestor(err: FileSystemError) {
     let message = err.to_string();
     match err {
@@ -8534,6 +8559,7 @@ fn assert_receive_merge_no_common_ancestor(err: FileSystemError) {
     );
 }
 
+#[cfg(feature = "replication-io")]
 fn omitted_incremental_content_key(export: &ChangedRecordExport) -> ObjectKey {
     for root in &export.roots {
         let manifest_record = root
@@ -8565,6 +8591,7 @@ fn omitted_incremental_content_key(export: &ChangedRecordExport) -> ObjectKey {
 
 /// End-to-end incremental receive: baseline exported to empty target,
 /// then incremental delta applied on top and verified byte-for-byte.
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_send_receive_end_to_end() {
     let source_root = temp_root("incr-e2e-source");
@@ -8708,6 +8735,7 @@ fn incremental_send_receive_end_to_end() {
     cleanup(&target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_refuses_and_preserves_receiptless_uncommitted_content() {
     let fixture = make_incremental_receive_fixture("incr-receiptless-retry", true, None);
@@ -8845,6 +8873,7 @@ fn incremental_receive_refuses_and_preserves_receiptless_uncommitted_content() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_protected_same_key_content_collision() {
     use crate::receive_merge_planner::{
@@ -8916,6 +8945,7 @@ fn incremental_receive_rejects_protected_same_key_content_collision() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_missing_from_root_without_selecting_new_root() {
     let fixture = make_incremental_receive_fixture("incr-missing-from-root", true, None);
@@ -8947,6 +8977,7 @@ fn incremental_receive_rejects_missing_from_root_without_selecting_new_root() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_replayed_completed_generation() {
     let fixture = make_incremental_receive_fixture("incr-replay-completed", true, None);
@@ -9007,6 +9038,7 @@ fn incremental_receive_rejects_replayed_completed_generation() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_target_missing_base_root() {
     let fixture = make_incremental_receive_fixture("incr-missing-base", true, None);
@@ -9048,6 +9080,7 @@ fn incremental_receive_rejects_target_missing_base_root() {
     cleanup(&other_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_loose_unprotected_base_root() {
     let fixture = make_incremental_receive_fixture("incr-loose-base", false, None);
@@ -9081,6 +9114,7 @@ fn incremental_receive_rejects_loose_unprotected_base_root() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_divergent_base_root_identity() {
     let fixture = make_incremental_receive_fixture("incr-divergent-base", true, None);
@@ -9115,6 +9149,7 @@ fn incremental_receive_rejects_divergent_base_root_identity() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_missing_unchanged_content() {
     let fixture = make_incremental_receive_fixture("incr-missing-unchanged", true, None);
@@ -9154,6 +9189,7 @@ fn incremental_receive_rejects_missing_unchanged_content() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn full_receive_rejects_incremental_stream_for_empty_target() {
     let fixture = make_incremental_receive_fixture("incr-wrong-full-route", true, None);
@@ -9182,6 +9218,7 @@ fn full_receive_rejects_incremental_stream_for_empty_target() {
     cleanup(&empty_target);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_full_stream_for_existing_target() {
     let fixture = make_incremental_receive_fixture("incr-wrong-incr-route", true, None);
@@ -9210,6 +9247,7 @@ fn incremental_receive_rejects_full_stream_for_existing_target() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_reports_unknown_placement_without_target_epoch() {
     let fixture = make_incremental_receive_fixture("incr-placement-unknown", true, Some(42));
@@ -9263,6 +9301,7 @@ fn incremental_receive_reports_unknown_placement_without_target_epoch() {
 
 /// Test chained incremental receives: baseline → delta1 → delta2.
 /// Each delta carries only the roots created since the previous receive.
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_send_receive_chained_deltas() {
     let source_root = temp_root("incr-chain-source");
@@ -9394,6 +9433,7 @@ fn incremental_send_receive_chained_deltas() {
 }
 
 /// Debug: export incremental and validate independently.
+#[cfg(feature = "replication-io")]
 #[test]
 fn debug_incremental_validate() {
     let source_root = temp_root("debug-incr-val-source");
@@ -10040,6 +10080,7 @@ fn get_dir_changes_non_directory_returns_none() {
 // Issue #1579: 9/9 source-owned replication/rebuild canonical components have crate implementations.
 // These tests exercise the local-filesystem ↔ quorum-write-runtime integration.
 
+#[cfg(feature = "quorum-write")]
 fn quorum_options(replica_paths: Vec<PathBuf>) -> StoreOptions {
     StoreOptions {
         max_segment_bytes: 16 * 1024,
@@ -10061,6 +10102,7 @@ fn quorum_options(replica_paths: Vec<PathBuf>) -> StoreOptions {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn open_with_quorum_two_replicas_creates_and_reads_file() {
     let primary = temp_root("quorum-create-read");
     let r1 = primary.join("replica-1");
@@ -10101,6 +10143,7 @@ fn open_with_quorum_two_replicas_creates_and_reads_file() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_file_create_and_stat_fans_out_to_replicas() {
     let primary = temp_root("quorum-create-stat");
     let r1 = primary.join("replica-1");
@@ -10136,6 +10179,7 @@ fn quorum_file_create_and_stat_fans_out_to_replicas() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_multi_file_writes_visible_on_all_replicas() {
     let primary = temp_root("quorum-multi-write");
     let r1 = primary.join("replica-1");
@@ -10177,6 +10221,7 @@ fn quorum_multi_file_writes_visible_on_all_replicas() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_file_delete_fans_out_to_replicas() {
     let primary = temp_root("quorum-delete");
     let r1 = primary.join("replica-1");
@@ -10220,6 +10265,7 @@ fn quorum_file_delete_fans_out_to_replicas() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_reopen_after_close_persists_data() {
     let primary = temp_root("quorum-reopen");
     let r1 = primary.join("replica-1");
@@ -10249,6 +10295,7 @@ fn quorum_reopen_after_close_persists_data() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_reopen_with_quorum_persists_across_both() {
     let primary = temp_root("quorum-reopen-both");
     let r1 = primary.join("replica-1");
@@ -10951,6 +10998,7 @@ fn block_device_dataset_catalog_create_persists_across_reopen() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_single_replica_opens_and_works() {
     let primary = temp_root("quorum-single");
     let r1 = primary.join("replica-1");
@@ -10978,6 +11026,7 @@ fn quorum_single_replica_opens_and_works() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_write_rename_and_read_from_replicas() {
     let primary = temp_root("quorum-rename");
     let r1 = primary.join("replica-1");
@@ -11020,6 +11069,7 @@ fn quorum_write_rename_and_read_from_replicas() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_bad_replica_path_graceful_degradation() {
     let primary = temp_root("quorum-degrade");
     let bad_path = primary.join("does-not-exist");
@@ -12911,6 +12961,104 @@ fn feature_flag_mount_gate_empty_flags_succeeds() {
 }
 
 #[test]
+#[cfg(not(feature = "data-policy"))]
+fn feature_flag_mount_gate_refuses_data_policy_without_build_feature() {
+    use tidefs_types_dataset_feature_flags_core::{
+        FeatureClass, FeatureName, FEATURE_COMPRESSION_ZSTD,
+    };
+
+    let root = temp_root("feature-gate-disabled-data-policy");
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("first open");
+        let name = FeatureName::from_str(FEATURE_COMPRESSION_ZSTD).expect("zstd feature name");
+        fs.feature_flags_mut()
+            .expect("access feature flags")
+            .enable_feature(name, FeatureClass::RoCompat)
+            .expect("stage known feature");
+        assert!(matches!(
+            fs.persist_feature_flags(),
+            Err(FileSystemError::Unsupported { .. })
+        ));
+
+        // Seed the persisted unsupported state below the guarded API to prove
+        // that the default mount path also refuses it rather than silently
+        // treating the feature as available.
+        let roots = fs
+            .feature_flags
+            .persist(&mut fs.store)
+            .expect("persist test fixture feature tree");
+        fs.store
+            .put(
+                DeviceIoClass::Data,
+                feature_flags_roots_object_key(),
+                &roots.encode(),
+            )
+            .expect("persist test fixture roots");
+        fs.store.sync_all().expect("sync test fixture roots");
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    }
+
+    assert!(matches!(
+        LocalFileSystem::open_with_options(&root, options()),
+        Err(FileSystemError::Unsupported { .. })
+    ));
+    cleanup(&root);
+}
+
+#[test]
+#[cfg(not(feature = "data-policy"))]
+fn pool_property_persistence_refuses_compression_without_build_feature() {
+    use tidefs_dataset_properties::{PropertyKey, PropertyValue};
+
+    let root = temp_root("property-gate-disabled-data-policy");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open");
+    fs.pool_properties_mut()
+        .expect("access pool properties")
+        .set_local(
+            PropertyKey::new("compression.algorithm"),
+            PropertyValue::String("zstd".into()),
+        );
+    assert!(matches!(
+        fs.persist_pool_properties(),
+        Err(FileSystemError::Unsupported { .. })
+    ));
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
+#[cfg(feature = "data-policy")]
+fn mount_refuses_persisted_non_string_compression_algorithm() {
+    use tidefs_dataset_properties::{PropertyKey, PropertyValue};
+
+    let root = temp_root("property-gate-non-string-compression");
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("first open");
+        fs.pool_properties_mut()
+            .expect("access pool properties")
+            .set_local(
+                PropertyKey::new("compression.algorithm"),
+                PropertyValue::Bool(true),
+            );
+        fs.persist_pool_properties()
+            .expect("persist non-string compression property fixture");
+    }
+
+    let err = LocalFileSystem::open_with_options(&root, options())
+        .expect_err("non-string persisted compression property must refuse mount");
+    assert!(matches!(
+        err,
+        FileSystemError::Unsupported {
+            operation: "resolve mounted compression policy",
+            reason: "persisted local compression.algorithm must be a string naming off, none, lz4, zstd, or zstd-3",
+        }
+    ));
+    cleanup(&root);
+}
+
+#[test]
+#[cfg(feature = "data-policy")]
 fn feature_flag_mount_gate_known_features_succeeds() {
     use tidefs_types_dataset_feature_flags_core::{
         FeatureClass, FeatureName, FEATURE_COMPRESSION_ZSTD,
@@ -13556,6 +13704,7 @@ fn truncate_and_fallocate_advance_subtree_rev() {
 
 // ── Cross-pool receive authorization tests ──────────────────────────────
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn cross_pool_authorization_matches_exact_tuple() {
     let auth = crate::types::CrossPoolReceiveAuthorization {
@@ -13580,6 +13729,7 @@ fn cross_pool_authorization_matches_exact_tuple() {
     assert!(!auth.matches(&sender4));
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn validate_sender_authority_local_only_passes() {
     use crate::send_receive::validate_sender_authority_for_receive;
@@ -13597,6 +13747,7 @@ fn validate_sender_authority_local_only_passes() {
     );
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn validate_sender_authority_same_pool_passes() {
     use crate::send_receive::validate_sender_authority_for_receive;
@@ -13618,6 +13769,7 @@ fn validate_sender_authority_same_pool_passes() {
     );
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn validate_sender_authority_cross_pool_unauthorized() {
     use crate::send_receive::validate_sender_authority_for_receive;
@@ -13638,6 +13790,7 @@ fn validate_sender_authority_cross_pool_unauthorized() {
     }
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn validate_sender_authority_cross_pool_with_matching_authorization() {
     use crate::send_receive::validate_sender_authority_for_receive;
@@ -13664,6 +13817,7 @@ fn validate_sender_authority_cross_pool_with_matching_authorization() {
     );
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn validate_sender_authority_cross_pool_authorization_mismatch_epoch() {
     use crate::send_receive::validate_sender_authority_for_receive;
@@ -13692,6 +13846,7 @@ fn validate_sender_authority_cross_pool_authorization_mismatch_epoch() {
     }
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn validate_sender_authority_cross_pool_authorization_mismatch_uuid() {
     use crate::send_receive::validate_sender_authority_for_receive;
@@ -13720,6 +13875,7 @@ fn validate_sender_authority_cross_pool_authorization_mismatch_uuid() {
     }
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn error_display_cross_pool_unauthorized() {
     let err = crate::error::FileSystemError::CrossPoolReceiveUnauthorized {
@@ -13736,6 +13892,7 @@ fn error_display_cross_pool_unauthorized() {
     );
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn error_display_authorization_mismatch() {
     let err = crate::error::FileSystemError::CrossPoolReceiveAuthorizationMismatch {
@@ -13752,6 +13909,7 @@ fn error_display_authorization_mismatch() {
     );
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn error_display_malformed_sender_authority() {
     let err = crate::error::FileSystemError::MalformedSenderAuthority {
@@ -13768,6 +13926,7 @@ fn error_display_malformed_sender_authority() {
     );
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn error_display_stale_sender_generation() {
     let err = crate::error::FileSystemError::StaleSenderGeneration {

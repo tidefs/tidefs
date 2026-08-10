@@ -2337,7 +2337,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tidefs-block-allocator",
- "tidefs-local-object-store",
  "tidefs-locator-table",
  "tidefs-membership-epoch",
  "tidefs-pool-scan",
@@ -2661,7 +2660,6 @@ dependencies = [
  "tidefs-local-object-store",
  "tidefs-online-defrag",
  "tidefs-orphan-index",
- "tidefs-performance-contract",
  "tidefs-pool-scan",
  "tidefs-posix-acl",
  "tidefs-posix-semantics",
@@ -2949,7 +2947,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tidefs-durability-layout",
  "tidefs-membership-epoch",
- "tidefs-replication-model",
  "tidefs-storage-intent-core",
 ]
 
@@ -2993,7 +2990,6 @@ dependencies = [
  "tidefs-binary_schema-checksum",
  "tidefs-checksum-tree",
  "tidefs-commit_group",
- "tidefs-device-removal",
  "tidefs-encryption",
  "tidefs-intent-log",
  "tidefs-local-object-store",
@@ -3231,13 +3227,11 @@ dependencies = [
  "tempfile",
  "tidefs-checksum-tree",
  "tidefs-commit_group",
- "tidefs-flow-commit-coordinator",
  "tidefs-intent-log",
  "tidefs-local-object-store",
  "tidefs-membership-epoch",
  "tidefs-rebuild-planner",
  "tidefs-replica-health",
- "tidefs-replication-model",
  "tidefs-vfs-engine",
 ]
 

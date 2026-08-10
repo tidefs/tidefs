@@ -70,6 +70,7 @@ pub const FORMAL_NO_PRODUCTION_FSCK_FAILURE_MODEL: &str = "TideFS storage item 0
 pub const RECOVERY_AUDIT_IS_NOT_FSCK: &str = "recovery audit reports validation only; it must not guess repairs, rewrite namespace truth, or become a production fsck requirement";
 pub const MOUNT_INVARIANT_GATE_IS_NOT_FSCK: &str = "mount invariant gate validates committed roots before they become live; it does not repair, rewrite, or require production fsck";
 pub const LOCAL_STORAGE_ALLOCATOR_SPEC: &str = "TideFS storage item 102 local storage allocator: finite content-grain and inode capacity are admitted before publication, statfs reports the same allocator truth, and reusable free space excludes content still protected by committed fallback roots";
+#[cfg(feature = "policy-observation")]
 pub const CLAIM_LEDGER_SPEC: &str = "design rule items Rule 3 and Rule 8: every block allocation must be traceable to a claim against a budget domain (Rule 8); the obligation ledger gates writes before the allocator run — writes are rejected when committed blocks (claims + reserves) would exceed capacity (Rule 3: authority is scarce); reserves guarantee minimums; witnesses prove authorization; the reverse explainer answers what would be freed if a domain were reclaimed";
 pub const SAFE_LOCAL_RECLAMATION_GC_SPEC: &str = "TideFS storage item 103 safe local reclamation: mutating GC requires a clear retained-root plan, preserves exact protected root-slot locations, copies protected non-root objects before segment retirement, and verifies recovery after mutation";
 pub const ROOT_AUTHENTICATION_SPEC: &str = "TideFS storage item 015 root authentication: committed filesystem roots are mountable only when a keyed BLAKE3-256 authentication record validates root slot, generation, transaction id, manifest digest, superblock digest, policy epoch, and algorithm suite";
@@ -93,9 +94,13 @@ pub const SNAPSHOT_RECORD_V3_MAGIC_BYTES: [u8; 8] = *b"VFSSNP21";
 /// for SEND/RECEIVE frames. The canonical send/receive format is VFSSEND2
 /// (defined in `tidefs-send-stream`) which is validated through the two-node
 /// harness but not yet wired into the daemon (see #5949).
+#[cfg(feature = "replication-io")]
 pub const SEND_RECEIVE_CHANGED_RECORD_SPEC: &str = "TideFS storage item 109 send/receive: a VFSSEND1 changed-record stream exports authenticated committed-root transaction records, receive validates the stream in staging, re-signs imported roots with the destination root-authentication key, and publishes the received root without operator repair";
+#[cfg(feature = "replication-io")]
 pub const SEND_RECEIVE_STREAM_MAGIC_ASCII: &str = "VFSSEND1";
+#[cfg(feature = "replication-io")]
 pub const SEND_RECEIVE_STREAM_MAGIC_BYTES: [u8; 8] = *b"VFSSEND1";
+#[cfg(feature = "replication-io")]
 pub const SEND_RECEIVE_STREAM_VERSION: u16 = 1;
 pub const ONLINE_VERIFIER_SPEC: &str = "TideFS storage item 110 online verifier: non-mutating verification walks committed root candidates, transaction manifests, authenticated roots, namespace invariants, content checksums, and snapshot references without rewriting namespace truth";
 pub const ONLINE_VERIFIER_IS_NOT_FSCK: &str = "online verification reports issues only; it must not rewrite root slots, transaction objects, namespace records, or content objects and must stay separate from production recovery/repair";

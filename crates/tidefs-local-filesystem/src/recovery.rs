@@ -4361,7 +4361,8 @@ mod receipt_validation_tests {
         );
         let payload = b"test-chunk-payload-for-receipt-validation";
         let encoded =
-            encode_content_chunk(inode, chunk_ref.chunk_index, payload, &Default::default());
+            encode_content_chunk(inode, chunk_ref.chunk_index, payload, &Default::default())
+                .expect("encode recovery fixture chunk");
         store.put(key, &encoded).expect("put chunk data");
         store.sync_all().expect("sync");
     }

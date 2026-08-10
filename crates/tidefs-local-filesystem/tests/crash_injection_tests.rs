@@ -813,6 +813,7 @@ fn crash_test_child_workload() {
             let _ = fs.sync_all();
         }
         // Repair hooks: trigger repair_cycle
+        #[cfg(feature = "distributed-repair")]
         CrashInjectionPoint::RepairBeforeApply
         | CrashInjectionPoint::RepairBeforeWriteback
         | CrashInjectionPoint::RepairAfterWriteback => {
@@ -1469,6 +1470,7 @@ fn double_crash_recovery_chain_preserves_committed_roots() {
 /// REL-STOR-014: interrupted repair scenario for the storage recovery
 /// failure-injection campaign.
 #[test]
+#[cfg(feature = "distributed-repair")]
 fn interrupted_repair_preserves_committed_data() {
     set_test_key();
     let root = temp_root("interrupted-repair");
@@ -1916,6 +1918,7 @@ fn chaos_cycle_child_workload() {
             let _ = fs.fallocate_file("/chaos_alloc.txt", 0, 4096);
             let _ = fs.sync_all();
         }
+        #[cfg(feature = "distributed-repair")]
         CrashInjectionPoint::RepairBeforeApply
         | CrashInjectionPoint::RepairBeforeWriteback
         | CrashInjectionPoint::RepairAfterWriteback => {
@@ -1991,6 +1994,7 @@ fn chaos_soak_crash_recovery_campaign() {
         .iter()
         .copied()
         .filter(|p| !p.is_recovery_hook())
+        .filter(|p| cfg!(feature = "distributed-repair") || !p.is_repair_hook())
         .collect();
 
     let root_str = root.to_str().unwrap();
@@ -2079,6 +2083,7 @@ fn chaos_soak_crash_recovery_campaign() {
 /// the 12 crate-level tests in repair_scheduling.rs) ensures duplicate
 /// mark_repaired/mark_failed/ingest operations are safe no-ops.
 #[test]
+#[cfg(feature = "distributed-repair")]
 fn repair_cycle_repeated_calls_idempotent() {
     set_test_key();
     let root = temp_root("repair-idempotent");

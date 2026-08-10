@@ -89,9 +89,9 @@ The repository is not short of implementations; it has too many overlapping
 ones in the default graph:
 
 - 166 root-workspace packages plus four excluded fuzz packages are present.
-- The default normal dependency closure of `tidefsctl` is 112 of 166 workspace
-  packages; selecting its explicit `full` feature reaches 117. Its manifest
-  now has 17 required and 12 optional normal dependencies. The default parser,
+- The default normal dependency closure of `tidefsctl` is 91 of 166 workspace
+  packages; selecting its explicit `full` feature reaches 105. Its manifest
+  now has 16 required and 13 optional normal dependencies. The default parser,
   help, source modules, and direct dependency edges therefore carry only the
   local pool, mount, device, dataset, snapshot, defrag, live-owner, and status
   families.
@@ -102,20 +102,23 @@ ones in the default graph:
   `receipt-demo`, `scrub-observation`, and `workload-telemetry` each own one
   optional source/dependency family; `full` aggregates those four for retained
   development packaging.
-- The daemon's default normal tree still reaches 108 of 166 workspace packages
-  (200 total packages including external crates), versus 111 workspace and 203
-  total with `full`. The remaining cluster, membership, transport,
-  performance-contract, and storage-policy reachability comes through required
-  deeper owners such as `tidefs-local-filesystem`, `tidefs-local-object-store`,
-  `tidefs-orphan-index`, and their dependencies. The LocalFileSystem slice must
-  contract those paths; this adapter slice neither hides them nor overstates
-  their removal.
+- The daemon's default normal tree reaches 88 of 166 workspace packages (190
+  total packages including external crates), versus 97 workspace and 199 total
+  with `full`. The remaining default replication-model reachability comes
+  through the required flow-commit/rebuild coordinator stack, not through the
+  standalone `tidefs-local-filesystem` default. That separate carrier boundary
+  remains visible rather than being hidden in filesystem feature wiring.
 - `fuse_vfs_adapter.rs` is 43,876 lines, `local-filesystem/src/lib.rs` is
   17,692, `vfs_engine_impl.rs` is 16,391, and the binary daemon `main.rs` is
   3,900 lines. The remaining size is concentrated in three
   mixed-authority carriers plus validation and smoke command source.
 - Mounted pool admission no longer selects fixed roots or replays filesystem
   transactions; Pool-backed local-filesystem recovery owns mounted state.
+- The default `tidefs-local-filesystem` normal tree is 58 workspace packages
+  (136 total) and excludes device-removal, replication-model, erasure-coding,
+  claim-ledger, performance-contract, storage-intent read-serving, and
+  quorum-write families. Its explicit `full` feature restores the retained
+  optional subsystems and reaches 95 workspace packages (183 total).
 - The daemon validation CLI now reaches the same library runtime as
   `tidefsctl`; it no longer constructs a second recovery, namespace, FUSE, or
   shutdown stack.

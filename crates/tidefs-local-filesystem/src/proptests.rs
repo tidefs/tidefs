@@ -291,7 +291,12 @@ proptest! {
             dir_rev: 0,
             subtree_rev: 0,
         };
-        let encoded = encode_content_chunk(&record, chunk_index, &payload, &ContentCompressionPolicy::zstd_default());
+        #[cfg(feature = "data-policy")]
+        let compression_policy = ContentCompressionPolicy::zstd_default();
+        #[cfg(not(feature = "data-policy"))]
+        let compression_policy = ContentCompressionPolicy::off();
+        let encoded = encode_content_chunk(&record, chunk_index, &payload, &compression_policy)
+            .expect("encode content chunk");
         let decoded = decode_content_chunk(&encoded)
             .expect("decode content chunk roundtrip");
 

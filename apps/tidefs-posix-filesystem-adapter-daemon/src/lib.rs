@@ -1106,19 +1106,25 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             .map_err(|e| format!("open store: {e}"))?;
 
         if !effective_mode.read_only && config.runtime.enable_dedup {
-            use tidefs_types_dataset_feature_flags_core::{FeatureClass, FeatureName};
+            #[cfg(not(feature = "data-policy"))]
+            return Err("dedup mount activation requires the data-policy feature".into());
 
-            let dedup_name = "org.tidefs:dedup"
-                .parse::<FeatureName>()
-                .expect("org.tidefs:dedup is a valid FeatureName");
-            lfs.feature_flags_mut()
-                .map_err(|e| format!("access dedup feature flags: {e}"))?
-                .enable_feature(dedup_name, FeatureClass::RoCompat)
-                .map_err(|e| format!("enable dedup feature: {e}"))?;
-            lfs.persist_feature_flags()
-                .map_err(|e| format!("persist dedup feature flag: {e}"))?;
-            lfs.refresh_policies_from_features()
-                .map_err(|e| format!("refresh mounted feature policies: {e}"))?;
+            #[cfg(feature = "data-policy")]
+            {
+                use tidefs_types_dataset_feature_flags_core::{FeatureClass, FeatureName};
+
+                let dedup_name = "org.tidefs:dedup"
+                    .parse::<FeatureName>()
+                    .expect("org.tidefs:dedup is a valid FeatureName");
+                lfs.feature_flags_mut()
+                    .map_err(|e| format!("access dedup feature flags: {e}"))?
+                    .enable_feature(dedup_name, FeatureClass::RoCompat)
+                    .map_err(|e| format!("enable dedup feature: {e}"))?;
+                lfs.persist_feature_flags()
+                    .map_err(|e| format!("persist dedup feature flag: {e}"))?;
+                lfs.refresh_policies_from_features()
+                    .map_err(|e| format!("refresh mounted feature policies: {e}"))?;
+            }
         }
 
         // Resolve dataset path through the canonical catalog.

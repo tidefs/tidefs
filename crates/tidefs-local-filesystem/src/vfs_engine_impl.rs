@@ -133,6 +133,7 @@ fn map_errno(err: &FileSystemError) -> Errno {
         FileSystemError::CorruptContent { .. } => Errno::EIO,
         FileSystemError::Unsupported { .. } => Errno::EOPNOTSUPP,
         FileSystemError::SizeOverflow { .. } => Errno::EFBIG,
+        #[cfg(feature = "policy-observation")]
         FileSystemError::ReadServingRefused { .. } => Errno::EIO,
         FileSystemError::Store(StoreError::NoSpace) => Errno::ENOSPC,
         _ => Errno::EIO,
@@ -1732,6 +1733,7 @@ impl VfsLocalFileSystem {
                     LivePoolAdminCommand::SnapshotExtract => {
                         self.live_snapshot_extract(&args, wants_json)
                     }
+                    #[cfg(feature = "replication-io")]
                     LivePoolAdminCommand::SnapshotSend => {
                         self.live_snapshot_send(&args, wants_json)
                     }
@@ -2304,6 +2306,14 @@ impl VfsLocalFileSystem {
                     ),
                 );
             };
+            if !crate::feature_available_in_current_build(&feature) {
+                return live_admin_error(
+                    1,
+                    format!(
+                        "dataset set-strategy: feature '{feature_str}' requires a data-policy build"
+                    ),
+                );
+            }
             let enable_result = match fs.feature_flags_mut() {
                 Ok(flags) => flags.enable_feature_with_prereqs(feature, feature_class),
                 Err(err) => {
@@ -2371,6 +2381,7 @@ impl VfsLocalFileSystem {
                     format!("dataset set-strategy: failed to persist feature flags: {err}"),
                 );
             }
+            #[cfg(feature = "data-policy")]
             if let Err(err) = fs.refresh_policies_from_features() {
                 return live_admin_error(
                     1,
@@ -2402,8 +2413,13 @@ impl VfsLocalFileSystem {
         }
 
         let supported = tidefs_dataset_feature_flags::SupportedFeaturesV1::current();
-        let to_enable: Vec<_> = supported
+        let available: Vec<_> = supported
             .as_slice()
+            .iter()
+            .filter(|feature| crate::feature_available_in_current_build(feature))
+            .cloned()
+            .collect();
+        let to_enable: Vec<_> = available
             .iter()
             .filter(|feature| !fs.feature_flags().is_enabled(feature))
             .cloned()
@@ -2412,7 +2428,7 @@ impl VfsLocalFileSystem {
         if to_enable.is_empty() {
             return live_admin_ok_text(format!(
                 "dataset '{name}': all {} supported features are already enabled",
-                supported.len()
+                available.len()
             ));
         }
 
@@ -2422,7 +2438,7 @@ impl VfsLocalFileSystem {
         let mut failed = Vec::new();
         let mut out = vec![format!(
             "dataset '{name}': upgrading from {before_count} enabled to {} supported features...",
-            supported.len()
+            available.len()
         )];
 
         let mut pending = to_enable;
@@ -2500,6 +2516,7 @@ impl VfsLocalFileSystem {
                     format!("dataset upgrade: failed to persist feature flags: {err}"),
                 );
             }
+            #[cfg(feature = "data-policy")]
             if let Err(err) = fs.refresh_policies_from_features() {
                 return live_admin_error(
                     1,
@@ -3029,6 +3046,7 @@ impl VfsLocalFileSystem {
         }
     }
 
+    #[cfg(feature = "replication-io")]
     fn live_snapshot_send(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
         let mut fs = self.fs.borrow_mut();
         let plan = match live_snapshot_send_plan(args, &mut fs) {
@@ -3874,6 +3892,7 @@ fn live_admin_string_vec(args: &Value, key: &str) -> Result<Vec<String>, String>
     }
 }
 
+#[cfg(feature = "replication-io")]
 fn live_admin_hex_16_or_default(args: &Value, key: &str) -> Result<[u8; 16], String> {
     match live_admin_optional_arg(args, key) {
         Some(value) => live_admin_hex_to_16(value),
@@ -3881,6 +3900,7 @@ fn live_admin_hex_16_or_default(args: &Value, key: &str) -> Result<[u8; 16], Str
     }
 }
 
+#[cfg(feature = "replication-io")]
 fn live_admin_hex_to_16(value: &str) -> Result<[u8; 16], String> {
     let hex = value.strip_prefix("0x").unwrap_or(value);
     if hex.len() != 32 {
@@ -3902,11 +3922,13 @@ fn live_admin_hex_to_16(value: &str) -> Result<[u8; 16], String> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 enum LiveSnapshotSendFormat {
     Vfssend1,
     Vfssend2,
 }
 
+#[cfg(feature = "replication-io")]
 impl LiveSnapshotSendFormat {
     fn parse(args: &Value) -> Result<Self, String> {
         match live_admin_optional_arg(args, "format").unwrap_or("vfssend1") {
@@ -3925,11 +3947,13 @@ impl LiveSnapshotSendFormat {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 enum LiveSnapshotSendMode {
     Full,
     Incremental { from_root: CommittedRootSummary },
 }
 
+#[cfg(feature = "replication-io")]
 impl LiveSnapshotSendMode {
     const fn is_incremental(&self) -> bool {
         matches!(self, Self::Incremental { .. })
@@ -3944,6 +3968,7 @@ impl LiveSnapshotSendMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 enum LiveSnapshotSendDestination {
     Output(std::path::PathBuf),
     TargetAddress {
@@ -3953,6 +3978,7 @@ enum LiveSnapshotSendDestination {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 struct LiveSnapshotSendPlan {
     destination: LiveSnapshotSendDestination,
     format: LiveSnapshotSendFormat,
@@ -3962,6 +3988,7 @@ struct LiveSnapshotSendPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 struct LiveSnapshotEncodedStream {
     encoded: Vec<u8>,
     total_records: u64,
@@ -3969,6 +3996,7 @@ struct LiveSnapshotEncodedStream {
     roots_len: usize,
 }
 
+#[cfg(feature = "replication-io")]
 fn live_snapshot_send_plan(
     args: &Value,
     fs: &mut LocalFileSystem,
@@ -4000,6 +4028,7 @@ fn live_snapshot_send_plan(
     })
 }
 
+#[cfg(feature = "replication-io")]
 fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestination, String> {
     let output = live_admin_optional_arg(args, "output").map(std::path::PathBuf::from);
     match live_admin_optional_arg(args, "target_addr") {
@@ -4014,6 +4043,7 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
     }
 }
 
+#[cfg(feature = "replication-io")]
 fn live_snapshot_send_from_root_arg(
     args: &Value,
     fs: &mut LocalFileSystem,
@@ -4051,6 +4081,7 @@ fn live_snapshot_send_from_root_arg(
         })
 }
 
+#[cfg(feature = "replication-io")]
 fn live_admin_hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
     let hex = value.strip_prefix("0x").unwrap_or(value);
     if !hex.len().is_multiple_of(2) {
@@ -4072,6 +4103,7 @@ fn live_admin_hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+#[cfg(feature = "replication-io")]
 fn live_snapshot_send_export(
     fs: &mut LocalFileSystem,
     plan: &LiveSnapshotSendPlan,
@@ -4450,6 +4482,7 @@ impl VfsLocalFileSystem {
             .reflink_clone_content_plan(source_fh.inode_id, &source_record, &dest_record)
             .map_err(|e| map_errno(&e))?;
         let new_blocks = allocation_bytes / u64::from(crate::constants::content_chunk_size());
+        #[cfg(feature = "policy-observation")]
         fs.ensure_obligation_capacity("staging_dirty", new_blocks, Some(dest_fh.inode_id))
             .map_err(|e| map_errno(&e))?;
         fs.ensure_content_capacity_with_planned_inode(Some(dest_fh.inode_id), planned_entries)
@@ -6838,6 +6871,7 @@ mod tests {
         live_admin(engine, "snapshot", operation, args, wants_json)
     }
 
+    #[cfg(feature = "replication-io")]
     fn live_from_root_hex(root: &CommittedRootSummary) -> String {
         let mut bytes = Vec::with_capacity(24);
         bytes.extend_from_slice(&root.transaction_id.to_le_bytes());
@@ -7145,6 +7179,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "data-policy")]
     fn live_dataset_set_strategy_updates_mounted_feature_flags() {
         let (engine, _td) = temp_fs();
         let created = live_dataset_admin(
@@ -7203,7 +7238,11 @@ mod tests {
         assert_eq!(upgraded["ok"], true, "upgrade response: {upgraded}");
         let supported = tidefs_dataset_feature_flags::SupportedFeaturesV1::current();
         let fs = engine.fs.borrow();
-        for feature in supported.as_slice() {
+        for feature in supported
+            .as_slice()
+            .iter()
+            .filter(|feature| crate::feature_available_in_current_build(feature))
+        {
             assert!(
                 fs.feature_flags().is_enabled(feature),
                 "supported feature {feature} should be enabled",
@@ -7413,6 +7452,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn live_snapshot_send_exports_from_mounted_pool_owner() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -7447,6 +7487,7 @@ mod tests {
         assert!(decoded.payload_bytes > 0);
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn live_snapshot_send_incremental_exports_from_authorized_live_root() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -7493,6 +7534,7 @@ mod tests {
         assert!(decoded.total_records > 0);
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn live_snapshot_send_incremental_requires_authorized_from_root() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -7573,6 +7615,7 @@ mod tests {
         assert!(!output.exists());
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn live_snapshot_send_rejects_target_addr_until_remote_admission_is_wired() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -7610,6 +7653,7 @@ mod tests {
         assert!(!output.exists());
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn live_snapshot_send_rejects_unknown_format_before_exporting() {
         let root = tempfile::tempdir().expect("tempdir");

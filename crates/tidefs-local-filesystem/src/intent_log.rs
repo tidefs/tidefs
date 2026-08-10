@@ -2093,7 +2093,7 @@ pub(crate) fn replay_entry(
                     ci,
                     chunk_data,
                     &state.content_compression_policy,
-                );
+                )?;
                 let checksum = checksum64(&encoded_chunk);
 
                 let chunk_key = content_chunk_object_key_for_version(*inode_id, tick, ci);
@@ -2418,7 +2418,7 @@ impl ReplayBatcher {
                     ci,
                     chunk_data,
                     &state.content_compression_policy,
-                );
+                )?;
                 let checksum = checksum64(&encoded_chunk);
 
                 let chunk_key = content_chunk_object_key_for_version(inode_id, tick, ci);
@@ -2616,6 +2616,7 @@ impl ReplayBatcher {
                     patches: &patches,
                     allow_holes: true,
                     dedup_index: &mut dedup_index,
+                    #[cfg(feature = "quorum-write")]
                     quorum_store: None,
                     compression_policy: &compression_policy,
                 },

@@ -8,6 +8,7 @@ use std::fmt;
 use tidefs_local_object_store::{
     IntegrityDigest64, ObjectKey, ObjectLocation, StoreRetentionCompactionReport, StoreStats,
 };
+#[cfg(feature = "distributed-repair")]
 use tidefs_replication_model::PlacementReceiptRef;
 use tidefs_types_vfs_core::{
     Generation, InodeAttr, InodeFlags, InodeId, NodeFacets, NodeKind, PosixAttrs, S_IFBLK, S_IFCHR,
@@ -16,11 +17,14 @@ use tidefs_types_vfs_core::{
 use tidefs_types_vfs_owned::DirEntry as OwnedDirEntry;
 
 use crate::constants::*;
+#[cfg(feature = "replication-io")]
 use crate::decode_changed_record_export;
+#[cfg(feature = "replication-io")]
 use crate::encode_changed_record_export;
 use crate::error::FileSystemError;
 use crate::Result;
 
+#[cfg(feature = "replication-io")]
 pub use tidefs_send_stream::{Id128, SenderAuthority, SenderAuthorityEvidence};
 
 /// Per-receive authorization for a cross-pool receive stream.
@@ -33,6 +37,7 @@ pub use tidefs_send_stream::{Id128, SenderAuthority, SenderAuthorityEvidence};
 /// sender pool does not match the local target pool, the receive is refused
 /// unless an exact-matching [`CrossPoolReceiveAuthorization`] is supplied.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 pub struct CrossPoolReceiveAuthorization {
     /// UUID of the sender pool the operator authorizes for this receive.
     pub sender_pool_uuid: Id128,
@@ -44,6 +49,7 @@ pub struct CrossPoolReceiveAuthorization {
     pub sender_dataset_uuid: Id128,
 }
 
+#[cfg(feature = "replication-io")]
 impl CrossPoolReceiveAuthorization {
     /// Return true when every field matches the evidence in `sender`.
     #[must_use]
@@ -94,6 +100,7 @@ impl MountedContentChecksumEvidence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MountedContentPlacementEvidence {
     SparseHole,
+    #[cfg(feature = "distributed-repair")]
     ReceiptVerified {
         generation: u64,
         placement_receipt_ref: PlacementReceiptRef,
@@ -114,6 +121,7 @@ pub enum MountedContentPlacementEvidence {
 }
 
 impl MountedContentPlacementEvidence {
+    #[cfg(feature = "distributed-repair")]
     pub fn allows_repair_dispatch(&self) -> bool {
         matches!(self, Self::ReceiptVerified { .. })
     }
@@ -1395,163 +1403,171 @@ impl SnapshotRollbackReport {
     }
 }
 
-#[repr(u16)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum ChangedRecordObjectRole {
-    TransactionManifest = 1,
-    TransactionSuperblock = 2,
-    TransactionInode = 3,
-    TransactionDirectory = 4,
-    VersionedContent = 5,
-    VersionedContentChunk = 6,
-    TransactionSnapshotCatalogEntry = 7,
-    TransactionExtentMap = 8,
-}
+#[cfg(feature = "replication-io")]
+mod replication_types {
+    use super::*;
 
-impl ChangedRecordObjectRole {
-    pub const fn as_u16(self) -> u16 {
-        self as u16
+    #[repr(u16)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+    pub enum ChangedRecordObjectRole {
+        TransactionManifest = 1,
+        TransactionSuperblock = 2,
+        TransactionInode = 3,
+        TransactionDirectory = 4,
+        VersionedContent = 5,
+        VersionedContentChunk = 6,
+        TransactionSnapshotCatalogEntry = 7,
+        TransactionExtentMap = 8,
     }
 
-    pub const fn human_name(self) -> &'static str {
-        match self {
-            Self::TransactionManifest => "transaction manifest",
-            Self::TransactionSuperblock => "transaction superblock",
-            Self::TransactionInode => "transaction inode",
-            Self::TransactionDirectory => "transaction directory",
-            Self::VersionedContent => "versioned file content",
-            Self::VersionedContentChunk => "versioned file content chunk",
-            Self::TransactionSnapshotCatalogEntry => "transaction snapshot catalog entry",
-            Self::TransactionExtentMap => "transaction extent map",
+    impl ChangedRecordObjectRole {
+        pub const fn as_u16(self) -> u16 {
+            self as u16
+        }
+
+        pub const fn human_name(self) -> &'static str {
+            match self {
+                Self::TransactionManifest => "transaction manifest",
+                Self::TransactionSuperblock => "transaction superblock",
+                Self::TransactionInode => "transaction inode",
+                Self::TransactionDirectory => "transaction directory",
+                Self::VersionedContent => "versioned file content",
+                Self::VersionedContentChunk => "versioned file content chunk",
+                Self::TransactionSnapshotCatalogEntry => "transaction snapshot catalog entry",
+                Self::TransactionExtentMap => "transaction extent map",
+            }
+        }
+
+        pub const fn from_manifest_role(role: TransactionManifestObjectRole) -> Self {
+            match role {
+                TransactionManifestObjectRole::TransactionSuperblock => Self::TransactionSuperblock,
+                TransactionManifestObjectRole::TransactionInode => Self::TransactionInode,
+                TransactionManifestObjectRole::TransactionDirectory => Self::TransactionDirectory,
+                TransactionManifestObjectRole::VersionedContent => Self::VersionedContent,
+                TransactionManifestObjectRole::VersionedContentChunk => Self::VersionedContentChunk,
+                TransactionManifestObjectRole::TransactionSnapshotCatalogEntry => {
+                    Self::TransactionSnapshotCatalogEntry
+                }
+                TransactionManifestObjectRole::TransactionExtentMap => Self::TransactionExtentMap,
+            }
+        }
+
+        pub const fn to_manifest_role(self) -> Option<TransactionManifestObjectRole> {
+            match self {
+                Self::TransactionManifest => None,
+                Self::TransactionSuperblock => {
+                    Some(TransactionManifestObjectRole::TransactionSuperblock)
+                }
+                Self::TransactionInode => Some(TransactionManifestObjectRole::TransactionInode),
+                Self::TransactionDirectory => {
+                    Some(TransactionManifestObjectRole::TransactionDirectory)
+                }
+                Self::VersionedContent => Some(TransactionManifestObjectRole::VersionedContent),
+                Self::VersionedContentChunk => {
+                    Some(TransactionManifestObjectRole::VersionedContentChunk)
+                }
+                Self::TransactionSnapshotCatalogEntry => {
+                    Some(TransactionManifestObjectRole::TransactionSnapshotCatalogEntry)
+                }
+                Self::TransactionExtentMap => {
+                    Some(TransactionManifestObjectRole::TransactionExtentMap)
+                }
+            }
         }
     }
 
-    pub const fn from_manifest_role(role: TransactionManifestObjectRole) -> Self {
-        match role {
-            TransactionManifestObjectRole::TransactionSuperblock => Self::TransactionSuperblock,
-            TransactionManifestObjectRole::TransactionInode => Self::TransactionInode,
-            TransactionManifestObjectRole::TransactionDirectory => Self::TransactionDirectory,
-            TransactionManifestObjectRole::VersionedContent => Self::VersionedContent,
-            TransactionManifestObjectRole::VersionedContentChunk => Self::VersionedContentChunk,
-            TransactionManifestObjectRole::TransactionSnapshotCatalogEntry => {
-                Self::TransactionSnapshotCatalogEntry
+    /// Decode error for object-role `TryFrom<u16>` — preserves the rejected raw tag.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum LocalFilesystemDecodeError {
+        UnknownObjectRole(u16),
+    }
+
+    impl TryFrom<u16> for ChangedRecordObjectRole {
+        type Error = LocalFilesystemDecodeError;
+
+        fn try_from(value: u16) -> std::result::Result<Self, Self::Error> {
+            match value {
+                1 => Ok(Self::TransactionManifest),
+                2 => Ok(Self::TransactionSuperblock),
+                3 => Ok(Self::TransactionInode),
+                4 => Ok(Self::TransactionDirectory),
+                5 => Ok(Self::VersionedContent),
+                6 => Ok(Self::VersionedContentChunk),
+                7 => Ok(Self::TransactionSnapshotCatalogEntry),
+                8 => Ok(Self::TransactionExtentMap),
+                _ => Err(LocalFilesystemDecodeError::UnknownObjectRole(value)),
             }
-            TransactionManifestObjectRole::TransactionExtentMap => Self::TransactionExtentMap,
         }
     }
 
-    pub const fn to_manifest_role(self) -> Option<TransactionManifestObjectRole> {
-        match self {
-            Self::TransactionManifest => None,
-            Self::TransactionSuperblock => {
-                Some(TransactionManifestObjectRole::TransactionSuperblock)
-            }
-            Self::TransactionInode => Some(TransactionManifestObjectRole::TransactionInode),
-            Self::TransactionDirectory => Some(TransactionManifestObjectRole::TransactionDirectory),
-            Self::VersionedContent => Some(TransactionManifestObjectRole::VersionedContent),
-            Self::VersionedContentChunk => {
-                Some(TransactionManifestObjectRole::VersionedContentChunk)
-            }
-            Self::TransactionSnapshotCatalogEntry => {
-                Some(TransactionManifestObjectRole::TransactionSnapshotCatalogEntry)
-            }
-            Self::TransactionExtentMap => Some(TransactionManifestObjectRole::TransactionExtentMap),
-        }
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ChangedObjectRecord {
+        pub role: ChangedRecordObjectRole,
+        pub object_key: ObjectKey,
+        pub checksum: IntegrityDigest64,
+        pub payload: Vec<u8>,
     }
-}
 
-/// Decode error for object-role `TryFrom<u16>` — preserves the rejected raw tag.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LocalFilesystemDecodeError {
-    UnknownObjectRole(u16),
-}
-
-impl TryFrom<u16> for ChangedRecordObjectRole {
-    type Error = LocalFilesystemDecodeError;
-
-    fn try_from(value: u16) -> std::result::Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::TransactionManifest),
-            2 => Ok(Self::TransactionSuperblock),
-            3 => Ok(Self::TransactionInode),
-            4 => Ok(Self::TransactionDirectory),
-            5 => Ok(Self::VersionedContent),
-            6 => Ok(Self::VersionedContentChunk),
-            7 => Ok(Self::TransactionSnapshotCatalogEntry),
-            8 => Ok(Self::TransactionExtentMap),
-            _ => Err(LocalFilesystemDecodeError::UnknownObjectRole(value)),
-        }
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ChangedRecordRoot {
+        pub source_root: CommittedRootSummary,
+        pub records: Vec<ChangedObjectRecord>,
     }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChangedObjectRecord {
-    pub role: ChangedRecordObjectRole,
-    pub object_key: ObjectKey,
-    pub checksum: IntegrityDigest64,
-    pub payload: Vec<u8>,
-}
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum ChangedRecordTransformContract {
+        /// Content payloads are explicit stored frames for a mounted filesystem
+        /// whose device-level transforms are disabled. Checksums cover the stored
+        /// frame bytes carried by each changed record.
+        StoredFrameNoDeviceTransforms,
+        /// Mounted device transforms are required. The stream carries a typed
+        /// refusal tuple, but not the persisted per-frame metadata needed for
+        /// replay. Receivers must fail closed until that replay metadata exists.
+        MountedDeviceTransformsRequireTypedMetadata,
+    }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChangedRecordRoot {
-    pub source_root: CommittedRootSummary,
-    pub records: Vec<ChangedObjectRecord>,
-}
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct ChangedRecordTypedTransformMetadata {
+        pub(crate) plaintext_identity: ChangedRecordPlaintextIdentity,
+        pub(crate) transform_frame_identity: ChangedRecordTransformFrameIdentity,
+        pub(crate) checksum_layer: ChangedRecordChecksumLayer,
+        pub(crate) stored_frame_contract: ChangedRecordStoredFrameContract,
+        pub(crate) refusal_state: ChangedRecordTransformRefusalState,
+    }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ChangedRecordTransformContract {
-    /// Content payloads are explicit stored frames for a mounted filesystem
-    /// whose device-level transforms are disabled. Checksums cover the stored
-    /// frame bytes carried by each changed record.
-    StoredFrameNoDeviceTransforms,
-    /// Mounted device transforms are required. The stream carries a typed
-    /// refusal tuple, but not the persisted per-frame metadata needed for
-    /// replay. Receivers must fail closed until that replay metadata exists.
-    MountedDeviceTransformsRequireTypedMetadata,
-}
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum ChangedRecordPlaintextIdentity {
+        StoredFrameBytesAreMountedPlaintext,
+        RequiresTypedMountedContentIdentity,
+    }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ChangedRecordTypedTransformMetadata {
-    pub(crate) plaintext_identity: ChangedRecordPlaintextIdentity,
-    pub(crate) transform_frame_identity: ChangedRecordTransformFrameIdentity,
-    pub(crate) checksum_layer: ChangedRecordChecksumLayer,
-    pub(crate) stored_frame_contract: ChangedRecordStoredFrameContract,
-    pub(crate) refusal_state: ChangedRecordTransformRefusalState,
-}
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum ChangedRecordTransformFrameIdentity {
+        NotApplicableNoDeviceTransforms,
+        MissingTypedCompressionEncryptionFrameIdentity,
+    }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ChangedRecordPlaintextIdentity {
-    StoredFrameBytesAreMountedPlaintext,
-    RequiresTypedMountedContentIdentity,
-}
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum ChangedRecordChecksumLayer {
+        StoredFrameBytes,
+        RequiresTypedMountedTransformChecksum,
+    }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ChangedRecordTransformFrameIdentity {
-    NotApplicableNoDeviceTransforms,
-    MissingTypedCompressionEncryptionFrameIdentity,
-}
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum ChangedRecordStoredFrameContract {
+        StoredFrameNoDeviceTransforms,
+        RawMediaBytesNotMountedContentAuthority,
+    }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ChangedRecordChecksumLayer {
-    StoredFrameBytes,
-    RequiresTypedMountedTransformChecksum,
-}
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum ChangedRecordTransformRefusalState {
+        ReplayReady,
+        MissingTypedTransformMetadata,
+    }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ChangedRecordStoredFrameContract {
-    StoredFrameNoDeviceTransforms,
-    RawMediaBytesNotMountedContentAuthority,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ChangedRecordTransformRefusalState {
-    ReplayReady,
-    MissingTypedTransformMetadata,
-}
-
-impl ChangedRecordTypedTransformMetadata {
-    pub(crate) const fn for_contract(contract: ChangedRecordTransformContract) -> Self {
-        match contract {
+    impl ChangedRecordTypedTransformMetadata {
+        pub(crate) const fn for_contract(contract: ChangedRecordTransformContract) -> Self {
+            match contract {
             ChangedRecordTransformContract::StoredFrameNoDeviceTransforms => Self {
                 plaintext_identity:
                     ChangedRecordPlaintextIdentity::StoredFrameBytesAreMountedPlaintext,
@@ -1575,109 +1591,113 @@ impl ChangedRecordTypedTransformMetadata {
                     ChangedRecordTransformRefusalState::MissingTypedTransformMetadata,
             },
         }
-    }
-}
-
-impl ChangedRecordTransformContract {
-    pub const fn as_u16(self) -> u16 {
-        match self {
-            Self::StoredFrameNoDeviceTransforms => 1,
-            Self::MountedDeviceTransformsRequireTypedMetadata => 2,
         }
     }
 
-    pub const fn requires_typed_metadata(self) -> bool {
-        matches!(self, Self::MountedDeviceTransformsRequireTypedMetadata)
+    impl ChangedRecordTransformContract {
+        pub const fn as_u16(self) -> u16 {
+            match self {
+                Self::StoredFrameNoDeviceTransforms => 1,
+                Self::MountedDeviceTransformsRequireTypedMetadata => 2,
+            }
+        }
+
+        pub const fn requires_typed_metadata(self) -> bool {
+            matches!(self, Self::MountedDeviceTransformsRequireTypedMetadata)
+        }
     }
-}
 
-impl TryFrom<u16> for ChangedRecordTransformContract {
-    type Error = FileSystemError;
+    impl TryFrom<u16> for ChangedRecordTransformContract {
+        type Error = FileSystemError;
 
-    fn try_from(value: u16) -> std::result::Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::StoredFrameNoDeviceTransforms),
-            2 => Ok(Self::MountedDeviceTransformsRequireTypedMetadata),
-            _ => Err(FileSystemError::Decode {
-                object: "local filesystem send/receive stream",
-                reason: "unsupported transform contract",
-            }),
+        fn try_from(value: u16) -> std::result::Result<Self, Self::Error> {
+            match value {
+                1 => Ok(Self::StoredFrameNoDeviceTransforms),
+                2 => Ok(Self::MountedDeviceTransformsRequireTypedMetadata),
+                _ => Err(FileSystemError::Decode {
+                    object: "local filesystem send/receive stream",
+                    reason: "unsupported transform contract",
+                }),
+            }
+        }
+    }
+
+    impl Default for ChangedRecordTransformContract {
+        fn default() -> Self {
+            Self::StoredFrameNoDeviceTransforms
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ChangedRecordExport {
+        pub spec: &'static str,
+        pub stream_version: u16,
+        pub current_root: CommittedRootSummary,
+        pub roots: Vec<ChangedRecordRoot>,
+        pub total_records: u64,
+        pub payload_bytes: u64,
+        pub production_fsck_required: bool,
+        /// Baseline root for incremental deltas; None for full exports.
+        pub from_root: Option<CommittedRootSummary>,
+        /// True when this export is an incremental delta.
+        pub incremental: bool,
+        /// Placement epoch at export time; None when placement is not tracked
+        /// (backward-compatible with existing callers).
+        pub placement_epoch: Option<u64>,
+        pub transform_contract: ChangedRecordTransformContract,
+    }
+
+    impl ChangedRecordExport {
+        pub fn encode(&self) -> Vec<u8> {
+            encode_changed_record_export(self)
+        }
+
+        pub fn decode(bytes: &[u8]) -> Result<Self> {
+            decode_changed_record_export(bytes)
+        }
+
+        /// VFSSEND1 changed-record exports carry no distributed sender authority.
+        ///
+        /// Distributed senders must use VFSSEND2 sender-authority evidence instead
+        /// of interpreting a changed-record stream as cross-pool authority.
+        pub const fn sender_authority(&self) -> SenderAuthorityEvidence {
+            SenderAuthorityEvidence::AbsentLocalOnly
+        }
+
+        pub const fn production_recovery_requires_operator_repair(&self) -> bool {
+            self.production_fsck_required
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ChangedRecordImportReport {
+        pub spec: &'static str,
+        pub target_root: PathBuf,
+        pub imported_roots: u64,
+        pub imported_records: u64,
+        pub imported_payload_bytes: u64,
+        pub selected_generation: u64,
+        pub selected_transaction_id: u64,
+        pub snapshot_catalog_entries: usize,
+        pub stream_version: u16,
+        pub staging_validated_before_publish: bool,
+        pub destination_root_reauthentication: bool,
+        pub production_fsck_required: bool,
+        /// Placement epoch from the decoded export; None when sender did not track it.
+        pub placement_epoch: Option<u64>,
+        /// Whether placement was verified stable during import.
+        pub placement_verified_stable: bool,
+    }
+
+    impl ChangedRecordImportReport {
+        pub const fn production_recovery_requires_operator_repair(&self) -> bool {
+            self.production_fsck_required
         }
     }
 }
 
-impl Default for ChangedRecordTransformContract {
-    fn default() -> Self {
-        Self::StoredFrameNoDeviceTransforms
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChangedRecordExport {
-    pub spec: &'static str,
-    pub stream_version: u16,
-    pub current_root: CommittedRootSummary,
-    pub roots: Vec<ChangedRecordRoot>,
-    pub total_records: u64,
-    pub payload_bytes: u64,
-    pub production_fsck_required: bool,
-    /// Baseline root for incremental deltas; None for full exports.
-    pub from_root: Option<CommittedRootSummary>,
-    /// True when this export is an incremental delta.
-    pub incremental: bool,
-    /// Placement epoch at export time; None when placement is not tracked
-    /// (backward-compatible with existing callers).
-    pub placement_epoch: Option<u64>,
-    pub transform_contract: ChangedRecordTransformContract,
-}
-
-impl ChangedRecordExport {
-    pub fn encode(&self) -> Vec<u8> {
-        encode_changed_record_export(self)
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        decode_changed_record_export(bytes)
-    }
-
-    /// VFSSEND1 changed-record exports carry no distributed sender authority.
-    ///
-    /// Distributed senders must use VFSSEND2 sender-authority evidence instead
-    /// of interpreting a changed-record stream as cross-pool authority.
-    pub const fn sender_authority(&self) -> SenderAuthorityEvidence {
-        SenderAuthorityEvidence::AbsentLocalOnly
-    }
-
-    pub const fn production_recovery_requires_operator_repair(&self) -> bool {
-        self.production_fsck_required
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChangedRecordImportReport {
-    pub spec: &'static str,
-    pub target_root: PathBuf,
-    pub imported_roots: u64,
-    pub imported_records: u64,
-    pub imported_payload_bytes: u64,
-    pub selected_generation: u64,
-    pub selected_transaction_id: u64,
-    pub snapshot_catalog_entries: usize,
-    pub stream_version: u16,
-    pub staging_validated_before_publish: bool,
-    pub destination_root_reauthentication: bool,
-    pub production_fsck_required: bool,
-    /// Placement epoch from the decoded export; None when sender did not track it.
-    pub placement_epoch: Option<u64>,
-    /// Whether placement was verified stable during import.
-    pub placement_verified_stable: bool,
-}
-
-impl ChangedRecordImportReport {
-    pub const fn production_recovery_requires_operator_repair(&self) -> bool {
-        self.production_fsck_required
-    }
-}
+#[cfg(feature = "replication-io")]
+pub use replication_types::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryAuditReport {
@@ -2229,6 +2249,7 @@ pub(crate) struct ContentCompressionPolicy {
 
 /// Tracks where the effective compression policy was resolved from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "data-policy")]
 pub enum CompressionPolicySource {
     /// Policy was set explicitly via dataset properties (compression.algorithm).
     PropertyOverride,
@@ -2244,6 +2265,7 @@ pub enum CompressionPolicySource {
 /// authority so callers can inspect the effective policy without depending on
 /// the mutable implementation type used by write encoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "data-policy")]
 pub struct EffectiveCompressionPolicyReport {
     /// Compression algorithm currently selected for content writes.
     pub algorithm: ContentCompressionAlgorithm,
@@ -2266,6 +2288,7 @@ impl Default for ContentCompressionPolicy {
 }
 
 impl ContentCompressionPolicy {
+    #[cfg(feature = "data-policy")]
     pub(crate) fn report(
         &self,
         source: CompressionPolicySource,
@@ -2286,6 +2309,7 @@ impl ContentCompressionPolicy {
         }
     }
 
+    #[cfg(feature = "data-policy")]
     pub(crate) fn zstd_default() -> Self {
         Self {
             algorithm: ContentCompressionAlgorithm::Zstd,
@@ -2294,6 +2318,7 @@ impl ContentCompressionPolicy {
         }
     }
 
+    #[cfg(feature = "data-policy")]
     pub(crate) fn lz4_default() -> Self {
         Self {
             algorithm: ContentCompressionAlgorithm::Lz4,
@@ -2306,8 +2331,8 @@ impl ContentCompressionPolicy {
     ///
     /// Returns `Err` with a static description if the level is outside the
     /// algorithm's valid range.  Used as a production guard in
-    /// [`encode_content_chunk`] so misconfigured policies fall back to
-    /// uncompressed storage rather than producing invalid data.
+    /// [`encode_content_chunk`] so misconfigured policies are refused rather
+    /// than silently changing the selected transform.
     pub(crate) fn validate(&self) -> std::result::Result<(), &'static str> {
         match self.algorithm {
             ContentCompressionAlgorithm::Zstd => {
@@ -2632,6 +2657,7 @@ impl ReclaimDrainStats {
 /// Rule 8 requires that every allocation be traceable back to a claim.
 /// This report surfaces the ledger state for operator visibility.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "policy-observation")]
 pub struct ClaimLedgerReport {
     pub spec: &'static str,
     pub total_blocks: u64,
@@ -2646,6 +2672,7 @@ pub struct ClaimLedgerReport {
     pub reverse_explain_label: String,
 }
 
+#[cfg(feature = "policy-observation")]
 impl ClaimLedgerReport {
     pub fn is_non_authoritative(&self) -> bool {
         self.spec == CLAIM_LEDGER_SPEC
@@ -2732,6 +2759,7 @@ impl ContentFingerprint {
         Self(bytes)
     }
 
+    #[cfg(feature = "data-policy")]
     pub(crate) fn from_dedup_hash(hash: tidefs_dedup::DedupHash) -> Self {
         Self(*hash.as_bytes32())
     }
@@ -2740,6 +2768,7 @@ impl ContentFingerprint {
         &self.0
     }
 
+    #[cfg(feature = "data-policy")]
     pub(crate) fn as_dedup_hash(&self) -> tidefs_dedup::DedupHash {
         tidefs_dedup::DedupHash::from(self.0)
     }

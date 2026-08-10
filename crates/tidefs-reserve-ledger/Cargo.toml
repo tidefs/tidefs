@@ -16,10 +16,17 @@ description = "Reserve ledger and budget domain runtime: named resource pools wi
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 blake3 = { version = "1", default-features = false }
-tidefs-claim-ledger = { workspace = true }
-tidefs-types-claim-ledger-core = { workspace = true }
+tidefs-claim-ledger = { workspace = true, optional = true }
+tidefs-types-claim-ledger-core = { workspace = true, optional = true }
+
+[features]
+default = []
+policy-observation = ["dep:tidefs-claim-ledger", "dep:tidefs-types-claim-ledger-core"]
+full = ["policy-observation"]
 
 [dev-dependencies]
+tidefs-claim-ledger = { workspace = true }
+tidefs-types-claim-ledger-core = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

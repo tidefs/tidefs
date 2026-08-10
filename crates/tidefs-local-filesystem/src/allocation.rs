@@ -1090,7 +1090,8 @@ mod tests {
             chunk_index,
             payload,
             &ContentCompressionPolicy::off(),
-        );
+        )
+        .expect("encode receipted chunk");
         let key = content_chunk_object_key_for_version(record.inode_id, data_version, chunk_index);
         let (_, receipt) = pool
             .put_with_receipt(DeviceIoClass::Data, key, &encoded)
@@ -1147,7 +1148,8 @@ mod tests {
             0,
             b"bytes",
             &ContentCompressionPolicy::off(),
-        );
+        )
+        .expect("encode receiptless chunk");
         pool.raw_primary_store_mut()
             .put(expected_key, &encoded)
             .expect("write receiptless raw chunk");
@@ -1170,7 +1172,8 @@ mod tests {
             0,
             b"bytes",
             &ContentCompressionPolicy::off(),
-        );
+        )
+        .expect("encode wrong-identity chunk");
         let wrong_key =
             content_chunk_object_key_for_version(record.inode_id, record.data_version, 1);
         let (_, receipt) = pool
@@ -1200,6 +1203,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "data-policy")]
     fn reclaim_receipt_chunk_validates_dedup_canonical_authority() {
         let mut pool = temp_pool("chunk-dedup");
         let payload = b"dedup replacement bytes";
@@ -1209,7 +1213,8 @@ mod tests {
             12,
             payload,
             &ContentCompressionPolicy::off(),
-        );
+        )
+        .expect("encode canonical chunk");
         let fingerprint = compute_content_fingerprint(payload);
         let canonical_key = content_dedup_object_key(&fingerprint);
         pool.put_with_receipt(DeviceIoClass::Data, canonical_key, &canonical_encoded)

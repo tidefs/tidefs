@@ -18,7 +18,7 @@ tidefs-transport = { workspace = true }
 tidefs-send-stream = { workspace = true }
 tidefs-replicated-object-store = { workspace = true }
 tidefs-local-object-store = { workspace = true }
-tidefs-local-filesystem = { workspace = true }
+tidefs-local-filesystem = { workspace = true, features = ["replication-io"] }
 tidefs-membership-live = { workspace = true }
 tidefs-membership-types = { workspace = true }
 tidefs-membership-epoch = { workspace = true }

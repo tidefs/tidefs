@@ -21,10 +21,16 @@ tidefs-commit_group = { workspace = true }
 tidefs-types-orphan-index-core = { workspace = true }
 tidefs-binary_schema-checksum = { workspace = true }
 tidefs-binary_schema-core = { workspace = true }
-tidefs-performance-contract = { workspace = true }
+tidefs-performance-contract = { workspace = true, optional = true }
 blake3 = { version = "1", default-features = false }
 
+[features]
+default = []
+policy-observation = ["dep:tidefs-performance-contract"]
+full = ["policy-observation"]
+
 [dev-dependencies]
+tidefs-performance-contract = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

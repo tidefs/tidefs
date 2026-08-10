@@ -14,8 +14,8 @@ description = "TideFS local filesystem: userspace product core pending kernel ex
 
 [dependencies]
 blake3 = "=1.5.5"
-zstd = { version = "0.13", default-features = false }
-lz4_flex = "0.11"
+zstd = { version = "0.13", default-features = false, optional = true }
+lz4_flex = { version = "0.11", optional = true }
 tidefs-dataset-feature-flags = { workspace = true }
 tidefs-extent-map = { workspace = true }
 tidefs-types-extent-map-core = { workspace = true }
@@ -23,7 +23,7 @@ tidefs-block-allocator = { workspace = true }
 tidefs-types-dataset-feature-flags-core = { workspace = true }
 tidefs-dataset-lifecycle = { workspace = true }
 tidefs-dataset-properties = { workspace = true }
-tidefs-dedup = { workspace = true }
+tidefs-dedup = { workspace = true, optional = true }
 tidefs-cache-core = { workspace = true }
 tidefs-types-cache-lattice-core = { workspace = true }
 tidefs-types-space-accounting-core = { workspace = true }
@@ -33,37 +33,36 @@ tidefs-durability-layout = { workspace = true }
 tidefs-types-vfs-core = { workspace = true, features = ["alloc"] }
 tidefs-vfs-engine = { workspace = true }
 tidefs-types-vfs-owned = { workspace = true }
-tidefs-types-claim-ledger-core = { workspace = true }
+tidefs-types-claim-ledger-core = { workspace = true, optional = true }
 tidefs-reserve-ledger = { workspace = true }
-tidefs-claim-ledger = { workspace = true }
-tidefs-erasure-coding = { workspace = true }
-tidefs-performance-contract = { workspace = true, features = ["alloc"] }
+tidefs-claim-ledger = { workspace = true, optional = true }
+tidefs-erasure-coding = { workspace = true, optional = true }
 tidefs-types-polymorphic-xattr-core = { workspace = true, features = ["alloc"] }
 tidefs-posix-acl = { workspace = true, features = ["alloc"] }
 tidefs-inode-attributes = { workspace = true }
 tidefs-commit_group = { workspace = true }
-tidefs-cleanup-engine = { workspace = true }
+tidefs-cleanup-engine = { workspace = true, optional = true }
 tidefs-intent-log = { workspace = true }
 tidefs-recovery-loop = { workspace = true }
-tidefs-send-stream = { workspace = true }
-tidefs-receive-stream = { workspace = true }
+tidefs-send-stream = { workspace = true, optional = true }
+tidefs-receive-stream = { workspace = true, optional = true }
 tidefs-storage-intent-core = { workspace = true }
-tidefs-storage-intent-read-serving = { workspace = true }
+tidefs-storage-intent-read-serving = { workspace = true, optional = true }
 
 tidefs-background-scheduler = { workspace = true }
-tidefs-compaction = { workspace = true }
-tidefs-replication-model = { workspace = true }
+tidefs-compaction = { workspace = true, optional = true }
+tidefs-replication-model = { workspace = true, optional = true }
 tidefs-scrub-core = { workspace = true }
 tidefs-reclaim-queue-core = { workspace = true }
 tidefs-types-reclaim-queue-core = { workspace = true }
-tidefs-online-defrag = { workspace = true }
-tidefs-types-incremental-job-core = { workspace = true }
+tidefs-online-defrag = { workspace = true, optional = true }
+tidefs-types-incremental-job-core = { workspace = true, optional = true }
 
 tidefs-orphan-index = { workspace = true }
 tidefs-types-orphan-index-core = { workspace = true }
 tidefs-posix-semantics = { workspace = true }
 
-tidefs-quorum-write-runtime = { workspace = true }
+tidefs-quorum-write-runtime = { workspace = true, optional = true }
 rand = "0.8"
 tidefs-types-pool-label-core = { workspace = true }
 tidefs-pool-scan = { workspace = true }
@@ -73,7 +72,42 @@ serde_json = { workspace = true }
 thiserror = "2"
 
 [features]
+default = []
 encryption = ["dep:tidefs-encryption"]
+replication-io = ["dep:tidefs-send-stream", "dep:tidefs-receive-stream"]
+quorum-write = ["dep:tidefs-quorum-write-runtime"]
+distributed-repair = [
+    "dep:tidefs-erasure-coding",
+    "dep:tidefs-replication-model",
+    "tidefs-local-object-store/distributed-repair",
+    "tidefs-recovery-loop/distributed-recovery",
+    "tidefs-reclaim-queue-core/distributed-repair",
+    "tidefs-scrub-core/distributed-repair",
+    "tidefs-pool-scan/distributed-repair",
+]
+policy-observation = [
+    "dep:tidefs-claim-ledger",
+    "dep:tidefs-storage-intent-read-serving",
+    "dep:tidefs-types-claim-ledger-core",
+    "tidefs-reserve-ledger/policy-observation",
+]
+data-policy = [
+    "dep:lz4_flex",
+    "dep:tidefs-cleanup-engine",
+    "dep:tidefs-compaction",
+    "dep:tidefs-dedup",
+    "dep:tidefs-online-defrag",
+    "dep:tidefs-types-incremental-job-core",
+    "dep:zstd",
+]
+full = [
+    "encryption",
+    "replication-io",
+    "quorum-write",
+    "distributed-repair",
+    "policy-observation",
+    "data-policy",
+]
 [lib]
 path = "src/lib.rs"
 
@@ -84,7 +118,44 @@ criterion = { workspace = true }
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
 tidefs-types-dataset-lifecycle-core = { workspace = true }
 tidefs-reclaim = { workspace = true }
+tidefs-erasure-coding = { workspace = true }
+tidefs-replication-model = { workspace = true }
 
 [[bench]]
 name = "filesystem"
 harness = false
+
+[[test]]
+name = "device_removal_integration"
+path = "tests/device_removal_integration.rs"
+required-features = ["distributed-repair"]
+
+[[test]]
+name = "read_path"
+path = "tests/read_path.rs"
+required-features = ["policy-observation"]
+
+[[test]]
+name = "changed_record_sender_authority"
+path = "tests/changed_record_sender_authority.rs"
+required-features = ["replication-io"]
+
+[[test]]
+name = "send_receive_incremental_vfssend2"
+path = "tests/send_receive_incremental_vfssend2.rs"
+required-features = ["replication-io"]
+
+[[test]]
+name = "dedup_policy_toggle"
+path = "tests/dedup_policy_toggle.rs"
+required-features = ["data-policy"]
+
+[[test]]
+name = "dedup_crash_reopen"
+path = "tests/dedup_crash_reopen.rs"
+required-features = ["data-policy"]
+
+[[test]]
+name = "dedup_retention_gc"
+path = "tests/dedup_retention_gc.rs"
+required-features = ["data-policy"]

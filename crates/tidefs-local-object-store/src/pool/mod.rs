@@ -26,7 +26,9 @@ use std::time::Duration;
 
 use rand;
 
+#[cfg(any(feature = "distributed-repair", test))]
 use tidefs_membership_epoch::{EpochId, MemberId};
+#[cfg(any(feature = "distributed-repair", test))]
 use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
 use tidefs_types_pool_label_core::{
     self as pool_label, features, DeviceClass as LabelDeviceClass, PoolLabelV1, PoolState,
@@ -53,6 +55,7 @@ use tidefs_block_allocator::{BlockAllocator, BlockId, TrimRequest};
 use tidefs_durability_layout::{
     DurabilityLayoutV1, DurabilityPolicy, FailureDomainLevel, FailureDomainV1,
 };
+#[cfg(any(feature = "distributed-repair", test))]
 use tidefs_erasure_coding::{
     encode_receipt_stripe, reconstruct_receipt_stripe, ErasureShard, ReceiptStripeError, ShardKind,
     StripeConfig,
@@ -135,6 +138,16 @@ impl PoolRedundancyPolicy {
         }
     }
 
+    fn ensure_available(self) -> Result<()> {
+        #[cfg(all(not(feature = "distributed-repair"), not(test)))]
+        if matches!(self, Self::Erasure { .. }) {
+            return Err(StoreError::InvalidOptions {
+                reason: "erasure pool operation requires the distributed-repair feature",
+            });
+        }
+        Ok(())
+    }
+
     fn layout(self) -> Result<DurabilityLayoutV1> {
         let policy = match self {
             Self::Replicated { copies } => {
@@ -182,6 +195,7 @@ impl PoolRedundancyPolicy {
     /// Project this local pool policy into the shared distributed receipt
     /// policy identity.
     #[must_use]
+    #[cfg(any(feature = "distributed-repair", test))]
     pub const fn to_receipt_redundancy_policy(self) -> ReceiptRedundancyPolicy {
         match self {
             Self::Replicated { copies } => ReceiptRedundancyPolicy::Replicated { copies },
@@ -359,6 +373,7 @@ impl ReplacementRemanenceTreatment {
 }
 
 /// Fail-closed replacement/rebuild evidence status for local pool state.
+#[cfg(any(feature = "distributed-repair", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplacementRebuildEvidenceStatus {
     pub old_member: MemberId,
@@ -604,12 +619,14 @@ impl PlacementReceipt {
 
     /// Project this local placement receipt into the shared distributed receipt
     /// reference using the object-store-level subject id.
+    #[cfg(any(feature = "distributed-repair", test))]
     pub fn shared_receipt_ref(&self) -> Result<PlacementReceiptRef> {
         self.shared_receipt_ref_for_subject(self.object_store_subject_id())
     }
 
     /// Project this local placement receipt into the shared distributed receipt
     /// reference with an explicit caller-supplied subject id.
+    #[cfg(any(feature = "distributed-repair", test))]
     pub fn shared_receipt_ref_for_subject(&self, object_id: u64) -> Result<PlacementReceiptRef> {
         let target_count =
             u16::try_from(self.targets.len()).map_err(|_| StoreError::InvalidOptions {
@@ -1884,6 +1901,7 @@ impl Pool {
         properties: PoolProperties,
         options: &StoreOptions,
     ) -> Result<Self> {
+        properties.redundancy_policy.ensure_available()?;
         if pool_config_has_label_authority(&config) {
             return Self::open(config, properties, options);
         }
@@ -2264,6 +2282,7 @@ impl Pool {
             }
             properties.redundancy_policy = recovered_redundancy_policy;
         }
+        properties.redundancy_policy.ensure_available()?;
 
         // -- Pool feature compatibility gate ----------------------------------------
         //
@@ -3024,6 +3043,7 @@ impl Pool {
 
     /// Return the latest local placement receipts projected into the shared
     /// distributed receipt reference model.
+    #[cfg(any(feature = "distributed-repair", test))]
     pub fn placement_receipt_refs(&self, class: IoClass) -> Result<Vec<PlacementReceiptRef>> {
         self.placement_receipts(class)?
             .into_iter()
@@ -3368,6 +3388,7 @@ impl Pool {
         }))
     }
 
+    #[cfg(any(feature = "distributed-repair", test))]
     fn put_erasure_with_receipt(
         &mut self,
         key: ObjectKey,
@@ -3467,6 +3488,19 @@ impl Pool {
             sequence: 0,
             len: payload.len() as u64,
             checksum: crate::store::checksum64(payload),
+        })
+    }
+
+    #[cfg(all(not(feature = "distributed-repair"), not(test)))]
+    fn put_erasure_with_receipt(
+        &mut self,
+        _key: ObjectKey,
+        _payload: &[u8],
+        _indices: &[usize],
+        _receipt: &mut PlacementReceipt,
+    ) -> Result<StoredObject> {
+        Err(StoreError::InvalidOptions {
+            reason: "erasure pool operation requires the distributed-repair feature",
         })
     }
 
@@ -4165,6 +4199,7 @@ impl Pool {
             .map(|read| read.payload))
     }
 
+    #[cfg(any(feature = "distributed-repair", test))]
     fn reconstruct_erasure_with_receipt(
         &self,
         receipt: &PlacementReceipt,
@@ -4274,6 +4309,16 @@ impl Pool {
             payload: reconstructed.payload,
             rebuilt_shard_indices,
         }))
+    }
+
+    #[cfg(all(not(feature = "distributed-repair"), not(test)))]
+    fn reconstruct_erasure_with_receipt(
+        &self,
+        _receipt: &PlacementReceipt,
+    ) -> Result<Option<ReconstructedErasureRead>> {
+        Err(StoreError::InvalidOptions {
+            reason: "erasure pool operation requires the distributed-repair feature",
+        })
     }
 
     /// Delete an object from every device that can hold this I/O class.
@@ -5403,6 +5448,7 @@ impl Pool {
     /// Durable marker replay can establish identity/state replayability, but
     /// old-device detach remains fail-closed until receipt-backed progress is
     /// complete and stable.
+    #[cfg(any(feature = "distributed-repair", test))]
     pub fn replacement_rebuild_evidence_status(&self) -> Option<ReplacementRebuildEvidenceStatus> {
         let replacement = self.replacement.as_ref();
         let live_state = replacement.map(|replacement| match &replacement.state {

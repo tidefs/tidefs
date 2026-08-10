@@ -13,9 +13,8 @@
 //! **Kernel-portable product-core types** (carried into Rust-for-Linux):
 //! - `LockType`, `LockRange`, `LockConflict`, `LockList`, `LockTracker`
 //!   owned by [`tidefs_types_vfs_core`].
-//! - `StorageAuthorityToken` owned by
-//!   [`tidefs_types_claim_ledger_core`] (replaces `ControlPlaneReceiptId`
-//!   in obligation/budget/claim records).
+//! - Policy-observation builds additionally use `StorageAuthorityToken` from
+//!   `tidefs_types_claim_ledger_core` in obligation/budget/claim records.
 //! - `InodeId`, `Errno`, `NodeKind`, `NodeFacets`, `LockSpec`, `StatFs`,
 //!   and other VFS boundary scalars from [`tidefs_types_vfs_core`].
 //!
@@ -82,7 +81,7 @@
 //! 4. receipt-bound dead-object drains free segments only after committed
 //!    clearance evidence authorizes the object ids.
 //!
-//! The scrub-to-repair scheduling chain:
+//! With `distributed-repair`, the scrub-to-repair scheduling chain is:
 //! 1. `BackgroundScrubber` periodically imports the mounted Pool topology
 //!    read-only, verifies its committed roots and content through current Pool
 //!    placement authority, and sets the shared `scrub_corruption_detected`
@@ -285,6 +284,7 @@ pub mod ack_receipt;
 pub mod admission;
 mod allocation;
 mod background_cleaner;
+#[cfg(feature = "data-policy")]
 pub mod background_compaction;
 mod background_orphan_reclamation;
 pub mod capacity_authority;
@@ -301,6 +301,7 @@ pub mod dirty_page_tracker;
 pub mod encoding;
 mod error;
 pub mod export;
+#[cfg(feature = "data-policy")]
 mod extent_map_store_adapter;
 mod fsck;
 pub mod fuse_fsync;
@@ -322,19 +323,25 @@ mod persistence;
 mod pool_label;
 pub mod posix_acl;
 mod quota;
+#[cfg(feature = "replication-io")]
 pub mod receive_merge_planner;
+#[cfg(feature = "replication-io")]
 pub mod receive_persistence;
 mod records;
 mod recovery;
 pub mod release_dispatch;
 mod repair;
 mod scrub;
+#[cfg(feature = "distributed-repair")]
 mod scrub_repair_integration;
+#[cfg(feature = "replication-io")]
 mod send_receive;
 mod snapshot;
 mod space_pressure;
+#[cfg(feature = "replication-io")]
 pub mod vfssend2_bridge;
 
+#[cfg(feature = "distributed-repair")]
 pub mod device_removal;
 #[cfg(feature = "encryption")]
 pub mod encrypted_fs;
@@ -373,6 +380,7 @@ use tidefs_background_scheduler::{
     TickReport,
 };
 use tidefs_block_allocator::TrimRequest;
+#[cfg(feature = "policy-observation")]
 use tidefs_claim_ledger::{ClaimClass, ClaimEntryRecord, ClaimantRef};
 use tidefs_commit_group::{
     CommitGroupId, CommitGroupRecovery, CommitGroupSync, RootPointer, SyncGate,
@@ -391,24 +399,27 @@ use tidefs_local_object_store::{
     PoolRedundancyPolicy, StoreEncryptionKey, StoreError, StoreOptions, SuspectLogStats,
     DEFAULT_MAX_SEGMENT_BYTES, RECORD_OVERHEAD_BYTES,
 };
-use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex, OrphanIndexAdmissionError};
-use tidefs_performance_contract::AdmissionPermit;
+use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex};
+#[cfg(feature = "quorum-write")]
 use tidefs_quorum_write_runtime::{QuorumConfig, QuorumObjectStore};
+#[cfg(feature = "policy-observation")]
 use tidefs_reserve_ledger::{BudgetDomain, ReserveClass};
 use tidefs_space_accounting::{
     DatasetQuotaHierarchy, SpaceAccounting, SpaceDomainRegistry, StatfsResult,
 };
+#[cfg(feature = "policy-observation")]
 use tidefs_storage_intent_core::{
-    StorageIntentDomainId, StorageIntentEvidenceId, StorageIntentGuaranteeClass,
-    StorageIntentObjectScope, StorageIntentRefusalReason,
+    StorageIntentDomainId, StorageIntentEvidenceId, StorageIntentObjectScope,
 };
+use tidefs_storage_intent_core::{StorageIntentGuaranteeClass, StorageIntentRefusalReason};
+#[cfg(feature = "policy-observation")]
 use tidefs_storage_intent_read_serving::{
     read_serving_decide, ReadServingDecisionInput, ReadServingDecisionRecord,
     ReadServingDecisionState, StorageIntentReadSourceClass,
 };
-use tidefs_types_claim_ledger_core::StorageAuthorityToken;
+#[cfg(feature = "policy-observation")]
 use tidefs_types_claim_ledger_core::{
-    BudgetDomainId, ClaimEntry, ClaimId, ClaimReason, ObligationLedger,
+    BudgetDomainId, ClaimEntry, ClaimId, ClaimReason, ObligationLedger, StorageAuthorityToken,
 };
 use tidefs_types_space_accounting_core::{
     DatasetSpaceCountersV1, DatasetSpaceUsage, PoolPhysicalCountersV1, SpaceDelta, SpaceDomainId,
@@ -421,10 +432,13 @@ use tidefs_types_vfs_core::{
 use tidefs_types_vfs_core::{LockConflict, LockRange, LockTracker, LockType};
 
 use background_orphan_reclamation::BackgroundOrphanReclamation;
+#[cfg(feature = "data-policy")]
 use extent_map_store_adapter::FilesystemExtentMapStore;
+#[cfg(feature = "data-policy")]
 use tidefs_online_defrag::{DefragStats, OnlineDefragService};
 use tidefs_reclaim_queue_core::BPlusTreeReclaimQueue;
 pub use tidefs_recovery_loop::RecoveryPolicy;
+#[cfg(feature = "data-policy")]
 use tidefs_types_incremental_job_core::JobId;
 use tidefs_types_reclaim_queue_core::ObjectKey as ReclaimObjectKey;
 use tidefs_types_reclaim_queue_core::QueueFamily as ReclaimQueueFamily;
@@ -465,11 +479,13 @@ fn map_feature_flags_load_error(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "policy-observation")]
 pub struct ReadServingRuntimeRead {
     pub decision: ReadServingDecisionRecord,
     pub bytes: Option<Vec<u8>>,
 }
 
+#[cfg(feature = "policy-observation")]
 impl ReadServingRuntimeRead {
     #[must_use]
     pub fn served_bytes(&self) -> Option<&[u8]> {
@@ -488,17 +504,22 @@ impl ReadServingRuntimeRead {
 }
 
 pub use crate::constants::*;
+#[cfg(feature = "data-policy")]
 pub use crate::dedup::DedupStats;
 pub use crate::error::*;
 pub use crate::fsck::{FsckCategory, FsckFinding, FsckReport, FsckSeverity};
 use crate::orphan_cleanup::OrphanCleanupStats;
 pub use crate::records::SnapshotKind;
 pub use crate::snapshot::{
-    BookmarkSummary, CloneSummary, HoldInfo, PromoteReport, SnapshotDeletionDeadlistDeferral,
-    SnapshotDeletionDeferral, SnapshotDescriptor, SnapshotMutationApplyReport,
+    BookmarkSummary, CloneSummary, HoldInfo, PromoteReport, SnapshotDescriptor,
     SnapshotRetentionPolicy, SnapshotRetentionReport,
 };
+#[cfg(feature = "replication-io")]
+pub use crate::snapshot::{
+    SnapshotDeletionDeadlistDeferral, SnapshotDeletionDeferral, SnapshotMutationApplyReport,
+};
 pub use crate::types::*;
+#[cfg(feature = "data-policy")]
 use tidefs_cleanup_engine::{CleanupEngine, JobExecutor};
 
 use crate::allocation::*;
@@ -512,7 +533,7 @@ pub(crate) use crate::inode_authority::DatasetInodeAuthority;
 use crate::inode_cache::*;
 // Intent-log sync write latency module (types used via glob re-export)
 // Intent-log sync write latency module (re-exported for future use)
-use crate::admission::LocalWriteAdmission;
+use crate::admission::{LocalAdmissionPermit, LocalWriteAdmission};
 use crate::background_cleaner::{BackgroundCleaner, BackgroundCleanerConfig};
 use crate::capacity_authority::{
     CapacityAuthority, CapacityAuthoritySnapshot, CapacityReservationHandle, CapacityStatfs,
@@ -532,14 +553,18 @@ pub(crate) use crate::persistence::*;
 pub(crate) use crate::quota::*;
 use crate::records::*;
 pub(crate) use crate::recovery::*;
+#[cfg(feature = "distributed-repair")]
 use crate::repair::{RepairLog, RepairOutcome};
+#[cfg(feature = "replication-io")]
 pub(crate) use crate::send_receive::*;
 
 // Public fuzz-target entrypoints (not part of the product API).
 #[doc(hidden)]
 pub use crate::intent_log::fuzz_decode_intent_log_entry;
 #[doc(hidden)]
+#[cfg(feature = "replication-io")]
 pub use crate::send_receive::fuzz_decode_receive_checkpoint;
+#[cfg(feature = "replication-io")]
 pub use crate::send_receive::verify_placement_stable;
 #[cfg(test)]
 pub fn default_root_authentication_key() -> Result<RootAuthenticationKey> {
@@ -749,6 +774,7 @@ struct MutationDelta {
     old_quota_table: QuotaTable,
     old_space_accounting: SpaceAccounting,
     old_capacity_authority: CapacityAuthoritySnapshot,
+    #[cfg(feature = "policy-observation")]
     old_obligation_ledger: Box<ObligationLedger>,
     old_dirty_pages: BTreeMap<InodeId, Vec<DirtyRange>>,
     old_extent_allocator: ExtentAllocator,
@@ -885,6 +911,48 @@ impl FileSystemState {
     }
 }
 
+pub(crate) fn is_data_policy_feature(
+    feature: &tidefs_types_dataset_feature_flags_core::FeatureName,
+) -> bool {
+    use tidefs_types_dataset_feature_flags_core::{
+        FEATURE_COMPRESSION_LZ4, FEATURE_COMPRESSION_ZSTD,
+    };
+
+    feature.as_str() == FEATURE_COMPRESSION_LZ4
+        || feature.as_str() == FEATURE_COMPRESSION_ZSTD
+        || feature.as_str() == "org.tidefs:dedup"
+}
+
+pub(crate) fn feature_available_in_current_build(
+    feature: &tidefs_types_dataset_feature_flags_core::FeatureName,
+) -> bool {
+    !is_data_policy_feature(feature) || cfg!(feature = "data-policy")
+}
+
+#[cfg(not(feature = "data-policy"))]
+fn feature_flags_select_data_policy(feature_flags: &FeatureFlags) -> bool {
+    feature_flags
+        .all_features()
+        .into_iter()
+        .any(|(_class, feature, _value)| is_data_policy_feature(&feature))
+}
+
+#[cfg(not(feature = "data-policy"))]
+fn properties_select_compression(props: &PropertySet) -> bool {
+    use tidefs_dataset_properties::{PropertyKey, PropertySource, PropertyValue};
+
+    let Some(entry) = props.get(&PropertyKey::new("compression.algorithm")) else {
+        return false;
+    };
+    if !matches!(entry.source, PropertySource::Local) {
+        return false;
+    }
+    !matches!(
+        &entry.value,
+        PropertyValue::String(value) if matches!(value.as_str(), "off" | "none")
+    )
+}
+
 /// Resolve content compression policy from dataset feature flags.
 ///
 /// Priority: lz4 > zstd > off. Only one algorithm is active at a time;
@@ -892,42 +960,58 @@ impl FileSystemState {
 /// This is the single live compression authority for the mounted filesystem.
 /// Resolve compression policy from the dataset property `compression.algorithm`.
 ///
-/// Returns `None` if the property is not locally set; callers should fall
-/// back to feature flags or default.
+/// Returns `Ok(None)` if the property is not locally set; callers should fall
+/// back to feature flags or default. A locally set value must name a supported
+/// algorithm and is rejected rather than silently reinterpreted.
+#[cfg(feature = "data-policy")]
 fn resolve_compression_policy_from_properties(
     props: &PropertySet,
-) -> Option<(ContentCompressionPolicy, CompressionPolicySource)> {
+) -> Result<Option<(ContentCompressionPolicy, CompressionPolicySource)>> {
     use tidefs_dataset_properties::PropertyKey;
     let key = PropertyKey::new("compression.algorithm");
-    let entry = props.get(&key)?;
+    let Some(entry) = props.get(&key) else {
+        return Ok(None);
+    };
     // Only use the property if it was explicitly set (Local).
     if !matches!(
         entry.source,
         tidefs_dataset_properties::PropertySource::Local
     ) {
-        return None;
+        return Ok(None);
     }
     let algo = match &entry.value {
         tidefs_dataset_properties::PropertyValue::String(s) => s.as_str(),
-        _ => return None,
+        _ => {
+            return Err(FileSystemError::Unsupported {
+                operation: "resolve mounted compression policy",
+                reason: "persisted local compression.algorithm must be a string naming off, none, lz4, zstd, or zstd-3",
+            });
+        }
     };
-    match algo {
-        "zstd" | "zstd-3" => Some((
+    let resolved = match algo {
+        "zstd" | "zstd-3" => (
             ContentCompressionPolicy::zstd_default(),
             CompressionPolicySource::PropertyOverride,
-        )),
-        "lz4" => Some((
+        ),
+        "lz4" => (
             ContentCompressionPolicy::lz4_default(),
             CompressionPolicySource::PropertyOverride,
-        )),
-        "off" | "none" => Some((
+        ),
+        "off" | "none" => (
             ContentCompressionPolicy::off(),
             CompressionPolicySource::PropertyOverride,
-        )),
-        _ => None, // Unknown algorithm: fall through to feature flags/default.
-    }
+        ),
+        _ => {
+            return Err(FileSystemError::Unsupported {
+                operation: "resolve mounted compression policy",
+                reason: "persisted local compression.algorithm names an unsupported algorithm; expected off, none, lz4, zstd, or zstd-3",
+            });
+        }
+    };
+    Ok(Some(resolved))
 }
 
+#[cfg(feature = "data-policy")]
 fn resolve_compression_policy(feature_flags: &FeatureFlags) -> ContentCompressionPolicy {
     use tidefs_types_dataset_feature_flags_core::{
         FEATURE_COMPRESSION_LZ4, FEATURE_COMPRESSION_ZSTD,
@@ -945,7 +1029,7 @@ fn resolve_compression_policy(feature_flags: &FeatureFlags) -> ContentCompressio
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "data-policy"))]
 mod resolve_compression_policy_tests {
     use super::*;
     use tidefs_types_dataset_feature_flags_core::{
@@ -1106,7 +1190,7 @@ mod resolve_compression_policy_tests {
             tidefs_dataset_properties::PropertyKey::new("compression.algorithm"),
             tidefs_dataset_properties::PropertyValue::String("zstd".into()),
         );
-        let result = resolve_compression_policy_from_properties(&props);
+        let result = resolve_compression_policy_from_properties(&props).unwrap();
         assert!(result.is_some());
         let (policy, source) = result.unwrap();
         assert_eq!(policy.algorithm, ContentCompressionAlgorithm::Zstd);
@@ -1120,7 +1204,7 @@ mod resolve_compression_policy_tests {
             tidefs_dataset_properties::PropertyKey::new("compression.algorithm"),
             tidefs_dataset_properties::PropertyValue::String("lz4".into()),
         );
-        let result = resolve_compression_policy_from_properties(&props);
+        let result = resolve_compression_policy_from_properties(&props).unwrap();
         assert!(result.is_some());
         let (policy, source) = result.unwrap();
         assert_eq!(policy.algorithm, ContentCompressionAlgorithm::Lz4);
@@ -1134,7 +1218,7 @@ mod resolve_compression_policy_tests {
             tidefs_dataset_properties::PropertyKey::new("compression.algorithm"),
             tidefs_dataset_properties::PropertyValue::String("off".into()),
         );
-        let result = resolve_compression_policy_from_properties(&props);
+        let result = resolve_compression_policy_from_properties(&props).unwrap();
         assert!(result.is_some());
         let (policy, source) = result.unwrap();
         assert_eq!(policy.algorithm, ContentCompressionAlgorithm::None);
@@ -1144,22 +1228,20 @@ mod resolve_compression_policy_tests {
     #[test]
     fn property_not_set_returns_none() {
         let props = PropertySet::new();
-        let result = resolve_compression_policy_from_properties(&props);
+        let result = resolve_compression_policy_from_properties(&props).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn property_unknown_algorithm_returns_none() {
+    fn property_unknown_algorithm_is_rejected() {
         let mut props = PropertySet::new();
         props.set_local(
             tidefs_dataset_properties::PropertyKey::new("compression.algorithm"),
             tidefs_dataset_properties::PropertyValue::String("bzip2".into()),
         );
-        let result = resolve_compression_policy_from_properties(&props);
-        assert!(
-            result.is_none(),
-            "unknown algorithm should fall through to feature flags"
-        );
+        let err = resolve_compression_policy_from_properties(&props).unwrap_err();
+        assert!(matches!(err, FileSystemError::Unsupported { .. }));
+        assert!(err.to_string().contains("unsupported algorithm"));
     }
 
     #[test]
@@ -1174,7 +1256,7 @@ mod resolve_compression_policy_tests {
         );
         // Inherited values should not be treated as property overrides;
         // the child must explicitly set the property to override.
-        let result = resolve_compression_policy_from_properties(&props);
+        let result = resolve_compression_policy_from_properties(&props).unwrap();
         assert!(result.is_none());
     }
 }
@@ -1721,6 +1803,7 @@ pub struct FsyncStatsSnapshot {
 #[derive(Debug)]
 pub struct LocalFileSystem {
     store: Pool,
+    #[cfg(feature = "quorum-write")]
     quorum_store: Option<QuorumObjectStore>,
     state: FileSystemState,
     allocator_policy: LocalStorageAllocatorPolicy,
@@ -1744,12 +1827,12 @@ pub struct LocalFileSystem {
     mutation_recorded_commit_group_write: bool,
     domain_registry: SpaceDomainRegistry,
     /// Runtime write-admission state with hard dirty-byte/op/age caps.
-    /// Every dirty producer must acquire an [`AdmissionPermit`] before
+    /// Every dirty producer must acquire a [`LocalAdmissionPermit`] before
     /// work enters any tracked queue or buffer.
     write_admission: LocalWriteAdmission,
     /// Outstanding admission permits for dirty writes not yet committed.
     /// Released en masse when dirty_set is cleared after a successful SYNC.
-    pending_permits: Vec<AdmissionPermit>,
+    pending_permits: Vec<LocalAdmissionPermit>,
     /// Centralised dirty-state tracker for the writeback layer (§4 of #1190).
     /// Accounts data bytes, metadata ops, inode/dir dirty sets, and catalog
     /// dirty flag.  Read by commit_group auto-sync triggers; cleared on successful SYNC.
@@ -1764,7 +1847,9 @@ pub struct LocalFileSystem {
     /// drained by the TxgCoordinator during two-phase commit.
     intent_log_buffer: Option<std::sync::Arc<tidefs_intent_log::IntentLogBuffer>>,
     commit_group: CommitGroupStateMachine,
+    #[cfg(feature = "policy-observation")]
     obligation_ledger: Box<ObligationLedger>,
+    #[cfg(feature = "policy-observation")]
     budget_domain: BudgetDomain,
     auto_compaction_waste_threshold: f64,
     space_pressure: SpacePressure,
@@ -1773,12 +1858,15 @@ pub struct LocalFileSystem {
     /// Shared extent maps for background defrag service. This is the
     /// same [`Arc`] held by [`FileSystemState::extent_maps`], so defrag
     /// results are committed directly to the canonical extent maps.
+    #[cfg(feature = "data-policy")]
     extent_maps_shared: Option<Arc<Mutex<BTreeMap<InodeId, tidefs_extent_map::ExtentMap>>>>,
     /// Shared statistics published by the online defrag job after each tick.
+    #[cfg(feature = "data-policy")]
     online_defrag_stats: Option<Arc<Mutex<DefragStats>>>,
     feature_flags: FeatureFlags,
     content_compression_policy: ContentCompressionPolicy,
     /// Tracks where the effective compression policy was resolved from.
+    #[cfg(feature = "data-policy")]
     compression_policy_source: CompressionPolicySource,
     lifecycle: DatasetLifecycle,
     /// Pool-store-backed dataset catalog mapping hierarchical paths to stable
@@ -1792,6 +1880,7 @@ pub struct LocalFileSystem {
     /// Populated by `schedule_scrub_repairs()` with receipt-gated repair
     /// admission state. Consumed by `dispatch_scheduled_repairs()` to apply
     /// admitted repairs in priority order when receipt evidence is present.
+    #[cfg(feature = "distributed-repair")]
     scrub_repair_schedule: Option<crate::scrub_repair_integration::ScrubRepairSchedule>,
     /// Shared flag set by the background scrubber when corruption is detected
     /// on-disk.  Consumed by [`tick_background_services`] Duty 3 to trigger
@@ -1816,7 +1905,7 @@ pub struct LocalFileSystem {
     dataset_mount_id: u64,
     pool_uuid: u64,
     /// tidefs-queue-root: local_fs.write_buffers
-    /// admission: AdmissionPermit  service_curve: ServiceCurve
+    /// admission: LocalAdmissionPermit  service_curve: filesystem-owned bounded work
     write_buffers: BTreeMap<InodeId, WriteBuffer>,
     write_buffer_config: WriteBufferConfig,
     fsync_stats: FsyncStats,
@@ -1847,6 +1936,7 @@ pub struct LocalFileSystem {
     /// Built from the dataset catalog by the caller and used by
     /// statfs/ENOSPC to walk the ancestor chain.
     quota_parent_map: HashMap<[u8; 16], [u8; 16]>,
+    #[cfg(feature = "data-policy")]
     cleanup_engine: Option<CleanupEngine<Box<dyn JobExecutor + Send>>>,
     /// Current placement epoch for send/receive stream attribution.
     placement_epoch: Option<u64>,
@@ -2616,6 +2706,7 @@ impl LocalFileSystem {
 
     /// Attach a deferred cleanup engine for post-commit orphan drain
     /// and block reclamation.
+    #[cfg(feature = "data-policy")]
     pub fn with_cleanup_engine(
         mut self,
         engine: CleanupEngine<Box<dyn JobExecutor + Send>>,
@@ -2701,6 +2792,13 @@ impl LocalFileSystem {
     /// Persist the pool properties to the pool store after mutation.
     pub fn persist_pool_properties(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("persist pool properties")?;
+        #[cfg(not(feature = "data-policy"))]
+        if properties_select_compression(&self.pool_properties) {
+            return Err(FileSystemError::Unsupported {
+                operation: "persist mounted compression policy",
+                reason: "compression properties require the data-policy feature",
+            });
+        }
         self.store.put(
             DeviceIoClass::Data,
             pool_properties_object_key(),
@@ -2718,6 +2816,13 @@ impl LocalFileSystem {
     /// object in a single durable batch.
     pub fn persist_feature_flags(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("persist dataset feature flags")?;
+        #[cfg(not(feature = "data-policy"))]
+        if feature_flags_select_data_policy(&self.feature_flags) {
+            return Err(FileSystemError::Unsupported {
+                operation: "persist mounted data-policy feature flags",
+                reason: "compression and dedup feature flags require the data-policy feature",
+            });
+        }
         // Write per-class feature B-trees into the pool store.
         let roots = self.feature_flags.persist(&mut self.store)?;
         // Write the roots pointer object so remount can locate the B-trees.
@@ -2737,10 +2842,11 @@ impl LocalFileSystem {
     /// Callers that mutate feature flags via [`feature_flags_mut`] on a
     /// live (already-mounted) filesystem should call this after
     /// [`persist_feature_flags`] so that new writes use the updated
+    #[cfg(feature = "data-policy")]
     pub fn refresh_policies_from_features(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("refresh mounted feature policies")?;
         // Try dataset-property-based compression first, then feature flags.
-        let (policy, source) = self.resolve_effective_compression_policy();
+        let (policy, source) = self.resolve_effective_compression_policy()?;
         self.content_compression_policy = policy;
         self.compression_policy_source = source;
         self.state.content_compression_policy = self.content_compression_policy.clone();
@@ -2755,14 +2861,15 @@ impl LocalFileSystem {
 
     /// Resolve the effective compression policy, preferring dataset properties
     /// over feature flags and returning the source of the resolution.
+    #[cfg(feature = "data-policy")]
     fn resolve_effective_compression_policy(
         &self,
-    ) -> (ContentCompressionPolicy, CompressionPolicySource) {
+    ) -> Result<(ContentCompressionPolicy, CompressionPolicySource)> {
         // Check pool properties first (pool-scoped compression override).
         if let Some((policy, source)) =
-            resolve_compression_policy_from_properties(&self.pool_properties)
+            resolve_compression_policy_from_properties(&self.pool_properties)?
         {
-            return (policy, source);
+            return Ok((policy, source));
         }
         // Fall back to feature flags.
         let policy = resolve_compression_policy(&self.feature_flags);
@@ -2771,7 +2878,7 @@ impl LocalFileSystem {
         } else {
             CompressionPolicySource::FeatureFlag
         };
-        (policy, source)
+        Ok((policy, source))
     }
 
     /// Return the effective content compression policy and its resolution source.
@@ -2780,6 +2887,7 @@ impl LocalFileSystem {
     /// compression algorithm is currently active and whether it was set
     /// via a typed property, feature flag, or the default.
     #[must_use]
+    #[cfg(feature = "data-policy")]
     pub fn effective_compression_policy_report(&self) -> EffectiveCompressionPolicyReport {
         self.content_compression_policy
             .report(self.compression_policy_source)
@@ -2803,11 +2911,13 @@ impl LocalFileSystem {
     }
 
     /// Whether content-addressed chunk dedup is active for this filesystem.
+    #[cfg(feature = "data-policy")]
     pub fn is_dedup_enabled(&self) -> bool {
         self.dedup_enabled
     }
 
     /// Enable or disable content-addressed chunk dedup.
+    #[cfg(feature = "data-policy")]
     pub fn set_dedup_enabled(&mut self, enabled: bool) -> Result<()> {
         self.ensure_mutation_allowed("set mounted dedup policy")?;
         self.dedup_enabled = enabled;
@@ -2815,6 +2925,7 @@ impl LocalFileSystem {
     }
 
     /// Return a snapshot of the current session dedup statistics.
+    #[cfg(feature = "data-policy")]
     pub fn dedup_stats(&self) -> crate::dedup::DedupStats {
         self.dedup_index.borrow().stats()
     }
@@ -3869,11 +3980,14 @@ impl LocalFileSystem {
         // We clone the Arc (reference-count bump), not the map, so the
         // defrag adapter modifies the same in-memory extent maps that the
         // filesystem uses.
+        #[cfg(feature = "data-policy")]
         let extent_maps_shared = Arc::clone(&state.extent_maps);
+        #[cfg(feature = "data-policy")]
         let online_defrag_stats = Arc::new(Mutex::new(DefragStats::default()));
 
         let mut fs = Self {
             store,
+            #[cfg(feature = "quorum-write")]
             quorum_store: None,
             state,
             allocator_policy,
@@ -3892,7 +4006,7 @@ impl LocalFileSystem {
             mutation_recorded_commit_group_write: false,
             domain_registry: SpaceDomainRegistry::new(),
             state_before_transaction: None,
-            write_admission: LocalWriteAdmission::new(Default::default()),
+            write_admission: LocalWriteAdmission::new(Default::default())?,
             pending_permits: Vec::new(),
             dirty_set: DirtySet::default(),
             intent_log,
@@ -3902,9 +4016,11 @@ impl LocalFileSystem {
                 CommitGroupConfig::default(),
                 TxnGroupId(generation),
             ),
+            #[cfg(feature = "policy-observation")]
             obligation_ledger: Box::new(ObligationLedger::new(
                 allocator_policy.content_capacity_bytes / content_chunk_size() as u64,
             )),
+            #[cfg(feature = "policy-observation")]
             budget_domain: BudgetDomain::new(
                 BudgetDomainId::from_str("default"),
                 "default".into(),
@@ -3920,13 +4036,17 @@ impl LocalFileSystem {
             lifecycle,
             dataset_catalog,
             pool_properties,
+            #[cfg(feature = "data-policy")]
             compression_policy_source: CompressionPolicySource::Default,
             feature_flags: FeatureFlags::new(),
             content_compression_policy: ContentCompressionPolicy::default(),
             pending_orphan_deletions: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(feature = "data-policy")]
             extent_maps_shared: Some(extent_maps_shared), // Arc::clone of state.extent_maps
+            #[cfg(feature = "data-policy")]
             online_defrag_stats: Some(Arc::clone(&online_defrag_stats)),
             background_scheduler: None,
+            #[cfg(feature = "distributed-repair")]
             scrub_repair_schedule: None,
             scrub_corruption_detected: None,
             reclaim_queue: Arc::new(Mutex::new(BPlusTreeReclaimQueue::new())),
@@ -3953,6 +4073,7 @@ impl LocalFileSystem {
             quota_hierarchy: None,
             quota_parent_map: HashMap::new(),
             placement_epoch: None,
+            #[cfg(feature = "data-policy")]
             cleanup_engine: None,
         };
 
@@ -4022,6 +4143,7 @@ impl LocalFileSystem {
             // Online extent-map defragmentation runs at BestEffort priority
             // (mapped from JobKind::Defrag). It never starves critical,
             // latency-sensitive, or throughput-priority lanes.
+            #[cfg(feature = "data-policy")]
             if let Some(ref em_shared) = fs.extent_maps_shared {
                 let defrag_store = FilesystemExtentMapStore::new(Arc::clone(em_shared));
                 let defrag_svc = OnlineDefragService::new(
@@ -4114,16 +4236,32 @@ impl LocalFileSystem {
             tidefs_dataset_feature_flags::MountCheckResult::ReadWrite => {}
         }
 
-        // Derive content compression policy from enabled dataset feature flags.
-        // Priority: lz4 > zstd > off.  Only one algorithm is active at a time;
-        // the policy governs all mounted-filesystem content writes.
-        let (policy, source) = fs.resolve_effective_compression_policy();
-        fs.content_compression_policy = policy;
-        fs.compression_policy_source = source;
-        fs.state.content_compression_policy = fs.content_compression_policy.clone();
-
-        // Resolve per-dataset dedup policy from persisted feature flags.
+        #[cfg(not(feature = "data-policy"))]
         {
+            if feature_flags_select_data_policy(&fs.feature_flags) {
+                return Err(FileSystemError::Unsupported {
+                    operation: "mount filesystem with persisted data-policy feature flags",
+                    reason: "compression and dedup feature flags require the data-policy feature",
+                });
+            }
+            if properties_select_compression(&fs.pool_properties) {
+                return Err(FileSystemError::Unsupported {
+                    operation: "mount filesystem with persisted compression policy",
+                    reason: "compression properties require the data-policy feature",
+                });
+            }
+        }
+
+        #[cfg(feature = "data-policy")]
+        {
+            // Priority: lz4 > zstd > off. Only one algorithm is active at a
+            // time and governs mounted-filesystem content writes.
+            let (policy, source) = fs.resolve_effective_compression_policy()?;
+            fs.content_compression_policy = policy;
+            fs.compression_policy_source = source;
+            fs.state.content_compression_policy = fs.content_compression_policy.clone();
+
+            // Resolve per-dataset dedup policy from persisted feature flags.
             let dedup_name =
                 tidefs_types_dataset_feature_flags_core::FeatureName::from_str("org.tidefs:dedup")
                     .expect("org.tidefs:dedup is a valid FeatureName");
@@ -4210,6 +4348,7 @@ impl LocalFileSystem {
     /// When the quorum store fails to open (e.g., insufficient replicas),
     /// the filesystem still opens in single-store mode with `quorum_store`
     /// set to `None`.
+    #[cfg(feature = "quorum-write")]
     pub fn open_with_quorum(
         root: impl AsRef<Path>,
         options: StoreOptions,
@@ -4555,12 +4694,6 @@ impl LocalFileSystem {
         self.reclaim_queue.lock().unwrap().insert(entry);
     }
 
-    fn orphan_index_admission_error(_err: OrphanIndexAdmissionError) -> FileSystemError {
-        FileSystemError::CorruptState {
-            reason: "orphan-index metadata admission rejected permit",
-        }
-    }
-
     fn hard_link_public_error(err: FileSystemError) -> FileSystemError {
         match err {
             FileSystemError::Unsupported {
@@ -4587,18 +4720,16 @@ impl LocalFileSystem {
         }
     }
 
-    fn release_metadata_admission_permit(&mut self, permit: AdmissionPermit) -> Result<()> {
+    fn release_metadata_admission_permit(&mut self, permit: LocalAdmissionPermit) -> Result<()> {
         self.write_admission
             .release(permit)
             .map(|_| ())
-            .map_err(|_e| FileSystemError::CorruptState {
-                reason: "failed to release metadata admission permit",
-            })
+            .map_err(FileSystemError::from)
     }
 
     fn release_optional_metadata_admission_permit(
         &mut self,
-        permit: Option<AdmissionPermit>,
+        permit: Option<LocalAdmissionPermit>,
     ) -> Result<()> {
         if let Some(permit) = permit {
             self.release_metadata_admission_permit(permit)?;
@@ -4608,7 +4739,7 @@ impl LocalFileSystem {
 
     fn rollback_mutation_delta_and_release_metadata_permit(
         &mut self,
-        permit: &mut Option<AdmissionPermit>,
+        permit: &mut Option<LocalAdmissionPermit>,
     ) -> Result<()> {
         self.rollback_mutation_delta();
         self.release_optional_metadata_admission_permit(permit.take())
@@ -4633,19 +4764,12 @@ impl LocalFileSystem {
             OrphanEntryFlags::NONE
         };
         let entry = OrphanEntry::new(inode_id.get(), generation, nlink, flags);
-        let _orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
-        let insert_result = {
+        let orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
+        let inserted = {
             let mut orphan_index = self.orphan_index.lock().unwrap();
-            orphan_index.insert_admitted(inode_id.get(), entry, &_orphan_md_permit)
+            orphan_index.insert(inode_id.get(), entry)
         };
-        let inserted = match insert_result {
-            Ok(inserted) => inserted,
-            Err(err) => {
-                self.release_metadata_admission_permit(_orphan_md_permit)?;
-                return Err(Self::orphan_index_admission_error(err));
-            }
-        };
-        self.release_metadata_admission_permit(_orphan_md_permit)?;
+        self.release_metadata_admission_permit(orphan_md_permit)?;
         Ok(inserted)
     }
 
@@ -4658,22 +4782,9 @@ impl LocalFileSystem {
     ) -> Result<bool> {
         self.ensure_mutation_allowed("track temporary-file orphan")?;
         let orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
-        let insert_result = {
+        let inserted = {
             let mut orphan_index = self.orphan_index.lock().unwrap();
-            orphan_index.insert_tmpfile_admitted(
-                inode_id.get(),
-                generation,
-                creating_pid,
-                0,
-                &orphan_md_permit,
-            )
-        };
-        let inserted = match insert_result {
-            Ok(inserted) => inserted,
-            Err(err) => {
-                self.release_metadata_admission_permit(orphan_md_permit)?;
-                return Err(Self::orphan_index_admission_error(err));
-            }
+            orphan_index.insert_tmpfile(inode_id.get(), generation, creating_pid, 0)
         };
         self.release_metadata_admission_permit(orphan_md_permit)?;
         Ok(inserted)
@@ -4683,16 +4794,9 @@ impl LocalFileSystem {
     pub fn remove_tmpfile_orphan_on_link(&mut self, inode_id: InodeId) -> Result<bool> {
         self.ensure_mutation_allowed("remove temporary-file orphan")?;
         let orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
-        let remove_result = {
+        let removed = {
             let mut orphan_index = self.orphan_index.lock().unwrap();
-            orphan_index.remove_on_link_admitted(inode_id.get(), 0, &orphan_md_permit)
-        };
-        let removed = match remove_result {
-            Ok(removed) => removed,
-            Err(err) => {
-                self.release_metadata_admission_permit(orphan_md_permit)?;
-                return Err(Self::orphan_index_admission_error(err));
-            }
+            orphan_index.remove_on_link(inode_id.get(), 0)
         };
         self.release_metadata_admission_permit(orphan_md_permit)?;
         Ok(removed)
@@ -4734,6 +4838,7 @@ impl LocalFileSystem {
     }
 
     /// Return the latest online defrag counters published by the background job.
+    #[cfg(feature = "data-policy")]
     pub fn online_defrag_stats(&self) -> Option<DefragStats> {
         self.online_defrag_stats
             .as_ref()
@@ -5248,6 +5353,7 @@ impl LocalFileSystem {
     /// On mount, this classifies any corruption detected by a previous
     /// background scrub and dispatches only receipt-backed repair work before
     /// user I/O begins.
+    #[cfg(feature = "distributed-repair")]
     pub fn repair_cycle(&mut self) -> Result<RepairLog> {
         self.ensure_mutation_allowed("run repair cycle")?;
         use crate::crash_hooks::check_crash_hook;
@@ -5277,6 +5383,7 @@ impl LocalFileSystem {
     ///
     /// Returns the validation ledger. The scheduling bridge is stored on `self`
     /// and consumed by [`dispatch_scheduled_repairs`](Self::dispatch_scheduled_repairs).
+    #[cfg(feature = "distributed-repair")]
     pub fn schedule_scrub_repairs(
         &mut self,
     ) -> Result<tidefs_scrub::scrub_repair::ScrubRepairLedger> {
@@ -5302,6 +5409,7 @@ impl LocalFileSystem {
     /// Prefer [`schedule_scrub_repairs`](Self::schedule_scrub_repairs) for
     /// the full detect→schedule→dispatch pipeline. This method remains for
     /// callers that only need the validation ledger.
+    #[cfg(feature = "distributed-repair")]
     pub fn scrub_repair_pass(&self) -> Result<tidefs_scrub::scrub_repair::ScrubRepairLedger> {
         if !self.recovery_policy.allows_repair_writeback() {
             return Ok(tidefs_scrub::scrub_repair::ScrubRepairLedger::new());
@@ -5326,6 +5434,7 @@ impl LocalFileSystem {
     ///
     /// Returns the repair log with applied outcomes, or an empty log if
     /// no schedule is pending.
+    #[cfg(feature = "distributed-repair")]
     pub fn dispatch_scheduled_repairs(&mut self) -> Result<RepairLog> {
         self.ensure_mutation_allowed("dispatch scheduled repairs")?;
         use crate::crash_hooks::check_crash_hook;
@@ -5461,6 +5570,7 @@ impl LocalFileSystem {
         // on-disk corruption.  Duty 3 picks up that signal, re-scrubs through
         // the live store, schedules prioritized repairs, and dispatches them
         // without blocking foreground I/O beyond a single tick.
+        #[cfg(feature = "distributed-repair")]
         if let Some(ref flag) = self.scrub_corruption_detected {
             if flag.swap(false, Ordering::SeqCst) {
                 if self.recovery_policy.allows_repair_writeback() {
@@ -5574,10 +5684,12 @@ impl LocalFileSystem {
         // counts reflect the new configured capacity ceiling.
         self.capacity_authority
             .set_total_bytes(policy.content_capacity_bytes);
-        // Recreate obligation ledger with new capacity
+        // Recreate optional policy-observation state with the new capacity.
+        #[cfg(feature = "policy-observation")]
         self.obligation_ledger = Box::new(ObligationLedger::new(
             policy.content_capacity_bytes / content_chunk_size() as u64,
         ));
+        #[cfg(feature = "policy-observation")]
         self.budget_domain = BudgetDomain::new(
             BudgetDomainId::from_str("default"),
             "default".into(),
@@ -5958,6 +6070,7 @@ impl LocalFileSystem {
         })
     }
 
+    #[cfg(feature = "policy-observation")]
     pub fn claim_ledger_report(&self) -> ClaimLedgerReport {
         use tidefs_types_claim_ledger_core::ClaimReason;
         let summary = self.obligation_ledger.reverse_explain_summary();
@@ -6239,6 +6352,7 @@ impl LocalFileSystem {
         self.commit_state_replacement(previous_state, report)
     }
 
+    #[cfg(feature = "replication-io")]
     pub fn export_changed_records(&mut self) -> Result<ChangedRecordExport> {
         self.ensure_mutation_allowed("export mounted changed records")?;
         self.ensure_snapshot_authority_consistent()?;
@@ -6259,6 +6373,7 @@ impl LocalFileSystem {
     /// included in the stream.
     ///
     /// This mirrors ZFS `zfs send -i <base> <target>`.
+    #[cfg(feature = "replication-io")]
     pub fn export_incremental_changed_records(
         &mut self,
         from_root: &CommittedRootSummary,
@@ -6288,6 +6403,7 @@ impl LocalFileSystem {
     /// stream suitable for transport or storage.
     ///
     /// [`export_changed_records`]: Self::export_changed_records
+    #[cfg(feature = "replication-io")]
     pub fn export_vfssend2(
         &mut self,
         pool_id: tidefs_send_stream::Id128,
@@ -6308,6 +6424,7 @@ impl LocalFileSystem {
     /// included. Callers must supply the pool and dataset identifiers.
     ///
     /// [`export_incremental_changed_records`]: Self::export_incremental_changed_records
+    #[cfg(feature = "replication-io")]
     pub fn export_incremental_vfssend2(
         &mut self,
         pool_id: tidefs_send_stream::Id128,
@@ -6320,6 +6437,7 @@ impl LocalFileSystem {
         )
     }
 
+    #[cfg(feature = "replication-io")]
     pub fn receive_changed_records_into_empty_root(
         root: impl AsRef<Path>,
         options: StoreOptions,
@@ -6336,6 +6454,7 @@ impl LocalFileSystem {
         )
     }
 
+    #[cfg(feature = "replication-io")]
     pub fn receive_changed_records_into_empty_root_with_root_authentication_key(
         root: impl AsRef<Path>,
         options: StoreOptions,
@@ -6358,6 +6477,7 @@ impl LocalFileSystem {
 
     /// Receive an incremental changed-record stream into an existing filesystem
     /// that already contains the base snapshot.
+    #[cfg(feature = "replication-io")]
     pub fn receive_incremental_changed_records(
         root: impl AsRef<Path>,
         options: StoreOptions,
@@ -6382,6 +6502,7 @@ impl LocalFileSystem {
     /// decisions (keep-local, keep-remote) instead of failing closed on
     /// conflicting non-empty targets.  See
     /// `docs/RECEIVE_MERGE_PLANNER_DESIGN.md` §5.1 item 4.
+    #[cfg(feature = "replication-io")]
     #[allow(clippy::too_many_arguments)]
     pub fn receive_incremental_changed_records_with_root_authentication_key(
         root: impl AsRef<Path>,
@@ -6882,15 +7003,9 @@ impl LocalFileSystem {
                     .ok_or(FileSystemError::CorruptState {
                         reason: "missing orphan-index metadata admission permit",
                     })?;
-            let remove_result = {
+            {
                 let mut orphan_index = self.orphan_index.lock().unwrap();
-                orphan_index.remove_admitted(inode_id.get(), &orphan_md_permit)
-            };
-            if let Err(err) = remove_result {
-                let release_result = self.release_metadata_admission_permit(orphan_md_permit);
-                self.rollback_mutation_delta();
-                release_result?;
-                return Err(Self::orphan_index_admission_error(err));
+                orphan_index.remove(inode_id.get());
             }
             self.release_metadata_admission_permit(orphan_md_permit)?;
         }
@@ -6998,6 +7113,7 @@ impl LocalFileSystem {
         let (planned_entries, allocation_bytes, materialized_bytes) =
             self.reflink_clone_content_plan(source_inode_id, &source_record, &dest_record)?;
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
+        #[cfg(feature = "policy-observation")]
         self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(planned_inode_id))?;
         self.ensure_content_capacity_with_planned_inode(None, planned_entries)?;
 
@@ -7070,6 +7186,7 @@ impl LocalFileSystem {
         Ok(record)
     }
 
+    #[cfg(feature = "policy-observation")]
     fn read_serving_scope_for_local_read(
         &self,
         inode_id: InodeId,
@@ -7097,6 +7214,7 @@ impl LocalFileSystem {
         }
     }
 
+    #[cfg(feature = "policy-observation")]
     fn project_local_read_serving_input(
         &self,
         mut input: ReadServingDecisionInput,
@@ -7143,6 +7261,7 @@ impl LocalFileSystem {
         input
     }
 
+    #[cfg(feature = "policy-observation")]
     fn read_serving_decision_allows_bytes(decision: &ReadServingDecisionRecord) -> bool {
         decision.refusal == StorageIntentRefusalReason::None
             && matches!(
@@ -7154,6 +7273,7 @@ impl LocalFileSystem {
             )
     }
 
+    #[cfg(feature = "policy-observation")]
     pub fn read_file_with_read_serving(
         &self,
         path: impl AsRef<str>,
@@ -7197,6 +7317,7 @@ impl LocalFileSystem {
     }
 
     #[allow(clippy::result_large_err)]
+    #[cfg(feature = "policy-observation")]
     pub fn read_file_with_required_read_serving(
         &self,
         path: impl AsRef<str>,
@@ -7206,6 +7327,7 @@ impl LocalFileSystem {
             .into_bytes()
     }
 
+    #[cfg(feature = "policy-observation")]
     pub fn read_file_range_with_read_serving(
         &self,
         path: impl AsRef<str>,
@@ -7252,6 +7374,7 @@ impl LocalFileSystem {
     }
 
     #[allow(clippy::result_large_err)]
+    #[cfg(feature = "policy-observation")]
     pub fn read_file_range_with_required_read_serving(
         &self,
         path: impl AsRef<str>,
@@ -7569,6 +7692,7 @@ impl LocalFileSystem {
         let patch_ranges = self.coalesced_patch_ranges(patches)?;
         let replaced_data_bytes =
             self.materialized_content_bytes_in_ranges(inode_id, &old_record, &patch_ranges)?;
+        #[cfg(feature = "policy-observation")]
         if allocation_bytes > old_allocation_bytes {
             self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(inode_id))?;
         }
@@ -7593,6 +7717,7 @@ impl LocalFileSystem {
                 patches: &content_patches,
                 allow_holes,
                 dedup_index: &mut dedup,
+                #[cfg(feature = "quorum-write")]
                 quorum_store: self.quorum_store.as_mut(),
                 compression_policy: &self.content_compression_policy,
             })
@@ -7619,33 +7744,8 @@ impl LocalFileSystem {
             let _accepted_by_commit_group =
                 self.record_mutation_commit_group_write(dirty_allocation_bytes);
         }
-        self.obligation_ledger.release_claims_for_inode(inode_id);
-        if new_blocks > 0 {
-            self.obligation_ledger
-                .claim(ClaimEntry {
-                    claim_id: ClaimId::new(),
-                    budget_domain: BudgetDomainId::from_str("staging_dirty"),
-                    blocks: new_blocks,
-                    inode_id,
-                    reason: ClaimReason::Write,
-                    authorized_by: StorageAuthorityToken::ABSENT,
-                    generation: tick,
-                })
-                .ok();
-        }
-        let _ = self.budget_domain.admit_claim(ClaimEntryRecord {
-            claim_id: ClaimId::new(),
-            claimant_ref: ClaimantRef::Service {
-                service_name: "staging_dirty".into(),
-            },
-            claim_class: ClaimClass::Product,
-            claimed_bytes: new_blocks * content_chunk_size() as u64,
-            committed_bytes: 0,
-            inode_id: Some(inode_id),
-            freshness_fence_ref: None,
-            claim_receipt_ref: StorageAuthorityToken::ABSENT,
-            expiration_deadline: None,
-        });
+        #[cfg(feature = "policy-observation")]
+        self.record_policy_allocation_claim(inode_id, new_blocks, tick);
 
         self.inode_cache.borrow_mut().invalidate(inode_id);
         self.mark_inode_metadata_dirty(inode_id);
@@ -8071,17 +8171,25 @@ impl LocalFileSystem {
         }
 
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
+        #[cfg(feature = "policy-observation")]
+        self.record_policy_allocation_claim(inode_id, new_blocks, tick);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "policy-observation")]
+    fn record_policy_allocation_claim(&mut self, inode_id: InodeId, blocks: u64, generation: u64) {
         self.obligation_ledger.release_claims_for_inode(inode_id);
-        if new_blocks > 0 {
+        if blocks > 0 {
             self.obligation_ledger
                 .claim(ClaimEntry {
                     claim_id: ClaimId::new(),
                     budget_domain: BudgetDomainId::from_str("staging_dirty"),
-                    blocks: new_blocks,
+                    blocks,
                     inode_id,
                     reason: ClaimReason::Write,
                     authorized_by: StorageAuthorityToken::ABSENT,
-                    generation: tick,
+                    generation,
                 })
                 .ok();
         }
@@ -8091,15 +8199,13 @@ impl LocalFileSystem {
                 service_name: "staging_dirty".into(),
             },
             claim_class: ClaimClass::Product,
-            claimed_bytes: new_blocks * content_chunk_size() as u64,
+            claimed_bytes: blocks * content_chunk_size() as u64,
             committed_bytes: 0,
             inode_id: Some(inode_id),
             freshness_fence_ref: None,
             claim_receipt_ref: StorageAuthorityToken::ABSENT,
             expiration_deadline: None,
         });
-
-        Ok(())
     }
 
     fn record_dirty_buffer_free(&mut self, bytes: u64) {
@@ -8247,9 +8353,9 @@ impl LocalFileSystem {
         Ok(Some(bytes))
     }
 
-    /// Try to admit a dirty write operation through the performance contract.
+    /// Try to admit a dirty write operation through filesystem-owned limits.
     ///
-    /// Acquires an `AdmissionPermit` that conserves dirty-byte and dirty-op
+    /// Acquires a `LocalAdmissionPermit` that conserves dirty-byte and dirty-op
     /// budget. The permit is stored in `pending_permits` and released
     /// en masse when the dirty set is cleared after a successful commit.
     fn try_admit_write(&mut self, dirty_bytes: u64, dirty_ops: u32) -> Result<()> {
@@ -8261,10 +8367,17 @@ impl LocalFileSystem {
     }
 
     /// Release all outstanding admission permits after a successful SYNC.
-    fn release_pending_permits(&mut self) {
-        for permit in self.pending_permits.drain(..) {
-            let _ = self.write_admission.release(permit);
+    fn release_pending_permits(&mut self) -> Result<()> {
+        while let Some(permit) = self.pending_permits.pop() {
+            if let Err(error) = self.write_admission.release(permit) {
+                let reason = error.to_string();
+                if let Some(permit) = error.into_permit() {
+                    self.pending_permits.push(permit);
+                }
+                return Err(FileSystemError::DirtyAdmissionRejected { reason });
+            }
         }
+        Ok(())
     }
 
     /// Take a bounded peak-usage snapshot for runtime evidence collection.
@@ -8279,7 +8392,7 @@ impl LocalFileSystem {
     }
 
     /// Return the current write-admission hard and effective caps.
-    pub fn admission_config(&self) -> tidefs_performance_contract::WriteAdmissionConfig {
+    pub fn admission_config(&self) -> crate::admission::LocalAdmissionConfig {
         self.write_admission.config()
     }
 
@@ -9075,6 +9188,7 @@ impl LocalFileSystem {
         // Zero the content range in the object store via punch_hole_content.
         // This ensures subsequent reads return zeros for the freed range.
         let mut pool_store = self.store.pool_store_mut();
+        #[cfg(feature = "quorum-write")]
         let quorum_store = None; // block-device discard is a local operation.
         crate::content::punch_hole_content(PunchHoleContent {
             store: &mut pool_store,
@@ -9083,6 +9197,7 @@ impl LocalFileSystem {
             new_record: &updated,
             hole_offset: byte_offset,
             hole_length: effective_length,
+            #[cfg(feature = "quorum-write")]
             quorum_store,
             compression_policy: &self.content_compression_policy,
         })?;
@@ -9198,6 +9313,7 @@ impl LocalFileSystem {
             new_record: &updated,
             hole_offset: offset,
             hole_length: effective_length,
+            #[cfg(feature = "quorum-write")]
             quorum_store: self.quorum_store.as_mut(),
             compression_policy: &self.content_compression_policy,
         })?;
@@ -9480,6 +9596,7 @@ impl LocalFileSystem {
             new_record: &updated,
             hole_offset: offset,
             hole_length: effective_length,
+            #[cfg(feature = "quorum-write")]
             quorum_store: self.quorum_store.as_mut(),
             compression_policy: &self.content_compression_policy,
         })?;
@@ -9840,15 +9957,9 @@ impl LocalFileSystem {
                     .ok_or(FileSystemError::CorruptState {
                         reason: "missing orphan-index metadata admission permit",
                     })?;
-            let insert_result = {
+            {
                 let mut orphan_index = self.orphan_index.lock().unwrap();
-                orphan_index.insert_admitted(entry.inode_id.get(), orphan_entry, &orphan_md_permit)
-            };
-            if let Err(err) = insert_result {
-                let release_result = self.release_metadata_admission_permit(orphan_md_permit);
-                self.rollback_mutation_delta();
-                release_result?;
-                return Err(Self::orphan_index_admission_error(err));
+                orphan_index.insert(entry.inode_id.get(), orphan_entry);
             }
             self.release_metadata_admission_permit(orphan_md_permit)?;
             // Record nlink=0 in state so record_reclaim_delta can iterate
@@ -10886,6 +10997,7 @@ impl LocalFileSystem {
                     &record,
                     initial_content,
                     &mut dedup,
+                    #[cfg(feature = "quorum-write")]
                     self.quorum_store.as_mut(),
                     &self.content_compression_policy,
                 )
@@ -10966,6 +11078,7 @@ impl LocalFileSystem {
         let (planned_entries, allocation_bytes, _materialized_bytes) =
             self.reflink_clone_content_plan(source_inode_id, &source_record, &dest_record)?;
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
+        #[cfg(feature = "policy-observation")]
         self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(dest_inode_id))?;
         self.ensure_content_capacity_with_planned_inode(
             Some(dest_inode_id),
@@ -11026,9 +11139,9 @@ impl LocalFileSystem {
             &self.store,
             &record,
         )?)?;
-        // Pre-check obligation ledger before allocator (Design rule Rule 3: authority is scarce)
         let allocation_bytes = allocation_bytes(&planned_entries)?;
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
+        #[cfg(feature = "policy-observation")]
         if allocation_bytes > old_allocation_bytes {
             self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(inode_id))?;
         }
@@ -11051,6 +11164,7 @@ impl LocalFileSystem {
                 &record,
                 &content,
                 &mut dedup,
+                #[cfg(feature = "quorum-write")]
                 self.quorum_store.as_mut(),
                 &self.content_compression_policy,
             )
@@ -11077,36 +11191,8 @@ impl LocalFileSystem {
             }
         };
 
-        // Release old claims and register new allocation claim per Rule 8
-        // (space-as-claimed-capital: every allocation is an obligation)
-        self.obligation_ledger.release_claims_for_inode(inode_id);
-        if new_blocks > 0 {
-            self.obligation_ledger
-                .claim(ClaimEntry {
-                    claim_id: ClaimId::new(),
-                    budget_domain: BudgetDomainId::from_str("staging_dirty"),
-                    blocks: new_blocks,
-                    inode_id,
-                    reason: ClaimReason::Write,
-                    authorized_by: StorageAuthorityToken::ABSENT,
-                    generation: tick,
-                })
-                .ok();
-        }
-        // Register claim with budget domain for authority governance (Rule 3)
-        let _ = self.budget_domain.admit_claim(ClaimEntryRecord {
-            claim_id: ClaimId::new(),
-            claimant_ref: ClaimantRef::Service {
-                service_name: "staging_dirty".into(),
-            },
-            claim_class: ClaimClass::Product,
-            claimed_bytes: new_blocks * content_chunk_size() as u64,
-            committed_bytes: 0,
-            inode_id: Some(inode_id),
-            freshness_fence_ref: None,
-            claim_receipt_ref: StorageAuthorityToken::ABSENT,
-            expiration_deadline: None,
-        });
+        #[cfg(feature = "policy-observation")]
+        self.record_policy_allocation_claim(inode_id, new_blocks, tick);
 
         self.inode_cache.borrow_mut().invalidate(inode_id);
         // Capture old record in mutation delta BEFORE replacing it
@@ -11165,6 +11251,7 @@ impl LocalFileSystem {
                 &[(overlay_offset, overlay_len)],
             )?
         };
+        #[cfg(feature = "policy-observation")]
         if allocation_bytes > old_allocation_bytes {
             self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(inode_id))?;
         }
@@ -11190,6 +11277,7 @@ impl LocalFileSystem {
                 overlay_bytes,
                 allow_holes,
                 dedup_index: &mut dedup,
+                #[cfg(feature = "quorum-write")]
                 quorum_store: self.quorum_store.as_mut(),
                 compression_policy: &self.content_compression_policy,
             })
@@ -11223,36 +11311,8 @@ impl LocalFileSystem {
             let _accepted_by_commit_group =
                 self.record_mutation_commit_group_write(dirty_allocation_bytes);
         }
-        // Release old claims and register new allocation claim per Rule 8
-        // (space-as-claimed-capital: every allocation is an obligation)
-        self.obligation_ledger.release_claims_for_inode(inode_id);
-        if new_blocks > 0 {
-            self.obligation_ledger
-                .claim(ClaimEntry {
-                    claim_id: ClaimId::new(),
-                    budget_domain: BudgetDomainId::from_str("staging_dirty"),
-                    blocks: new_blocks,
-                    inode_id,
-                    reason: ClaimReason::Write,
-                    authorized_by: StorageAuthorityToken::ABSENT,
-                    generation: tick,
-                })
-                .ok();
-        }
-        // Register claim with budget domain for authority governance (Rule 3)
-        let _ = self.budget_domain.admit_claim(ClaimEntryRecord {
-            claim_id: ClaimId::new(),
-            claimant_ref: ClaimantRef::Service {
-                service_name: "staging_dirty".into(),
-            },
-            claim_class: ClaimClass::Product,
-            claimed_bytes: new_blocks * content_chunk_size() as u64,
-            committed_bytes: 0,
-            inode_id: Some(inode_id),
-            freshness_fence_ref: None,
-            claim_receipt_ref: StorageAuthorityToken::ABSENT,
-            expiration_deadline: None,
-        });
+        #[cfg(feature = "policy-observation")]
+        self.record_policy_allocation_claim(inode_id, new_blocks, tick);
 
         self.inode_cache.borrow_mut().invalidate(inode_id);
         // Capture old record in mutation delta BEFORE replacing it
@@ -11299,6 +11359,7 @@ impl LocalFileSystem {
                 // Run deferred cleanup (orphan drain, block reclamation)
                 // after each committed-root advance. No-op when no engine
                 // is attached.
+                #[cfg(feature = "data-policy")]
                 if let Some(ref mut engine) = self.cleanup_engine {
                     engine.run_cleanup_pass();
                 }
@@ -11343,7 +11404,7 @@ impl LocalFileSystem {
                     // authority still exists.
                     self.state = previous_state;
                     self.rollback_mutation_delta();
-                    self.mark_metalogue_clean();
+                    self.mark_metalogue_clean()?;
                 }
                 Err(err)
             }
@@ -12395,6 +12456,13 @@ impl LocalFileSystem {
 
     pub(crate) fn do_commit(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("commit mounted filesystem state")?;
+        #[cfg(not(feature = "data-policy"))]
+        if feature_flags_select_data_policy(&self.feature_flags) {
+            return Err(FileSystemError::Unsupported {
+                operation: "commit mounted data-policy feature flags",
+                reason: "compression and dedup feature flags require the data-policy feature",
+            });
+        }
         // Advance the admission tick so dirty-age caps can be enforced
         // against the current commit cycle.
         self.write_admission.advance_tick();
@@ -12477,6 +12545,7 @@ impl LocalFileSystem {
             let stored_bytes = match self.store.primary_store().get(slot_key)? {
                 Some(b) => b,
                 None => {
+                    #[cfg(feature = "quorum-write")]
                     if let Some(ref qs) = self.quorum_store {
                         let (_, data, _) = qs.quorum_get(slot_key);
                         if let Some(b) = data {
@@ -12491,6 +12560,10 @@ impl LocalFileSystem {
                             reason: "root commit written but not found on re-read",
                         });
                     }
+                    #[cfg(not(feature = "quorum-write"))]
+                    return Err(FileSystemError::CorruptState {
+                        reason: "root commit written but not found on re-read",
+                    });
                 }
             };
             let stored_root = decode_root_commit(&stored_bytes)?;
@@ -12505,7 +12578,7 @@ impl LocalFileSystem {
             // be retried, but must not restore live state behind this root.
             self.discard_mutation_delta();
             check_crash_hook(CrashInjectionPoint::CommitGroupAfterCommit);
-            self.mark_metalogue_clean();
+            self.mark_metalogue_clean()?;
         }
         // Persist quota table alongside committed state
         self.store.put(
@@ -12560,6 +12633,7 @@ impl LocalFileSystem {
         check_crash_hook(CrashInjectionPoint::CommitGroupBeforeCheckpoint);
         self.store.rotate_if_needed()?;
         // Sync quorum replicas after the primary commits successfully.
+        #[cfg(feature = "quorum-write")]
         if let Some(qs) = self.quorum_store.as_mut() {
             if let Err(e) = qs.quorum_sync() {
                 eprintln!("quorum sync warning: {e}");
@@ -12779,7 +12853,7 @@ impl LocalFileSystem {
         self.state.dirty_content.contains(&inode_id)
     }
 
-    fn mark_metalogue_clean(&mut self) {
+    fn mark_metalogue_clean(&mut self) -> Result<()> {
         let generation = self.state.generation;
         for &inode_id in &self.state.dirty_inodes {
             self.state.last_inode_write_tx.insert(inode_id, generation);
@@ -12791,6 +12865,7 @@ impl LocalFileSystem {
         self.state.dirty_inodes.clear();
         self.state.dirty_dirs.clear();
         self.dirty_set.clear();
+        self.release_pending_permits()
     }
 
     fn forget_removed_inode_state(&mut self, inode_id: InodeId) {
@@ -12810,6 +12885,7 @@ impl LocalFileSystem {
         self.extent_allocator.remove_inode(inode_id.get());
         self.state.extent_maps.lock().unwrap().remove(&inode_id);
         self.state.known_inode_ids.remove(&inode_id);
+        #[cfg(feature = "policy-observation")]
         self.obligation_ledger.release_claims_for_inode(inode_id);
         self.dirty_set.forget_inode(inode_id);
         self.inode_cache.borrow_mut().invalidate(inode_id);
@@ -12861,6 +12937,7 @@ impl LocalFileSystem {
                 old_quota_table: self.state.quota_table.clone(),
                 old_space_accounting: self.state.space_accounting.clone(),
                 old_capacity_authority: self.capacity_authority.snapshot_for_rollback(),
+                #[cfg(feature = "policy-observation")]
                 old_obligation_ledger: self.obligation_ledger.clone(),
                 old_dirty_pages,
                 old_extent_allocator: self.extent_allocator.clone(),
@@ -12920,7 +12997,12 @@ impl LocalFileSystem {
             self.state.dirty_inodes.clear();
             self.state.dirty_dirs.clear();
             self.dirty_set.clear();
-            self.release_pending_permits();
+            if let Err(error) = self.release_pending_permits() {
+                self.mutation_requires_reopen = true;
+                eprintln!(
+                    "failed to release rolled-back admission permits; reopen required: {error}"
+                );
+            }
 
             // Restore side ledgers to pre-transaction state (#5980).
             if let Some(old_write_buffers) = delta.old_write_buffers {
@@ -12930,6 +13012,7 @@ impl LocalFileSystem {
             self.state.space_accounting = delta.old_space_accounting;
             self.capacity_authority
                 .restore_from_snapshot(&delta.old_capacity_authority);
+            #[cfg(feature = "policy-observation")]
             self.obligation_ledger = delta.old_obligation_ledger;
             self.extent_allocator = delta.old_extent_allocator;
             // Restore dirty-page tracker ranges.
@@ -13025,13 +13108,15 @@ impl LocalFileSystem {
         Ok(())
     }
 
-    /// Gate a proposed allocation through the obligation ledger.
+    /// Gate a policy-observation build's proposed allocation through its
+    /// obligation ledger.
     ///
     /// This is the Design rule Rule 3 scarcity gate: before the allocator
     /// checks physical space, the obligation ledger checks whether the
     /// budget domain has enough free blocks after accounting for current
     /// claims and active reserves. If not, the write is rejected with
     /// ClaimRejected even if physical space is available.
+    #[cfg(feature = "policy-observation")]
     fn ensure_obligation_capacity(
         &self,
         budget_domain: &str,
@@ -13887,6 +13972,8 @@ pub mod local_filesystem {
     pub const FAMILY_NAME: &str = "Local Filesystem";
     pub const ROLE: &str = "durable inode, directory, file-content, link, symlink, unlink, rename, truncate, root-slot commits, automatic previous-or-new recovery, and reopen harness over the Local Object Store";
 
+    #[cfg(feature = "policy-observation")]
+    pub use crate::CLAIM_LEDGER_SPEC;
     pub use crate::{
         audit_recovery, audit_recovery_with_root_authentication_key,
         content_chunk_object_key_for_version, content_object_key_for_version, directory_object_key,
@@ -13899,16 +13986,15 @@ pub mod local_filesystem {
         run_crash_recovery_matrix_with_root_authentication_key, transaction_directory_object_key,
         transaction_inode_object_key, transaction_manifest_object_key,
         transaction_superblock_object_key, verify_online,
-        verify_online_with_root_authentication_key, ChangedObjectRecord, ChangedRecordExport,
-        ChangedRecordImportReport, ChangedRecordObjectRole, ChangedRecordRoot,
-        CommittedRootSummary, CrashInjectionBoundary, CrashRecoveryCaseReport,
-        CrashRecoveryExpectation, CrashRecoveryExplicitErrorReport, CrashRecoveryMatrixReport,
-        CrashRecoveryObservedOutcome, FileSystemError, FileSystemStatfs, FileSystemStats,
-        FilesystemCommitBoundary, FilesystemContentInspectionReport, FilesystemContentObjectKind,
-        FilesystemContentObjectRef, FilesystemError, FilesystemOptions, FilesystemStats,
-        InodeRecord, IntentLogLatencyClass, IntentLogReplyState, IntentLogSyncWriteLatencyCase,
-        LocalFileSystem, LocalFilesystem, LocalStorageAllocatorPolicy, LocalStorageAllocatorReport,
-        LocalStorageResource, MountInvariantReport, NamespaceEntry, NoProductionFsckFailureClass,
+        verify_online_with_root_authentication_key, CommittedRootSummary, CrashInjectionBoundary,
+        CrashRecoveryCaseReport, CrashRecoveryExpectation, CrashRecoveryExplicitErrorReport,
+        CrashRecoveryMatrixReport, CrashRecoveryObservedOutcome, FileSystemError, FileSystemStatfs,
+        FileSystemStats, FilesystemCommitBoundary, FilesystemContentInspectionReport,
+        FilesystemContentObjectKind, FilesystemContentObjectRef, FilesystemError,
+        FilesystemOptions, FilesystemStats, InodeRecord, IntentLogLatencyClass,
+        IntentLogReplyState, IntentLogSyncWriteLatencyCase, LocalFileSystem, LocalFilesystem,
+        LocalStorageAllocatorPolicy, LocalStorageAllocatorReport, LocalStorageResource,
+        MountInvariantReport, NamespaceEntry, NoProductionFsckFailureClass,
         NoProductionFsckFailureModelCase, OnlineVerifierIssue, OnlineVerifierIssueKind,
         OnlineVerifierIssueSeverity, OnlineVerifierOutcome, OnlineVerifierReport,
         OnlineVerifierRootReport, PageCacheCoherencyClass, PageCacheVisibilityState,
@@ -13917,19 +14003,18 @@ pub mod local_filesystem {
         RootAuthenticationCode, RootAuthenticationDigest, RootAuthenticationKey,
         RootAuthenticationRecord, RootRetentionDebt, RootRetentionPlan, RootRetentionPolicy,
         SafeReclamationReport, SnapshotRollbackReport, SnapshotSummary, TransactionManifestEntry,
-        TransactionManifestObjectRole, CLAIM_LEDGER_SPEC, DEFAULT_DIRECTORY_PERMISSIONS,
-        DEFAULT_FILE_PERMISSIONS, DEFAULT_LOCAL_FILESYSTEM_CONTENT_CAPACITY_BYTES,
-        DEFAULT_LOCAL_FILESYSTEM_INODE_CAPACITY, DEFAULT_RETAINED_COMMITTED_ROOTS,
-        DEFAULT_SYMLINK_PERMISSIONS, FILESYSTEM_CONTENT_CHUNK_SIZE,
-        FILESYSTEM_CONTENT_OBJECT_PREFIX, FILESYSTEM_DIRECTORY_OBJECT_PREFIX,
-        FILESYSTEM_FORMAT_VERSION, FILESYSTEM_INODE_OBJECT_PREFIX, FILESYSTEM_ROOT_OBJECT_PREFIX,
-        FILESYSTEM_ROOT_SLOT_COUNT, FILESYSTEM_TRANSACTION_OBJECT_PREFIX,
-        FORMAL_NO_PRODUCTION_FSCK_FAILURE_MODEL, INTENT_LOG_SYNC_WRITE_LATENCY_CASES,
-        INTENT_LOG_SYNC_WRITE_LATENCY_POLICY_VERSION, INTENT_LOG_SYNC_WRITE_LATENCY_SPEC,
-        LOCAL_SNAPSHOT_ROLLBACK_SPEC, LOCAL_STORAGE_ALLOCATOR_GRAIN_BYTES,
-        LOCAL_STORAGE_ALLOCATOR_SPEC, MAX_NAME_BYTES, MINIMUM_SAFE_RETAINED_ROOTS,
-        MOUNT_INVARIANT_GATE_IS_NOT_FSCK, NO_PRODUCTION_FSCK_FAILURE_MODEL_CASES,
-        ONLINE_VERIFIER_IS_NOT_FSCK, ONLINE_VERIFIER_SPEC,
+        TransactionManifestObjectRole, DEFAULT_DIRECTORY_PERMISSIONS, DEFAULT_FILE_PERMISSIONS,
+        DEFAULT_LOCAL_FILESYSTEM_CONTENT_CAPACITY_BYTES, DEFAULT_LOCAL_FILESYSTEM_INODE_CAPACITY,
+        DEFAULT_RETAINED_COMMITTED_ROOTS, DEFAULT_SYMLINK_PERMISSIONS,
+        FILESYSTEM_CONTENT_CHUNK_SIZE, FILESYSTEM_CONTENT_OBJECT_PREFIX,
+        FILESYSTEM_DIRECTORY_OBJECT_PREFIX, FILESYSTEM_FORMAT_VERSION,
+        FILESYSTEM_INODE_OBJECT_PREFIX, FILESYSTEM_ROOT_OBJECT_PREFIX, FILESYSTEM_ROOT_SLOT_COUNT,
+        FILESYSTEM_TRANSACTION_OBJECT_PREFIX, FORMAL_NO_PRODUCTION_FSCK_FAILURE_MODEL,
+        INTENT_LOG_SYNC_WRITE_LATENCY_CASES, INTENT_LOG_SYNC_WRITE_LATENCY_POLICY_VERSION,
+        INTENT_LOG_SYNC_WRITE_LATENCY_SPEC, LOCAL_SNAPSHOT_ROLLBACK_SPEC,
+        LOCAL_STORAGE_ALLOCATOR_GRAIN_BYTES, LOCAL_STORAGE_ALLOCATOR_SPEC, MAX_NAME_BYTES,
+        MINIMUM_SAFE_RETAINED_ROOTS, MOUNT_INVARIANT_GATE_IS_NOT_FSCK,
+        NO_PRODUCTION_FSCK_FAILURE_MODEL_CASES, ONLINE_VERIFIER_IS_NOT_FSCK, ONLINE_VERIFIER_SPEC,
         PAGE_CACHE_WRITEBACK_MMAP_ACCEPTANCE_CASES, PAGE_CACHE_WRITEBACK_MMAP_POLICY_VERSION,
         PAGE_CACHE_WRITEBACK_MMAP_SPEC, PATH_MAX_BYTES, POSIX_SUBSET_ENTRIES,
         POSIX_SUBSET_POLICY_VERSION, POSIX_SUBSET_SPEC, PRODUCTION_RECOVERY_DOCTRINE,
@@ -13939,9 +14024,14 @@ pub mod local_filesystem {
         ROOT_AUTHENTICATION_MAGIC_ASCII, ROOT_AUTHENTICATION_MAGIC_BYTES,
         ROOT_AUTHENTICATION_POLICY_EPOCH, ROOT_AUTHENTICATION_RECORD_VERSION,
         ROOT_AUTHENTICATION_SPEC, ROOT_PATH, SAFE_LOCAL_RECLAMATION_GC_SPEC,
-        SEND_RECEIVE_CHANGED_RECORD_SPEC, SEND_RECEIVE_STREAM_MAGIC_ASCII,
-        SEND_RECEIVE_STREAM_MAGIC_BYTES, SEND_RECEIVE_STREAM_VERSION, SNAPSHOT_CATALOG_MAGIC_ASCII,
-        SNAPSHOT_CATALOG_MAGIC_BYTES,
+        SNAPSHOT_CATALOG_MAGIC_ASCII, SNAPSHOT_CATALOG_MAGIC_BYTES,
+    };
+    #[cfg(feature = "replication-io")]
+    pub use crate::{
+        ChangedObjectRecord, ChangedRecordExport, ChangedRecordImportReport,
+        ChangedRecordObjectRole, ChangedRecordRoot, SEND_RECEIVE_CHANGED_RECORD_SPEC,
+        SEND_RECEIVE_STREAM_MAGIC_ASCII, SEND_RECEIVE_STREAM_MAGIC_BYTES,
+        SEND_RECEIVE_STREAM_VERSION,
     };
     pub use tidefs_local_object_store::{
         device_layout::DeviceMediaClass, CompressionAlgorithm, CompressionConfig, EncryptionConfig,
@@ -14195,20 +14285,23 @@ mod mutation_reopen_fence_tests {
             fs.prune_snapshots(crate::snapshot::SnapshotRetentionPolicy::keep_all()),
             Err(FileSystemError::MutationRequiresReopen { .. })
         ));
-        let vfssend2_mutation =
-            tidefs_send_stream::SnapshotMutation::delete([0; 16], Vec::<u8>::new());
-        assert!(matches!(
-            fs.apply_vfssend2_snapshot_mutation(&vfssend2_mutation),
-            Err(FileSystemError::MutationRequiresReopen { .. })
-        ));
-        assert!(matches!(
-            fs.export_changed_records(),
-            Err(FileSystemError::MutationRequiresReopen { .. })
-        ));
-        assert!(matches!(
-            crate::vfssend2_bridge::receive_vfssend2_snapshot_mutations(&mut fs, b""),
-            Err(FileSystemError::MutationRequiresReopen { .. })
-        ));
+        #[cfg(feature = "replication-io")]
+        {
+            let vfssend2_mutation =
+                tidefs_send_stream::SnapshotMutation::delete([0; 16], Vec::<u8>::new());
+            assert!(matches!(
+                fs.apply_vfssend2_snapshot_mutation(&vfssend2_mutation),
+                Err(FileSystemError::MutationRequiresReopen { .. })
+            ));
+            assert!(matches!(
+                fs.export_changed_records(),
+                Err(FileSystemError::MutationRequiresReopen { .. })
+            ));
+            assert!(matches!(
+                crate::vfssend2_bridge::receive_vfssend2_snapshot_mutations(&mut fs, b""),
+                Err(FileSystemError::MutationRequiresReopen { .. })
+            ));
+        }
         assert!(matches!(
             fs.cleanup_orphans(),
             Err(FileSystemError::MutationRequiresReopen { .. })
@@ -14481,6 +14574,7 @@ mod orphan_index_integration_tests {
         }
 
         #[test]
+        #[cfg(feature = "data-policy")]
         fn online_defrag_stats_are_exposed_on_open() {
             let root = std::env::temp_dir().join("bs_test_online_defrag_stats");
             if root.exists() {
@@ -14491,6 +14585,7 @@ mod orphan_index_integration_tests {
         }
 
         #[test]
+        #[cfg(feature = "data-policy")]
         fn online_defrag_scheduler_tick_scans_shared_extent_map_and_stats() {
             let inode = InodeId::new(42);
             let mut extent_map = tidefs_extent_map::ExtentMap::new();
@@ -14538,6 +14633,7 @@ mod orphan_index_integration_tests {
         }
 
         #[test]
+        #[cfg(feature = "data-policy")]
         fn online_defrag_adapter_uses_extent_map_file_size() {
             let inode = InodeId::new(43);
             let mut extent_map = tidefs_extent_map::ExtentMap::new();
@@ -14633,6 +14729,7 @@ mod orphan_index_integration_tests {
         }
     }
 
+    #[cfg(feature = "data-policy")]
     fn dedup_reclaim_fixture(
         name: &str,
     ) -> (
@@ -14754,6 +14851,7 @@ mod orphan_index_integration_tests {
     }
 
     #[test]
+    #[cfg(feature = "data-policy")]
     fn reclaim_refuses_substituted_redirect_before_refcount_or_delete() {
         let (_root, mut fs, redirect_key, canonical_key, fingerprint, refcount_before) =
             dedup_reclaim_fixture("reclaim_substituted_redirect");
@@ -14796,6 +14894,7 @@ mod orphan_index_integration_tests {
     }
 
     #[test]
+    #[cfg(feature = "data-policy")]
     fn reclaim_refuses_receiptless_canonical_before_refcount_or_redirect_delete() {
         let (_root, mut fs, redirect_key, canonical_key, fingerprint, refcount_before) =
             dedup_reclaim_fixture("reclaim_receiptless_canonical");
@@ -14846,6 +14945,7 @@ mod orphan_index_integration_tests {
     }
 
     #[test]
+    #[cfg(feature = "data-policy")]
     fn reclaim_ambiguous_delete_does_not_decrement_dedup_refcount() {
         let (_root, mut fs, redirect_key, canonical_key, fingerprint, refcount_before) =
             dedup_reclaim_fixture("reclaim_delete_failure_refcount");
@@ -17283,6 +17383,7 @@ mod recovery_integration_tests {
     /// Verify that scrub_repair_pass is gated by RecoveryPolicy and
     /// returns an empty ledger when repair is not permitted.
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn scrub_repair_pass_gated_by_policy() {
         let tmp = TempDir::new().expect("tempdir");
         let opts = StoreOptions::test_fast();

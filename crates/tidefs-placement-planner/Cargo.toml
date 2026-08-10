@@ -16,7 +16,16 @@ description = "source-owned data_copy_0: replica target computation from placeme
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 tidefs-durability-layout = { workspace = true }
-tidefs-membership-epoch = { workspace = true }
-tidefs-replication-model = { workspace = true }
-tidefs-storage-intent-core = { workspace = true }
+tidefs-membership-epoch = { workspace = true, optional = true }
+tidefs-storage-intent-core = { workspace = true, optional = true }
 blake3 = "1"
+
+[features]
+default = []
+membership = ["dep:tidefs-membership-epoch"]
+data-policy = ["dep:tidefs-storage-intent-core"]
+full = ["membership", "data-policy"]
+
+[dev-dependencies]
+tidefs-membership-epoch = { workspace = true }
+tidefs-storage-intent-core = { workspace = true }

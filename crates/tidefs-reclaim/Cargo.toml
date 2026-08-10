@@ -18,10 +18,16 @@ tidefs-pool-allocator = { workspace = true }
 tidefs-reclaim-queue-core = { workspace = true }
 tidefs-types-reclaim-queue-core = { workspace = true }
 tidefs-binary_schema-checksum = { workspace = true }
-tidefs-dedup = { workspace = true }
+tidefs-dedup = { workspace = true, optional = true }
+
+[features]
+default = []
+dedup = ["dep:tidefs-dedup"]
+full = ["dedup"]
 
 [dev-dependencies]
 tidefs-spacemap-allocator = { workspace = true }
+tidefs-dedup = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

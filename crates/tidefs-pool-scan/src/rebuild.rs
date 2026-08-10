@@ -167,21 +167,18 @@ impl RebuildScheduler {
         }
 
         // 2. Degraded devices: present but health is Degraded or Faulted.
-        for leaf in crate::DeviceRemovalPlanner::flatten_leaves(&config.device_tree) {
-            let health = find_leaf_health(&config.device_tree, &leaf.device_path)
-                .unwrap_or(DeviceHealth::Online);
-
+        for (device_path, device_index, health) in leaf_statuses(&config.device_tree) {
             match health {
                 DeviceHealth::Degraded => {
                     actions.push(RebuildAction {
                         kind: RebuildKind::ResilienceRestore,
                         reason: format!(
                             "device {} is degraded (index {})",
-                            leaf.device_path.display(),
-                            leaf.device_index
+                            device_path.display(),
+                            device_index
                         ),
-                        affected_device_indices: vec![leaf.device_index],
-                        target_device_index: Some(leaf.device_index),
+                        affected_device_indices: vec![device_index],
+                        target_device_index: Some(device_index),
                         urgent: false,
                     });
                 }
@@ -191,10 +188,10 @@ impl RebuildScheduler {
                         kind: RebuildKind::DeviceReplace,
                         reason: format!(
                             "device {} is faulted (index {})",
-                            leaf.device_path.display(),
-                            leaf.device_index
+                            device_path.display(),
+                            device_index
                         ),
-                        affected_device_indices: vec![leaf.device_index],
+                        affected_device_indices: vec![device_index],
                         target_device_index: None,
                         urgent: true,
                     });
@@ -297,24 +294,29 @@ fn collect_indices(node: &DeviceType, out: &mut Vec<u32>) {
     }
 }
 
-/// Look up the health of a leaf device by its path.
-fn find_leaf_health(tree: &DeviceType, path: &std::path::Path) -> Option<DeviceHealth> {
+fn leaf_statuses(tree: &DeviceType) -> Vec<(std::path::PathBuf, u32, DeviceHealth)> {
+    let mut leaves = Vec::new();
+    collect_leaf_statuses(tree, &mut leaves);
+    leaves
+}
+
+fn collect_leaf_statuses(
+    tree: &DeviceType,
+    leaves: &mut Vec<(std::path::PathBuf, u32, DeviceHealth)>,
+) {
     match tree {
         DeviceType::Leaf {
             device_path,
+            device_index,
             health,
             ..
-        } => {
-            if device_path == path {
-                Some(*health)
-            } else {
-                None
-            }
-        }
+        } => leaves.push((device_path.clone(), *device_index, *health)),
         DeviceType::PoolWideData { children }
         | DeviceType::Mirror { children }
         | DeviceType::ParityRaid { children, .. } => {
-            children.iter().find_map(|c| find_leaf_health(c, path))
+            for child in children {
+                collect_leaf_statuses(child, leaves);
+            }
         }
     }
 }

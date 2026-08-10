@@ -12,6 +12,11 @@ authors.workspace = true
 
 description = "Demo for the TideFS Local Filesystem MVP over the Local Object Store"
 
+[features]
+default = []
+replication-io = ["tidefs-local-filesystem/replication-io"]
+full = ["replication-io"]
+
 [dependencies]
 tidefs-local-filesystem = { workspace = true }
 tidefs-posix-filesystem-adapter-daemon = { workspace = true }

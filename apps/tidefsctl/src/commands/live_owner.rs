@@ -14,6 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process;
 
+#[cfg(feature = "distributed-repair")]
 use tidefs_device_removal::admission::{
     validate_live_owner_response, DeviceRemovalAdmissionRequest, DEVICE_REMOVAL_AUTHORITY_KIND,
 };
@@ -447,6 +448,7 @@ fn cached_without_owner_json(
     if let Some(pool_uuid) = pool_uuid {
         out["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
     }
+    #[cfg(feature = "distributed-repair")]
     annotate_device_removal_authority_json(command, operation, &mut out);
     out
 }
@@ -469,6 +471,7 @@ fn cached_without_owner_lines(
             hex_uuid(&pool_uuid)
         ));
     }
+    #[cfg(feature = "distributed-repair")]
     if let Some(line) = device_removal_authority_line(command, operation, None) {
         lines.push(line);
     }
@@ -530,6 +533,7 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
         if let Some(pool_uuid) = route.pool_uuid {
             out["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
         }
+        #[cfg(feature = "distributed-repair")]
         annotate_device_removal_authority_json(command, operation, &mut out);
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         process::exit(1);
@@ -546,6 +550,7 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
             hex_uuid(&pool_uuid)
         );
     }
+    #[cfg(feature = "distributed-repair")]
     if let Some(line) = device_removal_authority_line(command, operation, route_device_path(&route))
     {
         eprintln!("{line}");
@@ -705,6 +710,7 @@ fn send_live_owner_request_at(
                 ));
             }
             let response_json = live_owner_bytes_json(&bytes_hex, declared_bytes);
+            #[cfg(feature = "distributed-repair")]
             validate_required_owner_evidence(route, &response_json)?;
             if route.json {
                 let out = serde_json::json!({
@@ -736,6 +742,7 @@ fn send_live_owner_request_at(
         }
         LivePoolAdminResponseBody::MachineJson(machine_json) => {
             let mut value = parse_live_owner_machine_json(&machine_json)?;
+            #[cfg(feature = "distributed-repair")]
             validate_required_owner_evidence(route, &value)?;
             if route.json {
                 annotate_live_owner_status_json(route, &mut value);
@@ -759,6 +766,7 @@ fn send_live_owner_request_at(
         }
         LivePoolAdminResponseBody::Text(text) => {
             let response_json = live_owner_status_text_json(route, &text);
+            #[cfg(feature = "distributed-repair")]
             validate_required_owner_evidence(route, &response_json)?;
             if route.json {
                 println!(
@@ -779,6 +787,7 @@ fn send_live_owner_request_at(
         }
         LivePoolAdminResponseBody::Empty => {
             let response_json = live_owner_status_text_json(route, "");
+            #[cfg(feature = "distributed-repair")]
             validate_required_owner_evidence(route, &response_json)?;
             if route.json && is_status_route(route) {
                 println!(
@@ -862,6 +871,7 @@ fn validate_live_owner_response_envelope(
     }
 }
 
+#[cfg(feature = "distributed-repair")]
 fn validate_required_owner_evidence(
     route: &LivePoolRoute<'_>,
     response: &serde_json::Value,
@@ -894,6 +904,7 @@ fn live_owner_bytes_json(bytes_hex: &str, bytes: usize) -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "distributed-repair")]
 fn device_removal_admission_request(
     route: &LivePoolRoute<'_>,
 ) -> Option<DeviceRemovalAdmissionRequest> {
@@ -912,10 +923,12 @@ fn device_removal_admission_request(
     Some(DeviceRemovalAdmissionRequest::new(route.pool, device_path))
 }
 
+#[cfg(feature = "distributed-repair")]
 fn is_device_removal_route(command: &str, operation: &str) -> bool {
     command == "device" && operation == "remove"
 }
 
+#[cfg(feature = "distributed-repair")]
 fn route_device_path<'route>(route: &'route LivePoolRoute<'_>) -> Option<&'route str> {
     route
         .args
@@ -927,6 +940,7 @@ fn route_device_path<'route>(route: &'route LivePoolRoute<'_>) -> Option<&'route
         })
 }
 
+#[cfg(feature = "distributed-repair")]
 fn annotate_device_removal_authority_json(
     command: &str,
     operation: &str,
@@ -943,6 +957,7 @@ fn annotate_device_removal_authority_json(
     );
 }
 
+#[cfg(feature = "distributed-repair")]
 fn device_removal_authority_line(
     command: &str,
     operation: &str,
@@ -1723,10 +1738,12 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
+    #[cfg(feature = "distributed-repair")]
     use tidefs_device_removal::admission::{
         DeviceRemovalAdmissionEvidence, DEVICE_REMOVAL_AUTHORITY_FIELD,
         DEVICE_REMOVAL_AUTHORITY_KIND,
     };
+    #[cfg(feature = "distributed-repair")]
     use tidefs_device_removal::{EvacuationCompletionGeneration, EvacuationReceipt};
 
     fn write_owner_manifest(root: &Path, socket_path: &Path) {
@@ -1745,6 +1762,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(feature = "distributed-repair")]
     fn test_receipt(device_guid: [u8; 16], topology_generation: u64) -> EvacuationReceipt {
         EvacuationReceipt::new(
             EvacuationCompletionGeneration {
@@ -1805,6 +1823,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "distributed-repair")]
     fn device_remove_route() -> LivePoolRoute<'static> {
         LivePoolRoute {
             command: "device",
@@ -1846,6 +1865,7 @@ mod tests {
         assert!(!owner_interface_reachable_by_uuid_at(dir.path(), &uuid));
     }
 
+    #[cfg(feature = "distributed-repair")]
     #[test]
     fn device_remove_live_owner_response_requires_committed_receipt_authority() {
         let dir = tempfile::tempdir().unwrap();
@@ -1874,6 +1894,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "distributed-repair")]
     #[test]
     fn device_remove_live_owner_accepts_receipt_shaped_authority() {
         let dir = tempfile::tempdir().unwrap();
@@ -2421,6 +2442,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "distributed-repair")]
     #[test]
     fn device_remove_cached_owner_refusal_names_receipt_authority() {
         let json = cached_without_owner_json("device", "remove", "tank", None);
@@ -2453,6 +2475,7 @@ mod tests {
             .any(|line| line.contains("cached imported-pool state is not removal authority")));
     }
 
+    #[cfg(feature = "distributed-repair")]
     #[test]
     fn device_remove_unavailable_owner_refusal_names_target_device_authority() {
         let line = device_removal_authority_line("device", "remove", Some("/dev/disk2"))
