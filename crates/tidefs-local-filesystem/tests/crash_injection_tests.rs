@@ -439,8 +439,10 @@ fn scrub_detects_injected_byte_corruption() {
     // Phase 2: corrupt segment bytes on disk to trigger checksum mismatches.
     // The online verifier must detect these and report IssuesFound.
     {
-        let store =
-            LocalObjectStore::open_with_options(&root, opts()).expect("open store for corruption");
+        let store_options = opts();
+        let pool = LocalFileSystem::default_development_pool(&root, &store_options, None, None)
+            .expect("open Pool for corruption");
+        let store = pool.raw_primary_store();
         let keys = store.list_keys();
         let mut corrupted: u32 = 0;
         for key in &keys {
@@ -462,7 +464,6 @@ fn scrub_detects_injected_byte_corruption() {
                 break;
             }
         }
-        drop(store);
     }
 
     // Phase 3: run the online verifier — must detect checksum mismatches.
@@ -1491,8 +1492,9 @@ fn interrupted_repair_preserves_committed_data() {
 
     // -- Phase 2: Inject corruption into a segment file on disk ---------
     {
-        let store =
-            LocalObjectStore::open_with_options(&root, store_opts.clone()).expect("open store");
+        let pool = LocalFileSystem::default_development_pool(&root, &store_opts, None, None)
+            .expect("open Pool for corruption");
+        let store = pool.raw_primary_store();
         let segments_dir = store.segments_dir().to_path_buf();
         let keys = store.list_keys();
 
@@ -1512,7 +1514,6 @@ fn interrupted_repair_preserves_committed_data() {
                 break;
             }
         }
-        drop(store);
     }
 
     // -- Phase 3: Crash during repair (RepairBeforeApply hook) ----------
@@ -1619,8 +1620,11 @@ fn missing_device_graceful_detection() {
         drop(fs);
     }
 
-    // -- Phase 2: Simulate device loss — delete segment files -----------
-    let segments_dir = root.join("segments");
+    // -- Phase 2: Simulate loss of the configured Pool data device -------
+    let pool = LocalFileSystem::default_development_pool(&root, &opts(), None, None)
+        .expect("open Pool to locate data device");
+    let segments_dir = pool.raw_primary_store().segments_dir().to_path_buf();
+    drop(pool);
     assert!(
         segments_dir.is_dir(),
         "segments dir must exist before device loss"
