@@ -1710,6 +1710,7 @@ impl PoolConfig {
     /// Returns [`DeviceRemovalError::TargetDeviceNotFound`] if the device
     /// is not found in the tree, or [`DeviceRemovalError::WouldEmptyPool`]
     /// if removing it would leave the pool with zero devices.
+    #[cfg(any(feature = "distributed-repair", test))]
     pub fn remove_device(&mut self, device_path: &Path) -> Result<(), DeviceRemovalError> {
         // Check that removing this device won't compromise redundancy.
         check_removal_redundancy(&self.device_tree, device_path)?;
@@ -1733,6 +1734,7 @@ impl PoolConfig {
 
     /// Recursively walk the device tree and remove the leaf matching `path`.
     /// Returns `true` if a leaf was found and removed.
+    #[cfg(any(feature = "distributed-repair", test))]
     fn remove_leaf_from_tree(node: &mut DeviceType, path: &Path) -> bool {
         match node {
             DeviceType::Leaf { device_path, .. } => {
