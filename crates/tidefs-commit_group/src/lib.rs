@@ -63,6 +63,8 @@ mod coordinator;
 #[cfg(feature = "std")]
 mod dirty;
 #[cfg(feature = "std")]
+mod durability;
+#[cfg(feature = "std")]
 mod epoch;
 #[cfg(feature = "kernel-storage")]
 pub mod kernel_storage;
@@ -101,6 +103,8 @@ pub use commit::{
 pub use coordinator::CommitGroupCoordinator;
 #[cfg(feature = "std")]
 pub use dirty::DirtyTracker;
+#[cfg(feature = "std")]
+pub use durability::{DurabilityError, DurabilitySequence};
 #[cfg(feature = "std")]
 pub use epoch::{
     seal_commit_hash, verify_commit_record, CommitGroupEpoch, CommitGroupStateMachine,

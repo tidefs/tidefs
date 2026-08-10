@@ -2465,6 +2465,7 @@ version = "0.421.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tidefs-commit_group",
  "tidefs-membership-epoch",
  "tidefs-rebuild-planner",
  "tidefs-rebuild-runtime",
@@ -3039,7 +3040,6 @@ dependencies = [
  "tidefs-dataset-lifecycle",
  "tidefs-dir-index",
  "tidefs-extent-map",
- "tidefs-flow-commit-coordinator",
  "tidefs-inode-attributes",
  "tidefs-intent-log",
  "tidefs-invalidation-feed",

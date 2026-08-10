@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tidefs-commit_group = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

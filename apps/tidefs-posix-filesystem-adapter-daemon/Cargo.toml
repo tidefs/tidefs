@@ -50,7 +50,6 @@ tidefs-types-dataset-feature-flags-core = { workspace = true }
 tidefs-vfs-engine = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
-tidefs-flow-commit-coordinator = { workspace = true }
 tidefs-cluster = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }
 serde = { version = "1", features = ["derive"] }

@@ -11,8 +11,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tidefs_commit_group::{CommitGroupId, RootPointer};
-use tidefs_flow_commit_coordinator::{DurabilityError, DurabilitySequence};
+use tidefs_commit_group::{CommitGroupId, DurabilityError, DurabilitySequence, RootPointer};
 use tidefs_local_object_store::txg_manager::{CommitGroupManager, COMMITTED_ROOT_FILE};
 use tidefs_recovery_loop::compute_committed_root_digest;
 
