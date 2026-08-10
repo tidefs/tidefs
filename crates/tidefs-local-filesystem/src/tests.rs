@@ -4609,22 +4609,20 @@ fn auto_commit_disabled_batches_mutations() {
 }
 
 #[test]
-fn auto_commit_disabled_mutations_lost_on_unclean_shutdown() {
-    let root = temp_root("auto-commit-disabled-lost");
+fn auto_commit_disabled_mutations_persist_on_clean_shutdown() {
+    let root = temp_root("auto-commit-disabled-clean-shutdown");
     {
         let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
         fs.set_auto_commit(false)
             .expect("test setup mutation must be admitted");
         fs.create_file("/uncommitted.txt", 0o644)
             .expect("create uncommitted.txt");
-        // Drop without committing simulates unclean shutdown.
+        // Drop is the clean-close safety net and publishes pending state even
+        // when ordinary mutation auto-commit is disabled.
     }
     {
         let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        assert!(matches!(
-            fs.lookup("/uncommitted.txt"),
-            Err(FileSystemError::NotFound { .. })
-        ));
+        assert!(fs.lookup("/uncommitted.txt").is_ok());
     }
     cleanup(&root);
 }
