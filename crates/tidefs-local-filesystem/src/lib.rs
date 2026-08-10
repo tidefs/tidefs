@@ -12811,6 +12811,17 @@ impl LocalFileSystem {
         let must_persist =
             self.is_state_dirty() || intent_log_requires_commit || flushed_write_buffers;
 
+        // The root ring retains commits, not mutation-count residues. A burst
+        // can advance the live generation by an exact multiple of the ring
+        // size, so select the successor slot explicitly before publication.
+        // Keeping the transaction id and state generation together also
+        // preserves the intent-log anchor ordering used after reopen.
+        if must_persist {
+            let previous_root = self.selected_committed_root_summary()?;
+            self.state.generation =
+                next_mounted_commit_generation(self.state.generation, &previous_root)?;
+        }
+
         // COMMIT_GROUP STATE MACHINE: transition phases only when there is real work.
         // No-op commits (clean state + empty intent log) do not advance the commit_group.
         // Seven-step canonical commit ordering:

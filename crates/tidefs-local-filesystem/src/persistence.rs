@@ -600,3 +600,49 @@ pub(crate) fn publish_root_commit(
 pub(crate) fn root_slot_for_transaction(transaction_id: u64) -> u64 {
     transaction_id % FILESYSTEM_ROOT_SLOT_COUNT
 }
+
+/// Choose the generation for the next mounted commit so root-slot retention
+/// advances by one committed root, independent of how many mutations the
+/// commit contains.
+///
+/// Local intent anchors use the committed transaction id as their generation
+/// floor, so mounted publication keeps those two ordering values identical.
+/// A mutation burst may advance `state.generation` by several complete turns
+/// of the root ring; rounding that floor forward to the successor slot keeps
+/// the preceding committed root mountable instead of overwriting its slot.
+pub(crate) fn next_mounted_commit_generation(
+    state_generation: u64,
+    previous_root: &CommittedRootSummary,
+) -> Result<u64> {
+    if previous_root.slot >= FILESYSTEM_ROOT_SLOT_COUNT
+        || previous_root.slot != root_slot_for_transaction(previous_root.transaction_id)
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "selected committed root does not match the root-slot ring",
+        });
+    }
+
+    let previous_successor =
+        previous_root
+            .transaction_id
+            .checked_add(1)
+            .ok_or(FileSystemError::CorruptState {
+                reason: "committed-root transaction id space is exhausted",
+            })?;
+    let lower_bound = state_generation
+        .max(previous_successor)
+        .max(ROOT_COMMIT_MIN_TRANSACTION_ID);
+    let successor_slot = (previous_root.slot + 1) % FILESYSTEM_ROOT_SLOT_COUNT;
+    let lower_slot = root_slot_for_transaction(lower_bound);
+    let slot_adjustment = if lower_slot <= successor_slot {
+        successor_slot - lower_slot
+    } else {
+        FILESYSTEM_ROOT_SLOT_COUNT - (lower_slot - successor_slot)
+    };
+
+    lower_bound
+        .checked_add(slot_adjustment)
+        .ok_or(FileSystemError::CorruptState {
+            reason: "committed-root transaction id space is exhausted",
+        })
+}

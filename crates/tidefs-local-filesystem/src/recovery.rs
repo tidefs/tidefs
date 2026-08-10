@@ -23,7 +23,9 @@ use crate::intent_log::{
 };
 use crate::merge_allocation_entries;
 use crate::object_keys::*;
-use crate::persistence::{persist_state_with_pool, root_slot_for_transaction};
+use crate::persistence::{
+    next_mounted_commit_generation, persist_state_with_pool, root_slot_for_transaction,
+};
 use crate::read_content_from_store;
 use crate::read_content_layout_from_store;
 use crate::records::*;
@@ -362,6 +364,8 @@ pub(crate) fn load_latest_committed_state_pool(
                 let count = replay_uncommitted_with_pool(&log, &mut state, pool, &committed_base)?;
                 check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
                 if count > 0 {
+                    state.generation =
+                        next_mounted_commit_generation(state.generation, selected_root)?;
                     persist_state_with_pool(pool, &state, root_authentication_key)?;
                     let generation = state.generation;
                     for inode_id in state.dirty_inodes.iter().copied() {
