@@ -15594,18 +15594,25 @@ mod orphan_index_integration_tests {
     #[test]
     fn committed_burst_unlinks_drain_local_reclaim_in_one_tick() {
         let (_root, mut fs) = make_test_fs("reclaim_burst_commit_tick").expect("open");
+        eprintln!("reclaim-burst milestone: open");
         fs.set_auto_commit(false)
             .expect("test setup mutation must be admitted");
         fs.set_max_uncommitted_mutations(1_000)
             .expect("test setup mutation must be admitted");
+        eprintln!("reclaim-burst milestone: configured");
 
         for i in 0..180_u64 {
             let path = format!("/drop_{i}");
             fs.create_file(&path, 0o644).expect("create_file");
             fs.write_file(&path, 0, &[i as u8; 1024])
                 .expect("write_file");
+            if i % 30 == 29 {
+                eprintln!("reclaim-burst milestone: wrote {}", i + 1);
+            }
         }
+        eprintln!("reclaim-burst milestone: create/write loop complete");
         fs.do_commit().expect("initial commit");
+        eprintln!("reclaim-burst milestone: initial commit complete");
         assert_eq!(
             fs.reclaim_queue_depth(),
             0,
@@ -15617,7 +15624,11 @@ mod orphan_index_integration_tests {
         for i in 0..180_u64 {
             let path = format!("/drop_{i}");
             fs.unlink(&path).expect("unlink");
+            if i % 30 == 29 {
+                eprintln!("reclaim-burst milestone: unlinked {}", i + 1);
+            }
         }
+        eprintln!("reclaim-burst milestone: unlink loop complete");
 
         let queued_before_commit = fs.reclaim_queue_depth();
         assert!(
@@ -15630,6 +15641,7 @@ mod orphan_index_integration_tests {
         );
 
         fs.do_commit().expect("unlink commit");
+        eprintln!("reclaim-burst milestone: unlink commit complete");
 
         assert!(
             fs.reclaim_queue_depth() > 0,
@@ -15639,6 +15651,7 @@ mod orphan_index_integration_tests {
             fs.create_file(format!("/burst-root-advance-{index}"), 0o644)
                 .expect("advance burst fallback ring");
             fs.do_commit().expect("commit burst fallback-ring advance");
+            eprintln!("reclaim-burst milestone: fallback advance {index} complete");
         }
         assert_eq!(
             fs.reclaim_queue_depth(),
