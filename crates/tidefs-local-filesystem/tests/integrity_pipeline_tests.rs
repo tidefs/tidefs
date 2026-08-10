@@ -28,9 +28,7 @@ use tidefs_local_filesystem::{
     OnlineVerifierIssueKind, OnlineVerifierOutcome, DEFAULT_DIRECTORY_PERMISSIONS,
     DEFAULT_FILE_PERMISSIONS,
 };
-use tidefs_local_object_store::{
-    segment_file_name, LocalObjectStore, ObjectKey, StoreOptions, RECORD_HEADER_LEN,
-};
+use tidefs_local_object_store::{segment_file_name, LocalObjectStore, ObjectKey, StoreOptions};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -74,7 +72,11 @@ fn opts() -> StoreOptions {
 }
 
 fn seg_path(segments_dir: &Path, segment_id: u64) -> PathBuf {
-    segments_dir.join(segment_file_name(segment_id))
+    if segments_dir.is_file() || (segments_dir.exists() && !segments_dir.is_dir()) {
+        segments_dir.to_path_buf()
+    } else {
+        segments_dir.join(segment_file_name(segment_id))
+    }
 }
 
 fn corrupt_bytes(path: &Path, offset: u64, len: u64) {
@@ -96,16 +98,14 @@ fn corrupt_bytes(path: &Path, offset: u64, len: u64) {
 fn corrupt_object_payload(store: &LocalObjectStore, key: ObjectKey) {
     let loc = store.location_of(key).expect("object location");
     let path = seg_path(store.segments_dir(), loc.segment_id);
-    let payload_start = loc.record_offset + RECORD_HEADER_LEN as u64;
-    corrupt_bytes(&path, payload_start, (loc.payload_len / 2).max(1));
+    corrupt_bytes(&path, loc.payload_offset, (loc.payload_len / 2).max(1));
 }
 
 fn corrupt_record_trailer(store: &LocalObjectStore, key: ObjectKey) {
     let loc = store.location_of(key).expect("object location");
     let path = seg_path(store.segments_dir(), loc.segment_id);
-    let trailer_offset = loc.record_offset + RECORD_HEADER_LEN as u64 + loc.payload_len;
-    if trailer_offset > loc.record_offset + RECORD_HEADER_LEN as u64 {
-        corrupt_bytes(&path, trailer_offset, 1);
+    if loc.payload_len > 0 {
+        corrupt_bytes(&path, loc.payload_offset + loc.payload_len, 1);
     }
 }
 

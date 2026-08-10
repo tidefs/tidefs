@@ -791,7 +791,7 @@ mod corruption_detection {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     use tidefs_local_filesystem::LocalFileSystem;
-    use tidefs_local_object_store::{segment_file_name, StoreOptions, RECORD_HEADER_LEN};
+    use tidefs_local_object_store::{segment_file_name, StoreOptions};
 
     /// Flip a payload byte in every current record on the Pool data device.
     /// Returns the number of corrupted keys.
@@ -811,10 +811,14 @@ mod corruption_detection {
             if location.payload_len == 0 {
                 continue;
             }
-            let segment_path = store
-                .segments_dir()
-                .join(segment_file_name(location.segment_id));
-            let payload_offset = location.record_offset + RECORD_HEADER_LEN as u64;
+            let segments_dir = store.segments_dir();
+            let segment_path =
+                if segments_dir.is_file() || (segments_dir.exists() && !segments_dir.is_dir()) {
+                    segments_dir.to_path_buf()
+                } else {
+                    segments_dir.join(segment_file_name(location.segment_id))
+                };
+            let payload_offset = location.payload_offset;
             let mut file = fs::OpenOptions::new()
                 .read(true)
                 .write(true)

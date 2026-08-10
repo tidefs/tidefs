@@ -19,7 +19,8 @@ use tidefs_local_filesystem::{
     LocalFileSystem, DEFAULT_DIRECTORY_PERMISSIONS, DEFAULT_FILE_PERMISSIONS,
 };
 use tidefs_local_object_store::{
-    CrashInjectionConfig, FaultInjectionConfig, LocalObjectStore, ObjectKey, StoreOptions,
+    CrashInjectionConfig, FaultInjectionConfig, LocalObjectStore, ObjectKey, ObjectLocation,
+    StoreOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -347,6 +348,17 @@ fn corrupt_segment_byte(seg_path: &std::path::Path, offset: u64) {
     file.write_all(&buf).expect("write corrupted byte");
 }
 
+fn object_record_path(store: &LocalObjectStore, location: ObjectLocation) -> std::path::PathBuf {
+    let segments_dir = store.segments_dir();
+    if segments_dir.is_file() || (segments_dir.exists() && !segments_dir.is_dir()) {
+        segments_dir.to_path_buf()
+    } else {
+        segments_dir.join(tidefs_local_object_store::segment_file_name(
+            location.segment_id,
+        ))
+    }
+}
+
 /// Corrupt a single byte at the given offset in a segment file.
 // These tests extend the existing FaultInjectionConfig coverage with
 // filesystem-level scenarios that exercise the interaction between fault
@@ -448,13 +460,9 @@ fn scrub_detects_injected_byte_corruption() {
         for key in &keys {
             let locs = store.version_locations_of(*key);
             for loc in &locs {
-                let seg_path = store
-                    .segments_dir()
-                    .join(tidefs_local_object_store::segment_file_name(loc.segment_id));
-                let payload_start =
-                    loc.record_offset + tidefs_local_object_store::RECORD_HEADER_LEN as u64;
+                let seg_path = object_record_path(store, *loc);
                 // Corrupt a single byte in the payload, invalidating the checksum.
-                corrupt_segment_byte(&seg_path, payload_start);
+                corrupt_segment_byte(&seg_path, loc.payload_offset);
                 corrupted += 1;
                 if corrupted >= 3 {
                     break;
@@ -1495,19 +1503,14 @@ fn interrupted_repair_preserves_committed_data() {
         let pool = LocalFileSystem::default_development_pool(&root, &store_opts, None, None)
             .expect("open Pool for corruption");
         let store = pool.raw_primary_store();
-        let segments_dir = store.segments_dir().to_path_buf();
         let keys = store.list_keys();
 
         let mut corrupted = false;
         for key in &keys {
             let locs = store.version_locations_of(*key);
             if let Some(loc) = locs.first() {
-                let seg_path =
-                    segments_dir.join(tidefs_local_object_store::segment_file_name(loc.segment_id));
-                let payload_start =
-                    loc.record_offset + tidefs_local_object_store::RECORD_HEADER_LEN as u64;
-
-                corrupt_segment_byte(&seg_path, payload_start);
+                let seg_path = object_record_path(store, *loc);
+                corrupt_segment_byte(&seg_path, loc.payload_offset);
                 corrupted = true;
             }
             if corrupted {
@@ -1623,21 +1626,13 @@ fn missing_device_graceful_detection() {
     // -- Phase 2: Simulate loss of the configured Pool data device -------
     let pool = LocalFileSystem::default_development_pool(&root, &opts(), None, None)
         .expect("open Pool to locate data device");
-    let segments_dir = pool.raw_primary_store().segments_dir().to_path_buf();
+    let device_path = pool.raw_primary_store().segments_dir().to_path_buf();
     drop(pool);
     assert!(
-        segments_dir.is_dir(),
-        "segments dir must exist before device loss"
+        device_path.is_file(),
+        "selected Pool data device must exist before device loss"
     );
-
-    // Remove all segment files from the segments directory
-    for entry in std::fs::read_dir(&segments_dir).expect("read segments dir") {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        if path.is_file() {
-            std::fs::remove_file(&path).expect("remove segment file");
-        }
-    }
+    std::fs::remove_file(&device_path).expect("remove selected Pool data device");
 
     // -- Phase 3: Reopen after device loss -------------------------------
     // Two valid outcomes:
