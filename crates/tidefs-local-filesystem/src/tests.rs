@@ -4604,6 +4604,23 @@ fn auto_commit_disabled_batches_mutations() {
     assert!(fs.lookup("/a.txt").is_ok());
     assert!(fs.lookup("/b.txt").is_ok());
 
+    let committed = fs
+        .selected_committed_root_summary()
+        .expect("select batched committed root");
+    assert_ne!(
+        committed.transaction_id, committed.generation,
+        "fixture must separate publication identity from logical generation"
+    );
+
+    // A later commit reuses the clean /a.txt and /b.txt inode objects by the
+    // transaction that actually published them, not by the lower logical
+    // generation carried inside that root.
+    fs.create_file("/c.txt", 0o644).expect("create c.txt");
+    fs.commit().expect("commit after batched root");
+    assert!(fs.lookup("/a.txt").is_ok());
+    assert!(fs.lookup("/b.txt").is_ok());
+    assert!(fs.lookup("/c.txt").is_ok());
+
     drop(fs);
     cleanup(&root);
 }

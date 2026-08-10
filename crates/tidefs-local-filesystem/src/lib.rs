@@ -11738,7 +11738,7 @@ impl LocalFileSystem {
                     // authority still exists.
                     self.state = previous_state;
                     self.rollback_mutation_delta();
-                    self.mark_metalogue_clean()?;
+                    self.clear_metalogue_dirty_tracking()?;
                 }
                 Err(err)
             }
@@ -12928,7 +12928,7 @@ impl LocalFileSystem {
             // be retried, but must not restore live state behind this root.
             self.discard_mutation_delta();
             check_crash_hook(CrashInjectionPoint::CommitGroupAfterCommit);
-            self.mark_metalogue_clean()?;
+            self.mark_metalogue_committed(transaction_id)?;
         }
         // Persist quota table alongside committed state
         self.store.put(
@@ -13203,14 +13203,21 @@ impl LocalFileSystem {
         self.state.dirty_content.contains(&inode_id)
     }
 
-    fn mark_metalogue_clean(&mut self) -> Result<()> {
-        let generation = self.state.generation;
+    fn mark_metalogue_committed(&mut self, transaction_id: u64) -> Result<()> {
         for &inode_id in &self.state.dirty_inodes {
-            self.state.last_inode_write_tx.insert(inode_id, generation);
+            self.state
+                .last_inode_write_tx
+                .insert(inode_id, transaction_id);
         }
         for &inode_id in &self.state.dirty_dirs {
-            self.state.last_dir_write_tx.insert(inode_id, generation);
+            self.state
+                .last_dir_write_tx
+                .insert(inode_id, transaction_id);
         }
+        self.clear_metalogue_dirty_tracking()
+    }
+
+    fn clear_metalogue_dirty_tracking(&mut self) -> Result<()> {
         self.state.dirty_content.clear();
         self.state.dirty_inodes.clear();
         self.state.dirty_dirs.clear();
