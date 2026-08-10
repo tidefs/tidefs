@@ -145,7 +145,7 @@
             };
             cargoBuildFlags = [
               "--workspace"
-              "--features" "tidefsctl/full"
+              "--features" "tidefsctl/full,tidefs-posix-filesystem-adapter-daemon/full"
             ];
             workspaceBins = workspaceBins;
           };

@@ -90,6 +90,7 @@ pub mod fuse_vfs_adapter;
 pub mod handler_prelude;
 pub mod live_owner;
 pub mod lock_dispatch;
+#[cfg(feature = "workload-telemetry")]
 pub mod materialized_cache;
 pub mod mmap_coherency;
 
@@ -103,6 +104,7 @@ pub mod mount_options;
 pub mod read_cache;
 pub mod readdir_dispatch;
 pub mod txg_cycle;
+#[cfg(feature = "workload-telemetry")]
 pub mod workload_observer;
 pub mod write_dispatch;
 
@@ -116,6 +118,7 @@ pub mod clustered_mount;
 pub mod fusewire;
 pub mod ingress;
 pub mod maintenance;
+#[cfg(feature = "cluster")]
 pub mod placement_recorder;
 pub mod reply;
 pub mod runtime;
@@ -135,7 +138,8 @@ use tidefs_background_scheduler::{
 };
 use tidefs_dataset_lifecycle::SyncGuarantee;
 use tidefs_intent_log::IntentLogBuffer;
-use tidefs_performance_contract::{ScrubRuntimeObservation, ServiceCurve};
+#[cfg(feature = "scrub-observation")]
+use tidefs_performance_contract::ScrubRuntimeObservation;
 use tidefs_vfs_engine::{
     LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminOutput,
     LivePoolAdminRequest, LivePoolAdminResponseBody,
@@ -144,6 +148,10 @@ use tidefs_vfs_engine::{
 const MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 const MOUNT_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
 const MOUNT_FUSE_INIT_TIMEOUT_SECS: u64 = 5;
+// The selected local mount owns its bounded scrub work-per-tick policy.
+// Optional observations report this behavior but do not configure it.
+const MOUNT_SCRUB_MAX_RECORDS_PER_TICK: u64 = 1;
+const MOUNT_SCRUB_MAX_BYTES_PER_TICK: u64 = 1024 * 1024;
 
 /// Resolve an encryption configuration from a sealed pool key envelope file.
 ///
@@ -351,6 +359,7 @@ pub struct MountRuntimeOptions {
     /// Optional validation-only queue-depth artifact path.
     pub queue_depth_artifact: Option<PathBuf>,
     /// Optional validation-only mounted-scrub observation path.
+    #[cfg(feature = "scrub-observation")]
     pub scrub_runtime_observation_artifact: Option<PathBuf>,
 }
 
@@ -378,6 +387,7 @@ impl Default for MountRuntimeOptions {
             enable_repair_writeback: false,
             fault_inject_corruption: None,
             queue_depth_artifact: None,
+            #[cfg(feature = "scrub-observation")]
             scrub_runtime_observation_artifact: None,
         }
     }
@@ -501,10 +511,12 @@ pub enum MountAuthority {
     /// Standalone/local mount with no cluster lease material.
     Standalone,
     /// Cluster mount authorized by a validated pool lease token.
+    #[cfg(feature = "cluster")]
     ClusterLease(ClusterMountAuthority),
 }
 
 /// Raw mount authority material decoded at the daemon boundary.
+#[cfg(feature = "cluster")]
 #[derive(Debug, Clone, Copy)]
 pub enum MountAuthorityWire<'a> {
     Standalone {
@@ -517,6 +529,7 @@ pub enum MountAuthorityWire<'a> {
 }
 
 /// Validated cluster lease authority for a mounted pool.
+#[cfg(feature = "cluster")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterMountAuthority {
     token: tidefs_cluster::PoolLeaseToken,
@@ -527,6 +540,7 @@ impl MountAuthority {
         Self::Standalone
     }
 
+    #[cfg(feature = "cluster")]
     pub fn cluster_lease(
         expected_pool_guid: [u8; 16],
         token: tidefs_cluster::PoolLeaseToken,
@@ -535,6 +549,7 @@ impl MountAuthority {
         Ok(Self::ClusterLease(ClusterMountAuthority { token }))
     }
 
+    #[cfg(feature = "cluster")]
     pub fn from_wire(wire: MountAuthorityWire<'_>) -> Result<Self, String> {
         match wire {
             MountAuthorityWire::Standalone {
@@ -567,9 +582,17 @@ impl MountAuthority {
     }
 
     pub fn is_cluster_authorized(&self) -> bool {
-        matches!(self, Self::ClusterLease(_))
+        #[cfg(feature = "cluster")]
+        {
+            matches!(self, Self::ClusterLease(_))
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            false
+        }
     }
 
+    #[cfg(feature = "cluster")]
     fn validate_for_pool(
         &self,
         pool_uuid: Option<&[u8; 16]>,
@@ -587,12 +610,14 @@ impl MountAuthority {
     }
 }
 
+#[cfg(feature = "cluster")]
 impl ClusterMountAuthority {
     pub fn token(&self) -> &tidefs_cluster::PoolLeaseToken {
         &self.token
     }
 }
 
+#[cfg(feature = "cluster")]
 fn validate_cluster_lease_token(
     token: &tidefs_cluster::PoolLeaseToken,
     expected_pool_guid: &[u8; 16],
@@ -656,7 +681,9 @@ fn fuse_mount_options_for_mode(
 
 struct MountedBackgroundScrubService {
     store: tidefs_local_object_store::LocalObjectStore,
+    #[cfg(feature = "scrub-observation")]
     observation: ScrubRuntimeObservation,
+    #[cfg(feature = "scrub-observation")]
     observation_artifact: Option<PathBuf>,
     next_tick_not_before: std::time::Instant,
 }
@@ -667,20 +694,24 @@ impl MountedBackgroundScrubService {
     fn open(
         root: &Path,
         options: tidefs_local_object_store::StoreOptions,
-        observation_artifact: Option<PathBuf>,
+        #[cfg(feature = "scrub-observation")] observation_artifact: Option<PathBuf>,
     ) -> Result<Self, String> {
         let store = tidefs_local_object_store::LocalObjectStore::open_with_options(root, options)
             .map_err(|error| format!("open scheduled scrub store: {error}"))?;
         let service = Self {
             store,
+            #[cfg(feature = "scrub-observation")]
             observation: ScrubRuntimeObservation::new(std::process::id()),
+            #[cfg(feature = "scrub-observation")]
             observation_artifact,
             next_tick_not_before: std::time::Instant::now(),
         };
+        #[cfg(feature = "scrub-observation")]
         service.publish_observation()?;
         Ok(service)
     }
 
+    #[cfg(feature = "scrub-observation")]
     fn publish_observation(&self) -> Result<(), String> {
         if let Some(path) = self.observation_artifact.as_deref() {
             write_scrub_runtime_observation(path, &self.observation)?;
@@ -707,9 +738,8 @@ impl BackgroundService for MountedBackgroundScrubService {
     }
 
     fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
-        let curve = ServiceCurve::SCRUB_BOUNDED_DEFAULT;
-        let max_records = Self::bounded_limit(budget.max_items, u64::from(curve.max_ops_per_tick));
-        let max_bytes = Self::bounded_limit(budget.max_bytes, curve.max_bytes_per_tick);
+        let max_records = Self::bounded_limit(budget.max_items, MOUNT_SCRUB_MAX_RECORDS_PER_TICK);
+        let max_bytes = Self::bounded_limit(budget.max_bytes, MOUNT_SCRUB_MAX_BYTES_PER_TICK);
         let report = self
             .store
             .run_background_scrub_with_budget(max_records, max_bytes)
@@ -741,9 +771,11 @@ impl BackgroundService for MountedBackgroundScrubService {
                 std::time::Instant::now() + std::time::Duration::from_millis(budget.max_ms);
         }
 
+        #[cfg(feature = "scrub-observation")]
         let work_observed =
             report.segments_scanned > 0 || report.records_verified > 0 || report.bytes_scanned > 0;
         let work_pending = self.store.background_scrub_pending();
+        #[cfg(feature = "scrub-observation")]
         if work_observed {
             self.observation.record_admitted_cycle(
                 report.records_verified,
@@ -785,6 +817,7 @@ impl BackgroundService for MountedBackgroundScrubService {
     }
 }
 
+#[cfg(feature = "scrub-observation")]
 fn write_scrub_runtime_observation(
     path: &Path,
     observation: &ScrubRuntimeObservation,
@@ -931,11 +964,13 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     if snapshot_export && config.runtime.queue_depth_artifact.is_some() {
         return Err("queue-depth artifacts are not supported for snapshot export mounts".into());
     }
+    #[cfg(feature = "scrub-observation")]
     if snapshot_export && config.runtime.scrub_runtime_observation_artifact.is_some() {
         return Err(
             "scrub runtime observations are not supported for snapshot export mounts".into(),
         );
     }
+    #[cfg(feature = "scrub-observation")]
     if effective_mode.background_scrub_interval_secs == 0
         && config.runtime.scrub_runtime_observation_artifact.is_some()
     {
@@ -944,10 +979,10 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         );
     }
 
+    #[cfg(feature = "cluster")]
     let cluster_lease_token = config
         .mount_authority
         .validate_for_pool(config.pool_uuid.as_ref())?;
-
     if !snapshot_export {
         fs::create_dir_all(&config.backing_dir)
             .map_err(|e| format!("create backing dir {}: {e}", config.backing_dir.display()))?;
@@ -1188,6 +1223,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     };
 
     // When cluster-authorized, wrap the engine in a placement-recording layer.
+    #[cfg(feature = "cluster")]
     let vfs_engine: Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send> =
         if let Some(token) = cluster_lease_token {
             let member_id = token.node_id;
@@ -1202,6 +1238,8 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         } else {
             Box::new(base_engine)
         };
+    #[cfg(not(feature = "cluster"))]
+    let vfs_engine: Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send> = Box::new(base_engine);
     let mut adapter = fuse_vfs_adapter::FuseVfsAdapter::new(vfs_engine)
         .map_err(|e| format!("adapter init: {e:?}"))?
         .with_coherency_profile(config.coherency_profile);
@@ -1268,12 +1306,15 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             reclaim_enabled: config.runtime.enable_reclaim,
             ..tidefs_local_object_store::StoreOptions::default()
         };
-        let observation_required = config.runtime.scrub_runtime_observation_artifact.is_some();
-        match MountedBackgroundScrubService::open(
+        #[cfg(feature = "scrub-observation")]
+        let scrub_service = MountedBackgroundScrubService::open(
             &config.backing_dir,
             scrub_options,
             config.runtime.scrub_runtime_observation_artifact.clone(),
-        ) {
+        );
+        #[cfg(not(feature = "scrub-observation"))]
+        let scrub_service = MountedBackgroundScrubService::open(&config.backing_dir, scrub_options);
+        match scrub_service {
             Ok(service) => {
                 adapter.register_background_service(Box::new(service));
                 eprintln!(
@@ -1281,7 +1322,8 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                     effective_mode.background_scrub_interval_secs
                 );
             }
-            Err(error) if observation_required => {
+            #[cfg(feature = "scrub-observation")]
+            Err(error) if config.runtime.scrub_runtime_observation_artifact.is_some() => {
                 return Err(format!("background-scrub: {error}"));
             }
             Err(error) => {
@@ -1740,7 +1782,20 @@ pub fn check_idmapped_mount(mountpoint: &std::path::Path) -> Result<(), String> 
 }
 
 #[cfg(test)]
-mod mount_authority_tests {
+mod standalone_mount_authority_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_mount_authority_is_local_only() {
+        let authority = MountAuthority::standalone();
+
+        assert!(matches!(authority, MountAuthority::Standalone));
+        assert!(!authority.is_cluster_authorized());
+    }
+}
+
+#[cfg(all(test, feature = "cluster"))]
+mod cluster_mount_authority_tests {
     use super::*;
     use tidefs_cluster::{EpochId, PoolLeaseToken, WriteFence};
 
@@ -1761,14 +1816,6 @@ mod mount_authority_tests {
 
     fn token_bytes(token: &PoolLeaseToken) -> Vec<u8> {
         bincode::serialize(token).expect("serialize lease token")
-    }
-
-    #[test]
-    fn standalone_mount_authority_is_local_only() {
-        let authority = MountAuthority::standalone();
-
-        assert!(!authority.is_cluster_authorized());
-        assert!(authority.validate_for_pool(None).unwrap().is_none());
     }
 
     #[test]

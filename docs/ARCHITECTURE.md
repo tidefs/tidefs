@@ -95,12 +95,21 @@ ones in the default graph:
   help, source modules, and direct dependency edges therefore carry only the
   local pool, mount, device, dataset, snapshot, defrag, live-owner, and status
   families.
-- Remaining block-core, cluster, membership, transport, recovery-loop, and
-  storage-intent-core reachability has a demonstrated source path through the
-  still-required POSIX daemon, `tidefs-local-filesystem`, or their local
-  dependencies. The next daemon and LocalFileSystem slices must contract those
-  owners; the CLI slice does not hide them with placeholder types or a second
-  carrier.
+- The POSIX daemon now has 35 direct normal dependencies in its default local
+  build and 41 with its explicit `full` feature. Its default has no direct
+  normal edge to block-volume core, `bincode`, cluster, performance-contract,
+  POSIX receipt schema/package-profile, or workload packages. `cluster`,
+  `receipt-demo`, `scrub-observation`, and `workload-telemetry` each own one
+  optional source/dependency family; `full` aggregates those four for retained
+  development packaging.
+- The daemon's default normal tree still reaches 108 of 166 workspace packages
+  (200 total packages including external crates), versus 111 workspace and 203
+  total with `full`. The remaining cluster, membership, transport,
+  performance-contract, and storage-policy reachability comes through required
+  deeper owners such as `tidefs-local-filesystem`, `tidefs-local-object-store`,
+  `tidefs-orphan-index`, and their dependencies. The LocalFileSystem slice must
+  contract those paths; this adapter slice neither hides them nor overstates
+  their removal.
 - `fuse_vfs_adapter.rs` is 43,876 lines, `local-filesystem/src/lib.rs` is
   17,692, `vfs_engine_impl.rs` is 16,391, and the binary daemon `main.rs` is
   3,900 lines. The remaining size is concentrated in three
@@ -110,13 +119,20 @@ ones in the default graph:
 - The daemon validation CLI now reaches the same library runtime as
   `tidefsctl`; it no longer constructs a second recovery, namespace, FUSE, or
   shutdown stack.
-- The adapter's direct normal dependencies include cluster, block, validation,
-  workload, performance-contract, and schema families.
-  `tidefsctl` now owns block-volume, cluster/transport, kernel/validation
+- The default daemon's public mount authority is standalone-only. Cluster lease
+  decoding, cluster authority types, placement wrapping, and their tests compile
+  only with `cluster`. Receipt-demo parsing/help/source compiles only with
+  `receipt-demo`; mounted scrub observation configuration and output compile
+  only with `scrub-observation`; workload observation/cache modules and their
+  read/write/fsync logging hooks compile only with `workload-telemetry`.
+  Production scrub scheduling remains local runtime behavior bounded to one
+  record and one MiB per tick whether or not observation is compiled.
+- `tidefsctl` owns block-volume, cluster/transport, kernel/validation
   diagnostics, receive-merge, remote snapshot transport, and storage-intent
-  policy command families behind explicit Cargo features. The default package
-  has no direct normal edge to those optional-only packages; full and focused
-  Nix consumers select the required features explicitly.
+  policy command families behind explicit Cargo features. Its `cluster` feature
+  selects the daemon cluster boundary, while full workspace Nix packaging
+  selects both `tidefsctl/full` and daemon `full`. Focused default daemon
+  packaging remains standalone-local.
 
 This is the governing diagnosis: TideFS's first product spine is obscured by a
 large default dependency closure and duplicate authorities. Particular defects
