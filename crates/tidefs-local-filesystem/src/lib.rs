@@ -15295,6 +15295,58 @@ mod orphan_index_integration_tests {
     fn reclaim_ambiguous_delete_does_not_decrement_dedup_refcount() {
         let (_root, mut fs, redirect_key, canonical_key, fingerprint, refcount_before) =
             dedup_reclaim_fixture("reclaim_delete_failure_refcount");
+
+        // Isolate the redirect as an actual reclaim candidate. The committed
+        // fixture root still references it, so first unlink the file while
+        // withholding only this exact key from normal reclaim, then retire
+        // every fallback root that can still name the old content.
+        fs.unlink("/dedup.bin").expect("unlink dedup file");
+        let redirect_reclaim_key = ReclaimObjectKey(*redirect_key.as_bytes());
+        assert!(
+            fs.reclaim_queue
+                .lock()
+                .unwrap()
+                .delete(&redirect_reclaim_key),
+            "unlink must queue the exact dedup redirect"
+        );
+        fs.do_commit().expect("commit dedup unlink");
+        assert!(
+            fs.collect_reclaim_protected_content_keys()
+                .expect("collect retained-root content keys")
+                .contains(&redirect_key),
+            "the pre-unlink fallback root must initially protect the redirect"
+        );
+        for index in 0..FILESYSTEM_ROOT_SLOT_COUNT.saturating_sub(1) {
+            fs.create_file(format!("/redirect-root-advance-{index}"), 0o644)
+                .expect("advance redirect fallback ring");
+            fs.do_commit()
+                .expect("commit redirect fallback-ring advance");
+        }
+        assert!(
+            !fs.collect_reclaim_protected_content_keys()
+                .expect("collect retired-root content keys")
+                .contains(&redirect_key),
+            "the redirect must become reclaimable after its content root retires"
+        );
+        assert_eq!(
+            fs.reclaim_queue_depth(),
+            0,
+            "other unlink obligations must drain after fallback-root retirement"
+        );
+        assert!(
+            fs.store
+                .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
+                .expect("strict retained redirect read")
+                .is_some(),
+            "withholding the exact queue entry must retain the redirect for fault injection"
+        );
+        assert_eq!(
+            crate::dedup_refcount::DedupRefCount::read(fs.store.raw_primary_store(), &fingerprint,)
+                .expect("read refcount before injected delete"),
+            refcount_before,
+            "fixture setup must preserve canonical lifetime"
+        );
+
         let queued = enqueue_exact_reclaim_entry(&fs, redirect_key);
         fs.persist_local_reclaim_queue(true)
             .expect("persist exact queue before injecting handoff failure");
