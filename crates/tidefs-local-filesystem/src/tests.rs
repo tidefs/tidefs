@@ -11057,8 +11057,7 @@ fn quorum_single_replica_opens_and_works() {
     let content = b"single replica data";
     fs.create_file("/solo", 0o644).expect("create file");
     fs.write_file("/solo", 0, content).expect("write file");
-    fs.fsync_file("/solo")
-        .expect("fsync single-replica file");
+    fs.fsync_file("/solo").expect("fsync single-replica file");
 
     let read_back = fs.read_file("/solo").expect("read file");
     assert_eq!(read_back, content);
