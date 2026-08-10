@@ -2363,6 +2363,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "replication-io")]
     fn inode_payload_with_format_version(version: u16) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&INODE_MAGIC);

@@ -1463,6 +1463,7 @@ mod tests {
         fs.lifecycle().stats().per_root_pins[TraversalRootType::SnapshotCatalog.to_u8() as usize]
     }
 
+    #[cfg(feature = "replication-io")]
     fn snapshot_root(summary: &SnapshotSummary) -> TraversalRoot {
         TraversalRoot::new(
             TraversalRootType::SnapshotCatalog,
