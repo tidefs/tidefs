@@ -8369,6 +8369,7 @@ fn incremental_send_receive_skips_unchanged_objects() {
     cleanup(&target_root);
 }
 
+#[cfg(feature = "replication-io")]
 struct IncrementalReceiveFixture {
     source_root: PathBuf,
     target_root: PathBuf,
