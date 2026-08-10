@@ -24,8 +24,8 @@ use crate::intent_log::{
 use crate::merge_allocation_entries;
 use crate::object_keys::*;
 use crate::persistence::{
-    next_mounted_commit_transaction_id, persist_state_with_pool,
-    persist_state_with_pool_at_transaction, root_slot_for_transaction,
+    next_mounted_commit_transaction_id, persist_state_with_pool_at_transaction,
+    root_slot_for_transaction,
 };
 use crate::read_content_from_store;
 use crate::read_content_layout_from_store;
