@@ -6393,7 +6393,7 @@ impl LocalFileSystem {
         self.sync_all()?;
         let current_root = self.selected_current_root_summary()?;
         export_changed_records_from_root(
-            self.store.raw_primary_store_mut(),
+            &mut self.store,
             &current_root,
             &self.state,
             self.root_authentication_key,
@@ -6417,7 +6417,7 @@ impl LocalFileSystem {
         self.sync_all()?;
         let to_root = self.selected_current_root_summary()?;
         export_incremental_changed_records(
-            self.store.raw_primary_store_mut(),
+            &mut self.store,
             from_root,
             &to_root,
             &self.state,
