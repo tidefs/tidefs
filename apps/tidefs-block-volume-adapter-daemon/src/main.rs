@@ -1649,10 +1649,9 @@ fn run_ublk_reconnect() -> Result<(), AppError> {
 #[allow(unsafe_code)]
 fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), AppError> {
     let args: Vec<String> = std::env::args().collect();
-    let config = parse_ublk_serve_args(&args[2..], cli_nr_hw_queues).map_err(|err| {
+    let config = parse_ublk_serve_args(&args[2..], cli_nr_hw_queues).inspect_err(|err| {
         eprintln!("tidefs ublk-serve: {}", err.message);
         eprintln!("{UBLK_SERVE_USAGE}");
-        err
     })?;
 
     let geometry = BlockVolumeGeometryRecord::new(
