@@ -338,10 +338,13 @@
             };
             cargoBuildFlags = [
               "-p" "tidefs-posix-filesystem-adapter-daemon"
+              "-p" "tidefsctl"
               "--bin" "tidefs-posix-filesystem-adapter-daemon"
+              "--bin" "tidefsctl"
             ];
             workspaceBins = [
               "tidefs-posix-filesystem-adapter-daemon"
+              "tidefsctl"
             ];
           };
 
@@ -3226,7 +3229,7 @@ EOF
           poolRemountLifecycleValidation = import ./nix/vm/pool-remount-lifecycle-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
-            tidefsPackage = default;
+            tidefsPackage = tidefsFuseRuntime;
           };
 
 

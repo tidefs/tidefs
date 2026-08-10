@@ -132,7 +132,9 @@ ones in the default graph:
   policy command families behind explicit Cargo features. Its `cluster` feature
   selects the daemon cluster boundary, while full workspace Nix packaging
   selects both `tidefsctl/full` and daemon `full`. Focused default daemon
-  packaging remains standalone-local.
+  packaging contains default `tidefsctl` plus the default daemon and supplies
+  the pool-remount lifecycle row, so that outer carrier test has no optional
+  daemon feature compiled in.
 
 This is the governing diagnosis: TideFS's first product spine is obscured by a
 large default dependency closure and duplicate authorities. Particular defects
