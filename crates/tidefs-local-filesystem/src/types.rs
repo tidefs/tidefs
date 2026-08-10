@@ -2301,6 +2301,7 @@ impl ContentCompressionPolicy {
         }
     }
 
+    #[cfg(any(test, feature = "data-policy"))]
     pub(crate) fn off() -> Self {
         Self {
             algorithm: ContentCompressionAlgorithm::None,

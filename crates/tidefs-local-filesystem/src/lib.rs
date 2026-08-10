@@ -330,6 +330,7 @@ pub mod receive_persistence;
 mod records;
 mod recovery;
 pub mod release_dispatch;
+#[cfg(any(test, feature = "distributed-repair"))]
 mod repair;
 mod scrub;
 #[cfg(feature = "distributed-repair")]
@@ -1939,6 +1940,7 @@ pub struct LocalFileSystem {
     #[cfg(feature = "data-policy")]
     cleanup_engine: Option<CleanupEngine<Box<dyn JobExecutor + Send>>>,
     /// Current placement epoch for send/receive stream attribution.
+    #[cfg(feature = "replication-io")]
     placement_epoch: Option<u64>,
 }
 
@@ -2500,7 +2502,7 @@ impl LocalFileSystem {
 
     /// Set the current placement epoch for send/receive stream attribution.
     /// Callers in the multi-node stack should set this before exporting.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "replication-io"))]
     pub(crate) fn set_placement_epoch(&mut self, epoch: u64) -> Result<()> {
         self.ensure_mutation_allowed("set mounted placement epoch")?;
         self.placement_epoch = Some(epoch);
@@ -4072,6 +4074,7 @@ impl LocalFileSystem {
             mounted_dataset_id: ROOT_DATASET_ID,
             quota_hierarchy: None,
             quota_parent_map: HashMap::new(),
+            #[cfg(feature = "replication-io")]
             placement_epoch: None,
             #[cfg(feature = "data-policy")]
             cleanup_engine: None,
@@ -4556,6 +4559,7 @@ impl LocalFileSystem {
     /// This is an internal correctness gate for mounted operations that make
     /// authorization decisions from root contents. Public recovery diagnostics
     /// intentionally retain their raw repair-store scope until #2377.
+    #[cfg(feature = "replication-io")]
     pub(crate) fn recovery_audit_pool_authority(&mut self) -> Result<RecoveryAuditReport> {
         audit_recovery_pool(&mut self.store, self.root_authentication_key)
     }

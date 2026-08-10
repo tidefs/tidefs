@@ -9,9 +9,9 @@ use tidefs_storage_intent_read_serving::ReadServingDecisionRecord;
 use tidefs_types_space_accounting_core::AdmissionResult;
 use tidefs_types_vfs_core::{InodeId, LockConflict, NodeKind};
 
-use crate::types::{
-    CommittedRootSummary, CrashRecoveryExpectation, FilesystemCommitBoundary, LocalStorageResource,
-};
+#[cfg(feature = "replication-io")]
+use crate::types::CommittedRootSummary;
+use crate::types::{CrashRecoveryExpectation, FilesystemCommitBoundary, LocalStorageResource};
 
 #[cfg(feature = "replication-io")]
 pub const INCREMENTAL_RECEIVE_BASE_ROOT_CONFLICT_OPERATOR_ACTIONS: &str =

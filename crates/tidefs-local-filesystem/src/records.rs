@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+#[cfg(feature = "replication-io")]
 use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
 
-use tidefs_local_object_store::{IntegrityDigest64, ObjectKey};
+use tidefs_local_object_store::IntegrityDigest64;
+#[cfg(feature = "replication-io")]
+use tidefs_local_object_store::ObjectKey;
 use tidefs_types_vfs_core::InodeId;
 
 use crate::types::*;
@@ -189,12 +192,14 @@ pub(crate) enum ContentLayout {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[cfg(feature = "replication-io")]
 pub(crate) struct RootIdentity {
     pub(crate) transaction_id: u64,
     pub(crate) generation: u64,
     pub(crate) superblock_checksum: u64,
 }
 
+#[cfg(feature = "replication-io")]
 impl RootIdentity {
     pub(crate) fn from_summary(summary: &CommittedRootSummary) -> Self {
         Self {

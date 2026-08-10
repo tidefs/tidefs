@@ -1589,6 +1589,7 @@ pub(crate) fn snapshot_retained_roots(state: &FileSystemState) -> Vec<CommittedR
     roots
 }
 
+#[cfg(feature = "replication-io")]
 pub(crate) fn roots_with_snapshot_roots(
     mut roots: Vec<CommittedRootSummary>,
     state: &FileSystemState,

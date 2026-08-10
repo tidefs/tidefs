@@ -32,6 +32,7 @@ pub struct DedupStats {
 impl DedupStats {
     /// Dedup ratio: total_chunks / (total_chunks - dedup_hits), or 0.0 if
     /// no chunks have been written.
+    #[cfg(feature = "data-policy")]
     pub fn dedup_ratio(&self) -> f64 {
         let unique = self.total_chunks.saturating_sub(self.dedup_hits);
         if unique == 0 {
@@ -89,6 +90,7 @@ impl DedupIndex {
         }
     }
 
+    #[cfg(feature = "data-policy")]
     pub fn record_dedup_hit(&mut self, bytes: u64) {
         self.stats.dedup_hits += 1;
         self.stats.dedup_bytes_saved += bytes;
@@ -98,6 +100,7 @@ impl DedupIndex {
         self.stats.total_chunks += 1;
     }
 
+    #[cfg(feature = "data-policy")]
     pub fn stats(&self) -> DedupStats {
         self.stats
     }

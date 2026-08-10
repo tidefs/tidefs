@@ -1136,6 +1136,7 @@ fn read_chunk_bytes_with_receipt(
     }
 }
 
+#[cfg(feature = "data-policy")]
 fn encode_new_canonical_chunk<S: ContentWriteStore>(
     store: &mut S,
     record: &InodeRecord,

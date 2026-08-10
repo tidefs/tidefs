@@ -554,6 +554,7 @@ fn record_scrubbed_block(report: &mut ScrubReport, scrubbed: ScrubbedBlock) {
     }
 }
 
+#[cfg(any(test, feature = "distributed-repair"))]
 pub(crate) fn scrub_inodes_content(
     store: &LocalObjectStore,
     inodes: &BTreeMap<InodeId, InodeRecord>,
@@ -615,6 +616,7 @@ pub(crate) fn scrub_inodes_content_with_pool(
 
 /// Possible actions for resolving a corrupt block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, feature = "distributed-repair"))]
 pub enum RepairStrategy {
     /// Retry from a replica (not yet implemented — requires redundancy).
     #[cfg(feature = "distributed-repair")]

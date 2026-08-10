@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "replication-io")]
 use std::io::Cursor;
 
+#[cfg(feature = "replication-io")]
 use tidefs_extent_map::ExtentMap;
 use tidefs_local_object_store::{checksum64, IntegrityDigest64, ObjectKey};
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind};
