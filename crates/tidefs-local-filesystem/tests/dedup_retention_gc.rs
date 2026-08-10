@@ -10,7 +10,9 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use tidefs_local_filesystem::{LocalFileSystem, DEFAULT_FILE_PERMISSIONS};
+use tidefs_local_filesystem::{
+    LocalFileSystem, DEFAULT_FILE_PERMISSIONS, FILESYSTEM_ROOT_SLOT_COUNT,
+};
 
 const CHUNK_SIZE: usize = 65536;
 const DATA_SIZE: usize = CHUNK_SIZE; // single chunk for simple fingerprint tracking
@@ -126,21 +128,50 @@ fn canonical_object_reclaimed_after_all_files_deleted() {
         );
     }
 
-    // Delete the file — canonical refcount should reach 0.
-    // The reclaim drain in tick_background_services processes the
-    // chunk key, detects the dedup redirect (for the first-file case
-    // the per-inode key stores inline data, not a redirect, so the
-    // canonical object retains its anchor refcount=1 until the reclaim
-    // drain also deletes the canonical data key).
-    //
-    // Force a reclaim drain to push the deletion through.
+    // Delete and close before the retained fallback ring advances. The
+    // per-inode chunk is a redirect even for the first deduplicated write;
+    // its exact reclaim obligation must survive this reopen boundary.
     {
         let mut fs = open_fs(&dir);
         fs.unlink("/only.bin").expect("unlink");
         fs.sync_all().expect("sync");
-        // Drive reclaim drain.
+        assert!(
+            fs.reclaim_queue_depth() > 0,
+            "the pre-delete fallback root must keep exact content reclaim pending"
+        );
+    }
+
+    // Reopen proves the local queue is durable. Reclaim must remain pending
+    // while the pre-delete root can still be selected. Then publish enough
+    // later roots to retire every slot that can reference the deleted file.
+    {
+        let mut fs = open_fs(&dir);
+        assert!(
+            fs.reclaim_queue_depth() > 0,
+            "exact reclaim obligations must survive close/reopen"
+        );
         fs.tick_background_services()
             .expect("tick background services");
+        assert!(
+            fs.reclaim_queue_depth() > 0,
+            "reclaim must not bypass a still-mountable fallback root"
+        );
+
+        for index in 0..FILESYSTEM_ROOT_SLOT_COUNT {
+            fs.create_file(
+                format!("/retire-fallback-{index}"),
+                DEFAULT_FILE_PERMISSIONS,
+            )
+            .expect("publish post-delete mutation");
+            fs.sync_all().expect("commit post-delete mutation");
+        }
+        fs.tick_background_services()
+            .expect("drain after fallback retirement");
+        assert_eq!(
+            fs.reclaim_queue_depth(),
+            0,
+            "exact queue must drain after every referencing fallback root retires"
+        );
     }
 
     // Reopen with dedup enabled and write the same content again.

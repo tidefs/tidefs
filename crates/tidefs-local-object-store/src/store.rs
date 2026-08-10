@@ -108,6 +108,13 @@ const BLOCK_DATA_FORMAT_VERSION: u32 = 1;
 const FORMAT_MANIFEST_FILE_NAME: &str = "format_manifest";
 /// Well-known object name for committed compaction publication manifests.
 const COMPACTION_PUBLISH_MANIFEST_OBJECT_NAME: &str = "tidefs-compaction-publish-manifest";
+/// Well-known object name for the mounted filesystem's exact deferred-reclaim queue.
+///
+/// This is distinct from the object-store's physical reclaim queues: the
+/// filesystem queue retains logical object-key obligations until every
+/// mountable root has stopped referencing them and `Pool::delete()` has
+/// completed the receipt-authoritative handoff.
+pub const FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME: &str = "tidefs-filesystem-reclaim-queue-v1";
 /// Prefix for hidden target objects staged by verified compaction rewrites.
 const COMPACTION_TARGET_KEY_PREFIX: [u8; 8] = *b"TFSCMPCT";
 const COMPACTION_MANIFEST_MAGIC: &[u8; 8] = b"TFSCMPM1";
@@ -611,8 +618,8 @@ fn is_compaction_target_key(key: ObjectKey) -> bool {
     key.as_bytes()[..8] == COMPACTION_TARGET_KEY_PREFIX
 }
 
-fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 6] {
-    static KEYS: OnceLock<[ObjectKey; 6]> = OnceLock::new();
+fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 7] {
+    static KEYS: OnceLock<[ObjectKey; 7]> = OnceLock::new();
     KEYS.get_or_init(|| {
         [
             ObjectKey::from_name(RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
@@ -620,6 +627,7 @@ fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 6] {
             ObjectKey::from_name(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
             ObjectKey::from_name(RECLAIM_RECEIPTS_OBJECT_NAME.as_bytes()),
             ObjectKey::from_name(SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME.as_bytes()),
+            ObjectKey::from_name(FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
             compaction_publish_manifest_key(),
         ]
     })

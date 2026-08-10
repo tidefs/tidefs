@@ -398,7 +398,7 @@ use tidefs_local_object_store::{
     DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, EncryptionConfig, IntegrityDigest64,
     IoClass, LocalObjectStore, ObjectKey, ObjectLocation, Pool, PoolConfig, PoolProperties,
     PoolRedundancyPolicy, StoreEncryptionKey, StoreError, StoreOptions, SuspectLogStats,
-    DEFAULT_MAX_SEGMENT_BYTES, RECORD_OVERHEAD_BYTES,
+    DEFAULT_MAX_SEGMENT_BYTES, FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME, RECORD_OVERHEAD_BYTES,
 };
 use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex};
 #[cfg(feature = "quorum-write")]
@@ -477,6 +477,81 @@ fn map_feature_flags_load_error(
             }
         }
     }
+}
+
+fn filesystem_reclaim_queue_object_key() -> ObjectKey {
+    ObjectKey::from_name(FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME.as_bytes())
+}
+
+/// Load the mounted filesystem's exact deferred-reclaim obligations through
+/// current Pool placement authority. Missing state is the pre-queue/empty
+/// case; malformed bytes or uncertain receipts refuse the mount.
+fn load_filesystem_reclaim_queue(store: &Pool) -> Result<BPlusTreeReclaimQueue> {
+    let Some((bytes, _receipt)) = store
+        .get_with_current_receipt(DeviceIoClass::Data, filesystem_reclaim_queue_object_key())?
+    else {
+        return Ok(BPlusTreeReclaimQueue::new());
+    };
+    let queue =
+        BPlusTreeReclaimQueue::decode(&bytes).map_err(|_| FileSystemError::CorruptState {
+            reason: "mounted filesystem reclaim queue failed integrity-checked decode",
+        })?;
+    queue
+        .validate()
+        .map_err(|_| FileSystemError::CorruptState {
+            reason: "mounted filesystem reclaim queue failed B+tree validation",
+        })?;
+    Ok(queue)
+}
+
+/// Derive the exact content keys named by one inode record. Chunk keys come
+/// from the strict Pool-readable manifest, including each chunk reference's
+/// own data version; they are never guessed from raw-store scans.
+fn inode_content_reclaim_entries(
+    store: &Pool,
+    record: &InodeRecord,
+    include_chunks: bool,
+) -> Result<Vec<ReclaimQueueEntry>> {
+    if record.size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut keys = BTreeSet::new();
+    keys.insert(content_object_key_for_version(
+        record.inode_id,
+        record.data_version,
+    ));
+    keys.insert(content_object_key_for_version(record.inode_id, 0));
+
+    if include_chunks {
+        match MountedContentReadAuthority::new(store).read_layout(record.inode_id, record)? {
+            ContentLayout::Inline(_) => {}
+            ContentLayout::Chunked(manifest) => {
+                for chunk_ref in manifest
+                    .chunks
+                    .iter()
+                    .filter(|chunk_ref| !chunk_ref.is_hole())
+                {
+                    keys.insert(content_chunk_object_key_for_version(
+                        manifest.inode_id,
+                        chunk_ref.data_version,
+                        chunk_ref.chunk_index,
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(keys
+        .into_iter()
+        .map(|key| {
+            ReclaimQueueEntry::new(
+                ReclaimObjectKey(*key.as_bytes()),
+                -1,
+                ReclaimQueueFamily::Extent,
+            )
+        })
+        .collect())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3882,6 +3957,7 @@ impl LocalFileSystem {
             )
         };
         drop(open_recovery);
+        let reclaim_queue_inner = load_filesystem_reclaim_queue(&store)?;
         // Reconstruct snapshot GC pins from the durable snapshot catalog.
         // Each snapshot root is pinned by full TraversalRoot identity so the GC
         // treats its object graph as reachable. Without this step, snapshot
@@ -4058,7 +4134,7 @@ impl LocalFileSystem {
             #[cfg(feature = "distributed-repair")]
             scrub_repair_schedule: None,
             scrub_corruption_detected: None,
-            reclaim_queue: Arc::new(Mutex::new(BPlusTreeReclaimQueue::new())),
+            reclaim_queue: Arc::new(Mutex::new(reclaim_queue_inner)),
             deferred_rewrite_trims: Vec::new(),
             total_reclaim_drains: 0,
             total_reclaim_entries_drained: 0,
@@ -4289,14 +4365,16 @@ impl LocalFileSystem {
                 reason: "dataset lifecycle refused mount",
             });
         }
-        // Mount-time orphan cleanup: synchronously reclaim all orphaned
-        // inodes (nlink==0 after unclean shutdown) before accepting I/O.
-        // Content objects, extent maps, stale directory entries, and
-        // block allocator space are freed for each orphaned inode.
+        // Mount-time orphan cleanup: synchronously reconcile every orphan
+        // (nlink==0 after unclean shutdown) before accepting I/O. Exact
+        // content keys are queued through strict Pool authority and made
+        // durable before the cleanup root; no raw content scan participates.
         // BackgroundOrphanReclamation handles incremental runtime orphans.
         if recovery_policy.allows_any_mutation() {
-            if let Err(e) = fs.cleanup_orphans() {
-                eprintln!("warning: mount-time orphan cleanup failed: {e}");
+            let cleanup = fs.cleanup_orphans()?;
+            if !cleanup.is_idle() {
+                fs.do_commit()?;
+                fs.store.sync_all()?;
             }
         }
 
@@ -4601,6 +4679,56 @@ impl LocalFileSystem {
         self.root_retention_plan(RootRetentionPolicy::safe_default())
     }
 
+    /// Persist the exact mounted reclaim queue through current Pool receipt
+    /// authority. The encoded queue is compared before writing so ordinary
+    /// commits do not manufacture replacement placements for unchanged state.
+    ///
+    /// When `durability_required` is true, `sync_all` runs even if the queue
+    /// bytes were already current. Reclaim uses that mode to order redirect
+    /// deletion/refcount handoff before completed original entries disappear.
+    fn persist_local_reclaim_queue(&mut self, durability_required: bool) -> Result<bool> {
+        let encoded = self.reclaim_queue.lock().unwrap().encode();
+        let key = filesystem_reclaim_queue_object_key();
+        let current = self
+            .store
+            .get_with_current_receipt(DeviceIoClass::Data, key)?;
+
+        let changed = match current {
+            Some((current_bytes, _receipt)) => {
+                let current_queue =
+                    BPlusTreeReclaimQueue::decode(&current_bytes).map_err(|_| {
+                        FileSystemError::CorruptState {
+                            reason:
+                                "mounted filesystem reclaim queue failed integrity-checked decode",
+                        }
+                    })?;
+                current_queue
+                    .validate()
+                    .map_err(|_| FileSystemError::CorruptState {
+                        reason: "mounted filesystem reclaim queue failed B+tree validation",
+                    })?;
+                if current_bytes == encoded {
+                    false
+                } else {
+                    self.store
+                        .put_with_receipt(DeviceIoClass::Data, key, &encoded)?;
+                    true
+                }
+            }
+            None if self.reclaim_queue.lock().unwrap().is_empty() => false,
+            None => {
+                self.store
+                    .put_with_receipt(DeviceIoClass::Data, key, &encoded)?;
+                true
+            }
+        };
+
+        if durability_required {
+            self.store.sync_all()?;
+        }
+        Ok(changed)
+    }
+
     /// Record reclaim deltas for freed content objects into the shared
     /// reclaim queue for deferred background processing.  Called by file
     /// operations (unlink, truncate, rename-overwrite) when content is
@@ -4611,9 +4739,9 @@ impl LocalFileSystem {
     ///
     /// # Key authority (fixed #5959)
     ///
-    /// Uses exact versioned content-object keys via
-    /// `content_object_key_for_version()`, matching the orphan cleanup path in
-    /// `tick_background_services()`.
+    /// Uses the strict Pool-readable content manifest to retain each chunk
+    /// reference's own data version. Receipt uncertainty queues only the exact
+    /// current manifest keys and deliberately retains unprovable chunk work.
     ///
     /// For full-inode deletion (nlink reaches 0), also inserts per-chunk
     /// keys via `content_chunk_object_key_for_version()`.
@@ -4625,61 +4753,34 @@ impl LocalFileSystem {
         {
             return;
         }
-        let dv = record.as_ref().map(|r| r.data_version);
-        let chunk_reclaim_indexes = match record.as_ref().filter(|record| record.nlink == 0) {
-            Some(record) => {
-                let content_reader = MountedContentReadAuthority::new(&self.store);
-                match content_reader.read_layout(inode_id, record) {
-                    Ok(ContentLayout::Chunked(manifest)) => Some(
-                        manifest
-                            .chunks
-                            .iter()
-                            .filter(|chunk_ref| !chunk_ref.is_hole())
-                            .map(|chunk_ref| chunk_ref.chunk_index)
-                            .collect::<Vec<_>>(),
-                    ),
-                    Ok(ContentLayout::Inline(_)) => Some(Vec::new()),
-                    Err(_) => content_chunk_count(record.size)
-                        .ok()
-                        .map(|chunk_count| (0..chunk_count).collect()),
-                }
-            }
-            None => None,
+        let Some(record) = record else {
+            return;
         };
-
+        let include_chunks = record.nlink == 0;
+        let entries = match inode_content_reclaim_entries(&self.store, &record, include_chunks) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!(
+                    "reclaim: inode {} chunk authority is uncertain; retaining unprovable chunk work: {error}",
+                    inode_id.get()
+                );
+                [record.data_version, 0]
+                    .into_iter()
+                    .map(|version| {
+                        let key = content_object_key_for_version(inode_id, version);
+                        ReclaimQueueEntry::new(
+                            ReclaimObjectKey(*key.as_bytes()),
+                            -1,
+                            ReclaimQueueFamily::Extent,
+                        )
+                    })
+                    .collect()
+            }
+        };
         let mut rq = self.reclaim_queue.lock().unwrap();
-
-        // Versioned content keys for current and baseline data versions.
-        if let Some(dv) = dv {
-            for version in [0_u64, dv] {
-                let vkey = content_object_key_for_version(inode_id, version);
-                rq.insert(ReclaimQueueEntry::new(
-                    ReclaimObjectKey(*vkey.as_bytes()),
-                    -1,
-                    ReclaimQueueFamily::Extent,
-                ));
-            }
+        for entry in entries {
+            rq.insert(entry);
         }
-
-        // Chunk-level keys for full-inode deletion: enumerate all chunks
-        // at the current data version so the object store can reclaim each
-        // individually after the namespace mutation is committed. Do not
-        // delete objects here: this runs before commit rollback is impossible,
-        // and foreground unlink must not leave a namespace entry pointing at
-        // tombstoned content if the commit fails.
-        if let (Some(record), Some(chunk_reclaim_indexes)) =
-            (record.as_ref(), chunk_reclaim_indexes)
-        {
-            for ci in chunk_reclaim_indexes {
-                let ckey = content_chunk_object_key_for_version(inode_id, record.data_version, ci);
-                rq.insert(ReclaimQueueEntry::new(
-                    ReclaimObjectKey(*ckey.as_bytes()),
-                    -1,
-                    ReclaimQueueFamily::Extent,
-                ));
-            }
-        }
-        drop(rq);
     }
 
     /// Record an inode tombstone in the reclaim queue when an inode's
@@ -4904,8 +5005,12 @@ impl LocalFileSystem {
         self.ensure_mutation_allowed("drain local reclaim queue")?;
         const MAX_RECLAIM_PER_TICK: usize = 1024;
 
-        // Receipt-authority preflight is read-only. Entries without exact
-        // current authority stay in the queue for a later drain cycle.
+        // Make every current obligation durable before any logical deletion.
+        // Receipt-authority preflight below is read-only; entries without
+        // exact current authority stay in this queue for a later cycle.
+        if !self.reclaim_queue.lock().unwrap().is_empty() {
+            self.persist_local_reclaim_queue(true)?;
+        }
 
         // Protect every root the mounted recovery/retention authority can
         // select, including recursively retained snapshot and clone roots.
@@ -4987,8 +5092,8 @@ impl LocalFileSystem {
         }
 
         if !batch.is_empty() {
-            let mut dedup_index = self.dedup_index.borrow_mut();
             let mut completed_keys = BTreeSet::new();
+            let mut performed_logical_handoff = false;
 
             for (object_key, _entry) in &batch {
                 let local_key = tidefs_local_object_store::ObjectKey::from_bytes(object_key.0);
@@ -5004,6 +5109,7 @@ impl LocalFileSystem {
                     continue;
                 }
                 completed_keys.insert(local_key);
+                performed_logical_handoff = true;
 
                 // Delete the redirect before decrementing its canonical
                 // refcount. If deletion fails, retrying the queue entry must
@@ -5034,22 +5140,37 @@ impl LocalFileSystem {
                     );
                     self.reclaim_queue.lock().unwrap().insert(rq_entry);
                     if let StrictReclaimPreflight::DedupRedirect(fingerprint) = preflight {
-                        dedup_index.remove(fingerprint);
+                        self.dedup_index.borrow_mut().remove(fingerprint);
                     }
                 }
             }
 
             entries_drained = completed_keys.len();
 
+            // Preserve the handoff state while every completed original entry
+            // is still present. This sync orders Pool deletion, dedup refcount
+            // updates, and any newly queued canonical key before the originals
+            // can disappear from the durable queue. Retrying an absent
+            // original is idempotent and cannot decrement a live refcount
+            // twice.
+            if performed_logical_handoff {
+                self.persist_local_reclaim_queue(true)?;
+            }
+
             // Remove only entries whose strict preflight and handoff
             // completed. Every refusal retains the original delta and family.
-            let mut q = self.reclaim_queue.lock().unwrap();
-            for (object_key, entry) in &batch {
-                q.delete(object_key);
-                let local_key = tidefs_local_object_store::ObjectKey::from_bytes(object_key.0);
-                if !completed_keys.contains(&local_key) {
-                    q.insert(*entry);
+            {
+                let mut q = self.reclaim_queue.lock().unwrap();
+                for (object_key, entry) in &batch {
+                    q.delete(object_key);
+                    let local_key = tidefs_local_object_store::ObjectKey::from_bytes(object_key.0);
+                    if !completed_keys.contains(&local_key) {
+                        q.insert(*entry);
+                    }
                 }
+            }
+            if !completed_keys.is_empty() {
+                self.persist_local_reclaim_queue(true)?;
             }
             self.total_reclaim_drains += 1;
             self.total_reclaim_entries_drained += entries_drained as u64;
@@ -5546,20 +5667,12 @@ impl LocalFileSystem {
         };
 
         if !pending.is_empty() {
-            let mut rq = self.reclaim_queue.lock().unwrap();
             let mut idx = self.orphan_index.lock().unwrap();
             for &inode_id_raw in &pending {
-                let inode_id = InodeId(inode_id_raw);
-
-                for dv in [0_u64, 1_u64] {
-                    let manifest_key = content_object_key_for_version(inode_id, dv);
-                    rq.insert(ReclaimQueueEntry::new(
-                        tidefs_types_reclaim_queue_core::ObjectKey(*manifest_key.as_bytes()),
-                        -1,
-                        QueueFamily::Extent,
-                    ));
-                }
-
+                // Runtime unlink already queued exact manifest/chunk/inode
+                // keys before publishing the root that removed this inode.
+                // This scheduler duty retires only the orphan marker; it must
+                // not guess content versions after the inode record is gone.
                 idx.remove(inode_id_raw);
             }
         }
@@ -5604,39 +5717,86 @@ impl LocalFileSystem {
 
     #[allow(dead_code)]
     // INTENT: kept for planned architecture; callers in test modules or pending wiring into FUSE dispatch
-    /// Mount-time orphan recovery: delegates to the `orphan_cleanup`
-    /// module for synchronous reclamation of all orphaned inodes.
-    ///
-    /// Content objects, extent maps, stale directory entries, and
-    /// block allocator space are freed for each orphaned inode, and
-    /// the orphan index entry is removed.
+    /// Mount-time orphan recovery through the mounted Pool and metadata
+    /// cleanup authorities.
     fn recover_orphans(&mut self) -> Result<()> {
-        let _stats = orphan_cleanup::cleanup_orphans(
-            self.store.raw_primary_store_mut(),
-            &mut self.state,
-            &self.orphan_index,
-            &self.reclaim_queue,
-        )?;
+        let _stats = self.cleanup_orphans()?;
         Ok(())
+    }
+
+    /// Prepare exact content and inode reclaim entries for every orphan whose
+    /// inode record is still present. All strict Pool reads complete before
+    /// the in-memory queue changes, so an uncertain manifest leaves namespace
+    /// and orphan state untouched and the mount fails closed.
+    fn prepare_orphan_reclaim_entries(&mut self) -> Result<usize> {
+        let orphan_ids = self.orphan_index.lock().unwrap().collect_inode_ids();
+        let mut prepared = BTreeMap::new();
+
+        for inode_id_raw in orphan_ids {
+            let inode_id = InodeId::new(inode_id_raw);
+            let Some(record) = self.state.inodes.get(&inode_id).cloned() else {
+                // A committed unlink removes the inode from the current root;
+                // its already-persisted exact queue remains the authority.
+                continue;
+            };
+            let has_directory_entry = self
+                .state
+                .directories
+                .values()
+                .any(|dir| dir.values().any(|entry| entry.inode_id == inode_id));
+            if record.nlink > 0 && !has_directory_entry {
+                continue;
+            }
+
+            if record.is_file_like() {
+                for entry in inode_content_reclaim_entries(&self.store, &record, true)? {
+                    prepared.insert(entry.object_key, entry);
+                }
+            }
+            let inode_key = inode_object_key(inode_id);
+            let tombstone = ReclaimQueueEntry::new(
+                ReclaimObjectKey(*inode_key.as_bytes()),
+                -1,
+                ReclaimQueueFamily::InodeTombstone,
+            );
+            prepared.insert(tombstone.object_key, tombstone);
+        }
+
+        let mut queue = self.reclaim_queue.lock().unwrap();
+        let mut inserted = 0;
+        for entry in prepared.into_values() {
+            inserted += usize::from(queue.insert(entry));
+        }
+        Ok(inserted)
     }
 
     /// Mount-time orphan cleanup: synchronously reclaim all orphaned
     /// inodes from the persistent orphan index.
     ///
-    /// Called from `open` after intent log replay.  For each orphaned
-    /// inode, frees extent maps, removes stale directory entries,
-    /// releases block allocator space via the reclaim queue, deletes
-    /// content objects, and removes the orphan index entry.
+    /// Called from `open` after intent log replay. Exact content and inode
+    /// keys enter the durable mounted reclaim queue first; metadata cleanup
+    /// then removes extent maps, stale directory entries, inode records, and
+    /// orphan markers without raw-store content access.
     ///
     /// Returns statistics about the cleanup pass.
     pub(crate) fn cleanup_orphans(&mut self) -> Result<OrphanCleanupStats> {
         self.ensure_mutation_allowed("clean up mounted orphan inodes")?;
-        orphan_cleanup::cleanup_orphans(
-            self.store.raw_primary_store_mut(),
-            &mut self.state,
-            &self.orphan_index,
-            &self.reclaim_queue,
-        )
+        let reclaim_entries_queued = self.prepare_orphan_reclaim_entries()?;
+        let mut stats = orphan_cleanup::cleanup_orphans(&mut self.state, &self.orphan_index)?;
+        stats.reclaim_entries_queued = reclaim_entries_queued;
+        if stats.inodes_removed_from_state > 0
+            || stats.directory_entries_removed > 0
+            || stats.extent_maps_freed > 0
+        {
+            self.state.generation =
+                self.state
+                    .generation
+                    .checked_add(1)
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "orphan cleanup exhausted filesystem generation space",
+                    })?;
+        }
+        Ok(stats)
     }
 
     #[allow(dead_code)] // INTENT: kept for planned architecture; callers in test modules or pending wiring into FUSE dispatch
@@ -12671,6 +12831,11 @@ impl LocalFileSystem {
         }
         if must_persist {
             self.sync_extent_allocator_to_state();
+            // Reclaim obligations created by this mutation must reach Pool
+            // placement authority before the transaction sync and committed
+            // root can make their source objects unreachable. The transaction
+            // object sync inside persist_state_with_pool orders both writes.
+            self.persist_local_reclaim_queue(false)?;
             if let Err(error) =
                 persist_state_with_pool(&mut self.store, &self.state, self.root_authentication_key)
             {
@@ -15112,6 +15277,8 @@ mod orphan_index_integration_tests {
         let (_root, mut fs, redirect_key, canonical_key, fingerprint, refcount_before) =
             dedup_reclaim_fixture("reclaim_delete_failure_refcount");
         let queued = enqueue_exact_reclaim_entry(&fs, redirect_key);
+        fs.persist_local_reclaim_queue(true)
+            .expect("persist exact queue before injecting handoff failure");
 
         let mut failure = tidefs_local_object_store::FaultInjectionConfig::off();
         failure.write_failure_probability = 1.0;
@@ -15364,15 +15531,30 @@ mod orphan_index_integration_tests {
             "reclaim queue should have entries after unlink (extent + inode tombstone), got {post_unlink_depth}"
         );
 
-        // ---- Phase 3: drain local queue via production reclaim handoff ----
-        // drain_local_reclaim_queue_into_store() (called by tick_background_services
-        // Duty 2) hands off entries to object-store durable reclaim queue via store.delete().
+        // ---- Phase 3: retain work until the unlink is committed and every
+        // fallback root that references /drop has left the root ring. ----
         fs.tick_background_services()
             .expect("tick background services");
 
         assert!(
-            fs.reclaim_queue_depth() == 0,
-            "local reclaim queue must be empty after tick_background_services"
+            fs.reclaim_queue_depth() > 0,
+            "uncommitted unlink must not reclaim content from the current committed root"
+        );
+
+        fs.do_commit().expect("commit unlink");
+        assert!(
+            fs.reclaim_queue_depth() > 0,
+            "the pre-unlink fallback root must retain content reclaim work"
+        );
+        for index in 0..FILESYSTEM_ROOT_SLOT_COUNT.saturating_sub(1) {
+            fs.create_file(format!("/root-advance-{index}"), 0o644)
+                .expect("advance fallback ring");
+            fs.do_commit().expect("commit fallback-ring advance");
+        }
+        assert_eq!(
+            fs.reclaim_queue_depth(),
+            0,
+            "local reclaim queue must drain after the referencing fallback root retires"
         );
 
         // ---- Phase 4: inspect object-store reclaim queue ----
@@ -15449,10 +15631,19 @@ mod orphan_index_integration_tests {
 
         fs.do_commit().expect("unlink commit");
 
+        assert!(
+            fs.reclaim_queue_depth() > 0,
+            "the committed burst must remain pending while its prior root is mountable"
+        );
+        for index in 0..FILESYSTEM_ROOT_SLOT_COUNT.saturating_sub(1) {
+            fs.create_file(format!("/burst-root-advance-{index}"), 0o644)
+                .expect("advance burst fallback ring");
+            fs.do_commit().expect("commit burst fallback-ring advance");
+        }
         assert_eq!(
             fs.reclaim_queue_depth(),
             0,
-            "one committed background tick must drain a bounded burst of local reclaim entries"
+            "one bounded tick per later commit must drain the burst after fallback retirement"
         );
     }
 

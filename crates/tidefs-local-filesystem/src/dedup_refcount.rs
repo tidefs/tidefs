@@ -58,10 +58,10 @@
 //!   not trigger a reclaim drain (e.g., between `unlink` and
 //!   `tick_background_services`) will leave the durable refcount unchanged
 //!   until the next drain or mount-time orphan cleanup.
-//! - Mount-time orphan cleanup (`orphan_cleanup::cleanup_orphans`) is a
-//!   separate path that handles dedup refcount decrement for inodes that
-//!   reached nlink==0 before an unclean shutdown. It is not a live-runtime
-//!   reclaim path.
+//! - Mount-time orphan cleanup never scans or decrements mounted content
+//!   through the raw store. It queues exact manifest/chunk keys through the
+//!   same persisted, strict-Pool-authoritative reclaim path used by runtime
+//!   unlink; this drain remains the sole dedup refcount consumer.
 //! - The production dedup refcount authority is validated at Tier 1 via the
 //!   `dedup_retention_gc` and `dedup_crash_reopen` integration tests, not via
 //!   unit tests in this module. Mounted-FUSE, ublk, QEMU, multi-node, and

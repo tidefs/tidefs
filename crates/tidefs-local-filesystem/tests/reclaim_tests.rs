@@ -404,10 +404,17 @@ fn test_storage_reclaim_tick_completes_after_fallback_rotation() {
     // /drop root remains protected until enough later valid roots replace it
     // in the four-slot recovery floor; older overwritten locations are stale.
     fs.sync_all().expect("commit unlink");
+    assert!(
+        fs.reclaim_queue_depth() > 0,
+        "the committed /drop fallback must retain content reclaim work"
+    );
+    drop(fs);
+
+    let mut fs = LocalFileSystem::open(&root).expect("reopen with pending reclaim queue");
     let pending_before_rotation = fs.reclaim_queue_depth();
     assert!(
         pending_before_rotation > 0,
-        "the committed /drop fallback must retain content reclaim work"
+        "exact content reclaim work must survive close/reopen"
     );
     let completed_before_rotation = fs.reclaim_stats().total_reclaim_entries_drained;
     let later_roots_needed = FILESYSTEM_ROOT_SLOT_COUNT.saturating_sub(1);
