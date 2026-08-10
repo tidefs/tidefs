@@ -10159,6 +10159,8 @@ fn open_with_quorum_two_replicas_creates_and_reads_file() {
         .write_file("/shared-file", 0, content)
         .expect("write file");
     assert_eq!(record.size, content.len() as u64);
+    fs.fsync_file("/shared-file")
+        .expect("fsync replicated file");
 
     // Read back through the filesystem
     let read_back = fs.read_file("/shared-file").expect("read file");
@@ -10196,12 +10198,14 @@ fn quorum_file_create_and_stat_fans_out_to_replicas() {
 
     fs.create_file("/visible", 0o644).expect("create file");
     fs.write_file("/visible", 0, b"visible data")
-        .expect("write triggers commit_group commit to replicas");
+        .expect("write visible data");
+    fs.fsync_file("/visible")
+        .expect("fsync visible data to replicas");
     let inode = fs.stat("/visible").expect("stat file");
     assert!(inode.is_file_like());
 
-    // After create + stat (which triggers a commit_group commit), replicas should
-    // contain the superblock and inode objects that the primary wrote.
+    // After fsync publishes the buffered data, every replica must contain
+    // durable quorum content. Stat is observation, not a durability barrier.
     for replica_path in &[&r1, &r2] {
         let replica_store =
             LocalObjectStore::open_with_options(replica_path, StoreOptions::test_fast())
@@ -10237,6 +10241,8 @@ fn quorum_multi_file_writes_visible_on_all_replicas() {
     fs.create_file("/b", 0o644).expect("create b");
     fs.write_file("/a", 0, data_a).expect("write a");
     fs.write_file("/b", 0, data_b).expect("write b");
+    fs.fsync_file("/a").expect("fsync a to replicas");
+    fs.fsync_file("/b").expect("fsync b to replicas");
 
     let read_a = fs.read_file("/a").expect("read a");
     let read_b = fs.read_file("/b").expect("read b");
@@ -11051,6 +11057,8 @@ fn quorum_single_replica_opens_and_works() {
     let content = b"single replica data";
     fs.create_file("/solo", 0o644).expect("create file");
     fs.write_file("/solo", 0, content).expect("write file");
+    fs.fsync_file("/solo")
+        .expect("fsync single-replica file");
 
     let read_back = fs.read_file("/solo").expect("read file");
     assert_eq!(read_back, content);
