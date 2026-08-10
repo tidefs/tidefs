@@ -6040,9 +6040,30 @@ impl LocalFileSystem {
     }
 
     pub fn allocator_report(&mut self) -> Result<LocalStorageAllocatorReport> {
+        // Accepted buffered writes publish their pending inode version for
+        // immediate stat/read visibility before that version's content object
+        // exists in the Pool. Derive the materialized allocation baseline from
+        // each buffered inode's last Pool-readable record, then add the dirty
+        // bytes below.
+        let pool_readable_state = if self.buffered_write_base_records.is_empty() {
+            None
+        } else {
+            let mut state = self.state.clone();
+            let inodes = Arc::make_mut(&mut state.inodes);
+            for (inode_id, record) in &self.buffered_write_base_records {
+                let pool_readable =
+                    inodes
+                        .get_mut(inode_id)
+                        .ok_or(FileSystemError::CorruptState {
+                            reason: "buffered write base record has no live inode",
+                        })?;
+                *pool_readable = record.clone();
+            }
+            Some(state)
+        };
         let mut report = allocator_report_for_state_pool(
             &mut self.store,
-            &self.state,
+            pool_readable_state.as_ref().unwrap_or(&self.state),
             self.allocator_policy,
             self.root_authentication_key,
         )?;
