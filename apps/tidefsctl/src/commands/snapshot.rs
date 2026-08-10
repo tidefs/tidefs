@@ -14,11 +14,11 @@ use std::process;
 
 use clap::{Args, Subcommand};
 #[cfg(feature = "replication-io")]
-use tidefs_local_filesystem::ChangedRecordExport;
+use tidefs_local_filesystem::{ChangedRecordExport, RootAuthenticationKey};
 use tidefs_local_filesystem::{
     HoldInfo, LocalFileSystem, LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy,
-    RecoveryPolicy, RootAuthenticationKey, SnapshotDescriptor, SnapshotKind,
-    SnapshotRetentionPolicy, SnapshotRetentionReport, SnapshotSummary,
+    RecoveryPolicy, SnapshotDescriptor, SnapshotKind, SnapshotRetentionPolicy,
+    SnapshotRetentionReport, SnapshotSummary,
 };
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 #[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
@@ -1025,7 +1025,9 @@ fn open_filesystem_with_live_args(
         LocalFileSystemOpenConfig {
             options: StoreOptions::default(),
             allocator_policy: LocalStorageAllocatorPolicy::default(),
-            root_authentication_key: root_authentication_key(),
+            root_authentication_key: super::root_authentication_key_or_exit(&format!(
+                "snapshot {operation}"
+            )),
             encryption: None,
             compression: None,
             log_device_device_path: None,
