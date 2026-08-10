@@ -30,6 +30,7 @@ use crate::fusewire::{
 };
 use crate::handler_prelude::*;
 use crate::lock_dispatch::{DaemonLockDispatch, LockDispatchError};
+#[cfg(feature = "workload-telemetry")]
 use crate::materialized_cache::MaterializedSignatureCache;
 use crate::mmap_coherency::MmapCoherency;
 use crate::read_cache::ReadCache;
@@ -39,6 +40,7 @@ use crate::workers_meta::{
     LookupConfig, LookupErrorKind, LookupOutcome, MetaError, MetaReplySink, StatfsFields,
 };
 use crate::workers_writeback::WritebackCacheStats;
+#[cfg(feature = "workload-telemetry")]
 use crate::workload_observer::WorkloadObserver;
 use crate::write_dispatch::DaemonWriteDispatch;
 use crate::writeback_reclaim::WritebackInodeCache;
@@ -2915,7 +2917,9 @@ pub struct FuseVfsAdapter {
     /// Stable DatasetId for the mounted dataset, resolved through the catalog.
     /// Used for lifecycle gating, cache invalidation scope, and metrics.
     pub(crate) dataset_id: Option<tidefs_dataset_catalog::DatasetId>,
+    #[cfg(feature = "workload-telemetry")]
     pub(crate) workload_observer: Arc<WorkloadObserver>,
+    #[cfg(feature = "workload-telemetry")]
     pub(crate) signature_cache: Arc<MaterializedSignatureCache>,
 }
 
@@ -2996,7 +3000,9 @@ impl FuseVfsAdapter {
             writeback_seen_inodes: Mutex::new(HashSet::new()),
             relatime_read_atime_pending: Mutex::new(HashSet::new()),
             dataset_id: Some(ROOT_DATASET_ID),
+            #[cfg(feature = "workload-telemetry")]
             workload_observer: Arc::new(WorkloadObserver::new()),
+            #[cfg(feature = "workload-telemetry")]
             signature_cache: Arc::new(MaterializedSignatureCache::new()),
         })
     }
@@ -9327,21 +9333,24 @@ impl Filesystem for FuseVfsAdapter {
         // request for the multi-pool dispatch seam.  The classified context
         // is available for observability through the request-context mirror.
         let _p5_02 = Self::classify_fuse_read(req.unique(), ino, req.uid(), req.gid(), req.pid());
-        self.workload_observer
-            .observe_read(offset as u64, size as u64);
-        if let Some(stats) = self.workload_observer.maybe_materialize() {
-            tracing::info!(
-                signature = stats.current_signature.name(),
-                confidence = stats.confidence,
-                window_ops = stats.window_ops,
-                reads = stats.reads,
-                writes = stats.writes,
-                fsyncs = stats.fsyncs,
-                read_bytes = stats.read_bytes,
-                write_bytes = stats.write_bytes,
-                "workload materialized"
-            );
-            self.signature_cache.refresh(stats);
+        #[cfg(feature = "workload-telemetry")]
+        {
+            self.workload_observer
+                .observe_read(offset as u64, size as u64);
+            if let Some(stats) = self.workload_observer.maybe_materialize() {
+                tracing::info!(
+                    signature = stats.current_signature.name(),
+                    confidence = stats.confidence,
+                    window_ops = stats.window_ops,
+                    reads = stats.reads,
+                    writes = stats.writes,
+                    fsyncs = stats.fsyncs,
+                    read_bytes = stats.read_bytes,
+                    write_bytes = stats.write_bytes,
+                    "workload materialized"
+                );
+                self.signature_cache.refresh(stats);
+            }
         }
         match self.dispatch_read(&ctx, ino, fh, offset, size, lock_owner) {
             Ok(data) => reply.data(&data),
@@ -9386,21 +9395,24 @@ impl Filesystem for FuseVfsAdapter {
         // for the multi-pool dispatch seam observability path.
         let _p5_02 =
             Self::classify_fuse_write(req.unique(), ino, req.uid(), req.gid(), req.pid(), 0);
-        self.workload_observer
-            .observe_write(offset as u64, data.len() as u64);
-        if let Some(stats) = self.workload_observer.maybe_materialize() {
-            tracing::info!(
-                signature = stats.current_signature.name(),
-                confidence = stats.confidence,
-                window_ops = stats.window_ops,
-                reads = stats.reads,
-                writes = stats.writes,
-                fsyncs = stats.fsyncs,
-                read_bytes = stats.read_bytes,
-                write_bytes = stats.write_bytes,
-                "workload materialized"
-            );
-            self.signature_cache.refresh(stats);
+        #[cfg(feature = "workload-telemetry")]
+        {
+            self.workload_observer
+                .observe_write(offset as u64, data.len() as u64);
+            if let Some(stats) = self.workload_observer.maybe_materialize() {
+                tracing::info!(
+                    signature = stats.current_signature.name(),
+                    confidence = stats.confidence,
+                    window_ops = stats.window_ops,
+                    reads = stats.reads,
+                    writes = stats.writes,
+                    fsyncs = stats.fsyncs,
+                    read_bytes = stats.read_bytes,
+                    write_bytes = stats.write_bytes,
+                    "workload materialized"
+                );
+                self.signature_cache.refresh(stats);
+            }
         }
 
         // Validate write_flags. FUSE_WRITE_CACHE is accepted only when
@@ -9509,20 +9521,23 @@ impl Filesystem for FuseVfsAdapter {
         }
         let _p5_02 =
             Self::classify_fuse_fsync(req.unique(), ino, fh, req.uid(), req.gid(), req.pid());
-        self.workload_observer.observe_fsync();
-        if let Some(stats) = self.workload_observer.maybe_materialize() {
-            tracing::info!(
-                signature = stats.current_signature.name(),
-                confidence = stats.confidence,
-                window_ops = stats.window_ops,
-                reads = stats.reads,
-                writes = stats.writes,
-                fsyncs = stats.fsyncs,
-                read_bytes = stats.read_bytes,
-                write_bytes = stats.write_bytes,
-                "workload materialized"
-            );
-            self.signature_cache.refresh(stats);
+        #[cfg(feature = "workload-telemetry")]
+        {
+            self.workload_observer.observe_fsync();
+            if let Some(stats) = self.workload_observer.maybe_materialize() {
+                tracing::info!(
+                    signature = stats.current_signature.name(),
+                    confidence = stats.confidence,
+                    window_ops = stats.window_ops,
+                    reads = stats.reads,
+                    writes = stats.writes,
+                    fsyncs = stats.fsyncs,
+                    read_bytes = stats.read_bytes,
+                    write_bytes = stats.write_bytes,
+                    "workload materialized"
+                );
+                self.signature_cache.refresh(stats);
+            }
         }
         let _start = std::time::Instant::now();
         let ctx = Self::ctx_from_req(req);

@@ -73,6 +73,24 @@ fn daemon_config_help_advertises_mount_startup_knobs() {
 }
 
 #[test]
+fn daemon_config_help_matches_optional_validation_features() {
+    let output = run_daemon(&["--help"]);
+    assert!(output.status.success(), "stderr: {}", stderr_text(&output));
+
+    let stdout = stdout_text(&output);
+    assert_eq!(
+        stdout.contains("--scrub-runtime-observation-artifact"),
+        cfg!(feature = "scrub-observation"),
+        "scrub observation help must match the compiled feature boundary"
+    );
+    assert_eq!(
+        stdout.contains("\n  receipt-demo\n"),
+        cfg!(feature = "receipt-demo"),
+        "receipt demo help must match the compiled feature boundary"
+    );
+}
+
+#[test]
 fn daemon_config_mount_parses_store_mount_profile_and_root_key_flag() {
     let root = unique_root("preview");
     let store = root.join("store");

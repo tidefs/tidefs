@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(obs.current_signature_name(), "OLTP");
 
         let mut off = 0u64;
-        for _ in 0..32 {
+        for _ in 0..64 {
             obs.observe_read(off, 65536);
             off += 65536;
         }
