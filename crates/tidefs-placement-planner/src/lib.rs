@@ -573,6 +573,7 @@ fn strict_for_tier(
 }
 
 /// Deterministic record-id derivation (mirrors `tidefs-membership-epoch`).
+#[cfg(any(feature = "membership", test))]
 const fn derive_record_id(left: u64, right: u64, salt: u64) -> u64 {
     left.wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(right)

@@ -22,9 +22,9 @@ use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaV
 #[cfg(feature = "distributed-repair")]
 use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
 use tidefs_types_orphan_index_core::OrphanReplayWatermark;
-use tidefs_types_reclaim_queue_core::{
-    DeadObjectEntry, DeadObjectReceiptPolicy, DeadObjectReplacementReceipt, ObjectKey,
-};
+#[cfg(any(feature = "distributed-repair", test))]
+use tidefs_types_reclaim_queue_core::DeadObjectReceiptPolicy;
+use tidefs_types_reclaim_queue_core::{DeadObjectEntry, DeadObjectReplacementReceipt, ObjectKey};
 
 /// Reason a shared placement receipt reference cannot authorize dead-object reclaim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
