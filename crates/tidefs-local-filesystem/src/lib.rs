@@ -8586,7 +8586,15 @@ impl LocalFileSystem {
         }
 
         let overlay_hit = wb.overlay_range(offset, &mut bytes);
-        if !overlay_hit && effective_size == base_record.size {
+        // A buffered write advances the live inode's content identity before
+        // writeback materializes that version.  When the requested range does
+        // not intersect buffered bytes, the data copied above still came from
+        // the saved Pool-readable base and must not be discarded in favour of
+        // a second read through the pending live version.
+        if !overlay_hit
+            && effective_size == base_record.size
+            && record.data_version == base_record.data_version
+        {
             return Ok(None);
         }
         Ok(Some(bytes))
@@ -12449,6 +12457,11 @@ impl LocalFileSystem {
 
     pub fn fsync_data_only(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("synchronize filesystem data")?;
+        // Filesystem-scoped fdatasync covers every accepted dirty range.  A
+        // buffered write has already advanced its live inode version, so drain
+        // the buffers before either intent-log persistence or Pool validation
+        // observes that version.
+        self.flush_all_write_buffers()?;
         // Intent log fast path: flush pending data entries instead of
         // walking dirty inodes and flushing content objects individually.
         if self.intent_log.pending_flush_count() > 0 {
@@ -17790,7 +17803,7 @@ mod recovery_integration_tests {
         assert!(matches!(
             opened,
             Err(FileSystemError::CorruptState { reason })
-                if reason == "root slots exist but no valid committed root could be selected"
+                if reason == "root slots exist but no Pool-authorized committed root could be selected"
         ));
     }
 

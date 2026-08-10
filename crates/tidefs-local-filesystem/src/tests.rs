@@ -3312,7 +3312,7 @@ fn recovery_probe_reports_explicit_error_without_guessing_repair() {
     assert!(matches!(
         LocalFileSystem::open_with_options(&root, options()),
         Err(FileSystemError::CorruptState { reason })
-            if reason == "root slots exist but no valid committed root could be selected"
+            if reason == "root slots exist but no Pool-authorized committed root could be selected"
     ));
     cleanup(&root);
 }
@@ -3458,7 +3458,7 @@ fn root_authentication_requires_the_matching_external_key() {
     assert!(matches!(
         LocalFileSystem::open_with_root_authentication_key(&root, options(), wrong_key),
         Err(FileSystemError::CorruptState { reason })
-            if reason == "root slots exist but no valid committed root could be selected"
+            if reason == "root slots exist but no Pool-authorized committed root could be selected"
     ));
     cleanup(&root);
 }
@@ -4501,7 +4501,7 @@ fn all_root_slots_invalid_reports_explicit_integrity_error_without_fsck() {
     assert!(matches!(
         LocalFileSystem::open_with_options(&root, options()),
         Err(FileSystemError::CorruptState { reason })
-            if reason == "root slots exist but no valid committed root could be selected"
+            if reason == "root slots exist but no Pool-authorized committed root could be selected"
     ));
     cleanup(&root);
 }

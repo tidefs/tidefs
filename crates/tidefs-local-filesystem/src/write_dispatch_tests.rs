@@ -181,11 +181,12 @@ proptest! {
             let record = fs.stat("/data.bin").expect("stat");
             prop_assert_eq!(record.size, expected.len() as u64);
 
-            let content_key = content_object_key_for_version(record.inode_id, record.data_version);
-            let raw = fs.store.get(DeviceIoClass::Data, content_key)
-                .expect("read content obj")
-                .expect("content obj exists");
-            let manifest = decode_content_manifest(&raw).expect("decode manifest");
+            let layout = MountedContentReadAuthority::new(&fs.store)
+                .read_layout(record.inode_id, &record)
+                .expect("read content layout through mounted Pool authority");
+            let ContentLayout::Chunked(manifest) = layout else {
+                panic!("full-content dispatch must publish a chunked layout");
+            };
 
             prop_assert_eq!(manifest.file_size, expected.len() as u64);
             prop_assert_eq!(manifest.chunk_size, content_chunk_size());
