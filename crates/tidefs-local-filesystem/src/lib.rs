@@ -772,6 +772,7 @@ struct MutationDelta {
     // Buffered payload snapshots are lazy so metadata-only mutations do not
     // clone dirty writeback buffers.
     old_write_buffers: Option<BTreeMap<InodeId, WriteBuffer>>,
+    old_buffered_write_base_records: BTreeMap<InodeId, InodeRecord>,
     old_quota_table: QuotaTable,
     old_space_accounting: SpaceAccounting,
     old_capacity_authority: CapacityAuthoritySnapshot,
@@ -1908,6 +1909,12 @@ pub struct LocalFileSystem {
     /// tidefs-queue-root: local_fs.write_buffers
     /// admission: LocalAdmissionPermit  service_curve: filesystem-owned bounded work
     write_buffers: BTreeMap<InodeId, WriteBuffer>,
+    /// Pool-readable inode record from before the first currently buffered
+    /// write for each inode. `state.inodes` owns the live dirty metadata and
+    /// content version observed by stat/readers; this map keeps content reads
+    /// and writeback anchored to the last materialized Pool object until the
+    /// complete inode buffer is written under that pending version.
+    buffered_write_base_records: BTreeMap<InodeId, InodeRecord>,
     write_buffer_config: WriteBufferConfig,
     fsync_stats: FsyncStats,
     /// Sync gate for TXG group commit durability fence coordination.
@@ -4065,6 +4072,7 @@ impl LocalFileSystem {
             lock_tracker: RefCell::new(LockTracker::new()),
             dataset_mount_id,
             write_buffers: BTreeMap::new(),
+            buffered_write_base_records: BTreeMap::new(),
             write_buffer_config: WriteBufferConfig::default(),
             pool_uuid,
             fsync_stats: FsyncStats::default(),
@@ -7666,13 +7674,20 @@ impl LocalFileSystem {
         patches: &[CoalescedBufferedWritePatch<'_>],
         new_size: u64,
         allow_holes: bool,
+        pending_record: Option<InodeRecord>,
     ) -> Result<InodeRecord> {
         let old_record = record.clone();
-        let planned_tick = next_generation_after(self.state.generation);
-        let mut planned_record = record.clone();
+        let uses_pending_version = pending_record.is_some();
+        let planned_tick = pending_record.as_ref().map_or_else(
+            || next_generation_after(self.state.generation),
+            |record| record.data_version,
+        );
+        let mut planned_record = pending_record.unwrap_or_else(|| record.clone());
         planned_record.size = new_size;
-        planned_record.data_version = planned_tick;
-        planned_record.metadata_version = planned_tick;
+        if !uses_pending_version {
+            planned_record.data_version = planned_tick;
+            planned_record.metadata_version = planned_tick;
+        }
         let content_patches: Vec<ContentOverlayPatch<'_>> = patches
             .iter()
             .map(|patch| ContentOverlayPatch {
@@ -7708,12 +7723,23 @@ impl LocalFileSystem {
         self.ensure_content_capacity_with_planned_inode(Some(inode_id), planned_entries.clone())?;
 
         self.begin_mutation("rewrite file content")?;
-        let tick = self.bump_generation();
-        debug_assert_eq!(tick, planned_tick);
-        record.size = new_size;
-        record.data_version = tick;
-        record.metadata_version = tick;
-        Self::advance_subtree_revision(&mut record);
+        let tick = if uses_pending_version {
+            // The buffered write already acquired its visible content version,
+            // dirty accounting, and commit-group ownership at write acceptance.
+            // Writeback materializes exactly that version instead of inventing
+            // a later identity at flush time.
+            self.mutation_recorded_commit_group_write = true;
+            record = planned_record.clone();
+            planned_tick
+        } else {
+            let tick = self.bump_generation();
+            debug_assert_eq!(tick, planned_tick);
+            record.size = new_size;
+            record.data_version = tick;
+            record.metadata_version = tick;
+            Self::advance_subtree_revision(&mut record);
+            tick
+        };
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
             let mut pool_store = self.store.pool_store_mut();
@@ -7747,7 +7773,7 @@ impl LocalFileSystem {
             }
         };
         rewrite_trim_plan.replaced_data_bytes = replaced_data_bytes;
-        if dirty_allocation_bytes > 0 {
+        if dirty_allocation_bytes > 0 && !uses_pending_version {
             self.dirty_set
                 .record_data_write(inode_id, dirty_allocation_bytes);
             let _accepted_by_commit_group =
@@ -7757,10 +7783,14 @@ impl LocalFileSystem {
         self.record_policy_allocation_claim(inode_id, new_blocks, tick);
 
         self.inode_cache.borrow_mut().invalidate(inode_id);
-        self.mark_inode_metadata_dirty(inode_id);
-        Arc::make_mut(&mut self.state.inodes).insert(inode_id, record.clone());
-        self.inode_cache.borrow_mut().invalidate(inode_id);
-        self.mark_inode_content_dirty(inode_id);
+        if uses_pending_version {
+            self.buffered_write_base_records.remove(&inode_id);
+        } else {
+            self.mark_inode_metadata_dirty(inode_id);
+            Arc::make_mut(&mut self.state.inodes).insert(inode_id, record.clone());
+            self.inode_cache.borrow_mut().invalidate(inode_id);
+            self.mark_inode_content_dirty(inode_id);
+        }
         self.account_rewrite_replaced_data(rewrite_trim_plan.replaced_data_bytes);
         let committed = self.commit_mutation(record)?;
         self.apply_rewrite_trim_plan(rewrite_trim_plan);
@@ -7776,6 +7806,14 @@ impl LocalFileSystem {
             return Ok(());
         }
         let base_record = self.committed_inode_record(inode_id)?;
+        let pending_record = self
+            .buffered_write_base_records
+            .contains_key(&inode_id)
+            .then(|| self.state.inodes.get(&inode_id).cloned())
+            .flatten()
+            .ok_or(FileSystemError::CorruptState {
+                reason: "buffered write is missing its live inode record",
+            })?;
         let patches = match self.coalesced_write_buffer_patches(&segments) {
             Ok(patches) => patches,
             Err(err) => {
@@ -7804,13 +7842,13 @@ impl LocalFileSystem {
                 &patches,
                 batch_new_size,
                 true,
+                Some(pending_record),
             ) {
                 Ok(_) => {
                     drop(patches);
                     self.finalize_drained_write_segments(inode_id, segments);
                     return Ok(());
                 }
-                Err(FileSystemError::Unsupported { .. }) => {}
                 Err(err) => {
                     self.restore_drained_write_segments(inode_id, &segments);
                     return Err(err);
@@ -7882,26 +7920,6 @@ impl LocalFileSystem {
             None => return Ok(()),
         };
         self.write_buffers.remove(&inode_id);
-        self.flush_drained_write_segments(inode_id, segments)
-    }
-
-    fn flush_write_buffer_batch(&mut self, inode_id: InodeId) -> Result<()> {
-        self.snapshot_write_buffers_for_rollback();
-        let (segments, drained_empty) = match self.write_buffers.get_mut(&inode_id) {
-            Some(wb) if !wb.is_empty() => {
-                let segments = wb.drain_flush_batch();
-                let drained_empty = wb.is_empty();
-                (segments, drained_empty)
-            }
-            Some(_) => {
-                self.write_buffers.remove(&inode_id);
-                return Ok(());
-            }
-            None => return Ok(()),
-        };
-        if drained_empty {
-            self.write_buffers.remove(&inode_id);
-        }
         self.flush_drained_write_segments(inode_id, segments)
     }
 
@@ -8094,6 +8112,9 @@ impl LocalFileSystem {
         inode_id: InodeId,
         adjusted_record: &InodeRecord,
     ) -> InodeRecord {
+        if let Some(record) = self.buffered_write_base_records.get(&inode_id) {
+            return record.clone();
+        }
         if let Some(record) = self.state.inodes.get(&inode_id) {
             return record.clone();
         }
@@ -8104,6 +8125,9 @@ impl LocalFileSystem {
     }
 
     fn committed_inode_record(&self, inode_id: InodeId) -> Result<InodeRecord> {
+        if let Some(record) = self.buffered_write_base_records.get(&inode_id) {
+            return Ok(record.clone());
+        }
         if let Some(record) = self.state.inodes.get(&inode_id) {
             return Ok(record.clone());
         }
@@ -8254,6 +8278,7 @@ impl LocalFileSystem {
         };
         if remove {
             self.write_buffers.remove(&inode_id);
+            self.buffered_write_base_records.remove(&inode_id);
         }
         freed
     }
@@ -8275,6 +8300,7 @@ impl LocalFileSystem {
         };
         if remove {
             self.write_buffers.remove(&inode_id);
+            self.buffered_write_base_records.remove(&inode_id);
         }
         cleared
     }
@@ -8504,12 +8530,24 @@ impl LocalFileSystem {
             >= self.write_buffer_config.flush_threshold_bytes;
         let foreground_flush_rollback = if may_flush_after_ingest {
             let old_write_buffer = self.write_buffers.get(&inode_id).cloned();
+            let old_base_record = self.buffered_write_base_records.get(&inode_id).cloned();
+            let old_live_record = self.state.inodes.get(&inode_id).cloned();
             let old_dirty_ranges = self
                 .writeback_range_tracker
                 .lock()
                 .expect("locked")
                 .snapshot_ranges();
-            Some((old_write_buffer, old_dirty_ranges))
+            Some((
+                old_write_buffer,
+                old_base_record,
+                old_live_record,
+                old_dirty_ranges,
+                self.state.generation,
+                self.state.dirty_content.clone(),
+                self.state.dirty_inodes.clone(),
+                self.state.dirty_dirs.clone(),
+                self.dirty_set.clone(),
+            ))
         } else {
             None
         };
@@ -8536,29 +8574,78 @@ impl LocalFileSystem {
             debug_assert_eq!(newly_buffered as u64, physical_admit_bytes);
             wb.should_flush()
         };
+        self.buffered_write_base_records
+            .entry(inode_id)
+            .or_insert(committed_record);
+        let tick = self.bump_generation();
+        let mut pending_record = record.clone();
+        pending_record.size = new_size;
+        pending_record.data_version = tick;
+        pending_record.metadata_version = tick;
+        Self::advance_subtree_revision(&mut pending_record);
+        let write_time = crate::types::current_posix_time_ns()
+            .max(pending_record.posix_time.mtime_ns.saturating_add(1))
+            .max(pending_record.posix_time.ctime_ns.saturating_add(1));
+        pending_record.posix_time.mtime_ns = write_time;
+        pending_record.posix_time.ctime_ns = write_time;
+        self.mark_inode_metadata_dirty(inode_id);
+        Arc::make_mut(&mut self.state.inodes).insert(inode_id, pending_record);
+        self.inode_cache.borrow_mut().invalidate(inode_id);
+        self.mark_inode_content_dirty(inode_id);
+        self.dirty_set
+            .record_data_write(inode_id, physical_admit_bytes);
+        let _accepted_by_commit_group =
+            self.record_mutation_commit_group_write(physical_admit_bytes);
         if should_flush {
-            while self
-                .write_buffers
-                .get(&inode_id)
-                .is_some_and(WriteBuffer::should_flush)
-            {
-                if let Err(err) = self.flush_write_buffer_batch(inode_id) {
-                    if let Some((old_write_buffer, old_dirty_ranges)) = foreground_flush_rollback {
-                        match old_write_buffer {
-                            Some(wb) => {
-                                self.write_buffers.insert(inode_id, wb);
-                            }
-                            None => {
-                                self.write_buffers.remove(&inode_id);
-                            }
+            if let Err(err) = self.flush_write_buffer(inode_id) {
+                if let Some((
+                    old_write_buffer,
+                    old_base_record,
+                    old_live_record,
+                    old_dirty_ranges,
+                    old_generation,
+                    old_dirty_content,
+                    old_dirty_inodes,
+                    old_dirty_dirs,
+                    old_dirty_set,
+                )) = foreground_flush_rollback
+                {
+                    match old_write_buffer {
+                        Some(wb) => {
+                            self.write_buffers.insert(inode_id, wb);
                         }
-                        self.writeback_range_tracker
-                            .lock()
-                            .expect("locked")
-                            .restore_ranges(old_dirty_ranges);
+                        None => {
+                            self.write_buffers.remove(&inode_id);
+                        }
                     }
-                    return Err(err);
+                    match old_base_record {
+                        Some(record) => {
+                            self.buffered_write_base_records.insert(inode_id, record);
+                        }
+                        None => {
+                            self.buffered_write_base_records.remove(&inode_id);
+                        }
+                    }
+                    match old_live_record {
+                        Some(record) => {
+                            Arc::make_mut(&mut self.state.inodes).insert(inode_id, record);
+                        }
+                        None => {
+                            Arc::make_mut(&mut self.state.inodes).remove(&inode_id);
+                        }
+                    }
+                    self.state.generation = old_generation;
+                    self.state.dirty_content = old_dirty_content;
+                    self.state.dirty_inodes = old_dirty_inodes;
+                    self.state.dirty_dirs = old_dirty_dirs;
+                    self.dirty_set = old_dirty_set;
+                    self.inode_cache.borrow_mut().invalidate(inode_id);
+                    self.writeback_range_tracker
+                        .lock()
+                        .expect("locked")
+                        .restore_ranges(old_dirty_ranges);
                 }
+                return Err(err);
             }
         }
 
@@ -8688,6 +8775,7 @@ impl LocalFileSystem {
             &patches,
             new_size,
             true,
+            None,
         ) {
             Ok(record) => Ok(record),
             Err(FileSystemError::Unsupported { .. }) => {
@@ -8758,6 +8846,10 @@ impl LocalFileSystem {
             for (offset, length) in &written_ranges {
                 tracker.clear_range(inode_id, *offset, *length);
             }
+        }
+        if self.write_buffers.contains_key(&inode_id) {
+            self.buffered_write_base_records
+                .insert(inode_id, result.clone());
         }
         Ok(self.adjust_for_write_buffer(inode_id, result))
     }
@@ -9063,6 +9155,10 @@ impl LocalFileSystem {
                 kind: record.kind(),
             });
         }
+        // Truncate is a new content-version boundary. Materialize the complete
+        // accepted write epoch first so it cannot discard the Pool base record
+        // while leaving an inode version whose content object does not exist.
+        self.flush_write_buffer(inode_id)?;
         let _new_len =
             usize::try_from(size).map_err(|_| FileSystemError::SizeOverflow { requested: size })?;
         let old_effective_size = self.effective_file_size(inode_id);
@@ -12311,6 +12407,10 @@ impl LocalFileSystem {
     /// commit that also syncs metadata, use `fsync_all` instead.
     pub fn sync_all_dirty(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("synchronize all dirty inode data")?;
+        // DirtySet includes accepted buffered writes. Materialize every
+        // buffered inode before walking dirty_content so flush_all cannot
+        // report success while only syncing the prior Pool-visible version.
+        self.flush_all_write_buffers()?;
         let dirty_inodes: Vec<InodeId> = self.state.dirty_content.iter().copied().collect();
         for inode_id in &dirty_inodes {
             let record = self
@@ -12893,6 +12993,7 @@ impl LocalFileSystem {
             .remove(&inode_id)
             .map(|wb| wb.buffered_bytes() as u64)
             .unwrap_or(0);
+        self.buffered_write_base_records.remove(&inode_id);
         self.record_dirty_buffer_free(freed);
         self.state.dirty_content.remove(&inode_id);
         self.state.dirty_inodes.remove(&inode_id);
@@ -12952,6 +13053,7 @@ impl LocalFileSystem {
                 old_generation: self.state.generation,
                 old_inode_authority: self.state.inode_authority,
                 old_write_buffers: None,
+                old_buffered_write_base_records: self.buffered_write_base_records.clone(),
                 old_quota_table: self.state.quota_table.clone(),
                 old_space_accounting: self.state.space_accounting.clone(),
                 old_capacity_authority: self.capacity_authority.snapshot_for_rollback(),
@@ -13026,6 +13128,7 @@ impl LocalFileSystem {
             if let Some(old_write_buffers) = delta.old_write_buffers {
                 self.write_buffers = old_write_buffers;
             }
+            self.buffered_write_base_records = delta.old_buffered_write_base_records;
             self.state.quota_table = delta.old_quota_table;
             self.state.space_accounting = delta.old_space_accounting;
             self.capacity_authority

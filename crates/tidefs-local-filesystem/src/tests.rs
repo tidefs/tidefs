@@ -954,20 +954,38 @@ fn create_paths_initialize_posix_times_from_wall_clock() {
 #[test]
 fn create_write_reopen_read_file() {
     let root = temp_root("create-write-reopen");
-    {
+    let accepted_versions = {
         let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
         fs.create_dir("/docs", 0o755).expect("create docs");
         fs.create_file("/docs/hello.txt", 0o644)
             .expect("create file");
-        fs.write_file("/docs/hello.txt", 0, b"hello filesystem")
+        let before = fs.stat("/docs/hello.txt").expect("stat before write");
+        let accepted = fs
+            .write_file("/docs/hello.txt", 0, b"hello filesystem")
             .expect("write file");
+        assert!(accepted.data_version > before.data_version);
+        assert!(accepted.metadata_version > before.metadata_version);
+        assert!(fs.has_dirty_metadata());
+        let visible = fs.stat("/docs/hello.txt").expect("stat pending write");
+        assert_eq!(visible.data_version, accepted.data_version);
+        assert_eq!(visible.metadata_version, accepted.metadata_version);
         fs.sync_all().expect("sync fs");
-    }
+        let committed = fs.stat("/docs/hello.txt").expect("stat committed write");
+        assert_eq!(committed.data_version, accepted.data_version);
+        assert_eq!(committed.metadata_version, accepted.metadata_version);
+        assert!(!fs.has_dirty_metadata());
+        (accepted.data_version, accepted.metadata_version)
+    };
     {
         let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
         assert_eq!(
             fs.read_file("/docs/hello.txt").expect("read file"),
             b"hello filesystem".to_vec()
+        );
+        let reopened = fs.stat("/docs/hello.txt").expect("stat reopened write");
+        assert_eq!(
+            (reopened.data_version, reopened.metadata_version),
+            accepted_versions
         );
         let entries = fs.list_dir("/docs").expect("list docs");
         assert_eq!(entries.len(), 1);
