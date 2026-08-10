@@ -37,9 +37,9 @@ const SNAP_KIND_PULL_REQUEST: u8 = 2;
 const SNAP_KIND_PULL_RESPONSE: u8 = 3;
 #[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 pub(crate) const SNAP_KIND_ACK: u8 = 4;
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "block-volume")]
 pub(crate) const SNAP_KIND_BLOCK_PUSH: u8 = 5;
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "block-volume")]
 pub(crate) const SNAP_KIND_BLOCK_PULL_REQUEST: u8 = 6;
 #[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 pub(crate) const SNAP_KIND_BLOCK_PULL_RESPONSE: u8 = 7;
@@ -777,7 +777,7 @@ pub struct SnapshotSendArgs {
 
     /// Send an incremental delta from the specified base root.
     /// The hex key encodes (tid: u64, gen: u64, csum: u64) = 48 hex chars = 24 bytes.
-    #[arg(long = "incremental", conflicts_with = "full")]
+    #[arg(long = "incremental")]
     pub incremental: bool,
 
     /// Hex-encoded base root key for incremental send (48 hex chars = 24 bytes).
