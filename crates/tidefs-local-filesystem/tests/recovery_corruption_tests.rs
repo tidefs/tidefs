@@ -154,16 +154,22 @@ fn inode_for_path(root: &Path, path: &str) -> InodeRecord {
     inode
 }
 
-/// Get the first transaction id visible in the root slot ring.
-fn first_transaction_id(root: &Path) -> u64 {
+/// Get the newest verified committed root visible in the root-slot ring.
+fn newest_verified_root(root: &Path) -> tidefs_local_filesystem::CommittedRootSummary {
     setup_auth_env();
     let report = tidefs_local_filesystem::verify_online(root, opts()).expect("verify_online");
     report
         .verified_committed_roots
-        .first()
+        .iter()
+        .max_by_key(|verified| verified.root.transaction_id)
         .expect("at least one committed root")
         .root
-        .transaction_id
+        .clone()
+}
+
+/// Get the newest transaction id visible in the root-slot ring.
+fn newest_transaction_id(root: &Path) -> u64 {
+    newest_verified_root(root).transaction_id
 }
 
 // ---------------------------------------------------------------------------
@@ -175,16 +181,17 @@ fn recovery_after_segment_header_corruption() {
     let root = temp_root("seg-header");
     setup_fs_with_stable_and_candidate(&root);
 
+    let selected = newest_verified_root(&root);
     let store = fs_data_store(&root);
-    let mut target = None;
-    for slot in 0..4_u64 {
-        if let Some(loc) = store.location_of(root_slot_object_key(slot)) {
-            target = Some((loc.segment_id, loc.record_offset));
-            break;
-        }
-    }
-    let (segment_id, record_offset) = target.expect("at least one root slot record must exist");
-    corrupt_segment_bytes(&store, segment_id, record_offset, 8);
+    let selected_location = store
+        .location_of(root_slot_object_key(selected.slot))
+        .expect("selected root slot record must exist");
+    corrupt_segment_bytes(
+        &store,
+        selected_location.segment_id,
+        selected_location.record_offset,
+        8,
+    );
     drop(store);
 
     // Recovery should fall back to the previous valid root.
@@ -197,7 +204,7 @@ fn recovery_after_transaction_manifest_corruption() {
     let root = temp_root("txn-manifest");
     setup_fs_with_stable_and_candidate(&root);
 
-    let cg_id = first_transaction_id(&root);
+    let cg_id = newest_transaction_id(&root);
     let store = fs_data_store(&root);
     let manifest_key = transaction_manifest_object_key(cg_id);
 
@@ -217,7 +224,7 @@ fn recovery_after_inode_record_corruption() {
     setup_fs_with_stable_and_candidate(&root);
 
     let inode = inode_for_path(&root, "/data/candidate.txt");
-    let cg_id = first_transaction_id(&root);
+    let cg_id = newest_transaction_id(&root);
 
     let store = fs_data_store(&root);
 
@@ -239,7 +246,7 @@ fn recovery_after_directory_entry_corruption() {
 
     // Find the /data directory inode.
     let data_inode = inode_for_path(&root, "/data");
-    let cg_id = first_transaction_id(&root);
+    let cg_id = newest_transaction_id(&root);
 
     let store = fs_data_store(&root);
 
@@ -258,26 +265,22 @@ fn recovery_after_root_slot_partial_write() {
     let root = temp_root("root-slot");
     setup_fs_with_stable_and_candidate(&root);
 
+    // Corrupt only the newest root publication. Damaging the newest record in
+    // every retained slot would exceed the root ring's stated fault model and
+    // could legitimately leave only pre-stable roots.
+    let selected = newest_verified_root(&root);
     let store = fs_data_store(&root);
-
-    // Corrupt a root-slot object by truncating its payload.
-    let mut corrupted_any = false;
-    for slot in 0..4_u64 {
-        let key = root_slot_object_key(slot);
-        if let Some(loc) = store.location_of(key) {
-            // Overwrite the root-slot payload with a shorter, garbage version.
-            let payload_start = loc.record_offset + RECORD_HEADER_LEN as u64;
-            corrupt_segment_bytes(
-                &store,
-                loc.segment_id,
-                payload_start,
-                16.min(loc.payload_len),
-            );
-            corrupted_any = true;
-        }
-    }
+    let loc = store
+        .location_of(root_slot_object_key(selected.slot))
+        .expect("selected root slot record must exist");
+    let payload_start = loc.record_offset + RECORD_HEADER_LEN as u64;
+    corrupt_segment_bytes(
+        &store,
+        loc.segment_id,
+        payload_start,
+        16.min(loc.payload_len),
+    );
     drop(store);
-    assert!(corrupted_any, "expected at least one root slot with data");
 
     verify_recovery_handles_corruption(&root, "recovers");
     cleanup(&root);

@@ -6241,9 +6241,18 @@ fn stage_durable_intent_without_drop(root: &Path, publish_replayed_root: bool) -
             &committed_base,
         )
         .expect("fold durable intent into staged root");
-        crate::persistence::persist_state_with_pool(
+        let previous_root = fs
+            .selected_committed_root_summary()
+            .expect("select crash fixture committed root");
+        let transaction_id = crate::persistence::next_mounted_commit_transaction_id(
+            fs.state.generation,
+            &previous_root,
+        )
+        .expect("select crash fixture replay transaction");
+        crate::persistence::persist_state_with_pool_at_transaction(
             &mut fs.store,
             &fs.state,
+            transaction_id,
             root_authentication_key,
         )
         .expect("publish replayed root");

@@ -12823,16 +12823,18 @@ impl LocalFileSystem {
         let must_persist =
             self.is_state_dirty() || intent_log_requires_commit || flushed_write_buffers;
 
-        // The root ring retains commits, not mutation-count residues. A burst
-        // can advance the live generation by an exact multiple of the ring
-        // size, so select the successor slot explicitly before publication.
-        // Keeping the transaction id and state generation together also
-        // preserves the intent-log anchor ordering used after reopen.
-        if must_persist {
+        // The root ring retains commits, not mutation-count residues. Select
+        // the successor publication slot explicitly while leaving filesystem
+        // generation owned by logical mutations.
+        let transaction_id = if must_persist {
             let previous_root = self.selected_committed_root_summary()?;
-            self.state.generation =
-                next_mounted_commit_generation(self.state.generation, &previous_root)?;
-        }
+            Some(next_mounted_commit_transaction_id(
+                self.state.generation,
+                &previous_root,
+            )?)
+        } else {
+            None
+        };
 
         // COMMIT_GROUP STATE MACHINE: transition phases only when there is real work.
         // No-op commits (clean state + empty intent log) do not advance the commit_group.
@@ -12867,9 +12869,15 @@ impl LocalFileSystem {
             // root can make their source objects unreachable. The transaction
             // object sync inside persist_state_with_pool orders both writes.
             self.persist_local_reclaim_queue(false)?;
-            if let Err(error) =
-                persist_state_with_pool(&mut self.store, &self.state, self.root_authentication_key)
-            {
+            let transaction_id = transaction_id.ok_or(FileSystemError::CorruptState {
+                reason: "mounted commit lost its selected transaction identity",
+            })?;
+            if let Err(error) = persist_state_with_pool_at_transaction(
+                &mut self.store,
+                &self.state,
+                transaction_id,
+                self.root_authentication_key,
+            ) {
                 if matches!(&error, FileSystemError::PublishOutcomeUncertain { .. }) {
                     self.arm_mutation_reopen_fence();
                 }
@@ -12883,7 +12891,6 @@ impl LocalFileSystem {
             // mount and commit, the corruption goes undetected until
             // next mount.  Re-read the root commit we just wrote and
             // run the same validation that mount uses.
-            let transaction_id = self.state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
             let slot_key = root_slot_object_key(root_slot_for_transaction(transaction_id));
             let stored_bytes = match self.store.primary_store().get(slot_key)? {
                 Some(b) => b,

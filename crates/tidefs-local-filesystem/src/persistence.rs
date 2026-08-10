@@ -41,6 +41,28 @@ pub(crate) fn persist_state_with_pool(
     Ok(())
 }
 
+/// Persist mounted state under an explicit transaction identity.
+///
+/// Filesystem generation describes the newest logical state mutation, while
+/// transaction id identifies one durable publication in the root-slot ring.
+/// A batched commit may therefore need a later transaction id without
+/// inventing mutations or changing the generation exposed after recovery.
+pub(crate) fn persist_state_with_pool_at_transaction(
+    pool: &mut Pool,
+    state: &FileSystemState,
+    transaction_id: u64,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<()> {
+    let _ = persist_state_with_pool_at_transaction_until_boundary(
+        pool,
+        state,
+        transaction_id,
+        root_authentication_key,
+        None,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn persist_state_with_pool_until_boundary(
     pool: &mut Pool,
     state: &FileSystemState,
@@ -48,6 +70,27 @@ pub(crate) fn persist_state_with_pool_until_boundary(
     stop_after: Option<FilesystemCommitBoundary>,
 ) -> Result<FilesystemCommitBoundary> {
     let transaction_id = state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
+    persist_state_with_pool_at_transaction_until_boundary(
+        pool,
+        state,
+        transaction_id,
+        root_authentication_key,
+        stop_after,
+    )
+}
+
+pub(crate) fn persist_state_with_pool_at_transaction_until_boundary(
+    pool: &mut Pool,
+    state: &FileSystemState,
+    transaction_id: u64,
+    root_authentication_key: RootAuthenticationKey,
+    stop_after: Option<FilesystemCommitBoundary>,
+) -> Result<FilesystemCommitBoundary> {
+    if transaction_id < state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID) {
+        return Err(FileSystemError::CorruptState {
+            reason: "mounted transaction id precedes filesystem state generation",
+        });
+    }
     let content_entries = pool_content_manifest_entries_for_state(pool, state)?;
     let root = persist_transaction_objects_with_precomputed_content(
         pool.raw_primary_store_mut(),
@@ -612,16 +655,15 @@ pub(crate) fn root_slot_for_transaction(transaction_id: u64) -> u64 {
     transaction_id % FILESYSTEM_ROOT_SLOT_COUNT
 }
 
-/// Choose the generation for the next mounted commit so root-slot retention
-/// advances by one committed root, independent of how many mutations the
-/// commit contains.
+/// Choose the transaction id for the next mounted commit so root-slot
+/// retention advances by one committed root, independent of how many
+/// mutations the commit contains.
 ///
-/// Local intent anchors use the committed transaction id as their generation
-/// floor, so mounted publication keeps those two ordering values identical.
-/// A mutation burst may advance `state.generation` by several complete turns
-/// of the root ring; rounding that floor forward to the successor slot keeps
-/// the preceding committed root mountable instead of overwriting its slot.
-pub(crate) fn next_mounted_commit_generation(
+/// Transaction id is publication order; filesystem generation is logical
+/// mutation order. A mutation burst may advance `state.generation` by several
+/// complete turns of the root ring, so round the transaction floor forward to
+/// the successor slot without rewriting the state's generation.
+pub(crate) fn next_mounted_commit_transaction_id(
     state_generation: u64,
     previous_root: &CommittedRootSummary,
 ) -> Result<u64> {
