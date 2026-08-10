@@ -67,7 +67,9 @@ pub(crate) enum RoutingSemantics {
         feature = "storage-intent"
     ))]
     PassiveDiagnostic,
+    #[cfg(feature = "cluster")]
     PrototypeOnly,
+    #[cfg(feature = "cluster")]
     DevelopmentExercise,
     Removed,
 }
@@ -86,7 +88,9 @@ impl RoutingSemantics {
                 feature = "storage-intent"
             ))]
             Self::PassiveDiagnostic => "passive-diagnostic",
+            #[cfg(feature = "cluster")]
             Self::PrototypeOnly => "prototype-only",
+            #[cfg(feature = "cluster")]
             Self::DevelopmentExercise => "development-exercise",
             Self::Removed => "removed",
         }
