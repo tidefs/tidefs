@@ -5690,18 +5690,19 @@ impl LocalFileSystem {
             .set_total_bytes(policy.content_capacity_bytes);
         // Recreate optional policy-observation state with the new capacity.
         #[cfg(feature = "policy-observation")]
-        self.obligation_ledger = Box::new(ObligationLedger::new(
-            policy.content_capacity_bytes / content_chunk_size() as u64,
-        ));
-        #[cfg(feature = "policy-observation")]
-        self.budget_domain = BudgetDomain::new(
-            BudgetDomainId::from_str("default"),
-            "default".into(),
-            policy.content_capacity_bytes,
-            ReserveClass::Rebuild,
-            policy.content_capacity_bytes / 10,
-            policy.content_capacity_bytes / 5,
-        );
+        {
+            self.obligation_ledger = Box::new(ObligationLedger::new(
+                policy.content_capacity_bytes / content_chunk_size() as u64,
+            ));
+            self.budget_domain = BudgetDomain::new(
+                BudgetDomainId::from_str("default"),
+                "default".into(),
+                policy.content_capacity_bytes,
+                ReserveClass::Rebuild,
+                policy.content_capacity_bytes / 10,
+                policy.content_capacity_bytes / 5,
+            );
+        }
         Ok(())
     }
 

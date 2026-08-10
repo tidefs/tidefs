@@ -285,7 +285,7 @@ fn extent_map_data_survives_reopen_via_read_path() {
 
     // Phase 2: Reopen and verify data (regular read path).
     {
-        let mut fs =
+        let fs =
             LocalFileSystem::open_with_options(&root, test_options()).expect("reopen filesystem");
         let data = fs.read_file("/persist.bin").expect("read persist.bin");
         assert_eq!(
@@ -308,6 +308,7 @@ fn extent_map_data_survives_reopen_via_read_path() {
         #[cfg(feature = "replication-io")]
         {
             // Confirm the optional replication export includes extent maps.
+            let mut fs = fs;
             let export = fs.export_changed_records().expect("export changed records");
             let has_ext_map = export.roots.iter().any(|root| {
                 root.records

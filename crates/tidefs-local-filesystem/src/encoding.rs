@@ -727,9 +727,9 @@ mod replication_encoding {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct ChangedRecordEnvelopeVersion {
-        incremental: bool,
-        has_placement_epoch: bool,
+    pub(crate) struct ChangedRecordEnvelopeVersion {
+        pub(crate) incremental: bool,
+        pub(crate) has_placement_epoch: bool,
     }
 
     fn changed_record_stream_version(incremental: bool, has_placement_epoch: bool) -> u16 {
@@ -751,14 +751,14 @@ mod replication_encoding {
     const CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED: u16 = 1 << 2;
     const CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY: u16 = 1 << 3;
     const CHANGED_RECORD_TRANSFORM_REFUSAL: u16 = 1 << 4;
-    const CHANGED_RECORD_TYPED_TRANSFORM_METADATA_MASK: u16 =
+    pub(crate) const CHANGED_RECORD_TYPED_TRANSFORM_METADATA_MASK: u16 =
         CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED
             | CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED
             | CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED
             | CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY
             | CHANGED_RECORD_TRANSFORM_REFUSAL;
 
-    fn encode_changed_record_typed_transform_metadata(
+    pub(crate) fn encode_changed_record_typed_transform_metadata(
         metadata: ChangedRecordTypedTransformMetadata,
     ) -> u16 {
         let mut bits = 0_u16;
@@ -790,7 +790,7 @@ mod replication_encoding {
         bits
     }
 
-    fn decode_changed_record_typed_transform_metadata(
+    pub(crate) fn decode_changed_record_typed_transform_metadata(
         bits: u16,
     ) -> Result<ChangedRecordTypedTransformMetadata> {
         if bits & !CHANGED_RECORD_TYPED_TRANSFORM_METADATA_MASK != 0 {
@@ -831,7 +831,7 @@ mod replication_encoding {
         })
     }
 
-    fn decode_changed_record_stream_version(
+    pub(crate) fn decode_changed_record_stream_version(
         stream_version: u16,
     ) -> Result<ChangedRecordEnvelopeVersion> {
         let envelope = match stream_version {

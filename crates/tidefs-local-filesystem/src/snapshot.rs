@@ -1452,6 +1452,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "replication-io")]
     fn record_root_id(fs: &LocalFileSystem, name: &str) -> Vfssend2Id128 {
         let name = snapshot_name_bytes(name).expect("snapshot name");
         let record = fs.state.snapshots.get(&name).expect("snapshot record");
