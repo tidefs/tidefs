@@ -17,6 +17,7 @@
 //! but do not block recovery of intact entries.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(any(feature = "policy-observation", test))]
 use std::fmt;
 use std::vec::Vec;
 
