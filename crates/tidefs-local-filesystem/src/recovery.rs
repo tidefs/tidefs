@@ -4357,17 +4357,19 @@ mod receipt_validation_tests {
     }
 
     fn make_chunk_ref(
+        inode: &InodeRecord,
         chunk_index: u64,
-        data_version: u64,
         len: u32,
         placement_receipt_generation: u64,
     ) -> ContentChunkRef {
         let payload = chunk_payload(chunk_index, len);
+        let encoded = encode_content_chunk(inode, chunk_index, &payload, &Default::default())
+            .expect("encode recovery fixture chunk reference");
         ContentChunkRef {
             chunk_index,
-            data_version,
+            data_version: inode.data_version,
             len,
-            checksum: checksum64(&payload),
+            checksum: checksum64(&encoded),
             placement_receipt_generation,
         }
     }
@@ -4409,7 +4411,7 @@ mod receipt_validation_tests {
         let root = temp_dir("zero-receipt-gen");
         let mut store = make_store(&root);
         let inode = make_file_inode(2, 1, 4096);
-        let chunk_ref = make_chunk_ref(0, 1, 4096, 0);
+        let chunk_ref = make_chunk_ref(&inode, 0, 4096, 0);
         put_chunk_data(&mut store, &inode, &chunk_ref);
         let mut report = FilesystemContentInspectionReport::empty();
 
@@ -4441,7 +4443,7 @@ mod receipt_validation_tests {
         let inode = make_file_inode(2, 1, 4096);
 
         let chunk_key = content_chunk_object_key_for_version(inode.inode_id, 1, 0);
-        let mut chunk_ref = make_chunk_ref(0, 1, 4096, 0);
+        let mut chunk_ref = make_chunk_ref(&inode, 0, 4096, 0);
         // Use put_with_receipt to get the pool-assigned generation, then
         // build a chunk_ref that carries that exact generation.
         let (_stored, receipt) = pool
@@ -4492,7 +4494,7 @@ mod receipt_validation_tests {
         let mut store = make_store(&store_root);
         let pool = make_pool(&pool_root);
         let inode = make_file_inode(2, 1, 4096);
-        let chunk_ref = make_chunk_ref(0, 1, 4096, 5);
+        let chunk_ref = make_chunk_ref(&inode, 0, 4096, 5);
         put_chunk_data(&mut store, &inode, &chunk_ref);
 
         let mut report = FilesystemContentInspectionReport::empty();
@@ -4517,7 +4519,7 @@ mod receipt_validation_tests {
         let root = temp_dir("no-pool-mismatch");
         let mut store = make_store(&root);
         let inode = make_file_inode(2, 1, 4096);
-        let chunk_ref = make_chunk_ref(0, 1, 4096, 5);
+        let chunk_ref = make_chunk_ref(&inode, 0, 4096, 5);
         put_chunk_data(&mut store, &inode, &chunk_ref);
         let mut report = FilesystemContentInspectionReport::empty();
 
@@ -4546,7 +4548,7 @@ mod receipt_validation_tests {
 
         // Chunk 0: match pool receipt generation -> no mismatch
         let key0 = content_chunk_object_key_for_version(inode.inode_id, 1, 0);
-        let mut chunk0 = make_chunk_ref(0, 1, 4096, 0);
+        let mut chunk0 = make_chunk_ref(&inode, 0, 4096, 0);
         let (_s0, r0) = pool
             .put_with_receipt(DeviceIoClass::Data, key0, &encoded_chunk(&inode, &chunk0))
             .expect("put chunk0");
@@ -4554,12 +4556,12 @@ mod receipt_validation_tests {
         put_chunk_data(&mut store, &inode, &chunk0);
 
         // Chunk 1: receipt gen 7, pool has NO receipt for this key -> mismatch
-        let chunk1 = make_chunk_ref(1, 1, 4096, 7);
+        let chunk1 = make_chunk_ref(&inode, 1, 4096, 7);
         put_chunk_data(&mut store, &inode, &chunk1);
 
         // Chunk 2: receipt gen mismatches pool gen -> mismatch
         let key2 = content_chunk_object_key_for_version(inode.inode_id, 1, 2);
-        let mut chunk2 = make_chunk_ref(2, 1, 4096, 0);
+        let mut chunk2 = make_chunk_ref(&inode, 2, 4096, 0);
         let (_s2, r2) = pool
             .put_with_receipt(DeviceIoClass::Data, key2, &encoded_chunk(&inode, &chunk2))
             .expect("put chunk2");
