@@ -59,8 +59,6 @@ use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, F
 
 use crate::{CopyFileRangeIntent, LocalFileSystem};
 
-use tidefs_inode_table::{Ino, InodeTable};
-
 #[cfg(test)]
 const O_RDONLY: u32 = 0;
 const O_WRONLY: u32 = 0o1;
@@ -156,10 +154,6 @@ pub struct VfsLocalFileSystem {
     active_dir_handles: RefCell<BTreeMap<DirHandleId, InodeId>>,
     next_dir_handle_id: RefCell<u64>,
     anonymous_tmpfiles: RefCell<BTreeMap<InodeId, AnonymousTmpfile>>,
-    /// Optional inode table for metadata prefetch during readdir.
-    /// When set, `readdir` issues a best-effort `prefetch_batch` call
-    /// to prime the in-memory attribute cache for listed entries.
-    inode_table: Option<Arc<InodeTable>>,
     /// When set, all path resolution is scoped to this filesystem directory,
     /// typically the backing directory of a non-root dataset.  The root inode
     /// (ROOT_INODE_ID) maps to this path instead of "/".
@@ -483,7 +477,6 @@ impl VfsLocalFileSystem {
             next_dir_handle_id: RefCell::new(1),
             anonymous_tmpfiles: RefCell::new(BTreeMap::new()),
             dataset_root_path: None,
-            inode_table: None,
             timestamp_policy: TimestampPolicy::Relatime,
             sync_guarantee: SyncGuarantee::Local,
         }
@@ -558,19 +551,6 @@ impl VfsLocalFileSystem {
     /// Consume the adapter and return the inner `LocalFileSystem`.
     pub fn into_inner(self) -> LocalFileSystem {
         self.fs.into_inner()
-    }
-
-    /// Set an inode table for metadata prefetch during readdir.
-    ///
-    /// When set, each [`readdir`](VfsEngine::readdir) call issues a
-    /// best-effort batch prefetch of the inode attributes for the listed
-    /// entries to warm the in-memory cache.
-    pub fn set_inode_table(&mut self, table: Arc<InodeTable>) -> crate::Result<()> {
-        self.fs
-            .borrow()
-            .ensure_mutation_allowed("set mounted VFS inode table")?;
-        self.inode_table = Some(table);
-        Ok(())
     }
 
     /// Set the mount-level atime policy for automatic timestamp updates.
@@ -6201,16 +6181,6 @@ impl VfsEngine for VfsLocalFileSystem {
                 .map_err(|e| map_errno(&e))?
         };
 
-        // Fire-and-forget metadata prefetch: if an inode table is
-        // configured, prime the cache for every inode returned.
-        // Best-effort; failures are silently ignored.
-        if let Some(ref tbl) = self.inode_table {
-            let inos: Vec<Ino> = entries.iter().map(|e| Ino(e.inode_id.0)).collect();
-            if !inos.is_empty() {
-                let _ = tbl.prefetch_batch(&inos);
-            }
-        }
-
         let mut dir_entries: Vec<DirEntry> = Vec::with_capacity(batch_limit);
         for (index, entry) in entries.into_iter().enumerate() {
             let cookie = offset
@@ -6553,15 +6523,6 @@ mod tests {
             engine.set_timestamp_policy(TimestampPolicy::Noatime),
             Err(FileSystemError::MutationRequiresReopen { .. })
         ));
-        let inode_table = Arc::new(InodeTable::new(
-            16,
-            Box::new(tidefs_inode_table::SystemTimeSource),
-        ));
-        assert!(matches!(
-            engine.set_inode_table(inode_table),
-            Err(FileSystemError::MutationRequiresReopen { .. })
-        ));
-
         let second_lock = LockSpec {
             start: 20,
             end: 29,
@@ -16271,97 +16232,6 @@ mod tests {
         assert_eq!(updated.posix.mode & 0o777, 0o755);
         assert_eq!(updated.posix.uid, 2000);
         assert_eq!(updated.posix.size, 100);
-    }
-
-    // ── readdir metadata prefetch smoke test ─────────────────────────
-
-    #[test]
-    fn readdir_with_inode_table_does_not_panic() {
-        let (engine, _td) = temp_fs();
-        let root = engine.get_root_inode(&ctx()).unwrap();
-
-        // Create a few files in the root directory.
-        for i in 0..10u64 {
-            let name = format!("file_{i:03}").into_bytes();
-            engine.create(root, &name, 0o644, 0, &ctx()).unwrap();
-        }
-
-        // Set an inode table for metadata prefetch.
-        let inode_table = std::sync::Arc::new(tidefs_inode_table::InodeTable::new(
-            64,
-            Box::new(tidefs_inode_table::SystemTimeSource),
-        ));
-        let mut engine_mut = engine;
-        engine_mut
-            .set_inode_table(inode_table)
-            .expect("set inode prefetch table");
-
-        // Open and read the root directory. Prefetch is fire-and-forget;
-        // the assertion is that this does not panic or error.
-        let dh = engine_mut.opendir(root, &ctx()).unwrap();
-        let result = engine_mut.readdir(&dh, 0, &ctx());
-        assert!(
-            result.is_ok(),
-            "readdir should succeed with inode table set"
-        );
-
-        let (entries, _has_more) = result.unwrap();
-        assert!(
-            !entries.is_empty(),
-            "root dir should have entries after creating files"
-        );
-
-        engine_mut.releasedir(&dh).unwrap();
-    }
-
-    // ── readdir metadata prefetch large-directory integration test ───
-
-    #[test]
-    fn readdir_prefetch_with_30_entries_does_not_panic() {
-        let (engine, _td) = temp_fs();
-        let root = engine.get_root_inode(&ctx()).unwrap();
-
-        // Create 30 files in the root directory.
-        for i in 0..30u64 {
-            let name = format!("prefetch_test_{i:03}").into_bytes();
-            engine.create(root, &name, 0o644, 0, &ctx()).unwrap();
-        }
-
-        // Set an inode table for metadata prefetch.
-        let inode_table = std::sync::Arc::new(tidefs_inode_table::InodeTable::new(
-            128,
-            Box::new(tidefs_inode_table::SystemTimeSource),
-        ));
-        let mut engine_mut = engine;
-        engine_mut
-            .set_inode_table(inode_table.clone())
-            .expect("set inode prefetch table");
-
-        // Open and read.
-        let dh = engine_mut.opendir(root, &ctx()).unwrap();
-        let (entries, has_more) = engine_mut.readdir(&dh, 0, &ctx()).unwrap();
-
-        assert!(entries.len() >= 30, "should list at least 30 files");
-        assert!(!has_more, "should fit in one batch");
-
-        // After readdir, the inode table should have been called with
-        // prefetch_batch (fire-and-forget). Verify the table is still
-        // functional by creating and looking up an entry directly.
-        let ino = inode_table.create(
-            tidefs_inode_table::InodeKind::File,
-            tidefs_inode_table::InodeAttributes::new(
-                0o644,
-                0,
-                0,
-                tidefs_inode_table::InodeKind::File,
-            ),
-        );
-        assert!(
-            ino.is_ok(),
-            "inode table should be functional after prefetch"
-        );
-
-        engine_mut.releasedir(&dh).unwrap();
     }
 
     #[test]

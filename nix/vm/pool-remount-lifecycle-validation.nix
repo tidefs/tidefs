@@ -137,7 +137,7 @@ USAGE
 
     copy_binary_to_bin "$BUSYBOX" busybox
     for applet in sh ls cat echo mount umount grep insmod rmmod dmesg sleep poweroff \
-                    reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync \
+                    reboot mknod mkdir rmdir dd stat cp mv rm ln touch find wc sync \
                     expr head tail cut kill ps test seq blockdev mountpoint du \
                     uname date hexdump sed sha256sum timeout; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
@@ -204,8 +204,10 @@ done
 if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
     for op in virtio0_size virtio1_size pool_create startup_failure_unwind \
              startup_retry_mount pool_import mount \
-             write_data fsync_data read_verify unmount pool_export reimport remount \
-             persist_verify committed_root_advance intent_log_consistency \
+             write_data fsync_data read_verify lookup_inode rename_entry \
+             link_inode_identity unlink_entry readdir_entry unmount pool_export \
+             reimport remount persist_verify inode_identity_stable \
+             committed_root_advance intent_log_consistency \
              readonly_prep_release readonly_mount readonly_kernel_ro readonly_read \
              readonly_create_erofs readonly_write_erofs readonly_truncate_erofs \
              readonly_unlink_erofs readonly_rename_erofs readonly_mkdir_erofs \
@@ -216,7 +218,7 @@ if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
              crash_cycle_committed_pre_crash_read crash_cycle_sigkill \
              crash_cycle_stale_mount_detached crash_cycle_reimport_no_export \
              crash_cycle_recovery_remount crash_cycle_committed_survived \
-             crash_cycle_unfsynced_bounded; do
+             crash_cycle_inode_stable crash_cycle_unfsynced_bounded; do
         blocked "$op" "virtio block devices missing"
     done
     echo "PASSED=$PASSED FAILED=$FAILED BLOCKED=$BLOCKED"
@@ -331,6 +333,7 @@ echo "--- Phase 6: Write/fsync/read data ---"
 
 TF="$MNT/remount_lifecycle_test.txt"
 TC="TideFS-Remount-Lifecycle-Validation-$(date +%s 2>/dev/null || echo 0)"
+PRE_REMOUNT_INODE=0
 
 if [ "$MOUNTED" -eq 1 ]; then
     echo "$TC" > "$TF" 2>/tmp/werr
@@ -344,8 +347,54 @@ if [ "$MOUNTED" -eq 1 ]; then
 
     RC=$(cat "$TF" 2>/dev/null || true)
     [ "$RC" = "$TC" ] && pass "read_verify" || fail "read_verify" "expected '$TC' got '$RC'"
+
+    PRE_REMOUNT_INODE=$(stat -c '%i' "$TF" 2>/tmp/lookup-inode.err || echo 0)
+    if [ "$PRE_REMOUNT_INODE" -gt 0 ] 2>/dev/null; then
+        pass "lookup_inode"
+    else
+        fail "lookup_inode" "$(cat /tmp/lookup-inode.err 2>/dev/null)"
+    fi
+
+    RENAMED_TF="$MNT/remount_lifecycle_renamed.txt"
+    if mv "$TF" "$RENAMED_TF" 2>/tmp/rename-entry.err \
+        && [ ! -e "$TF" ] && [ -f "$RENAMED_TF" ]; then
+        pass "rename_entry"
+    else
+        fail "rename_entry" "$(cat /tmp/rename-entry.err 2>/dev/null)"
+    fi
+
+    LINKED_TF="$MNT/remount_lifecycle_link.txt"
+    if ln "$RENAMED_TF" "$LINKED_TF" 2>/tmp/link-entry.err; then
+        RENAMED_INODE=$(stat -c '%i' "$RENAMED_TF" 2>/dev/null || echo 0)
+        LINKED_INODE=$(stat -c '%i' "$LINKED_TF" 2>/dev/null || echo 0)
+        if [ "$RENAMED_INODE" -gt 0 ] 2>/dev/null \
+            && [ "$RENAMED_INODE" = "$LINKED_INODE" ] \
+            && [ "$RENAMED_INODE" = "$PRE_REMOUNT_INODE" ]; then
+            pass "link_inode_identity"
+        else
+            fail "link_inode_identity" \
+                "source=$RENAMED_INODE link=$LINKED_INODE expected=$PRE_REMOUNT_INODE"
+        fi
+    else
+        fail "link_inode_identity" "$(cat /tmp/link-entry.err 2>/dev/null)"
+    fi
+
+    if rm "$RENAMED_TF" 2>/tmp/unlink-entry.err \
+        && [ ! -e "$RENAMED_TF" ] && [ -f "$LINKED_TF" ]; then
+        pass "unlink_entry"
+    else
+        fail "unlink_entry" "$(cat /tmp/unlink-entry.err 2>/dev/null)"
+    fi
+
+    if ls "$MNT" 2>/tmp/readdir-entry.err | grep -qx 'remount_lifecycle_link.txt'; then
+        pass "readdir_entry"
+    else
+        fail "readdir_entry" "$(cat /tmp/readdir-entry.err 2>/dev/null)"
+    fi
+    TF="$LINKED_TF"
 else
-    for op in write_data fsync_data read_verify; do
+    for op in write_data fsync_data read_verify lookup_inode rename_entry \
+              link_inode_identity unlink_entry readdir_entry; do
         blocked "$op" "not mounted"
     done
 fi
@@ -466,8 +515,18 @@ if [ "$REMOUNTED" -eq 1 ]; then
         tail -80 /tmp/remount.log 2>/dev/null || true
         fail "persist_verify" "expected '$TC' got '$PB'"
     fi
+
+    POST_REMOUNT_INODE=$(stat -c '%i' "$TF" 2>/tmp/post-remount-inode.err || echo 0)
+    if [ "$PRE_REMOUNT_INODE" -gt 0 ] 2>/dev/null \
+        && [ "$POST_REMOUNT_INODE" = "$PRE_REMOUNT_INODE" ]; then
+        pass "inode_identity_stable"
+    else
+        fail "inode_identity_stable" \
+            "before=$PRE_REMOUNT_INODE after=$POST_REMOUNT_INODE $(cat /tmp/post-remount-inode.err 2>/dev/null)"
+    fi
 else
     blocked "persist_verify" "remount failed"
+    blocked "inode_identity_stable" "remount failed"
 fi
 
 echo ""
@@ -895,6 +954,15 @@ if [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ]; then
         fail "crash_cycle_committed_survived" "expected '$CRASH_COMMITTED_CONTENT' got '$POST_CRASH_COMMITTED'"
     fi
 
+    POST_CRASH_INODE=$(stat -c '%i' "$TF" 2>/tmp/post-crash-inode.err || echo 0)
+    if [ "$PRE_REMOUNT_INODE" -gt 0 ] 2>/dev/null \
+        && [ "$POST_CRASH_INODE" = "$PRE_REMOUNT_INODE" ]; then
+        pass "crash_cycle_inode_stable"
+    else
+        fail "crash_cycle_inode_stable" \
+            "before=$PRE_REMOUNT_INODE after=$POST_CRASH_INODE $(cat /tmp/post-crash-inode.err 2>/dev/null)"
+    fi
+
     if [ -f "$CRASH_UNCOMMITTED_FILE" ]; then
         if ! POST_CRASH_UNCOMMITTED=$(cat "$CRASH_UNCOMMITTED_FILE" 2>/tmp/crash_uncommitted_read.err); then
             fail "crash_cycle_unfsynced_bounded" "recovered file is unreadable: $(cat /tmp/crash_uncommitted_read.err 2>/dev/null)"
@@ -909,6 +977,7 @@ if [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ]; then
     fi
 else
     blocked "crash_cycle_committed_survived" "crash-recovery remount failed"
+    blocked "crash_cycle_inode_stable" "crash-recovery remount failed"
     blocked "crash_cycle_unfsynced_bounded" "crash-recovery remount failed"
 fi
 
@@ -974,8 +1043,9 @@ INITSCRIPT
       fuse_support fuse_device \
       virtio0_present virtio1_present virtio0_size virtio1_size \
       pool_create startup_failure_unwind startup_retry_mount \
-      pool_import mount write_data fsync_data read_verify \
-      unmount pool_export reimport remount persist_verify \
+      pool_import mount write_data fsync_data read_verify lookup_inode \
+      rename_entry link_inode_identity unlink_entry readdir_entry \
+      unmount pool_export reimport remount persist_verify inode_identity_stable \
       committed_root_advance intent_log_consistency \
       readonly_prep_release readonly_mount readonly_kernel_ro readonly_read \
       readonly_create_erofs readonly_write_erofs readonly_truncate_erofs \
@@ -988,7 +1058,7 @@ INITSCRIPT
       crash_cycle_committed_pre_crash_read crash_cycle_sigkill \
       crash_cycle_stale_mount_detached crash_cycle_reimport_no_export \
       crash_cycle_recovery_remount crash_cycle_committed_survived \
-      crash_cycle_unfsynced_bounded \
+      crash_cycle_inode_stable crash_cycle_unfsynced_bounded \
       sync_done; do
       if grep -q "PASS: $op" "$VAL_LOG" 2>/dev/null; then
         echo "  PASS: $op"; PASSC=$((PASSC + 1))

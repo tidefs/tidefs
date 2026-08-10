@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! FUSE rename dispatch with namespace renameat2 integration.
+//! FUSE rename dispatch through the mounted VFS engine.
 //!
 //! This module provides the FUSE `rename` / `renameat2` operation dispatch
 //! that chains FUSE protocol argument extraction, POSIX constraint validation,
-//! namespace `renameat2` delegation, dir-index entry swap, and inode-table
-//! link-count updates.
+//! and VFS engine rename delegation.
 //!
 //! Supported modes:
 //! - `RENAME` (flags=0): plain POSIX rename with overwrite semantics
@@ -13,11 +12,8 @@
 //!
 //! `RENAME_WHITEOUT` is a Linux overlayfs-specific mode that TideFS does not
 //! implement for mounted FUSE rename dispatch. It is rejected fail-closed with
-//! `EINVAL` before any namespace mutation.
+//! `EINVAL` before any mounted filesystem mutation.
 
-use std::sync::Arc;
-
-use tidefs_namespace::Namespace;
 use tidefs_types_vfs_core::InodeId;
 use tidefs_vfs_engine::{Errno, RequestCtx, VfsEngine};
 
@@ -44,30 +40,15 @@ pub struct EngineRenameRequest<'a> {
 // FuseRenameDispatch
 // ---------------------------------------------------------------------------
 
-/// Stateful FUSE rename dispatcher that validates FUSE protocol arguments,
-/// applies POSIX rename constraints, and delegates to the VFS engine or
-/// namespace for atomic directory-entry manipulation.
-pub struct FuseRenameDispatch {
-    /// Optional namespace handle for direct namespace-level rename.
-    /// When present, renames go through the namespace instead of the engine.
-    namespace: Option<Arc<Namespace>>,
-}
+/// FUSE rename dispatcher that validates protocol arguments, applies POSIX
+/// rename constraints, and delegates to the mounted VFS engine.
+pub struct FuseRenameDispatch;
 
 impl FuseRenameDispatch {
-    /// Create a new rename dispatcher without a namespace.
-    ///
-    /// Renames will be dispatched through the VFS engine via
-    /// `dispatch_engine_rename`.
+    /// Create an engine-backed rename dispatcher.
     #[must_use]
     pub fn new() -> Self {
-        Self { namespace: None }
-    }
-
-    /// Attach a [`Namespace`] for direct namespace-level rename operations.
-    #[must_use]
-    pub fn with_namespace(mut self, ns: Arc<Namespace>) -> Self {
-        self.namespace = Some(ns);
-        self
+        Self
     }
 
     /// Standard POSIX rename: atomically moves `oldname` under `old_parent`
@@ -182,130 +163,11 @@ impl FuseRenameDispatch {
 
         engine.rename(old_parent, old_name, new_parent, new_name, flags, ctx)
     }
-
-    /// Standard POSIX rename through the namespace.
-    ///
-    /// Prefer this path when a namespace is attached and the caller wants
-    /// namespace-level semantics (direct dir-index manipulation, finer error
-    /// reporting).
-    ///
-    /// # Panics
-    ///
-    /// Panics if no namespace was attached via `with_namespace`.
-    pub fn dispatch_namespace_rename(
-        &self,
-        old_parent: InodeId,
-        old_name: &[u8],
-        new_parent: InodeId,
-        new_name: &[u8],
-    ) -> RenameResult {
-        self.dispatch_namespace_with_flags(old_parent, old_name, new_parent, new_name, 0)
-    }
-
-    /// `RENAME_NOREPLACE` through the namespace.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no namespace was attached via `with_namespace`.
-    pub fn dispatch_namespace_rename_noreplace(
-        &self,
-        old_parent: InodeId,
-        old_name: &[u8],
-        new_parent: InodeId,
-        new_name: &[u8],
-    ) -> RenameResult {
-        self.dispatch_namespace_with_flags(
-            old_parent,
-            old_name,
-            new_parent,
-            new_name,
-            RENAME_NOREPLACE,
-        )
-    }
-
-    /// `RENAME_EXCHANGE` through the namespace.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no namespace was attached via `with_namespace`.
-    pub fn dispatch_namespace_rename_exchange(
-        &self,
-        old_parent: InodeId,
-        old_name: &[u8],
-        new_parent: InodeId,
-        new_name: &[u8],
-    ) -> RenameResult {
-        self.dispatch_namespace_with_flags(
-            old_parent,
-            old_name,
-            new_parent,
-            new_name,
-            RENAME_EXCHANGE,
-        )
-    }
-
-    /// Core namespace dispatch with flags.
-    fn dispatch_namespace_with_flags(
-        &self,
-        old_parent: InodeId,
-        old_name: &[u8],
-        new_parent: InodeId,
-        new_name: &[u8],
-        flags: u32,
-    ) -> RenameResult {
-        let ns = self
-            .namespace
-            .as_ref()
-            .expect("FuseRenameDispatch::dispatch_namespace_* called without a namespace");
-
-        let old_name_str = std::str::from_utf8(old_name).map_err(|_| Errno(libc::EINVAL as u16))?;
-        let new_name_str = std::str::from_utf8(new_name).map_err(|_| Errno(libc::EINVAL as u16))?;
-
-        let old_parent_raw = old_parent.get();
-        let new_parent_raw = new_parent.get();
-        ns.rename_with_flags(
-            old_parent_raw,
-            old_name_str,
-            new_parent_raw,
-            new_name_str,
-            flags,
-        )
-        .map_err(map_namespace_error)
-    }
 }
 
 impl Default for FuseRenameDispatch {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Error mapping
-// ---------------------------------------------------------------------------
-
-/// Map `tidefs_namespace::NamespaceError` to a FUSE `Errno`.
-pub fn map_namespace_error(err: tidefs_namespace::NamespaceError) -> Errno {
-    use tidefs_namespace::NamespaceError;
-    match err {
-        NamespaceError::NotFound | NamespaceError::InodeNotFound => Errno(libc::ENOENT as u16),
-        NamespaceError::AlreadyExists => Errno(libc::EEXIST as u16),
-        NamespaceError::NotEmpty => Errno(libc::ENOTEMPTY as u16),
-        NamespaceError::NotDirectory => Errno(libc::ENOTDIR as u16),
-        NamespaceError::IsDirectory => Errno(libc::EISDIR as u16),
-        NamespaceError::InvalidName => Errno(libc::EINVAL as u16),
-        NamespaceError::CrossDeviceRename => Errno(libc::EXDEV as u16),
-        NamespaceError::RenameCycle => Errno(libc::EINVAL as u16),
-        NamespaceError::LinkCountOverflow => Errno(libc::EMLINK as u16),
-        NamespaceError::TooManySymlinks => Errno(libc::ELOOP as u16),
-        NamespaceError::NotSymlink => Errno(libc::EINVAL as u16),
-        NamespaceError::NotSupported => Errno(libc::EOPNOTSUPP as u16),
-        NamespaceError::DirIndex(_) => Errno(libc::EIO as u16),
-
-        NamespaceError::StaleCursor => Errno(libc::EAGAIN as u16),
-
-        NamespaceError::MutationRequiresReopen { .. } => Errno(libc::EIO as u16),
-        NamespaceError::DatasetIdentityMismatch { .. } => Errno(libc::EIO as u16),
     }
 }
 
@@ -650,100 +512,6 @@ mod tests {
             .lookup(dst_dir.inode_id, b"moved.txt", &ctx)
             .expect("moved file exists");
         assert_eq!(moved.inode_id, file_attr.inode_id);
-    }
-
-    // ── error mapping ────────────────────────────────────────────────
-
-    #[test]
-    fn error_mapping_covers_all_variants() {
-        use tidefs_namespace::NamespaceError;
-        let cases = [
-            (NamespaceError::NotFound, libc::ENOENT),
-            (NamespaceError::InodeNotFound, libc::ENOENT),
-            (NamespaceError::AlreadyExists, libc::EEXIST),
-            (NamespaceError::NotEmpty, libc::ENOTEMPTY),
-            (NamespaceError::NotDirectory, libc::ENOTDIR),
-            (NamespaceError::IsDirectory, libc::EISDIR),
-            (NamespaceError::InvalidName, libc::EINVAL),
-            (NamespaceError::CrossDeviceRename, libc::EXDEV),
-            (NamespaceError::RenameCycle, libc::EINVAL),
-            (NamespaceError::LinkCountOverflow, libc::EMLINK),
-            (NamespaceError::TooManySymlinks, libc::ELOOP),
-            (NamespaceError::NotSymlink, libc::EINVAL),
-            (NamespaceError::NotSupported, libc::EOPNOTSUPP),
-            (
-                NamespaceError::MutationRequiresReopen {
-                    operation: "rename namespace entry",
-                },
-                libc::EIO,
-            ),
-        ];
-        for (err, expected) in &cases {
-            assert_eq!(
-                map_namespace_error(err.clone()).0,
-                *expected as u16,
-                "unexpected errno for {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn namespace_rename_wired_to_dispatch() {
-        let ns = Arc::new(tidefs_namespace::Namespace::new());
-        ns.create_dir(1, "d1", tidefs_namespace::InodeAttributes::new_dir(0))
-            .expect("create d1");
-        let file = ns
-            .create_file(1, "f.txt", tidefs_namespace::InodeAttributes::new_file(0))
-            .expect("create file");
-
-        let dispatch = FuseRenameDispatch::new().with_namespace(Arc::clone(&ns));
-
-        dispatch
-            .dispatch_namespace_rename(InodeId::new(1), b"f.txt", InodeId::new(1), b"g.txt")
-            .expect("namespace rename");
-
-        assert!(ns.lookup(1, "f.txt").unwrap().is_none());
-        assert_eq!(ns.lookup(1, "g.txt").unwrap(), Some(file));
-    }
-
-    #[test]
-    fn namespace_rename_noreplace_rejects_existing_target() {
-        let ns = Arc::new(tidefs_namespace::Namespace::new());
-        ns.create_file(1, "src", tidefs_namespace::InodeAttributes::new_file(0))
-            .expect("create src");
-        ns.create_file(1, "dst", tidefs_namespace::InodeAttributes::new_file(0))
-            .expect("create dst");
-
-        let dispatch = FuseRenameDispatch::new().with_namespace(Arc::clone(&ns));
-
-        let result = dispatch.dispatch_namespace_rename_noreplace(
-            InodeId::new(1),
-            b"src",
-            InodeId::new(1),
-            b"dst",
-        );
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().0, libc::EEXIST as u16);
-    }
-
-    #[test]
-    fn namespace_rename_exchange_swaps() {
-        let ns = Arc::new(tidefs_namespace::Namespace::new());
-        let left = ns
-            .create_file(1, "left", tidefs_namespace::InodeAttributes::new_file(0))
-            .expect("create left");
-        let right = ns
-            .create_file(1, "right", tidefs_namespace::InodeAttributes::new_file(0))
-            .expect("create right");
-
-        let dispatch = FuseRenameDispatch::new().with_namespace(Arc::clone(&ns));
-
-        dispatch
-            .dispatch_namespace_rename_exchange(InodeId::new(1), b"left", InodeId::new(1), b"right")
-            .expect("namespace exchange");
-
-        assert_eq!(ns.lookup(1, "left").unwrap(), Some(right));
-        assert_eq!(ns.lookup(1, "right").unwrap(), Some(left));
     }
 
     // ── directory rename tests ──────────────────────────────────────

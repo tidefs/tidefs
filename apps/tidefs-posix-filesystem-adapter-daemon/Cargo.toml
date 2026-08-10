@@ -22,7 +22,6 @@ tidefs-local-filesystem = { workspace = true, features = ["encryption"] }
 tidefs-pool-import = { workspace = true }
 tidefs-dataset-lifecycle = { workspace = true }
 tidefs-dataset-catalog = { workspace = true }
-tidefs-inode-table = { workspace = true }
 tidefs-invalidation-feed = { workspace = true }
 tidefs-dir-index = { workspace = true }
 tidefs-posix-acl = { workspace = true }
@@ -50,7 +49,6 @@ tidefs-types-posix-filesystem-adapter-core = { workspace = true }
 tidefs-types-vfs-core = { workspace = true }
 tidefs-types-dataset-feature-flags-core = { workspace = true }
 tidefs-vfs-engine = { workspace = true }
-tidefs-namespace = { workspace = true, features = ["persistent-dir-index"] }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tidefs-flow-commit-coordinator = { workspace = true }

@@ -14,12 +14,10 @@
 //!
 use std::cell::RefCell;
 
-use std::sync::Arc;
 use tidefs_local_filesystem::{
     human::local_filesystem::StoreOptions, open_dispatch::FileHandleTable,
     vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem, RootAuthenticationKey,
 };
-use tidefs_namespace::Namespace;
 use tidefs_posix_filesystem_adapter_daemon::fuse_rename::{
     EngineRenameRequest, FuseRenameDispatch,
 };
@@ -560,70 +558,49 @@ impl AdapterTestHarness {
     }
 }
 
-/// Adapter-level harness that wires a [`Namespace`] into the FUSE adapter
-/// so that dispatched operations exercise the namespace-backed code paths
-/// (dir-index lookup, inode-table attribute retrieval).
-struct NamespaceAdapterTestHarness {
+/// Engine-backed adapter harness focused on lookup behavior.
+struct LookupAdapterTestHarness {
     _temp: tempfile::TempDir,
     adapter: FuseVfsAdapter,
-    ns: Arc<Namespace>,
 }
 
-impl NamespaceAdapterTestHarness {
+impl LookupAdapterTestHarness {
     fn new() -> Self {
-        let tmp = tempfile::tempdir().expect("tempdir for namespace adapter harness");
+        let tmp = tempfile::tempdir().expect("tempdir for lookup adapter harness");
         let lfs = LocalFileSystem::open_with_root_authentication_key(
             tmp.path(),
             StoreOptions::default(),
             RootAuthenticationKey::demo_key(),
         )
-        .expect("open local filesystem for namespace harness");
+        .expect("open local filesystem for lookup harness");
         let engine = VfsLocalFileSystem::new(lfs);
-        let ns = Arc::new(Namespace::new());
-        let adapter = FuseVfsAdapter::new(Box::new(engine))
-            .expect("create FuseVfsAdapter")
-            .with_namespace(Arc::clone(&ns));
+        let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create FuseVfsAdapter");
         Self {
             _temp: tmp,
             adapter,
-            ns,
         }
     }
 
-    /// Pre-populate a directory entry through the namespace so the
-    /// namespace-backed lookup path can resolve it.  Uses the engine
-    /// mkdir/create path to build the parent directory, then inserts
-    /// the child entry directly into the namespace.
-    fn insert_namespace_entry(&self, parent: u64, name: &str, mode: u32) -> u64 {
-        use tidefs_namespace::InodeAttributes;
-        let now = std::time::SystemTime::now();
+    /// Create a directory entry through the mounted engine before lookup.
+    fn insert_engine_entry(&self, parent: u64, name: &str, mode: u32) -> u64 {
+        let ctx = test_ctx();
         let kind_bits = mode & libc::S_IFMT;
-        let attrs = InodeAttributes {
-            inode: 0,
-            mode,
-            uid: 0,
-            gid: 0,
-            size: 0,
-            nlink: if kind_bits == libc::S_IFDIR { 2 } else { 1 },
-            atime: now,
-            mtime: now,
-            ctime: now,
-            rdev: 0,
-        };
-
         if kind_bits == libc::S_IFDIR {
-            self.ns
-                .create_dir(parent, name, attrs)
-                .expect("namespace create_dir")
+            self.adapter
+                .dispatch_mkdir(&ctx, parent, name.as_bytes(), mode & 0o777)
+                .expect("engine mkdir")
+                .inode_id
+                .get()
         } else {
-            self.ns
-                .create_file(parent, name, attrs)
-                .expect("namespace create_file")
+            self.adapter
+                .dispatch_mknod(&ctx, parent, name.as_bytes(), mode, 0)
+                .expect("engine mknod")
+                .inode_id
+                .get()
         }
     }
 
-    /// Look up a path component through the adapter's dispatch_lookup,
-    /// which routes through the namespace when one is attached.
+    /// Look up a path component through the adapter's mounted engine.
     fn lookup(&self, ctx: &RequestCtx, parent: u64, name: &[u8]) -> Result<InodeAttr, Errno> {
         self.adapter.dispatch_lookup(ctx, parent, name)
     }
@@ -822,21 +799,19 @@ fn test_adapter_getattr_roundtrip() {
     );
 }
 
-// ── Namespace-backed lookup tests ────────────────────────────────────────
+// ── Engine-backed lookup tests ───────────────────────────────────────────
 
 #[test]
-fn test_namespace_lookup_existing_file() {
-    let h = NamespaceAdapterTestHarness::new();
+fn test_engine_lookup_existing_file() {
+    let h = LookupAdapterTestHarness::new();
     let ctx = test_ctx();
     let root = ROOT_INODE;
 
-    // Pre-populate a file entry in the namespace root dir.
-    let child_ino = h.insert_namespace_entry(root, "hello.txt", libc::S_IFREG | 0o644);
+    let child_ino = h.insert_engine_entry(root, "hello.txt", libc::S_IFREG | 0o644);
 
-    // Resolve it through the adapter dispatch_lookup -> namespace path.
     let found = h
         .lookup(&ctx, root, b"hello.txt")
-        .expect("namespace-backed lookup should find existing file");
+        .expect("engine-backed lookup should find existing file");
     assert_eq!(
         found.inode_id.get(),
         child_ino,
@@ -850,23 +825,23 @@ fn test_namespace_lookup_existing_file() {
 }
 
 #[test]
-fn test_namespace_lookup_existing_directory() {
-    let h = NamespaceAdapterTestHarness::new();
+fn test_engine_lookup_existing_directory() {
+    let h = LookupAdapterTestHarness::new();
     let ctx = test_ctx();
     let root = ROOT_INODE;
 
-    let subdir_ino = h.insert_namespace_entry(root, "mydir", libc::S_IFDIR | 0o755);
+    let subdir_ino = h.insert_engine_entry(root, "mydir", libc::S_IFDIR | 0o755);
 
     let found = h
         .lookup(&ctx, root, b"mydir")
-        .expect("namespace-backed lookup should find directory");
+        .expect("engine-backed lookup should find directory");
     assert_eq!(found.inode_id.get(), subdir_ino);
     assert_eq!(found.kind, tidefs_vfs_engine::NodeKind::Dir);
 }
 
 #[test]
-fn test_namespace_lookup_enoent() {
-    let h = NamespaceAdapterTestHarness::new();
+fn test_engine_lookup_enoent() {
+    let h = LookupAdapterTestHarness::new();
     let ctx = test_ctx();
     let root = ROOT_INODE;
 
@@ -877,13 +852,12 @@ fn test_namespace_lookup_enoent() {
 }
 
 #[test]
-fn test_namespace_lookup_empty_directory() {
-    let h = NamespaceAdapterTestHarness::new();
+fn test_engine_lookup_empty_directory() {
+    let h = LookupAdapterTestHarness::new();
     let ctx = test_ctx();
     let root = ROOT_INODE;
 
-    // Create a subdirectory via namespace, then lookup a name in it.
-    let subdir_ino = h.insert_namespace_entry(root, "empty_dir", libc::S_IFDIR | 0o755);
+    let subdir_ino = h.insert_engine_entry(root, "empty_dir", libc::S_IFDIR | 0o755);
 
     // Looking up a nonexistent name in an empty directory should return ENOENT.
     let err = h
@@ -893,13 +867,12 @@ fn test_namespace_lookup_empty_directory() {
 }
 
 #[test]
-fn test_namespace_lookup_enotdir() {
-    let h = NamespaceAdapterTestHarness::new();
+fn test_engine_lookup_enotdir() {
+    let h = LookupAdapterTestHarness::new();
     let ctx = test_ctx();
     let root = ROOT_INODE;
 
-    // Create a regular file via namespace.
-    let file_ino = h.insert_namespace_entry(root, "regular.txt", libc::S_IFREG | 0o644);
+    let file_ino = h.insert_engine_entry(root, "regular.txt", libc::S_IFREG | 0o644);
 
     // Trying to look up 'anything' inside a regular file should return ENOTDIR.
     let err = h
@@ -909,8 +882,8 @@ fn test_namespace_lookup_enotdir() {
 }
 
 #[test]
-fn test_namespace_lookup_enoent_missing_parent() {
-    let h = NamespaceAdapterTestHarness::new();
+fn test_engine_lookup_enoent_missing_parent() {
+    let h = LookupAdapterTestHarness::new();
     let ctx = test_ctx();
 
     // Parent inode 9999 was never allocated.
@@ -921,12 +894,12 @@ fn test_namespace_lookup_enoent_missing_parent() {
 }
 
 #[test]
-fn test_namespace_lookup_created_then_resolved() {
-    let h = NamespaceAdapterTestHarness::new();
+fn test_engine_lookup_created_then_resolved() {
+    let h = LookupAdapterTestHarness::new();
     let ctx = test_ctx();
     let root = ROOT_INODE;
 
-    // Create a file via the namespace-backed adapter create dispatch.
+    // Create a file through the engine-backed adapter dispatch.
     let created = h
         .adapter
         .dispatch_create(
@@ -936,9 +909,9 @@ fn test_namespace_lookup_created_then_resolved() {
             libc::S_IFREG | 0o600,
             0, /* flags */
         )
-        .expect("create via namespace-backed adapter");
+        .expect("create via engine-backed adapter");
 
-    // Resolve it through lookup (also namespace-backed).
+    // Resolve it through the same engine-backed adapter.
     let found = h
         .lookup(&ctx, root, b"newfile.bin")
         .expect("lookup after create should succeed");
@@ -950,15 +923,15 @@ fn test_namespace_lookup_created_then_resolved() {
 }
 
 #[test]
-fn test_namespace_lookup_multiple_children() {
-    let h = NamespaceAdapterTestHarness::new();
+fn test_engine_lookup_multiple_children() {
+    let h = LookupAdapterTestHarness::new();
     let ctx = test_ctx();
     let root = ROOT_INODE;
 
     let mut inos = Vec::new();
     for i in 0..5 {
         let name = format!("child_{i}");
-        let ino = h.insert_namespace_entry(root, &name, libc::S_IFREG | 0o644);
+        let ino = h.insert_engine_entry(root, &name, libc::S_IFREG | 0o644);
         inos.push(ino);
     }
 
@@ -966,14 +939,14 @@ fn test_namespace_lookup_multiple_children() {
         let name = format!("child_{i}");
         let found = h
             .lookup(&ctx, root, name.as_bytes())
-            .expect("namespace-backed lookup for multiple children");
+            .expect("engine-backed lookup for multiple children");
         assert_eq!(found.inode_id.get(), expected_ino);
     }
 }
 
 #[test]
-fn test_namespace_lookup_invalid_name_rejected() {
-    let h = NamespaceAdapterTestHarness::new();
+fn test_engine_lookup_invalid_name_rejected() {
+    let h = LookupAdapterTestHarness::new();
     let ctx = test_ctx();
     let root = ROOT_INODE;
 

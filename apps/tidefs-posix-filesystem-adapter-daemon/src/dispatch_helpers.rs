@@ -9,30 +9,11 @@
 //!
 //! Every error path in the daemon maps to a POSIX errno before reaching
 //! the kernel. This catalogue documents every mapping site and the errno
-//! values in use. The two primary centralized mappers are:
-//!
-//! - `crate::fuse_vfs_adapter::namespace_error_to_errno`:
-//!   maps [`tidefs_namespace::NamespaceError`] to [`Errno`].
-//! - `crate::fuse_vfs_adapter::errno_from_meta_error`:
+//! values in use. The primary centralized mapper is
+//! `crate::fuse_vfs_adapter::errno_from_meta_error`, which
 //!   maps [`MetaError`](crate::workers_meta::MetaError) to [`Errno`].
 //!
-//! ## 1. NamespaceError → Errno (namespace_error_to_errno, line 120)
-//!
-//! | NamespaceError variant          | Errno       |
-//! |--------------------------------|-------------|
-//! | `NotFound`, `InodeNotFound`    | `ENOENT`    |
-//! | `AlreadyExists`                | `EEXIST`    |
-//! | `NotEmpty`                     | `ENOTEMPTY` |
-//! | `NotDirectory`                 | `ENOTDIR`   |
-//! | `IsDirectory`                  | `EISDIR`    |
-//! | `InvalidName`                  | `EINVAL`    |
-//! | `TooManySymlinks`              | `ELOOP`     |
-//! | `NotSymlink`                   | `EINVAL`    |
-//! | `LinkCountOverflow`            | `EMLINK`    |
-//! | `RenameCycle`                  | `EINVAL`    |
-//! | (other)                        | `EIO`       |
-//!
-//! ## 2. MetaError → Errno (errno_from_meta_error, line 1610)
+//! ## 1. MetaError → Errno (errno_from_meta_error)
 //!
 //! | MetaError variant   | Errno     |
 //! |--------------------|-----------|
@@ -42,7 +23,7 @@
 //! | `PermDenied`       | `EPERM`   |
 //! | `ReplyError`, `Io` | `EIO`     |
 //!
-//! ## 3. Domain error enums with to_errno() methods
+//! ## 2. Domain error enums with to_errno() methods
 //!
 //! | Error enum            | Module                  | Returns | Variants mapped to errno                       |
 //! |-----------------------|-------------------------|---------|-------------------------------------------------|
@@ -51,7 +32,7 @@
 //! | `FsyncError`          | `fuse_flush_fsync`      | `Errno` | Same as FlushError                              |
 //! | `LockDispatchError`   | `lock_dispatch`         | `Errno` | `InvalidLockType→EINVAL`, `Conflict→EAGAIN`, `WouldBlock→EAGAIN` |
 //!
-//! ## 4. Inline Errno values in helper functions (fuse_vfs_adapter.rs)
+//! ## 3. Inline Errno values in helper functions (fuse_vfs_adapter.rs)
 //!
 //! | Location / function                    | Condition                            | Errno        |
 //! |----------------------------------------|--------------------------------------|--------------|
@@ -83,14 +64,14 @@
 //! | `readdir` negative lookup              |                                      | `ENOENT`     |
 //! | `readdir` negative lookup (not dir)    |                                      | `ENOTDIR`    |
 //! | `readdir` permission denied            |                                      | `EACCES`     |
-//! | Namespace path (non-UTF-8 name)        |                                      | `EINVAL`     |
-//! | Namespace path (name too long)         |                                      | `ENAMETOOLONG` |
-//! | Namespace path (bad link target)       |                                      | `EINVAL`     |
+//! | Engine path (invalid component)        |                                      | `EINVAL`     |
+//! | Engine path (name too long)            |                                      | `ENAMETOOLONG` |
+//! | Engine path (bad link target)          |                                      | `EINVAL`     |
 //! | xattr value > max size                 |                                      | `ERANGE`     |
 //! | `dispatch_poll_file` (bad handle)      |                                      | `EBADF`      |
 //! | `statfs` empty reply sink              |                                      | `EIO`        |
 //!
-//! ## 5. FUSE handler inline error returns
+//! ## 4. FUSE handler inline error returns
 //!
 //! | Handler    | Condition                            | Errno        |
 //! |-----------|--------------------------------------|--------------|

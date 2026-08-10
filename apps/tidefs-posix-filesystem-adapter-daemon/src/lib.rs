@@ -21,19 +21,16 @@
 //!    the appropriate dispatch handler.
 //!
 //! 2. **Dispatch**: the [`FuseVfsAdapter`] implements [`fuser::Filesystem`]
-//!    and dispatches each operation to a type-safe handler.  Namespace
-//!    operations (lookup, mkdir, unlink, rename, symlink, …) go through
-//!    [`Namespace`]; data-path operations (read, write, fallocate, flush,
-//!    fsync) go through the page-cache and extent-map; metadata operations
-//!    (getattr, setattr, access) go through the inode table and permission
-//!    checker.
+//!    and projects each operation into the mounted [`VfsEngine`]. Adapter
+//!    handle, lookup-reference, page-cache, and reply state remains derived
+//!    transport state; namespace, inode, metadata, and persistence decisions
+//!    stay in the engine.
 //!
 //! 3. **Reply**: each handler returns either a success value (packed into
 //!    a FUSE reply) or an [`Errno`] error code.  The reply layer
 //!    converts these into the appropriate kernel reply message.
 //!
 //! [`FuseVfsAdapter`]: crate::fuse_vfs_adapter::FuseVfsAdapter
-//! [`Namespace`]: tidefs_namespace::Namespace
 //! [`RequestCtx`]: tidefs_types_vfs_core::RequestCtx
 //! [`Errno`]: tidefs_vfs_engine::Errno
 //!
@@ -62,10 +59,7 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`fuse_vfs_adapter`] | Main `fuser::Filesystem` impl; ~30 FUSE op handlers |
-//! | [`fuse_write`] | Write/write_buf dispatch with page-cache dirty tracking |
-//! | [`fuse_read`] | Read dispatch with page-cache look-aside |
 //! | [`fuse_flush_fsync`] | Flush/fsync dispatch with writeback and extent commit |
-//! | [`fuse_lookup_forget`] | Lookup and forget dispatch |
 //! | [`fuse_rename`] | Atomic rename with cross-directory validation |
 //! | [`fuse_create_unlink_dispatch`] | Unlink/rmdir with capacity release |
 //! | [`readdir_dispatch`] | Readdir/readdirplus with cookie-based pagination |
@@ -74,10 +68,7 @@
 //! | [`writeback_reclaim`] | Dirty-page writeback and reclaim |
 //!
 //! [`fuse_vfs_adapter`]: crate::fuse_vfs_adapter
-//! [`fuse_write`]: crate::fuse_write
-//! [`fuse_read`]: crate::fuse_read
 //! [`fuse_flush_fsync`]: crate::fuse_flush_fsync
-//! [`fuse_lookup_forget`]: crate::fuse_lookup_forget
 //! [`fuse_rename`]: crate::fuse_rename
 //! [`fuse_create_unlink_dispatch`]: crate::fuse_create_unlink_dispatch
 //! [`readdir_dispatch`]: crate::readdir_dispatch
@@ -93,12 +84,9 @@ pub mod dispatch_helpers;
 pub mod fsync_handler;
 pub mod fuse_create_unlink_dispatch;
 pub mod fuse_flush_fsync;
-pub mod fuse_lookup_forget;
 pub mod fuse_posix_lock;
-pub mod fuse_read;
 pub mod fuse_rename;
 pub mod fuse_vfs_adapter;
-pub mod fuse_write;
 pub mod handler_prelude;
 pub mod live_owner;
 pub mod lock_dispatch;

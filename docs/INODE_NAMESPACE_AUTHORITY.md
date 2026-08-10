@@ -1,12 +1,12 @@
 # Inode Namespace Authority
 
-Maturity: current design decision for TFR-004 and GitHub issue #655.
+Maturity: current design and mounted implementation boundary for TFR-004.
 
 Decision id: `tfr-004.dataset_inode_authority.v1`.
 
-This document decides the owner boundary for dataset-scoped inode identity.
-It is a design authority document, not runtime implementation evidence. It
-does not claim production readiness and does not close TFR-004 by itself.
+This document decides the owner boundary for dataset-scoped inode identity and
+records how the selected mounted carrier applies it. It does not claim
+production readiness or close TFR-004 by itself.
 
 ## Scope
 
@@ -21,12 +21,34 @@ This decision covers:
   `tidefs-inode-table`, and FUSE adapter registries;
 - old pre-release catalog handling for inode and root dataset mismatches.
 
-This decision does not implement runtime behavior, add migration code, or
-prove crash consistency for rename, replay, special nodes, or lookup caches.
+This decision does not by itself prove crash consistency for rename, replay,
+special nodes, or lookup caches. Current runtime evidence belongs to the
+focused carrier tests named by the implementing issue and pull request.
 
-## Evidence Reviewed
+## Current Mounted Implementation
 
-The decision is based on the following current evidence.
+The selected local mounted carrier applies the decision as follows:
+
+- `DatasetInodeAuthority` inside `tidefs-local-filesystem` owns the dataset ID,
+  root inode, allocation cursor, explicit-ID observation, and recovery seeding.
+- `VfsLocalFileSystem` consumes local-filesystem inode and directory state
+  directly. It has no optional `InodeTable`, setter, or mirrored allocation
+  branch.
+- `FuseVfsAdapter` attaches no `Namespace`. Lookup, attributes, mutation,
+  rename, directory iteration, and xattrs project the VFS engine without a
+  namespace fallback, mirrored durable attributes, or merged directory view.
+- FUSE lookup counts, forget counts, and path/negative caches are derived
+  kernel-reference state only. The selected adapter has no inode-table-backed
+  lookup/read/write batch, and `tidefs-namespace` remains outside the selected
+  mounted carrier.
+- The mounted pool lifecycle checks stable inode identity through rename,
+  hard-link, unlink, clean export/reimport, and crash recovery.
+
+## Original Decision Evidence
+
+The original decision was based on the following source state. It is preserved
+as decision rationale, not as the current implementation map; the current map
+is above and in `docs/ARCHITECTURE.md`.
 
 Documentation:
 
@@ -99,17 +121,18 @@ FUSE adapter:
   and cache state.
 - `bump_forget_refcount()` and `dispatch_forget()` track kernel lookup
   references and decide when adapter caches can be invalidated.
-- `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_lookup_forget.rs`
-  still wraps `tidefs-inode-table::InodeTable` for an older lookup/forget
-  batch. This is adapter reference state, not durable dataset identity.
+- At decision time, the now-retired pre-contraction `fuse_lookup_forget.rs`
+  wrapped `tidefs-inode-table::InodeTable` for an unwired lookup/forget batch.
+  Its removal left kernel reference accounting in `FuseVfsAdapter` itself.
 
 ## Owner Models Compared
 
 ### Model A: `LocalFileSystem` Owns Allocation, Namespace Is A Projection
 
-This matches much of the current source: `LocalFileSystem` stores inode maps,
-the global cursor, directory state, content/extents, committed roots, recovery,
-and snapshot inputs. Namespace persistence can project into it.
+At decision time this matched much of the source: `LocalFileSystem` stored
+inode maps, the global cursor, directory state, content/extents, committed
+roots, recovery, and snapshot inputs. Namespace persistence could project into
+it.
 
 Rejected as the final model because the current owner is global to
 `LocalFileSystem`, not explicitly dataset-scoped. Treating the existing global
@@ -131,10 +154,11 @@ storage failure policy. Making namespace the durable owner would either move
 those storage responsibilities into namespace or leave allocator state split at
 the crash/recovery boundary.
 
-Namespace remains the name and directory-entry projection. It may allocate only
-through the dataset inode authority when persistent mounted storage is present.
-Its memory allocator remains acceptable only for isolated in-memory namespace
-use and tests that are not mounted dataset authority.
+The selected mounted carrier no longer uses `Namespace` as its name and
+directory-entry projection. Any distinct namespace consumer may allocate
+durable IDs only through the dataset inode authority; its memory allocator
+remains acceptable only for isolated in-memory use and tests that are not
+mounted dataset authority.
 
 ### Model C: Dedicated Dataset-Scoped Inode Authority
 
@@ -164,29 +188,27 @@ The authority owns:
 - the rule that a persisted inode ID belongs to exactly one mounted dataset
   authority at a time.
 
-The authority may initially live as a focused local-filesystem module because
-`tidefs-local-filesystem` currently owns the durable records, content/extents,
-committed roots, snapshots, and recovery code that must be wired first. The
-boundary is still the dataset inode authority, not the current global
-`LocalFileSystem` maps or `next_inode_id`.
+The authority lives as a focused local-filesystem module because
+`tidefs-local-filesystem` owns the durable records, content/extents, committed
+roots, snapshots, and recovery code that consume it. The boundary is the
+dataset inode authority, not an adapter registry or namespace projection.
 
 ## Boundary Rules
 
 ### Inode Allocation
 
-All durable mounted inode allocation must go through the dataset inode
-authority. The current global `next_inode_id` is implementation residue until
-issue #664 extracts or introduces the explicit authority.
+All durable mounted inode allocation goes through `DatasetInodeAuthority`.
+Recovery reconstructs it from the selected durable inode IDs, and explicit ID
+insertion advances its reuse-prevention state.
 
-`Namespace` must not allocate mounted persistent inode IDs independently. When
-mounted persistent stores are present, namespace allocation delegates to the
-dataset inode authority. The fallback `MemInodeTable` is only an in-memory
-namespace projection.
+`Namespace` is not attached to the selected mounted carrier. Any other
+persistent namespace consumer must not allocate mounted IDs independently; the
+fallback `MemInodeTable` is only an in-memory non-carrier projection.
 
-`tidefs-inode-table` must not allocate durable mounted inode IDs unless it is
-fed by the dataset inode authority. Its allocation and free-list state may
-remain useful for non-mounted tests, adapter projections, or kernel-facing
-registries, but it is not the mounted dataset owner.
+`tidefs-inode-table` must not allocate durable mounted inode IDs. Its state may
+remain useful for non-mounted tests or kernel-reference projections, but
+`VfsLocalFileSystem` does not consume it and it is not the mounted dataset
+owner.
 
 ### Persisted Inode IDs
 
@@ -204,9 +226,9 @@ truth.
 ### Dataset And Root Identity
 
 Dataset identity and root inode identity are part of the same mounted dataset
-boundary. `ROOT_DATASET_ID` remains the current root bridge for fresh roots,
-but implementation work must move root inode identity into the dataset inode
-authority rather than treating root-level `LocalFileSystem` state as final.
+boundary. `ROOT_DATASET_ID` seeds fresh roots through
+`DatasetInodeAuthority`; root-level adapter or namespace state is not a second
+identity owner.
 
 A mounted dataset's root inode ID must be stable across reopen, snapshot
 selection, and namespace replay. It must be rejected if a persisted catalog or
@@ -229,10 +251,10 @@ FUSE lookup and forget state owns only kernel lookup references, adapter cache
 invalidation, negative cache state, and lookup hotness. It does not own durable
 inode allocation, existence, reuse, or persisted ID recovery.
 
-`lookup_counts`, `forget_refcounts`, path caches, removed-lookup attributes,
-and the older `fuse_lookup_forget`/`tidefs-inode-table` wrapper must be
-treated as projections of mounted dataset identity. Issue #665 owns the
-adapter work that makes this boundary explicit.
+`lookup_counts`, `forget_refcounts`, path caches, and removed-lookup attributes
+are projections of mounted dataset identity. `FuseVfsAdapter` obtains existence
+and attributes from the VFS engine rather than consulting an inode-table batch
+or falling back to a second namespace.
 
 ### Old Catalogs
 
@@ -249,8 +271,8 @@ rewritten.
 
 Migration is allowed only if a future GitHub issue names the external boundary
 or operator-owned data set, the validation plan, and the removal or graduation
-criteria required by `docs/UNRELEASED_AUTHORITY_POLICY.md`. Issue #666 owns
-any refinement of this policy.
+criteria required by `docs/UNRELEASED_AUTHORITY_POLICY.md`. Closed issue #666
+implemented the current fail-closed policy.
 
 ### Special-Node `rdev`
 
@@ -258,28 +280,26 @@ Special-node `rdev` preservation through the LocalFileSystem-backed namespace
 bridge is evidence that the bridge can carry device numbers. It is not enough
 to close generic replay authority.
 
-Issue #667 owns the separate slice for `rdev` authority through intent records,
-namespace replay, and recovery. Allocator work must preserve existing `rdev`
-behavior but must not claim that replay problem is solved.
+Issue #667 tracked and closed the separate `rdev` intent/replay slice. Changes
+to allocator or namespace ownership must preserve that behavior without making
+the adapter or a namespace mirror authoritative again.
 
-## Follow-Up Implementation Map
+## Implementation Sequence
 
-The implementation work remains split so each issue has a non-overlapping
-write set.
+The decision was implemented and then contracted through these bounded issues:
 
-| Issue | Slice | Primary write set | Boundary |
-|---|---|---|---|
-| #664 | Extract or introduce the dataset-scoped allocator owner. | `crates/tidefs-local-filesystem/src/lib.rs`, `crates/tidefs-local-filesystem/src/recovery.rs`, a focused local-filesystem inode authority module, and local-filesystem tests. | Owns durable allocation, explicit ID insertion, root identity, recovery cursor reconstruction, and snapshot/reopen seeding. Does not edit FUSE lookup authority or `rdev` replay. |
-| #665 | Make FUSE lookup references a projection of dataset inode identity. | `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs`, `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_lookup_forget.rs`, `apps/tidefs-posix-filesystem-adapter-daemon/src/workers_meta/mod.rs`, and adapter tests. | Owns kernel lookup references, forget handling, path/negative caches, and adapter invalidation. Does not own durable allocation. |
-| #666 | Settle old catalog fail-closed policy. | `docs/INODE_NAMESPACE_AUTHORITY.md`, `docs/REVIEW_TODO_REGISTER.md`, `docs/UNRELEASED_AUTHORITY_POLICY.md` if the general policy needs clarification, and focused local-filesystem enforcement tests only if gaps are found. | Keeps stale pre-release catalog mismatches fail-closed unless a named external/operator boundary requires migration. |
-| #667 | Replay special-node `rdev` through explicit intent authority. | `crates/tidefs-local-filesystem/src/intent_log.rs`, `crates/tidefs-local-filesystem/src/records.rs`, focused replay tests, and `crates/tidefs-namespace` bridge tests only if the bridge API changes. | Owns device-number persistence and replay for special nodes. Does not change generic inode allocation ownership. |
+| Issue | Slice | Resulting boundary |
+|---|---|---|
+| #664 | Extract the dataset-scoped allocator owner. | Durable allocation, explicit IDs, root identity, recovery reconstruction, and snapshot/reopen seeding belong to local-filesystem's dataset authority. |
+| #665 | Make FUSE lookup references a projection. | Kernel lookup references, forget handling, and cache invalidation do not own durable allocation. |
+| #666 | Settle old catalog policy. | Conflicting pre-release catalog identity fails closed unless a named external boundary authorizes migration. |
+| #667 | Replay special-node `rdev` through intent authority. | Device-number persistence does not change generic inode ownership. |
+| #2397 | Remove residual mounted namespace and inode-table fallbacks. | The selected VFS/FUSE carrier has one namespace identity and propagates engine results without a second mounted authority. |
 
 ## Validation For This Decision
 
-This issue is documentation/design work. The required validation is bounded
-source inspection against the evidence above and `git diff --check`.
-
-No runtime filesystem validation is required for this decision document. If
-this document is subsequently added to a structured claims-scanned surface,
-validate the smallest relevant `tidefs-xtask` claim or policy mode before
-merging that change.
+The original decision issue required bounded source inspection and
+`git diff --check`. Implementation changes require focused local-filesystem and
+adapter checks plus the existing `tidefsctl` pool-remount lifecycle row for
+stable inode identity across clean reopen and crash recovery. Do not add a new
+claim, manifest, or validation harness for this boundary.
