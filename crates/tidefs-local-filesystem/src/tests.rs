@@ -431,18 +431,24 @@ fn stage_probe_file_state(
 }
 
 fn write_staged_content(
-    store: &mut LocalObjectStore,
+    store: &mut Pool,
     staged: &FileSystemState,
     inode_id: InodeId,
     bytes: &[u8],
 ) {
     let record = staged.inodes.get(&inode_id).expect("staged inode exists");
-    store
-        .put(
-            content_object_key_for_version(inode_id, record.data_version),
-            &encode_content(record, bytes),
-        )
-        .expect("write staged content object");
+    let mut pool_store = store.pool_store_mut();
+    write_chunked_content(
+        false,
+        &mut pool_store,
+        record,
+        bytes,
+        &mut DedupIndex::new(),
+        #[cfg(feature = "quorum-write")]
+        None,
+        &staged.content_compression_policy,
+    )
+    .expect("write staged content through Pool");
 }
 
 fn current_content_manifest(fs: &LocalFileSystem, path: &str) -> ContentManifestObject {
@@ -707,174 +713,8 @@ fn apply_crash_boundary(
     bytes: &[u8],
     boundary: CrashInjectionBoundary,
 ) -> CrashRecoveryExpectation {
-    let transaction_id = staged.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
-    match boundary {
-        CrashInjectionBoundary::NoCrash | CrashInjectionBoundary::AfterRootCommitSynced => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            let observed = persist_state_until_boundary(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                fs.root_authentication_key,
-                Some(FilesystemCommitBoundary::RootCommitSynced),
-            )
-            .expect("complete root commit sync");
-            assert_eq!(observed, FilesystemCommitBoundary::RootCommitSynced);
-        }
-        CrashInjectionBoundary::BeforeContentObjects => {
-            fs.store.sync_all().expect("sync previous state only");
-        }
-        CrashInjectionBoundary::AfterContentObjects => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            fs.store.sync_all().expect("sync staged content object");
-        }
-        CrashInjectionBoundary::AfterTransactionInodes => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            write_transaction_inodes(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            fs.store.sync_all().expect("sync staged inodes");
-        }
-        CrashInjectionBoundary::AfterTransactionDirectories => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            write_transaction_inodes(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            write_transaction_directories(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            fs.store.sync_all().expect("sync staged directories");
-        }
-        CrashInjectionBoundary::AfterTransactionSuperblock => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            write_transaction_inodes(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            write_transaction_directories(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            let _root = write_transaction_superblock(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            fs.store
-                .sync_all()
-                .expect("sync staged transaction superblock");
-        }
-        CrashInjectionBoundary::AfterTransactionObjectsSynced => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            let observed = persist_state_until_boundary(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                fs.root_authentication_key,
-                Some(FilesystemCommitBoundary::TransactionObjectsSynced),
-            )
-            .expect("stop after transaction objects sync");
-            assert_eq!(observed, FilesystemCommitBoundary::TransactionObjectsSynced);
-        }
-        CrashInjectionBoundary::AfterMalformedRootCommit => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            write_transaction_inodes(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            write_transaction_directories(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            let root = write_transaction_superblock(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            fs.store
-                .put(
-                    DeviceIoClass::Data,
-                    root_slot_object_key(root.slot),
-                    b"malformed root-slot bytes with a valid object-store checksum",
-                )
-                .expect("write malformed root commit candidate");
-            fs.store
-                .sync_all()
-                .expect("sync malformed root commit candidate");
-        }
-        CrashInjectionBoundary::AfterRootCommitMissingTransaction => {
-            let (root, _superblock_bytes) = root_for_staged_state(staged, transaction_id);
-            publish_root_commit(
-                fs.store.primary_store_mut().raw_store_mut(),
-                &root,
-                fs.root_authentication_key,
-            )
-            .expect("publish root commit with missing transaction objects");
-            fs.store
-                .sync_all()
-                .expect("sync missing-transaction root commit candidate");
-        }
-        CrashInjectionBoundary::AfterRootCommitWritten => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            let observed = persist_state_until_boundary(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                fs.root_authentication_key,
-                Some(FilesystemCommitBoundary::RootCommitWritten),
-            )
-            .expect("stop after root commit write");
-            assert_eq!(observed, FilesystemCommitBoundary::RootCommitWritten);
-        }
-    }
-    boundary.expected_recovery()
+    apply_crash_matrix_boundary(fs, staged, inode_id, bytes, boundary)
+        .expect("apply Pool-backed crash boundary")
 }
 
 fn assert_recovery_outcome(
@@ -3477,12 +3317,7 @@ fn unauthenticated_newer_root_candidate_is_skipped() {
     let (staged, candidate_path, inode_id, new_bytes) =
         stage_probe_file_state(&fs, b"unauthenticated.txt", b"unauthenticated bytes");
     let transaction_id = staged.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
-    write_staged_content(
-        fs.store.primary_store_mut().raw_store_mut(),
-        &staged,
-        inode_id,
-        &new_bytes,
-    );
+    write_staged_content(&mut fs.store, &staged, inode_id, &new_bytes);
     let root_commit = persist_transaction_objects(
         fs.store.primary_store_mut().raw_store_mut(),
         &staged,
@@ -3494,8 +3329,9 @@ fn unauthenticated_newer_root_candidate_is_skipped() {
         ..root_commit
     };
     fs.store
+        .primary_store_mut()
+        .raw_store_mut()
         .put(
-            DeviceIoClass::Data,
             root_slot_object_key(unauthenticated_root.slot),
             &encode_root_commit(&unauthenticated_root),
         )
@@ -3516,6 +3352,7 @@ fn unauthenticated_newer_root_candidate_is_skipped() {
         reopened.read_file(&candidate_path),
         Err(FileSystemError::NotFound { .. })
     ));
+    drop(reopened);
     cleanup(&root);
 }
 
@@ -4036,12 +3873,7 @@ fn missing_manifest_newer_root_is_skipped_without_operator_repair() {
         b"new bytes behind missing manifest",
     );
     let transaction_id = staged.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
-    write_staged_content(
-        fs.store.primary_store_mut().raw_store_mut(),
-        &staged,
-        inode_id,
-        &new_bytes,
-    );
+    write_staged_content(&mut fs.store, &staged, inode_id, &new_bytes);
     write_transaction_inodes(
         fs.store.primary_store_mut().raw_store_mut(),
         &staged,
@@ -5230,28 +5062,42 @@ fn invalid_transaction_manifest_makes_newer_root_candidate_unselectable() {
 
     let (staged, candidate_path, inode_id, new_bytes) =
         stage_probe_file_state(&fs, b"candidate.txt", b"candidate after bad manifest");
-    write_staged_content(
-        fs.store.primary_store_mut().raw_store_mut(),
-        &staged,
-        inode_id,
-        &new_bytes,
-    );
+    write_staged_content(&mut fs.store, &staged, inode_id, &new_bytes);
     let root_commit = persist_transaction_objects(
         fs.store.primary_store_mut().raw_store_mut(),
         &staged,
         staged.generation,
     )
     .expect("write newer transaction objects");
+    let corrupt_manifest = b"corrupt manifest bytes";
+    let superblock_bytes = fs
+        .store
+        .primary_store()
+        .raw_store()
+        .get(transaction_superblock_object_key(
+            root_commit.transaction_id,
+        ))
+        .expect("read transaction superblock")
+        .expect("transaction superblock exists");
+    let corrupt_root = RootCommitRecord {
+        manifest_checksum: checksum64(corrupt_manifest),
+        root_authentication: Some(root_authentication_record_for_bytes(
+            &superblock_bytes,
+            Some(corrupt_manifest),
+        )),
+        ..root_commit
+    };
     fs.store
+        .primary_store_mut()
+        .raw_store_mut()
         .put(
-            DeviceIoClass::Data,
-            transaction_manifest_object_key(root_commit.transaction_id),
-            b"corrupt manifest bytes",
+            transaction_manifest_object_key(corrupt_root.transaction_id),
+            corrupt_manifest,
         )
         .expect("overwrite transaction manifest with corrupt bytes");
     publish_root_commit(
         fs.store.primary_store_mut().raw_store_mut(),
-        &root_commit,
+        &corrupt_root,
         fs.root_authentication_key,
     )
     .expect("publish newer root commit");
@@ -5538,8 +5384,9 @@ fn retention_plan_keeps_same_slot_fallback_location_without_repair() {
     let bad_transaction_id = committed_generation.saturating_add(FILESYSTEM_ROOT_SLOT_COUNT);
     let bad_slot = root_slot_for_transaction(bad_transaction_id);
     fs.store
+        .primary_store_mut()
+        .raw_store_mut()
         .put(
-            DeviceIoClass::Data,
             root_slot_object_key(bad_slot),
             b"invalid newer root slot bytes",
         )
@@ -5567,11 +5414,12 @@ fn retention_plan_keeps_same_slot_fallback_location_without_repair() {
             == root_slot_object_key(root_slot_for_transaction(committed_generation))));
     assert!(!plan.production_recovery_requires_operator_repair());
     assert!(!plan.mutates_storage());
+    drop(reopened);
     cleanup(&root);
 }
 
 #[test]
-fn safe_reclamation_preserves_retained_roots_and_reopens() {
+fn safe_reclamation_fails_closed_and_reopens_with_retained_roots() {
     let root = temp_root("safe-reclamation-gc");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/data.bin", 0o644).expect("create file");
@@ -5580,11 +5428,16 @@ fn safe_reclamation_preserves_retained_roots_and_reopens() {
         expected = vec![round; content_chunk_size() as usize];
         fs.write_file("/data.bin", 0, &expected)
             .expect("write generation");
+        fs.sync_all().expect("commit generation");
     }
-    fs.sync_all().expect("sync before reclamation");
-    let before_stats = fs.stats().object_store;
     let before_plan = fs.safe_root_retention_plan().expect("safe retention plan");
-    assert!(before_plan.retention_policy_satisfied());
+    assert!(
+        before_plan.retention_policy_satisfied(),
+        "retention debt: required {}, available {}, roots {:?}",
+        before_plan.retention_debt.policy_required_committed_roots,
+        before_plan.retention_debt.valid_committed_roots_available,
+        before_plan.audit.valid_committed_roots,
+    );
     assert!(!before_plan.reclaimable_live_object_keys.is_empty());
 
     let report = fs
@@ -5592,7 +5445,11 @@ fn safe_reclamation_preserves_retained_roots_and_reopens() {
         .expect("safe reclaim unprotected objects");
     assert_eq!(report.spec, SAFE_LOCAL_RECLAMATION_GC_SPEC);
     assert!(report.retention_policy_satisfied());
-    assert!(report.mutates_storage());
+    assert!(report.mutating_reclamation_allowed);
+    assert!(
+        !report.mutates_storage(),
+        "block-device reclamation must fail closed while exact root-slot locations are protected"
+    );
     assert!(!report.production_recovery_requires_operator_repair());
     assert_eq!(
         report.protected_committed_roots_preserved,
@@ -5603,12 +5460,16 @@ fn safe_reclamation_preserves_retained_roots_and_reopens() {
         before_plan.protected_root_slot_locations.len()
     );
     assert!(report.store.exact_locations_preserved);
-    assert!(report.store.tombstoned_unprotected_keys > 0);
-    assert!(
-        report.store.segment_count_after <= report.store.segment_count_before.saturating_add(1),
-        "safe reclamation may rotate one checkpoint segment while preserving exact roots"
+    assert_eq!(report.store.tombstoned_unprotected_keys, 0);
+    assert!(report.store.retired_segments.is_empty());
+    assert_eq!(
+        report.store.live_objects_after,
+        report.store.live_objects_before
     );
-    assert!(report.store.segment_count_before <= before_stats.segment_count);
+    assert_eq!(
+        report.store.segment_count_after, report.store.segment_count_before,
+        "fail-closed block-device reclamation must not change segment count"
+    );
     assert_eq!(
         fs.read_file("/data.bin").expect("read after reclamation"),
         expected
@@ -5627,6 +5488,7 @@ fn safe_reclamation_preserves_retained_roots_and_reopens() {
     assert_eq!(audit.outcome, RecoveryAuditOutcome::SelectedCommittedRoot);
     assert!(audit.valid_committed_roots.len() <= DEFAULT_RETAINED_COMMITTED_ROOTS);
     assert!(!audit.production_recovery_requires_operator_repair());
+    drop(reopened);
     cleanup(&root);
 }
 

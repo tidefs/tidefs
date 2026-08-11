@@ -121,6 +121,7 @@ pub(crate) fn persist_state_with_pool_at_transaction_until_boundary(
     Ok(FilesystemCommitBoundary::RootCommitSynced)
 }
 
+#[cfg(test)]
 pub(crate) fn persist_state_until_boundary(
     store: &mut LocalObjectStore,
     state: &FileSystemState,
@@ -152,6 +153,7 @@ pub(crate) fn persist_state_until_boundary(
     Ok(FilesystemCommitBoundary::RootCommitSynced)
 }
 
+#[cfg(test)]
 pub(crate) fn sync_store_after_commit_boundary(
     store: &mut LocalObjectStore,
     boundary: FilesystemCommitBoundary,
@@ -404,6 +406,7 @@ pub(crate) fn fs_io_error(
     })
 }
 
+#[cfg(any(test, feature = "replication-io"))]
 pub(crate) fn persist_transaction_objects(
     store: &mut LocalObjectStore,
     state: &FileSystemState,

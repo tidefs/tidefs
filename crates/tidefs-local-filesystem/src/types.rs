@@ -2119,8 +2119,12 @@ impl SafeReclamationReport {
         self.production_fsck_required
     }
 
-    pub const fn mutates_storage(&self) -> bool {
-        self.mutating_reclamation_allowed
+    pub fn mutates_storage(&self) -> bool {
+        self.store.copied_protected_objects > 0
+            || self.store.tombstoned_unprotected_keys > 0
+            || !self.store.retired_segments.is_empty()
+            || self.store.live_objects_before != self.store.live_objects_after
+            || self.store.segment_count_before != self.store.segment_count_after
     }
 }
 
