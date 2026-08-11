@@ -5958,6 +5958,52 @@ impl LocalFileSystem {
         (data_bytes, reserved_bytes)
     }
 
+    fn data_write_space_delta(
+        &self,
+        inode_id: InodeId,
+        ranges: &[(u64, u64)],
+    ) -> Result<SpaceDelta> {
+        let mut written_bytes = 0_u64;
+        let mut replaced_data_bytes = 0_u64;
+        let mut replaced_reserved_bytes = 0_u64;
+        for &(offset, length) in ranges {
+            written_bytes =
+                written_bytes
+                    .checked_add(length)
+                    .ok_or(FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    })?;
+            let (extent_data_bytes, reserved_bytes) =
+                self.accounted_extent_bytes(inode_id, offset, length);
+            replaced_data_bytes = replaced_data_bytes.checked_add(extent_data_bytes).ok_or(
+                FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                },
+            )?;
+            replaced_reserved_bytes = replaced_reserved_bytes.checked_add(reserved_bytes).ok_or(
+                FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                },
+            )?;
+        }
+
+        let logical_used_delta = i64::try_from(
+            i128::from(written_bytes).saturating_sub(i128::from(replaced_data_bytes)),
+        )
+        .map_err(|_| FileSystemError::SizeOverflow {
+            requested: written_bytes.max(replaced_data_bytes),
+        })?;
+        let reserved_delta = i64::try_from(i128::from(replaced_reserved_bytes).saturating_neg())
+            .map_err(|_| FileSystemError::SizeOverflow {
+                requested: replaced_reserved_bytes,
+            })?;
+        Ok(SpaceDelta {
+            logical_used_delta,
+            reserved_delta,
+            ..SpaceDelta::ZERO
+        })
+    }
+
     fn unaccounted_extent_ranges(
         &self,
         inode_id: InodeId,
@@ -8810,7 +8856,7 @@ impl LocalFileSystem {
             &committed_record,
             &dirty_charge_ranges,
         )?;
-        let logical_growth_bytes = new_size.saturating_sub(record.size);
+        let write_space_delta = self.data_write_space_delta(inode_id, &[(offset, bytes_len)])?;
         // A buffered write is one mounted mutation even when it reaches the
         // foreground writeback threshold immediately.  Start rollback
         // authority before accepting its capacity hold so a threshold flush
@@ -8956,10 +9002,10 @@ impl LocalFileSystem {
                 .quota_table
                 .apply_delta(inode_ancestors, delta_bytes, 0);
         }
-        if logical_growth_bytes > 0 {
+        if !write_space_delta.is_zero() {
             self.state
                 .space_accounting
-                .accumulate_delta(SpaceDelta::new_write(logical_growth_bytes));
+                .accumulate_delta(write_space_delta);
         }
         self.state
             .space_accounting
@@ -9104,7 +9150,7 @@ impl LocalFileSystem {
             &base_record,
             &materialization_charge_ranges,
         )?;
-        let logical_growth_bytes = new_size.saturating_sub(effective_size);
+        let write_space_delta = self.data_write_space_delta(inode_id, &written_ranges)?;
         if physical_admit_bytes > 0 {
             let handle = self.reserve_with_hierarchy_replacement_credit(
                 physical_admit_bytes,
@@ -9176,10 +9222,10 @@ impl LocalFileSystem {
                 .quota_table
                 .apply_delta(&inode_ancestors, delta_bytes, 0);
         }
-        if logical_growth_bytes > 0 {
+        if !write_space_delta.is_zero() {
             self.state
                 .space_accounting
-                .accumulate_delta(SpaceDelta::new_write(logical_growth_bytes));
+                .accumulate_delta(write_space_delta);
         }
         self.state
             .space_accounting
@@ -9818,7 +9864,7 @@ impl LocalFileSystem {
     ) -> Result<InodeRecord> {
         self.ensure_mutation_allowed("punch file hole by inode")?;
         let logical_size = self.effective_file_size(inode_id);
-        let mut record = self.committed_inode_record(inode_id)?;
+        let record = self.committed_inode_record(inode_id)?;
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
@@ -9840,11 +9886,12 @@ impl LocalFileSystem {
             return Ok(self.adjust_for_write_buffer(inode_id, record));
         }
         let effective_length = logical_size.saturating_sub(offset).min(length);
-        if logical_size > record.size {
-            let _ =
-                self.rewrite_content_with_overlay(inode_id, record, 0, &[], logical_size, true)?;
-            record = self.committed_inode_record(inode_id)?;
-        }
+        // Hole punch is a new content-version boundary. Materialize the
+        // complete accepted write epoch first so the punch cannot publish a
+        // manifest from the Pool base while retaining a newer buffered inode
+        // identity for later writeback.
+        self.flush_write_buffer(inode_id)?;
+        let record = self.committed_inode_record(inode_id)?;
 
         // Accumulate space delta only for extents that actually existed in the
         // punched range. Sparse holes must stay accounting-neutral.
@@ -10059,7 +10106,7 @@ impl LocalFileSystem {
     ) -> Result<InodeRecord> {
         self.ensure_mutation_allowed("zero file range by inode")?;
         let logical_size = self.effective_file_size(inode_id);
-        let mut record = self.committed_inode_record(inode_id)?;
+        let record = self.committed_inode_record(inode_id)?;
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
@@ -10082,26 +10129,24 @@ impl LocalFileSystem {
         if effective_length == 0 {
             return Ok(self.adjust_for_write_buffer(inode_id, record));
         }
-        if logical_size > record.size {
-            let _ =
-                self.rewrite_content_with_overlay(inode_id, record, 0, &[], logical_size, true)?;
-            record = self.committed_inode_record(inode_id)?;
-        }
+        // Zero range is a new content-version boundary. Materialize the
+        // complete accepted write epoch first so the zeroing operation and
+        // later writeback cannot publish from different Pool base records.
+        self.flush_write_buffer(inode_id)?;
+        let record = self.committed_inode_record(inode_id)?;
         let record_size = record.size;
         let (data_bytes, _reserved_bytes) =
             self.accounted_extent_bytes(inode_id, offset, effective_length);
         let materialized_data =
             self.content_range_has_materialized_data(inode_id, &record, offset, effective_length)?;
         let reservation_ranges = self.unaccounted_extent_ranges(inode_id, offset, effective_length);
-        let materialized_bytes =
-            self.materialized_content_bytes_in_ranges(inode_id, &record, &reservation_ranges)?;
         let unaccounted_hole_bytes =
             reservation_ranges.iter().try_fold(0_u64, |sum, (_, len)| {
                 sum.checked_add(*len).ok_or(FileSystemError::SizeOverflow {
                     requested: u64::MAX,
                 })
             })?;
-        let newly_allocated_bytes = unaccounted_hole_bytes.saturating_sub(materialized_bytes);
+        let newly_allocated_bytes = unaccounted_hole_bytes;
         let will_mutate_capacity_or_content =
             newly_allocated_bytes > 0 || data_bytes > 0 || materialized_data;
         if will_mutate_capacity_or_content {
@@ -10167,7 +10212,7 @@ impl LocalFileSystem {
             return Ok(self.adjust_for_write_buffer(inode_id, record));
         }
 
-        let data_to_unwritten_bytes = data_bytes.saturating_add(materialized_bytes);
+        let data_to_unwritten_bytes = data_bytes;
         let reserved_delta = data_to_unwritten_bytes.saturating_add(newly_allocated_bytes);
         if data_to_unwritten_bytes > 0 || reserved_delta > 0 {
             self.state.space_accounting.accumulate_delta(SpaceDelta {
