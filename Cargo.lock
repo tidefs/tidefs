@@ -3046,7 +3046,6 @@ dependencies = [
  "tidefs-local-filesystem",
  "tidefs-local-object-store",
  "tidefs-lock-service",
- "tidefs-performance-contract",
  "tidefs-permission",
  "tidefs-pool-import",
  "tidefs-posix-acl",

@@ -14,7 +14,7 @@
 #
 # Dependencies:
 #   - Linux 7.0 kernel with FUSE support (fuse.ko)
-#   - tidefs-posix-filesystem-adapter-daemon binary
+#   - tidefsctl canonical pool lifecycle binary
 #   - QEMU with KVM acceleration
 #   - busybox for initrd userspace
 #
@@ -56,10 +56,10 @@ let
     if linuxKernel_7_0 == null
     then ""
     else "${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}";
-  defaultFuseDaemon =
+  defaultTidefsctl =
     if tidefsPackage == null
     then ""
-    else "${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon";
+    else "${tidefsPackage}/bin/tidefsctl";
   fuseWritebackValidationScript = pkgs.writeShellScriptBin "tidefs-fuse-writeback-validation" ''
     set -euo pipefail
 
@@ -68,8 +68,8 @@ ${toolSetup}
     DEFAULT_MODULE_DIR="${defaultModuleDir}"
     KERNEL_IMG="''${TIDEFS_FUSE_WBC_KERNEL_IMG:-$DEFAULT_KERNEL_IMG}"
     MODULE_DIR="''${TIDEFS_FUSE_WBC_MODULE_DIR:-$DEFAULT_MODULE_DIR}"
-    DEFAULT_FUSE_DAEMON="${defaultFuseDaemon}"
-    FUSE_DAEMON="''${TIDEFS_FUSE_WBC_DAEMON_BIN:-$DEFAULT_FUSE_DAEMON}"
+    DEFAULT_TIDEFSCTL="${defaultTidefsctl}"
+    TIDEFSCTL="''${TIDEFS_FUSE_WBC_TIDEFSCTL_BIN:-$DEFAULT_TIDEFSCTL}"
 
     TMPDIR="''${TIDEFS_FUSE_WBC_TMPDIR:-/tmp/tidefs-fuse-writeback-validation}"
     TIMEOUT_SEC="''${TIDEFS_FUSE_WBC_TIMEOUT:-300}"
@@ -77,7 +77,7 @@ ${toolSetup}
 
     usage() {
       cat <<EOF
-Usage: tidefs-fuse-writeback-validation [--daemon-bin PATH] [--kernel-img PATH] [--module-dir DIR] [--timeout SECONDS] [--keep-tmp]
+Usage: tidefs-fuse-writeback-validation [--tidefsctl-bin PATH] [--kernel-img PATH] [--module-dir DIR] [--timeout SECONDS] [--keep-tmp]
 
 Produce tier-classified FUSE writeback-cache validation in a
 reproducible Nix/QEMU Linux 7.0 environment. Exercises dirty-page tracking,
@@ -90,8 +90,8 @@ Validation tiers:
   T3  Crash-consistency (two-boot cycle with persistent storage)
 
 Options:
-  --daemon-bin PATH    Use this already-built FUSE daemon binary
-                       (or set TIDEFS_FUSE_WBC_DAEMON_BIN)
+  --tidefsctl-bin PATH Use this already-built canonical lifecycle binary
+                       (or set TIDEFS_FUSE_WBC_TIDEFSCTL_BIN)
   --kernel-img PATH    Use this already-built Linux 7.0 bzImage
                        (or set TIDEFS_FUSE_WBC_KERNEL_IMG)
   --module-dir DIR     Use this already-built Linux module directory when
@@ -112,7 +112,7 @@ EOF
     KEEP_TMP=0
     while [ $# -gt 0 ]; do
       case "$1" in
-        --daemon-bin) FUSE_DAEMON="$2"; shift 2 ;;
+        --tidefsctl-bin) TIDEFSCTL="$2"; shift 2 ;;
         --kernel-img) KERNEL_IMG="$2"; shift 2 ;;
         --module-dir) MODULE_DIR="$2"; shift 2 ;;
         --timeout) TIMEOUT_SEC="$2"; shift 2 ;;
@@ -137,9 +137,9 @@ EOF
       exit 2
     fi
 
-    if [ -z "$FUSE_DAEMON" ]; then
-      echo "ERROR: FUSE daemon not configured" >&2
-      echo "Pass --daemon-bin PATH or set TIDEFS_FUSE_WBC_DAEMON_BIN." >&2
+    if [ -z "$TIDEFSCTL" ]; then
+      echo "ERROR: tidefsctl not configured" >&2
+      echo "Pass --tidefsctl-bin PATH or set TIDEFS_FUSE_WBC_TIDEFSCTL_BIN." >&2
       exit 2
     fi
 
@@ -150,15 +150,15 @@ EOF
       fi
     done
 
-    if [ ! -f "$FUSE_DAEMON" ] || [ ! -x "$FUSE_DAEMON" ]; then
-      echo "ERROR: FUSE daemon not found or not executable: $FUSE_DAEMON" >&2
+    if [ ! -f "$TIDEFSCTL" ] || [ ! -x "$TIDEFSCTL" ]; then
+      echo "ERROR: tidefsctl not found or not executable: $TIDEFSCTL" >&2
       exit 2
     fi
 
     echo "=== TideFS FUSE Writeback-Cache Validation Validation ==="
     echo "  Kernel:    $KERNEL_IMG"
     echo "  QEMU:      $QEMU_BIN"
-    echo "  Daemon:    $FUSE_DAEMON"
+    echo "  Control:   $TIDEFSCTL"
     echo "  Timeout:   ''${TIMEOUT_SEC}s"
     echo "  Validation:  tier-classified PASS/FAIL/BLOCKED rows"
     echo ""
@@ -222,7 +222,7 @@ EOF
     echo "  Collecting daemon library dependencies..."
     RUNTIME_LIBS=""
     if command -v ldd >/dev/null 2>&1; then
-      RUNTIME_LIBS=$(ldd "$FUSE_DAEMON" "$BUSYBOX" 2>/dev/null \
+    RUNTIME_LIBS=$(ldd "$TIDEFSCTL" "$BUSYBOX" 2>/dev/null \
         | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) { sub(/\(.*/, "", $i); print $i } }' \
         | sort -u || true)
     fi
@@ -233,21 +233,21 @@ EOF
     chmod +x "$RUN_DIR/bin/busybox"
     for applet in sh ls cat echo mount umount mountpoint grep insmod rmmod dmesg sleep poweroff \
                   reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync \
-                  expr head tail cut kill ps test seq date uname tr; do
+                  expr head tail cut kill ps test seq date uname tr truncate; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
-    # Copy FUSE daemon binary
-    cp "$FUSE_DAEMON" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
-    chmod +x "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
+    # Copy the canonical lifecycle binary.
+    cp "$TIDEFSCTL" "$RUN_DIR/bin/tidefsctl"
+    chmod +x "$RUN_DIR/bin/tidefsctl"
     if [ -n "$STRIP" ] && [ -x "$STRIP" ]; then
-      "$STRIP" --strip-unneeded "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon" 2>/dev/null \
-        || "$STRIP" --strip-debug "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon" 2>/dev/null \
+      "$STRIP" --strip-unneeded "$RUN_DIR/bin/tidefsctl" 2>/dev/null \
+        || "$STRIP" --strip-debug "$RUN_DIR/bin/tidefsctl" 2>/dev/null \
         || true
     fi
 
     if [ -n "$PATCHELF" ] && [ -x "$PATCHELF" ]; then
-      for bin in "$RUN_DIR/bin/busybox" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"; do
+      for bin in "$RUN_DIR/bin/busybox" "$RUN_DIR/bin/tidefsctl"; do
         "$PATCHELF" --set-interpreter /lib64/ld-linux-x86-64.so.2 "$bin" 2>/dev/null || true
         "$PATCHELF" --set-rpath /lib64:/lib:/usr/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu "$bin" 2>/dev/null || true
       done
@@ -388,8 +388,13 @@ if [ -n "$PERSISTENT_DISK" ]; then
     sync
 fi
 
-STORE=/store/tidefs-store
-mkdir -p "$STORE" 2>/dev/null || true
+DEVICE=/store/tidefs-device.tidefs
+POOL=writeback_validation_pool
+export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141
+if [ "$BOOT_COUNT" -eq 0 ] || [ ! -f "$DEVICE" ]; then
+    truncate -s 1073741824 "$DEVICE"
+    /bin/tidefsctl pool create "$POOL" --file-devices --devices "$DEVICE"
+fi
 
 # ── Phase 0: FUSE kernel module ──────────────────────────────────────
 echo "--- Phase 0: FUSE kernel support ---"
@@ -430,14 +435,10 @@ echo "--- Phase 1: Mount with writeback cache ---"
 
 DAEMON_PID=""
 if [ "$FUSE_READY" -eq 1 ]; then
-    mkdir -p "$STORE" "$MNT"
+    mkdir -p "$MNT"
 
     # Start the FUSE daemon in background with writeback cache enabled
-    TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141 \
-    /bin/tidefs-posix-filesystem-adapter-daemon \
-      mount-vfs \
-      --store "$STORE" \
-      --mount "$MNT" \
+    /bin/tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" \
       --writeback-cache \
       --writeback-cache-timeout 30 \
       > /tmp/daemon.log 2>&1 &

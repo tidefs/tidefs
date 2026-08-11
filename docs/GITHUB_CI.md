@@ -147,7 +147,7 @@ may use non-secret repository variables for scheduling gates, such as
   `fuse-vm-test`, `fuse-inode-metadata-validation`,
   `pool-remount-lifecycle-validation`, `qemu-ublk-smoke`,
   `qemu-ublk-qid-tag-runtime`, `storage-intent-ack-fault-matrix`,
-  `receipt-bound-reclaim-runtime`, `scrub-foreground-read-runtime`, and `all`;
+  `receipt-bound-reclaim-runtime`, and `all`;
   `.github/workflows/qemu-smoke.yml` remains the exact source for target
   commands, output directories, artifact upload names, and retention. The
   workflow constructs its matrix from the selected target before KVM runner

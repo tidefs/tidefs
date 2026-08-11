@@ -3,7 +3,7 @@
 //! attributes, fsync or remount, verify xattr data survives remount cycle.
 //!
 //! Exercises the FUSE xattr durability contract across set, get, list, and
-//! remove operations. Every test skips gracefully when the daemon binary or
+//! remove operations. Every test skips gracefully when `tidefsctl` or
 //! /dev/fuse is unavailable.
 //!
 //! The entire module is `#[cfg(test)]` because it contains only tests
@@ -19,13 +19,13 @@ mod tests {
     use super::*;
 
     /// Try to create a MountHarness.  Returns `None` and prints a skip
-    /// message when the daemon binary is unavailable.
+    /// message when `tidefsctl` is unavailable.
     fn try_mount() -> Option<MountHarness> {
         match MountHarness::new() {
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!(
-                    "SKIP: daemon not available (set TIDEFS_DAEMON_BIN or \
+                    "SKIP: tidefsctl not available (set TIDEFSCTL_BIN or \
                      build the workspace) -- {e}"
                 );
                 None

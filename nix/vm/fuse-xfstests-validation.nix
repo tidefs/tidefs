@@ -9,7 +9,7 @@
 #
 # Dependencies:
 #   - Linux 7.0 kernel with FUSE support (fuse.ko)
-#   - tidefs-posix-filesystem-adapter-daemon binary
+#   - tidefsctl canonical pool lifecycle binary
 #   - xfstests package from nixpkgs
 #   - QEMU with KVM acceleration
 #   - busybox for initrd userspace
@@ -40,7 +40,7 @@ let
     CPIO="${pkgs.cpio}/bin/cpio"
     SOCAT_BIN="${pkgs.socat}/bin/socat"
     MODULE_DIR="''${TIDEFS_FUSE_XFSTESTS_MODULE_DIR:-$DEFAULT_MODULE_DIR}"
-    FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
+    TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
     XFSTESTS_BIN="${xfstests}/bin/xfstests-check"
     BASH_BIN="${pkgs.bash}/bin/bash"
     PERL_BIN="${pkgs.perl}/bin/perl"
@@ -235,22 +235,17 @@ if false; then
       exit 2
     fi
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$LDD_BIN"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$LDD_BIN" "$TIDEFSCTL"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
       fi
     done
 
-    if [ ! -f "$FUSE_DAEMON" ] && [ ! -x "$FUSE_DAEMON" ]; then
-      echo "ERROR: FUSE daemon not found: $FUSE_DAEMON" >&2
-      exit 2
-    fi
-
     echo "=== TideFS FUSE xfstests Validation ==="
     echo "  Kernel:    $KERNEL_IMG"
     echo "  QEMU:      $QEMU_BIN"
-    echo "  Daemon:    $FUSE_DAEMON"
+    echo "  tidefsctl: $TIDEFSCTL"
     echo "  xfstests:  $XFSTESTS_BIN"
     echo "  Tests:     $TEST_LIST"
     echo "  Timeout:   ''${TIMEOUT_SEC}s"
@@ -296,11 +291,11 @@ if false; then
       fi | grep -o "/nix/store/[^ ]*" | sort -u || true
     }
 
-    # ── Collect daemon shared library dependencies ─────────────────────
+    # ── Collect tidefsctl shared library dependencies ──────────────────
 
-    echo "  Collecting daemon library dependencies..."
-    DAEMON_LIBS=""
-    DAEMON_LIBS=$(ldd_runtime_paths "$FUSE_DAEMON")
+    echo "  Collecting tidefsctl library dependencies..."
+    TIDEFSCTL_LIBS=""
+    TIDEFSCTL_LIBS=$(ldd_runtime_paths "$TIDEFSCTL")
 
     # ── Collect xfstests dependencies ─────────────────────────────────
 
@@ -409,7 +404,7 @@ if false; then
     for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff \
                   reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync \
                   expr head tail cut kill ps test seq du dirname basename \
-                  readlink tr cmp diff setsid od uname date mountpoint umount timeout sed mktemp chmod chown awk sort uniq xargs which tr ln tee hostname df pgrep pkill id killall logger; do
+                  readlink tr cmp diff setsid od uname date mountpoint umount timeout sed mktemp chmod chown awk sort uniq xargs which tr ln tee hostname df pgrep id logger truncate; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
     cat > "$RUN_DIR/etc/passwd" << 'PASSWD'
@@ -421,9 +416,8 @@ root:x:0:
 nobody:x:65534:
 GROUP
 
-    # Copy the daemon and its runtime libraries through the same helper used
-    # for guest tools, so optional libraries such as libibverbs are staged.
-    copy_runtime_binary "$FUSE_DAEMON" tidefs-posix-filesystem-adapter-daemon
+    # Copy the canonical lifecycle binary and its runtime libraries.
+    copy_runtime_binary "$TIDEFSCTL" tidefsctl
 
     # ── Install functional mount helper ──────────────────────────────
     cat > "$RUN_DIR/bin/tidefs-preview" << 'MOUNTHELPER'
@@ -434,33 +428,32 @@ GROUP
 set -e
 dev="tidefs-xfstests-root"
 mnt=""
-daemon_opts="relatime,dev,allow_other"
-daemon_read_only=""
-daemon_coherency="writeback"
-daemon_writeback_cache="1"
-daemon_content_capacity_bytes="2147483648"
-daemon_slow_request_diagnostics="''${TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS:-1}"
-daemon_slow_request_ms="''${TIDEFS_FUSE_SLOW_REQUEST_MS:-1000}"
-daemon_slow_request_report_ms="''${TIDEFS_FUSE_SLOW_REQUEST_REPORT_MS:-5000}"
+mount_opts="relatime,dev,allow_other"
+mount_read_only=""
+mount_coherency="writeback"
+mount_content_capacity_bytes="2147483648"
+mount_slow_request_diagnostics="''${TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS:-1}"
+mount_slow_request_ms="''${TIDEFS_FUSE_SLOW_REQUEST_MS:-1000}"
+mount_slow_request_report_ms="''${TIDEFS_FUSE_SLOW_REQUEST_REPORT_MS:-5000}"
 merge_mount_opts() {
     old_ifs="$IFS"
     IFS=,
     for opt in $1; do
         case "$opt" in
             atime|strictatime|relatime|noatime)
-                daemon_opts="$opt"
+                mount_opts="$opt"
                 ;;
             nodiratime|diratime)
-                daemon_opts="$daemon_opts,$opt"
+                mount_opts="$mount_opts,$opt"
                 ;;
             sync|async|allow_other|noallow_other|dev|nodev)
-                daemon_opts="$daemon_opts,$opt"
+                mount_opts="$mount_opts,$opt"
                 ;;
             ro)
-                daemon_read_only="--read-only"
+                mount_read_only="--read-only"
                 ;;
             rw)
-                daemon_read_only=""
+                mount_read_only=""
                 ;;
         esac
     done
@@ -506,72 +499,81 @@ if mountpoint -q "$mnt" 2>/dev/null; then exit 0; fi
 AUTH="000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 store_tag=$(printf '%s' "$dev" | tr -dc 'A-Za-z0-9._-' | head -c 48)
 [ -n "$store_tag" ] || store_tag=tidefs
-store="/store/tidefs-store-$store_tag"
+pool_root="/store/tidefs-store-$store_tag"
+device="$pool_root/device0.tidefs"
+pool_name="xfstests-$store_tag"
 mnt_tag=$(printf '%s' "$mnt" | tr -dc 'A-Za-z0-9._-' | head -c 48)
 [ -n "$mnt_tag" ] || mnt_tag=mount
 log_tag="$store_tag-$mnt_tag-$$"
 helper_log="/tmp/tidefs-preview-$log_tag.log"
-daemon_log="/tmp/tidefs-daemon-$log_tag.log"
+mount_log="/tmp/tidefs-mount-$log_tag.log"
+pid_file="/tmp/tidefs-mount-$mnt_tag.pid"
 {
     echo "tidefs-preview: dev=$dev"
     echo "tidefs-preview: mnt=$mnt"
-    echo "tidefs-preview: store=$store"
-    echo "tidefs-preview: daemon_opts=$daemon_opts"
-    echo "tidefs-preview: daemon_read_only=$daemon_read_only"
-    echo "tidefs-preview: daemon_coherency=$daemon_coherency"
-    echo "tidefs-preview: daemon_writeback_cache=$daemon_writeback_cache"
-    echo "tidefs-preview: daemon_content_capacity_bytes=$daemon_content_capacity_bytes"
-    echo "tidefs-preview: daemon_slow_request_diagnostics=$daemon_slow_request_diagnostics"
-    echo "tidefs-preview: daemon_slow_request_ms=$daemon_slow_request_ms"
-    echo "tidefs-preview: daemon_slow_request_report_ms=$daemon_slow_request_report_ms"
-    echo "tidefs-preview: daemon_log=$daemon_log"
+    echo "tidefs-preview: device=$device"
+    echo "tidefs-preview: pool=$pool_name"
+    echo "tidefs-preview: mount_opts=$mount_opts"
+    echo "tidefs-preview: mount_read_only=$mount_read_only"
+    echo "tidefs-preview: mount_coherency=$mount_coherency"
+    echo "tidefs-preview: mount_content_capacity_bytes=$mount_content_capacity_bytes"
+    echo "tidefs-preview: mount_slow_request_diagnostics=$mount_slow_request_diagnostics"
+    echo "tidefs-preview: mount_slow_request_ms=$mount_slow_request_ms"
+    echo "tidefs-preview: mount_slow_request_report_ms=$mount_slow_request_report_ms"
+    echo "tidefs-preview: mount_log=$mount_log"
 } > "$helper_log"
-mkdir -p "$store"
-TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS="$daemon_slow_request_diagnostics" \
-TIDEFS_FUSE_SLOW_REQUEST_MS="$daemon_slow_request_ms" \
-TIDEFS_FUSE_SLOW_REQUEST_REPORT_MS="$daemon_slow_request_report_ms" \
-setsid /bin/tidefs-posix-filesystem-adapter-daemon mount-vfs \
-    --store "$store" --mount "$mnt" \
+mkdir -p "$pool_root"
+if [ ! -f "$device" ]; then
+    truncate -s 2147483648 "$device"
+    TIDEFS_ROOT_AUTHENTICATION_KEY_HEX="$AUTH" \
+      /bin/tidefsctl pool create "$pool_name" --file-devices --devices "$device" \
+      >>"$mount_log" 2>&1
+fi
+TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS="$mount_slow_request_diagnostics" \
+TIDEFS_FUSE_SLOW_REQUEST_MS="$mount_slow_request_ms" \
+TIDEFS_FUSE_SLOW_REQUEST_REPORT_MS="$mount_slow_request_report_ms" \
+TIDEFS_ROOT_AUTHENTICATION_KEY_HEX="$AUTH" \
+setsid /bin/tidefsctl pool mount "$pool_name" "$mnt" --devices "$device" \
     --fs-name "$dev" \
-    --coherency "$daemon_coherency" \
+    --coherency "$mount_coherency" \
     --writeback-cache \
-    --content-capacity-bytes "$daemon_content_capacity_bytes" \
-    --options "$daemon_opts" \
-    $daemon_read_only \
-    --root-auth-key-hex "$AUTH" \
-    >"$daemon_log" 2>&1 &
-daemon_pid=$!
-echo "tidefs-preview: daemon_pid=$daemon_pid" >> "$helper_log"
+    --content-capacity-bytes "$mount_content_capacity_bytes" \
+    --options "$mount_opts" \
+    $mount_read_only \
+    >"$mount_log" 2>&1 &
+mount_pid=$!
+echo "$mount_pid" > "$pid_file"
+echo "tidefs-preview: mount_pid=$mount_pid" >> "$helper_log"
 report_mount_failure() {
     reason="$1"
-    echo "tidefs-preview: $reason dev=$dev mnt=$mnt store=$store daemon_pid=$daemon_pid" >> "$helper_log"
-    echo "tidefs-preview: $reason dev=$dev mnt=$mnt store=$store daemon_pid=$daemon_pid" >&2
+    echo "tidefs-preview: $reason dev=$dev mnt=$mnt device=$device mount_pid=$mount_pid" >> "$helper_log"
+    echo "tidefs-preview: $reason dev=$dev mnt=$mnt device=$device mount_pid=$mount_pid" >&2
     echo "--- tidefs-preview helper log: $helper_log ---" >&2
     tail -80 "$helper_log" >&2 2>/dev/null || true
-    echo "--- tidefs daemon log: $daemon_log ---" >&2
-    tail -120 "$daemon_log" >&2 2>/dev/null || true
+    echo "--- tidefs mount log: $mount_log ---" >&2
+    tail -120 "$mount_log" >&2 2>/dev/null || true
 }
 for i in $(seq 30); do
-    if grep -q "Mounted TideFS" "$daemon_log" 2>/dev/null; then
+    if grep -q "Mounted TideFS" "$mount_log" 2>/dev/null; then
         if ! mountpoint -q "$mnt" 2>/dev/null; then
-            report_mount_failure "daemon reported ready but mountpoint is missing"
+            report_mount_failure "mount owner reported ready but mountpoint is missing"
             exit 1
         fi
         echo "tidefs-preview: mounted after $i seconds" >> "$helper_log"
         exit 0
     fi
-    if grep -q "FUSE VFS mount failed" "$daemon_log" 2>/dev/null; then
-        report_mount_failure "daemon refused mount"
+    if grep -q "FUSE VFS mount failed" "$mount_log" 2>/dev/null; then
+        report_mount_failure "mount owner refused mount"
         exit 1
     fi
-    if ! kill -0 "$daemon_pid" 2>/dev/null; then
-        report_mount_failure "daemon exited before mount"
+    if ! kill -0 "$mount_pid" 2>/dev/null; then
+        report_mount_failure "mount owner exited before mount"
         exit 1
     fi
     sleep 1
 done
 report_mount_failure "mount timed out"
-kill "$daemon_pid" 2>/dev/null || true
+kill "$mount_pid" 2>/dev/null || true
 exit 1
 MOUNTHELPER
     chmod +x "$RUN_DIR/bin/tidefs-preview"
@@ -590,22 +592,22 @@ MOUNTHELPER
     fi
 
     # Copy shared libraries
-    for lib in $DAEMON_LIBS $XFSTESTS_LIBS; do
+    for lib in $TIDEFSCTL_LIBS $XFSTESTS_LIBS; do
       if [ -f "$lib" ]; then
         copy_nix_store_file "$lib" 0 2>/dev/null || true
         cp "$lib" "$RUN_DIR/usr/lib/" 2>/dev/null || true
       fi
     done
 
-    # Copy the dynamic linker for the daemon
-    LD_SO=$(ldd_runtime_paths "$FUSE_DAEMON" | grep '/ld-linux' | head -1 || true)
+    # Copy the dynamic linker for tidefsctl.
+    LD_SO=$(ldd_runtime_paths "$TIDEFSCTL" | grep '/ld-linux' | head -1 || true)
     if [ -n "$LD_SO" ] && [ -f "$LD_SO" ]; then
       cp "$LD_SO" "$RUN_DIR/lib/" 2>/dev/null || true
       chmod +x "$RUN_DIR/lib/$(basename "$LD_SO")" 2>/dev/null || true
     fi
 
     # Copy the glibc dynamic linker and essential shared libraries to
-    # the exact Nix store path that the busybox and daemon ELF headers expect.
+    # the exact Nix store path that the busybox and tidefsctl ELF headers expect.
     # GLIBC_LIB is interpolated at Nix build time (e.g. /nix/store/...-glibc-.../lib).
     if [ -n "$GLIBC_LIB" ] && [ -d "$GLIBC_LIB" ]; then
       NIX_LD_DIR="$RUN_DIR/$GLIBC_LIB"
@@ -618,7 +620,7 @@ MOUNTHELPER
       done
       echo "  Copied glibc ld + libs from $GLIBC_LIB to $NIX_LD_DIR/"
     else
-      echo "  WARNING: GLIBC_LIB not set; busybox/daemon may fail to start"
+      echo "  WARNING: GLIBC_LIB not set; busybox/tidefsctl may fail to start"
     fi
 
     # Copy fuse.ko if available. Compressed modules are expanded while the
@@ -828,10 +830,19 @@ MOUNTWRAP
       rm -f "$RUN_DIR/bin/umount"
       cat > "$RUN_DIR/bin/umount" << 'UMOUNTWRAP'
 #!/bin/sh
-wait_for_tidefs_daemon_exit() {
+wait_for_tidefs_mount_exit() {
     target="$1"
+    target_tag=$(printf '%s' "$target" | tr -dc 'A-Za-z0-9._-' | head -c 48)
+    [ -n "$target_tag" ] || target_tag=mount
+    pid_file="/tmp/tidefs-mount-$target_tag.pid"
+    [ -f "$pid_file" ] || return 0
+    pid=$(cat "$pid_file" 2>/dev/null || true)
+    case "$pid" in
+        ""|*[!0-9]*) return 0 ;;
+    esac
     for i in $(seq 30); do
-        if ! pgrep -f "tidefs-posix-filesystem-adapter-daemon.*--mount $target" >/dev/null 2>&1; then
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$pid_file"
             return 0
         fi
         sleep 1
@@ -846,7 +857,7 @@ if [ "$#" -eq 1 ]; then
             if [ -n "$target" ]; then
                 /bin/busybox umount "$target"
                 rc=$?
-                [ "$rc" -eq 0 ] && wait_for_tidefs_daemon_exit "$target" >/dev/null 2>&1
+                [ "$rc" -eq 0 ] && wait_for_tidefs_mount_exit "$target" >/dev/null 2>&1
                 exit "$rc"
             fi
             ;;
@@ -854,7 +865,7 @@ if [ "$#" -eq 1 ]; then
             target="$1"
             /bin/busybox umount "$target"
             rc=$?
-            [ "$rc" -eq 0 ] && wait_for_tidefs_daemon_exit "$target" >/dev/null 2>&1
+            [ "$rc" -eq 0 ] && wait_for_tidefs_mount_exit "$target" >/dev/null 2>&1
             exit "$rc"
             ;;
     esac
@@ -961,7 +972,6 @@ classify_notrun() {
 }
 
 MNT=/mnt/tidefs
-STORE=/store/tidefs-store
 RESULTS=/tmp/xfstests-results
 SANITY_TIMEOUT=__XFSTESTS_PER_TEST_TIMEOUT__
 case "$SANITY_TIMEOUT" in
@@ -971,10 +981,40 @@ esac
 terminate_guest_process_tree() {
     tree_pid="$1"
     signal="$2"
+    case "$tree_pid" in
+        ""|*[!0-9]*) return 0 ;;
+    esac
     for child_pid in $(pgrep -P "$tree_pid" 2>/dev/null || true); do
         terminate_guest_process_tree "$child_pid" "$signal"
     done
     kill "-$signal" "$tree_pid" 2>/dev/null || true
+}
+
+dump_guest_process_tree() {
+    tree_pid="$1"
+    tree_label="$2"
+    case "$tree_pid" in
+        ""|*[!0-9]*) return 0 ;;
+    esac
+    [ -d "/proc/$tree_pid" ] || return 0
+    cmd=$(tr '\000' ' ' <"/proc/$tree_pid/cmdline" 2>/dev/null || true)
+    state=$(sed -n 's/^State:[[:space:]]*//p' "/proc/$tree_pid/status" 2>/dev/null || true)
+    wchan=$(cat "/proc/$tree_pid/wchan" 2>/dev/null || true)
+    echo "process: owner=$tree_label pid=$tree_pid state=$state wchan=$wchan cmd=$cmd"
+    if [ -d "/proc/$tree_pid/task" ]; then
+        for task_dir in /proc/"$tree_pid"/task/[0-9]*; do
+            [ -d "$task_dir" ] || continue
+            tid="''${task_dir##*/}"
+            comm=$(cat "$task_dir/comm" 2>/dev/null || true)
+            task_state=$(sed -n 's/^State:[[:space:]]*//p' "$task_dir/status" 2>/dev/null || true)
+            task_wchan=$(cat "$task_dir/wchan" 2>/dev/null || true)
+            schedstat=$(cat "$task_dir/schedstat" 2>/dev/null || true)
+            echo "thread: pid=$tree_pid tid=$tid comm=$comm state=$task_state wchan=$task_wchan schedstat=$schedstat"
+        done
+    fi
+    for child_pid in $(pgrep -P "$tree_pid" 2>/dev/null || true); do
+        dump_guest_process_tree "$child_pid" "$tree_label"
+    done
 }
 
 dump_sanity_timeout_state() {
@@ -982,27 +1022,12 @@ dump_sanity_timeout_state() {
     echo "--- sanity timeout diagnostics for $sanity_label ---"
     echo "--- process table ---"
     ps 2>/dev/null || true
-    echo "--- matching TideFS/FUSE processes ---"
-    for pattern in "tidefs-posix-filesystem-adapter-daemon" "tidefs-preview" "xfstests-check"; do
-        pids=$(pgrep -f "$pattern" 2>/dev/null || true)
-        for pid in $pids; do
-            cmd=$(tr '\000' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
-            state=$(sed -n 's/^State:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null || true)
-            wchan=$(cat "/proc/$pid/wchan" 2>/dev/null || true)
-            echo "process: pid=$pid state=$state wchan=$wchan cmd=$cmd"
-            if [ -d "/proc/$pid/task" ]; then
-                for task_dir in /proc/"$pid"/task/[0-9]*; do
-                    [ -d "$task_dir" ] || continue
-                    tid="''${task_dir##*/}"
-                    comm=$(cat "$task_dir/comm" 2>/dev/null || true)
-                    task_state=$(sed -n 's/^State:[[:space:]]*//p' "$task_dir/status" 2>/dev/null || true)
-                    task_wchan=$(cat "$task_dir/wchan" 2>/dev/null || true)
-                    schedstat=$(cat "$task_dir/schedstat" 2>/dev/null || true)
-                    echo "thread: pid=$pid tid=$tid comm=$comm state=$task_state wchan=$task_wchan schedstat=$schedstat"
-                done
-            fi
-        done
-    done
+    echo "--- exact task-owned process trees ---"
+    dump_guest_process_tree "''${sanity_pid:-}" "sanity-$sanity_label"
+    sanity_mount_tag=$(printf '%s' "$MNT" | tr -dc 'A-Za-z0-9._-' | head -c 48)
+    [ -n "$sanity_mount_tag" ] || sanity_mount_tag=mount
+    sanity_mount_pid=$(cat "/tmp/tidefs-mount-$sanity_mount_tag.pid" 2>/dev/null || true)
+    dump_guest_process_tree "$sanity_mount_pid" "tidefs-mount-$MNT"
     echo "--- mount table ---"
     grep -E 'tidefs|fuse' /proc/mounts 2>/dev/null || true
     echo "--- open fds under TideFS mount ---"
@@ -1020,7 +1045,7 @@ dump_sanity_timeout_state() {
         done
     done
     echo "--- TideFS helper logs ---"
-    if find /tmp -maxdepth 1 -type f \( -name 'tidefs-preview-*.log' -o -name 'tidefs-daemon-*.log' -o -name 'daemon-helper.log' -o -name 'mount-helper.log' \) -print | sort | grep . >/tmp/tidefs-sanity-log-files; then
+    if find /tmp -maxdepth 1 -type f \( -name 'tidefs-preview-*.log' -o -name 'tidefs-mount-*.log' -o -name 'mount-helper.log' \) -print | sort | grep . >/tmp/tidefs-sanity-log-files; then
         while read -r f; do
             echo "helper-log: $f"
             echo "helper-log-bytes=$(wc -c <"$f" 2>/dev/null || true)"
@@ -1119,10 +1144,10 @@ fi
 echo ""
 echo "--- Phase 1: Mount TideFS FUSE ---"
 
-DAEMON_PID=""
+MOUNT_OWNER_PID=""
 MOUNTED=0
 if [ "$FUSE_READY" -eq 1 ]; then
-    mkdir -p "$STORE" "$MNT"
+    mkdir -p "$MNT"
     # Use the functional mount helper to mount on /mnt/tidefs.
     # This registers the mount with a source distinct from the xfstests
     # TEST_DEV/SCRATCH_DEV names, so xfstests source checks stay unambiguous.
@@ -1139,12 +1164,14 @@ if [ "$FUSE_READY" -eq 1 ]; then
     if [ "$MOUNTED" -eq 1 ]; then
         pass "fuse_mount"
         echo "  Mounted: $MNT"
-        # Find the actual daemon PID (the mount helper starts it)
-        DAEMON_PID=$(pgrep -f "tidefs-posix-filesystem-adapter-daemon" | head -1 || echo "")
-        [ -n "$DAEMON_PID" ] && echo "  Daemon PID: $DAEMON_PID"
+        # Read the exact mount-owner PID recorded by the helper.
+        MNT_TAG=$(printf '%s' "$MNT" | tr -dc 'A-Za-z0-9._-' | head -c 48)
+        MOUNT_OWNER_PID=$(cat "/tmp/tidefs-mount-$MNT_TAG.pid" 2>/dev/null || true)
+        [ -n "$MOUNT_OWNER_PID" ] && echo "  Mount owner PID: $MOUNT_OWNER_PID"
     else
         fail "fuse_mount" "mount did not appear within 30s; helper log: $(tail -5 /tmp/mount-helper.log 2>/dev/null)"
     fi
+    wait "$HELPER_PID" 2>/dev/null || true
 else
     blocked "fuse_mount" "/dev/fuse not available"
 fi
@@ -1244,6 +1271,8 @@ elif [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
     case "$GENERIC_013_TIMEOUT" in
         ""|*[!0-9]*) GENERIC_013_TIMEOUT="$PER_TEST_TIMEOUT" ;;
     esac
+    ACTIVE_XFSTESTS_PID=""
+    ACTIVE_XFSTESTS_PGID=""
 
     cleanup_xfstests_test() {
         cleanup_tidefs_store() {
@@ -1264,31 +1293,37 @@ elif [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             mounts_target="$1"
             awk -v target="$mounts_target" '$2 == target { found = 1 } END { exit(found ? 0 : 1) }' /proc/mounts
         }
-        stop_tidefs_daemons_for_mount() {
-            daemon_mount="$1"
-            for proc_dir in /proc/[0-9]*; do
-                [ -d "$proc_dir" ] || continue
-                pid="''${proc_dir#/proc/}"
-                cmd=$(tr '\000' ' ' <"$proc_dir/cmdline" 2>/dev/null || true)
-                case "$cmd" in
-                    *"tidefs-posix-filesystem-adapter-daemon "*"--mount $daemon_mount "*)
-                        echo "cleanup: stop TideFS daemon pid=$pid mount=$daemon_mount"
-                        kill "$pid" 2>/dev/null || true
-                        ;;
-                esac
-            done
+        stop_tidefs_mount_for_path() {
+            mount_target="$1"
+            target_tag=$(printf '%s' "$mount_target" | tr -dc 'A-Za-z0-9._-' | head -c 48)
+            [ -n "$target_tag" ] || target_tag=mount
+            pid_file="/tmp/tidefs-mount-$target_tag.pid"
+            [ -f "$pid_file" ] || return 0
+            pid=$(cat "$pid_file" 2>/dev/null || true)
+            case "$pid" in
+                ""|*[!0-9]*) return 0 ;;
+            esac
+            cmd=$(tr '\000' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+            case "$cmd" in
+                *"/bin/tidefsctl pool mount "*" $mount_target "*)
+                    echo "cleanup: stop TideFS mount owner pid=$pid mount=$mount_target"
+                    kill "$pid" 2>/dev/null || true
+                    ;;
+                *)
+                    rm -f "$pid_file"
+                    return 0
+                    ;;
+            esac
             sleep 1
-            for proc_dir in /proc/[0-9]*; do
-                [ -d "$proc_dir" ] || continue
-                pid="''${proc_dir#/proc/}"
-                cmd=$(tr '\000' ' ' <"$proc_dir/cmdline" 2>/dev/null || true)
+            if kill -0 "$pid" 2>/dev/null; then
+                cmd=$(tr '\000' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
                 case "$cmd" in
-                    *"tidefs-posix-filesystem-adapter-daemon "*"--mount $daemon_mount "*)
-                        echo "cleanup: kill TideFS daemon pid=$pid mount=$daemon_mount"
+                    *"/bin/tidefsctl pool mount "*" $mount_target "*)
                         kill -9 "$pid" 2>/dev/null || true
                         ;;
                 esac
-            done
+            fi
+            rm -f "$pid_file"
         }
         unmount_path_bounded() {
             unmount_target="$1"
@@ -1297,7 +1332,7 @@ elif [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             if timeout -k 5s 10s umount "$unmount_target" 2>/tmp/tidefs-umount.err; then
                 return 0
             fi
-            stop_tidefs_daemons_for_mount "$unmount_target"
+            stop_tidefs_mount_for_path "$unmount_target"
             if timeout -k 5s 10s umount -l "$unmount_target" 2>/tmp/tidefs-umount-lazy.err; then
                 return 0
             fi
@@ -1305,20 +1340,6 @@ elif [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             return 1
         }
 
-        echo "cleanup: stop xfstests helpers"
-        pkill -f "xfstests-check" 2>/dev/null || true
-        pkill -f "/tmp/xfstests\\." 2>/dev/null || true
-        pkill -f "/tmp/xfstests\\..*/src/" 2>/dev/null || true
-        pkill -f "/tmp/xfstests\\..*/ltp/" 2>/dev/null || true
-        pkill -f "fsstress" 2>/dev/null || true
-        killall fsstress 2>/dev/null || true
-        sleep 1
-        pkill -9 -f "xfstests-check" 2>/dev/null || true
-        pkill -9 -f "/tmp/xfstests\\." 2>/dev/null || true
-        pkill -9 -f "/tmp/xfstests\\..*/src/" 2>/dev/null || true
-        pkill -9 -f "/tmp/xfstests\\..*/ltp/" 2>/dev/null || true
-        pkill -9 -f "fsstress" 2>/dev/null || true
-        killall -9 fsstress 2>/dev/null || true
         echo "cleanup: unmount nested test mounts"
         for nested_mnt in "$SCRATCH_MNT" "$TEST_DIR"; do
             unmount_path_bounded "$nested_mnt" || true
@@ -1327,9 +1348,9 @@ elif [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             [ -e "$nested_mnt" ] || continue
             unmount_path_bounded "$nested_mnt" || true
         done
-        echo "cleanup: stop nested TideFS daemons"
-        stop_tidefs_daemons_for_mount "$TEST_DIR"
-        stop_tidefs_daemons_for_mount "$SCRATCH_MNT"
+        echo "cleanup: stop nested TideFS mount owners"
+        stop_tidefs_mount_for_path "$TEST_DIR"
+        stop_tidefs_mount_for_path "$SCRATCH_MNT"
         echo "cleanup: remove xfstests tmp"
         rm -rf /tmp/xfstests.* /tmp/cutmp* 2>/dev/null || true
         echo "cleanup: remove xfstests results"
@@ -1380,14 +1401,14 @@ elif [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         }
         dump_tidefs_helper_logs() {
             helper_test="$1"
-            if find /tmp -maxdepth 1 -type f \( -name 'tidefs-preview-*.log' -o -name 'tidefs-daemon-*.log' -o -name 'daemon-helper.log' -o -name 'mount-helper.log' \) -print | sort | grep . >/tmp/tidefs-helper-log-files; then
+            if find /tmp -maxdepth 1 -type f \( -name 'tidefs-preview-*.log' -o -name 'tidefs-mount-*.log' -o -name 'mount-helper.log' \) -print | sort | grep . >/tmp/tidefs-helper-log-files; then
                 while read -r f; do
                     echo "helper-log: $f"
                     echo "helper-log-bytes=$(wc -c <"$f" 2>/dev/null || true)"
                     grep -a "tidefs-diagnostic" "$f" 2>/dev/null || true
                     case "$f" in
-                        *tidefs-daemon-*)
-                            echo "--- full daemon log for $helper_test: $f ---"
+                        *tidefs-mount-*)
+                            echo "--- full mount-owner log for $helper_test: $f ---"
                             cat "$f" 2>/dev/null || true
                             ;;
                         *)
@@ -1424,25 +1445,20 @@ elif [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         echo "--- timeout diagnostics for $dump_test ---"
         echo "--- process table ---"
         ps 2>/dev/null || true
-        echo "--- matching xfstests processes ---"
-        diag_pids=""
-        for pattern in "xfstests-check" "/tmp/xfstests\\." "holetest" "tidefs-posix-filesystem-adapter-daemon"; do
-            pids=$(pgrep -f "$pattern" 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-                for pid in $pids; do
-                    cmd=$(tr '\000' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
-                    state=$(sed -n 's/^State:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null || true)
-                    echo "process: pid=$pid state=$state cmd=$cmd"
-                    case " $diag_pids " in
-                        *" $pid "*) ;;
-                        *) diag_pids="$diag_pids $pid" ;;
-                    esac
-                done
-            fi
-        done
-        for pid in $diag_pids; do
-            cmd=$(tr '\000' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
-            dump_process_threads "$pid" "$cmd"
+        echo "--- exact task-owned xfstests and mount processes ---"
+        if [ -n "$ACTIVE_XFSTESTS_PID" ]; then
+            cmd=$(tr '\000' ' ' <"/proc/$ACTIVE_XFSTESTS_PID/cmdline" 2>/dev/null || true)
+            dump_process_threads "$ACTIVE_XFSTESTS_PID" "xfstests-check $cmd"
+        fi
+        for diag_mount in "$MNT" "$TEST_DIR" "$SCRATCH_MNT"; do
+            diag_tag=$(printf '%s' "$diag_mount" | tr -dc 'A-Za-z0-9._-' | head -c 48)
+            [ -n "$diag_tag" ] || diag_tag=mount
+            diag_pid=$(cat "/tmp/tidefs-mount-$diag_tag.pid" 2>/dev/null || true)
+            case "$diag_pid" in
+                ""|*[!0-9]*) continue ;;
+            esac
+            cmd=$(tr '\000' ' ' <"/proc/$diag_pid/cmdline" 2>/dev/null || true)
+            dump_process_threads "$diag_pid" "mount-owner $diag_mount $cmd"
         done
         echo "--- mount table ---"
         grep -E 'tidefs|xfstests|fuse' /proc/mounts 2>/dev/null || true
@@ -1481,10 +1497,22 @@ elif [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
     terminate_process_tree() {
         tree_pid="$1"
         signal="$2"
+        case "$tree_pid" in
+            ""|*[!0-9]*) return 0 ;;
+        esac
         for child_pid in $(pgrep -P "$tree_pid" 2>/dev/null || true); do
             terminate_process_tree "$child_pid" "$signal"
         done
         kill "-$signal" "$tree_pid" 2>/dev/null || true
+    }
+
+    terminate_process_group() {
+        process_group="$1"
+        signal="$2"
+        case "$process_group" in
+            ""|*[!0-9]*|0|1) return 0 ;;
+        esac
+        kill "-$signal" "-$process_group" 2>/dev/null || true
     }
 
     run_dump_xfstests_test_state_bounded() {
@@ -1552,22 +1580,38 @@ elif [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         bounded_test="$1"
         bounded_result_base="$2"
         bounded_test_log="$3"
-        xfstests-check -fuse "$bounded_test" > "$bounded_test_log" 2>&1 &
+        setsid xfstests-check -fuse "$bounded_test" > "$bounded_test_log" 2>&1 &
         check_pid=$!
+        ACTIVE_XFSTESTS_PID="$check_pid"
+        ACTIVE_XFSTESTS_PGID="$check_pid"
         elapsed=0
         while kill -0 "$check_pid" 2>/dev/null; do
             if [ "$elapsed" -ge "$ACTIVE_TEST_TIMEOUT" ]; then
                 run_dump_xfstests_test_state_bounded "timeout-$bounded_test" "$bounded_test" "$bounded_result_base" "$bounded_test_log" || true
-                terminate_process_tree "$check_pid" TERM
+                terminate_process_group "$ACTIVE_XFSTESTS_PGID" TERM
                 sleep 2
-                terminate_process_tree "$check_pid" KILL
+                terminate_process_group "$ACTIVE_XFSTESTS_PGID" KILL
+                wait "$check_pid" 2>/dev/null || true
+                ACTIVE_XFSTESTS_PID=""
+                ACTIVE_XFSTESTS_PGID=""
                 return 124
             fi
             sleep 1
             elapsed=$((elapsed + 1))
         done
-        wait "$check_pid"
-        return "$?"
+        if wait "$check_pid"; then
+            check_rc=0
+        else
+            check_rc=$?
+        fi
+        # xfstests helpers inherit this dedicated process group. Stop any
+        # exact descendants that survived their group leader.
+        terminate_process_group "$ACTIVE_XFSTESTS_PGID" TERM
+        sleep 1
+        terminate_process_group "$ACTIVE_XFSTESTS_PGID" KILL
+        ACTIVE_XFSTESTS_PID=""
+        ACTIVE_XFSTESTS_PGID=""
+        return "$check_rc"
     }
 
     # Run each test individually with per-test timeout
@@ -1694,7 +1738,7 @@ fi
 
 # ── Phase 4: Tear-down ───────────────────────────────────────────────
 echo ""
-echo "--- Phase 4: Unmount and stop daemon ---"
+echo "--- Phase 4: Unmount and stop mount owner ---"
 
 if [ "$MOUNTED" -eq 1 ]; then
     # xfstests may leave nested TEST_DIR/SCRATCH_MNT mounts active; unmount
@@ -1718,21 +1762,41 @@ else
     blocked "unmount" "filesystem not mounted"
 fi
 
-# Clean up daemon processes
-# Kill by known PID first
-if [ -n "$DAEMON_PID" ]; then
-    kill "$DAEMON_PID" 2>/dev/null || true
+# Verify and stop only the exact mount owner recorded by this task.
+mount_owner_matches() {
+    owner_pid="$1"
+    owner_mount="$2"
+    case "$owner_pid" in
+        ""|*[!0-9]*) return 1 ;;
+    esac
+    owner_cmd=$(tr '\000' ' ' <"/proc/$owner_pid/cmdline" 2>/dev/null || true)
+    case "$owner_cmd" in
+        *"/bin/tidefsctl pool mount "*" $owner_mount "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+for _wait in $(seq 10); do
+    if [ -z "$MOUNT_OWNER_PID" ] || ! kill -0 "$MOUNT_OWNER_PID" 2>/dev/null; then
+        break
+    fi
     sleep 1
-    kill -9 "$DAEMON_PID" 2>/dev/null || true
+done
+if [ -n "$MOUNT_OWNER_PID" ] && kill -0 "$MOUNT_OWNER_PID" 2>/dev/null; then
+    if mount_owner_matches "$MOUNT_OWNER_PID" "$MNT"; then
+        kill "$MOUNT_OWNER_PID" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$MOUNT_OWNER_PID" 2>/dev/null && mount_owner_matches "$MOUNT_OWNER_PID" "$MNT"; then
+            kill -9 "$MOUNT_OWNER_PID" 2>/dev/null || true
+        fi
+    else
+        fail "mount_owner_stop" "recorded PID no longer belongs to this TideFS mount; left untouched"
+    fi
 fi
-# Also kill any remaining daemon processes
-pkill -f "tidefs-posix-filesystem-adapter-daemon" 2>/dev/null || true
-sleep 1
-# Verify cleanup
-if ! pgrep -f "tidefs-posix-filesystem-adapter-daemon" > /dev/null 2>&1; then
-    pass "daemon_stop"
-else
-    fail "daemon_stop" "daemon process still running after kill"
+if [ -z "$MOUNT_OWNER_PID" ] || ! kill -0 "$MOUNT_OWNER_PID" 2>/dev/null; then
+    pass "mount_owner_stop"
+elif mount_owner_matches "$MOUNT_OWNER_PID" "$MNT"; then
+    fail "mount_owner_stop" "exact mount owner still running after teardown"
 fi
 
 # ── Validation Summary ──────────────────────────────────────────────────
@@ -2171,7 +2235,7 @@ SUMMARYEOF
     "TideFS userspace FUSE mount",
     "basic mkdir/write/read/unlink sanity",
     "upstream xfstests $TEST_SCOPE requested rows",
-    "unmount and daemon-stop rows recorded"
+    "unmount and exact mount-owner stop rows recorded"
   ],
   "limitations": [
     "Bounded xfstests smoke tranche, not exhaustive upstream xfstests coverage.",

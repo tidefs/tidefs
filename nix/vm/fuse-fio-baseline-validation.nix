@@ -22,7 +22,7 @@ let
     GZIP="${pkgs.gzip}/bin/gzip"
     FIO="${pkgs.fio}/bin/fio"
     PYTHON="${pkgs.python3}/bin/python3"
-    FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
+    TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
 
     TMPDIR="''${TIDEFS_FUSE_FIO_TMPDIR:-/tmp/tidefs-fuse-fio-baseline}"
     TIMEOUT_SEC="''${TIDEFS_FUSE_FIO_TIMEOUT:-900}"
@@ -52,7 +52,7 @@ USAGE
       esac
     done
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$FIO" "$PYTHON" "$FUSE_DAEMON"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$FIO" "$PYTHON" "$TIDEFSCTL"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ENVIRONMENT REFUSAL: dependency not found: $dep" >&2
         exit 2
@@ -75,7 +75,7 @@ USAGE
 
     echo "=== TideFS VAL: fuse-fio-baseline direct QEMU ==="
     echo "  Kernel:      $KERNEL_IMG"
-    echo "  FUSE daemon: $FUSE_DAEMON"
+    echo "  TideFS control: $TIDEFSCTL"
     echo "  fio:         $FIO"
     echo "  QEMU:        $QEMU_BIN"
     echo "  Accel:       $QEMU_ACCEL_LABEL"
@@ -110,7 +110,7 @@ USAGE
     copy_runtime_deps() {
       echo "  Copying exact Nix store runtime dependencies..."
       local deps
-      deps=$("$LDD_BIN" "$BUSYBOX" "$FIO" "$FUSE_DAEMON" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
+      deps=$("$LDD_BIN" "$BUSYBOX" "$FIO" "$TIDEFSCTL" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
       for lib in $deps; do
         if [ -f "$lib" ]; then
           local lib_dir
@@ -120,7 +120,7 @@ USAGE
         fi
       done
 
-      for binary in "$BUSYBOX" "$FIO" "$FUSE_DAEMON"; do
+      for binary in "$BUSYBOX" "$FIO" "$TIDEFSCTL"; do
         local ld_so
         ld_so=$("$LDD_BIN" "$binary" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
         if [ -n "$ld_so" ] && [ -f "$ld_so" ]; then
@@ -142,7 +142,7 @@ USAGE
     done
 
     copy_binary_to_bin "$FIO" fio
-    copy_binary_to_bin "$FUSE_DAEMON" tidefs-posix-filesystem-adapter-daemon
+    copy_binary_to_bin "$TIDEFSCTL" tidefsctl
     copy_runtime_deps
 
     cat > "$RUN_DIR/init" << 'INITSCRIPT'
@@ -259,18 +259,17 @@ else
     environment_refusal "fuse_device" "/dev/fuse not available"
 fi
 
-STORE=/store/tidefs-fio
+DEVICE=/store/tidefs-fio-device.tidefs
+POOL=fio_baseline_pool
 MNT=/mnt/tidefs
 DAEMON_PID=""
 MOUNTED=0
 
-mkdir -p "$STORE" "$MNT"
+mkdir -p "$MNT"
 if [ -e /dev/fuse ] && grep -q fuse /proc/filesystems 2>/dev/null; then
-    /bin/tidefs-posix-filesystem-adapter-daemon mount-vfs \
-      --store "$STORE" \
-      --mount "$MNT" \
-      --root-auth-key-hex 4141414141414141414141414141414141414141414141414141414141414141 \
-      --no-writeback-cache \
+    truncate -s 1073741824 "$DEVICE"
+    /bin/tidefsctl pool create "$POOL" --file-devices --devices "$DEVICE"
+    /bin/tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" \
       > /tmp/tidefs-fuse-daemon.log 2>&1 &
     DAEMON_PID=$!
     echo "daemon_pid=$DAEMON_PID"

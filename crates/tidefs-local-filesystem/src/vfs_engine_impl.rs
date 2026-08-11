@@ -1344,7 +1344,7 @@ impl VfsLocalFileSystem {
             "schema_version": 1,
             "evidence_class": "queue-depth-runtime-artifact",
             "evidence_scope": "bounded mounted FUSE runtime dirty-write admission queue-depth snapshot",
-            "source": "tidefs-posix-filesystem-adapter-daemon smoke-mount",
+            "source": "tidefsctl mounted lifecycle",
             "claim_ids": [
                 "perf.local.no_unbounded_dirty_debt.v1"
             ],
@@ -1395,7 +1395,7 @@ impl VfsLocalFileSystem {
                 "permits": config.hard_max_permits
             },
             "determinism": {
-                "workload": "fixed smoke-mount quick workload",
+                "workload": "fixed canonical mounted lifecycle workload",
                 "admission_state": "single mounted local filesystem with default hard caps",
                 "tolerance": {
                     "peak_dirty_bytes": 0,
@@ -3116,7 +3116,7 @@ fn live_performance_admission_snapshot_args(
     Ok((
         live_admin_typed_optional_string_arg(args, "workload")?
             .filter(|value| !value.is_empty())
-            .unwrap_or("fuse-smoke-mount-quick"),
+            .unwrap_or("local-mounted-filesystem"),
         live_admin_typed_optional_string_arg(args, "mount_adapter")?
             .filter(|value| !value.is_empty())
             .unwrap_or("fuse"),

@@ -11,10 +11,8 @@ Nix build sandbox.
 Runner options passed through to the built runner include:
   --timeout SECONDS
   --validation-dir DIR
-  --queue-depth-artifact PATH
   --ack-receipt-runtime
   --data-shape-runtime
-  --scrub-foreground-read
   --keep-tmp
 
 Build options consumed by this launcher:

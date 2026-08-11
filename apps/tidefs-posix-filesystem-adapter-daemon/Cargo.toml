@@ -33,7 +33,6 @@ tidefs-permission = { workspace = true }
 tidefs-lock-service = { workspace = true }
 tidefs-posix-semantics = { workspace = true }
 tidefs-background-scheduler = { workspace = true }
-tidefs-performance-contract = { workspace = true, features = ["serde"], optional = true }
 tidefs-local-object-store = { workspace = true }
 
 tidefs-recovery-loop = { workspace = true }
@@ -66,14 +65,12 @@ receipt-demo = [
     "dep:tidefs-types-package-profile-catalog",
 ]
 replication-io = ["tidefs-local-filesystem/replication-io"]
-scrub-observation = ["dep:tidefs-performance-contract"]
 workload-telemetry = ["dep:tidefs-workload"]
 full = [
     "cluster",
     "data-policy",
     "replication-io",
     "receipt-demo",
-    "scrub-observation",
     "workload-telemetry",
 ]
 

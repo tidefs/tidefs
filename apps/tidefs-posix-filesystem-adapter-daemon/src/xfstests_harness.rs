@@ -393,10 +393,6 @@ impl XfstestsConfig {
         let mount = std::env::var("TIDEFS_SCOREBOARD_MOUNT").unwrap_or_default();
 
         let mut env_vars = Vec::new();
-        // Set TIDEFS_BIN so mount.fuse helper can locate the daemon binary.
-        if let Ok(exe) = std::env::current_exe() {
-            env_vars.push(("TIDEFS_BIN".into(), exe.display().to_string()));
-        }
         // Prepend mount helper dir and /usr/bin to PATH.  The mount helper dir
         // contains a "mount" wrapper that routes -t fuse to /usr/sbin/mount.fuse
         // because the Nix mount binary lacks FUSE support.
@@ -419,10 +415,6 @@ impl XfstestsConfig {
             env_vars.push(("TEST_DIR".into(), test_dir));
             env_vars.push(("TEST_DEV".into(), "tidefs-preview".into()));
             env_vars.push(("FSTYP".into(), "fuse".into()));
-            env_vars.push((
-                ROOT_AUTHENTICATION_ENV_VAR.into(),
-                "4141414141414141414141414141414141414141414141414141414141414141".to_string(),
-            ));
             env_vars.push((
                 ROOT_AUTHENTICATION_ENV_VAR.into(),
                 "4141414141414141414141414141414141414141414141414141414141414141".to_string(),

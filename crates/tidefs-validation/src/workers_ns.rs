@@ -3,7 +3,7 @@
 //!
 //! Exercises the full adapter stack (FUSE decode -> ingress -> capacity
 //! dispatch -> workers-ns handler -> reply encode) through a real FUSE
-//! mount.  Every test skips gracefully when the daemon binary or
+//! mount.  Every test skips gracefully when `tidefsctl` or
 //! /dev/fuse is unavailable.
 //!
 //! The entire module is `#[cfg(test)]` because it contains only tests
@@ -19,13 +19,13 @@ use std::os::unix::fs::MetadataExt;
 
 #[cfg(test)]
 /// Try to create a MountHarness.  Returns `None` and prints a skip
-/// message when the daemon binary is unavailable.
+/// message when `tidefsctl` is unavailable.
 fn try_mount() -> Option<MountHarness> {
     match MountHarness::new() {
         Ok(h) => Some(h),
         Err(e) => {
             eprintln!(
-                "SKIP: daemon not available (set TIDEFS_DAEMON_BIN or \
+                "SKIP: tidefsctl not available (set TIDEFSCTL_BIN or \
                  build the workspace) -- {e}"
             );
             None

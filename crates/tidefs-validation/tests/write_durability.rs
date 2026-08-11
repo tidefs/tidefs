@@ -146,15 +146,15 @@ fn write_fsync_remount_verify_8kib() {
     harness.fsync_file("durable.bin").expect("fsync session 1");
 
     // Capture store path before unmount kills the TempDir guard.
-    let store_path = harness.store_path().to_path_buf();
+    let device_path = harness.device_path().to_path_buf();
 
     harness.unmount_only(true).expect("unmount session 1");
 
     // Verify backing store directory still exists and has content.
     assert!(
-        store_path.exists(),
-        "backing store {} must exist after unmount",
-        store_path.display()
+        device_path.exists(),
+        "pool device {} must exist after unmount",
+        device_path.display()
     );
 
     harness.remount().expect("remount session 2");
@@ -333,11 +333,7 @@ fn multi_file_write_fsync_remount_verify() {
 // ── additional write-durability coverage ──────────────────────────────────
 
 use std::fs;
-use std::io;
-use std::path::Path;
-use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
 
 /// Pseudo-random data seeded by `seed` and sized to `len_bytes`.
 fn prng_test_data(seed: u64, len_bytes: usize) -> Vec<u8> {
@@ -349,52 +345,6 @@ fn prng_test_data(seed: u64, len_bytes: usize) -> Vec<u8> {
             b
         })
         .collect()
-}
-
-/// Wait for a mount point to become ready (times out after 10s).
-fn wait_for_mount(path: &Path) -> io::Result<()> {
-    let start = Instant::now();
-    loop {
-        match fs::metadata(path) {
-            Ok(_) => return Ok(()),
-            Err(_) if start.elapsed() < Duration::from_secs(10) => {
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Spawn a fresh daemon on an existing store/mount pair.
-fn spawn_daemon_on(store: &Path, mount: &Path) -> io::Result<(std::process::Child, u32)> {
-    let daemon_bin = tidefs_validation::mount_harness::find_daemon_binary()?;
-    let child = Command::new(&daemon_bin)
-        .arg("mount-vfs")
-        .arg("--store")
-        .arg(store)
-        .arg("--mount")
-        .arg(mount)
-        .arg("--root-auth-key-hex")
-        .arg("0000000000000000000000000000000000000000000000000000000000000001")
-        .spawn()
-        .map_err(|e| io::Error::other(format!("spawn daemon: {e}")))?;
-    let pid = child.id();
-    wait_for_mount(mount)?;
-    Ok((child, pid))
-}
-
-/// Kill a child process by PID with SIGTERM then SIGKILL.
-fn kill_daemon(pid: u32) {
-    // SAFETY: kill(2) with SIGTERM; pid is a valid daemon PID.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-    thread::sleep(Duration::from_millis(200));
-    // SAFETY: kill(2) is a C FFI call; pid is a valid daemon PID.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
-    thread::sleep(Duration::from_millis(100));
 }
 
 // ── multi-chunk large-file durability ─────────────────────────────────────
@@ -584,42 +534,21 @@ fn write_durability_unlink_survives_remount() {
 fn write_durability_fsync_crash_remount_4kib() {
     let test_data = prng_test_data(0xCAFE, 4096);
 
-    let harness = MountHarness::new_or_fail("write_durability_fsync_crash_remount_4kib");
+    let mut harness = MountHarness::new_or_fail("write_durability_fsync_crash_remount_4kib");
 
     harness
         .create_file("crash_test.bin", &test_data)
         .expect("create_file");
     harness.fsync_file("crash_test.bin").expect("fsync");
 
-    // Save paths before killing the daemon.
-    let store_path = harness.store_path().to_path_buf();
-    let mount_path = harness.mount_path().to_path_buf();
-    let pid = harness.daemon_pid();
-
-    // Hard crash: SIGKILL.
-    // SAFETY: kill(2) is a C FFI call; pid is a valid daemon PID.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
-    thread::sleep(Duration::from_millis(300));
-
-    // Force unmount: fusermount -u may fail on dead mount, use -z (lazy).
-    let _ = Command::new("fusermount")
-        .arg("-u")
-        .arg("-z")
-        .arg(&mount_path)
-        .output();
-
-    // Keep the harness alive via ManuallyDrop: its TempDir holds the
-    // backing store which must survive until after the remount read.
-    let mut harness = std::mem::ManuallyDrop::new(harness);
-
-    // Spawn a fresh daemon on the same store/mount.
-    let (child, pid2) =
-        spawn_daemon_on(&store_path, &mount_path).expect("spawn daemon after crash");
+    harness
+        .crash_and_remount()
+        .expect("canonical pool mount after crash");
 
     // Verify data survived.
-    let read_back = fs::read(mount_path.join("crash_test.bin")).expect("read after crash+remount");
+    let read_back = harness
+        .read_file("crash_test.bin")
+        .expect("read after crash+remount");
     assert_eq!(
         read_back.len(),
         test_data.len(),
@@ -629,21 +558,6 @@ fn write_durability_fsync_crash_remount_4kib() {
         read_back, test_data,
         "byte-for-byte mismatch after fsync+crash+remount"
     );
-
-    // Cleanup: kill daemon, unmount, then drop the harness.
-    kill_daemon(pid2);
-    let _ = Command::new("fusermount")
-        .arg("-u")
-        .arg("-z")
-        .arg(&mount_path)
-        .output();
-    drop(child);
-    // SAFETY: ManuallyDrop::drop prevents the normal Drop from running;
-    // this avoids double-unmount when the daemon has already been killed.
-    // The pointer to harness is valid (live local variable).
-    unsafe {
-        std::mem::ManuallyDrop::drop(&mut harness);
-    }
 }
 
 // ── negative test: write without fsync before crash ────────────────────────
@@ -653,36 +567,20 @@ fn write_durability_fsync_crash_remount_4kib() {
 fn write_durability_no_fsync_crash_test() {
     let test_data = prng_test_data(0xBEEF, 2048);
 
-    let harness = MountHarness::new_or_fail("write_durability_no_fsync_crash_test");
+    let mut harness = MountHarness::new_or_fail("write_durability_no_fsync_crash_test");
 
     harness
         .create_file("no_fsync.bin", &test_data)
         .expect("create_file");
     // Explicitly DO NOT fsync.
 
-    let store_path = harness.store_path().to_path_buf();
-    let mount_path = harness.mount_path().to_path_buf();
-    let pid = harness.daemon_pid();
-
-    // SAFETY: kill(2) is a C FFI call; pid is a valid daemon PID.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
-    thread::sleep(Duration::from_millis(300));
-    let _ = Command::new("fusermount")
-        .arg("-u")
-        .arg("-z")
-        .arg(&mount_path)
-        .output();
-
-    let mut harness = std::mem::ManuallyDrop::new(harness);
-
-    let (child, pid2) =
-        spawn_daemon_on(&store_path, &mount_path).expect("spawn daemon after crash (no fsync)");
+    harness
+        .crash_and_remount()
+        .expect("canonical pool mount after crash without fsync");
 
     // The file may or may not survive. POSIX does not guarantee data
     // written without fsync survives a crash.
-    match fs::read(mount_path.join("no_fsync.bin")) {
+    match harness.read_file("no_fsync.bin") {
         Ok(data) => {
             if data == test_data {
                 eprintln!("note: no-fsync data survived crash (implementation detail)");
@@ -693,20 +591,6 @@ fn write_durability_no_fsync_crash_test() {
         Err(e) => {
             eprintln!("note: no-fsync file not found after crash (expected): {e}");
         }
-    }
-
-    kill_daemon(pid2);
-    let _ = Command::new("fusermount")
-        .arg("-u")
-        .arg("-z")
-        .arg(&mount_path)
-        .output();
-    drop(child);
-    // SAFETY: ManuallyDrop::drop prevents the normal Drop from running;
-    // this avoids double-unmount when the daemon has already been killed.
-    // The pointer to harness is valid (live local variable).
-    unsafe {
-        std::mem::ManuallyDrop::drop(&mut harness);
     }
 }
 

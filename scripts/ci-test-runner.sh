@@ -121,30 +121,30 @@ prepare_validation_fuse_daemon() {
         return 0
     fi
 
-    if [[ -n "${TIDEFS_DAEMON_BIN:-}" ]]; then
+    if [[ -n "${TIDEFSCTL_BIN:-}" ]]; then
         return 0
     fi
 
     local profile_dir="debug"
-    local build_flags=(--locked -p tidefs-posix-filesystem-adapter-daemon)
+    local build_flags=(--locked -p tidefsctl)
     if cargo_flags_use_release; then
         profile_dir="release"
         build_flags+=(--release)
     fi
 
-    echo "Building tidefs-posix-filesystem-adapter-daemon for FUSE validation"
+    echo "Building tidefsctl for canonical FUSE validation"
     (cd "$ws_root" && cargo build "${build_flags[@]}")
 
-    local daemon_bin="$CARGO_TARGET_DIR/$profile_dir/tidefs-posix-filesystem-adapter-daemon"
-    if [[ "$daemon_bin" != /* ]]; then
-        daemon_bin="$ws_root/$daemon_bin"
+    local tidefsctl_bin="$CARGO_TARGET_DIR/$profile_dir/tidefsctl"
+    if [[ "$tidefsctl_bin" != /* ]]; then
+        tidefsctl_bin="$ws_root/$tidefsctl_bin"
     fi
-    if [[ ! -f "$daemon_bin" ]]; then
-        echo "ci-test-runner: expected daemon binary not found at $daemon_bin" >&2
+    if [[ ! -f "$tidefsctl_bin" ]]; then
+        echo "ci-test-runner: expected tidefsctl binary not found at $tidefsctl_bin" >&2
         return 1
     fi
 
-    export TIDEFS_DAEMON_BIN="$daemon_bin"
+    export TIDEFSCTL_BIN="$tidefsctl_bin"
 }
 
 failure_excerpt_json() {

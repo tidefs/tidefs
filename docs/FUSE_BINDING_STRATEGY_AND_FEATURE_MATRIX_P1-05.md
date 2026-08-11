@@ -339,15 +339,16 @@ page-cache and invalidation authority in
 
 ### 6.2 Profile selection
 
-The profile is selected at mount time via a daemon flag:
+The coherency profile is selected on the canonical pool mount carrier:
 
 ```text
-tidefs-posix-filesystem-adapter-daemon mount \
-  --profile strict|perf|cluster \
-  --store /data/tidefs --mount /mnt/tidefs
+tidefsctl pool mount <pool> /mnt/tidefs \
+  --devices <device>... \
+  --coherency strict|writeback|nearline|async|offline
 ```
 
-Default: `perf` for single-node production; `strict` for xfstests harness.
+Consumers select a non-default profile explicitly when the mounted behavior
+under test requires it. There is no separate daemon-local profile command.
 
 ### 6.3 Profile transition rules
 

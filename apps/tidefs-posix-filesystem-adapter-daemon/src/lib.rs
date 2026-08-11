@@ -138,8 +138,6 @@ use tidefs_background_scheduler::{
 };
 use tidefs_dataset_lifecycle::SyncGuarantee;
 use tidefs_intent_log::IntentLogBuffer;
-#[cfg(feature = "scrub-observation")]
-use tidefs_performance_contract::ScrubRuntimeObservation;
 use tidefs_vfs_engine::{
     LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminOutput,
     LivePoolAdminRequest, LivePoolAdminResponseBody,
@@ -313,18 +311,16 @@ pub struct MountConfig {
     /// cluster-lease-authorized.
     pub mount_authority: MountAuthority,
 
-    /// Runtime semantics shared by `tidefsctl` and the transitional daemon
-    /// CLI wrapper. Production callers use [`MountRuntimeOptions::default`];
-    /// validation callers may explicitly select the same canonical runtime's
-    /// focused fault and observation controls.
+    /// Runtime semantics selected by the canonical `tidefsctl pool mount`
+    /// carrier. Focused library validation may additionally set fault and
+    /// observation inputs that are deliberately absent from the operator CLI.
     pub runtime: MountRuntimeOptions,
 }
 
 /// Focused configuration for the one mounted runtime implementation.
 ///
-/// This contains mount semantics formerly applied only by the daemon binary's
-/// duplicate `mount-vfs` implementation. The binary now translates its CLI
-/// into these options and delegates to [`run_mount`].
+/// `tidefsctl pool mount` translates operator options into this single
+/// configuration and delegates to [`run_mount`].
 #[derive(Debug)]
 pub struct MountRuntimeOptions {
     /// Source name reported by the FUSE mount in mount tables.
@@ -358,9 +354,6 @@ pub struct MountRuntimeOptions {
     pub fault_inject_corruption: Option<f64>,
     /// Optional validation-only queue-depth artifact path.
     pub queue_depth_artifact: Option<PathBuf>,
-    /// Optional validation-only mounted-scrub observation path.
-    #[cfg(feature = "scrub-observation")]
-    pub scrub_runtime_observation_artifact: Option<PathBuf>,
 }
 
 impl Default for MountRuntimeOptions {
@@ -387,8 +380,6 @@ impl Default for MountRuntimeOptions {
             enable_repair_writeback: false,
             fault_inject_corruption: None,
             queue_depth_artifact: None,
-            #[cfg(feature = "scrub-observation")]
-            scrub_runtime_observation_artifact: None,
         }
     }
 }
@@ -681,42 +672,19 @@ fn fuse_mount_options_for_mode(
 
 struct MountedBackgroundScrubService {
     store: tidefs_local_object_store::LocalObjectStore,
-    #[cfg(feature = "scrub-observation")]
-    observation: ScrubRuntimeObservation,
-    #[cfg(feature = "scrub-observation")]
-    observation_artifact: Option<PathBuf>,
     next_tick_not_before: std::time::Instant,
 }
 
 impl MountedBackgroundScrubService {
     const NAME: &'static str = "mounted-segment-scrub";
 
-    fn open(
-        root: &Path,
-        options: tidefs_local_object_store::StoreOptions,
-        #[cfg(feature = "scrub-observation")] observation_artifact: Option<PathBuf>,
-    ) -> Result<Self, String> {
+    fn open(root: &Path, options: tidefs_local_object_store::StoreOptions) -> Result<Self, String> {
         let store = tidefs_local_object_store::LocalObjectStore::open_with_options(root, options)
             .map_err(|error| format!("open scheduled scrub store: {error}"))?;
-        let service = Self {
+        Ok(Self {
             store,
-            #[cfg(feature = "scrub-observation")]
-            observation: ScrubRuntimeObservation::new(std::process::id()),
-            #[cfg(feature = "scrub-observation")]
-            observation_artifact,
             next_tick_not_before: std::time::Instant::now(),
-        };
-        #[cfg(feature = "scrub-observation")]
-        service.publish_observation()?;
-        Ok(service)
-    }
-
-    #[cfg(feature = "scrub-observation")]
-    fn publish_observation(&self) -> Result<(), String> {
-        if let Some(path) = self.observation_artifact.as_deref() {
-            write_scrub_runtime_observation(path, &self.observation)?;
-        }
-        Ok(())
+        })
     }
 
     fn bounded_limit(scheduler_limit: u64, curve_limit: u64) -> u64 {
@@ -771,24 +739,7 @@ impl BackgroundService for MountedBackgroundScrubService {
                 std::time::Instant::now() + std::time::Duration::from_millis(budget.max_ms);
         }
 
-        #[cfg(feature = "scrub-observation")]
-        let work_observed =
-            report.segments_scanned > 0 || report.records_verified > 0 || report.bytes_scanned > 0;
         let work_pending = self.store.background_scrub_pending();
-        #[cfg(feature = "scrub-observation")]
-        if work_observed {
-            self.observation.record_admitted_cycle(
-                report.records_verified,
-                report.bytes_scanned,
-                work_pending,
-            );
-            if work_pending {
-                self.observation.record_budget_throttle();
-            }
-            if let Err(error) = self.publish_observation() {
-                eprintln!("background-scrub: failed to write runtime observation: {error}");
-            }
-        }
 
         if report.segments_scanned > 0 || report.records_verified > 0 {
             tracing::info!(
@@ -817,40 +768,6 @@ impl BackgroundService for MountedBackgroundScrubService {
     }
 }
 
-#[cfg(feature = "scrub-observation")]
-fn write_scrub_runtime_observation(
-    path: &Path,
-    observation: &ScrubRuntimeObservation,
-) -> Result<(), String> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "create scrub runtime observation dir {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
-    let bytes = serde_json::to_vec_pretty(observation)
-        .map_err(|error| format!("encode scrub runtime observation: {error}"))?;
-    let temp_path = path.with_extension(format!("tmp-{}", observation.daemon_pid));
-    std::fs::write(&temp_path, bytes).map_err(|error| {
-        format!(
-            "write scrub runtime observation temp file {}: {error}",
-            temp_path.display()
-        )
-    })?;
-    std::fs::rename(&temp_path, path).map_err(|error| {
-        format!(
-            "publish scrub runtime observation {}: {error}",
-            path.display()
-        )
-    })?;
-    Ok(())
-}
-
 fn write_queue_depth_runtime_artifact(
     engine: &live_owner::LiveOwnerEngine,
     path: &Path,
@@ -858,7 +775,7 @@ fn write_queue_depth_runtime_artifact(
     let mut args = BTreeMap::new();
     args.insert(
         "workload".to_string(),
-        LivePoolAdminArg::String("fuse-smoke-mount-quick".to_string()),
+        LivePoolAdminArg::String("local-mounted-filesystem".to_string()),
     );
     args.insert(
         "mount_adapter".to_string(),
@@ -964,21 +881,6 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     if snapshot_export && config.runtime.queue_depth_artifact.is_some() {
         return Err("queue-depth artifacts are not supported for snapshot export mounts".into());
     }
-    #[cfg(feature = "scrub-observation")]
-    if snapshot_export && config.runtime.scrub_runtime_observation_artifact.is_some() {
-        return Err(
-            "scrub runtime observations are not supported for snapshot export mounts".into(),
-        );
-    }
-    #[cfg(feature = "scrub-observation")]
-    if effective_mode.background_scrub_interval_secs == 0
-        && config.runtime.scrub_runtime_observation_artifact.is_some()
-    {
-        return Err(
-            "scrub runtime observations require a positive background scrub interval".into(),
-        );
-    }
-
     #[cfg(feature = "cluster")]
     let cluster_lease_token = config
         .mount_authority
@@ -1312,13 +1214,6 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             reclaim_enabled: config.runtime.enable_reclaim,
             ..tidefs_local_object_store::StoreOptions::default()
         };
-        #[cfg(feature = "scrub-observation")]
-        let scrub_service = MountedBackgroundScrubService::open(
-            &config.backing_dir,
-            scrub_options,
-            config.runtime.scrub_runtime_observation_artifact.clone(),
-        );
-        #[cfg(not(feature = "scrub-observation"))]
         let scrub_service = MountedBackgroundScrubService::open(&config.backing_dir, scrub_options);
         match scrub_service {
             Ok(service) => {
@@ -1327,10 +1222,6 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                     "background-scrub: scheduled (interval={}s)",
                     effective_mode.background_scrub_interval_secs
                 );
-            }
-            #[cfg(feature = "scrub-observation")]
-            Err(error) if config.runtime.scrub_runtime_observation_artifact.is_some() => {
-                return Err(format!("background-scrub: {error}"));
             }
             Err(error) => {
                 eprintln!("background-scrub: disabled after setup failure: {error}");

@@ -1692,8 +1692,9 @@ pub fn check_fuse_mount_path_current_workspace() -> Result<(), StorageCheckError
     for rel in [
         "docs/FUSE_LSEEK_PC004B.md",
         "apps/tidefs-posix-filesystem-adapter-daemon/Cargo.toml",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/lib.rs",
         "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
+        "apps/tidefsctl/src/commands/mount.rs",
         "flake.nix",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -1711,13 +1712,13 @@ pub fn check_fuse_mount_path_current_workspace() -> Result<(), StorageCheckError
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs",
+        "apps/tidefsctl/src/commands/mount.rs",
         &[
-            "mod fuse_preview",
-            "mount --store <path> --mount <path>",
-            "smoke-mount",
-            "fuse_mount_smoke.passed=true",
-            "mount_foreground",
+            "PoolMountRuntimeArgs",
+            "PoolMountArgs",
+            "pool_import_owned",
+            "MountAuthority::standalone",
+            "tidefs_posix_filesystem_adapter_daemon::run_mount",
         ],
         &mut missing,
     );
@@ -1759,7 +1760,7 @@ pub fn check_fuse_mount_path_current_workspace() -> Result<(), StorageCheckError
             "pkgs.fuse3",
             "boot.kernelModules = [ \"fuse\" \"virtio_console\" ]",
             "test -e /dev/fuse",
-            "tidefs-posix-filesystem-adapter-daemon smoke-mount",
+            "tidefsctl pool mount",
             "buildRustPackage",
             "cargoLock.lockFile",
         ],
@@ -2712,7 +2713,10 @@ pub fn check_xfstests_harness_current_workspace() -> Result<(), StorageCheckErro
             "tidefs-preview",
             "TIDEFS_XFSTESTS_STORE_ROOT",
             "mountpoint -q",
-            "tidefs-posix-filesystem-adapter-daemon mount",
+            "TIDEFSCTL_BIN",
+            "pool create",
+            "pool mount",
+            "--file-devices",
         ],
         &mut missing,
     );
@@ -2875,7 +2879,10 @@ pub fn check_posix_scoreboard_current_workspace() -> Result<(), StorageCheckErro
         &[
             "tidefs-xfstests-mount",
             "tidefs-preview",
-            "tidefs-posix-filesystem-adapter-daemon mount",
+            "TIDEFSCTL_BIN",
+            "pool create",
+            "pool mount",
+            "--file-devices",
             "mountpoint -q",
             "TIDEFS_XFSTESTS_STORE_ROOT",
         ],

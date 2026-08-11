@@ -22,7 +22,6 @@ let
     CPIO="${pkgs.cpio}/bin/cpio"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
     TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
-    FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
 
     TMPDIR="''${TIDEFS_FUSE_DEMO_SOAK_TMPDIR:-/tmp/tidefs-fuse-runtime-evidence-soak}"
     TIMEOUT_SEC="''${TIDEFS_FUSE_DEMO_SOAK_TIMEOUT:-3600}"
@@ -58,7 +57,7 @@ let
       echo "  /dev/kvm not available; falling back to QEMU TCG"
     fi
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$FUSE_DAEMON" "$TIDEFSCTL"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$TIDEFSCTL"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -118,14 +117,11 @@ let
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
-    cp "$FUSE_DAEMON" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
-    chmod +x "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
-
     cp "$TIDEFSCTL" "$RUN_DIR/bin/tidefsctl"
     chmod +x "$RUN_DIR/bin/tidefsctl"
 
     echo "  Copying exact Nix store runtime dependencies..."
-    DEPS=$("$LDD_BIN" "$BUSYBOX" "$FUSE_DAEMON" "$TIDEFSCTL" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
+    DEPS=$("$LDD_BIN" "$BUSYBOX" "$TIDEFSCTL" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
     for lib in $DEPS; do
       if [ -f "$lib" ]; then
         lib_dir=$(dirname "$lib")
@@ -137,7 +133,7 @@ let
     # Nix-built ELF binaries embed the dynamic linker as an absolute
     # /nix/store path. Copy that exact path, including BusyBox's interpreter,
     # otherwise the kernel reports /init as ENOENT before the script runs.
-    for binary in "$BUSYBOX" "$FUSE_DAEMON" "$TIDEFSCTL"; do
+    for binary in "$BUSYBOX" "$TIDEFSCTL"; do
       LD_SO=$("$LDD_BIN" "$binary" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
       if [ -n "$LD_SO" ] && [ -f "$LD_SO" ]; then
         LD_DIR=$(dirname "$LD_SO")

@@ -10,7 +10,7 @@ It evaluates the fast harness text and executes it directly, avoiding a Nix
 build phase during harness-only edit loops.
 
 Common harness options:
-  --daemon-bin PATH    Already-built tidefs-posix-filesystem-adapter-daemon
+  --tidefsctl-bin PATH Already-built canonical TideFS lifecycle binary
   --kernel-img PATH    Already-built Linux 7.0 bzImage
   --module-dir DIR     Optional module directory when FUSE is modular
   --validation-dir DIR   Write boot logs and summary

@@ -22,7 +22,7 @@
 #
 # Dependencies:
 #   - Linux kernel with FUSE support
-#   - tidefs-posix-filesystem-adapter-daemon binary
+#   - tidefsctl canonical pool lifecycle binary
 #   - QEMU for guest execution
 {
   pkgs,
@@ -295,7 +295,7 @@ CEOF
     TIMEOUT_BIN="${pkgs.coreutils}/bin/timeout"
     KERNEL_IMG="${linuxKernel_7_0}/bzImage"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
-    DAEMON_BIN="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
+    TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
     METADATA_TEST="${fuseInodeMetadataTestBin}/bin/tidefs-fuse-inode-metadata-test"
 
     TMPDIR="''${TIDEFS_FUSE_INODE_METADATA_TMPDIR:-/tmp/tidefs-fuse-inode-metadata-validation}"
@@ -343,7 +343,7 @@ EOF
       exit 2
     fi
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$CPIO" "$XZ_BIN" "$TIMEOUT_BIN" "$KERNEL_IMG" "$DAEMON_BIN" "$METADATA_TEST"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$CPIO" "$XZ_BIN" "$TIMEOUT_BIN" "$KERNEL_IMG" "$TIDEFSCTL" "$METADATA_TEST"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -354,7 +354,7 @@ EOF
     echo "  Kernel:         $KERNEL_IMG"
     echo "  Module dir:     $MODULE_DIR"
     echo "  QEMU:           $QEMU_BIN"
-    echo "  Daemon:         $DAEMON_BIN"
+    echo "  Control:        $TIDEFSCTL"
     echo "  Metadata test:  $METADATA_TEST"
     echo "  Validation dir: $VALIDATION_DIR"
     echo "  Timeout:        ''${TIMEOUT_SEC}s"
@@ -405,7 +405,7 @@ EOF
     }
 
     copy_binary "$BUSYBOX" "$RUN_DIR/bin/busybox"
-    for applet in sh ls cat echo mount umount grep dmesg sleep poweroff reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync expr head tail cut kill ps test seq date uname tr sed tee true false env printf basename dirname readlink chmod id insmod; do
+    for applet in sh ls cat echo mount umount grep dmesg sleep poweroff reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync expr head tail cut kill ps test seq date uname tr sed tee true false env printf basename dirname readlink chmod id insmod truncate; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
@@ -435,10 +435,10 @@ EOF
     chmod +x "$RUN_DIR/bin/fusermount"
     ln -sf fusermount "$RUN_DIR/bin/fusermount3"
 
-    copy_binary "$DAEMON_BIN" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
+    copy_binary "$TIDEFSCTL" "$RUN_DIR/bin/tidefsctl"
     copy_binary "$METADATA_TEST" "$RUN_DIR/bin/tidefs-fuse-inode-metadata-test"
     copy_binary "$TIMEOUT_BIN" "$RUN_DIR/bin/timeout"
-    copy_runtime_deps "$BUSYBOX" "$DAEMON_BIN" "$METADATA_TEST" "$TIMEOUT_BIN"
+    copy_runtime_deps "$BUSYBOX" "$TIDEFSCTL" "$METADATA_TEST" "$TIMEOUT_BIN"
 
     FUSE_KO=""
     for candidate in \
@@ -475,7 +475,8 @@ BLOCKED=0
 SOURCE_COMMIT="__SOURCE_COMMIT__"
 ARTIFACT_SCOPE="__ARTIFACT_SCOPE__"
 ROOT_KEY="__ROOT_KEY__"
-STORE=/tmp/tidefs-validation/store
+DEVICE=/tmp/tidefs-validation/device0.tidefs
+POOL=inode_metadata_validation_pool
 MNT=/tmp/tidefs-validation/mnt
 OBSERVED_ROWS=/tmp/tidefs-validation/observed_rows.txt
 DAEMON_LOG=/tmp/tidefs-validation/daemon.log
@@ -699,13 +700,16 @@ verify_mtime() {
 }
 
 : > "$OBSERVED_ROWS"
-mkdir -p "$STORE" "$MNT"
+mkdir -p "$MNT"
+export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX="$ROOT_KEY"
+truncate -s 268435456 "$DEVICE"
+/bin/tidefsctl pool create "$POOL" --file-devices --devices "$DEVICE"
 
 echo "=== TideFS FUSE Inode Metadata Validation ==="
 echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "commit=$SOURCE_COMMIT"
 echo "kernel=$(uname -r)"
-echo "daemon=/bin/tidefs-posix-filesystem-adapter-daemon"
+echo "control=/bin/tidefsctl"
 echo "test=/bin/tidefs-fuse-inode-metadata-test"
 echo "artifact_scope=$ARTIFACT_SCOPE"
 echo "Tier: mounted-userspace-qemu-guest"
@@ -726,9 +730,7 @@ else
 fi
 
 echo "--- Phase 1: Start FUSE daemon ---"
-/bin/tidefs-posix-filesystem-adapter-daemon mount-vfs \
-    --store "$STORE" --mount "$MNT" \
-    --root-auth-key-hex "$ROOT_KEY" \
+/bin/tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" \
     --options noatime \
     > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
@@ -863,9 +865,7 @@ pass "crash_simulated"
 echo ""
 echo "--- Phase 5: Remount and verify ---"
 mkdir -p "$MNT"
-/bin/tidefs-posix-filesystem-adapter-daemon mount-vfs \
-    --store "$STORE" --mount "$MNT" \
-    --root-auth-key-hex "$ROOT_KEY" \
+/bin/tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" \
     --options noatime \
     > "$REMOUNT_LOG" 2>&1 &
 REMOUNT_PID=$!

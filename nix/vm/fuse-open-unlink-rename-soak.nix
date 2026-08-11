@@ -20,7 +20,7 @@ let
     KERNEL_IMG="${linuxKernel_7_0}/bzImage"
     CPIO="${pkgs.cpio}/bin/cpio"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
-    FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
+    TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
 
     TMPDIR="''${TIDEFS_OPEN_UNLINK_RENAME_TMPDIR:-/tmp/tidefs-fuse-open-unlink-rename-soak}"
     TIMEOUT_SEC="''${TIDEFS_OPEN_UNLINK_RENAME_TIMEOUT:-600}"
@@ -44,7 +44,7 @@ let
       exit 2
     fi
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$FUSE_DAEMON"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$TIDEFSCTL"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -91,19 +91,19 @@ let
     for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff \
                     reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync \
                     expr head tail cut kill ps test seq du dirname basename \
-                    readlink tr cmp diff; do
+                    readlink tr cmp diff mountpoint umount truncate; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
-    cp "$FUSE_DAEMON" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
-    chmod +x "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
+    cp "$TIDEFSCTL" "$RUN_DIR/bin/tidefsctl"
+    chmod +x "$RUN_DIR/bin/tidefsctl"
 
     # Copy shared libraries
     if command -v ldd >/dev/null 2>&1; then
-      for lib in $(ldd "$FUSE_DAEMON" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true); do
+      for lib in $(ldd "$TIDEFSCTL" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true); do
         [ -f "$lib" ] && cp "$lib" "$RUN_DIR/usr/lib/" 2>/dev/null || true
       done
-      LD_SO=$(ldd "$FUSE_DAEMON" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
+      LD_SO=$(ldd "$TIDEFSCTL" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
       if [ -n "$LD_SO" ] && [ -f "$LD_SO" ]; then
         cp "$LD_SO" "$RUN_DIR/lib/" 2>/dev/null || true
         chmod +x "$RUN_DIR/lib/$(basename "$LD_SO")" 2>/dev/null || true
@@ -138,8 +138,10 @@ fail()    { echo "FAIL: $1 -- $2"; FAILED=$((FAILED + 1)); }
 blocked() { echo "BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
 
 MNT=/mnt/tidefs
-STORE=/store/tidefs-store
+DEVICE=/store/tidefs-device.tidefs
+POOL=open_unlink_rename_pool
 SOAK_N=__SOAK_ITERATIONS__
+export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141
 
 # ── Phase 0: FUSE kernel module ────────────────────────────────────
 FUSE_READY=0
@@ -171,11 +173,10 @@ fi
 DAEMON_PID=""
 MOUNTED=0
 if [ "$FUSE_READY" -eq 1 ]; then
-    mkdir -p "$STORE" "$MNT"
-    /bin/tidefs-posix-filesystem-adapter-daemon \
-      mount-vfs \
-      --store "$STORE" \
-      --mount "$MNT" \
+    mkdir -p "$MNT"
+    truncate -s 1073741824 "$DEVICE"
+    /bin/tidefsctl pool create "$POOL" --file-devices --devices "$DEVICE"
+    /bin/tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" \
       > /tmp/daemon.log 2>&1 &
     DAEMON_PID=$!
 
