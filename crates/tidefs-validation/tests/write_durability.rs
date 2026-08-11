@@ -333,7 +333,6 @@ fn multi_file_write_fsync_remount_verify() {
 // ── additional write-durability coverage ──────────────────────────────────
 
 use std::fs;
-use std::thread;
 
 /// Pseudo-random data seeded by `seed` and sized to `len_bytes`.
 fn prng_test_data(seed: u64, len_bytes: usize) -> Vec<u8> {
