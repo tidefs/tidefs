@@ -73,13 +73,13 @@ mod tests {
     use super::*;
 
     /// Try to create a MountHarness.  Returns `None` and prints a skip
-    /// message when the daemon binary is unavailable.
+    /// message when `tidefsctl` is unavailable.
     fn try_mount() -> Option<MountHarness> {
         match MountHarness::new() {
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!(
-                    "SKIP: daemon not available (set TIDEFS_DAEMON_BIN or \
+                    "SKIP: tidefsctl not available (set TIDEFSCTL_BIN or \
                      build the workspace) -- {e}"
                 );
                 None

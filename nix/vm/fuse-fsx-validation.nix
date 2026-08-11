@@ -33,7 +33,7 @@ let
     PATCHELF="${patchelf}/bin/patchelf"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
     GLIBC_LIB="${glibc}/lib"
-    FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
+    TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
     FSX_BIN="${tidefsFsx}/bin/fsx"
     MMAP_BIN="${tidefsMmapWorkload}/bin/tidefs-mmap-workload"
     XTAST_BIN="${tidefsPackage}/bin/tidefs-xtask"
@@ -70,7 +70,7 @@ let
       exit 2
     fi
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$FUSE_DAEMON" "$FSX_BIN"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$TIDEFSCTL" "$FSX_BIN"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -124,12 +124,12 @@ let
     for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff \
                   reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync \
                   expr head tail cut kill ps test seq du dirname basename \
-                  readlink tr cmp diff mountpoint uname date umount; do
+                  readlink tr cmp diff mountpoint uname date umount truncate; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
-    cp "$FUSE_DAEMON" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
-    chmod +x "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
+    cp "$TIDEFSCTL" "$RUN_DIR/bin/tidefsctl"
+    chmod +x "$RUN_DIR/bin/tidefsctl"
     cp "$FSX_BIN" "$RUN_DIR/bin/fsx"
     chmod +x "$RUN_DIR/bin/fsx"
     if [ -n "$MMAP_BIN" ] && [ -f "$MMAP_BIN" ]; then
@@ -139,14 +139,14 @@ let
 
     # Copy shared libraries BEFORE patchelf so ldd works on the original binaries
     if command -v ldd >/dev/null 2>&1; then
-      for lib in $(ldd "$FUSE_DAEMON" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true); do
+      for lib in $(ldd "$TIDEFSCTL" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true); do
         [ -f "$lib" ] && cp "$lib" "$RUN_DIR/usr/lib/" 2>/dev/null || true
       done
       # Also copy busybox dependencies
       for lib in $(ldd "$RUN_DIR/bin/busybox" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true); do
         [ -f "$lib" ] && cp "$lib" "$RUN_DIR/usr/lib/" 2>/dev/null || true
       done
-      LD_SO=$(ldd "$FUSE_DAEMON" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
+      LD_SO=$(ldd "$TIDEFSCTL" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
       if [ -n "$LD_SO" ] && [ -f "$LD_SO" ]; then
         cp "$LD_SO" "$RUN_DIR/lib/" 2>/dev/null || true
         chmod +x "$RUN_DIR/lib/$(basename "$LD_SO")" 2>/dev/null || true
@@ -166,7 +166,7 @@ let
         chmod +x "$RUN_DIR/lib/ld-linux-x86-64.so.2" 2>/dev/null || true
       fi
       # Copy fuse3 library if present
-      for fuse_lib in "$(dirname "$FUSE_DAEMON")/../lib/libfuse3.so"* /nix/store/*/lib/libfuse3.so*; do
+      for fuse_lib in "$(dirname "$TIDEFSCTL")/../lib/libfuse3.so"* /nix/store/*/lib/libfuse3.so*; do
         if [ -f "$fuse_lib" ]; then
           cp "$fuse_lib" "$RUN_DIR/usr/lib/" 2>/dev/null || true
           break
@@ -176,7 +176,7 @@ let
 
 
     # Fix ELF interpreter paths for initrd: reset to /lib/ld-linux-x86-64.so.2
-    for bin in "$RUN_DIR/bin/busybox" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon" "$RUN_DIR/bin/fsx"; do
+    for bin in "$RUN_DIR/bin/busybox" "$RUN_DIR/bin/tidefsctl" "$RUN_DIR/bin/fsx"; do
       if [ -f "$bin" ]; then
         "$PATCHELF" --set-interpreter /lib/ld-linux-x86-64.so.2 "$bin" 2>/dev/null || true
         "$PATCHELF" --set-rpath /usr/lib:/lib "$bin" 2>/dev/null || true
@@ -210,8 +210,10 @@ fail()    { echo "FAIL: $1 -- $2"; FAILED=$((FAILED + 1)); }
 blocked() { echo "BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
 
 MNT=/mnt/tidefs
-STORE=/store/tidefs-store
+DEVICE=/store/tidefs-device.tidefs
+POOL=fsx_validation_pool
 FSX_N=__FSX_NOPS__
+export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141
 
 # ── Phase 0: FUSE kernel module ──────────────────────────────────────
 FUSE_READY=0
@@ -243,13 +245,10 @@ fi
 DAEMON_PID=""
 MOUNTED=0
 if [ "$FUSE_READY" -eq 1 ]; then
-    mkdir -p "$STORE" "$MNT"
-    /bin/tidefs-posix-filesystem-adapter-daemon \
-      mount-vfs \
-      --store "$STORE" \
-      --mount "$MNT" \
-      --root-auth-key-hex 4141414141414141414141414141414141414141414141414141414141414141 \
-      --no-writeback-cache \
+    mkdir -p "$MNT"
+    truncate -s 1073741824 "$DEVICE"
+    /bin/tidefsctl pool create "$POOL" --file-devices --devices "$DEVICE"
+    /bin/tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" \
       > /tmp/daemon.log 2>&1 &
     DAEMON_PID=$!
 

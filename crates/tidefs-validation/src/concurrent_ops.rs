@@ -318,7 +318,7 @@ fn run_concurrent_harness(config: &ConcurrentConfig) -> Vec<String> {
     let mount = match MountHarness::new() {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("SKIP: daemon not available -- {e}");
+            eprintln!("SKIP: tidefsctl not available -- {e}");
             return Vec::new();
         }
     };
@@ -667,7 +667,7 @@ mod tests {
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!(
-                    "SKIP: daemon not available (set TIDEFS_DAEMON_BIN or \
+                    "SKIP: tidefsctl not available (set TIDEFSCTL_BIN or \
                      build the workspace) -- {e}"
                 );
                 None

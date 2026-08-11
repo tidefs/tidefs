@@ -195,6 +195,9 @@ pub enum PoolCommand {
         /// Salt for the encryption passphrase (hex-encoded, 32 chars).
         #[arg(long = "encryption-salt")]
         encryption_salt: Option<String>,
+
+        #[command(flatten)]
+        runtime: crate::commands::mount::PoolMountRuntimeArgs,
     },
 
     /// Run an integrity check through the live owner, or offline with explicit devices
@@ -352,6 +355,7 @@ pub fn handle_pool(cmd: PoolCommand) {
             encryption_envelope,
             encryption_passphrase,
             encryption_salt,
+            runtime,
         } => {
             crate::commands::mount::handle_mount(crate::commands::mount::PoolMountArgs {
                 pool_name,
@@ -363,6 +367,7 @@ pub fn handle_pool(cmd: PoolCommand) {
                 encryption_envelope,
                 encryption_passphrase,
                 encryption_salt,
+                runtime,
                 #[cfg(feature = "cluster")]
                 cluster: false,
                 #[cfg(feature = "cluster")]

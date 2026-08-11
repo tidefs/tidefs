@@ -43241,11 +43241,11 @@ mod tests {
         );
     }
 
-    /// Full mount-vfs path simulation: coherency Writeback profile
+    /// Canonical pool-mount path simulation: coherency Writeback profile
     /// followed by --no-writeback-cache must disable writeback.
     #[test]
     fn mount_vfs_no_writeback_overrides_writeback_profile() {
-        // Simulate mount-vfs default path: coherency profile=Writeback, config.writeback_cache=false
+        // Simulate the pool-mount default: Writeback coherency with kernel writeback disabled.
         let adapter = fresh_test_adapter()
             .with_coherency_profile(crate::coherency_profile::CoherencyProfile::Writeback)
             .with_writeback_cache_disabled(); // --no-writeback-cache or default
@@ -43255,7 +43255,7 @@ mod tests {
         );
     }
 
-    /// Full mount-vfs path: --writeback-cache with Writeback profile.
+    /// Canonical pool-mount path with writeback cache and Writeback coherency.
     #[test]
     fn mount_vfs_writeback_with_writeback_profile_enables() {
         let adapter = fresh_test_adapter()

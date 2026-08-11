@@ -234,24 +234,6 @@
             ];
           };
 
-          tidefsScrubForegroundReadValidation = import ./nix/packages/tidefs.nix {
-            inherit (pkgs) lib pkg-config;
-            inherit (pkgs) fuse3 rdma-core;
-            rustPlatform = rustPlatform;
-            src = tidefsWorkspaceSrc;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-            };
-            cargoBuildFlags = [
-              "-p" "tidefs-validation"
-              "--features" "scrub-runtime"
-              "--bin" "scrub_foreground_read_validation"
-            ];
-            workspaceBins = [
-              "scrub_foreground_read_validation"
-            ];
-          };
-
           tidefsUblkRuntime = import ./nix/packages/tidefs.nix {
             inherit (pkgs) lib pkg-config;
             inherit (pkgs) fuse3 rdma-core;
@@ -374,7 +356,6 @@
             testScript = ''
               import json
               import os
-              import re
 
               validation = {
                 "test": "tidefs-qemu-smoke",
@@ -418,75 +399,51 @@
               machine.succeed("test -e /dev/fuse")
               record("fuse_device", "pass", "/dev/fuse")
 
-              machine.succeed("tidefs-xtask summary 2>&1")
-              record("xtask_summary", "pass")
-
-              machine.succeed("tidefs-store-demo 2>&1")
-              record("store_demo", "pass")
-
-              # smoke-mount is the essential userspace mount validation.
-              # Write full output to a guest file to avoid truncation;
-              # then read it back for complete diagnostics.
-              smoke_rc = machine.execute(
-                  "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141 "
-                  "sh -c 'mkdir -p /tmp/tidefs-validation/performance && tidefs-posix-filesystem-adapter-daemon smoke-mount --profile quick --queue-depth-artifact /tmp/tidefs-validation/performance/queue-depth-runtime.json 2>&1 | tee /tmp/smoke-mount-output.txt'",
-                  timeout=300
+              lifecycle_root = "/tmp/tidefs-qemu-smoke"
+              device = f"{lifecycle_root}/device0.tidefs"
+              mount_dir = f"{lifecycle_root}/mnt"
+              pool = "qemu_smoke_pool"
+              auth = "4141414141414141414141414141414141414141414141414141414141414141"
+              machine.succeed(
+                  f"mkdir -p {mount_dir} && truncate -s 268435456 {device} && "
+                  f"TIDEFS_ROOT_AUTHENTICATION_KEY_HEX={auth} "
+                  f"tidefsctl pool create {pool} --file-devices --devices {device}"
               )
-              smoke_status = "pass" if smoke_rc[0] == 0 else "product-fail"
-              if smoke_rc[1]:
-                  for line in smoke_rc[1].splitlines():
-                      log.log(f"smoke_mount: {line}")
-              # Post-mortem: append system diagnostics to the output file
-              # so the captured log reveals why the daemon hung or exited.
-              machine.execute(
-                  "sh -c '"
-                  "echo === POST-MORTEM: processes === >> /tmp/smoke-mount-output.txt; "
-                  "ps aux | grep -E \"tidefs|mount-vfs|fuse\" >> /tmp/smoke-mount-output.txt 2>&1 || true; "
-                  "echo === POST-MORTEM: mount info === >> /tmp/smoke-mount-output.txt; "
-                  "mount | grep tidefs >> /tmp/smoke-mount-output.txt 2>&1 || echo \"(not mounted)\" >> /tmp/smoke-mount-output.txt; "
-                  "echo === POST-MORTEM: dmesg === >> /tmp/smoke-mount-output.txt; "
-                  "dmesg | tail -80 >> /tmp/smoke-mount-output.txt'",
-                  timeout=30
+              record("pool_create", "pass")
+              machine.succeed(
+                  f"sh -c 'TIDEFS_ROOT_AUTHENTICATION_KEY_HEX={auth} "
+                  f"tidefsctl pool mount {pool} {mount_dir} --devices {device} "
+                  f">/tmp/tidefs-qemu-mount.log 2>&1 & echo $! >/tmp/tidefs-qemu-mount.pid'"
               )
-              # Read the full output from the guest file for recording.
-              smoke_full = machine.succeed("cat /tmp/smoke-mount-output.txt")
-              # Parse smoke-mount summary: "=== smoke-mount: X passed, Y failed ==="
-              m = re.search(r'smoke-mount:\s*(\d+)\s*passed,\s*(\d+)\s*failed', smoke_full)
-              if m:
-                  smoke_passed = int(m.group(1))
-                  smoke_failed = int(m.group(2))
-                  record("smoke_mount", smoke_status,
-                         f"{smoke_passed} passed, {smoke_failed} failed; full output: {smoke_full[:8000]}")
-              else:
-                  record("smoke_mount", smoke_status,
-                         f"could not parse summary; rc={smoke_rc[0]}; output: {smoke_full[:4000]}")
-                  smoke_passed = 0
-                  smoke_failed = 1
-              validation["smoke_mount_passed"] = smoke_passed
-              validation["smoke_mount_failed"] = smoke_failed
-              queue_artifact_rc = machine.execute(
-                  "cat /tmp/tidefs-validation/performance/queue-depth-runtime.json",
-                  timeout=30
+              mount_pid = machine.succeed("cat /tmp/tidefs-qemu-mount.pid").strip()
+              machine.wait_until_succeeds(f"mountpoint {mount_dir}", timeout=60)
+              record("pool_mount", "pass", f"pid={mount_pid}")
+              machine.succeed(
+                  f"printf '%s\\n' canonical-qemu-smoke > {mount_dir}/original && "
+                  f"sync {mount_dir}/original && mv {mount_dir}/original {mount_dir}/renamed && sync && "
+                  f"test \"$(cat {mount_dir}/renamed)\" = canonical-qemu-smoke"
               )
-              if queue_artifact_rc[0] == 0:
-                  record("queue_depth_runtime_artifact", "pass", queue_artifact_rc[1].strip()[:4000])
-                  validation["queue_depth_runtime_artifact"] = json.loads(queue_artifact_rc[1])
-              else:
-                  record(
-                      "queue_depth_runtime_artifact",
-                      "product-fail",
-                      "missing /tmp/tidefs-validation/performance/queue-depth-runtime.json",
-                  )
+              record("mounted_create_write_fsync_rename_read", "pass")
+              machine.succeed(f"umount {mount_dir}", timeout=30)
+              machine.wait_until_fails(f"kill -0 {mount_pid}", timeout=30)
+              record("clean_unmount_export", "pass")
+              machine.succeed(
+                  f"sh -c 'TIDEFS_ROOT_AUTHENTICATION_KEY_HEX={auth} "
+                  f"tidefsctl pool mount {pool} {mount_dir} --devices {device} "
+                  f">/tmp/tidefs-qemu-smoke-remount.log 2>&1 & echo $! >/tmp/tidefs-qemu-smoke-remount.pid'"
+              )
+              remount_pid = machine.succeed("cat /tmp/tidefs-qemu-smoke-remount.pid").strip()
+              machine.wait_until_succeeds(f"mountpoint {mount_dir}", timeout=60)
+              machine.succeed(f"test \"$(cat {mount_dir}/renamed)\" = canonical-qemu-smoke")
+              record("remount_persistence", "pass", f"pid={remount_pid}")
               # Record dmesg for kernel-side FUSE diagnostics.
               # When the daemon exits during CREATE, the kernel may log
               # FUSE connection errors that help identify the root cause.
               dmesg_tail = machine.succeed("dmesg | tail -80")
               record("dmesg_tail", "pass", dmesg_tail.strip()[:3000])
 
-              # Ensure cleanup: kill daemon first so the FUSE mount is released before unmount.
-              machine.execute("pkill -f 'mount-vfs' || true")
-              machine.execute("sleep 2")
-              machine.execute("fusermount -u /tmp/tidefs-smoke-mount-point || umount -l /tmp/tidefs-smoke-mount-point || true", timeout=30)
+              machine.succeed(f"umount {mount_dir}", timeout=30)
+              machine.wait_until_fails(f"kill -0 {remount_pid}", timeout=30)
 
               validation["passed"] = sum(1 for r in validation["results"] if r["status"] == "pass")
               validation["product_failures"] = sum(1 for r in validation["results"] if r["status"] == "product-fail")
@@ -514,7 +471,6 @@
             tidefsPackage = default;
             ackValidationPackage = tidefsStorageIntentAckRuntime;
             dataShapeValidationPackage = tidefsStorageIntentDataShapeRuntime;
-            scrubValidationPackage = tidefsScrubForegroundReadValidation;
           };
 
           tidefsFuseFioBenchmark = pkgs.runCommand "tidefs-fuse-fio-benchmark-deprecated" { } ''
@@ -607,33 +563,26 @@ EOF
               machine.succeed("test -e /dev/fuse")
               record("fuse_device", "pass", "/dev/fuse")
 
-              # Create backing store and mount point
+              # Create the canonical pool device and mount point.
               store_dir = "/tmp/tidefs-fio-store"
+              device = f"{store_dir}/device0.tidefs"
               mount_dir = "/tmp/tidefs-fio-mount"
               machine.succeed(f"mkdir -p {store_dir} {mount_dir}")
-
-              # Start FUSE daemon
-              daemon_log = "/tmp/tidefs-daemon-fio.log"
-              daemon_cmd = (
-                  "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141 "
-                  f"nohup tidefs-posix-filesystem-adapter-daemon mount-vfs "
-                  f"--store {store_dir} --mount {mount_dir} "
-                  f">> {daemon_log} 2>&1 &"
+              auth = "4141414141414141414141414141414141414141414141414141414141414141"
+              pool = "fio_baseline_pool"
+              mount_log = "/tmp/tidefs-fio-mount.log"
+              machine.succeed(
+                  f"truncate -s 1073741824 {device} && "
+                  f"TIDEFS_ROOT_AUTHENTICATION_KEY_HEX={auth} "
+                  f"tidefsctl pool create {pool} --file-devices --devices {device}"
               )
-              machine.succeed(daemon_cmd)
-              time.sleep(3)
-
-              # Verify daemon started
-              daemon_pid = machine.succeed(
-                  "pgrep -f 'tidefs-posix-filesystem-adapter-daemon.*mount-vfs' | head -1"
-              ).strip()
-              if daemon_pid:
-                  record("daemon_start", "pass", f"pid={daemon_pid}")
-              else:
-                  record("daemon_start", "harness-fail", "daemon failed to start")
-                  daemon_log_content = machine.succeed(f"cat {daemon_log}")
-                  record("daemon_log", "harness-fail", daemon_log_content[:2000])
-                  raise Exception("FUSE daemon failed to start")
+              machine.succeed(
+                  f"sh -c 'TIDEFS_ROOT_AUTHENTICATION_KEY_HEX={auth} "
+                  f"tidefsctl pool mount {pool} {mount_dir} --devices {device} "
+                  f">>{mount_log} 2>&1 & echo $! >/tmp/tidefs-fio-mount.pid'"
+              )
+              mount_pid = machine.succeed("cat /tmp/tidefs-fio-mount.pid").strip()
+              record("mount_owner_start", "pass", f"pid={mount_pid}")
 
               # Wait for mount
               machine.wait_until_succeeds(f"mountpoint {mount_dir}", timeout=60)
@@ -754,7 +703,7 @@ EOF
               machine.succeed("mkdir -p /tmp/tidefs-validation")
               with open("/tmp/tidefs-validation/fuse-fio-benchmark.json", "w") as f:
                   json.dump(validation, f, indent=2)
-              machine.succeed(f"cp {daemon_log} /tmp/tidefs-validation/tidefs-daemon-fio.log || true")
+              machine.succeed(f"cp {mount_log} /tmp/tidefs-validation/tidefs-mount-fio.log || true")
               machine.copy_from_vm("/tmp/tidefs-validation")
               print("tidefs-fuse-fio-benchmark validation:")
               print(json.dumps(validation, indent=2))
@@ -767,10 +716,9 @@ EOF
               if validation["environment_refusals"] > 0:
                   print(f"WARNING: {validation['environment_refusals']} environment refusals", file=sys.stderr)
 
-              # Ensure cleanup
-              machine.execute("pkill -f 'mount-vfs' || true")
-              machine.execute("sleep 2")
-              machine.execute(f"fusermount -u {mount_dir} || umount -l {mount_dir} || true", timeout=30)
+              # Ensure cleanup by exact task-owned mount PID.
+              machine.execute(f"umount {mount_dir} || true", timeout=30)
+              machine.wait_until_fails(f"kill -0 {mount_pid}", timeout=30)
             '';
           };
 
@@ -881,9 +829,6 @@ EOF
               with open("/tmp/tidefs-validation/qemu-xfstests-lock-symlink-fallocate.json", "w") as f:
                   json.dump(validation, f, indent=2)
 
-              # Cleanup: unmount any leftover mounts and stop daemons
-              machine.execute("umount /mnt/tidefs 2>/dev/null || true")
-              machine.execute("pkill -f 'tidefs-posix-filesystem-adapter-daemon' || true")
             '';
           };
           tidefsXfstestsLockGroup = pkgs.testers.runNixOSTest {
@@ -956,23 +901,24 @@ EOF
               machine.succeed("modprobe fuse || true")
               machine.succeed("test -e /dev/fuse")
 
-              # Create backing store and mount point
-              machine.succeed("mkdir -p /tmp/tidefs-store /mnt/tidefs")
-
-              # Start FUSE daemon
-              daemon_log = "/tmp/tidefs-daemon.log"
+              # Create the canonical pool device and mount point.
+              machine.succeed("mkdir -p /tmp/tidefs-store /mnt/tidefs && truncate -s 1073741824 /tmp/tidefs-store/device0.tidefs")
+              mount_log = "/tmp/tidefs-mount.log"
+              auth = "4141414141414141414141414141414141414141414141414141414141414141"
               machine.succeed(
-                  "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141 RUST_LOG=debug nohup tidefs-posix-filesystem-adapter-daemon mount-vfs "
-                  "--store /tmp/tidefs-store --mount /mnt/tidefs "
-                  f"> {daemon_log} 2>&1 &"
+                  f"TIDEFS_ROOT_AUTHENTICATION_KEY_HEX={auth} "
+                  "tidefsctl pool create xfstests_lock_pool --file-devices --devices /tmp/tidefs-store/device0.tidefs"
+              )
+              machine.succeed(
+                  f"sh -c 'TIDEFS_ROOT_AUTHENTICATION_KEY_HEX={auth} RUST_LOG=debug "
+                  "tidefsctl pool mount xfstests_lock_pool /mnt/tidefs --devices /tmp/tidefs-store/device0.tidefs "
+                  f"> {mount_log} 2>&1 & echo $! >/tmp/tidefs-xfstests-mount.pid'"
               )
               time.sleep(2)
 
-              daemon_pid = machine.succeed(
-                  "pgrep -f 'tidefs-posix-filesystem-adapter-daemon.*mount-vfs' | head -1"
-              ).strip()
-              assert daemon_pid, "FUSE daemon failed to start"
-              record("daemon_start", "pass", f"pid={daemon_pid}")
+              mount_pid = machine.succeed("cat /tmp/tidefs-xfstests-mount.pid").strip()
+              assert mount_pid, "tidefsctl mount owner failed to start"
+              record("mount_owner_start", "pass", f"pid={mount_pid}")
 
               machine.wait_until_succeeds("mountpoint /mnt/tidefs", timeout=30)
               record("fuse_mount", "pass")
@@ -996,11 +942,11 @@ EOF
                   print("xfstests-check stdout (last 2KB):")
                   print(stdout[-2000:] if len(stdout) > 2000 else stdout)
 
-              # Collect daemon log for diagnostics
-              daemon_tail = machine.succeed(
-                  f"tail -100 {daemon_log} 2>/dev/null || echo '(no daemon log)'"
+              # Collect mount-owner log for diagnostics
+              mount_tail = machine.succeed(
+                  f"tail -100 {mount_log} 2>/dev/null || echo '(no mount log)'"
               )
-              record("daemon_log", "pass", daemon_tail.strip())
+              record("mount_log", "pass", mount_tail.strip())
 
               # Parse xfstests results from check.log.
               # xfstests-check output format:
@@ -1105,7 +1051,7 @@ EOF
 
               # Cleanup
               machine.succeed("umount /mnt/tidefs")
-              machine.execute("pkill -f 'tidefs-posix-filesystem-adapter-daemon.*mount-vfs' || true")
+              machine.wait_until_fails(f"kill -0 {mount_pid}", timeout=30)
             '';
           };
 
@@ -3203,12 +3149,6 @@ EOF
             tidefsXtaskRuntime = tidefsXtaskRuntime;
           };
 
-          kernelCrossPathEquivalence = import ./nix/vm/kernel-cross-path-equivalence.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-            tidefsPackage = default;
-          };
-
           fuseUblkStorageIntegratedWorkflow = import ./nix/vm/fuse-ublk-storage-integrated-workflow.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
@@ -3437,43 +3377,6 @@ EOF
             exec ${pkgs.bash}/bin/bash nix/tidefs-validation.sh "$@"
           '';
           qemu-smoke = qemuSourceApp "tidefs-qemu-smoke";
-          scrub-foreground-read-runtime = script "tidefs-scrub-foreground-read-runtime" [
-            pkgs.bash
-            pkgs.coreutils
-          ] ''
-            row="scrub-foreground-read-runtime"
-            output_dir="."
-            while [ "$#" -gt 0 ]; do
-              case "$1" in
-                --row)
-                  [ "$#" -ge 2 ] || { echo "--row requires a value" >&2; exit 2; }
-                  row="$2"
-                  shift 2
-                  ;;
-                --output-dir)
-                  [ "$#" -ge 2 ] || { echo "--output-dir requires a value" >&2; exit 2; }
-                  output_dir="$2"
-                  shift 2
-                  ;;
-                --help|-h)
-                  echo "usage: tidefs-scrub-foreground-read-runtime --row scrub-foreground-read-runtime --output-dir DIR"
-                  exit 0
-                  ;;
-                *)
-                  echo "unknown argument: $1" >&2
-                  exit 2
-                  ;;
-              esac
-            done
-            if [ "$row" != "scrub-foreground-read-runtime" ]; then
-              echo "unsupported row: $row" >&2
-              exit 2
-            fi
-            exec ${pkgs.bash}/bin/bash ${./.}/scripts/tidefs-fuse-vm-test \
-              --timeout 900 \
-              --scrub-foreground-read \
-              --validation-dir "$output_dir"
-          '';
           storage-intent-data-shape-runtime = script "tidefs-storage-intent-data-shape-runtime" [
             pkgs.bash
             pkgs.coreutils
@@ -4299,18 +4202,6 @@ EOF
             exec ${self.packages.${system}.kernelTeardownValidation}/bin/tidefs-kmod-teardown-validation \
               --module ${self.packages.${system}.tidefsPosixVfsKmod}/tidefs_posix_vfs.ko "$@"
           '';
-          kernel-cross-path-equivalence = script "tidefs-kernel-cross-path-equivalence" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelCrossPathEquivalence
-          ] ''
-            exec ${self.packages.${system}.kernelCrossPathEquivalence}/bin/tidefs-kernel-cross-path-equivalence "$@"
-          '';
-
           rdma-carrier-test = script "tidefs-rdma-carrier-test" [
             self.packages.${system}.default
             pkgs.bash

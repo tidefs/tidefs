@@ -2,19 +2,15 @@
 use super::benchmark_harness::{BenchmarkResult, FioHarness};
 use super::gate_entry::MeasuredKpi;
 use super::validation_tier::ValidationTier;
-use std::process::Command;
 use std::time::Instant;
 
 pub struct FuseFioHarness {
     pub repo_root: String,
-    pub daemon_bin: String,
 }
 impl FuseFioHarness {
     pub fn new(repo_root: impl Into<String>) -> Self {
-        let r = repo_root.into();
         FuseFioHarness {
-            daemon_bin: format!("{r}/target/debug/tidefs-posix-filesystem-adapter-daemon"),
-            repo_root: r,
+            repo_root: repo_root.into(),
         }
     }
     pub fn run_smoke(&self) -> BenchmarkResult {
@@ -28,13 +24,6 @@ impl FuseFioHarness {
     }
     fn run_profile(&self, profile: &str, desc: &str) -> BenchmarkResult {
         let s = "mounted-fuse";
-        if !std::path::Path::new(&self.daemon_bin).exists() {
-            return BenchmarkResult::refused(
-                s,
-                format!("daemon bin not found at {}", self.daemon_bin),
-                ValidationTier::MountedUserspace,
-            );
-        }
         let scr = format!("{}/benchmarking/fio/run-benchmarks.sh", self.repo_root);
         if !std::path::Path::new(&scr).exists() {
             return BenchmarkResult::refused(
@@ -43,55 +32,17 @@ impl FuseFioHarness {
                 ValidationTier::MountedUserspace,
             );
         }
-        let tr = std::env::var("TIDEFS_FIO_TEMP")
-            .unwrap_or_else(|_| "/tmp/tidefs-fuse-fio-harness".into());
-        let mp = format!("{tr}/mnt");
-        let sp = format!("{tr}/store");
-        let _ = std::fs::remove_dir_all(&tr);
-        if let Err(e) = std::fs::create_dir_all(&mp) {
-            return BenchmarkResult::refused(
-                s,
-                format!("mnt dir {mp}: {e}"),
-                ValidationTier::MountedUserspace,
-            );
-        }
-        if let Err(e) = std::fs::create_dir_all(&sp) {
-            return BenchmarkResult::refused(
-                s,
-                format!("store dir {sp}: {e}"),
-                ValidationTier::MountedUserspace,
-            );
-        }
-        std::env::set_var("TIDEFS_ROOT_AUTHENTICATION_KEY_HEX", "A".repeat(64));
-        let mut dm = match Command::new(&self.daemon_bin)
-            .arg("--store")
-            .arg(&sp)
-            .arg("--mount")
-            .arg(&mp)
-            .arg("--no-writeback-cache")
-            .arg("-f")
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&tr);
+        let harness = match crate::mount_harness::MountHarness::new() {
+            Ok(harness) => harness,
+            Err(error) => {
                 return BenchmarkResult::refused(
                     s,
-                    format!("spawn: {e}"),
+                    format!("canonical pool mount unavailable: {error}"),
                     ValidationTier::MountedUserspace,
-                );
+                )
             }
         };
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        if !is_mount(&mp) {
-            let _ = dm.kill();
-            let _ = std::fs::remove_dir_all(&tr);
-            return BenchmarkResult::refused(
-                s,
-                "not mount after 2s",
-                ValidationTier::MountedUserspace,
-            );
-        }
+        let mp = harness.mount_path().display().to_string();
         // Collect metadata create/stat/unlink throughput
         let meta = run_metadata_bench(&mp);
 
@@ -103,11 +54,8 @@ impl FuseFioHarness {
             profile,
             ValidationTier::MountedUserspace,
         );
-        let _ = dm.kill();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let _ = std::fs::remove_dir_all(&tr);
         res.subject = s.to_string();
-        res.description = format!("fio {profile} mount: {desc}");
+        res.description = format!("fio {profile} canonical pool mount: {desc}");
         if res.executed {
             res.kpis.push(MeasuredKpi {
                 ref_id: "kpi.latency".into(),
@@ -188,25 +136,11 @@ fn run_metadata_bench(mount: &str) -> Result<Vec<MeasuredKpi>, String> {
     ])
 }
 
-fn is_mount(path: &str) -> bool {
-    if let Ok(o) = Command::new("mountpoint").arg("-q").arg(path).output() {
-        return o.status.success();
-    }
-    if let Ok(m) = std::fs::read_to_string("/proc/mounts") {
-        return m.lines().any(|l| l.split_whitespace().nth(1) == Some(path));
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn refuses_no_daemon() {
+    fn refuses_missing_fio_script() {
         assert!(!FuseFioHarness::new("/nx").run_smoke().executed);
-    }
-    #[test]
-    fn non_mount() {
-        assert!(!is_mount("/usr/share/doc/missing"));
     }
 }

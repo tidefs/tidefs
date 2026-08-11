@@ -1,8 +1,7 @@
 # TideFS: FUSE+ublk+storage integrated userspace workflow validation.
 #
-# Mounts a TideFS FUSE filesystem and attaches a ublk block-volume to the
-# same storage pool in a Linux 7.0 QEMU guest and produces qemu-guest
-# runtime evidence output.
+# Mounts a canonical TideFS device pool and separately attaches the retained
+# ublk development carrier in a Linux 7.0 QEMU guest.
 #
 # Integrated workflow operations (sequential daemon access):
 #   1. ublkWritePlusRead — ublk writes block data, reads back, stops
@@ -17,15 +16,14 @@
 #   qemu-guest        - Nix/QEMU Linux 7.0 guest
 #
 # This harness produces mounted-userspace/qemu-guest runtime evidence. It
-# boots a Linux 7.0 QEMU guest, runs daemons sequentially (only one writer at a
-# time because LocalObjectStore segment-file append lacks cross-process offset
-# coordination), and verifies shared-pool persistence through remount and
-# crash-recovery cycles.
+# boots a Linux 7.0 QEMU guest and verifies each carrier's own persistence
+# through remount and crash-recovery cycles. It does not claim a shared pool
+# between the filesystem and block-development carriers.
 #
 # Dependencies:
 #   - Linux 7.0 kernel with FUSE and ublk built-in (CONFIG_FUSE_FS=y,
 #     CONFIG_BLK_DEV_UBLK=y)
-#   - tidefs-posix-filesystem-adapter-daemon binary
+#   - tidefsctl canonical pool lifecycle binary
 #   - tidefs-block-volume-adapter-daemon binary
 #   - QEMU with KVM acceleration and QMP monitor support
 #   - Persistent storage (raw ext4 image via virtio-blk)
@@ -48,7 +46,7 @@ let
     KERNEL_IMG="${linuxKernel_7_0}/bzImage"
     CPIO="${pkgs.cpio}/bin/cpio"
     MKFS_EXT4="${pkgs.e2fsprogs}/bin/mkfs.ext4"
-    FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
+    TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
     UBLK_DAEMON="${tidefsPackage}/bin/tidefs-block-volume-adapter-daemon"
 
     TMPDIR="''${TIDEFS_INTEGRATED_WORKFLOW_TMPDIR:-/tmp/tidefs-fuse-ublk-integrated}"
@@ -59,9 +57,8 @@ let
 Usage: tidefs-fuse-ublk-integrated-workflow [--timeout SECONDS] [--keep-tmp]
 
 Produce FUSE+ublk+storage integrated workflow runtime evidence in a
-reproducible Nix/QEMU Linux 7.0 environment. Daemons access
-the pool sequentially (one writer at a time) to avoid segment-file append
-corruption from uncoordinated cross-process offset tracking.
+reproducible Nix/QEMU Linux 7.0 environment. The filesystem and retained ublk
+development carrier use separate storage authorities.
 
 Validation operations:
   1. ublkWritePlusRead
@@ -108,8 +105,8 @@ EOF
       fi
     done
 
-    if [ ! -f "$FUSE_DAEMON" ] && [ ! -x "$FUSE_DAEMON" ]; then
-      echo "ERROR: FUSE daemon not found: $FUSE_DAEMON" >&2
+    if [ ! -f "$TIDEFSCTL" ] && [ ! -x "$TIDEFSCTL" ]; then
+      echo "ERROR: tidefsctl not found: $TIDEFSCTL" >&2
       exit 2
     fi
 
@@ -121,7 +118,7 @@ EOF
     echo "=== TideFS FUSE+ublk+Storage Integrated Workflow Validation ==="
     echo "  Kernel:    $KERNEL_IMG"
     echo "  QEMU:      $QEMU_BIN"
-    echo "  FUSE daemon: $FUSE_DAEMON"
+    echo "  TideFS control: $TIDEFSCTL"
     echo "  ublk daemon: $UBLK_DAEMON"
     echo "  Timeout:   ''${TIMEOUT_SEC}s"
     echo "  Validation:  tier-classified PASS/FAIL/BLOCKED rows"
@@ -154,13 +151,13 @@ EOF
       dd if=/dev/zero of="$DISK_IMG" bs=1M count="$DISK_SIZE_MB" 2>/dev/null
     fi
 
-    # ── Collect daemon shared library dependencies ─────────────────────
+    # ── Collect runtime shared library dependencies ────────────────────
 
-    echo "  Collecting daemon library dependencies..."
+    echo "  Collecting runtime library dependencies..."
 
-    DAEMON_LIBS=""
+    RUNTIME_LIBS=""
     if command -v ldd >/dev/null 2>&1; then
-      DAEMON_LIBS=$(ldd "$FUSE_DAEMON" "$UBLK_DAEMON" "$BUSYBOX" "$MKFS_EXT4" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
+      RUNTIME_LIBS=$(ldd "$TIDEFSCTL" "$UBLK_DAEMON" "$BUSYBOX" "$MKFS_EXT4" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
     fi
 
     # ── Populate initrd ────────────────────────────────────────────────
@@ -169,7 +166,7 @@ EOF
     chmod +x "$RUN_DIR/bin/busybox"
     for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff \
                     reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync mountpoint mkfs.ext2 mkfs.ext4 mke2fs uname date \
-                    expr head tail cut kill ps test seq; do
+                    expr head tail cut kill ps test seq truncate; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
@@ -180,9 +177,9 @@ EOF
     cp "$MKFS_EXT4" "$RUN_DIR/bin/mkfs.ext4"
     chmod +x "$RUN_DIR/bin/mkfs.ext4"
 
-    # Copy daemon binaries
-    cp "$FUSE_DAEMON" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
-    chmod +x "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
+    # Copy lifecycle and block-development binaries.
+    cp "$TIDEFSCTL" "$RUN_DIR/bin/tidefsctl"
+    chmod +x "$RUN_DIR/bin/tidefsctl"
     cp "$UBLK_DAEMON" "$RUN_DIR/bin/tidefs-block-volume-adapter-daemon"
     chmod +x "$RUN_DIR/bin/tidefs-block-volume-adapter-daemon"
 
@@ -190,7 +187,7 @@ EOF
     # Nix binaries embed RPATH references to store-prefixed library
     # paths (e.g. /nix/store/<hash>-glibc/lib/libc.so.6), not bare
     # /usr/lib sonames.
-    for lib in $DAEMON_LIBS; do
+    for lib in $RUNTIME_LIBS; do
       if [ -f "$lib" ]; then
         lib_dir=$(dirname "$lib")
         mkdir -p "$RUN_DIR$lib_dir"
@@ -200,7 +197,7 @@ EOF
 
     # Copy the dynamic linker to the exact Nix store path each binary expects
     # (Nix binaries embed the full store path of ld-linux, not /lib/ld-linux.so)
-    for binary in "$BUSYBOX" "$FUSE_DAEMON" "$UBLK_DAEMON"; do
+    for binary in "$BUSYBOX" "$TIDEFSCTL" "$UBLK_DAEMON"; do
       if command -v ldd >/dev/null 2>&1; then
         LD_SO=$(ldd "$binary" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
         if [ -n "$LD_SO" ] && [ -f "$LD_SO" ]; then
@@ -239,6 +236,9 @@ blocked(){ echo "BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
 MNT=/mnt/tidefs
 UBLK_DEV=/dev/ublkb0
 POOL_DIR=/store/tidefs-pool
+FUSE_DEVICE=/store/tidefs-fuse-device.tidefs
+FUSE_POOL=integrated_fuse_pool
+export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141
 
 # ── Boot detection ──────────────────────────────────────────────────────
 PERSISTENT_DISK=""
@@ -299,6 +299,10 @@ mkdir -p "$POOL_DIR" "$MNT" 2>/dev/null || true
 if [ "$BOOT_COUNT" -eq 0 ] && [ -n "$PERSISTENT_DISK" ]; then
     rm -rf "$POOL_DIR"/* 2>/dev/null || true
     echo "  Cleared stale pool data for fresh run"
+fi
+if [ "$BOOT_COUNT" -eq 0 ] || [ ! -f "$FUSE_DEVICE" ]; then
+    truncate -s 268435456 "$FUSE_DEVICE"
+    /bin/tidefsctl pool create "$FUSE_POOL" --file-devices --devices "$FUSE_DEVICE"
 fi
 
 # ── Phase 0: Kernel module support ──────────────────────────────────────
@@ -411,37 +415,33 @@ else
     done
 fi
 
-# ── Phase 2: FUSE daemon — write files, read back ───────────────────────
+# ── Phase 2: FUSE mount — write files, read back ────────────────────────
 echo ""
 echo "--- Phase 2: FUSE write/read ---"
 
-FUSE_DAEMON_PID=""
+FUSE_MOUNT_PID=""
 MOUNTED=0
 
 if [ "$FUSE_READY" -eq 1 ]; then
-    export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141
-    /bin/tidefs-posix-filesystem-adapter-daemon \
-      mount-vfs \
-      --store "$POOL_DIR" \
-      --mount "$MNT" \
+    /bin/tidefsctl pool mount "$FUSE_POOL" "$MNT" --devices "$FUSE_DEVICE" \
       --writeback-cache \
-      > /tmp/fuse_daemon.log 2>&1 &
+      > /tmp/fuse_mount.log 2>&1 &
 
-    FUSE_DAEMON_PID=$!
-    echo "  FUSE daemon PID: $FUSE_DAEMON_PID"
+    FUSE_MOUNT_PID=$!
+    echo "  FUSE mount-owner PID: $FUSE_MOUNT_PID"
 
     sleep 2
-    echo "  === FUSE daemon startup log ==="
-    tail -20 /tmp/fuse_daemon.log 2>/dev/null || echo "  (no daemon log)"
-    echo "  === end FUSE daemon startup log ==="
+    echo "  === FUSE mount startup log ==="
+    tail -20 /tmp/fuse_mount.log 2>/dev/null || echo "  (no mount log)"
+    echo "  === end FUSE mount startup log ==="
 
     for i in $(seq 1 30); do
         if mountpoint -q "$MNT" 2>/dev/null; then
             MOUNTED=1
             break
         fi
-        if ! kill -0 "$FUSE_DAEMON_PID" 2>/dev/null; then
-            echo "  FUSE daemon exited early; check /tmp/fuse_daemon.log"
+        if ! kill -0 "$FUSE_MOUNT_PID" 2>/dev/null; then
+            echo "  FUSE mount owner exited early; check /tmp/fuse_mount.log"
             break
         fi
         sleep 1
@@ -450,7 +450,7 @@ if [ "$FUSE_READY" -eq 1 ]; then
     if [ "$MOUNTED" -eq 1 ]; then
         pass "fuse_mount"
     else
-        tail -30 /tmp/fuse_daemon.log 2>/dev/null || echo "  (no daemon log)"
+        tail -30 /tmp/fuse_mount.log 2>/dev/null || echo "  (no mount log)"
         fail "fuse_mount" "mount did not appear within 30s"
     fi
 else
@@ -486,14 +486,14 @@ if [ "$MOUNTED" -eq 1 ]; then
     # No cross-contamination: FUSE writes should not corrupt ublk block namespace
     pass "iwf_no_cross_contamination"
 
-    # Stop FUSE daemon
+    # Stop the FUSE mount owner.
     umount "$MNT" 2>/tmp/um.err && pass "unmount_phase2" || fail "unmount_phase2" "$(cat /tmp/um.err)"
 
-    kill "$FUSE_DAEMON_PID" 2>/dev/null || true
+    kill "$FUSE_MOUNT_PID" 2>/dev/null || true
     sleep 1
-    kill -9 "$FUSE_DAEMON_PID" 2>/dev/null || true
-    pass "fuse_daemon_stop_phase2"
-    FUSE_DAEMON_PID=""
+    kill -9 "$FUSE_MOUNT_PID" 2>/dev/null || true
+    pass "fuse_mount_owner_stop_phase2"
+    FUSE_MOUNT_PID=""
 else
     for op in iwf_fuse_write iwf_fuse_read iwf_no_cross_contamination; do
         blocked "$op" "FUSE not mounted"
@@ -558,16 +558,12 @@ echo "--- Phase 4: FUSE persistence verification ---"
 
 MOUNTED=0
 if [ "$FUSE_READY" -eq 1 ]; then
-    export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141
-    /bin/tidefs-posix-filesystem-adapter-daemon \
-      mount-vfs \
-      --store "$POOL_DIR" \
-      --mount "$MNT" \
+    /bin/tidefsctl pool mount "$FUSE_POOL" "$MNT" --devices "$FUSE_DEVICE" \
       --writeback-cache \
-      > /tmp/fuse_daemon2.log 2>&1 &
+      > /tmp/fuse_mount2.log 2>&1 &
 
-    FUSE_DAEMON_PID=$!
-    echo "  FUSE daemon PID (boot2): $FUSE_DAEMON_PID"
+    FUSE_MOUNT_PID=$!
+    echo "  FUSE mount-owner PID (boot2): $FUSE_MOUNT_PID"
 
     sleep 2
     for i in $(seq 1 30); do
@@ -575,7 +571,7 @@ if [ "$FUSE_READY" -eq 1 ]; then
             MOUNTED=1
             break
         fi
-        if ! kill -0 "$FUSE_DAEMON_PID" 2>/dev/null; then
+        if ! kill -0 "$FUSE_MOUNT_PID" 2>/dev/null; then
             break
         fi
         sleep 1
@@ -584,7 +580,7 @@ if [ "$FUSE_READY" -eq 1 ]; then
     if [ "$MOUNTED" -eq 1 ]; then
         pass "fuse_remount"
     else
-        tail -20 /tmp/fuse_daemon2.log 2>/dev/null
+        tail -20 /tmp/fuse_mount2.log 2>/dev/null
         fail "fuse_remount" "FUSE remount failed"
     fi
 else
@@ -714,11 +710,11 @@ if [ "$MOUNTED" -eq 1 ]; then
     umount "$MNT" 2>/tmp/um.err && pass "unmount" || fail "unmount" "$(cat /tmp/um.err)"
 fi
 
-if [ -n "$FUSE_DAEMON_PID" ]; then
-    kill "$FUSE_DAEMON_PID" 2>/dev/null || true
+if [ -n "$FUSE_MOUNT_PID" ]; then
+    kill "$FUSE_MOUNT_PID" 2>/dev/null || true
     sleep 1
-    kill -9 "$FUSE_DAEMON_PID" 2>/dev/null || true
-    pass "fuse_daemon_stop"
+    kill -9 "$FUSE_MOUNT_PID" 2>/dev/null || true
+    pass "fuse_mount_owner_stop"
 fi
 
 if [ -n "$UBLK_DAEMON_PID" ]; then
@@ -823,12 +819,12 @@ INITSCRIPT
       fuse_builtin fuse_device
       ublk_control_device
       ublk_attach iwf_ublk_write_phase1 iwf_ublk_read_phase1 ublk_daemon_stop_phase1
-      fuse_mount iwf_fuse_write iwf_fuse_read iwf_no_cross_contamination unmount_phase2 fuse_daemon_stop_phase2
+      fuse_mount iwf_fuse_write iwf_fuse_read iwf_no_cross_contamination unmount_phase2 fuse_mount_owner_stop_phase2
       ublk_reattach iwf_ublk_persistence_read ublk_daemon_stop_phase3
       fuse_remount iwf_fuse_persistence iwf_fuse_text_persistence
       iwf_crash_synced_data_survived iwf_crash_mid_data_handled iwf_crash_committed_root
       iwf_txg_commit_during_io iwf_txg_commit_no_corruption
-      unmount fuse_daemon_stop ublk_daemon_stop
+      unmount fuse_mount_owner_stop ublk_daemon_stop
     "
 
     for op in $ALL_OPS; do
@@ -870,7 +866,7 @@ INITSCRIPT
       grep -q "PASS: $op" "$VAL_LOG" 2>/dev/null || OP1_PASS=0
     done
 
-    for op in fuse_mount iwf_fuse_write iwf_fuse_read iwf_no_cross_contamination unmount_phase2 fuse_daemon_stop_phase2; do
+    for op in fuse_mount iwf_fuse_write iwf_fuse_read iwf_no_cross_contamination unmount_phase2 fuse_mount_owner_stop_phase2; do
       grep -q "PASS: $op" "$VAL_LOG" 2>/dev/null || OP2_PASS=0
     done
 
@@ -915,7 +911,7 @@ INITSCRIPT
     if [ "$ALL_PASS" -eq 1 ]; then
       echo ""
       echo "VALIDATION: PASS -- all 6 sequential integrated workflow operations passed"
-      echo "  FUSE+ublk+storage shared-pool persistence verified with sequential daemon access."
+      echo "  Canonical filesystem-pool and retained ublk-carrier persistence verified independently."
       echo "  Hard validation at: $VAL_LOG1 $VAL_LOG2"
       exit 0
     fi

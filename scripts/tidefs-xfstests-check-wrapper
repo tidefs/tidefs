@@ -7,13 +7,11 @@
 # Environment:
 #   TIDEFS_XFSTESTS_MOUNT_HELPER_DIR  mount helper directory (must contain
 #                                      the "mount" wrapper and "tidefs-preview")
-#   TIDEFS_BIN                        path to tidefs-posix-filesystem-adapter-daemon
 # Usage: tidefs-xfstests-check-wrapper [xfstests-check args...]
 set -eu
 
 XFSTESTS_STORE="/nix/store/89zj163815x5w8labri1z6n8595xj6j3-xfstests-2023.05.14/lib/xfstests"
 MH_DIR="${TIDEFS_XFSTESTS_MOUNT_HELPER_DIR:-}"
-DAEMON_BIN="${TIDEFS_BIN:-}"
 
 dir=$(mktemp --tmpdir -d xfstests.XXXXXX)
 trap "rm -rf $dir" EXIT
@@ -46,7 +44,6 @@ NIX_UTIL="/nix/store/g9h37kjrpvyzhsq4a79v2qkrpl4y1s7k-util-linux-2.42-bin/bin"
 export PATH="/usr/bin:/usr/sbin${MH_DIR:+:${MH_DIR}}:${NIX_BASE}:${NIX_UTIL}:${PATH:-}"
 export FSTYP="fuse"
 export TEST_DEV="tidefs-preview"
-export TIDEFS_BIN="${DAEMON_BIN}"
 export TIDEFS_XFSTESTS_MOUNT_HELPER_DIR="${MH_DIR}"
 
 exec ./check "$@"

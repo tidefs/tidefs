@@ -95,24 +95,26 @@ ones in the default graph:
   optional normal dependencies. The default parser, help, source modules, and
   direct dependency edges therefore carry only the local pool, mount, device,
   dataset, snapshot, defrag, live-owner, and status families.
-- The POSIX daemon now has 34 direct normal dependencies in its default local
-  build and 40 with its explicit `full` feature. Its default has no direct
+- The POSIX daemon now has 33 direct normal dependencies in its default local
+  build and 38 with its explicit `full` feature. Its default has no direct
   normal edge to block-volume core, `bincode`, cluster, performance-contract,
-  POSIX receipt schema/package-profile, or workload packages. `cluster`,
-  `receipt-demo`, `scrub-observation`, and `workload-telemetry` each own one
-  optional source/dependency family; `full` aggregates those four for retained
-  development packaging.
+  POSIX receipt schema/package-profile, or workload packages. The daemon has no
+  performance-contract edge in any feature set. `cluster`, `receipt-demo`, and
+  `workload-telemetry` each own one optional source/dependency family; `full`
+  aggregates them with the retained data-policy and replication forwarding
+  features for development packaging.
 - The daemon's default normal tree reaches 76 of 166 workspace packages (175
-  total packages including external crates), versus 89 workspace and 188 total
+  total packages including external crates), versus 88 workspace and 187 total
   with `full`. Its default carrier also excludes the distributed, claim,
   performance, storage-intent read-serving, and quorum-write families removed
   from the standalone `tidefs-local-filesystem`; its explicit features restore
-  the adapter's retained cluster, replication, data-policy, receipt,
-  observation, and telemetry surfaces.
-- `fuse_vfs_adapter.rs` is 43,876 lines, `local-filesystem/src/lib.rs` is
-  17,692, `vfs_engine_impl.rs` is 16,391, and the binary daemon `main.rs` is
-  3,900 lines. The remaining size is concentrated in three
-  mixed-authority carriers plus validation and smoke command source.
+  the adapter's retained cluster, replication, data-policy, receipt, and
+  telemetry surfaces.
+- `fuse_vfs_adapter.rs` is 43,303 lines, `local-filesystem/src/lib.rs` is
+  18,698, `vfs_engine_impl.rs` is 15,835, the shared daemon `lib.rs` is 2,082,
+  and the binary daemon `main.rs` is 771 lines. The remaining size is
+  concentrated in the FUSE, local-filesystem, and VFS carriers plus focused
+  validation orchestration.
 - Mounted pool admission no longer selects fixed roots or replays filesystem
   transactions; Pool-backed local-filesystem recovery owns mounted state.
 - The default `tidefs-local-filesystem` normal tree is 58 workspace packages
@@ -131,11 +133,10 @@ ones in the default graph:
 - The default daemon's public mount authority is standalone-only. Cluster lease
   decoding, cluster authority types, placement wrapping, and their tests compile
   only with `cluster`. Receipt-demo parsing/help/source compiles only with
-  `receipt-demo`; mounted scrub observation configuration and output compile
-  only with `scrub-observation`; workload observation/cache modules and their
-  read/write/fsync logging hooks compile only with `workload-telemetry`.
-  Production scrub scheduling remains local runtime behavior bounded to one
-  record and one MiB per tick whether or not observation is compiled.
+  `receipt-demo`; workload observation/cache modules and their read/write/fsync
+  logging hooks compile only with `workload-telemetry`. Production scrub
+  scheduling remains local runtime behavior bounded to one record and one MiB
+  per tick, without a second validation-artifact contract in the mount carrier.
 - `tidefsctl` owns block-volume, cluster/transport, kernel/validation
   diagnostics, receive-merge, remote snapshot transport, and storage-intent
   policy command families behind explicit Cargo features. Its `cluster` feature
@@ -441,10 +442,12 @@ Move the useful write/read/replay/snapshot/send-receive and object-store smoke
 signal to focused tests through `tidefsctl` and `run_mount`, update those exact
 consumers, and only then delete the demo packages in a reviewable removal PR.
 
-The same rule applies below the package level to the daemon binary's
-`mount-vfs`, `smoke-mount`, `score-posix`, and `xfstests-harness` product-like
-paths: preserve focused test signal, move the test to the selected carrier,
-then delete the duplicate runtime path rather than keeping two architectures.
+The daemon binary's duplicate local `mount-vfs` and `smoke-mount` paths were
+deleted after their mounted signal moved to `tidefsctl pool create` plus
+`tidefsctl pool mount` or focused direct tests. The retained `score-posix` and
+`xfstests-harness` commands are development-only test orchestration; their
+mounted work uses the selected carrier and they do not define another runtime
+architecture.
 
 ## Contraction And Delivery Order
 
@@ -459,10 +462,9 @@ then delete the duplicate runtime path rather than keeping two architectures.
    local-filesystem authority.
 4. Make dataset inode authority the only durable namespace identity and remove
    namespace/inode-table/FUSE fallbacks that can decide durable truth.
-5. Keep the binary `mount-vfs` command only as a temporary translator into
-   `run_mount`; move its validation consumers to `tidefsctl` or focused direct
-   tests, then delete the wrapper, smoke/demo paths, stale dependencies, and
-   policy checks.
+5. Keep `run_mount` as the single library carrier under `tidefsctl pool mount`;
+   keep validation consumers on `tidefsctl` or focused direct tests, with no
+   duplicate daemon mount wrapper or smoke path.
 6. Exercise create, mount, real I/O, `fsync`/`fdatasync`, rename, clean stop,
    crash, reopen, status, unmount/export, and reimport through the one carrier.
    Fix failures in the owner selected above rather than reintroducing another

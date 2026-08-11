@@ -8,7 +8,7 @@
 //! files, append-after-crash cycles, no-fsync data-loss expectations, and
 //! partial-fsync mix scenarios.
 //!
-//! Every test skips gracefully when the daemon binary or /dev/fuse is
+//! Every test skips gracefully when `tidefsctl` or /dev/fuse is
 //! unavailable.
 
 #[cfg(test)]
@@ -71,7 +71,7 @@ mod tests {
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!(
-                    "SKIP: daemon not available (set TIDEFS_DAEMON_BIN or \
+                    "SKIP: tidefsctl not available (set TIDEFSCTL_BIN or \
                      build the workspace) -- {e}"
                 );
                 None

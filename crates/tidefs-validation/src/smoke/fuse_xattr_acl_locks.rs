@@ -31,7 +31,7 @@ pub fn run_fuse_xattr_acl_locks_integration() -> Result<(), String> {
     eprintln!(
         "fuse: mount={} store={} pid={}",
         harness.mount_path().display(),
-        harness.store_path().display(),
+        harness.device_path().display(),
         harness.daemon_pid(),
     );
 

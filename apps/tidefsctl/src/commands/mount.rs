@@ -22,6 +22,96 @@ use tidefs_local_filesystem::RootAuthenticationKey;
 use tidefs_transport::{NodeInfo, Transport, TransportAddr};
 use tidefs_vfs_engine::LivePoolAdminArg;
 
+/// Runtime semantics for the canonical local pool mount carrier.
+///
+/// These are mounted-filesystem choices, not alternate storage paths. Fault
+/// injection and validation artifact destinations deliberately remain library
+/// inputs and are not exposed by `tidefsctl`.
+#[derive(Args, Debug)]
+pub struct PoolMountRuntimeArgs {
+    /// Source name reported for the FUSE mount
+    #[arg(long = "fs-name", default_value = "tidefs")]
+    pub fs_name: String,
+
+    /// Enable the kernel FUSE writeback cache
+    #[arg(long = "writeback-cache")]
+    pub writeback_cache: bool,
+
+    /// Comma-separated FUSE semantics (atime, sync, allow_other, dev, ...)
+    #[arg(short = 'o', long = "options")]
+    pub options: Option<String>,
+
+    /// Acknowledge writes only after the local durability barrier
+    #[arg(long = "sync")]
+    pub sync: bool,
+
+    /// Record eligible buffered writes in the intent log
+    #[arg(long = "intent-log-write")]
+    pub intent_log_write: bool,
+
+    /// Mounted filesystem content-capacity limit in bytes
+    #[arg(long = "content-capacity-bytes")]
+    pub content_capacity_bytes: Option<u64>,
+
+    /// Maximum dirty-page age in seconds
+    #[arg(long = "writeback-cache-timeout")]
+    pub writeback_cache_timeout_secs: Option<u64>,
+
+    /// Grace period for in-flight requests during shutdown
+    #[arg(long = "drain-timeout-secs")]
+    pub drain_timeout_secs: Option<u64>,
+
+    /// Interval in seconds between bounded mounted scrub cycles; zero disables
+    #[arg(long = "background-scrub-interval")]
+    pub background_scrub_interval_secs: Option<u64>,
+
+    /// Cache coherency profile: strict, writeback, nearline, async, or offline
+    #[arg(long = "coherency")]
+    pub coherency: Option<String>,
+
+    /// Per-object compression algorithm: zstd, lz4, or off
+    #[arg(long = "compress-algo")]
+    pub compress_algo: Option<String>,
+
+    /// Enable deduplication for the mounted dataset
+    #[arg(long = "enable-dedup")]
+    pub enable_dedup: bool,
+
+    /// Enable committed-root-safe object reclaim
+    #[arg(long = "enable-reclaim")]
+    pub enable_reclaim: bool,
+
+    /// Admit repair writeback during recovery
+    #[arg(long = "enable-repair-writeback")]
+    pub enable_repair_writeback: bool,
+
+    /// Mount a committed snapshot read-only
+    #[arg(long = "snapshot")]
+    pub snapshot: Option<String>,
+}
+
+impl Default for PoolMountRuntimeArgs {
+    fn default() -> Self {
+        Self {
+            fs_name: "tidefs".to_string(),
+            writeback_cache: false,
+            options: None,
+            sync: false,
+            intent_log_write: false,
+            content_capacity_bytes: None,
+            writeback_cache_timeout_secs: None,
+            drain_timeout_secs: None,
+            background_scrub_interval_secs: None,
+            coherency: None,
+            compress_algo: None,
+            enable_dedup: false,
+            enable_reclaim: false,
+            enable_repair_writeback: false,
+            snapshot: None,
+        }
+    }
+}
+
 /// `pool mount <pool_name> <mount_point> [--devices <dev>...] [--read-only] [--relatime]`
 ///
 /// When `--devices` is provided, the pool is imported from the raw block
@@ -77,6 +167,9 @@ pub struct PoolMountArgs {
 
     #[arg(long = "encryption-salt")]
     pub encryption_salt: Option<String>,
+
+    #[command(flatten)]
+    pub runtime: PoolMountRuntimeArgs,
 
     #[cfg(feature = "cluster")]
     /// Request cluster-authoritative mount. When set, the pool must have
@@ -539,6 +632,82 @@ pub fn handle_mount(args: PoolMountArgs) {
         println!("  read-only:   yes");
     }
 
+    let mut runtime = tidefs_posix_filesystem_adapter_daemon::MountRuntimeOptions::default();
+    runtime.fs_name = args.runtime.fs_name.clone();
+    if let Some(raw) = args.runtime.options.as_deref() {
+        runtime.mount_options =
+            tidefs_posix_filesystem_adapter_daemon::mount_options::MountOptions::parse(raw)
+                .unwrap_or_else(|error| {
+                    eprintln!("tidefsctl pool mount: invalid mount options: {error}");
+                    process::exit(1);
+                });
+    }
+    if args.relatime {
+        runtime.mount_options.timestamp_policy =
+            tidefs_posix_filesystem_adapter_daemon::mount_options::TimestampPolicy::RelativeAtime;
+    }
+    if args.runtime.sync {
+        runtime.mount_options.sync = true;
+    }
+    runtime.intent_log_write =
+        args.runtime.intent_log_write || runtime.mount_options.intent_log_write;
+    if let Some(bytes) = args.runtime.content_capacity_bytes {
+        if bytes == 0 {
+            eprintln!("tidefsctl pool mount: --content-capacity-bytes must be greater than zero");
+            process::exit(1);
+        }
+        runtime.content_capacity_bytes = bytes;
+    }
+    if let Some(seconds) = args.runtime.writeback_cache_timeout_secs {
+        if seconds == 0 {
+            eprintln!("tidefsctl pool mount: --writeback-cache-timeout must be greater than zero");
+            process::exit(1);
+        }
+        runtime.writeback_cache_timeout_secs = seconds;
+    }
+    if let Some(seconds) = args.runtime.drain_timeout_secs {
+        runtime.drain_timeout_secs = seconds;
+    }
+    if let Some(seconds) = args.runtime.background_scrub_interval_secs {
+        runtime.background_scrub_interval_secs = seconds;
+    }
+    runtime.enable_dedup = args.runtime.enable_dedup;
+    runtime.enable_reclaim = args.runtime.enable_reclaim;
+    runtime.enable_repair_writeback = args.runtime.enable_repair_writeback;
+    if let Some(raw) = args.runtime.compress_algo.as_deref() {
+        let algorithm = match raw.to_ascii_lowercase().as_str() {
+            "zstd" => tidefs_local_object_store::CompressionAlgorithm::Zstd,
+            "lz4" => tidefs_local_object_store::CompressionAlgorithm::Lz4,
+            "off" | "none" => tidefs_local_object_store::CompressionAlgorithm::Uncompressed,
+            _ => {
+                eprintln!(
+                    "tidefsctl pool mount: unknown compression algorithm `{raw}`; expected zstd, lz4, or off"
+                );
+                process::exit(1);
+            }
+        };
+        runtime.compression = Some(tidefs_local_object_store::CompressionConfig {
+            algorithm,
+            level: if algorithm == tidefs_local_object_store::CompressionAlgorithm::Lz4 {
+                0
+            } else {
+                3
+            },
+            min_compress_bytes: 0,
+        });
+    }
+    let coherency_profile = args
+        .runtime
+        .coherency
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .unwrap_or_else(|error: String| {
+            eprintln!("tidefsctl pool mount: invalid coherency profile: {error}");
+            process::exit(1);
+        })
+        .unwrap_or_default();
+
     let config = tidefs_posix_filesystem_adapter_daemon::MountConfig {
         backing_dir,
         mountpoint,
@@ -550,16 +719,15 @@ pub fn handle_mount(args: PoolMountArgs) {
         foreground: true,
         debug: false,
         read_only: args.read_only,
-        writeback_cache: false,
-        coherency_profile:
-            tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile::Writeback,
+        writeback_cache: args.runtime.writeback_cache,
+        coherency_profile,
         block_devices: args.devices.clone(),
         import_owner: Some(import_owner),
         dataset_path: Some(args.dataset.clone()),
         encryption: encryption_config,
-        snapshot_name: None,
+        snapshot_name: args.runtime.snapshot.clone(),
         mount_authority,
-        runtime: tidefs_posix_filesystem_adapter_daemon::MountRuntimeOptions::default(),
+        runtime,
     };
 
     if let Err(err) = tidefs_posix_filesystem_adapter_daemon::run_mount(config) {
@@ -800,12 +968,18 @@ mod tests {
     // ── Struct binding tests ───────────────────────────────────────
 
     #[test]
+    fn runtime_defaults_match_cli_fs_name() {
+        assert_eq!(PoolMountRuntimeArgs::default().fs_name, "tidefs");
+    }
+
+    #[test]
     fn mount_args_bind_expected_fields() {
         let args = PoolMountArgs {
             dataset: "root".into(),
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,
+            runtime: PoolMountRuntimeArgs::default(),
             #[cfg(feature = "cluster")]
             cluster: false,
             #[cfg(feature = "cluster")]
@@ -835,6 +1009,7 @@ mod tests {
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,
+            runtime: PoolMountRuntimeArgs::default(),
             dataset: "root".into(),
             #[cfg(feature = "cluster")]
             cluster: false,
@@ -858,6 +1033,7 @@ mod tests {
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,
+            runtime: PoolMountRuntimeArgs::default(),
             #[cfg(feature = "cluster")]
             cluster: false,
             #[cfg(feature = "cluster")]
@@ -880,6 +1056,7 @@ mod tests {
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,
+            runtime: PoolMountRuntimeArgs::default(),
             #[cfg(feature = "cluster")]
             cluster: false,
             #[cfg(feature = "cluster")]

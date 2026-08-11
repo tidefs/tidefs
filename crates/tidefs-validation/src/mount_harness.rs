@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! End-to-end FUSE mount harness for the TideFS POSIX filesystem adapter daemon.
+//! End-to-end FUSE mount harness for the canonical TideFS pool lifecycle.
 //!
-//! `MountHarness` spawns the `tidefs-posix-filesystem-adapter-daemon` binary,
-//! waits for the mount point to become ready, and exposes helper methods for
-//! file IO, metadata, and directory operations through the mounted filesystem
-//! path. Cleanup (unmount and temp directory removal) happens on `Drop`.
+//! `MountHarness` creates a regular-file pool device through `tidefsctl pool
+//! create --file-devices`, mounts it through `tidefsctl pool mount --devices`,
+//! and exposes helper methods for I/O through the mounted filesystem path.
+//! Cleanup (unmount and temporary-device removal) happens on `Drop`.
 //!
-//! The daemon binary is located via, in order:
-//! 1. `TIDEFS_DAEMON_BIN` environment variable (absolute path)
+//! The `tidefsctl` binary is located via, in order:
+//! 1. `TIDEFSCTL_BIN` environment variable (absolute path)
 //! 2. `CARGO_TARGET_DIR`/debug/ or `CARGO_TARGET_DIR`/release/
 //! 3. `target/debug/` or `target/release/` relative to the workspace root
 
@@ -18,105 +18,68 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const FUSE_SUPER_MAGIC: libc::c_long = 0x6573_5546;
-pub(crate) const MOUNT_HARNESS_ROOT_AUTH_KEY_HEX: &str =
+pub const MOUNT_HARNESS_ROOT_AUTH_KEY_HEX: &str =
     "0000000000000000000000000000000000000000000000000000000000000001";
+/// Root-authentication environment variable consumed across the tidefsctl
+/// process boundary.
+pub const MOUNT_HARNESS_ROOT_AUTH_ENV_VAR: &str = "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX";
+const MOUNT_HARNESS_DEVICE_BYTES: u64 = 256 * 1024 * 1024;
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Manages a FUSE-mounted TideFS instance backed by a local filesystem store.
+/// Manages a FUSE-mounted TideFS pool backed by temporary regular-file devices.
 pub struct MountHarness {
-    /// Temporary root directory (parent of both store and mount).
+    /// Temporary root directory (parent of pool devices and mountpoint).
     #[allow(dead_code)]
     work_dir: tempfile::TempDir,
-    /// Path to the backing store directory.
-    store_path: PathBuf,
+    /// Canonical pool identity passed to every mount process.
+    pool_name: String,
+    /// Regular-file pool devices created through `tidefsctl pool create`.
+    device_paths: Vec<PathBuf>,
     /// Path to the FUSE mount point.
     mount_path: PathBuf,
-    /// Handle to the daemon child process.
+    /// Canonical operator binary used for every lifecycle transition.
+    tidefsctl_bin: PathBuf,
+    /// Retained `pool mount` arguments used by restart paths.
+    mount_args: Vec<String>,
+    /// Handle to the `tidefsctl pool mount` child process.
     child: Child,
-    /// PID of the daemon process (cached before possible reap).
+    /// PID of the mount-owner process (cached before possible reap).
     daemon_pid: u32,
-    /// Validation-only typed scrub observation emitted by the mounted daemon.
-    scrub_runtime_observation_path: Option<PathBuf>,
 }
 
 // ── builder ────────────────────────────────────────────────────────
 
 /// Builder for [`MountHarness`] with optional configuration overrides.
 pub struct MountHarnessBuilder {
-    daemon_bin: Option<PathBuf>,
+    tidefsctl_bin: Option<PathBuf>,
     extra_args: Vec<String>,
-    scrub_runtime_observation: bool,
-    pre_mount_setup: Option<Box<dyn FnOnce(&Path) -> io::Result<()>>>,
-}
-
-#[derive(Debug)]
-struct PreMountSetupError(io::Error);
-
-impl std::fmt::Display for PreMountSetupError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "pre-mount setup failed: {}", self.0)
-    }
-}
-
-impl std::error::Error for PreMountSetupError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
-
-pub(crate) fn is_pre_mount_setup_failure(error: &io::Error) -> bool {
-    error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<PreMountSetupError>())
-        .is_some()
 }
 
 impl MountHarnessBuilder {
     fn new() -> Self {
         Self {
-            daemon_bin: None,
+            tidefsctl_bin: None,
             extra_args: Vec::new(),
-            scrub_runtime_observation: false,
-            pre_mount_setup: None,
         }
     }
 
-    /// Override the daemon binary path. When unset, the builder falls
-    /// back to [`find_daemon_binary`].
-    pub fn daemon_bin(mut self, path: impl Into<PathBuf>) -> Self {
-        self.daemon_bin = Some(path.into());
+    /// Override the `tidefsctl` binary path. When unset, use
+    /// [`find_tidefsctl_binary`].
+    pub fn tidefsctl_bin(mut self, path: impl Into<PathBuf>) -> Self {
+        self.tidefsctl_bin = Some(path.into());
         self
     }
 
-    /// Extra command-line arguments appended after the required
-    /// `mount-vfs --store ... --mount ... --root-auth-key-hex ...`
-    /// arguments.
+    /// Extra arguments for the canonical `tidefsctl pool mount` command.
     ///
     /// Use this to pass FUSE mount options such as `-o allow_other`.
     pub fn extra_args(mut self, args: &[&str]) -> Self {
         self.extra_args = args.iter().map(|s| s.to_string()).collect();
-        self
-    }
-
-    /// Ask the daemon to emit the validation-only typed scrub observation
-    /// owned by issue #1792 into this harness's temporary directory.
-    pub fn scrub_runtime_observation(mut self) -> Self {
-        self.scrub_runtime_observation = true;
-        self
-    }
-
-    /// Run validation-only backing-store setup before the daemon starts.
-    ///
-    /// Setup that bypasses the mounted boundary is harness input and must not
-    /// be cited as mounted filesystem behavior.
-    pub fn pre_mount_setup(
-        mut self,
-        setup: impl FnOnce(&Path) -> io::Result<()> + 'static,
-    ) -> Self {
-        self.pre_mount_setup = Some(Box::new(setup));
         self
     }
 
@@ -142,53 +105,55 @@ impl MountHarnessBuilder {
     }
 
     pub fn build(mut self) -> io::Result<MountHarness> {
-        let daemon_bin = match self.daemon_bin {
+        let tidefsctl_bin = match self.tidefsctl_bin {
             Some(ref p) => p.clone(),
-            None => find_daemon_binary()?,
+            None => find_tidefsctl_binary()?,
         };
 
         let work_dir = tempfile::TempDir::new()
             .map_err(|e| io::Error::other(format!("create harness work dir: {e}")))?;
 
-        let store_path = work_dir.path().join("store");
+        let device_path = work_dir.path().join("device0.tidefs");
         let mount_path = work_dir.path().join("mnt");
-
-        fs::create_dir_all(&store_path).map_err(|e| {
-            io::Error::other(format!("create store dir {}: {e}", store_path.display()))
-        })?;
         fs::create_dir_all(&mount_path).map_err(|e| {
             io::Error::other(format!("create mount dir {}: {e}", mount_path.display()))
         })?;
-        if let Some(setup) = self.pre_mount_setup.take() {
-            setup(&store_path).map_err(|error| {
-                let kind = error.kind();
-                io::Error::new(kind, PreMountSetupError(error))
+
+        let device = fs::File::create(&device_path).map_err(|error| {
+            io::Error::other(format!(
+                "create pool device {}: {error}",
+                device_path.display()
+            ))
+        })?;
+        device
+            .set_len(MOUNT_HARNESS_DEVICE_BYTES)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "size pool device {}: {error}",
+                    device_path.display()
+                ))
             })?;
-        }
+        device.sync_all().map_err(|error| {
+            io::Error::other(format!(
+                "sync pool device {}: {error}",
+                device_path.display()
+            ))
+        })?;
 
-        // Validation root authentication key avoids requiring env setup.
-        let mut cmd = Command::new(&daemon_bin);
-        cmd.arg("mount-vfs")
-            .arg("--store")
-            .arg(&store_path)
-            .arg("--mount")
-            .arg(&mount_path)
-            .arg("--root-auth-key-hex")
-            .arg(MOUNT_HARNESS_ROOT_AUTH_KEY_HEX);
+        let pool_name = format!(
+            "validation-{}-{}",
+            std::process::id(),
+            NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        create_file_device_pool(&tidefsctl_bin, &pool_name, &[device_path.clone()])?;
 
-        for arg in &self.extra_args {
-            cmd.arg(arg);
-        }
-        let scrub_runtime_observation_path = self
-            .scrub_runtime_observation
-            .then(|| work_dir.path().join("scrub-runtime-observation.json"));
-        if let Some(path) = scrub_runtime_observation_path.as_deref() {
-            cmd.arg("--scrub-runtime-observation-artifact").arg(path);
-        }
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| io::Error::other(format!("spawn daemon {}: {e}", daemon_bin.display())))?;
+        let mut child = spawn_pool_mount(
+            &tidefsctl_bin,
+            &pool_name,
+            &[device_path.clone()],
+            &mount_path,
+            &self.extra_args,
+        )?;
 
         let daemon_pid = child.id();
 
@@ -197,18 +162,20 @@ impl MountHarnessBuilder {
                 kill_child(daemon_pid);
             }
             io::Error::other(format!(
-                "mount point {} did not become ready: {e}",
+                "canonical pool mount {} did not become ready: {e}",
                 mount_path.display()
             ))
         })?;
 
         Ok(MountHarness {
             work_dir,
-            store_path,
+            pool_name,
+            device_paths: vec![device_path],
             mount_path,
+            tidefsctl_bin,
+            mount_args: std::mem::take(&mut self.extra_args),
             child,
             daemon_pid,
-            scrub_runtime_observation_path,
         })
     }
 }
@@ -217,12 +184,11 @@ impl MountHarnessBuilder {
 pub type FuseMountFixture = MountHarness;
 
 impl MountHarness {
-    /// Spawn the daemon binary, create a temp backing store, mount at a temp
-    /// mount point, and block until the mount point is an active FUSE mount.
+    /// Create a temporary pool device, mount it through `tidefsctl`, and block
+    /// until the mount point is an active FUSE mount.
     ///
-    /// Uses the binary location from `find_daemon_binary`.  The backing store
-    /// is initialised with a demo root authentication key so no environment
-    /// setup is required.
+    /// Uses the binary location from [`find_tidefsctl_binary`]. The pool uses a
+    /// validation root-authentication key so no environment setup is required.
     pub fn new() -> io::Result<Self> {
         Self::builder().build()
     }
@@ -271,19 +237,24 @@ impl MountHarness {
         &self.mount_path
     }
 
-    /// Absolute path to the backing store directory.
-    pub fn store_path(&self) -> &Path {
-        &self.store_path
+    /// Pool identity passed to `tidefsctl pool mount`.
+    pub fn pool_name(&self) -> &str {
+        &self.pool_name
+    }
+
+    /// Regular-file devices containing the durable pool state.
+    pub fn device_paths(&self) -> &[PathBuf] {
+        &self.device_paths
+    }
+
+    /// First regular-file pool device used by the single-device fixture.
+    pub fn device_path(&self) -> &Path {
+        &self.device_paths[0]
     }
 
     /// PID of the daemon process.
     pub fn daemon_pid(&self) -> u32 {
         self.daemon_pid
-    }
-
-    /// Typed scrub observation path when requested through the builder.
-    pub fn scrub_runtime_observation_path(&self) -> Option<&Path> {
-        self.scrub_runtime_observation_path.as_deref()
     }
 
     // ── helpers ────────────────────────────────────────────────────
@@ -812,23 +783,13 @@ impl MountHarness {
         // Brief pause so the kernel releases the mount.
         thread::sleep(Duration::from_millis(200));
 
-        // Spawn a fresh daemon on the same store + mount.
-        let daemon_bin = find_daemon_binary()?;
-        let child = Command::new(&daemon_bin)
-            .arg("mount-vfs")
-            .arg("--store")
-            .arg(&self.store_path)
-            .arg("--mount")
-            .arg(&self.mount_path)
-            .arg("--root-auth-key-hex")
-            .arg("0000000000000000000000000000000000000000000000000000000000000001")
-            .spawn()
-            .map_err(|e| {
-                io::Error::other(format!(
-                    "spawn daemon (crash-remount) {}: {e}",
-                    daemon_bin.display()
-                ))
-            })?;
+        let child = spawn_pool_mount(
+            &self.tidefsctl_bin,
+            &self.pool_name,
+            &self.device_paths,
+            &self.mount_path,
+            &self.mount_args,
+        )?;
 
         self.daemon_pid = child.id();
         self.child = child;
@@ -883,23 +844,13 @@ impl MountHarness {
         // Brief pause so the kernel releases the mount.
         thread::sleep(Duration::from_millis(200));
 
-        // Spawn a fresh daemon on the same store + mount.
-        let daemon_bin = find_daemon_binary()?;
-        let child = Command::new(&daemon_bin)
-            .arg("mount-vfs")
-            .arg("--store")
-            .arg(&self.store_path)
-            .arg("--mount")
-            .arg(&self.mount_path)
-            .arg("--root-auth-key-hex")
-            .arg("0000000000000000000000000000000000000000000000000000000000000001")
-            .spawn()
-            .map_err(|e| {
-                io::Error::other(format!(
-                    "spawn daemon (graceful-remount) {}: {e}",
-                    daemon_bin.display()
-                ))
-            })?;
+        let child = spawn_pool_mount(
+            &self.tidefsctl_bin,
+            &self.pool_name,
+            &self.device_paths,
+            &self.mount_path,
+            &self.mount_args,
+        )?;
 
         self.daemon_pid = child.id();
         self.child = child;
@@ -915,22 +866,13 @@ impl MountHarness {
     pub fn remount(&mut self) -> io::Result<()> {
         self.unmount_only(true)?;
 
-        let daemon_bin = find_daemon_binary()?;
-        let child = Command::new(&daemon_bin)
-            .arg("mount-vfs")
-            .arg("--store")
-            .arg(&self.store_path)
-            .arg("--mount")
-            .arg(&self.mount_path)
-            .arg("--root-auth-key-hex")
-            .arg("0000000000000000000000000000000000000000000000000000000000000001")
-            .spawn()
-            .map_err(|e| {
-                io::Error::other(format!(
-                    "spawn daemon (remount) {}: {e}",
-                    daemon_bin.display()
-                ))
-            })?;
+        let child = spawn_pool_mount(
+            &self.tidefsctl_bin,
+            &self.pool_name,
+            &self.device_paths,
+            &self.mount_path,
+            &self.mount_args,
+        )?;
 
         self.daemon_pid = child.id();
         self.child = child;
@@ -1013,13 +955,75 @@ pub fn sigkill_child(pid: u32) {
     }
 }
 
-/// Locate the daemon binary, checking (in order):
-/// 1. `TIDEFS_DAEMON_BIN` env var
+fn create_file_device_pool(
+    tidefsctl_bin: &Path,
+    pool_name: &str,
+    device_paths: &[PathBuf],
+) -> io::Result<()> {
+    let output = Command::new(tidefsctl_bin)
+        .arg("pool")
+        .arg("create")
+        .arg(pool_name)
+        .arg("--file-devices")
+        .arg("--devices")
+        .args(device_paths)
+        .env(
+            MOUNT_HARNESS_ROOT_AUTH_ENV_VAR,
+            MOUNT_HARNESS_ROOT_AUTH_KEY_HEX,
+        )
+        .output()
+        .map_err(|error| {
+            io::Error::other(format!(
+                "run canonical pool create {}: {error}",
+                tidefsctl_bin.display()
+            ))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "canonical pool create failed with {}: stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+fn spawn_pool_mount(
+    tidefsctl_bin: &Path,
+    pool_name: &str,
+    device_paths: &[PathBuf],
+    mount_path: &Path,
+    mount_args: &[String],
+) -> io::Result<Child> {
+    let mut command = Command::new(tidefsctl_bin);
+    command
+        .arg("pool")
+        .arg("mount")
+        .arg(pool_name)
+        .arg(mount_path)
+        .args(mount_args)
+        .arg("--devices")
+        .args(device_paths)
+        .env(
+            MOUNT_HARNESS_ROOT_AUTH_ENV_VAR,
+            MOUNT_HARNESS_ROOT_AUTH_KEY_HEX,
+        );
+    command.spawn().map_err(|error| {
+        io::Error::other(format!(
+            "spawn canonical pool mount {}: {error}",
+            tidefsctl_bin.display()
+        ))
+    })
+}
+
+/// Locate `tidefsctl`, checking (in order):
+/// 1. `TIDEFSCTL_BIN` env var
 /// 2. `CARGO_TARGET_DIR`/debug/ and `CARGO_TARGET_DIR`/release/
 /// 3. `<workspace>/target/debug/` and `<workspace>/target/release/`
-pub fn find_daemon_binary() -> io::Result<PathBuf> {
+pub fn find_tidefsctl_binary() -> io::Result<PathBuf> {
     // 1. Explicit environment variable.
-    if let Ok(path) = std::env::var("TIDEFS_DAEMON_BIN") {
+    if let Ok(path) = std::env::var("TIDEFSCTL_BIN") {
         let p = PathBuf::from(&path);
         if p.is_file() {
             return Ok(p);
@@ -1028,11 +1032,11 @@ pub fn find_daemon_binary() -> io::Result<PathBuf> {
 
     // 2. CARGO_TARGET_DIR (set when target dir is non-default).
     if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
-        let dbg = Path::new(&td).join("debug/tidefs-posix-filesystem-adapter-daemon");
+        let dbg = Path::new(&td).join("debug/tidefsctl");
         if dbg.is_file() {
             return Ok(dbg);
         }
-        let rel = Path::new(&td).join("release/tidefs-posix-filesystem-adapter-daemon");
+        let rel = Path::new(&td).join("release/tidefsctl");
         if rel.is_file() {
             return Ok(rel);
         }
@@ -1045,8 +1049,8 @@ pub fn find_daemon_binary() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other("cannot determine workspace root"))?;
 
     let candidates = [
-        workspace_root.join("target/debug/tidefs-posix-filesystem-adapter-daemon"),
-        workspace_root.join("target/release/tidefs-posix-filesystem-adapter-daemon"),
+        workspace_root.join("target/debug/tidefsctl"),
+        workspace_root.join("target/release/tidefsctl"),
     ];
 
     for candidate in &candidates {
@@ -1056,7 +1060,7 @@ pub fn find_daemon_binary() -> io::Result<PathBuf> {
     }
 
     Err(io::Error::other(format!(
-        "daemon binary not found; set TIDEFS_DAEMON_BIN or build the daemon first. \
+        "tidefsctl binary not found; set TIDEFSCTL_BIN or build tidefsctl first. \
          Looked in: {}",
         candidates
             .iter()
@@ -1113,9 +1117,9 @@ mod tests {
         let md = harness.stat(".").expect("stat mount root");
         assert!(md.is_dir(), "mount root must be a directory");
         eprintln!(
-            "harness: mount={} store={} pid={}",
+            "harness: mount={} device={} pid={}",
             harness.mount_path().display(),
-            harness.store_path().display(),
+            harness.device_path().display(),
             harness.daemon_pid(),
         );
         // Drop triggers unmount + cleanup.
@@ -1201,34 +1205,14 @@ mod tests {
             .create_file("sub/persist_deep.txt", data)
             .expect("create deep file session 1");
 
-        let store_path = harness.store_path().to_path_buf();
+        let device_path = harness.device_path().to_path_buf();
         let mount_path = harness.mount_path().to_path_buf();
 
         harness.unmount_only(true).expect("unmount session 1");
 
-        assert!(
-            store_path.exists(),
-            "backing store must exist after unmount"
-        );
+        assert!(device_path.exists(), "pool device must exist after unmount");
 
-        // Spawn a new daemon on the same store.
-        let daemon_bin = find_daemon_binary().expect("find daemon binary");
-        let root_auth_key_hex = "0000000000000000000000000000000000000000000000000000000000000001";
-
-        let mut child2 = Command::new(&daemon_bin)
-            .arg("mount-vfs")
-            .arg("--store")
-            .arg(&store_path)
-            .arg("--mount")
-            .arg(&mount_path)
-            .arg("--root-auth-key-hex")
-            .arg(root_auth_key_hex)
-            .spawn()
-            .expect("spawn daemon session 2");
-
-        let daemon_pid2 = child2.id();
-        wait_for_mount(&mut child2, &mount_path, Duration::from_secs(10))
-            .expect("mount point ready session 2");
+        harness.remount().expect("canonical pool remount session 2");
 
         let read_back =
             fs::read(mount_path.join("persist.txt")).expect("read persist.txt session 2");
@@ -1241,12 +1225,6 @@ mod tests {
             "persistence data mismatch for sub/persist_deep.txt"
         );
 
-        kill_child(daemon_pid2);
-        let _ = Command::new("fusermount")
-            .arg("-u")
-            .arg(&mount_path)
-            .output();
-        let _ = child2.wait_with_output();
         drop(harness);
     }
 
@@ -1400,12 +1378,12 @@ mod tests {
 
     // ── negative / error-path tests ──────────────────────────────────
 
-    /// Verify that MountHarnessBuilder with a non-existent daemon binary
+    /// Verify that MountHarnessBuilder with a non-existent tidefsctl binary
     /// returns an error from build() rather than panicking.
     #[test]
-    fn builder_nonexistent_daemon_bin() {
+    fn builder_nonexistent_tidefsctl_bin() {
         let result = MountHarness::builder()
-            .daemon_bin("/nonexistent/path/to/tidefs-daemon")
+            .tidefsctl_bin("/nonexistent/path/to/tidefsctl")
             .build();
         match result {
             Err(e) => {
@@ -1418,22 +1396,20 @@ mod tests {
                     "error should mention the path problem: {e}"
                 );
             }
-            Ok(_) => panic!(
-                "builder with nonexistent daemon binary should fail,                  but mount succeeded (daemon found on PATH?)"
-            ),
+            Ok(_) => panic!("builder with nonexistent tidefsctl binary should fail"),
         }
     }
 
-    /// Verify that the harness returns an error when the daemon binary
+    /// Verify that the harness returns an error when the tidefsctl binary
     /// exists but cannot execute (e.g., a directory passed as binary).
     #[test]
-    fn builder_non_executable_daemon_bin() {
+    fn builder_non_executable_tidefsctl_bin() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         // A directory is not an executable binary.
-        let result = MountHarness::builder().daemon_bin(dir.path()).build();
+        let result = MountHarness::builder().tidefsctl_bin(dir.path()).build();
         match result {
             Err(_) => { /* expected: directory is not executable */ }
-            Ok(_) => panic!("builder with directory as daemon bin should fail"),
+            Ok(_) => panic!("builder with directory as tidefsctl bin should fail"),
         }
     }
 
@@ -1452,9 +1428,9 @@ mod tests {
             "independent harnesses must have different mount points"
         );
         assert_ne!(
-            h1.store_path(),
-            h2.store_path(),
-            "independent harnesses must have different store paths"
+            h1.device_path(),
+            h2.device_path(),
+            "independent harnesses must have different pool devices"
         );
 
         // Write to each and verify no cross-talk.

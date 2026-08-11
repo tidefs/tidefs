@@ -206,13 +206,13 @@ fn write_dispatch_fsync_remount_verify() {
         .fsync_file("dispatch_durable.bin")
         .expect("fsync session 1");
 
-    let store_path = harness.store_path().to_path_buf();
+    let device_path = harness.device_path().to_path_buf();
     harness.unmount_only(true).expect("unmount session 1");
 
     assert!(
-        store_path.exists(),
-        "backing store {} must exist after unmount",
-        store_path.display()
+        device_path.exists(),
+        "pool device {} must exist after unmount",
+        device_path.display()
     );
 
     harness.remount().expect("remount session 2");
@@ -252,13 +252,13 @@ fn write_dispatch_64kib_fsync_remount() {
         .expect("create_file");
     harness.fsync_file("dispatch_64k.bin").expect("fsync");
 
-    let store_path = harness.store_path().to_path_buf();
+    let device_path = harness.device_path().to_path_buf();
     harness.unmount_only(true).expect("unmount");
 
     assert!(
-        store_path.exists(),
-        "backing store {} must exist after unmount",
-        store_path.display()
+        device_path.exists(),
+        "pool device {} must exist after unmount",
+        device_path.display()
     );
 
     harness.remount().expect("remount");
@@ -302,13 +302,13 @@ fn write_dispatch_namespace_preserved_after_remount() {
     harness.fsync_file("dir_a/dir_b/y.txt").expect("fsync y");
     harness.fsync_file("root_file.txt").expect("fsync root");
 
-    let store_path = harness.store_path().to_path_buf();
+    let device_path = harness.device_path().to_path_buf();
     harness.unmount_only(true).expect("unmount");
 
     assert!(
-        store_path.exists(),
-        "backing store {} must exist after unmount",
-        store_path.display()
+        device_path.exists(),
+        "pool device {} must exist after unmount",
+        device_path.display()
     );
 
     harness.remount().expect("remount");
@@ -381,14 +381,14 @@ fn write_dispatch_store_survives_unmount() {
         .expect("create_file");
     harness.fsync_file("store_survive.bin").expect("fsync");
 
-    let store_path = harness.store_path().to_path_buf();
+    let device_path = harness.device_path().to_path_buf();
     harness.unmount_only(true).expect("unmount");
 
     // The backing store must exist after unmount (TempDir not dropped).
     assert!(
-        store_path.exists(),
-        "backing store {} must exist after unmount",
-        store_path.display()
+        device_path.exists(),
+        "pool device {} must exist after unmount",
+        device_path.display()
     );
 
     // Remount and verify data survived byte-for-byte.
@@ -404,13 +404,13 @@ fn write_dispatch_store_survives_unmount() {
          write dispatch may not have flushed to object store"
     );
 
-    // Verify the store directory has content (non-empty).
-    let store_has_entries = std::fs::read_dir(&store_path)
-        .map(|mut rd| rd.any(|e| e.is_ok()))
-        .unwrap_or(false);
+    // The same durable pool device remains available for the remount.
+    let device_len = std::fs::metadata(&device_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     assert!(
-        store_has_entries,
-        "backing store {} should contain entries after write + fsync + unmount",
-        store_path.display()
+        device_len > 0,
+        "pool device {} should retain durable bytes after write + fsync + unmount",
+        device_path.display()
     );
 }

@@ -15,7 +15,7 @@
 #
 # Dependencies:
 #   - Linux kernel with FUSE support
-#   - tidefs-posix-filesystem-adapter-daemon binary
+#   - tidefsctl canonical pool lifecycle binary
 #   - QEMU for guest execution
 {
   pkgs,
@@ -378,11 +378,12 @@ CEOF
   fuseCreateOpenReleaseValidationScript = pkgs.writeShellScriptBin "tidefs-fuse-create-open-release-validation" ''
     set -euo pipefail
 
-    DAEMON_BIN="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
+    TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
     COR_TEST="${fuseCreateOpenReleaseTestBin}/bin/tidefs-fuse-create-open-release-test"
 
     TMPDIR="''${TIDEFS_FUSE_COR_TMPDIR:-/tmp/tidefs-fuse-create-open-release-validation}"
-    STORE="$TMPDIR/store"
+    DEVICE="$TMPDIR/device0.tidefs"
+    POOL="create_open_release_pool"
     MNT="$TMPDIR/mnt"
 
     usage() {
@@ -419,14 +420,16 @@ EOF
     echo "=== TideFS FUSE Create/Open/Release Validation ==="
     echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "kernel=$(uname -r)"
-    echo "daemon=$DAEMON_BIN"
+    echo "control=$TIDEFSCTL"
     echo "test=$COR_TEST"
     echo ""
     echo "Tier: mounted-userspace"
     echo ""
 
     rm -rf "$TMPDIR"
-    mkdir -p "$STORE" "$MNT"
+    mkdir -p "$MNT"
+    truncate -s 268435456 "$DEVICE"
+    "$TIDEFSCTL" pool create "$POOL" --file-devices --devices "$DEVICE"
 
     # Check /dev/fuse
     if [ ! -e /dev/fuse ]; then
@@ -446,8 +449,7 @@ EOF
     # ── Phase 1: Start FUSE daemon ────────────────────────────────────
     echo "--- Phase 1: Start FUSE daemon ---"
     DAEMON_LOG="$TMPDIR/daemon.log"
-    "$DAEMON_BIN" mount-vfs \
-      --store "$STORE" --mount "$MNT" \
+    "$TIDEFSCTL" pool mount "$POOL" "$MNT" --devices "$DEVICE" \
       > "$DAEMON_LOG" 2>&1 &
     DAEMON_PID=$!
 
@@ -526,8 +528,7 @@ EOF
     echo ""
     echo "--- Phase 5: Remount and verify ---"
     mkdir -p "$MNT"
-    "$DAEMON_BIN" mount-vfs \
-      --store "$STORE" --mount "$MNT" \
+    "$TIDEFSCTL" pool mount "$POOL" "$MNT" --devices "$DEVICE" \
       > "$TMPDIR/daemon_remount.log" 2>&1 &
     REMOUNT_PID=$!
 

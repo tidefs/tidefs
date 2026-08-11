@@ -56,26 +56,28 @@ fn mount_reject_double() {
         }
     };
 
-    let daemon_bin = match mount_harness::find_daemon_binary() {
+    let tidefsctl_bin = match mount_harness::find_tidefsctl_binary() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("SKIP mount_reject_double: cannot locate daemon binary -- {e}");
+            eprintln!("SKIP mount_reject_double: cannot locate tidefsctl -- {e}");
             return;
         }
     };
 
-    let root_auth_key_hex = "0000000000000000000000000000000000000000000000000000000000000001";
-
-    // Attempt to start a second daemon on the already-mounted path.
-    let output = std::process::Command::new(&daemon_bin)
-        .arg("mount-vfs")
-        .arg("--store")
-        .arg(harness.store_path())
-        .arg("--mount")
+    // Attempt a second canonical import+mount on the already-owned pool.
+    let mut command = std::process::Command::new(&tidefsctl_bin);
+    command
+        .arg("pool")
+        .arg("mount")
+        .arg(harness.pool_name())
         .arg(harness.mount_path())
-        .arg("--root-auth-key-hex")
-        .arg(root_auth_key_hex)
-        .output();
+        .arg("--devices")
+        .args(harness.device_paths())
+        .env(
+            mount_harness::MOUNT_HARNESS_ROOT_AUTH_ENV_VAR,
+            mount_harness::MOUNT_HARNESS_ROOT_AUTH_KEY_HEX,
+        );
+    let output = command.output();
 
     match output {
         Ok(out) => {
@@ -84,7 +86,7 @@ fn mount_reject_double() {
                     || String::from_utf8_lossy(&out.stderr).contains("already")
                     || String::from_utf8_lossy(&out.stderr).contains("busy")
                     || String::from_utf8_lossy(&out.stderr).contains("exist"),
-                "second daemon should not mount successfully on an occupied path;\
+                "second canonical pool mount should not claim an occupied path;\
                  exit={}, stderr={}",
                 out.status,
                 String::from_utf8_lossy(&out.stderr)

@@ -152,11 +152,12 @@ tests. Block-volume, kernel-resident, and clustered modes follow unless a
 demonstrated safety prerequisite requires earlier work.
 
 For this pilot, the selected carrier is `tidefsctl pool mount` calling the
-library `tidefs_posix_filesystem_adapter_daemon::run_mount` path. The daemon
-binary's separate `mount-vfs` and `smoke-mount` paths are validation inputs to
-be migrated into that carrier, not independent product architectures. Ordinary
-development is selected by this contract, current source, and live issues and
-pull requests; publication claims do not select or block that work.
+library `tidefs_posix_filesystem_adapter_daemon::run_mount` path. Mounted
+validation creates regular-file device pools through `tidefsctl pool create`
+and exercises that same carrier; the daemon binary has no separate local mount
+or smoke carrier. Ordinary development is selected by this contract, current
+source, and live issues and pull requests; publication claims do not select or
+block that work.
 
 The default `tidefsctl` build is this local pool, mount, device, dataset,
 snapshot, defrag, live-owner, and status carrier. Block-volume commands,

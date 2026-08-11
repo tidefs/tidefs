@@ -12,10 +12,9 @@ pkgs.writeShellScriptBin "tidefs-fuse-namespace-scale-stress-host" ''
   set -euo pipefail
 
   TIDEFSCTL="$(find /nix/store -maxdepth 3 -name tidefsctl -type f -path '*-tidefs-workspace-*/bin/*' 2>/dev/null | head -1)"
-  FUSE_DAEMON="$(find /nix/store -maxdepth 3 -name tidefs-posix-filesystem-adapter-daemon -type f 2>/dev/null | head -1)"
 
-  if [ -z "$TIDEFSCTL" ] || [ -z "$FUSE_DAEMON" ]; then
-    echo "FATAL: tidefs binaries not found in /nix/store" >&2
+  if [ -z "$TIDEFSCTL" ]; then
+    echo "FATAL: tidefsctl not found in /nix/store" >&2
     exit 1
   fi
 

@@ -9,7 +9,6 @@
   tidefsPackage,
   ackValidationPackage,
   dataShapeValidationPackage,
-  scrubValidationPackage,
 }:
 
 pkgs.writeShellScriptBin "tidefs-fuse-vm-test-runner" ''
@@ -23,12 +22,9 @@ pkgs.writeShellScriptBin "tidefs-fuse-vm-test-runner" ''
   XZ_BIN="${pkgs.xz}/bin/xz"
   KERNEL_IMG="${linuxKernel_7_0}/bzImage"
   MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
-  TIDEFS_XTASK="${tidefsPackage}/bin/tidefs-xtask"
-  TIDEFS_STORE_DEMO="${tidefsPackage}/bin/tidefs-store-demo"
-  FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
+  TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
   ACK_VALIDATION="${ackValidationPackage}/bin/storage-intent-ack-runtime-validation"
   DATA_SHAPE_VALIDATION="${dataShapeValidationPackage}/bin/storage-intent-data-shape-runtime-validation"
-  SCRUB_VALIDATION="${scrubValidationPackage}/bin/scrub_foreground_read_validation"
   BASE64="${pkgs.coreutils}/bin/base64"
   B3SUM="${pkgs.b3sum}/bin/b3sum"
   JQ="${pkgs.jq}/bin/jq"
@@ -36,10 +32,8 @@ pkgs.writeShellScriptBin "tidefs-fuse-vm-test-runner" ''
   TMPDIR="''${TIDEFS_FUSE_VM_TEST_TMPDIR:-/tmp/tidefs-fuse-vm-test}"
   TIMEOUT_SEC="''${TIDEFS_FUSE_VM_TEST_TIMEOUT:-900}"
   VALIDATION_DIR="''${TIDEFS_FUSE_VM_TEST_VALIDATION_DIR:-/tmp/tidefs-validation/fuse-vm-test}"
-  QUEUE_DEPTH_ARTIFACT="''${TIDEFS_FUSE_VM_TEST_QUEUE_DEPTH_ARTIFACT:-}"
   ACK_RECEIPT_RUNTIME=0
   DATA_SHAPE_RUNTIME=0
-  SCRUB_FOREGROUND_READ=0
   KEEP_TMP=0
 
   usage() {
@@ -48,17 +42,15 @@ Usage: tidefs-fuse-vm-test-runner [OPTIONS]
 
 Build a tiny Linux 7.0 initrd from Nix-built artifacts and launch QEMU outside
 the Nix sandbox. The guest runs the tidefsFuseVmTest validation sequence:
-kernel check, /dev/fuse check, tidefs-xtask summary, tidefs-store-demo, and
-smoke-mount with queue-depth artifact capture. Focused runtime options replace
-that default sequence and finish after returning their typed evidence files.
+kernel check, /dev/fuse check, and the canonical pool create, mount, mounted
+I/O, clean remount, and persistence lifecycle. Focused runtime options replace
+that default sequence and finish after returning their typed output.
 
 Options:
   --timeout SECONDS              QEMU runtime timeout (default: 900)
   --validation-dir DIR           Host directory for qemu-boot.log and summary
-  --queue-depth-artifact PATH    Host artifact path for queue-depth JSON
   --ack-receipt-runtime          Run the mounted acknowledgment receipt rows
   --data-shape-runtime           Run the data-shape helper evidence rows
-  --scrub-foreground-read        Run the mounted scrub/read isolation row
   --keep-tmp                     Keep generated initrd/run directory
   --help, -h                     Show this help
 EOF
@@ -74,24 +66,12 @@ EOF
         VALIDATION_DIR="$2"
         shift 2
         ;;
-      --queue-depth-artifact)
-        QUEUE_DEPTH_ARTIFACT="$2"
-        shift 2
-        ;;
-      --queue-depth-artifact=*)
-        QUEUE_DEPTH_ARTIFACT="''${1#--queue-depth-artifact=}"
-        shift
-        ;;
       --ack-receipt-runtime)
         ACK_RECEIPT_RUNTIME=1
         shift
         ;;
       --data-shape-runtime)
         DATA_SHAPE_RUNTIME=1
-        shift
-        ;;
-      --scrub-foreground-read)
-        SCRUB_FOREGROUND_READ=1
         shift
         ;;
       --keep-tmp)
@@ -110,14 +90,10 @@ EOF
     esac
   done
 
-  FOCUSED_MODE_COUNT=$((ACK_RECEIPT_RUNTIME + DATA_SHAPE_RUNTIME + SCRUB_FOREGROUND_READ))
+  FOCUSED_MODE_COUNT=$((ACK_RECEIPT_RUNTIME + DATA_SHAPE_RUNTIME))
   if [ "$FOCUSED_MODE_COUNT" -gt 1 ]; then
     echo "ERROR: focused runtime options are mutually exclusive" >&2
     exit 2
-  fi
-
-  if [ -z "$QUEUE_DEPTH_ARTIFACT" ]; then
-    QUEUE_DEPTH_ARTIFACT="$VALIDATION_DIR/performance/queue-depth-runtime.json"
   fi
 
   if [ ! -e /dev/kvm ]; then
@@ -125,20 +101,12 @@ EOF
     exit 2
   fi
 
-  for dep in "$QEMU_BIN" "$BUSYBOX" "$CPIO" "$XZ_BIN" "$KERNEL_IMG" "$TIDEFS_XTASK" "$TIDEFS_STORE_DEMO" "$FUSE_DAEMON"; do
+  for dep in "$QEMU_BIN" "$BUSYBOX" "$CPIO" "$XZ_BIN" "$KERNEL_IMG" "$TIDEFSCTL"; do
     if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
       echo "ERROR: dependency not found: $dep" >&2
       exit 2
     fi
   done
-  if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
-    for dep in "$SCRUB_VALIDATION" "$BASE64" "$B3SUM" "$JQ"; do
-      if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
-        echo "ERROR: dependency not found: $dep" >&2
-        exit 2
-      fi
-    done
-  fi
   if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
     for dep in "$ACK_VALIDATION" "$BASE64" "$B3SUM" "$JQ"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
@@ -160,20 +128,14 @@ EOF
   echo "  Kernel:          $KERNEL_IMG"
   echo "  Module dir:      $MODULE_DIR"
   echo "  QEMU:            $QEMU_BIN"
-  echo "  TideFS xtask:    $TIDEFS_XTASK"
-  echo "  TideFS demo:     $TIDEFS_STORE_DEMO"
-  echo "  TideFS daemon:   $FUSE_DAEMON"
+  echo "  TideFS control:  $TIDEFSCTL"
   if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
     echo "  Ack validator:   $ACK_VALIDATION"
-  fi
-  if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
-    echo "  Scrub validator: $SCRUB_VALIDATION"
   fi
   if [ "$DATA_SHAPE_RUNTIME" -eq 1 ]; then
     echo "  Data-shape validator: $DATA_SHAPE_VALIDATION"
   fi
   echo "  Validation dir:  $VALIDATION_DIR"
-  echo "  Queue artifact:  $QUEUE_DEPTH_ARTIFACT"
   echo "  Timeout:         ''${TIMEOUT_SEC}s"
 
   RUN_DIR="$TMPDIR/run-$$"
@@ -222,7 +184,7 @@ EOF
   }
 
   copy_binary "$BUSYBOX" "$RUN_DIR/bin/busybox"
-  for applet in sh ls cat echo mount umount grep dmesg sleep timeout poweroff reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync expr head tail cut kill ps test seq date uname tr sed tee true false env printf basename dirname readlink chmod insmod; do
+  for applet in sh ls cat echo mount umount grep dmesg sleep timeout poweroff reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync expr head tail cut kill ps test seq date uname tr sed tee true false env printf basename dirname readlink chmod insmod truncate; do
     ln -sf busybox "$RUN_DIR/bin/$applet"
   done
 
@@ -251,17 +213,11 @@ exec umount "$@"
 EOF
   chmod +x "$RUN_DIR/bin/fusermount"
 
-  copy_binary "$TIDEFS_XTASK" "$RUN_DIR/bin/tidefs-xtask"
-  copy_binary "$TIDEFS_STORE_DEMO" "$RUN_DIR/bin/tidefs-store-demo"
-  copy_binary "$FUSE_DAEMON" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
-  copy_runtime_deps "$BUSYBOX" "$TIDEFS_XTASK" "$TIDEFS_STORE_DEMO" "$FUSE_DAEMON"
+  copy_binary "$TIDEFSCTL" "$RUN_DIR/bin/tidefsctl"
+  copy_runtime_deps "$BUSYBOX" "$TIDEFSCTL"
   if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
     copy_binary "$ACK_VALIDATION" "$RUN_DIR/bin/storage-intent-ack-runtime-validation"
     copy_runtime_deps "$ACK_VALIDATION"
-  fi
-  if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
-    copy_binary "$SCRUB_VALIDATION" "$RUN_DIR/bin/scrub_foreground_read_validation"
-    copy_runtime_deps "$SCRUB_VALIDATION"
   fi
   if [ "$DATA_SHAPE_RUNTIME" -eq 1 ]; then
     copy_binary "$DATA_SHAPE_VALIDATION" "$RUN_DIR/bin/storage-intent-data-shape-runtime-validation"
@@ -296,7 +252,6 @@ export PATH=/bin
 export LD_LIBRARY_PATH=/usr/lib:/lib:/lib64
 ACK_RECEIPT_RUNTIME=__ACK_RECEIPT_RUNTIME__
 DATA_SHAPE_RUNTIME=__DATA_SHAPE_RUNTIME__
-SCRUB_FOREGROUND_READ=__SCRUB_FOREGROUND_READ__
 GITHUB_RUN_ID="__GITHUB_RUN_ID__"
 GITHUB_RUN_ATTEMPT="__GITHUB_RUN_ATTEMPT__"
 GITHUB_SHA="__GITHUB_SHA__"
@@ -381,31 +336,6 @@ if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
     finish
 fi
 
-if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
-    SCRUB_RUNTIME_DIR=/tmp/tidefs-validation/scrub-foreground-read-runtime
-    mkdir -p "$SCRUB_RUNTIME_DIR"
-    TIDEFS_DAEMON_BIN=/bin/tidefs-posix-filesystem-adapter-daemon \
-      timeout 180 scrub_foreground_read_validation \
-      --row scrub-foreground-read-runtime \
-      --output-dir "$SCRUB_RUNTIME_DIR" \
-      >/tmp/scrub-foreground-read-output.txt 2>&1
-    SCRUB_RUNTIME_RC=$?
-    cat /tmp/scrub-foreground-read-output.txt
-
-    if [ -s "$SCRUB_RUNTIME_DIR/scrub-read-runtime.json" ]; then
-        echo "TIDEFS_SCRUB_RUNTIME_ARTIFACT_BEGIN"
-        /bin/busybox base64 "$SCRUB_RUNTIME_DIR/scrub-read-runtime.json"
-        echo "TIDEFS_SCRUB_RUNTIME_ARTIFACT_END"
-    fi
-    if [ -s "$SCRUB_RUNTIME_DIR/evidence-manifest.json" ]; then
-        echo "TIDEFS_SCRUB_EVIDENCE_MANIFEST_BEGIN"
-        /bin/busybox base64 "$SCRUB_RUNTIME_DIR/evidence-manifest.json"
-        echo "TIDEFS_SCRUB_EVIDENCE_MANIFEST_END"
-    fi
-    echo "scrub_runtime_exit_status=$SCRUB_RUNTIME_RC"
-    finish
-fi
-
 if [ "$DATA_SHAPE_RUNTIME" -eq 1 ]; then
     DATA_SHAPE_RUNTIME_DIR=/tmp/tidefs-validation/storage-intent-data-shape-runtime
     mkdir -p "$DATA_SHAPE_RUNTIME_DIR"
@@ -448,59 +378,85 @@ if [ "$DATA_SHAPE_RUNTIME" -eq 1 ]; then
     finish
 fi
 
-if tidefs-xtask summary >/tmp/xtask-summary.out 2>&1; then
-    cat /tmp/xtask-summary.out
-    pass "xtask_summary"
+export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141
+LIFECYCLE_ROOT=/tmp/tidefs-canonical-lifecycle
+DEVICE="$LIFECYCLE_ROOT/device0.tidefs"
+MNT="$LIFECYCLE_ROOT/mnt"
+POOL=fuse_vm_test_pool
+PAYLOAD=tidefs-canonical-mounted-lifecycle
+mkdir -p "$LIFECYCLE_ROOT" "$MNT"
+truncate -s 268435456 "$DEVICE"
+
+if tidefsctl pool create "$POOL" --file-devices --devices "$DEVICE" >/tmp/pool-create.log 2>&1; then
+    pass "pool_create"
 else
-    cat /tmp/xtask-summary.out
-    fail "xtask_summary" "tidefs-xtask summary exited nonzero"
+    cat /tmp/pool-create.log
+    fail "pool_create" "tidefsctl pool create failed"
+    finish
 fi
 
-if tidefs-store-demo >/tmp/store-demo.out 2>&1; then
-    cat /tmp/store-demo.out
-    pass "store_demo"
+tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" >/tmp/pool-mount.log 2>&1 &
+MOUNT_PID=$!
+MOUNTED=0
+for i in $(seq 30); do
+    if mountpoint -q "$MNT" 2>/dev/null; then
+        MOUNTED=1
+        break
+    fi
+    if ! kill -0 "$MOUNT_PID" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+if [ "$MOUNTED" -ne 1 ]; then
+    cat /tmp/pool-mount.log
+    fail "pool_mount" "canonical mount did not become ready"
+    finish
+fi
+pass "pool_mount"
+
+printf '%s\n' "$PAYLOAD" > "$MNT/original.txt"
+sync "$MNT/original.txt"
+mv "$MNT/original.txt" "$MNT/renamed.txt"
+sync
+if [ "$(cat "$MNT/renamed.txt")" = "$PAYLOAD" ]; then
+    pass "mounted_create_write_fsync_rename_read"
 else
-    cat /tmp/store-demo.out
-    fail "store_demo" "tidefs-store-demo exited nonzero"
+    fail "mounted_create_write_fsync_rename_read" "mounted payload mismatch"
 fi
 
-QUEUE_DEPTH_ARTIFACT="__QUEUE_DEPTH_ARTIFACT__"
-mkdir -p "$(dirname "$QUEUE_DEPTH_ARTIFACT")"
-TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141 \
-  tidefs-posix-filesystem-adapter-daemon smoke-mount \
-  --profile quick \
-  --queue-depth-artifact "$QUEUE_DEPTH_ARTIFACT" \
-  >/tmp/smoke-mount-output.txt 2>&1
-SMOKE_RC=$?
-cat /tmp/smoke-mount-output.txt
-
-SMOKE_SUMMARY=$(sed -n 's/.*smoke-mount:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*passed,[[:space:]]*\([0-9][0-9]*\)[[:space:]]*failed.*/\1 \2/p' /tmp/smoke-mount-output.txt | tail -1)
-SMOKE_FAILED=1
-if [ -n "$SMOKE_SUMMARY" ]; then
-    SMOKE_FAILED=$(echo "$SMOKE_SUMMARY" | cut -d' ' -f2)
-fi
-
-if [ "$SMOKE_RC" -eq 0 ] && [ "$SMOKE_FAILED" -eq 0 ]; then
-    pass "smoke_mount"
+if umount "$MNT" && wait "$MOUNT_PID"; then
+    pass "clean_unmount_export"
 else
-    fail "smoke_mount" "rc=$SMOKE_RC failed=$SMOKE_FAILED"
+    fail "clean_unmount_export" "mount owner did not exit cleanly"
 fi
+
+tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" >/tmp/pool-remount.log 2>&1 &
+REMOUNT_PID=$!
+REMOUNTED=0
+for i in $(seq 30); do
+    if mountpoint -q "$MNT" 2>/dev/null; then
+        REMOUNTED=1
+        break
+    fi
+    if ! kill -0 "$REMOUNT_PID" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+if [ "$REMOUNTED" -eq 1 ] && [ "$(cat "$MNT/renamed.txt" 2>/dev/null)" = "$PAYLOAD" ]; then
+    pass "remount_persistence"
+else
+    cat /tmp/pool-remount.log
+    fail "remount_persistence" "fsynced renamed file did not survive remount"
+fi
+umount "$MNT" 2>/dev/null || true
+wait "$REMOUNT_PID" 2>/dev/null || true
 
 echo "--- dmesg tail ---"
 dmesg | tail -80 2>/dev/null || true
 echo "--- end dmesg tail ---"
 
-if [ -s "$QUEUE_DEPTH_ARTIFACT" ]; then
-    pass "queue_depth_runtime_artifact"
-    echo "TIDEFS_QUEUE_DEPTH_ARTIFACT_BEGIN"
-    cat "$QUEUE_DEPTH_ARTIFACT"
-    echo
-    echo "TIDEFS_QUEUE_DEPTH_ARTIFACT_END"
-else
-    fail "queue_depth_runtime_artifact" "missing $QUEUE_DEPTH_ARTIFACT"
-fi
-
-umount -l /tmp/tidefs-smoke-mount-point 2>/dev/null || true
 finish
 INITSCRIPT
 
@@ -518,11 +474,8 @@ INITSCRIPT
     esac
   done
 
-  escaped_queue_path="$(printf '%s' "$QUEUE_DEPTH_ARTIFACT" | sed 's/[&|\\]/\\&/g')"
-  sed -i "s|__QUEUE_DEPTH_ARTIFACT__|$escaped_queue_path|g" "$RUN_DIR/init"
   sed -i "s|__ACK_RECEIPT_RUNTIME__|$ACK_RECEIPT_RUNTIME|g" "$RUN_DIR/init"
   sed -i "s|__DATA_SHAPE_RUNTIME__|$DATA_SHAPE_RUNTIME|g" "$RUN_DIR/init"
-  sed -i "s|__SCRUB_FOREGROUND_READ__|$SCRUB_FOREGROUND_READ|g" "$RUN_DIR/init"
   sed -i "s|__GITHUB_RUN_ID__|''${GITHUB_RUN_ID:-local}|g" "$RUN_DIR/init"
   sed -i "s|__GITHUB_RUN_ATTEMPT__|''${GITHUB_RUN_ATTEMPT:-1}|g" "$RUN_DIR/init"
   sed -i "s|__GITHUB_SHA__|''${GITHUB_SHA:-unknown}|g" "$RUN_DIR/init"
@@ -572,12 +525,6 @@ INITSCRIPT
     ' "$VAL_LOG"
   }
 
-  queue_tmp="$RUN_DIR/queue-depth-runtime.json"
-  extract_between "TIDEFS_QUEUE_DEPTH_ARTIFACT_BEGIN" "TIDEFS_QUEUE_DEPTH_ARTIFACT_END" > "$queue_tmp" || true
-  if [ -s "$queue_tmp" ]; then
-    mkdir -p "$(dirname "$QUEUE_DEPTH_ARTIFACT")"
-    cp "$queue_tmp" "$QUEUE_DEPTH_ARTIFACT"
-  fi
 
   ack_artifact="$VALIDATION_DIR/ack-receipt-runtime.json"
   ack_manifest="$VALIDATION_DIR/ack-receipt-runtime.manifest.json"
@@ -590,19 +537,6 @@ INITSCRIPT
       "TIDEFS_ACK_RUNTIME_MANIFEST_BEGIN" \
       "TIDEFS_ACK_RUNTIME_MANIFEST_END" \
       | "$BASE64" --decode > "$ack_manifest" || true
-  fi
-
-  scrub_artifact="$VALIDATION_DIR/scrub-read-runtime.json"
-  scrub_manifest="$VALIDATION_DIR/evidence-manifest.json"
-  if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
-    extract_between \
-      "TIDEFS_SCRUB_RUNTIME_ARTIFACT_BEGIN" \
-      "TIDEFS_SCRUB_RUNTIME_ARTIFACT_END" \
-      | "$BASE64" --decode > "$scrub_artifact" || true
-    extract_between \
-      "TIDEFS_SCRUB_EVIDENCE_MANIFEST_BEGIN" \
-      "TIDEFS_SCRUB_EVIDENCE_MANIFEST_END" \
-      | "$BASE64" --decode > "$scrub_manifest" || true
   fi
 
   data_shape_transform_artifact="$VALIDATION_DIR/data-shape-transform-execution.json"
@@ -670,56 +604,6 @@ INITSCRIPT
       else
         echo "ACK RUNTIME: captured digest-matched mounted evidence with outcome=$artifact_outcome"
         PASSC=$((PASSC + 1))
-      fi
-    fi
-  fi
-  if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
-    if [ ! -s "$scrub_artifact" ] || [ ! -s "$scrub_manifest" ]; then
-      if [ "$REFUSALC" -eq 0 ]; then
-        FAILC=$((FAILC + 1))
-      fi
-    elif ! "$JQ" -e 'type == "object"' "$scrub_artifact" >/dev/null \
-      || ! "$JQ" -e 'type == "object"' "$scrub_manifest" >/dev/null; then
-      FAILC=$((FAILC + 1))
-    else
-      declared_digest=$("$JQ" -r '.content_digest // empty' "$scrub_manifest")
-      actual_digest="blake3:$("$B3SUM" "$scrub_artifact" | awk '{print $1}')"
-      scrub_outcome=$("$JQ" -r '.outcome // empty' "$scrub_artifact")
-      manifest_outcome=$("$JQ" -r '.outcome // empty' "$scrub_manifest")
-      scrub_source_ref=$("$JQ" -r '.source_ref // empty' "$scrub_artifact")
-      manifest_source_ref=$("$JQ" -r '.source_ref // empty' "$scrub_manifest")
-      expected_source_ref="''${GITHUB_SHA:-unknown}"
-      if [ -z "$declared_digest" ] || [ "$declared_digest" != "$actual_digest" ]; then
-        echo "FAIL: scrub_runtime_artifact_digest -- declared=$declared_digest actual=$actual_digest" >&2
-        FAILC=$((FAILC + 1))
-      elif [ -z "$scrub_source_ref" ] \
-        || [ "$scrub_source_ref" != "$manifest_source_ref" ] \
-        || [ "$scrub_source_ref" != "$expected_source_ref" ]; then
-        echo "FAIL: scrub_runtime_source_ref -- artifact=$scrub_source_ref manifest=$manifest_source_ref expected=$expected_source_ref" >&2
-        FAILC=$((FAILC + 1))
-      elif [ "$scrub_outcome" != "$manifest_outcome" ]; then
-        FAILC=$((FAILC + 1))
-      else
-        case "$scrub_outcome" in
-          pass)
-            if "$JQ" -e \
-              '.passed == true and .runtime_source.workload_ran == true and .mount != null and .scrub_activity.daemon_runtime != null' \
-              "$scrub_artifact" >/dev/null; then
-              PASSC=$((PASSC + 1))
-            else
-              FAILC=$((FAILC + 1))
-            fi
-            ;;
-          environment-refusal)
-            REFUSALC=$((REFUSALC + 1))
-            ;;
-          product-fail|harness-fail)
-            FAILC=$((FAILC + 1))
-            ;;
-          *)
-            FAILC=$((FAILC + 1))
-            ;;
-        esac
       fi
     fi
   fi
@@ -818,8 +702,6 @@ INITSCRIPT
     /^kernel_version=/ { sub(/^kernel_version=/, ""); print; exit }
   ' "$VAL_LOG")
   [ -n "$KERNEL_VERSION" ] || KERNEL_VERSION="unknown"
-  QUEUE_PRESENT=false
-  [ -s "$queue_tmp" ] && QUEUE_PRESENT=true
   DATA_SHAPE_TRANSFORM_PRESENT=false
   DATA_SHAPE_PERFORMANCE_PRESENT=false
   if [ "$DATA_SHAPE_RUNTIME" -eq 1 ]; then
@@ -841,8 +723,6 @@ INITSCRIPT
   "passed": $PASSC,
   "product_failures": $FAILC,
   "environment_refusals": $REFUSALC,
-  "queue_depth_artifact": "$QUEUE_DEPTH_ARTIFACT",
-  "queue_depth_artifact_present": $QUEUE_PRESENT,
   "data_shape_transform_artifact": "$data_shape_transform_artifact",
   "data_shape_transform_artifact_present": $DATA_SHAPE_TRANSFORM_PRESENT,
   "data_shape_performance_fault_artifact": "$data_shape_performance_artifact",
@@ -855,9 +735,6 @@ JSON
   echo "Validation: $PASSC passed, $FAILC failed, $REFUSALC refused"
   echo "Validation log: $VALIDATION_DIR/qemu-boot.log"
   echo "Validation JSON: $VALIDATION_DIR/fuse-vm-test.json"
-  if [ "$QUEUE_PRESENT" = true ]; then
-    echo "Queue-depth artifact: $QUEUE_DEPTH_ARTIFACT"
-  fi
   if [ "$DATA_SHAPE_TRANSFORM_PRESENT" = true ]; then
     echo "Data-shape transform artifact: $data_shape_transform_artifact"
   fi

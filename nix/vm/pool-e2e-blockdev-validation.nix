@@ -22,7 +22,6 @@ let
     GZIP="${pkgs.gzip}/bin/gzip"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
     TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
-    FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
 
     TMPDIR="''${TIDEFS_POOL_E2E_TMPDIR:-/tmp/tidefs-pool-e2e-blockdev-validation}"
     TIMEOUT_SEC="''${TIDEFS_POOL_E2E_TIMEOUT:-600}"
@@ -57,7 +56,7 @@ USAGE
       esac
     done
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$TIDEFSCTL" "$FUSE_DAEMON"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$TIDEFSCTL"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ENVIRONMENT REFUSAL: dependency not found: $dep" >&2
         exit 2
@@ -75,7 +74,6 @@ USAGE
     echo "=== TideFS VAL: pool-e2e-blockdev QEMU ==="
     echo "  Kernel:    $KERNEL_IMG"
     echo "  tidefsctl: $TIDEFSCTL"
-    echo "  Daemon:    $FUSE_DAEMON"
     echo "  QEMU:      $QEMU_BIN"
     echo "  Accel:     $QEMU_ACCEL_LABEL"
     echo "  Timeout:   ''${TIMEOUT_SEC}s"
@@ -141,7 +139,6 @@ USAGE
     done
 
     copy_binary_to_bin "$TIDEFSCTL" tidefsctl
-    copy_binary_to_bin "$FUSE_DAEMON" tidefs-posix-filesystem-adapter-daemon
 
     [ "$FUSE_BUILTIN" -eq 0 ] && cp "$FUSE_KO" "$RUN_DIR/lib/modules/fuse.ko"
 

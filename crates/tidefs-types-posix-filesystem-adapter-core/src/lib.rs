@@ -341,7 +341,7 @@ pub const FUSE_MOUNT_SURFACE_VALIDATION_CASES: &[PosixFilesystemAdapterSurfaceVa
         stable_id: "fuse_surface_0.mount_lifecycle",
         validation_class: PosixFilesystemAdapterSurfaceValidationClass::MountLifecycle,
         status: PosixFilesystemAdapterValidationStatus::ExecutedSmoke,
-        current_surface: "foreground mount command, smoke-mount command, and QEMU /dev/fuse smoke path",
+        current_surface: "tidefsctl pool mount and QEMU /dev/fuse mounted path",
         validation_output: ".github/workflows/qemu-smoke.yml qemu-smoke-fuse-vm-test artifact class and check-fuse-mount-path",
         parent_gate_boundary: "does not prove long-running, multi-client, unmount-race, or broad xfstests mount lifecycle correctness",
         closes_parent_publishing_checklist_item: false,

@@ -308,8 +308,8 @@ pub fn default_matrix_rows() -> Vec<KernelMatrixRow> {
             KernelTestTarget::VfsCleanRead,
             KernelSuiteFamily::QemuSmoke,
             KernelVariant::QemuGuest,
-            "QEMU boot with VFS kmod loaded, smoke-mount passes",
-            "smoke-mount",
+            "QEMU boot with VFS kmod loaded, canonical mounted lifecycle passes",
+            "pool-remount-lifecycle-validation",
         ),
         KernelMatrixRow::new(
             "k7-10-vfs-writeback-xfstests-generic",
