@@ -209,9 +209,10 @@
 //! `fsync_data_only_file`(LocalFileSystem::fsync_data_only_file)):
 //!
 //! 1. Write buffer is flushed.
-//! 2. **Intent-log path**: pending data entries are flushed to durable log
-//!    storage, then folded through Pool receipt publication into the normal
-//!    committed-root boundary.
+//! 2. **Intent-log path**: `fsync_file` flushes pending data entries to
+//!    durable log storage, then folds them through Pool receipt publication
+//!    into the normal committed-root boundary. `fsync_data_only_file` may
+//!    instead return with the data covered by a replayable durable intent.
 //! 3. **Full commit path**:
 //!    `do_commit` persists dirty metadata
 //!    (inodes, directories, extent maps, quota, space counters), rewrites
@@ -12489,6 +12490,7 @@ impl LocalFileSystem {
         // do_commit() folds this payload through the Pool before publishing a
         // root and clearing the now-redundant intent record.
         self.mark_inode_content_dirty(inode_id);
+        self.mark_inode_metadata_dirty(inode_id);
 
         self.record_durable_intent_ack_receipt(
             LocalAckOperation::SyncWrite,
@@ -12709,16 +12711,15 @@ impl LocalFileSystem {
         let started = Instant::now();
         let attr = self.stat(path.as_ref())?;
         self.flush_write_buffer(attr.inode_id)?;
-        // Intent log fast path: if pending entries for this inode exist,
-        // flushing them to durable storage (LOG_DEVICE) makes the data
-        // crash-safe via replay. The full commit_group commit will clear them
-        // later.  When no intents are pending for this inode we fall
-        // through to the full do_commit() path.
+        // Flush pending entries for this inode before the committed-root
+        // barrier. They remain replayable until do_commit() folds their
+        // payload through Pool receipt authority, publishes the replacement
+        // root, and clears the covered entries.
         if self.intent_log.has_pending_data_for_inode(attr.inode_id) {
             self.intent_log
                 .flush_and_sync(self.store.raw_primary_store_mut())?;
-            // Flushed intent-log entries remain replayable: the next
-            // do_commit() will clear them after publishing a new root.
+            // Flushed intent-log entries remain replayable until the
+            // do_commit() below publishes their replacement root.
             self.store.sync_all().map_err(FileSystemError::from)?;
             self.fsync_stats
                 .fsync_intent_log_fast_path_count
@@ -13187,10 +13188,9 @@ impl LocalFileSystem {
                 path: path.as_ref().to_string(),
             });
         }
-        // Intent log fast path: flush pending NamespaceSyncIntent entries
-        // for this directory to durable storage instead of doing a full
-        // commit_group commit.  The intent log replay will restore directory
-        // entries on crash; the next commit_group commit clears the log.
+        // Flush pending NamespaceSyncIntent entries before the committed-root
+        // barrier. They remain replayable until do_commit() publishes the
+        // already-applied namespace state and clears the covered entries.
         if self.intent_log.has_pending_namespace_for_dir(attr.inode_id) {
             self.intent_log
                 .flush_and_sync(self.store.raw_primary_store_mut())?;

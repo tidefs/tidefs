@@ -9568,10 +9568,9 @@ fn debug_incremental_validate() {
 }
 
 #[test]
-fn fsync_file_takes_fast_path_when_intents_pending() {
-    // When intent log has pending data entries for the fsync'd inode,
-    // fsync_file should flush the intent log (fast path) instead of
-    // performing a full do_commit().
+fn fsync_file_commits_pending_intent_through_root() {
+    // A full fsync flushes the replayable intent first, then folds its payload
+    // through Pool authority and publishes a committed replacement root.
     let root = temp_root("fsync-fastpath-file");
     let content = b"fast path data";
     {
@@ -9590,40 +9589,31 @@ fn fsync_file_takes_fast_path_when_intents_pending() {
             .sync_write_intent(ino, 0, content.len() as u64, digest, content)
             .expect("sync_write_intent");
         assert_eq!(reply, IntentLogReplyState::IntentDurable);
-        // After sync_write_intent, entries are flushed to LOG_DEVICE but
-        // remain in the intent log until do_commit() clears them.
-        // pending_flush_count() is 0 because sync() already flushed,
-        // but !is_empty() is true because entries are not cleared.
-        let has_entries = !fs.intent_log.is_empty();
         assert!(
-            has_entries,
+            !fs.intent_log.is_empty(),
             "intent log should have entries after sync_write_intent"
         );
 
-        // fsync_file should take the fast path: flush_and_sync (no-op since
-        // already flushed) and return without doing a full do_commit.
-        fs.fsync_file("/data.bin").expect("fsync_file fast path");
+        fs.fsync_file("/data.bin").expect("fsync_file");
 
-        // After fsync_file fast path, intent log entries are still present
-        // (they were flushed to LOG_DEVICE but not cleared — only do_commit clears).
         assert!(
-            !fs.intent_log.is_empty(),
-            "intent log should NOT be cleared by fast path; only full commit clears"
+            fs.intent_log.is_empty(),
+            "committed intent entries should be cleared after root publication"
         );
-        // State should still be dirty — fast path does not persist state.
         assert!(
-            fs.is_state_dirty(),
-            "state should remain dirty after fast path fsync"
+            !fs.is_state_dirty(),
+            "state should be clean after committed-root fsync"
         );
     }
-    // Reopen: intent log replays, data survives.
+    // Reopen must read the bytes through the committed Pool-backed root; no
+    // intent replay remains necessary.
     {
         let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
         let buf = fs.read_file("/data.bin").expect("read after reopen");
         assert_eq!(
             &buf[..],
             &content[..],
-            "written data should survive crash via intent log replay"
+            "written data should survive through the committed root"
         );
         assert!(
             fs.intent_log.is_empty(),
@@ -9706,10 +9696,11 @@ fn fsync_data_only_takes_fast_path_when_intents_pending() {
 }
 
 #[test]
-fn fsync_directory_takes_fast_path_for_namespace_intents() {
-    // When intent log has NamespaceSyncIntent entries for a directory,
-    // fsync_directory flushes them (fast path) instead of do_commit().
+fn fsync_directory_commits_pending_namespace_intent_through_root() {
+    // Directory fsync flushes its replayable namespace intent first, then
+    // publishes the already-applied namespace through the committed root.
     let root = temp_root("fsync-dir-fastpath");
+    let file_ino;
     {
         let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
         fs.set_auto_commit(false)
@@ -9718,8 +9709,10 @@ fn fsync_directory_takes_fast_path_for_namespace_intents() {
         let dir_ino = dir_rec.inode_id;
 
         // Create a file inside the directory — this dirties the dir.
-        fs.create_file("/mydir/file.txt", 0o644)
+        let file_rec = fs
+            .create_file("/mydir/file.txt", 0o644)
             .expect("create file in dir");
+        file_ino = file_rec.inode_id;
 
         // Record a NamespaceSyncIntent for the directory.
         // This simulates what would happen during mkdir/unlink/rename
@@ -9733,7 +9726,6 @@ fn fsync_directory_takes_fast_path_for_namespace_intents() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        let file_ino = InodeId::new(dir_ino.get() + 1);
         let accepted = fs
             .intent_log
             .append(
@@ -9749,24 +9741,32 @@ fn fsync_directory_takes_fast_path_for_namespace_intents() {
             .expect("append namespace intent");
         assert!(accepted, "namespace intent should be accepted");
 
-        // Fast path: has_pending_namespace_for_dir should return true.
         assert!(
             fs.intent_log.has_pending_namespace_for_dir(dir_ino),
             "should detect pending namespace intent for dir"
         );
 
-        fs.fsync_directory("/mydir")
-            .expect("fsync_directory fast path");
+        fs.fsync_directory("/mydir").expect("fsync_directory");
 
-        // After fast path, intent log still has entries (not cleared).
         assert!(
-            !fs.intent_log.is_empty(),
-            "intent log NOT cleared by fast path"
+            fs.intent_log.is_empty(),
+            "committed namespace intents should be cleared after root publication"
+        );
+        assert!(
+            !fs.is_state_dirty(),
+            "state should be clean after committed-root directory fsync"
         );
     }
-    // NOTE: NamespaceSyncIntent replay is not yet wired (see
-    // intent_log.rs replay_entries_against_state).  Once wired, add a
-    // reopen + verify step here to confirm directory entries survive.
+    {
+        let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+        let file = fs.stat("/mydir/file.txt").expect("stat committed child");
+        assert_eq!(file.inode_id, file_ino);
+        assert_eq!(file.kind(), NodeKind::File);
+        assert!(
+            fs.intent_log.is_empty(),
+            "reopen should not require namespace intent replay"
+        );
+    }
     cleanup(&root);
 }
 
