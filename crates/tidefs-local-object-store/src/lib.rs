@@ -184,15 +184,29 @@ impl ObjectKey {
 
 pub(crate) const POOL_PLACEMENT_RECEIPT_KEY_PREFIX: [u8; 8] = *b"TFSPRCPT";
 pub(crate) const POOL_PLACEMENT_SHARD_KEY_PREFIX: [u8; 8] = *b"TFSPSHRD";
+pub(crate) const POOL_RECEIPT_GENERATION_HIGH_WATER_KEY_PREFIX: [u8; 8] = *b"TFSPRGHW";
+
+pub(crate) fn pool_receipt_generation_high_water_key() -> ObjectKey {
+    let mut bytes = *blake3::hash(b"tidefs-pool-receipt-generation-high-water-v1").as_bytes();
+    bytes[..8].copy_from_slice(&POOL_RECEIPT_GENERATION_HIGH_WATER_KEY_PREFIX);
+    ObjectKey::from_bytes32(bytes)
+}
 
 pub(crate) fn is_pool_placement_receipt_key(key: ObjectKey) -> bool {
     let bytes = key.as_bytes();
     bytes[..8] == POOL_PLACEMENT_RECEIPT_KEY_PREFIX
 }
 
+pub(crate) fn is_pool_receipt_generation_high_water_key(key: ObjectKey) -> bool {
+    let bytes = key.as_bytes();
+    bytes[..8] == POOL_RECEIPT_GENERATION_HIGH_WATER_KEY_PREFIX
+}
+
 pub(crate) fn is_pool_placement_scan_internal_key(key: ObjectKey) -> bool {
     let bytes = key.as_bytes();
-    bytes[..8] == POOL_PLACEMENT_RECEIPT_KEY_PREFIX || bytes[..8] == POOL_PLACEMENT_SHARD_KEY_PREFIX
+    bytes[..8] == POOL_PLACEMENT_RECEIPT_KEY_PREFIX
+        || bytes[..8] == POOL_PLACEMENT_SHARD_KEY_PREFIX
+        || is_pool_receipt_generation_high_water_key(key)
 }
 
 impl fmt::Debug for ObjectKey {
