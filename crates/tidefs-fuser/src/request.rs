@@ -5,7 +5,7 @@
 //!
 //! Review debt TFR-016: This module is meant to go away soon in favor of `ll::Request`.
 
-use crate::abort::AbortHandle;
+use crate::abort::{AbortHandle, AbortRegistry};
 use crate::ll::{fuse_abi as abi, Errno, Response};
 use crate::trace::{errno_name, opcode_name, ERROR_COUNTERS};
 use log::{debug, error, warn};
@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use std::convert::TryFrom;
 #[cfg(feature = "abi-7-28")]
 use std::convert::TryInto;
+use std::io::{self, IoSlice};
 use std::path::Path;
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
@@ -25,6 +26,30 @@ use crate::reply::{Reply, ReplyDirectory, ReplySender};
 use crate::session::{Session, SessionACL};
 use crate::Filesystem;
 use crate::{ll, KernelConfig};
+
+struct AbortClearingReplySender {
+    inner: ChannelSender,
+    abort_registry: AbortRegistry,
+    unique: u64,
+}
+
+impl AbortClearingReplySender {
+    fn new(inner: ChannelSender, abort_registry: AbortRegistry, unique: u64) -> Self {
+        Self {
+            inner,
+            abort_registry,
+            unique,
+        }
+    }
+}
+
+impl ReplySender for AbortClearingReplySender {
+    fn send(&self, data: &[IoSlice<'_>]) -> io::Result<()> {
+        let result = self.inner.send(data);
+        self.abort_registry.remove(self.unique);
+        result
+    }
+}
 
 const SLOW_REQUEST_DIAGNOSTICS_ENV: &str = "TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS";
 const SLOW_REQUEST_THRESHOLD_ENV: &str = "TIDEFS_FUSE_SLOW_REQUEST_MS";
@@ -798,6 +823,10 @@ impl<'a> Request<'a> {
                 let unique = self.request.unique().into();
                 let handle = se.register_abort(unique);
                 self.attach_abort(handle);
+                let reply = Reply::new(
+                    unique,
+                    AbortClearingReplySender::new(self.ch.clone(), se.abort_registry(), unique),
+                );
                 se.filesystem.setlk(
                     self,
                     self.request.nodeid().into(),
@@ -809,9 +838,8 @@ impl<'a> Request<'a> {
                     x.lk_flags(),
                     x.lock().pid,
                     true,
-                    self.reply(),
+                    reply,
                 );
-                se.clear_abort(unique);
             }
             ll::Operation::BMap(x) => {
                 se.filesystem.bmap(
@@ -1098,6 +1126,36 @@ mod tests {
         let ch = dummy_channel();
         let req = Request::new(ch, &INIT_REQUEST[..]).unwrap();
         let _reply: crate::ReplyEmpty = req.reply();
+    }
+
+    #[test]
+    fn deferred_reply_clears_abort_registration_when_sent() {
+        let unique = 42;
+        let abort_registry = AbortRegistry::default();
+        abort_registry.register(unique);
+        let reply: crate::ReplyEmpty = Reply::new(
+            unique,
+            AbortClearingReplySender::new(dummy_channel(), abort_registry.clone(), unique),
+        );
+
+        reply.ok();
+
+        assert_eq!(abort_registry.len(), 0);
+    }
+
+    #[test]
+    fn deferred_reply_clears_abort_registration_when_dropped() {
+        let unique = 43;
+        let abort_registry = AbortRegistry::default();
+        abort_registry.register(unique);
+        let reply: crate::ReplyEmpty = Reply::new(
+            unique,
+            AbortClearingReplySender::new(dummy_channel(), abort_registry.clone(), unique),
+        );
+
+        drop(reply);
+
+        assert_eq!(abort_registry.len(), 0);
     }
 
     #[test]

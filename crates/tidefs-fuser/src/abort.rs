@@ -44,9 +44,9 @@ impl AbortHandle {
 /// The session dispatch loop registers a handle before entering a
 /// blocking operation and removes it on completion.  The INTERRUPT
 /// handler looks up the target unique and signals the handle.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct AbortRegistry {
-    inner: Mutex<HashMap<u64, AbortHandle>>,
+    inner: Arc<Mutex<HashMap<u64, AbortHandle>>>,
 }
 
 impl AbortRegistry {

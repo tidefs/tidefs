@@ -266,17 +266,18 @@ impl<FS: Filesystem> Session<FS> {
         self.abort_registry.register(unique)
     }
 
+    /// Return a shared handle for clearing an abort registration when a
+    /// deferred reply is sent.
+    pub(crate) fn abort_registry(&self) -> AbortRegistry {
+        self.abort_registry.clone()
+    }
+
     /// Signal and remove the abort handle for `unique`.
     ///
     /// Called when the kernel delivers FUSE_INTERRUPT for the given
     /// request.  Returns `true` when a handle was found and signalled.
     pub(crate) fn signal_abort(&mut self, unique: u64) -> bool {
         self.abort_registry.signal(unique)
-    }
-
-    /// Remove the abort handle for `unique` without signalling.
-    pub(crate) fn clear_abort(&mut self, unique: u64) {
-        self.abort_registry.remove(unique);
     }
 
     pub(crate) fn mark_initialized(&self) {

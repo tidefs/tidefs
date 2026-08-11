@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 
 mod capacity;
+#[cfg(feature = "cluster")]
 mod clustered_mount;
 mod coherency_profile;
 mod dispatch_helpers;

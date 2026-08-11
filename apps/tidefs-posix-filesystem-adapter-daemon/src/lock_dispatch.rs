@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE advisory lock dispatch (getlk / setlk / setlkw / flock).
 //!
-//! Wires `tidefs-lock-service` LockService with lease-backed ownership TTLs
-//! into the daemon dispatch layer so that FUSE lock operations are executed
-//! against the per-filesystem lease-backed lock registry.
+//! Owns the local mount session's in-process advisory-lock table. Clustered
+//! LOCK framing and lease authority live behind the daemon's `cluster` feature
+//! and do not participate in this dispatch path.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -12,11 +13,9 @@ use crate::fusewire::{
     FuseGetlkRequest, FuseLockIn, FuseSetlkRequest, FUSE_LK_TYPE_RDLCK, FUSE_LK_TYPE_UNLCK,
     FUSE_LK_TYPE_WRLCK,
 };
-use tidefs_lock_service::{
-    AcquireResult, LockAcquireRequest, LockMode, LockService, LockServiceConfig, LockServiceError,
-    MemberId, ServiceLockOwner,
+use tidefs_posix_filesystem_adapter_workers_locks::{
+    FlockType, LockConflict, LockList, LockRange, LockType,
 };
-use tidefs_posix_filesystem_adapter_workers_locks::{FlockType, LockConflict, LockRange, LockType};
 use tidefs_types_vfs_core::Errno;
 
 use crate::fuse_posix_lock::{FusePosixLockDispatch, FusePosixLockRequest};
@@ -58,29 +57,29 @@ impl WaiterSignal {
     /// Returns `true` when woken, `false` on timeout.
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
         let (lock, cvar) = &*self.inner;
-        let guard = lock.lock().unwrap();
+        let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if *guard {
             return true;
         }
-        let (_new_guard, result) = cvar.wait_timeout(guard, timeout).unwrap();
-        !result.timed_out()
+        let (new_guard, _result) = cvar
+            .wait_timeout(guard, timeout)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *new_guard
     }
 
     /// Wake all threads blocked on this signal.
     pub fn notify_all(&self) {
         let (lock, cvar) = &*self.inner;
-        let mut guard = lock.lock().unwrap();
+        let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = true;
         cvar.notify_all();
     }
 }
 
-/// Daemon lock dispatch state — owns the lease-backed lock service.
+/// Daemon lock dispatch state for one local mount session.
 #[allow(dead_code)]
 pub struct DaemonLockDispatch {
-    svc: LockService,
-    /// Monotonic clock for lease TTLs (milliseconds since an arbitrary epoch).
-    now_millis: u64,
+    locks_by_inode: BTreeMap<u64, LockList>,
     /// Pending blocking `setlkw` waiters.
     waiters: Vec<WaiterEntry>,
 }
@@ -103,8 +102,7 @@ impl DaemonLockDispatch {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            svc: LockService::new(LockServiceConfig::default()),
-            now_millis: 0,
+            locks_by_inode: BTreeMap::new(),
             waiters: Vec::new(),
         }
     }
@@ -114,66 +112,52 @@ impl DaemonLockDispatch {
         ino: u64,
         start: u64,
         len: u64,
-        mode: LockMode,
-        owner: ServiceLockOwner,
-        blocking: bool,
-    ) -> Result<AcquireResult, LockServiceError> {
-        self.svc.acquire(LockAcquireRequest {
-            ino,
-            start,
-            len,
-            mode,
-            owner,
-            blocking,
-            now_millis: self.now_millis,
-        })
+        lock_type: LockType,
+        owner: u64,
+        pid: u32,
+    ) -> Result<(), LockConflict> {
+        let requested = LockRange::new(start, len, lock_type, owner, pid);
+        self.locks_by_inode
+            .entry(ino)
+            .or_default()
+            .acquire(requested)
     }
 
-    /// Return a reference to the underlying LockService (for testing).
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub fn svc(&self) -> &LockService {
-        &self.svc
+    fn release_lock(&mut self, ino: u64, requested: LockRange) {
+        let remove_inode = if let Some(locks) = self.locks_by_inode.get_mut(&ino) {
+            locks.release(requested);
+            locks.is_empty()
+        } else {
+            false
+        };
+        if remove_inode {
+            self.locks_by_inode.remove(&ino);
+        }
     }
 
-    /// Advance the internal clock. Call before each lock operation (or
-    /// periodically) so that lease TTLs are evaluated against a moving
-    /// time base.
-    ///
-    /// Returns the list of locks that expired during this tick.
-    pub fn tick(&mut self, delta_millis: u64) -> Vec<tidefs_lock_service::LockState> {
-        self.now_millis = self.now_millis.saturating_add(delta_millis);
-        self.svc.sweep_expired(self.now_millis)
-    }
-
-    /// Set the internal clock to an absolute value and sweep expired leases.
-    pub fn set_now(&mut self, now_millis: u64) -> Vec<tidefs_lock_service::LockState> {
-        self.now_millis = now_millis;
-        self.svc.sweep_expired(self.now_millis)
+    fn query_lock(&self, ino: u64, requested: LockRange) -> Option<LockConflict> {
+        self.locks_by_inode
+            .get(&ino)
+            .and_then(|locks| locks.query_conflict(requested))
     }
 
     /// Return the number of inodes with active locks.
     #[must_use]
     pub fn inode_count(&self) -> usize {
-        let locks = self.svc.all_locks();
-        let mut inodes: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        for l in &locks {
-            inodes.insert(l.ino);
-        }
-        inodes.len()
+        self.locks_by_inode.len()
     }
 
     /// Return `true` when no locks are held.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.svc.lock_count() == 0
+        self.locks_by_inode.is_empty()
     }
 
     /// Return the current lock count.
     #[must_use]
     #[allow(dead_code)]
     pub fn lock_count(&self) -> usize {
-        self.svc.lock_count()
+        self.locks_by_inode.values().map(LockList::len).sum()
     }
 
     /// Drop all lock state and return to a clean initial state.
@@ -183,10 +167,9 @@ impl DaemonLockDispatch {
     /// locks are expected to have been released through fd closure on
     /// process death before this is called.
     pub fn reset(&mut self) {
-        self.svc = LockService::new(LockServiceConfig::default());
-        self.now_millis = 0;
+        self.locks_by_inode.clear();
         // Wake and clear any pending waiters so no threads are left
-        // blocking on a dead lock service.
+        // blocking on a discarded mount session.
         self.cancel_all_waiters();
     }
     // ── Query by FuseGetlkRequest ─────────────────────────────────────
@@ -204,29 +187,16 @@ impl DaemonLockDispatch {
             return Ok(None);
         }
 
-        let len = len_from_fuse(request.lk);
-        let overlapping = self.svc.query(ino, request.lk.start, len);
-
-        // Use the FUSE lock_owner (request.owner) for same-owner filtering.
-        // For POSIX locks lock_owner == pid; for OFD locks lock_owner is the
-        // file-description id, so two FDs from the same process correctly
-        // conflict.
-        let requesting_owner = request.owner;
-        for state in &overlapping {
-            let existing_type = lock_mode_to_lock_type(state.mode);
-            if lock_type_conflicts(lock_type, existing_type)
-                && state.owner.owner_key != requesting_owner
-            {
-                return Ok(Some(LockRange {
-                    start: state.start,
-                    len: range_len(state.start, state.end),
-                    lock_type: existing_type,
-                    owner: 0,
-                    pid: state.owner.pid,
-                }));
-            }
-        }
-        Ok(None)
+        let requested = LockRange::new(
+            request.lk.start,
+            len_from_fuse(request.lk),
+            lock_type,
+            request.owner,
+            request.lk.pid,
+        );
+        Ok(self
+            .query_lock(ino, requested)
+            .map(|conflict| conflict.existing))
     }
 
     /// Acquire a non-blocking lock.
@@ -235,52 +205,32 @@ impl DaemonLockDispatch {
             .ok_or(LockDispatchError::InvalidLockType(request.lk.typ))?;
 
         if lock_type == LockType::Unlock {
-            let owner = make_owner(request.lk.pid, request.owner);
             let unlock_start = request.lk.start;
-            let unlock_len = safe_len(request.lk.start, len_from_fuse(request.lk));
-            match self
-                .svc
-                .release(ino, unlock_start, unlock_len, owner, self.now_millis)
-            {
-                Ok(_) | Err(LockServiceError::NotFound) => {
-                    let end = range_end(unlock_start, unlock_len);
-                    self.wake_waiters_for_range(ino, unlock_start, end);
-                    return Ok(());
-                }
-                Err(e) => return Err(LockDispatchError::Internal(format!("release: {e:?}"))),
-            }
-        }
-
-        let mode = lock_type_to_lock_mode(lock_type);
-        let owner = make_owner(request.lk.pid, request.owner);
-        let len = len_from_fuse(request.lk);
-
-        let len = safe_len(request.lk.start, len);
-        match self.acquire_lock(ino, request.lk.start, len, mode, owner, false) {
-            Ok(AcquireResult::Granted { .. }) => Ok(()),
-            Ok(AcquireResult::Conflict { holder: _ }) => {
-                Err(LockDispatchError::Conflict(build_conflict(
-                    ino,
-                    &self.svc,
-                    request.lk.start,
-                    len,
-                    lock_type,
-                    request.lk.pid,
-                )))
-            }
-            Ok(AcquireResult::Queued) => Err(LockDispatchError::Conflict(build_conflict(
+            let unlock_len = len_from_fuse(request.lk);
+            self.release_lock(
                 ino,
-                &self.svc,
-                request.lk.start,
-                len,
-                lock_type,
-                request.lk.pid,
-            ))),
-            Err(LockServiceError::QueueFull) => {
-                Err(LockDispatchError::Internal("lock queue full".into()))
-            }
-            Err(e) => Err(LockDispatchError::Internal(format!("acquire: {e:?}"))),
+                LockRange::new(
+                    unlock_start,
+                    unlock_len,
+                    LockType::Unlock,
+                    request.owner,
+                    request.lk.pid,
+                ),
+            );
+            self.wake_waiters_for_range(ino, unlock_start, range_end(unlock_start, unlock_len));
+            return Ok(());
         }
+
+        let len = len_from_fuse(request.lk);
+        self.acquire_lock(
+            ino,
+            request.lk.start,
+            len,
+            lock_type,
+            request.owner,
+            request.lk.pid,
+        )
+        .map_err(LockDispatchError::Conflict)
     }
 
     /// Acquire a blocking lock.
@@ -293,38 +243,39 @@ impl DaemonLockDispatch {
             .ok_or(LockDispatchError::InvalidLockType(request.lk.typ))?;
 
         if lock_type == LockType::Unlock {
-            let owner = make_owner(request.lk.pid, request.owner);
             let unlock_start = request.lk.start;
-            let unlock_len = safe_len(request.lk.start, len_from_fuse(request.lk));
-            match self
-                .svc
-                .release(ino, unlock_start, unlock_len, owner, self.now_millis)
-            {
-                Ok(_) | Err(LockServiceError::NotFound) => {
-                    let end = range_end(unlock_start, unlock_len);
-                    self.wake_waiters_for_range(ino, unlock_start, end);
-                    return Ok(());
-                }
-                Err(e) => return Err(LockDispatchError::Internal(format!("release: {e:?}"))),
-            }
+            let unlock_len = len_from_fuse(request.lk);
+            self.release_lock(
+                ino,
+                LockRange::new(
+                    unlock_start,
+                    unlock_len,
+                    LockType::Unlock,
+                    request.owner,
+                    request.lk.pid,
+                ),
+            );
+            self.wake_waiters_for_range(ino, unlock_start, range_end(unlock_start, unlock_len));
+            return Ok(());
         }
 
-        let mode = lock_type_to_lock_mode(lock_type);
-        let owner = make_owner(request.lk.pid, request.owner);
-        let len = safe_len(request.lk.start, len_from_fuse(request.lk));
+        let len = len_from_fuse(request.lk);
 
         // Try non-blocking acquire first; on conflict register a waiter.
         let end = range_end(request.lk.start, len);
-        match self.acquire_lock(ino, request.lk.start, len, mode, owner, false) {
-            Ok(AcquireResult::Granted { .. }) => Ok(()),
-            Ok(AcquireResult::Queued) | Ok(AcquireResult::Conflict { .. }) => {
+        match self.acquire_lock(
+            ino,
+            request.lk.start,
+            len,
+            lock_type,
+            request.owner,
+            request.lk.pid,
+        ) {
+            Ok(()) => Ok(()),
+            Err(_) => {
                 let signal = self.register_waiter(ino, request.lk.start, end);
                 Err(LockDispatchError::Blocked { signal })
             }
-            Err(LockServiceError::QueueFull) => {
-                Err(LockDispatchError::Internal("lock queue full".into()))
-            }
-            Err(e) => Err(LockDispatchError::Internal(format!("acquire: {e:?}"))),
         }
     }
 
@@ -351,26 +302,10 @@ impl DaemonLockDispatch {
         if lock_type == LockType::Unlock {
             return Ok(None);
         }
-        // Use lock_owner for same-owner filtering.  For POSIX locks
-        // lock_owner == pid; for OFD locks lock_owner != pid and
-        // two different FDs from the same process correctly conflict.
-        let requesting_owner = lock_owner;
-        let overlapping = self.svc.query(ino, start, len);
-        for state in &overlapping {
-            let existing_type = lock_mode_to_lock_type(state.mode);
-            if lock_type_conflicts(lock_type, existing_type)
-                && state.owner.owner_key != requesting_owner
-            {
-                return Ok(Some(LockRange {
-                    start: state.start,
-                    len: range_len(state.start, state.end),
-                    lock_type: existing_type,
-                    owner: 0,
-                    pid: state.owner.pid,
-                }));
-            }
-        }
-        Ok(None)
+        let requested = LockRange::new(start, len, lock_type, lock_owner, pid);
+        Ok(self
+            .query_lock(ino, requested)
+            .map(|conflict| conflict.existing))
     }
 
     /// Acquire or release a lock with raw FUSE values.
@@ -393,35 +328,29 @@ impl DaemonLockDispatch {
         });
 
         if lock_type == LockType::Unlock {
-            let len = safe_len(start, len);
-            let owner = make_owner(pid, lock_owner);
-            match self.svc.release(ino, start, len, owner, self.now_millis) {
-                Ok(_) | Err(LockServiceError::NotFound) => return Ok(()),
-                Err(e) => return Err(LockDispatchError::Internal(format!("release: {e:?}"))),
-            }
+            self.release_lock(
+                ino,
+                LockRange::new(start, len, LockType::Unlock, lock_owner, pid),
+            );
+            self.wake_waiters_for_range(ino, start, range_end(start, len));
+            return Ok(());
         }
 
-        let mode = lock_type_to_lock_mode(lock_type);
-        let owner = make_owner(pid, lock_owner);
-        match self.acquire_lock(ino, start, len, mode, owner, false) {
-            Ok(AcquireResult::Granted { .. }) => Ok(()),
-            Ok(AcquireResult::Conflict { .. }) | Ok(AcquireResult::Queued) => {
-                Err(LockDispatchError::Conflict(build_conflict(
-                    ino, &self.svc, start, len, lock_type, pid,
-                )))
-            }
-            Err(_) => Err(LockDispatchError::Conflict(build_conflict(
-                ino, &self.svc, start, len, lock_type, pid,
-            ))),
-        }
+        self.acquire_lock(ino, start, len, lock_type, lock_owner, pid)
+            .map_err(LockDispatchError::Conflict)
     }
 
     /// Release all POSIX locks held by `lock_owner` on a single `ino`.
     pub fn release_by_owner_and_inode(&mut self, lock_owner: u64, ino: u64) {
-        let owner = make_owner(lock_owner as u32, lock_owner);
-        // Release all locks for this owner on this inode; wake any
-        // waiters whose range overlapped the released locks.
-        let _ = self.svc.release(ino, 0, 0, owner, self.now_millis);
+        let remove_inode = if let Some(locks) = self.locks_by_inode.get_mut(&ino) {
+            locks.release_by_owner(lock_owner);
+            locks.is_empty()
+        } else {
+            false
+        };
+        if remove_inode {
+            self.locks_by_inode.remove(&ino);
+        }
         // Broad wake: retry logic in the FUSE handler ensures
         // waiters re-check and re-register if still blocked.
         self.cancel_all_waiters();
@@ -471,6 +400,26 @@ impl DaemonLockDispatch {
         }
     }
 
+    /// Remove and wake one specific waiter.
+    ///
+    /// Interruptible FUSE requests call this before returning `EINTR` so a
+    /// cancelled waiter cannot remain in the mount-session table until some
+    /// unrelated lock release happens later.
+    pub fn cancel_waiter(&mut self, signal: &WaiterSignal) {
+        let mut cancelled = Vec::new();
+        self.waiters.retain(|waiter| {
+            if waiter.signal == *signal {
+                cancelled.push(waiter.signal.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for signal in cancelled {
+            signal.notify_all();
+        }
+    }
+
     // ── BSD flock dispatch ───────────────────────────────────────────
 
     /// Acquire or release a BSD flock on `ino` (mapped to EOF byte-range).
@@ -480,37 +429,18 @@ impl DaemonLockDispatch {
         flock_type: FlockType,
         owner: u64,
     ) -> Result<(), LockDispatchError> {
-        let mode = match flock_type {
-            FlockType::Shared => LockMode::Shared,
-            FlockType::Exclusive => LockMode::Exclusive,
+        let lock_type = match flock_type {
+            FlockType::Shared => LockType::Read,
+            FlockType::Exclusive => LockType::Write,
         };
-        let lock_owner = make_owner(0, owner);
-        match self.acquire_lock(ino, 0, u64::MAX, mode, lock_owner, false) {
-            Ok(AcquireResult::Granted { .. }) => Ok(()),
-            Ok(AcquireResult::Conflict { holder }) => {
-                // Same-owner upgrade: release old lock, retry acquire
-                if holder.is_some_and(|h| h.node_id == lock_owner.node_id) {
-                    let _ = self
-                        .svc
-                        .release(ino, 0, u64::MAX, lock_owner, self.now_millis);
-                    match self.acquire_lock(ino, 0, u64::MAX, mode, lock_owner, false) {
-                        Ok(AcquireResult::Granted { .. }) => return Ok(()),
-                        _ => return Err(LockDispatchError::WouldBlock),
-                    }
-                }
-                Err(LockDispatchError::WouldBlock)
-            }
-            Ok(AcquireResult::Queued) => Err(LockDispatchError::WouldBlock),
-            Err(_) => Err(LockDispatchError::WouldBlock),
-        }
+        self.acquire_lock(ino, 0, 0, lock_type, owner, 0)
+            .map_err(|_| LockDispatchError::WouldBlock)
     }
 
     /// Release the BSD flock on `ino` held by `owner`.
     pub fn release_flock(&mut self, ino: u64, owner: u64) {
-        let lock_owner = make_owner(0, owner);
-        let _ = self
-            .svc
-            .release(ino, 0, u64::MAX, lock_owner, self.now_millis);
+        self.release_lock(ino, LockRange::new(0, 0, LockType::Unlock, owner, 0));
+        self.wake_waiters_for_range(ino, 0, u64::MAX);
     }
 
     /// Acquire or release a BSD flock using raw FUSE lock values.
@@ -597,11 +527,11 @@ impl FusePosixLockDispatch for DaemonLockDispatch {
 pub enum LockDispatchError {
     /// The lock type value is not a valid `F_RDLCK` / `F_WRLCK` / `F_UNLCK`.
     InvalidLockType(u32),
-    /// The requested lock conflicts with an existing lock held by another process.
+    /// The requested lock conflicts with an existing lock held by another owner.
     Conflict(LockConflict),
     /// The BSD flock request would block (non-blocking conflict).
     WouldBlock,
-    /// Internal lock service error.
+    /// Internal lock dispatch error.
     Internal(String),
     /// The lock could not be immediately acquired; the caller should
     /// block on the contained `WaiterSignal` and retry when woken.
@@ -625,7 +555,11 @@ impl LockDispatchError {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 fn range_end(start: u64, len: u64) -> u64 {
-    start.saturating_add(len)
+    if len == 0 {
+        u64::MAX
+    } else {
+        start.saturating_add(len)
+    }
 }
 
 fn intervals_overlap(a1: u64, b1: u64, a2: u64, b2: u64) -> bool {
@@ -644,88 +578,11 @@ fn fuse_type_to_lock_type(typ: u32) -> Option<LockType> {
     }
 }
 
-/// Convert EOF len=0 to explicit u64::MAX range for LockService compatibility.
-fn safe_len(start: u64, len: u64) -> u64 {
-    if len == 0 {
-        u64::MAX.saturating_sub(start)
-    } else {
-        len
-    }
-}
-
 fn len_from_fuse(lk: FuseLockIn) -> u64 {
     if lk.end == u64::MAX {
         0
     } else {
         lk.end.saturating_sub(lk.start).saturating_add(1)
-    }
-}
-
-const fn lock_mode_to_lock_type(mode: LockMode) -> LockType {
-    match mode {
-        LockMode::Shared | LockMode::None => LockType::Read,
-        LockMode::Exclusive => LockType::Write,
-    }
-}
-
-const fn lock_type_conflicts(a: LockType, b: LockType) -> bool {
-    matches!((a, b), (LockType::Write, _) | (_, LockType::Write))
-}
-
-const fn lock_type_to_lock_mode(lt: LockType) -> LockMode {
-    match lt {
-        LockType::Read => LockMode::Shared,
-        LockType::Write => LockMode::Exclusive,
-        LockType::Unlock => LockMode::None,
-    }
-}
-
-fn make_owner(pid: u32, owner_handle: u64) -> ServiceLockOwner {
-    ServiceLockOwner::new(MemberId::new(owner_handle), pid, owner_handle)
-}
-
-fn range_len(start: u64, end: u64) -> u64 {
-    if end == u64::MAX {
-        0
-    } else {
-        end.saturating_sub(start)
-    }
-}
-
-fn build_conflict(
-    ino: u64,
-    svc: &LockService,
-    start: u64,
-    len: u64,
-    lock_type: LockType,
-    pid: u32,
-) -> LockConflict {
-    let overlapping = svc.query(ino, start, len);
-    let existing = overlapping
-        .first()
-        .map(|s| LockRange {
-            start: s.start,
-            len: range_len(s.start, s.end),
-            lock_type: lock_mode_to_lock_type(s.mode),
-            owner: 0,
-            pid: s.owner.pid,
-        })
-        .unwrap_or(LockRange {
-            start: 0,
-            len: 0,
-            lock_type: LockType::Write,
-            owner: 0,
-            pid: 0,
-        });
-    LockConflict {
-        requested: LockRange {
-            start,
-            len,
-            lock_type,
-            owner: 0,
-            pid,
-        },
-        existing,
     }
 }
 
@@ -1134,39 +991,14 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── Lease-expiry sweep tests ──────────────────────────────────
-
     #[test]
-    fn lease_expiry_auto_releases_locks() {
+    fn local_lock_survives_elapsed_wait_time() {
         let mut d = DaemonLockDispatch::new();
         d.setlk(1, &setlk_in(0, 99, FUSE_LK_TYPE_WRLCK, 100))
             .unwrap();
-        assert_eq!(d.inode_count(), 1);
-        let expired = d.set_now(60_000);
-        assert!(!expired.is_empty());
-        assert!(d.is_empty());
-    }
-
-    #[test]
-    fn non_expired_locks_are_not_swept() {
-        let mut d = DaemonLockDispatch::new();
-        d.setlk(1, &setlk_in(0, 99, FUSE_LK_TYPE_WRLCK, 100))
-            .unwrap();
-        assert_eq!(d.inode_count(), 1);
-        let expired = d.set_now(5_000);
-        assert!(expired.is_empty());
-        assert_eq!(d.inode_count(), 1);
-    }
-
-    #[test]
-    fn tick_advances_clock_and_sweeps() {
-        let mut d = DaemonLockDispatch::new();
-        d.setlk(1, &setlk_in(0, 99, FUSE_LK_TYPE_WRLCK, 100))
-            .unwrap();
-        assert_eq!(d.inode_count(), 1);
-        let had_expired = !d.tick(60_000).is_empty();
-        assert!(had_expired);
-        assert!(d.is_empty());
+        assert!(!WaiterSignal::new().wait_timeout(Duration::from_millis(1)));
+        let conflict = d.getlk(1, &lk_in(0, 99, FUSE_LK_TYPE_WRLCK, 200)).unwrap();
+        assert!(conflict.is_some(), "local locks have no lease TTL");
     }
 
     // ── OFD lock tests (owner != pid) ─────────────────────────────────
@@ -1287,22 +1119,31 @@ mod tests {
     #[test]
     fn ofd_lock_upgrade_same_fd() {
         let mut d = DaemonLockDispatch::new();
-        // FD 10 holds read lock.
+        // Two descriptions from the same process hold overlapping read locks.
         d.setlk(1, &ofd_setlk_in(0, 99, FUSE_LK_TYPE_RDLCK, 100, 10))
             .unwrap();
-        // Same FD tries to upgrade to write lock. The kernel handles
-        // same-owner replacement at the VFS layer; the direct dispatch
-        // path sees this as a self-conflict, which is correct — the
-        // LockService doesn't auto-replace same-owner locks.
-        // FD 20's read lock on overlapping range must conflict with
-        // FD 10's existing read lock (read locks are compatible, but
-        // the attempted write upgrade is the point of interest).
-        let err = d.setlk(1, &ofd_setlk_in(50, 10, FUSE_LK_TYPE_RDLCK, 100, 20));
-        assert!(
-            err.is_ok(),
-            "FD 20 read lock should be compatible with FD 10 read lock"
-        );
-        assert_eq!(d.lock_count(), 2);
+        d.setlk(1, &ofd_setlk_in(0, 99, FUSE_LK_TYPE_RDLCK, 100, 20))
+            .unwrap();
+
+        // FD 10 cannot upgrade while FD 20 still owns the overlapping read lock.
+        let err = d
+            .setlk(1, &ofd_setlk_in(0, 99, FUSE_LK_TYPE_WRLCK, 100, 10))
+            .unwrap_err();
+        assert_eq!(err.to_errno(), Errno::EAGAIN);
+
+        // Releasing FD 20 leaves FD 10 free to replace its own read range.
+        d.setlk(1, &ofd_setlk_in(0, 99, FUSE_LK_TYPE_UNLCK, 100, 20))
+            .unwrap();
+        d.setlk(1, &ofd_setlk_in(0, 99, FUSE_LK_TYPE_WRLCK, 100, 10))
+            .unwrap();
+
+        assert_eq!(d.lock_count(), 1);
+        let conflict = d
+            .getlk(1, &ofd_lk_in(0, 99, FUSE_LK_TYPE_RDLCK, 100, 30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(conflict.lock_type, LockType::Write);
+        assert_eq!(conflict.owner, 10);
     }
 
     #[test]
@@ -1339,6 +1180,48 @@ mod tests {
             .unwrap();
         // Waiter should now be woken.
         assert!(signal.wait_timeout(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn setlkw_eof_waiter_woken_on_finite_release() {
+        let mut d = DaemonLockDispatch::new();
+        d.setlk(1, &setlk_in(0, 99, FUSE_LK_TYPE_WRLCK, 100))
+            .unwrap();
+
+        let result = d.setlkw(1, &setlkw_in(50, u64::MAX, FUSE_LK_TYPE_RDLCK, 200));
+        let signal = match result {
+            Err(LockDispatchError::Blocked { signal }) => signal,
+            other => panic!("expected Blocked, got {other:?}"),
+        };
+        assert!(!signal.wait_timeout(Duration::from_millis(1)));
+
+        d.setlk(1, &setlk_in(0, 99, FUSE_LK_TYPE_UNLCK, 100))
+            .unwrap();
+        assert!(signal.wait_timeout(Duration::from_millis(1)));
+        assert!(d
+            .setlkw(1, &setlkw_in(50, u64::MAX, FUSE_LK_TYPE_RDLCK, 200))
+            .is_ok());
+    }
+
+    #[test]
+    fn finite_waiter_woken_on_eof_release() {
+        let mut d = DaemonLockDispatch::new();
+        d.setlk(1, &setlk_in(0, u64::MAX, FUSE_LK_TYPE_WRLCK, 100))
+            .unwrap();
+
+        let result = d.setlkw(1, &setlkw_in(50, 60, FUSE_LK_TYPE_RDLCK, 200));
+        let signal = match result {
+            Err(LockDispatchError::Blocked { signal }) => signal,
+            other => panic!("expected Blocked, got {other:?}"),
+        };
+        assert!(!signal.wait_timeout(Duration::from_millis(1)));
+
+        d.setlk(1, &setlk_in(0, u64::MAX, FUSE_LK_TYPE_UNLCK, 100))
+            .unwrap();
+        assert!(signal.wait_timeout(Duration::from_millis(1)));
+        assert!(d
+            .setlkw(1, &setlkw_in(50, 60, FUSE_LK_TYPE_RDLCK, 200))
+            .is_ok());
     }
 
     #[test]
