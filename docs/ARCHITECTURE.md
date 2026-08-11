@@ -20,7 +20,7 @@ block ordinary implementation work.
 
 | Path | Source role |
 |---|---|
-| `apps/tidefs-posix-filesystem-adapter-daemon` | Selected local FUSE carrier library; binary-only validation commands must converge on the library carrier. |
+| `apps/tidefs-posix-filesystem-adapter-daemon` | Selected local FUSE carrier library; the binary retains only development test orchestration and has no local mount runtime. |
 | `apps/tidefsctl` | Selected local operator lifecycle and status carrier. |
 | `apps/tidefs-scrub` | Scrub tool whose useful operator behavior is to consolidate into `tidefsctl`. |
 | `apps/tidefs-block-volume-adapter-daemon` | Block-mode source retained outside the first local mounted carrier. |
@@ -75,7 +75,6 @@ Pool-backed filesystem root before accepting mounted work.
 | Create | `apps/tidefsctl/src/commands/pool.rs`, `crates/tidefs-pool-import/src/create.rs` | Writes dual labels plus initial fixed-region VBCR/VRBT bootstrap state and leaves the pool exported. | Keep label/bootstrap creation; stop treating the fixed-region root as mounted filesystem state authority. |
 | Import for mount | `apps/tidefsctl/src/commands/mount.rs`, `crates/tidefs-pool-import/src/lib.rs` | Validates label, feature, encryption, topology, and pool-state agreement; acquires the exact import lock; opens devices in the requested mode; activates only labels for writable ownership; reports removal state; and retains matching export/release. It does not select a fixed-region root, apply `min_epoch`, replay transactions, mount a placeholder namespace, or initialize VRBT. | Keep as mounted device admission only. Pool-backed filesystem root selection and replay belong below `run_mount`; full explicit `pool_import` retains its separate recovery behavior. |
 | Carrier open | `apps/tidefs-posix-filesystem-adapter-daemon/src/lib.rs::run_mount` | Opens `LocalFileSystem` on the runtime metadata directory plus the devices, resolves the dataset, applies the selected sync, timestamp, capacity, writeback, maintenance, transform, and validation controls, wraps the one VFS/FUSE session, and publishes a live owner. | This is the only local mount runtime implementation. |
-| Transitional mount CLI | `apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs::mount_vfs` | Parses the retained validation CLI and translates every consumed option into `MountConfig`, then calls `run_mount`. It does not open storage, select or validate roots, replay transactions, load a placeholder namespace, construct VFS/FUSE, or own shutdown. | Keep only until current validation consumers migrate to `tidefsctl` or focused direct tests, then delete the command wrapper. |
 | Object authority | `crates/tidefs-local-object-store/src/pool/mod.rs` | Opens the same labeled devices as a `Pool`, owns placement/device I/O, and persists object records and pool labels. | Keep as the only object/device I/O authority. |
 | Filesystem root/recovery | `crates/tidefs-local-filesystem/src/{lib,recovery}.rs` | Selects Pool-backed root-slot records, validates content through Pool receipts, replays intent and commit-group state, and constructs live filesystem state. | Keep and focus as the single mounted transaction/root/recovery authority. |
 | Dataset/inode/namespace | `FileSystemState`, `DatasetInodeAuthority`, `tidefs-namespace`, `tidefs-inode-table`, FUSE maps | Local-filesystem owns durable dataset, root, inode, and directory state. `VfsLocalFileSystem` has no inode-table projection, and the selected adapter has neither a `Namespace` attachment nor an inode-table-backed normal dependency. FUSE lookup/forget references remain adapter-local maps. | Keep every durable decision in the dataset authority; keep non-carrier namespace users and kernel-reference projections outside mounted truth. |
@@ -127,9 +126,10 @@ ones in the default graph:
   for the corresponding `full` census. Keeping `--no-default-features`
   explicit prevents unrelated workspace feature unification from inflating a
   carrier's reported default closure.
-- The daemon validation CLI now reaches the same library runtime as
-  `tidefsctl`; it no longer constructs a second recovery, namespace, FUSE, or
-  shutdown stack.
+- Mounted validation now uses `tidefsctl pool create` plus `tidefsctl pool
+  mount` or focused library tests. The daemon binary retains only
+  development test orchestration and constructs no local mount, recovery,
+  namespace, FUSE, or shutdown stack.
 - The default daemon's public mount authority is standalone-only. Cluster lease
   decoding, cluster authority types, placement wrapping, and their tests compile
   only with `cluster`. Receipt-demo parsing/help/source compiles only with
