@@ -4207,6 +4207,9 @@ impl VfsEngine for VfsLocalFileSystem {
         }
 
         let mut fs = self.fs.borrow_mut();
+        if !fs.inode_id_is_allocated(inode) {
+            return Err(Errno::ENOENT);
+        }
 
         if attr.valid & FATTR_SIZE != 0 {
             // Use effective size accounting for buffered writes so the
