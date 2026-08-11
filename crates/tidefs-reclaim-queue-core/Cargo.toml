@@ -21,11 +21,16 @@ tidefs-types-reclaim-queue-core = { workspace = true }
 tidefs-binary_schema-core = { workspace = true }
 tidefs-binary_schema-checksum = { workspace = true }
 tidefs-types-pool-label-core = { workspace = true }
-tidefs-replication-model = { workspace = true }
+tidefs-replication-model = { workspace = true, optional = true }
 tidefs-types-orphan-index-core = { workspace = true }
 blake3 = "1"
 
 [dev-dependencies]
+
+[features]
+default = []
+distributed-repair = ["dep:tidefs-replication-model"]
+full = ["distributed-repair"]
 
 [lib]
 path = "src/lib.rs"

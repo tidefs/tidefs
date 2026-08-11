@@ -279,9 +279,14 @@ impl CapacityAuthority {
             pool.mounted_authority_projection(consumed, StatfsResult::DEFAULT_BLOCK_SIZE);
         let total = mounted_pool.phys_total_bytes;
         committed.update_pool_counters(mounted_pool);
+        // A normal statfs/accounting refresh must not erase allocations that
+        // have left reservation state but are still awaiting committed-root
+        // publication.  The commit-boundary refresh clears pending_bytes
+        // before entering here, so adding the mounted transient projection is
+        // neither stale nor double-counted after publication.
+        let mounted_used = consumed.saturating_add(self.pending_bytes()).min(total);
         self.total_bytes.store(total, Ordering::Release);
-        self.used_bytes
-            .store(consumed.min(total), Ordering::Release);
+        self.used_bytes.store(mounted_used, Ordering::Release);
         *self
             .committed_accounting
             .write()
@@ -295,9 +300,12 @@ impl CapacityAuthority {
         accounting: &SpaceAccounting,
         pool: PoolPhysicalCountersV1,
     ) {
-        self.refresh_committed_accounting(accounting, pool);
+        // Pending allocations are represented by the committed counters from
+        // this boundary onward. Clear the transient side before publishing the
+        // refreshed view so readers can never observe the same bytes twice.
         self.pending_bytes.store(0, Ordering::Release);
         self.reserved_bytes.store(0, Ordering::Release);
+        self.refresh_committed_accounting(accounting, pool);
     }
 
     /// Set the root-reserve byte count.

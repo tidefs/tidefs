@@ -13,15 +13,17 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tidefs_local_object_store::{IntegrityDigest64, StoreError};
+#[cfg(feature = "replication-io")]
+use tidefs_local_object_store::IntegrityDigest64;
+use tidefs_local_object_store::StoreError;
 use tidefs_types_extent_map_core::ExtentMapOps;
 use tidefs_types_vfs_core::{
     DirEntry, DirHandleId, EngineDirHandle, EngineFileHandle, Errno, Generation, InodeAttr,
-    InodeFlags, InodeId, LockSpec, NodeKind, PosixAttrs, RequestCtx, SetAttr, StatFs,
-    FALLOC_FL_COLLAPSE_RANGE, FALLOC_FL_INSERT_RANGE, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE,
-    FALLOC_FL_ZERO_RANGE, FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID,
-    FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID,
-    ROOT_INODE_ID, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
+    InodeId, LockSpec, NodeKind, RequestCtx, SetAttr, StatFs, FALLOC_FL_COLLAPSE_RANGE,
+    FALLOC_FL_INSERT_RANGE, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
+    FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE,
+    FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, ROOT_INODE_ID, S_IFBLK, S_IFCHR, S_IFDIR,
+    S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
 };
 use tidefs_types_vfs_core::{LockRange, LockType};
 use tidefs_vfs_engine::{
@@ -31,7 +33,7 @@ use tidefs_vfs_engine::{
 #[cfg(test)]
 use tidefs_vfs_engine::{LivePoolAdminOutput, LivePoolAdminResponseBody};
 
-use crate::content::{content_chunk_start, reflink_chunked_content, MountedContentReadAuthority};
+use crate::content::reflink_chunked_content;
 use crate::error::FileSystemError;
 use crate::fuse_getattr;
 use crate::fuse_setattr;
@@ -39,9 +41,10 @@ use crate::fuse_statfs;
 use crate::helpers::{kind_bits, validate_name};
 use crate::open_dispatch::{self, FileHandleState, FileHandleTable};
 use crate::release_dispatch;
-use crate::types::{CommittedRootSummary, InodeRecord, IntentLogReplyState, NamespaceEntry};
+#[cfg(feature = "replication-io")]
+use crate::types::CommittedRootSummary;
+use crate::types::{InodeRecord, IntentLogReplyState, NamespaceEntry};
 use crate::xattr_dispatch;
-use crate::ContentLayout;
 use tidefs_inode_attributes::timestamp::{TimestampPolicy, TimestampUpdate};
 use tidefs_posix_semantics::apply_setgid_inheritance_for_create;
 use tidefs_posix_semantics::sticky_dir_allows_unlink_or_rename;
@@ -133,6 +136,7 @@ fn map_errno(err: &FileSystemError) -> Errno {
         FileSystemError::CorruptContent { .. } => Errno::EIO,
         FileSystemError::Unsupported { .. } => Errno::EOPNOTSUPP,
         FileSystemError::SizeOverflow { .. } => Errno::EFBIG,
+        #[cfg(feature = "policy-observation")]
         FileSystemError::ReadServingRefused { .. } => Errno::EIO,
         FileSystemError::Store(StoreError::NoSpace) => Errno::ENOSPC,
         _ => Errno::EIO,
@@ -153,7 +157,6 @@ pub struct VfsLocalFileSystem {
     file_handle_table: RefCell<FileHandleTable>,
     active_dir_handles: RefCell<BTreeMap<DirHandleId, InodeId>>,
     next_dir_handle_id: RefCell<u64>,
-    anonymous_tmpfiles: RefCell<BTreeMap<InodeId, AnonymousTmpfile>>,
     /// When set, all path resolution is scoped to this filesystem directory,
     /// typically the backing directory of a non-root dataset.  The root inode
     /// (ROOT_INODE_ID) maps to this path instead of "/".
@@ -165,300 +168,6 @@ pub struct VfsLocalFileSystem {
 }
 
 // ActiveFileHandle replaced by FileHandleState from open_dispatch
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AnonymousTmpfile {
-    attr: InodeAttr,
-    data: SparseAnonymousData,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct SparseAnonymousData {
-    extents: BTreeMap<u64, Vec<u8>>,
-}
-
-impl SparseAnonymousData {
-    fn new() -> Self {
-        Self {
-            extents: BTreeMap::new(),
-        }
-    }
-
-    fn from_vec(bytes: Vec<u8>) -> Self {
-        let mut data = Self::new();
-        data.insert_if_data(0, bytes);
-        data
-    }
-
-    fn from_local_file(fs: &LocalFileSystem, record: &InodeRecord) -> crate::Result<Self> {
-        let content_reader = MountedContentReadAuthority::new(&fs.store);
-        let layout = content_reader.read_layout(record.inode_id, record)?;
-        match layout {
-            ContentLayout::Inline(content) => Ok(Self::from_vec(content.bytes)),
-            ContentLayout::Chunked(manifest) => {
-                let mut data = Self::new();
-                for chunk_ref in manifest
-                    .chunks
-                    .iter()
-                    .filter(|chunk_ref| !chunk_ref.is_hole())
-                {
-                    let chunk = content_reader.read_chunk(record.inode_id, chunk_ref)?;
-                    let offset = content_chunk_start(chunk_ref.chunk_index)?;
-                    data.insert_if_data(offset, chunk.bytes);
-                }
-                Ok(data)
-            }
-        }
-    }
-
-    fn insert_if_data(&mut self, offset: u64, bytes: Vec<u8>) {
-        if !bytes.is_empty() && bytes.iter().any(|&byte| byte != 0) {
-            self.extents.insert(offset, bytes);
-        }
-    }
-
-    fn read_at(
-        &self,
-        offset: u64,
-        size: u32,
-        file_size: u64,
-    ) -> std::result::Result<Vec<u8>, Errno> {
-        if size == 0 || offset >= file_size {
-            return Ok(Vec::new());
-        }
-        let requested_end = offset.checked_add(u64::from(size)).ok_or(Errno::EFBIG)?;
-        let end = requested_end.min(file_size);
-        let len = usize::try_from(end - offset).map_err(|_| Errno::EFBIG)?;
-        let mut out = vec![0_u8; len];
-        for (&extent_start, bytes) in self.extents.range(..end) {
-            let extent_len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
-            let extent_end = extent_start.checked_add(extent_len).ok_or(Errno::EFBIG)?;
-            if extent_end <= offset {
-                continue;
-            }
-            let copy_start = extent_start.max(offset);
-            let copy_end = extent_end.min(end);
-            if copy_start >= copy_end {
-                continue;
-            }
-            let src = usize::try_from(copy_start - extent_start).map_err(|_| Errno::EFBIG)?;
-            let dst = usize::try_from(copy_start - offset).map_err(|_| Errno::EFBIG)?;
-            let copy_len = usize::try_from(copy_end - copy_start).map_err(|_| Errno::EFBIG)?;
-            out[dst..dst + copy_len].copy_from_slice(&bytes[src..src + copy_len]);
-        }
-        Ok(out)
-    }
-
-    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::result::Result<u64, Errno> {
-        let len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
-        let end = offset.checked_add(len).ok_or(Errno::EFBIG)?;
-        self.clear_range(offset, end)?;
-        if bytes.iter().any(|&byte| byte != 0) {
-            self.extents.insert(offset, bytes.to_vec());
-        }
-        Ok(end)
-    }
-
-    fn clear_range(&mut self, start: u64, end: u64) -> std::result::Result<(), Errno> {
-        if start >= end {
-            return Ok(());
-        }
-        let keys = self
-            .extents
-            .range(..end)
-            .filter_map(|(&extent_start, bytes)| {
-                let extent_len = u64::try_from(bytes.len()).ok()?;
-                let extent_end = extent_start.checked_add(extent_len)?;
-                (extent_end > start).then_some(extent_start)
-            })
-            .collect::<Vec<_>>();
-        for extent_start in keys {
-            let Some(bytes) = self.extents.remove(&extent_start) else {
-                continue;
-            };
-            let extent_len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
-            let extent_end = extent_start.checked_add(extent_len).ok_or(Errno::EFBIG)?;
-            if extent_start < start {
-                let prefix_len = usize::try_from(start - extent_start).map_err(|_| Errno::EFBIG)?;
-                self.insert_if_data(extent_start, bytes[..prefix_len].to_vec());
-            }
-            if extent_end > end {
-                let suffix_start = usize::try_from(end - extent_start).map_err(|_| Errno::EFBIG)?;
-                self.insert_if_data(end, bytes[suffix_start..].to_vec());
-            }
-        }
-        Ok(())
-    }
-
-    fn truncate(&mut self, size: u64) -> std::result::Result<(), Errno> {
-        let keys = self.extents.keys().copied().collect::<Vec<_>>();
-        for start in keys {
-            let Some(bytes) = self.extents.remove(&start) else {
-                continue;
-            };
-            if start >= size {
-                continue;
-            }
-            let extent_len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
-            let extent_end = start.checked_add(extent_len).ok_or(Errno::EFBIG)?;
-            if extent_end <= size {
-                self.insert_if_data(start, bytes);
-            } else {
-                let keep = usize::try_from(size - start).map_err(|_| Errno::EFBIG)?;
-                self.insert_if_data(start, bytes[..keep].to_vec());
-            }
-        }
-        Ok(())
-    }
-
-    fn insert_zeros(
-        &mut self,
-        offset: u64,
-        length: u64,
-        file_size: u64,
-    ) -> std::result::Result<u64, Errno> {
-        let end = offset.checked_add(length).ok_or(Errno::EFBIG)?;
-        if offset >= file_size {
-            return Ok(end);
-        }
-        let mut shifted = BTreeMap::new();
-        for (start, bytes) in std::mem::take(&mut self.extents) {
-            let extent_len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
-            let extent_end = start.checked_add(extent_len).ok_or(Errno::EFBIG)?;
-            if extent_end <= offset {
-                if bytes.iter().any(|&byte| byte != 0) {
-                    shifted.insert(start, bytes);
-                }
-            } else if start >= offset {
-                let new_start = start.checked_add(length).ok_or(Errno::EFBIG)?;
-                if bytes.iter().any(|&byte| byte != 0) {
-                    shifted.insert(new_start, bytes);
-                }
-            } else {
-                let prefix_len = usize::try_from(offset - start).map_err(|_| Errno::EFBIG)?;
-                let suffix_start = offset.checked_add(length).ok_or(Errno::EFBIG)?;
-                let suffix = bytes[prefix_len..].to_vec();
-                let prefix = bytes[..prefix_len].to_vec();
-                if prefix.iter().any(|&byte| byte != 0) {
-                    shifted.insert(start, prefix);
-                }
-                if suffix.iter().any(|&byte| byte != 0) {
-                    shifted.insert(suffix_start, suffix);
-                }
-            }
-        }
-        self.extents = shifted;
-        file_size.checked_add(length).ok_or(Errno::EFBIG)
-    }
-
-    fn collapse_range(
-        &mut self,
-        offset: u64,
-        length: u64,
-        file_size: u64,
-    ) -> std::result::Result<u64, Errno> {
-        if offset >= file_size || length == 0 {
-            return Ok(file_size);
-        }
-        let end = offset
-            .checked_add(length)
-            .unwrap_or(u64::MAX)
-            .min(file_size);
-        let removed = end.saturating_sub(offset);
-        if removed == 0 {
-            return Ok(file_size);
-        }
-        let mut shifted = BTreeMap::new();
-        for (start, bytes) in std::mem::take(&mut self.extents) {
-            let extent_len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
-            let extent_end = start.checked_add(extent_len).ok_or(Errno::EFBIG)?;
-            if extent_end <= offset {
-                if bytes.iter().any(|&byte| byte != 0) {
-                    shifted.insert(start, bytes);
-                }
-            } else if start >= end {
-                let new_start = start.checked_sub(removed).ok_or(Errno::EIO)?;
-                if bytes.iter().any(|&byte| byte != 0) {
-                    shifted.insert(new_start, bytes);
-                }
-            } else {
-                if start < offset {
-                    let prefix_len = usize::try_from(offset - start).map_err(|_| Errno::EFBIG)?;
-                    let prefix = bytes[..prefix_len].to_vec();
-                    if prefix.iter().any(|&byte| byte != 0) {
-                        shifted.insert(start, prefix);
-                    }
-                }
-                if extent_end > end {
-                    let suffix_start = usize::try_from(end - start).map_err(|_| Errno::EFBIG)?;
-                    let new_start = if start < offset {
-                        offset
-                    } else {
-                        start.checked_sub(removed).ok_or(Errno::EIO)?
-                    };
-                    let suffix = bytes[suffix_start..].to_vec();
-                    if suffix.iter().any(|&byte| byte != 0) {
-                        shifted.insert(new_start, suffix);
-                    }
-                }
-            }
-        }
-        self.extents = shifted;
-        Ok(file_size - removed)
-    }
-
-    fn data_ranges(
-        &self,
-        offset: u64,
-        length: u64,
-        file_size: u64,
-    ) -> std::result::Result<Vec<LseekDataRange>, Errno> {
-        let end = offset
-            .checked_add(length)
-            .ok_or(Errno::EINVAL)?
-            .min(file_size);
-        if offset >= end {
-            return Ok(Vec::new());
-        }
-        let mut ranges = Vec::new();
-        for (&extent_start, bytes) in self.extents.range(..end) {
-            let extent_len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
-            let extent_end = extent_start.checked_add(extent_len).ok_or(Errno::EFBIG)?;
-            if extent_end <= offset {
-                continue;
-            }
-            let scan_start = extent_start.max(offset);
-            let scan_end = extent_end.min(end);
-            let mut cursor =
-                usize::try_from(scan_start - extent_start).map_err(|_| Errno::EFBIG)?;
-            let scan_end_idx =
-                usize::try_from(scan_end - extent_start).map_err(|_| Errno::EFBIG)?;
-            while cursor < scan_end_idx {
-                while cursor < scan_end_idx && bytes[cursor] == 0 {
-                    cursor += 1;
-                }
-                if cursor >= scan_end_idx {
-                    break;
-                }
-                let data_start = cursor;
-                while cursor < scan_end_idx && bytes[cursor] != 0 {
-                    cursor += 1;
-                }
-                ranges.push(LseekDataRange::new(
-                    extent_start + data_start as u64,
-                    extent_start + cursor as u64,
-                ));
-            }
-        }
-        Ok(ranges)
-    }
-
-    fn extents(&self) -> impl Iterator<Item = (u64, &[u8])> {
-        self.extents
-            .iter()
-            .map(|(&offset, bytes)| (offset, bytes.as_slice()))
-    }
-}
 
 impl VfsLocalFileSystem {
     const POSIX_ACL_ACCESS_XATTR: &[u8] = b"system.posix_acl_access";
@@ -475,7 +184,6 @@ impl VfsLocalFileSystem {
             file_handle_table: RefCell::new(FileHandleTable::new()),
             active_dir_handles: RefCell::new(BTreeMap::new()),
             next_dir_handle_id: RefCell::new(1),
-            anonymous_tmpfiles: RefCell::new(BTreeMap::new()),
             dataset_root_path: None,
             timestamp_policy: TimestampPolicy::Relatime,
             sync_guarantee: SyncGuarantee::Local,
@@ -611,121 +319,6 @@ impl VfsLocalFileSystem {
     }
 
     // allocate_file_handle_id replaced by FileHandleTable::register()
-
-    fn allocate_anonymous_inode_id(&self) -> std::result::Result<InodeId, Errno> {
-        // Reserve from the normal inode authority so linkat can publish the
-        // same inode number without inflating the persistent allocation bitmap.
-        self.fs
-            .borrow_mut()
-            .reserve_inode_id()
-            .map_err(|e| map_errno(&e))
-    }
-
-    fn anonymous_attr(inode_id: InodeId, mode: u32, ctx: &RequestCtx) -> InodeAttr {
-        let generation = Generation::new(inode_id.get());
-        let masked_permissions = (mode & 0o7777) & !ctx.umask;
-        let now_ns = crate::types::current_posix_time_ns();
-        InodeAttr {
-            inode_id,
-            generation,
-            kind: NodeKind::File,
-            posix: PosixAttrs {
-                mode: kind_bits(NodeKind::File) | masked_permissions,
-                uid: ctx.uid,
-                gid: ctx.gid,
-                nlink: 0,
-                rdev: 0,
-                atime_ns: now_ns,
-                mtime_ns: now_ns,
-                ctime_ns: now_ns,
-                btime_ns: now_ns,
-                size: 0,
-                blocks_512: 0,
-                blksize: 4096,
-            },
-            flags: InodeFlags::default(),
-            subtree_rev: generation.get(),
-            dir_rev: 0,
-        }
-    }
-
-    fn update_anonymous_size(file: &mut AnonymousTmpfile, size: u64) {
-        file.attr.posix.size = size;
-        file.attr.posix.blocks_512 = size.saturating_add(511) / 512;
-        let now_ns = crate::types::current_posix_time_ns();
-        // POSIX: content mutation advances mtime and ctime to the current
-        // wall clock.  The ctime advancement ensures it never steps backward
-        // even when the wall clock is unchanged across rapid mutations.
-        let new_mtime = now_ns.max(file.attr.posix.mtime_ns.saturating_add(1));
-        let new_ctime = now_ns.max(file.attr.posix.ctime_ns.saturating_add(1));
-        file.attr.posix.mtime_ns = new_mtime;
-        file.attr.posix.ctime_ns = new_ctime;
-        // subtree_rev is a storage identity counter, not a POSIX timestamp.
-        // Increment it independently of wall-clock time.
-        file.attr.subtree_rev = file.attr.subtree_rev.saturating_add(1).max(1);
-    }
-
-    fn apply_anonymous_metadata_setattr(file: &mut AnonymousTmpfile, attr: &SetAttr) {
-        let now_ns = crate::types::current_posix_time_ns();
-        let mut changed = false;
-        let mut should_bump_ctime = false;
-
-        if attr.valid & FATTR_MODE != 0 {
-            let mode = (file.attr.posix.mode & S_IFMT) | (attr.mode & !S_IFMT);
-            if file.attr.posix.mode != mode {
-                file.attr.posix.mode = mode;
-                changed = true;
-                should_bump_ctime = true;
-            }
-        }
-        if attr.valid & FATTR_UID != 0 && file.attr.posix.uid != attr.uid {
-            file.attr.posix.uid = attr.uid;
-            changed = true;
-            should_bump_ctime = true;
-        }
-        if attr.valid & FATTR_GID != 0 && file.attr.posix.gid != attr.gid {
-            file.attr.posix.gid = attr.gid;
-            changed = true;
-            should_bump_ctime = true;
-        }
-        if attr.valid & FATTR_ATIME != 0 && file.attr.posix.atime_ns != attr.atime_ns {
-            file.attr.posix.atime_ns = attr.atime_ns;
-            changed = true;
-            should_bump_ctime = true;
-        }
-        if attr.valid & FATTR_CTIME != 0 && file.attr.posix.ctime_ns != attr.ctime_ns {
-            file.attr.posix.ctime_ns = attr.ctime_ns;
-            changed = true;
-        }
-        if attr.valid & FATTR_ATIME_NOW != 0 && file.attr.posix.atime_ns != now_ns {
-            file.attr.posix.atime_ns = now_ns;
-            changed = true;
-            should_bump_ctime = true;
-        }
-        if attr.valid & FATTR_MTIME != 0 && file.attr.posix.mtime_ns != attr.mtime_ns {
-            file.attr.posix.mtime_ns = attr.mtime_ns;
-            changed = true;
-            should_bump_ctime = true;
-        }
-        if attr.valid & FATTR_MTIME_NOW != 0 && file.attr.posix.mtime_ns != now_ns {
-            file.attr.posix.mtime_ns = now_ns;
-            changed = true;
-            should_bump_ctime = true;
-        }
-        if should_bump_ctime && attr.valid & FATTR_CTIME == 0 {
-            let next_ctime = now_ns.max(file.attr.posix.ctime_ns.saturating_add(1));
-            if file.attr.posix.ctime_ns != next_ctime {
-                file.attr.posix.ctime_ns = next_ctime;
-                changed = true;
-            }
-        }
-        if changed {
-            file.attr.subtree_rev = file
-                .attr
-                .subtree_rev
-                .max(u64::try_from(file.attr.posix.ctime_ns.max(0)).unwrap_or(u64::MAX));
-        }
-    }
 
     fn register_file_handle(
         &self,
@@ -1014,19 +607,6 @@ impl VfsLocalFileSystem {
         } else {
             requested & !umask
         }
-    }
-
-    fn apply_metadata_setattr(
-        fs: &mut LocalFileSystem,
-        path: &str,
-        attr: &SetAttr,
-        size_changed: bool,
-    ) -> std::result::Result<(), Errno> {
-        if Self::metadata_setattr_is_noop(attr, size_changed) {
-            return Ok(());
-        }
-        let inode_id = fs.lookup(path).map_err(|e| map_errno(&e))?;
-        Self::apply_metadata_setattr_to_inode(fs, inode_id, attr, size_changed)
     }
 
     fn metadata_setattr_is_noop(attr: &SetAttr, size_changed: bool) -> bool {
@@ -1459,56 +1039,6 @@ impl VfsLocalFileSystem {
         gid: u32,
         parent_default_acl_entries: Option<&tidefs_posix_acl::PosixAcl>,
     ) -> std::result::Result<InodeRecord, Errno> {
-        self.create_empty_regular_file_with_inode(
-            None,
-            parent_id,
-            parent_path,
-            child_path,
-            name,
-            mode,
-            uid,
-            gid,
-            parent_default_acl_entries,
-        )
-    }
-
-    fn create_empty_regular_file_at_inode(
-        &self,
-        inode_id: InodeId,
-        parent_id: InodeId,
-        parent_path: &str,
-        child_path: &str,
-        name: &[u8],
-        mode: u32,
-        uid: u32,
-        gid: u32,
-        parent_default_acl_entries: Option<&tidefs_posix_acl::PosixAcl>,
-    ) -> std::result::Result<InodeRecord, Errno> {
-        self.create_empty_regular_file_with_inode(
-            Some(inode_id),
-            parent_id,
-            parent_path,
-            child_path,
-            name,
-            mode,
-            uid,
-            gid,
-            parent_default_acl_entries,
-        )
-    }
-
-    fn create_empty_regular_file_with_inode(
-        &self,
-        fixed_inode_id: Option<InodeId>,
-        parent_id: InodeId,
-        parent_path: &str,
-        child_path: &str,
-        name: &[u8],
-        mode: u32,
-        uid: u32,
-        gid: u32,
-        parent_default_acl_entries: Option<&tidefs_posix_acl::PosixAcl>,
-    ) -> std::result::Result<InodeRecord, Errno> {
         let mut fs = self.fs.borrow_mut();
         if fs
             .dir_entry_by_inode(parent_id, name, parent_path)
@@ -1551,16 +1081,7 @@ impl VfsLocalFileSystem {
         }
 
         let tick = fs.bump_generation();
-        let inode_id = if let Some(inode_id) = fixed_inode_id {
-            if fs.state.inodes.contains_key(&inode_id) {
-                fs.rollback_mutation_delta();
-                return Err(Errno::EIO);
-            }
-            fs.state.observe_explicit_inode_id(inode_id);
-            inode_id
-        } else {
-            fs.allocate_inode_id()
-        };
+        let inode_id = fs.allocate_inode_id();
         let generation = Generation::new(tick);
         let mut new_mode = mode;
         let mut xattrs = BTreeMap::new();
@@ -1732,6 +1253,7 @@ impl VfsLocalFileSystem {
                     LivePoolAdminCommand::SnapshotExtract => {
                         self.live_snapshot_extract(&args, wants_json)
                     }
+                    #[cfg(feature = "replication-io")]
                     LivePoolAdminCommand::SnapshotSend => {
                         self.live_snapshot_send(&args, wants_json)
                     }
@@ -2304,6 +1826,14 @@ impl VfsLocalFileSystem {
                     ),
                 );
             };
+            if !crate::feature_available_in_current_build(&feature) {
+                return live_admin_error(
+                    1,
+                    format!(
+                        "dataset set-strategy: feature '{feature_str}' requires a data-policy build"
+                    ),
+                );
+            }
             let enable_result = match fs.feature_flags_mut() {
                 Ok(flags) => flags.enable_feature_with_prereqs(feature, feature_class),
                 Err(err) => {
@@ -2371,6 +1901,7 @@ impl VfsLocalFileSystem {
                     format!("dataset set-strategy: failed to persist feature flags: {err}"),
                 );
             }
+            #[cfg(feature = "data-policy")]
             if let Err(err) = fs.refresh_policies_from_features() {
                 return live_admin_error(
                     1,
@@ -2402,8 +1933,13 @@ impl VfsLocalFileSystem {
         }
 
         let supported = tidefs_dataset_feature_flags::SupportedFeaturesV1::current();
-        let to_enable: Vec<_> = supported
+        let available: Vec<_> = supported
             .as_slice()
+            .iter()
+            .filter(|feature| crate::feature_available_in_current_build(feature))
+            .cloned()
+            .collect();
+        let to_enable: Vec<_> = available
             .iter()
             .filter(|feature| !fs.feature_flags().is_enabled(feature))
             .cloned()
@@ -2412,7 +1948,7 @@ impl VfsLocalFileSystem {
         if to_enable.is_empty() {
             return live_admin_ok_text(format!(
                 "dataset '{name}': all {} supported features are already enabled",
-                supported.len()
+                available.len()
             ));
         }
 
@@ -2422,7 +1958,7 @@ impl VfsLocalFileSystem {
         let mut failed = Vec::new();
         let mut out = vec![format!(
             "dataset '{name}': upgrading from {before_count} enabled to {} supported features...",
-            supported.len()
+            available.len()
         )];
 
         let mut pending = to_enable;
@@ -2500,6 +2036,7 @@ impl VfsLocalFileSystem {
                     format!("dataset upgrade: failed to persist feature flags: {err}"),
                 );
             }
+            #[cfg(feature = "data-policy")]
             if let Err(err) = fs.refresh_policies_from_features() {
                 return live_admin_error(
                     1,
@@ -3029,6 +2566,7 @@ impl VfsLocalFileSystem {
         }
     }
 
+    #[cfg(feature = "replication-io")]
     fn live_snapshot_send(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
         let mut fs = self.fs.borrow_mut();
         let plan = match live_snapshot_send_plan(args, &mut fs) {
@@ -3874,6 +3412,7 @@ fn live_admin_string_vec(args: &Value, key: &str) -> Result<Vec<String>, String>
     }
 }
 
+#[cfg(feature = "replication-io")]
 fn live_admin_hex_16_or_default(args: &Value, key: &str) -> Result<[u8; 16], String> {
     match live_admin_optional_arg(args, key) {
         Some(value) => live_admin_hex_to_16(value),
@@ -3881,6 +3420,7 @@ fn live_admin_hex_16_or_default(args: &Value, key: &str) -> Result<[u8; 16], Str
     }
 }
 
+#[cfg(feature = "replication-io")]
 fn live_admin_hex_to_16(value: &str) -> Result<[u8; 16], String> {
     let hex = value.strip_prefix("0x").unwrap_or(value);
     if hex.len() != 32 {
@@ -3902,11 +3442,13 @@ fn live_admin_hex_to_16(value: &str) -> Result<[u8; 16], String> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 enum LiveSnapshotSendFormat {
     Vfssend1,
     Vfssend2,
 }
 
+#[cfg(feature = "replication-io")]
 impl LiveSnapshotSendFormat {
     fn parse(args: &Value) -> Result<Self, String> {
         match live_admin_optional_arg(args, "format").unwrap_or("vfssend1") {
@@ -3925,11 +3467,13 @@ impl LiveSnapshotSendFormat {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 enum LiveSnapshotSendMode {
     Full,
     Incremental { from_root: CommittedRootSummary },
 }
 
+#[cfg(feature = "replication-io")]
 impl LiveSnapshotSendMode {
     const fn is_incremental(&self) -> bool {
         matches!(self, Self::Incremental { .. })
@@ -3944,6 +3488,7 @@ impl LiveSnapshotSendMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 enum LiveSnapshotSendDestination {
     Output(std::path::PathBuf),
     TargetAddress {
@@ -3953,6 +3498,7 @@ enum LiveSnapshotSendDestination {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 struct LiveSnapshotSendPlan {
     destination: LiveSnapshotSendDestination,
     format: LiveSnapshotSendFormat,
@@ -3962,6 +3508,7 @@ struct LiveSnapshotSendPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 struct LiveSnapshotEncodedStream {
     encoded: Vec<u8>,
     total_records: u64,
@@ -3969,6 +3516,7 @@ struct LiveSnapshotEncodedStream {
     roots_len: usize,
 }
 
+#[cfg(feature = "replication-io")]
 fn live_snapshot_send_plan(
     args: &Value,
     fs: &mut LocalFileSystem,
@@ -4000,6 +3548,7 @@ fn live_snapshot_send_plan(
     })
 }
 
+#[cfg(feature = "replication-io")]
 fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestination, String> {
     let output = live_admin_optional_arg(args, "output").map(std::path::PathBuf::from);
     match live_admin_optional_arg(args, "target_addr") {
@@ -4014,6 +3563,7 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
     }
 }
 
+#[cfg(feature = "replication-io")]
 fn live_snapshot_send_from_root_arg(
     args: &Value,
     fs: &mut LocalFileSystem,
@@ -4051,6 +3601,7 @@ fn live_snapshot_send_from_root_arg(
         })
 }
 
+#[cfg(feature = "replication-io")]
 fn live_admin_hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
     let hex = value.strip_prefix("0x").unwrap_or(value);
     if !hex.len().is_multiple_of(2) {
@@ -4072,6 +3623,7 @@ fn live_admin_hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+#[cfg(feature = "replication-io")]
 fn live_snapshot_send_export(
     fs: &mut LocalFileSystem,
     plan: &LiveSnapshotSendPlan,
@@ -4449,7 +4001,9 @@ impl VfsLocalFileSystem {
         let (planned_entries, allocation_bytes, materialized_bytes) = fs
             .reflink_clone_content_plan(source_fh.inode_id, &source_record, &dest_record)
             .map_err(|e| map_errno(&e))?;
+        #[cfg(feature = "policy-observation")]
         let new_blocks = allocation_bytes / u64::from(crate::constants::content_chunk_size());
+        #[cfg(feature = "policy-observation")]
         fs.ensure_obligation_capacity("staging_dirty", new_blocks, Some(dest_fh.inode_id))
             .map_err(|e| map_errno(&e))?;
         fs.ensure_content_capacity_with_planned_inode(Some(dest_fh.inode_id), planned_entries)
@@ -4530,16 +4084,11 @@ impl VfsLocalFileSystem {
         if live.enforce_access_mode && !open_flags_allow_read(live.open_flags) {
             return Err(Errno::EBADF);
         }
-        if let Some(file) = self.anonymous_tmpfiles.borrow().get(&fh.inode_id) {
-            return file.data.read_at(offset, size, file.attr.posix.size);
-        }
-        let path = self.inode_path(fh.inode_id)?;
-
-        let data = match self
-            .fs
-            .borrow()
-            .read_file_range(&path, offset, size as usize)
-        {
+        let data = match self.fs.borrow().read_file_range_by_inode(
+            fh.inode_id,
+            offset,
+            size as usize,
+        ) {
             Ok(data) => data,
             Err(err) => {
                 let errno = map_errno(&err);
@@ -4618,22 +4167,6 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
         self.validate_optional_file_handle(inode, handle)?;
-        if let Some(file) = self.anonymous_tmpfiles.borrow().get(&inode) {
-            return Ok(file.attr);
-        }
-        // If the inode was a released tmpfile (no longer in anonymous_tmpfiles
-        // but still tracked in the orphan index), return ENOENT so the
-        // adapter sees the expected missing-inode error.
-        if self
-            .fs
-            .borrow()
-            .orphan_index
-            .lock()
-            .unwrap()
-            .contains(inode.get())
-        {
-            return Err(Errno::ENOENT);
-        }
         if inode == ROOT_INODE_ID && self.dataset_root_path.is_some() {
             let root_path = self.root_path();
             let attr = self
@@ -4673,17 +4206,10 @@ impl VfsEngine for VfsLocalFileSystem {
             return Err(Errno::EINVAL);
         }
 
-        if let Some(file) = self.anonymous_tmpfiles.borrow_mut().get_mut(&inode) {
-            if attr.valid & FATTR_SIZE != 0 && attr.size != file.attr.posix.size {
-                file.data.truncate(attr.size)?;
-                Self::update_anonymous_size(file, attr.size);
-            }
-            Self::apply_anonymous_metadata_setattr(file, attr);
-            return Ok(file.attr);
-        }
-
-        let path = self.inode_path(inode)?;
         let mut fs = self.fs.borrow_mut();
+        if !fs.inode_id_is_allocated(inode) {
+            return Err(Errno::ENOENT);
+        }
 
         if attr.valid & FATTR_SIZE != 0 {
             // Use effective size accounting for buffered writes so the
@@ -4692,16 +4218,16 @@ impl VfsEngine for VfsLocalFileSystem {
             let logical_size = fs.effective_file_size(inode);
             let size_changed = attr.size != logical_size;
             if size_changed {
-                fs.truncate_file(&path, attr.size)
+                fs.truncate_file_by_inode(inode, attr.size)
                     .map_err(|e| map_errno(&e))?;
             }
-            Self::apply_metadata_setattr(&mut fs, &path, attr, size_changed)?;
+            Self::apply_metadata_setattr_to_inode(&mut fs, inode, attr, size_changed)?;
         } else {
-            Self::apply_metadata_setattr(&mut fs, &path, attr, false)?;
+            Self::apply_metadata_setattr_to_inode(&mut fs, inode, attr, false)?;
         }
 
         drop(fs);
-        self.fs.borrow().stat_attr(&path).map_err(|e| map_errno(&e))
+        self.getattr_by_ino(inode.get())
     }
 
     fn mkdir(
@@ -4908,30 +4434,53 @@ impl VfsEngine for VfsLocalFileSystem {
             return Err(Errno::ENOTDIR);
         }
 
-        let inode_id = self.allocate_anonymous_inode_id()?;
-        let attr = Self::anonymous_attr(inode_id, mode, ctx);
-        // Track in the persistent orphan index for crash-safe recovery.
-        let ino_u64 = inode_id.get();
-        let generation = Generation::new(ino_u64);
-        self.fs
+        let parent_default_acl_entries = Self::parent_default_acl_entries(&parent_record);
+        let permissions = Self::creation_permissions_for_parent(
+            parent_default_acl_entries.as_ref(),
+            mode,
+            ctx.umask,
+        );
+        let (mut file_mode, file_gid) = apply_setgid_inheritance_for_create(
+            parent_record.mode,
+            parent_record.gid,
+            S_IFREG | permissions,
+            ctx.gid,
+        );
+        let mut xattrs = BTreeMap::new();
+        if let Some(acl_entries) = parent_default_acl_entries.as_ref() {
+            for (name, value) in
+                tidefs_posix_acl::default_acl_inheritance_for_parent(acl_entries, file_mode, false)
+            {
+                if name == Self::POSIX_ACL_ACCESS_XATTR {
+                    if let Ok(access_acl) = tidefs_posix_acl::decode_posix_acl_xattr(&value) {
+                        file_mode =
+                            tidefs_posix_acl::posix_mode_from_access_acl(&access_acl, file_mode);
+                    }
+                }
+                xattrs.insert(name.to_vec(), value);
+            }
+        }
+        let record = self
+            .fs
             .borrow_mut()
-            .track_tmpfile_orphan(inode_id, generation.get(), ctx.pid)
-            .map_err(|e| map_errno(&e))?;
+            .create_unlinked_regular_file(
+                parent_record.inode_id,
+                file_mode,
+                ctx.uid,
+                file_gid,
+                xattrs,
+            )
+            .map_err(|error| map_errno(&error))?;
+        let inode_id = record.inode_id;
+        let attr = record.to_inode_attr();
 
         let fh = match self.register_file_handle(inode_id, flags, true) {
             Ok(fh) => fh,
             Err(err) => {
-                let _ = self.fs.borrow_mut().remove_tmpfile_orphan_on_link(inode_id);
+                let _ = self.fs.borrow_mut().finalize_orphan_inode(inode_id);
                 return Err(err);
             }
         };
-        self.anonymous_tmpfiles.borrow_mut().insert(
-            inode_id,
-            AnonymousTmpfile {
-                attr,
-                data: SparseAnonymousData::new(),
-            },
-        );
 
         Ok((attr, fh))
     }
@@ -4959,34 +4508,11 @@ impl VfsEngine for VfsLocalFileSystem {
             .borrow()
             .contains_inode(record.inode_id);
         if has_open_handles {
-            self.fs
-                .borrow_mut()
-                .flush_write_buffer(record.inode_id)
-                .map_err(|e| map_errno(&e))?;
-            let record = self
-                .fs
-                .borrow()
-                .stat(&child_path)
-                .map_err(|e| map_errno(&e))?;
-            let mut attr = self
-                .fs
-                .borrow()
-                .stat_attr(&child_path)
-                .map_err(|e| map_errno(&e))?;
-            if attr.posix.nlink <= 1 {
-                attr.posix.nlink = 0;
-                attr.posix.ctime_ns = crate::types::current_posix_time_ns();
-                let data = {
-                    let fs = self.fs.borrow();
-                    SparseAnonymousData::from_local_file(&fs, &record).map_err(|e| map_errno(&e))?
-                };
+            if record.nlink <= 1 {
                 self.fs
                     .borrow_mut()
-                    .unlink(&child_path)
+                    .unlink_child_retaining_inode(parent_record.inode_id, name, &child_path)
                     .map_err(|e| map_errno(&e))?;
-                self.anonymous_tmpfiles
-                    .borrow_mut()
-                    .insert(record.inode_id, AnonymousTmpfile { attr, data });
             } else {
                 self.fs
                     .borrow_mut()
@@ -5134,78 +4660,25 @@ impl VfsEngine for VfsLocalFileSystem {
         target: InodeId,
         new_parent: InodeId,
         new_name: &[u8],
-        ctx: &RequestCtx,
+        _ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
         self.ensure_writable()?;
-        // Materialize anonymous tmpfiles: when an O_TMPFILE inode is
-        // linked into the namespace, use the engine's own create+write
-        // path to build a proper filesystem inode and directory entry,
-        // then remap the handle table so the open fd stays valid.
-        let is_anonymous_tmpfile = self.anonymous_tmpfiles.borrow().contains_key(&target);
-        if is_anonymous_tmpfile {
+        let target_record = self
+            .fs
+            .borrow()
+            .get_inode_by_id(target)
+            .cloned()
+            .ok_or(Errno::ENOENT)?;
+        if target_record.nlink == 0 {
             let new_parent_path = self.inode_path(new_parent)?;
             let new_path = build_child_path(&new_parent_path, new_name)?;
-
-            // Check for duplicate before calling create().
-            if self.fs.borrow().stat(&new_path).is_ok() {
-                return Err(Errno::EEXIST);
-            }
-
-            // Remove from persistent orphan index: the inode is no longer
-            // orphaned once it has a directory entry.
-            self.fs
+            let linked = self
+                .fs
                 .borrow_mut()
-                .remove_tmpfile_orphan_on_link(target)
-                .map_err(|e| map_errno(&e))?;
-            let tmpfile = self
-                .anonymous_tmpfiles
-                .borrow_mut()
-                .remove(&target)
-                .ok_or(Errno::EIO)?;
-
-            // Publish the existing anonymous inode into the namespace rather
-            // than creating an alias with a fresh inode id.  Open handles and
-            // read/write paths use the tmpfile inode id after linkat.
-            let linked_record = self.create_empty_regular_file_at_inode(
-                target,
-                new_parent,
-                &new_parent_path,
-                &new_path,
-                new_name,
-                tmpfile.attr.posix.mode,
-                tmpfile.attr.posix.uid,
-                tmpfile.attr.posix.gid,
-                None,
-            )?;
-            let new_ino = linked_record.inode_id;
-            let new_fh = self.register_file_handle(new_ino, 0, false)?;
-
-            if tmpfile.attr.posix.size > 0 {
-                let mut size_attr = SetAttr::new();
-                size_attr.valid = FATTR_SIZE;
-                size_attr.size = tmpfile.attr.posix.size;
-                self.setattr(new_ino, &size_attr, Some(&new_fh), ctx)?;
-            }
-
-            // Write buffered data through the engine's write path.
-            for (extent_offset, extent_bytes) in tmpfile.data.extents() {
-                self.write(&new_fh, extent_offset, extent_bytes, ctx)?;
-            }
-
-            // Release the engine handle we allocated for the write.
-            self.release(&new_fh)?;
-
-            // Get updated attributes after write+setattr+release.
-            let linked_attr = self.getattr(new_ino, None, ctx)?;
-
-            // Add path cache entry for the original tmpfile inode so
-            // that lookups by the FUSE kernel can find the path.
+                .link_file_by_inode(target, new_parent, new_name, &new_path)
+                .map_err(|error| map_errno(&error))?;
             self.path_cache.borrow_mut().insert(target, new_path);
-
-            // Return attributes with the original inode ID.
-            let mut reply_attr = linked_attr;
-            reply_attr.inode_id = target;
-            return Ok(reply_attr);
+            return Ok(linked.to_inode_attr());
         }
 
         let target_path = self.inode_path(target)?;
@@ -5376,11 +4849,18 @@ impl VfsEngine for VfsLocalFileSystem {
         // Delegate handle release to the release dispatch module.
         let released = release_dispatch::engine_release(&self.file_handle_table, fh)?;
 
-        // Reclaim anonymous tmpfiles when the last handle is released.
-        let should_reclaim = self.anonymous_tmpfiles.borrow().contains_key(&released)
-            && !self.file_handle_table.borrow().contains_inode(released);
-        if should_reclaim {
-            self.anonymous_tmpfiles.borrow_mut().remove(&released);
+        if !self.file_handle_table.borrow().contains_inode(released) {
+            let should_finalize = self
+                .fs
+                .borrow()
+                .get_inode_by_id(released)
+                .is_some_and(|record| record.nlink == 0);
+            if should_finalize {
+                self.fs
+                    .borrow_mut()
+                    .finalize_orphan_inode(released)
+                    .map_err(|error| map_errno(&error))?;
+            }
         }
         Ok(())
     }
@@ -5431,26 +4911,13 @@ impl VfsEngine for VfsLocalFileSystem {
         if live.enforce_access_mode && !open_flags_allow_write(live.open_flags) {
             return Err(Errno::EBADF);
         }
-        if let Some(file) = self.anonymous_tmpfiles.borrow_mut().get_mut(&fh.inode_id) {
-            let write_offset = if live.enforce_access_mode && live.open_flags & O_APPEND != 0 {
-                file.attr.posix.size
-            } else {
-                offset
-            };
-            let write_end = file.data.write_at(write_offset, data)?;
-            if !data.is_empty() {
-                Self::update_anonymous_size(file, file.attr.posix.size.max(write_end));
-            }
-            return Ok(data.len() as u32);
-        }
-        let path = self.inode_path(fh.inode_id)?;
         if live.enforce_access_mode && live.open_flags & O_APPEND != 0 {
             // Hold the mutable borrow across both stat and write so that
             // the file-size read and the subsequent write are atomic with
             // respect to other append writers (POSIX O_APPEND semantics).
             let mut fs = self.fs.borrow_mut();
-            let write_offset = fs.stat(&path).map_err(|e| map_errno(&e))?.size;
-            if let Err(err) = fs.write_file(&path, write_offset, data) {
+            let write_offset = fs.get_inode_by_id(fh.inode_id).ok_or(Errno::ENOENT)?.size;
+            if let Err(err) = fs.write_file_by_inode(fh.inode_id, write_offset, data) {
                 let errno = map_errno(&err);
                 if errno == Errno::EIO && vfs_op_diagnostics_enabled() {
                     eprintln!(
@@ -5476,7 +4943,7 @@ impl VfsEngine for VfsLocalFileSystem {
         }
 
         let mut fs = self.fs.borrow_mut();
-        if let Err(err) = fs.write_file(&path, offset, data) {
+        if let Err(err) = fs.write_file_by_inode(fh.inode_id, offset, data) {
             let errno = map_errno(&err);
             if errno == Errno::EIO && vfs_op_diagnostics_enabled() {
                 eprintln!(
@@ -5507,15 +4974,9 @@ impl VfsEngine for VfsLocalFileSystem {
         if self.read_only {
             return Ok(());
         }
-        // Anonymous tmpfiles have no path and no backing store;
-        // they are reclaimed on release so flush is a no-op.
-        if self.anonymous_tmpfiles.borrow().contains_key(&fh.inode_id) {
-            return Ok(());
-        }
-        let path = self.inode_path(fh.inode_id)?;
         self.fs
             .borrow_mut()
-            .flush_file(&path, fh.inode_id.0, fh.fh_id.0, fh.lock_owner)
+            .flush_write_buffer(fh.inode_id)
             .map_err(|e| map_errno(&e))?;
         Ok(())
     }
@@ -5531,19 +4992,15 @@ impl VfsEngine for VfsLocalFileSystem {
         if self.read_only {
             return Ok(());
         }
-        if self.anonymous_tmpfiles.borrow().contains_key(&fh.inode_id) {
-            return Ok(());
-        }
         if datasync {
             self.fs
                 .borrow_mut()
                 .fdatasync_inode(fh.inode_id, true)
                 .map_err(|e| map_errno(&e))?;
         } else {
-            let path = self.inode_path(fh.inode_id)?;
             self.fs
                 .borrow_mut()
-                .fsync_file(&path)
+                .sync_inode(fh.inode_id)
                 .map_err(|e| map_errno(&e))?;
         }
         self.wait_for_sync_guarantee()?;
@@ -5560,55 +5017,6 @@ impl VfsEngine for VfsLocalFileSystem {
     ) -> std::result::Result<(), Errno> {
         self.ensure_writable()?;
         self.validate_file_handle(fh)?;
-        if let Some(file) = self.anonymous_tmpfiles.borrow_mut().get_mut(&fh.inode_id) {
-            let end = offset.checked_add(length).ok_or(Errno::EINVAL)?;
-            let known_mask = FALLOC_FL_COLLAPSE_RANGE
-                | FALLOC_FL_INSERT_RANGE
-                | FALLOC_FL_KEEP_SIZE
-                | FALLOC_FL_PUNCH_HOLE
-                | FALLOC_FL_ZERO_RANGE;
-            if mode & !known_mask != 0 {
-                return Err(Errno::EINVAL);
-            }
-            if mode & FALLOC_FL_PUNCH_HOLE != 0 {
-                if mode & FALLOC_FL_KEEP_SIZE == 0 || mode & FALLOC_FL_ZERO_RANGE != 0 {
-                    return Err(Errno::EINVAL);
-                }
-                file.data
-                    .clear_range(offset, end.min(file.attr.posix.size))?;
-            } else if mode & FALLOC_FL_ZERO_RANGE != 0 {
-                let zero_end = if mode & FALLOC_FL_KEEP_SIZE != 0 {
-                    end.min(file.attr.posix.size)
-                } else {
-                    end
-                };
-                file.data.clear_range(offset, zero_end)?;
-                if mode & FALLOC_FL_KEEP_SIZE == 0 {
-                    Self::update_anonymous_size(file, end);
-                }
-            } else if mode & FALLOC_FL_COLLAPSE_RANGE != 0 {
-                // In-memory collapse: remove [offset, offset+length) and shift tail left.
-                let new_size = file
-                    .data
-                    .collapse_range(offset, length, file.attr.posix.size)?;
-                Self::update_anonymous_size(file, new_size);
-            } else if mode & FALLOC_FL_INSERT_RANGE != 0 {
-                // In-memory insert: insert `length` zero bytes at `offset`, shift tail right.
-                if offset > file.attr.posix.size {
-                    // Offset beyond EOF: extend with zeros (same as default allocate).
-                    Self::update_anonymous_size(file, end);
-                } else if length > 0 {
-                    let new_size = file
-                        .data
-                        .insert_zeros(offset, length, file.attr.posix.size)?;
-                    Self::update_anonymous_size(file, new_size);
-                }
-            } else if mode & FALLOC_FL_KEEP_SIZE == 0 && end > file.attr.posix.size {
-                Self::update_anonymous_size(file, end);
-            }
-            return Ok(());
-        }
-        let path = self.inode_path(fh.inode_id)?;
         let mut fs = self.fs.borrow_mut();
 
         // Known modes: COLLAPSE_RANGE, INSERT_RANGE, KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE.
@@ -5627,7 +5035,7 @@ impl VfsEngine for VfsLocalFileSystem {
             if mode & FALLOC_FL_KEEP_SIZE == 0 || mode & FALLOC_FL_ZERO_RANGE != 0 {
                 return Err(Errno::EINVAL);
             }
-            fs.punch_hole(&path, offset, length)
+            fs.punch_hole_by_inode(fh.inode_id, offset, length)
                 .map_err(|e| map_errno(&e))?;
             let _ = fs.apply_timestamp_update(
                 fh.inode_id,
@@ -5637,12 +5045,16 @@ impl VfsEngine for VfsLocalFileSystem {
         } else if mode & FALLOC_FL_ZERO_RANGE != 0 {
             if mode & FALLOC_FL_KEEP_SIZE == 0 && length > 0 {
                 let end = offset.checked_add(length).ok_or(Errno::EINVAL)?;
-                let record = fs.stat(&path).map_err(|e| map_errno(&e))?;
+                let record = fs
+                    .get_inode_by_id(fh.inode_id)
+                    .cloned()
+                    .ok_or(Errno::ENOENT)?;
                 if end > record.size {
-                    fs.truncate_file(&path, end).map_err(|e| map_errno(&e))?;
+                    fs.truncate_file_by_inode(fh.inode_id, end)
+                        .map_err(|e| map_errno(&e))?;
                 }
             }
-            fs.zero_range(&path, offset, length)
+            fs.zero_range_by_inode(fh.inode_id, offset, length)
                 .map_err(|e| map_errno(&e))?;
             let _ = fs.apply_timestamp_update(
                 fh.inode_id,
@@ -5653,7 +5065,7 @@ impl VfsEngine for VfsLocalFileSystem {
             // COLLAPSE_RANGE: remove bytes in [offset, offset+length) and shift
             // tail left.  collapse_range() internally clamps to EOF and handles
             // offset>=size as a no-op.
-            fs.collapse_range(&path, offset, length)
+            fs.collapse_range_by_inode(fh.inode_id, offset, length)
                 .map_err(|e| map_errno(&e))?;
             let _ = fs.apply_timestamp_update(
                 fh.inode_id,
@@ -5664,7 +5076,7 @@ impl VfsEngine for VfsLocalFileSystem {
             // INSERT_RANGE: insert `length` zero bytes at `offset`, shifting
             // tail right.  insert_range() handles offset beyond EOF as
             // allocate+extend.
-            fs.insert_range(&path, offset, length)
+            fs.insert_range_by_inode(fh.inode_id, offset, length)
                 .map_err(|e| map_errno(&e))?;
             let _ = fs.apply_timestamp_update(
                 fh.inode_id,
@@ -5673,7 +5085,7 @@ impl VfsEngine for VfsLocalFileSystem {
             );
         } else if mode & FALLOC_FL_KEEP_SIZE != 0 {
             // Allocate Unwritten extents without extending file size.
-            fs.reserve_unwritten(&path, offset, length)
+            fs.reserve_unwritten_by_inode(fh.inode_id, offset, length)
                 .map_err(|e| map_errno(&e))?;
             let _ = fs.apply_timestamp_update(
                 fh.inode_id,
@@ -5684,7 +5096,7 @@ impl VfsEngine for VfsLocalFileSystem {
             // Default (mode 0): allocate + extend file size.
             if length > 0 {
                 let _end = offset.checked_add(length).ok_or(Errno::EINVAL)?;
-                fs.fallocate_file(&path, offset, length)
+                fs.fallocate_file_by_inode(fh.inode_id, offset, length)
                     .map_err(|e| map_errno(&e))?;
                 let _ = fs.apply_timestamp_update(
                     fh.inode_id,
@@ -5727,45 +5139,27 @@ impl VfsEngine for VfsLocalFileSystem {
             return Err(Errno::EINVAL);
         }
 
-        // Record intent-log entry for crash-recovery replay (non-tmpfile only).
-        if !self
-            .anonymous_tmpfiles
-            .borrow()
-            .contains_key(&source_fh.inode_id)
-            && !self
-                .anonymous_tmpfiles
-                .borrow()
-                .contains_key(&dest_fh.inode_id)
-        {
-            self.fs
-                .borrow_mut()
-                .record_copy_file_range_intent(CopyFileRangeIntent {
-                    src_ino: source_fh.inode_id,
-                    src_fh: source_fh.fh_id.0,
-                    dst_ino: dest_fh.inode_id,
-                    dst_fh: dest_fh.fh_id.0,
-                    src_offset: offset_in,
-                    dst_offset: offset_out,
-                    len: length,
-                })
-                .map_err(|e| map_errno(&e))?;
-        }
+        self.fs
+            .borrow_mut()
+            .record_copy_file_range_intent(CopyFileRangeIntent {
+                src_ino: source_fh.inode_id,
+                src_fh: source_fh.fh_id.0,
+                dst_ino: dest_fh.inode_id,
+                dst_fh: dest_fh.fh_id.0,
+                src_offset: offset_in,
+                dst_offset: offset_out,
+                len: length,
+            })
+            .map_err(|e| map_errno(&e))?;
 
-        let source_is_anonymous = self
-            .anonymous_tmpfiles
-            .borrow()
-            .contains_key(&source_fh.inode_id);
-        let dest_is_anonymous = self
-            .anonymous_tmpfiles
-            .borrow()
-            .contains_key(&dest_fh.inode_id);
-        if !source_is_anonymous && !dest_is_anonymous {
-            let source_path = self.inode_path(source_fh.inode_id)?;
-            let dest_path = self.inode_path(dest_fh.inode_id)?;
+        let source_path = self.inode_path(source_fh.inode_id).ok();
+        let dest_path = self.inode_path(dest_fh.inode_id).ok();
+        if let (Some(source_path), Some(dest_path)) = (source_path.as_deref(), dest_path.as_deref())
+        {
             let sparse_zero_copy = self
                 .fs
                 .borrow()
-                .sparse_zero_range_copy_len(&source_path, offset_in, requested)
+                .sparse_zero_range_copy_len(source_path, offset_in, requested)
                 .map_err(|e| map_errno(&e))?;
             if let Some(copied) = sparse_zero_copy {
                 let copied_u32 = u32::try_from(copied).map_err(|_| Errno::EFBIG)?;
@@ -5773,12 +5167,12 @@ impl VfsEngine for VfsLocalFileSystem {
                     let mut fs = self.fs.borrow_mut();
                     if copied > 0 {
                         let dest_end = offset_out.checked_add(copied).ok_or(Errno::EINVAL)?;
-                        let dest_size = fs.stat(&dest_path).map_err(|e| map_errno(&e))?.size;
+                        let dest_size = fs.stat(dest_path).map_err(|e| map_errno(&e))?.size;
                         if dest_end > dest_size {
-                            fs.truncate_file(&dest_path, dest_end)
+                            fs.truncate_file(dest_path, dest_end)
                                 .map_err(|e| map_errno(&e))?;
                         }
-                        fs.punch_hole(&dest_path, offset_out, copied)
+                        fs.punch_hole(dest_path, offset_out, copied)
                             .map_err(|e| map_errno(&e))?;
                     }
                     let _ = fs.apply_deferred_timestamp_update(
@@ -5803,12 +5197,11 @@ impl VfsEngine for VfsLocalFileSystem {
             }
         }
 
-        let direct_dest_path =
-            if dest_is_anonymous || (dst.enforce_access_mode && dst.open_flags & O_APPEND != 0) {
-                None
-            } else {
-                Some(self.inode_path(dest_fh.inode_id)?)
-            };
+        let direct_dest_path = if dst.enforce_access_mode && dst.open_flags & O_APPEND != 0 {
+            None
+        } else {
+            dest_path
+        };
 
         // Perform the copy via the read/write path.
         let mut copied = 0_u64;
@@ -6040,33 +5433,17 @@ impl VfsEngine for VfsLocalFileSystem {
             return Ok(Vec::new());
         }
         let end = offset.checked_add(length).ok_or(Errno::EINVAL)?;
-        if let Some(file) = self.anonymous_tmpfiles.borrow().get(&fh.inode_id) {
-            return file.data.data_ranges(offset, length, file.attr.posix.size);
-        }
         let fs = self.fs.borrow();
         let mut ranges = Vec::new();
-        let mut cursor = offset;
-
-        while cursor < end {
-            let Some(data_start) = fs
-                .find_next_data_offset(fh.inode_id, cursor)
-                .map_err(|e| map_errno(&e))?
-            else {
-                break;
-            };
-            if data_start >= end {
-                break;
+        for (data_start, data_end) in fs
+            .mounted_data_ranges(fh.inode_id)
+            .map_err(|e| map_errno(&e))?
+        {
+            let clipped_start = data_start.max(offset);
+            let clipped_end = data_end.min(end);
+            if clipped_start < clipped_end {
+                ranges.push(LseekDataRange::new(clipped_start, clipped_end));
             }
-
-            let data_end = fs
-                .find_next_hole_offset(fh.inode_id, data_start)
-                .map_err(|e| map_errno(&e))?;
-            if data_end <= data_start {
-                return Err(Errno::EIO);
-            }
-
-            ranges.push(LseekDataRange::new(data_start, data_end.min(end)));
-            cursor = data_end;
         }
 
         Ok(ranges)
@@ -6208,9 +5585,6 @@ impl VfsEngine for VfsLocalFileSystem {
         self.ensure_mounted_mutation_allowed("synchronize mounted inode data")?;
         self.validate_file_handle(fh)?;
         if self.read_only {
-            return Ok(());
-        }
-        if self.anonymous_tmpfiles.borrow().contains_key(&fh.inode_id) {
             return Ok(());
         }
         self.fs
@@ -6838,6 +6212,7 @@ mod tests {
         live_admin(engine, "snapshot", operation, args, wants_json)
     }
 
+    #[cfg(feature = "replication-io")]
     fn live_from_root_hex(root: &CommittedRootSummary) -> String {
         let mut bytes = Vec::with_capacity(24);
         bytes.extend_from_slice(&root.transaction_id.to_le_bytes());
@@ -7145,6 +6520,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "data-policy")]
     fn live_dataset_set_strategy_updates_mounted_feature_flags() {
         let (engine, _td) = temp_fs();
         let created = live_dataset_admin(
@@ -7203,7 +6579,11 @@ mod tests {
         assert_eq!(upgraded["ok"], true, "upgrade response: {upgraded}");
         let supported = tidefs_dataset_feature_flags::SupportedFeaturesV1::current();
         let fs = engine.fs.borrow();
-        for feature in supported.as_slice() {
+        for feature in supported
+            .as_slice()
+            .iter()
+            .filter(|feature| crate::feature_available_in_current_build(feature))
+        {
             assert!(
                 fs.feature_flags().is_enabled(feature),
                 "supported feature {feature} should be enabled",
@@ -7413,6 +6793,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn live_snapshot_send_exports_from_mounted_pool_owner() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -7447,6 +6828,7 @@ mod tests {
         assert!(decoded.payload_bytes > 0);
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn live_snapshot_send_incremental_exports_from_authorized_live_root() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -7493,6 +6875,7 @@ mod tests {
         assert!(decoded.total_records > 0);
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn live_snapshot_send_incremental_requires_authorized_from_root() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -7573,6 +6956,7 @@ mod tests {
         assert!(!output.exists());
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn live_snapshot_send_rejects_target_addr_until_remote_admission_is_wired() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -7610,6 +6994,7 @@ mod tests {
         assert!(!output.exists());
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn live_snapshot_send_rejects_unknown_format_before_exporting() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -9354,7 +8739,7 @@ mod tests {
             engine.lookup(root, b"open-gone.txt", &ctx()).unwrap_err(),
             Errno::ENOENT
         );
-        // Inode is still reachable through the live handle (preserved as anonymous tmpfile).
+        // The canonical zero-link inode remains reachable through the live handle.
         let attr_after = engine.getattr(attr.inode_id, None, &ctx()).unwrap();
         assert_eq!(attr_after.inode_id, attr.inode_id);
         assert_eq!(attr_after.posix.nlink, 0);
@@ -9373,7 +8758,7 @@ mod tests {
             b"before unlink"
         );
         engine.release(&fh).unwrap();
-        // After release the anonymous tmpfile is reclaimed; getattr should fail.
+        // Last release reclaims the canonical zero-link inode.
         assert_eq!(
             engine.getattr(attr.inode_id, None, &ctx()).unwrap_err(),
             Errno::ENOENT
@@ -9401,7 +8786,7 @@ mod tests {
     }
 
     #[test]
-    fn unlink_open_sparse_file_keeps_anonymous_content_sparse() {
+    fn unlink_open_sparse_file_keeps_canonical_inode_and_sparse_pool_content() {
         let (engine, _td) = temp_fs_with_content_capacity(2_u64 * 1024 * 1024 * 1024);
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (attr, fh) = engine
@@ -9432,17 +8817,25 @@ mod tests {
                 .unwrap_err(),
             Errno::ENOENT
         );
-        let anonymous = engine.anonymous_tmpfiles.borrow();
-        let file = anonymous
-            .get(&attr.inode_id)
-            .expect("anonymous sparse file");
-        assert_eq!(file.attr.posix.size, file_size);
-        assert_eq!(file.data.extents.len(), 16);
-        assert_eq!(
-            file.data.extents.values().map(Vec::len).sum::<usize>(),
-            16 * chunk_len
-        );
-        drop(anonymous);
+        {
+            let fs = engine.fs.borrow();
+            let record = fs
+                .get_inode_by_id(attr.inode_id)
+                .expect("retained canonical inode");
+            assert_eq!(record.nlink, 0);
+            assert_eq!(record.size, file_size);
+            let ranges = fs
+                .mounted_data_ranges(attr.inode_id)
+                .expect("canonical sparse Pool ranges");
+            assert_eq!(ranges.len(), 16);
+            // The canonical Pool carrier allocates chunk-granular content.
+            // Each sub-chunk write therefore owns one materialized chunk even
+            // though the unwritten half still reads as a sparse zero region.
+            assert_eq!(
+                ranges.iter().map(|(start, end)| end - start).sum::<u64>(),
+                16 * crate::constants::FILESYSTEM_CONTENT_CHUNK_SIZE as u64
+            );
+        }
 
         assert_eq!(
             engine.read(&fh, 0, chunk_len as u32, &ctx()).unwrap(),
@@ -9454,6 +8847,15 @@ mod tests {
                 .unwrap(),
             vec![0; chunk_len]
         );
+        engine
+            .write(&fh, file_size - chunk_len as u64, &payload, &ctx())
+            .expect("write retained inode through canonical handle path");
+        engine
+            .fsync(&fh, false, &ctx())
+            .expect("fsync retained inode through Pool authority");
+        engine
+            .fdatasync_inode(&fh, true, &ctx())
+            .expect("fdatasync retained inode through Pool authority");
         engine.release(&fh).unwrap();
         assert_eq!(
             engine.getattr(attr.inode_id, None, &ctx()).unwrap_err(),
@@ -13260,7 +12662,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_on_anonymous_tmpfile_succeeds() {
+    fn flush_on_unlinked_tmpfile_succeeds() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (attr, fh) = engine.tmpfile(root, 0o600, O_RDWR, &ctx()).unwrap();
@@ -13390,33 +12792,66 @@ mod tests {
     }
 
     #[test]
-    fn fsync_anonymous_tmpfile_succeeds_for_data_and_metadata_modes() {
+    fn fsync_unlinked_tmpfile_succeeds_for_data_and_metadata_modes() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (_attr, fh) = engine.tmpfile(root, 0o600, O_RDWR, &ctx()).unwrap();
 
-        engine.write(&fh, 0, b"anonymous", &ctx()).unwrap();
+        engine.write(&fh, 0, b"unlinked", &ctx()).unwrap();
 
         engine.fsync(&fh, false, &ctx()).unwrap();
         engine.fsync(&fh, true, &ctx()).unwrap();
-        assert_eq!(engine.read(&fh, 0, 9, &ctx()).unwrap(), b"anonymous");
+        assert_eq!(engine.read(&fh, 0, 8, &ctx()).unwrap(), b"unlinked");
     }
 
     #[test]
-    fn fsync_open_unlinked_file_succeeds_via_anonymous_tmpfile() {
+    fn open_unlinked_write_fsync_fallocate_survives_until_final_close() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
-        let (_attr, fh) = engine
+        let (attr, fh) = engine
             .create(root, b"sync-unlinked.txt", 0o644, O_RDWR, &ctx())
             .unwrap();
-        engine.write(&fh, 0, b"before unlink", &ctx()).unwrap();
+        let initial = b"before unlink";
+        let appended = b" and after";
+        engine.write(&fh, 0, initial, &ctx()).unwrap();
 
         engine.unlink(root, b"sync-unlinked.txt", &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .getattr(attr.inode_id, Some(&fh), &ctx())
+                .unwrap()
+                .posix
+                .nlink,
+            0
+        );
+        engine
+            .write(&fh, initial.len() as u64, appended, &ctx())
+            .unwrap();
+        engine.fallocate(&fh, 0, 4096, 4096, &ctx()).unwrap();
 
-        // fsync should succeed for an unlinked-but-open file preserved as anonymous tmpfile.
         engine.fsync(&fh, false, &ctx()).unwrap();
         engine.fsync(&fh, true, &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .read(&fh, 0, (initial.len() + appended.len()) as u32, &ctx())
+                .unwrap(),
+            [initial.as_slice(), appended.as_slice()].concat()
+        );
+        assert_eq!(engine.read(&fh, 4096, 32, &ctx()).unwrap(), vec![0; 32]);
+        assert_eq!(
+            engine
+                .getattr(attr.inode_id, Some(&fh), &ctx())
+                .unwrap()
+                .posix
+                .size,
+            8192
+        );
+
         engine.release(&fh).unwrap();
+        assert_eq!(
+            engine.getattr(attr.inode_id, None, &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
     }
 
     #[test]
@@ -15454,7 +14889,7 @@ mod tests {
     }
 
     #[test]
-    fn tmpfile_release_reclaims_anonymous_handle() {
+    fn tmpfile_final_release_reclaims_zero_link_inode() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (attr, fh) = engine.tmpfile(root, 0o600, O_RDWR, &ctx()).unwrap();
@@ -15466,29 +14901,38 @@ mod tests {
         assert_eq!(engine.inode_path(attr.inode_id).unwrap_err(), Errno::ENOENT);
     }
 
-    // ── tmpfile materialization via link ─────────────────────────────
+    // ── tmpfile direct-inode linking ─────────────────────────────────
 
     #[test]
-    fn tmpfile_link_materializes_into_namespace() {
+    fn tmpfile_write_fsync_link_preserves_inode_and_bytes_after_original_release() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (attr, fh) = engine.tmpfile(root, 0o644, O_RDWR, &ctx()).unwrap();
         let ino = attr.inode_id;
-        engine
-            .write(&fh, 0, b"materialized content", &ctx())
-            .unwrap();
+        let payload = b"linked tmpfile content";
+        engine.write(&fh, 0, payload, &ctx()).unwrap();
+        engine.fsync(&fh, false, &ctx()).unwrap();
 
         assert_eq!(engine.inode_path(ino).unwrap_err(), Errno::ENOENT);
 
         let linked_attr = engine.link(ino, root, b"linked-tmpfile", &ctx()).unwrap();
         assert_eq!(linked_attr.inode_id, ino);
         assert_eq!(linked_attr.posix.nlink, 1);
-        assert_eq!(linked_attr.posix.size, b"materialized content".len() as u64);
+        assert_eq!(linked_attr.posix.size, payload.len() as u64);
         assert_eq!(engine.inode_path(ino).unwrap(), "/linked-tmpfile");
+        assert_eq!(
+            engine.read(&fh, 0, payload.len() as u32, &ctx()).unwrap(),
+            payload
+        );
+
+        engine.release(&fh).unwrap();
+        assert_eq!(engine.getattr(ino, None, &ctx()).unwrap().inode_id, ino);
 
         let read_fh = engine.open(ino, O_RDONLY, &ctx()).unwrap();
-        let data = engine.read(&read_fh, 0, 30, &ctx()).unwrap();
-        assert_eq!(data, b"materialized content");
+        let data = engine
+            .read(&read_fh, 0, payload.len() as u32, &ctx())
+            .unwrap();
+        assert_eq!(data, payload);
         engine.release(&read_fh).unwrap();
     }
 

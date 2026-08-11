@@ -761,12 +761,16 @@ fn policy_to_failure_domain(policy: &FailureDomainPlacementPolicy) -> FailureDom
 // PlacementReceiptChecker implementation for PlacementRuntime
 // ---------------------------------------------------------------------------
 
+#[cfg(any(feature = "device-removal", test))]
 use tidefs_block_allocator::DeviceId;
+#[cfg(any(feature = "device-removal", test))]
 use tidefs_device_removal::{
     DevicePlacementReceiptEvidence, DeviceRemovalError, PlacementReceiptChecker,
 };
+#[cfg(any(feature = "device-removal", test))]
 use tidefs_locator_table::ExtentId;
 
+#[cfg(any(feature = "device-removal", test))]
 impl PlacementReceiptChecker for PlacementRuntime {
     fn placement_receipt_evidence(
         &self,

@@ -19,11 +19,15 @@ use crate::encoding::*;
 use crate::error::FileSystemError;
 use crate::helpers::*;
 use crate::intent_log::{
-    replay_uncommitted, replay_uncommitted_with_pool, IntentLog, IntentLogRootAnchor,
+    intent_log_requires_commit_after, replay_uncommitted, replay_uncommitted_with_pool, IntentLog,
+    IntentLogRootAnchor,
 };
 use crate::merge_allocation_entries;
 use crate::object_keys::*;
-use crate::persistence::{persist_state_with_pool, root_slot_for_transaction};
+use crate::persistence::{
+    next_mounted_commit_transaction_id, persist_state_with_pool_at_transaction,
+    root_slot_for_transaction,
+};
 use crate::read_content_from_store;
 use crate::read_content_layout_from_store;
 use crate::records::*;
@@ -357,12 +361,19 @@ pub(crate) fn load_latest_committed_state_pool(
             let committed_base = IntentLogRootAnchor::from_committed_root_summary(selected_root);
             let since_tx = committed_base.transaction_id;
             let mut log = IntentLog::load(pool.raw_primary_store())?;
-            if log.replay_is_needed(since_tx) {
+            if intent_log_requires_commit_after(&log, &committed_base) {
                 check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
                 let count = replay_uncommitted_with_pool(&log, &mut state, pool, &committed_base)?;
                 check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
                 if count > 0 {
-                    persist_state_with_pool(pool, &state, root_authentication_key)?;
+                    let transaction_id =
+                        next_mounted_commit_transaction_id(state.generation, selected_root)?;
+                    persist_state_with_pool_at_transaction(
+                        pool,
+                        &state,
+                        transaction_id,
+                        root_authentication_key,
+                    )?;
                     let generation = state.generation;
                     for inode_id in state.dirty_inodes.iter().copied() {
                         state.last_inode_write_tx.insert(inode_id, generation);
@@ -595,11 +606,22 @@ fn verify_online_source<S: CommittedRootRecoverySource>(
                         .saturating_add(root_report.verified_snapshot_roots);
                     report.verified_committed_roots.push(root_report);
                     for mut issue in slot_issues.drain(..) {
-                        issue.severity = OnlineVerifierIssueSeverity::Warning;
-                        issue.reason = format!(
-                            "stale same-slot root candidate ignored after validating fallback root: {}",
-                            issue.reason
-                        );
+                        if matches!(
+                            issue.kind,
+                            OnlineVerifierIssueKind::RootCommitValidation
+                                | OnlineVerifierIssueKind::SnapshotRootValidation
+                        ) {
+                            issue.reason = format!(
+                                "newer committed root failed validation before fallback root was selected: {}",
+                                issue.reason
+                            );
+                        } else {
+                            issue.severity = OnlineVerifierIssueSeverity::Warning;
+                            issue.reason = format!(
+                                "stale same-slot root candidate ignored after validating fallback root: {}",
+                                issue.reason
+                            );
+                        }
                         report.issues.push(issue);
                     }
                     slot_verified = true;
@@ -1589,6 +1611,7 @@ pub(crate) fn snapshot_retained_roots(state: &FileSystemState) -> Vec<CommittedR
     roots
 }
 
+#[cfg(feature = "replication-io")]
 pub(crate) fn roots_with_snapshot_roots(
     mut roots: Vec<CommittedRootSummary>,
     state: &FileSystemState,
@@ -3196,9 +3219,13 @@ pub(crate) fn validate_namespace_invariants(
                 return Err(FileSystemError::CorruptState { reason: "mount invariant gate: directory link count does not match child-directory topology" });
             }
         } else {
-            if refs == 0 {
+            // A live handle may retain a canonical file-like inode after its
+            // last directory entry is removed. Its committed nlink == 0 state
+            // is the crash-recovery authority; mount-time orphan cleanup
+            // removes it before accepting new handles.
+            if refs == 0 && inode.nlink != 0 {
                 return Err(FileSystemError::CorruptState {
-                    reason: "mount invariant gate: non-directory inode is unreachable",
+                    reason: "mount invariant gate: linked non-directory inode is unreachable",
                 });
             }
             if u64::from(inode.nlink) != refs {
@@ -3208,7 +3235,13 @@ pub(crate) fn validate_namespace_invariants(
     }
 
     let reachable = reachable_inodes_from_root(inodes, directories)?;
-    if reachable.len() != inodes.len() {
+    // Zero-link file-like inodes are intentionally outside namespace
+    // reachability while an open handle keeps them live.
+    let zero_link_orphans = inodes
+        .values()
+        .filter(|inode| !inode.carries_child_namespace() && inode.nlink == 0)
+        .count();
+    if reachable.len().saturating_add(zero_link_orphans) != inodes.len() {
         return Err(FileSystemError::CorruptState {
             reason: "mount invariant gate: committed root contains unreachable inode records",
         });
@@ -4212,8 +4245,8 @@ mod receipt_validation_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tidefs_local_object_store::pool::Pool;
     use tidefs_local_object_store::{
-        DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, IntegrityDigest64,
-        LocalObjectStore, PoolConfig, PoolProperties, StoreOptions,
+        DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, LocalObjectStore,
+        PoolConfig, PoolProperties, StoreOptions,
     };
     use tidefs_types_vfs_core::S_IFREG;
 
@@ -4335,18 +4368,35 @@ mod receipt_validation_tests {
     }
 
     fn make_chunk_ref(
+        inode: &InodeRecord,
         chunk_index: u64,
-        data_version: u64,
         len: u32,
         placement_receipt_generation: u64,
     ) -> ContentChunkRef {
+        let payload = chunk_payload(chunk_index, len);
+        let encoded = encode_content_chunk(inode, chunk_index, &payload, &Default::default())
+            .expect("encode recovery fixture chunk reference");
         ContentChunkRef {
             chunk_index,
-            data_version,
+            data_version: inode.data_version,
             len,
-            checksum: IntegrityDigest64(0xCAFE),
+            checksum: checksum64(&encoded),
             placement_receipt_generation,
         }
+    }
+
+    fn chunk_payload(chunk_index: u64, len: u32) -> Vec<u8> {
+        vec![0x40_u8.wrapping_add(chunk_index.to_le_bytes()[0]); len as usize]
+    }
+
+    fn encoded_chunk(inode: &InodeRecord, chunk_ref: &ContentChunkRef) -> Vec<u8> {
+        encode_content_chunk(
+            inode,
+            chunk_ref.chunk_index,
+            &chunk_payload(chunk_ref.chunk_index, chunk_ref.len),
+            &Default::default(),
+        )
+        .expect("encode recovery fixture chunk")
     }
 
     fn put_chunk_data(
@@ -4359,9 +4409,7 @@ mod receipt_validation_tests {
             chunk_ref.data_version,
             chunk_ref.chunk_index,
         );
-        let payload = b"test-chunk-payload-for-receipt-validation";
-        let encoded =
-            encode_content_chunk(inode, chunk_ref.chunk_index, payload, &Default::default());
+        let encoded = encoded_chunk(inode, chunk_ref);
         store.put(key, &encoded).expect("put chunk data");
         store.sync_all().expect("sync");
     }
@@ -4374,7 +4422,7 @@ mod receipt_validation_tests {
         let root = temp_dir("zero-receipt-gen");
         let mut store = make_store(&root);
         let inode = make_file_inode(2, 1, 4096);
-        let chunk_ref = make_chunk_ref(0, 1, 4096, 0);
+        let chunk_ref = make_chunk_ref(&inode, 0, 4096, 0);
         put_chunk_data(&mut store, &inode, &chunk_ref);
         let mut report = FilesystemContentInspectionReport::empty();
 
@@ -4406,12 +4454,18 @@ mod receipt_validation_tests {
         let inode = make_file_inode(2, 1, 4096);
 
         let chunk_key = content_chunk_object_key_for_version(inode.inode_id, 1, 0);
+        let mut chunk_ref = make_chunk_ref(&inode, 0, 4096, 0);
         // Use put_with_receipt to get the pool-assigned generation, then
         // build a chunk_ref that carries that exact generation.
         let (_stored, receipt) = pool
-            .put_with_receipt(DeviceIoClass::Data, chunk_key, b"pool-chunk-data")
+            .put_with_receipt(
+                DeviceIoClass::Data,
+                chunk_key,
+                &encoded_chunk(&inode, &chunk_ref),
+            )
             .expect("put_with_receipt in pool");
         let receipt_generation = receipt.generation;
+        chunk_ref.placement_receipt_generation = receipt_generation;
 
         // Verify the pool can find its own receipt before inspection.
         let pool_receipt = pool
@@ -4425,7 +4479,6 @@ mod receipt_validation_tests {
             pool_gen = pool_receipt.generation
         );
 
-        let chunk_ref = make_chunk_ref(0, 1, 4096, receipt_generation);
         put_chunk_data(&mut store, &inode, &chunk_ref);
 
         let mut report = FilesystemContentInspectionReport::empty();
@@ -4452,7 +4505,7 @@ mod receipt_validation_tests {
         let mut store = make_store(&store_root);
         let pool = make_pool(&pool_root);
         let inode = make_file_inode(2, 1, 4096);
-        let chunk_ref = make_chunk_ref(0, 1, 4096, 5);
+        let chunk_ref = make_chunk_ref(&inode, 0, 4096, 5);
         put_chunk_data(&mut store, &inode, &chunk_ref);
 
         let mut report = FilesystemContentInspectionReport::empty();
@@ -4477,7 +4530,7 @@ mod receipt_validation_tests {
         let root = temp_dir("no-pool-mismatch");
         let mut store = make_store(&root);
         let inode = make_file_inode(2, 1, 4096);
-        let chunk_ref = make_chunk_ref(0, 1, 4096, 5);
+        let chunk_ref = make_chunk_ref(&inode, 0, 4096, 5);
         put_chunk_data(&mut store, &inode, &chunk_ref);
         let mut report = FilesystemContentInspectionReport::empty();
 
@@ -4506,24 +4559,26 @@ mod receipt_validation_tests {
 
         // Chunk 0: match pool receipt generation -> no mismatch
         let key0 = content_chunk_object_key_for_version(inode.inode_id, 1, 0);
+        let mut chunk0 = make_chunk_ref(&inode, 0, 4096, 0);
         let (_s0, r0) = pool
-            .put_with_receipt(DeviceIoClass::Data, key0, b"pool-chunk-0")
+            .put_with_receipt(DeviceIoClass::Data, key0, &encoded_chunk(&inode, &chunk0))
             .expect("put chunk0");
-        let chunk0 = make_chunk_ref(0, 1, 4096, r0.generation);
+        chunk0.placement_receipt_generation = r0.generation;
         put_chunk_data(&mut store, &inode, &chunk0);
 
         // Chunk 1: receipt gen 7, pool has NO receipt for this key -> mismatch
-        let chunk1 = make_chunk_ref(1, 1, 4096, 7);
+        let chunk1 = make_chunk_ref(&inode, 1, 4096, 7);
         put_chunk_data(&mut store, &inode, &chunk1);
 
         // Chunk 2: receipt gen mismatches pool gen -> mismatch
         let key2 = content_chunk_object_key_for_version(inode.inode_id, 1, 2);
+        let mut chunk2 = make_chunk_ref(&inode, 2, 4096, 0);
         let (_s2, r2) = pool
-            .put_with_receipt(DeviceIoClass::Data, key2, b"pool-chunk-2")
+            .put_with_receipt(DeviceIoClass::Data, key2, &encoded_chunk(&inode, &chunk2))
             .expect("put chunk2");
         // Deliberately use a generation that differs from the pool receipt.
         let mismatched_gen = r2.generation.saturating_add(1);
-        let chunk2 = make_chunk_ref(2, 1, 4096, mismatched_gen);
+        chunk2.placement_receipt_generation = mismatched_gen;
         put_chunk_data(&mut store, &inode, &chunk2);
 
         let mut report = FilesystemContentInspectionReport::empty();

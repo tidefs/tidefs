@@ -470,12 +470,14 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
         summary: "roll back through the live owner or explicit offline devices",
     },
+    #[cfg(feature = "replication-io")]
     CommandSurface {
         path: "snapshot send",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
         summary: "export snapshot streams through owner authority or explicit offline devices",
     },
+    #[cfg(feature = "replication-io")]
     CommandSurface {
         path: "snapshot receive",
         class: CommandClass::PublicOperator,
@@ -945,12 +947,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "replication-io")]
     fn snapshot_receive_classification_is_live_owner_only() {
         let surface = find_surface("snapshot receive").expect("snapshot receive classified");
         assert_eq!(surface.routing, RoutingSemantics::LiveOwner);
         assert!(surface.summary.contains("live owner"));
         assert!(surface.summary.contains("offline receive is unsupported"));
         assert!(!surface.summary.contains("explicit offline devices"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "replication-io"))]
+    fn disabled_replication_io_has_no_classified_command_surface() {
+        assert!(find_surface("snapshot send").is_none());
+        assert!(find_surface("snapshot receive").is_none());
     }
 
     #[test]

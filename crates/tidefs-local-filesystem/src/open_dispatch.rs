@@ -118,7 +118,7 @@ impl FileHandleTable {
     ///
     /// Validates the handle identity (inode + flags + fh_id match), then
     /// removes the entry. Returns the inode ID of the released handle so
-    /// the caller can perform tmpfile reclamation if needed.
+    /// the caller can finalize a retained zero-link inode after last close.
     ///
     /// Returns `Err(BadFileDescriptor)` if the handle is not found or
     /// does not match.
@@ -174,20 +174,6 @@ impl FileHandleTable {
         }
         self.next_id = self.next_id.wrapping_add(1);
         Ok(FileHandleId::new(id))
-    }
-
-    /// Remap all file handles pointing to `from_ino` to `to_ino`.
-    ///
-    /// Used during O_TMPFILE materialization: when an anonymous tmpfile
-    /// is linked into the namespace, the engine remaps the existing open
-    /// handles so the O_TMPFILE fd remains valid.
-    #[allow(dead_code)]
-    pub fn remap_inode(&mut self, from_ino: InodeId, to_ino: InodeId) {
-        for state in self.handles.values_mut() {
-            if state.inode_id == from_ino {
-                state.inode_id = to_ino;
-            }
-        }
     }
 }
 

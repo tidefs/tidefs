@@ -28,9 +28,7 @@ use tidefs_local_filesystem::{
     OnlineVerifierIssueKind, OnlineVerifierOutcome, DEFAULT_DIRECTORY_PERMISSIONS,
     DEFAULT_FILE_PERMISSIONS,
 };
-use tidefs_local_object_store::{
-    segment_file_name, LocalObjectStore, ObjectKey, StoreOptions, RECORD_HEADER_LEN,
-};
+use tidefs_local_object_store::{segment_file_name, LocalObjectStore, ObjectKey, StoreOptions};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -74,7 +72,11 @@ fn opts() -> StoreOptions {
 }
 
 fn seg_path(segments_dir: &Path, segment_id: u64) -> PathBuf {
-    segments_dir.join(segment_file_name(segment_id))
+    if segments_dir.is_file() || (segments_dir.exists() && !segments_dir.is_dir()) {
+        segments_dir.to_path_buf()
+    } else {
+        segments_dir.join(segment_file_name(segment_id))
+    }
 }
 
 fn corrupt_bytes(path: &Path, offset: u64, len: u64) {
@@ -91,21 +93,34 @@ fn corrupt_bytes(path: &Path, offset: u64, len: u64) {
     }
     file.seek(SeekFrom::Start(offset)).expect("seek back");
     file.write_all(&buf).expect("write corrupted bytes");
+    file.sync_data().expect("persist corrupted bytes");
 }
 
 fn corrupt_object_payload(store: &LocalObjectStore, key: ObjectKey) {
     let loc = store.location_of(key).expect("object location");
     let path = seg_path(store.segments_dir(), loc.segment_id);
-    let payload_start = loc.record_offset + RECORD_HEADER_LEN as u64;
-    corrupt_bytes(&path, payload_start, (loc.payload_len / 2).max(1));
+    corrupt_bytes(&path, loc.payload_offset, (loc.payload_len / 2).max(1));
+}
+
+fn corrupt_all_object_payload_versions(store: &LocalObjectStore, key: ObjectKey) {
+    let locations = store.version_locations_of(key);
+    assert!(!locations.is_empty(), "object versions must exist");
+    for location in locations {
+        assert!(location.payload_len > 0, "object payload must be non-empty");
+        let path = seg_path(store.segments_dir(), location.segment_id);
+        corrupt_bytes(&path, location.payload_offset + location.payload_len / 2, 1);
+    }
+    assert!(
+        store.get(key).is_err(),
+        "corruption injection must invalidate the selected current object"
+    );
 }
 
 fn corrupt_record_trailer(store: &LocalObjectStore, key: ObjectKey) {
     let loc = store.location_of(key).expect("object location");
     let path = seg_path(store.segments_dir(), loc.segment_id);
-    let trailer_offset = loc.record_offset + RECORD_HEADER_LEN as u64 + loc.payload_len;
-    if trailer_offset > loc.record_offset + RECORD_HEADER_LEN as u64 {
-        corrupt_bytes(&path, trailer_offset, 1);
+    if loc.payload_len > 0 {
+        corrupt_bytes(&path, loc.payload_offset + loc.payload_len, 1);
     }
 }
 
@@ -216,12 +231,15 @@ fn content_chunk_corruption_detected_in_chain() {
 
     // Verify chunk exists.
     {
-        let store = LocalObjectStore::open_with_options(&root, opts()).expect("open store");
+        let store_options = opts();
+        let pool = LocalFileSystem::default_development_pool(&root, &store_options, None, None)
+            .expect("open Pool for corruption");
+        let store = pool.raw_primary_store();
         assert!(
             store.location_of(chunk_key).is_some(),
             "chunk 1 must exist for big.bin (3+ chunks)"
         );
-        corrupt_object_payload(&store, chunk_key);
+        corrupt_all_object_payload_versions(store, chunk_key);
     }
 
     // Corruption must be caught.
@@ -257,13 +275,16 @@ fn transaction_manifest_corruption_falls_back() {
 
     let cg_id = first_transaction_id(&root);
     {
-        let store = LocalObjectStore::open_with_options(&root, opts()).expect("open store");
+        let store_options = opts();
+        let pool = LocalFileSystem::default_development_pool(&root, &store_options, None, None)
+            .expect("open Pool for corruption");
+        let store = pool.raw_primary_store();
         let manifest_key = transaction_manifest_object_key(cg_id);
         assert!(
             store.location_of(manifest_key).is_some(),
             "manifest must exist"
         );
-        corrupt_object_payload(&store, manifest_key);
+        corrupt_object_payload(store, manifest_key);
     }
 
     // Reopen should fall back or report error.
@@ -291,12 +312,15 @@ fn content_manifest_corruption_detected() {
     let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
 
     {
-        let store = LocalObjectStore::open_with_options(&root, opts()).expect("open store");
+        let store_options = opts();
+        let pool = LocalFileSystem::default_development_pool(&root, &store_options, None, None)
+            .expect("open Pool for corruption");
+        let store = pool.raw_primary_store();
         assert!(
             store.location_of(content_key).is_some(),
             "content object must exist"
         );
-        corrupt_object_payload(&store, content_key);
+        corrupt_all_object_payload_versions(store, content_key);
     }
 
     match verify_online(&root, opts()) {
@@ -343,11 +367,14 @@ fn root_slot_corruption_preserves_older_roots() {
 
     // Corrupt the newest root-slot object.
     {
-        let store = LocalObjectStore::open_with_options(&root, opts()).expect("open store");
+        let store_options = opts();
+        let pool = LocalFileSystem::default_development_pool(&root, &store_options, None, None)
+            .expect("open Pool for corruption");
+        let store = pool.raw_primary_store();
         let latest_slot = 0_u64; // Root slots cycle; slot 0 may hold the newest root.
         let key = root_slot_object_key(latest_slot);
         if store.location_of(key).is_some() {
-            corrupt_object_payload(&store, key);
+            corrupt_object_payload(store, key);
         }
     }
 
@@ -471,12 +498,15 @@ fn record_trailer_corruption_triggers_store_integrity_check() {
     let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
 
     {
-        let store = LocalObjectStore::open_with_options(&root, opts()).expect("open store");
+        let store_options = opts();
+        let pool = LocalFileSystem::default_development_pool(&root, &store_options, None, None)
+            .expect("open Pool for corruption");
+        let store = pool.raw_primary_store();
         assert!(
             store.location_of(content_key).is_some(),
             "content object exists"
         );
-        corrupt_record_trailer(&store, content_key);
+        corrupt_record_trailer(store, content_key);
     }
 
     // After corrupting the trailer, the store must reject the record.

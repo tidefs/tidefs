@@ -235,6 +235,10 @@ mod tests {
 
     #[test]
     fn round_trip_max_id_values() {
+        // u32::MAX is ACL_UNDEFINED_ID on the Linux wire and is not a valid
+        // qualifier for a named user/group.  Exercise the actual maximum
+        // qualifier instead of asking the decoder to accept the sentinel.
+        const MAX_VALID_ACL_ID: u32 = u32::MAX - 1;
         let acl = PosixAcl::from_entries(vec![
             PosixAclEntry {
                 tag: ACL_USER_OBJ,
@@ -244,7 +248,7 @@ mod tests {
             PosixAclEntry {
                 tag: ACL_USER,
                 perm: 5,
-                id: 0xFFFF_FFFF,
+                id: MAX_VALID_ACL_ID,
             },
             PosixAclEntry {
                 tag: ACL_GROUP_OBJ,
@@ -265,6 +269,16 @@ mod tests {
         let bytes = acl.to_bytes();
         let parsed = PosixAcl::parse(&bytes).unwrap();
         assert_eq!(parsed, acl);
+
+        let undefined_named_id = PosixAcl::from_entries(vec![PosixAclEntry {
+            tag: ACL_USER,
+            perm: 5,
+            id: u32::MAX,
+        }]);
+        assert_eq!(
+            PosixAcl::parse(&undefined_named_id.to_bytes()),
+            Err(PosixAclError::Decode(AclError::InvalidQualifier))
+        );
     }
 
     #[test]

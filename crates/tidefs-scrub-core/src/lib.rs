@@ -15,21 +15,28 @@
 //! Follow-on phases add deep scrub (shard reconstruction), repair
 //! (self-healing), and distributed resilver.
 
+#[cfg(any(feature = "distributed-repair", test))]
 pub mod cross_replica_comparison;
 pub mod detector;
 pub mod integrity_verifier;
+#[cfg(any(feature = "distributed-repair", test))]
 pub mod multi_node_scrub;
 pub mod object_scanner;
 pub mod rate_limiter;
+#[cfg(any(feature = "distributed-repair", test))]
 pub mod repair_scheduling;
+#[cfg(any(feature = "distributed-repair", test))]
 pub mod scheduler;
 pub mod scrub_ledger;
+#[cfg(any(feature = "distributed-repair", test))]
 pub mod scrub_repair;
+#[cfg(any(feature = "distributed-repair", test))]
 pub use cross_replica_comparison::{
     compare_cross_replica, ChecksumLayer, ComparisonCandidate, ComparisonClassification,
     CrossReplicaComparisonRecord, EvidenceReadOutcome, EvidenceRejectionReason, PerReplicaOutcome,
     ReplicaEvidence, ScrubSubject, ScrubSubjectKind, TransportFailureReason,
 };
+#[cfg(any(feature = "distributed-repair", test))]
 pub use multi_node_scrub::{
     FanoutAuditEntry, MultiNodeScrubAudit, PeerVerificationOutcome, ScrubFanoutCoordinator,
     ScrubFanoutRequest, ScrubFanoutResponse,
@@ -44,11 +51,13 @@ use tidefs_background_scheduler::{
     BackgroundService, ServiceBudget, ServiceError, ServicePriority, TickReport,
 };
 use tidefs_checksum_tree::{verify_object, ChecksumMismatch, Digest, LocatorToken};
+#[cfg(any(feature = "distributed-repair", test))]
 use tidefs_erasure_coding::ParityRaid1;
 use tidefs_local_object_store::{
     load_suspect_log, write_suspect_log, LocalObjectStore, ObjectKey, SegmentChainStats,
     StoreOptions, SuspectEntry, SuspectLog, STORE_DIR_NAME,
 };
+#[cfg(any(feature = "distributed-repair", test))]
 use tidefs_locator_table::ExtentId;
 
 // ---------------------------------------------------------------------------
@@ -261,6 +270,7 @@ impl ScrubService {
     /// `replicas_remaining` is the number of healthy replicas known to exist
     /// for each entry's data (3 = multi-replica, 1 = single-copy, 0 = last-copy
     /// emergency). This feeds the escalation logic.
+    #[cfg(any(feature = "distributed-repair", test))]
     pub fn drain_suspect_log_to_bridge(
         &mut self,
         bridge: &mut repair_scheduling::ScrubToRepairBridge,
@@ -826,6 +836,7 @@ Findings:
 /// Tracks objects scanned, objects rebuilt, bytes transferred,
 /// estimated completion fraction, and bandwidth utilization.
 #[derive(Clone, Debug, Default)]
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct ResilverStats {
     /// Number of objects (extents) scanned so far.
     pub objects_scanned: u64,
@@ -843,6 +854,7 @@ pub struct ResilverStats {
     pub last_update_ns: u64,
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl ResilverStats {
     /// Record a successfully rebuilt object.
     pub fn record_rebuilt(&mut self, bytes: u64, now_ns: u64) {
@@ -885,6 +897,7 @@ impl ResilverStats {
 ///
 /// The resilver service uses this to discover all extents that need
 /// reconstruction after a device failure.
+#[cfg(any(feature = "distributed-repair", test))]
 pub trait ExtentEnumerator: Send + Sync {
     /// Return the total number of extents on the given device.
     fn extent_count(&self, device_id: u64) -> u64;
@@ -911,6 +924,7 @@ pub trait ExtentEnumerator: Send + Sync {
 ///
 /// Uses an inode number list (e.g. from the inode table or namespace) and
 /// a [`LocatorTable`] to perform the reverse-lookup.
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct LocatorTableExtentEnumerator {
     /// All known inode numbers in the pool.
     inodes: Vec<u64>,
@@ -920,6 +934,7 @@ pub struct LocatorTableExtentEnumerator {
     locator_table: Arc<tidefs_locator_table::LocatorTable>,
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl LocatorTableExtentEnumerator {
     /// Create a new enumerator backed by a locator table.
     ///
@@ -933,6 +948,7 @@ impl LocatorTableExtentEnumerator {
     }
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl ExtentEnumerator for LocatorTableExtentEnumerator {
     fn extent_count(&self, device_id: u64) -> u64 {
         self.load_extents(device_id).len() as u64
@@ -953,6 +969,7 @@ impl ExtentEnumerator for LocatorTableExtentEnumerator {
     }
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl LocatorTableExtentEnumerator {
     /// Load all extent IDs for a device from the locator table, caching the result.
     fn load_extents(&self, device_id: u64) -> Vec<ExtentId> {
@@ -980,6 +997,7 @@ impl LocatorTableExtentEnumerator {
 /// For mirror configurations, the source simply reads from a healthy
 /// replica. For erasure-coded configurations, the source reconstructs
 /// from available shards.
+#[cfg(any(feature = "distributed-repair", test))]
 pub trait ReconstructionSource: Send + Sync {
     /// Reconstruct the data for the given extent from available replicas.
     ///
@@ -1011,6 +1029,7 @@ pub trait ReconstructionSource: Send + Sync {
 /// In a single-node / local environment, the "replicas" are copies of
 /// the same data in the local object store.  For distributed environments,
 /// a networked variant would replace this.
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct LocalMirrorReconstructionSource {
     /// The local object store for reading replica data.
     store: std::sync::Mutex<tidefs_local_object_store::LocalObjectStore>,
@@ -1020,6 +1039,7 @@ pub struct LocalMirrorReconstructionSource {
     replacement_device_id: u64,
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl LocalMirrorReconstructionSource {
     /// Create a new local mirror reconstruction source.
     ///
@@ -1041,6 +1061,7 @@ impl LocalMirrorReconstructionSource {
     }
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl ReconstructionSource for LocalMirrorReconstructionSource {
     fn reconstruct_extent(
         &self,
@@ -1100,6 +1121,7 @@ impl ReconstructionSource for LocalMirrorReconstructionSource {
 
 /// Aggregate statistics for the repair service.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct RepairStats {
     pub repairs_attempted: u64,
     pub repairs_succeeded: u64,
@@ -1114,6 +1136,7 @@ pub struct RepairStats {
 
 /// Strategy for repairing a corrupt object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "distributed-repair", test))]
 pub enum RepairStrategy {
     /// Copy from a healthy mirror replica.
     Mirror,
@@ -1127,6 +1150,7 @@ pub enum RepairStrategy {
 
 /// Records a single repair attempt against a suspect entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct RepairAttempt {
     pub suspect_entry: SuspectEntry,
     pub strategy: RepairStrategy,
@@ -1140,6 +1164,7 @@ pub struct RepairAttempt {
 
 /// Outcome of attempting to repair a single suspect entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "distributed-repair", test))]
 pub enum RepairOutcome {
     /// Repair succeeded; the corrupt data was replaced.
     Repaired { bytes_repaired: u64 },
@@ -1155,6 +1180,7 @@ pub enum RepairOutcome {
 
 /// Strategy selection result for a suspect entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct RepairPlan {
     pub entry: SuspectEntry,
     pub strategy: RepairStrategy,
@@ -1172,6 +1198,7 @@ pub struct RepairPlan {
 /// Implementations consult the locator table, object metadata, or
 /// redundancy policy to determine whether the object is mirrored or
 /// erasure-coded and how many shards are involved.
+#[cfg(any(feature = "distributed-repair", test))]
 pub trait RepairPlanner: Send + Sync {
     /// Plan a repair for the given suspect entry.
     fn plan(&self, entry: &SuspectEntry) -> Option<RepairPlan>;
@@ -1182,6 +1209,7 @@ pub trait RepairPlanner: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Read and write individual erasure-coded shards for repair.
+#[cfg(any(feature = "distributed-repair", test))]
 pub trait ShardReader: Send + Sync {
     /// Read the data shards for a given locatee.
     ///
@@ -1214,6 +1242,7 @@ pub trait ShardReader: Send + Sync {
 ///
 /// Entries that fail repair are retried up to `max_repair_attempts` times
 /// (default 3).  After that they are counted as unrepairable.
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct RepairService {
     suspect_log: SuspectLog,
     mirror_source: Option<Arc<dyn ReconstructionSource>>,
@@ -1236,6 +1265,7 @@ pub struct RepairService {
     segments_dir: Option<PathBuf>,
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl RepairService {
     /// Create a new repair service.
     ///
@@ -1518,8 +1548,10 @@ impl RepairService {
 /// When mirror repair is unavailable (no [`ReconstructionSource`] configured),
 /// the [`RepairService`] falls back to erasure-coded repair if a
 /// [`ShardReader`] is available and `ec_shard_count` is known.
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct DefaultRepairPlanner;
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl RepairPlanner for DefaultRepairPlanner {
     fn plan(&self, entry: &SuspectEntry) -> Option<RepairPlan> {
         Some(RepairPlan {
@@ -1530,6 +1562,7 @@ impl RepairPlanner for DefaultRepairPlanner {
     }
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl BackgroundService for RepairService {
     fn name(&self) -> &'static str {
         "RepairService"
@@ -1676,6 +1709,7 @@ impl BackgroundService for RepairService {
 /// prefers cross-rack replicas to minimize cross-rack traffic.
 ///
 /// Implements `JobKind::Resilver` with `Throughput` priority.
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct ResilverService {
     /// The device that failed and needs rebuilding.
     failed_device_id: u64,
@@ -1699,6 +1733,7 @@ pub struct ResilverService {
     rebuild_progress: tidefs_rebuild_planner::RebuildProgress,
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl ResilverService {
     /// Create a new resilver service for the given failed and replacement devices.
     #[must_use]
@@ -1735,6 +1770,7 @@ impl ResilverService {
     }
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl BackgroundService for ResilverService {
     fn name(&self) -> &'static str {
         "ResilverService"
@@ -1842,6 +1878,7 @@ impl BackgroundService for ResilverService {
 ///
 /// Uses the system clock for now; production code should use a
 /// monotonic source.
+#[cfg(any(feature = "distributed-repair", test))]
 fn monotonic_ns() -> u64 {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -1864,6 +1901,7 @@ fn monotonic_ns() -> u64 {
 /// reconstructs each from redundant copies via [`ReconstructionSource`],
 /// writes to the replacement device, and collects [`ResilverOutcome`]
 /// records.
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct ResilverWorker {
     failed_device_id: u64,
     replacement_device_id: u64,
@@ -1871,6 +1909,7 @@ pub struct ResilverWorker {
     reconstructor: Arc<dyn ReconstructionSource>,
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl ResilverWorker {
     /// Create a new resilver worker.
     #[must_use]
@@ -1977,6 +2016,7 @@ impl ResilverWorker {
 
 /// Outcome of reconstructing a single extent during a device resilver.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "distributed-repair", test))]
 pub enum ResilverOutcome {
     /// Extent successfully reconstructed and written to the replacement device.
     Rebuilt {
@@ -2006,6 +2046,7 @@ pub enum ResilverOutcome {
     },
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl ResilverOutcome {
     /// Return true when this outcome represents a successful rebuild.
     #[must_use]
@@ -2031,6 +2072,7 @@ impl ResilverOutcome {
 
 /// Aggregate statistics and per-extent outcomes from a resilver pass.
 #[derive(Clone, Debug)]
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct ResilverSummary {
     /// Total number of extents enumerated.
     pub total_extents: u64,
@@ -2046,6 +2088,7 @@ pub struct ResilverSummary {
     pub outcomes: Vec<ResilverOutcome>,
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl ResilverSummary {
     /// Return true when no failures occurred.
     #[must_use]
@@ -2109,6 +2152,7 @@ impl ResilverSummary {
 /// because they occupy different placement stripes and thus involve
 /// different source devices.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct StripeMetadata {
     /// The stripe key for concurrent scheduling.
     /// Two extents with the same key share a placement stripe.
@@ -2124,6 +2168,7 @@ pub struct StripeMetadata {
 /// Maps an extent ID to its stripe grouping key.
 ///
 /// Extents with different keys can be rebuilt in parallel.
+#[cfg(any(feature = "distributed-repair", test))]
 pub trait StripeGrouping: Send + Sync {
     /// Compute the stripe key for the given extent.
     fn stripe_key(&self, extent_id: ExtentId, device_id: u64) -> StripeMetadata;
@@ -2134,10 +2179,12 @@ pub trait StripeGrouping: Send + Sync {
 /// This distributes extents across `stripe_width` concurrent rebuild slots
 /// using a simple modulo hash.  In production, this should be replaced by
 /// the placement planner's actual stripe assignment.
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct DefaultStripeGrouping {
     stripe_width: u64,
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl DefaultStripeGrouping {
     /// Create a new default stripe grouping with the given width.
     ///
@@ -2151,6 +2198,7 @@ impl DefaultStripeGrouping {
     }
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl StripeGrouping for DefaultStripeGrouping {
     fn stripe_key(&self, extent_id: ExtentId, _device_id: u64) -> StripeMetadata {
         StripeMetadata {
@@ -2173,6 +2221,7 @@ impl StripeGrouping for DefaultStripeGrouping {
 ///
 /// The service implements the same [`BackgroundService`] interface and
 /// can be used as a drop-in replacement for the basic [`ResilverService`].
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct StripeParallelResilverService {
     /// The device that failed and needs rebuilding.
     failed_device_id: u64,
@@ -2200,6 +2249,7 @@ pub struct StripeParallelResilverService {
     max_concurrency: usize,
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl StripeParallelResilverService {
     /// Create a new stripe-parallel resilver service.
     #[must_use]
@@ -2238,6 +2288,7 @@ impl StripeParallelResilverService {
     }
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl BackgroundService for StripeParallelResilverService {
     fn name(&self) -> &'static str {
         "StripeParallelResilverService"
@@ -2407,6 +2458,7 @@ impl BackgroundService for StripeParallelResilverService {
 ///
 /// In a single-node local environment, the failure domain map is empty
 /// and the selector falls back to the first available source.
+#[cfg(any(feature = "distributed-repair", test))]
 pub trait TopologyAwareSourceSelector: Send + Sync {
     /// Select the best source device from `candidates` for reconstruction
     /// of `extent_id`, avoiding the failure domain of `target_device_id`
@@ -2429,8 +2481,10 @@ pub trait TopologyAwareSourceSelector: Send + Sync {
 /// 1. Prefer candidates in a different failure domain from the target device.
 /// 2. If all candidates share the same domain, fall back to the first candidate.
 /// 3. If the failure domain map is empty (local case), returns the first candidate.
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct DefaultTopologyAwareSourceSelector;
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl TopologyAwareSourceSelector for DefaultTopologyAwareSourceSelector {
     fn select_source(
         &self,
@@ -2472,6 +2526,7 @@ impl TopologyAwareSourceSelector for DefaultTopologyAwareSourceSelector {
 ///
 /// In the local case (empty failure domain map), this degrades to the
 /// same behavior as the inner source.
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct TopologyAwareReconstructionSource {
     /// Inner reconstruction source (for actual I/O).
     inner: Arc<dyn ReconstructionSource>,
@@ -2483,6 +2538,7 @@ pub struct TopologyAwareReconstructionSource {
     source_candidates: std::collections::HashMap<u64, Vec<u64>>,
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl TopologyAwareReconstructionSource {
     /// Create a new topology-aware reconstruction source.
     ///
@@ -2506,6 +2562,7 @@ impl TopologyAwareReconstructionSource {
     }
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl ReconstructionSource for TopologyAwareReconstructionSource {
     fn reconstruct_extent(
         &self,
@@ -2561,6 +2618,7 @@ impl ReconstructionSource for TopologyAwareReconstructionSource {
 /// ([`StripeParallelResilverService`]), and each reconstruction prefers
 /// source replicas in different failure domains from the target device
 /// ([`TopologyAwareReconstructionSource`]).
+#[cfg(any(feature = "distributed-repair", test))]
 pub struct TopologyAwareResilverService {
     /// The device that failed and needs rebuilding.
     failed_device_id: u64,
@@ -2592,6 +2650,7 @@ pub struct TopologyAwareResilverService {
     same_domain_selections: u64,
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl TopologyAwareResilverService {
     /// Create a new topology-aware resilver service.
     #[must_use]
@@ -2644,6 +2703,7 @@ impl TopologyAwareResilverService {
     }
 }
 
+#[cfg(any(feature = "distributed-repair", test))]
 impl BackgroundService for TopologyAwareResilverService {
     fn name(&self) -> &'static str {
         "TopologyAwareResilverService"

@@ -133,6 +133,8 @@ full = [
     "receipt-bound-physical-reclaim",
     "ack-receipt-fault-matrix",
     "scrub-runtime",
+    "tidefs-local-filesystem/full",
+    "tidefs-posix-filesystem-adapter-daemon/full",
 ]
 
 [dependencies]

@@ -26,11 +26,21 @@ cluster = [
     "dep:tidefs-cluster",
     "dep:tidefs-membership-epoch",
     "dep:tidefs-transport",
+    "tidefs-local-object-store/cluster-import",
     "tidefs-posix-filesystem-adapter-daemon/cluster",
 ]
 diagnostics = ["dep:tidefs-validation"]
+data-policy = [
+    "tidefs-local-filesystem/data-policy",
+    "tidefs-posix-filesystem-adapter-daemon/data-policy",
+]
+distributed-repair = ["dep:tidefs-device-removal"]
 receive-merge = []
-remote-snapshot = ["dep:tidefs-transport"]
+replication-io = [
+    "tidefs-local-filesystem/replication-io",
+    "tidefs-posix-filesystem-adapter-daemon/replication-io",
+]
+remote-snapshot = ["replication-io", "dep:tidefs-transport"]
 storage-intent = [
     "dep:serde",
     "dep:tidefs-storage-intent-core",
@@ -39,8 +49,11 @@ storage-intent = [
 full = [
     "block-volume",
     "cluster",
+    "data-policy",
     "diagnostics",
+    "distributed-repair",
     "receive-merge",
+    "replication-io",
     "remote-snapshot",
     "storage-intent",
 ]
@@ -53,7 +66,7 @@ tidefs-pool-import = { workspace = true }
 tidefs-pool-scan = { workspace = true }
 tidefs-validation = { workspace = true, optional = true }
 tidefs-recovery-loop = { workspace = true, optional = true }
-tidefs-device-removal = { workspace = true }
+tidefs-device-removal = { workspace = true, optional = true }
 tidefs-types-pool-label-core = { workspace = true }
 tidefs-local-object-store = { workspace = true }
 tidefs-local-filesystem = { workspace = true }

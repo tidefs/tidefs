@@ -35,7 +35,6 @@ tidefs-posix-semantics = { workspace = true }
 tidefs-background-scheduler = { workspace = true }
 tidefs-performance-contract = { workspace = true, features = ["serde"], optional = true }
 tidefs-local-object-store = { workspace = true }
-tidefs-orphan-index = { workspace = true }
 
 tidefs-recovery-loop = { workspace = true }
 
@@ -50,7 +49,6 @@ tidefs-types-dataset-feature-flags-core = { workspace = true }
 tidefs-vfs-engine = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
-tidefs-flow-commit-coordinator = { workspace = true }
 tidefs-cluster = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -61,15 +59,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 [features]
 default = []
 cluster = ["dep:bincode", "dep:tidefs-cluster"]
+data-policy = ["tidefs-local-filesystem/data-policy"]
 receipt-demo = [
     "tidefs-types-posix-filesystem-adapter-core/wake-receipt",
     "dep:tidefs-schema-codec-posix-filesystem-adapter",
     "dep:tidefs-types-package-profile-catalog",
 ]
+replication-io = ["tidefs-local-filesystem/replication-io"]
 scrub-observation = ["dep:tidefs-performance-contract"]
 workload-telemetry = ["dep:tidefs-workload"]
 full = [
     "cluster",
+    "data-policy",
+    "replication-io",
     "receipt-demo",
     "scrub-observation",
     "workload-telemetry",

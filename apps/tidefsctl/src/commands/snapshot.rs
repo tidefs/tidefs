@@ -2,8 +2,10 @@
 //! Snapshot subcommands.
 //!
 //! Wires CLI arguments to `tidefs_local_filesystem::LocalFileSystem` to
-//! create, list, destroy, send, and receive point-in-time snapshot state.
+//! create, list, and destroy point-in-time snapshot state. The explicit
+//! `replication-io` feature also exposes stream send and receive.
 
+#[cfg(feature = "replication-io")]
 use std::fs;
 #[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
 use std::net::SocketAddr;
@@ -11,10 +13,12 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Args, Subcommand};
+#[cfg(feature = "replication-io")]
+use tidefs_local_filesystem::{ChangedRecordExport, RootAuthenticationKey};
 use tidefs_local_filesystem::{
-    ChangedRecordExport, HoldInfo, LocalFileSystem, LocalFileSystemOpenConfig,
-    LocalStorageAllocatorPolicy, RecoveryPolicy, RootAuthenticationKey, SnapshotDescriptor,
-    SnapshotKind, SnapshotRetentionPolicy, SnapshotRetentionReport, SnapshotSummary,
+    HoldInfo, LocalFileSystem, LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy,
+    RecoveryPolicy, SnapshotDescriptor, SnapshotKind, SnapshotRetentionPolicy,
+    SnapshotRetentionReport, SnapshotSummary,
 };
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 #[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
@@ -298,8 +302,10 @@ pub enum SnapshotCommand {
     /// Destroy a named snapshot, unpinning its object graph from GC
     Destroy(SnapshotDestroyArgs),
     /// Export a changed-record snapshot stream from the current filesystem root
+    #[cfg(feature = "replication-io")]
     Send(SnapshotSendArgs),
     /// Receive a changed-record snapshot stream through the live pool owner
+    #[cfg(feature = "replication-io")]
     Receive(SnapshotReceiveArgs),
     /// Rollback the dataset to a named snapshot state
     Rollback(SnapshotRollbackArgs),
@@ -719,6 +725,7 @@ pub struct SnapshotDestroyArgs {
 }
 
 /// `snapshot send <pool> [--devices <dev>...] --output <path>`
+#[cfg(feature = "replication-io")]
 #[derive(Args, Debug)]
 pub struct SnapshotSendArgs {
     /// Retired directory object-store backing mode.
@@ -794,6 +801,7 @@ pub struct SnapshotSendArgs {
 }
 
 /// `snapshot receive <pool> --input <path>`
+#[cfg(feature = "replication-io")]
 #[derive(Args, Debug)]
 pub struct SnapshotReceiveArgs {
     /// Pool name for imported-pool snapshots routed through the live owner
@@ -933,7 +941,9 @@ pub fn handle_snapshot(cmd: SnapshotCommand) {
         SnapshotCommand::Prune(args) => handle_prune(args),
         SnapshotCommand::PruneScheduled(args) => handle_prune_scheduled(args.cmd),
         SnapshotCommand::Destroy(args) => handle_destroy(args),
+        #[cfg(feature = "replication-io")]
         SnapshotCommand::Send(args) => handle_send(args),
+        #[cfg(feature = "replication-io")]
         SnapshotCommand::Receive(args) => handle_receive(args),
         SnapshotCommand::Rollback(args) => handle_rollback(args),
         SnapshotCommand::Export(args) => handle_export(args),
@@ -1015,7 +1025,9 @@ fn open_filesystem_with_live_args(
         LocalFileSystemOpenConfig {
             options: StoreOptions::default(),
             allocator_policy: LocalStorageAllocatorPolicy::default(),
-            root_authentication_key: root_authentication_key(),
+            root_authentication_key: super::root_authentication_key_or_exit(&format!(
+                "snapshot {operation}"
+            )),
             encryption: None,
             compression: None,
             log_device_device_path: None,
@@ -1088,6 +1100,7 @@ fn scan_device_pool_config(
     config
 }
 
+#[cfg(feature = "replication-io")]
 fn root_authentication_key() -> RootAuthenticationKey {
     super::root_authentication_key_or_exit("snapshot send")
 }
@@ -1344,6 +1357,7 @@ fn retention_report_lines(report: &SnapshotRetentionReport) -> Vec<String> {
 }
 
 #[allow(dead_code)]
+#[cfg(feature = "replication-io")]
 fn send_export_summary(export: &ChangedRecordExport) -> String {
     format!(
         "changed-record stream v{} (roots={}, records={}, payload={} bytes, snapshots={})",
@@ -1365,6 +1379,7 @@ fn send_export_summary(export: &ChangedRecordExport) -> String {
     )
 }
 
+#[cfg(feature = "replication-io")]
 fn hex_to_bytes(hex_str: &str) -> Result<Vec<u8>, String> {
     let hex = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     if hex.len() % 2 != 0 {
@@ -1382,6 +1397,7 @@ fn hex_to_bytes(hex_str: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+#[cfg(feature = "replication-io")]
 fn parse_hex_128(hex_str: &str) -> Result<[u8; 16], String> {
     let bytes = hex_to_bytes(hex_str)?;
     if bytes.len() != 16 {
@@ -1395,6 +1411,7 @@ fn parse_hex_128(hex_str: &str) -> Result<[u8; 16], String> {
     Ok(out)
 }
 
+#[cfg(feature = "replication-io")]
 fn snapshot_backing_path(
     backing_dir: Option<&PathBuf>,
     pool: Option<&str>,
@@ -1429,6 +1446,7 @@ fn snapshot_backing_path(
     }
 }
 
+#[cfg(feature = "replication-io")]
 fn parse_incremental_from_root(
     hex_key: &Option<String>,
     backing_path: &std::path::Path,
@@ -2071,6 +2089,7 @@ fn handle_extract(args: SnapshotExtractArgs) {
     );
 }
 
+#[cfg(feature = "replication-io")]
 fn handle_send(args: SnapshotSendArgs) {
     let _guard = super::authz::require_local_only("snapshot send");
 
@@ -2276,6 +2295,7 @@ fn handle_send(args: SnapshotSendArgs) {
     );
 }
 
+#[cfg(feature = "replication-io")]
 fn handle_receive(args: SnapshotReceiveArgs) {
     let _guard = super::authz::require_local_only("snapshot receive");
 
@@ -2292,6 +2312,7 @@ fn handle_receive(args: SnapshotReceiveArgs) {
     super::live_owner::route_with_args("snapshot", "receive", &args.pool, live_args);
 }
 
+#[cfg(feature = "replication-io")]
 fn snapshot_receive_live_args(args: &SnapshotReceiveArgs) -> LivePoolAdminArgs {
     super::live_owner::live_admin_args([
         (
@@ -2421,17 +2442,20 @@ mod tests {
             | SnapshotCommand::Holds(_)
             | SnapshotCommand::Prune(_)
             | SnapshotCommand::PruneScheduled(_)
-            | SnapshotCommand::Send(_)
-            | SnapshotCommand::Receive(_)
             | SnapshotCommand::Rollback(_)
             | SnapshotCommand::Export(_)
             | SnapshotCommand::Extract(_) => {
+                panic!("expected destroy command")
+            }
+            #[cfg(feature = "replication-io")]
+            SnapshotCommand::Send(_) | SnapshotCommand::Receive(_) => {
                 panic!("expected destroy command")
             }
         }
     }
 
     #[test]
+    #[cfg(feature = "replication-io")]
     fn snapshot_send_args_bindings() {
         let args = SnapshotSendArgs {
             backing_dir: Some(PathBuf::from("/tmp/pool")),
@@ -2457,6 +2481,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "replication-io")]
     fn snapshot_receive_args_bindings() {
         let args = SnapshotReceiveArgs {
             pool: "mypool".into(),
@@ -2477,7 +2502,7 @@ mod tests {
         assert!(args.source_addr.is_none());
     }
 
-    #[cfg(feature = "remote-snapshot")]
+    #[cfg(all(feature = "replication-io", feature = "remote-snapshot"))]
     #[test]
     fn snapshot_receive_live_args_exclude_offline_media() {
         let args = SnapshotReceiveArgs {

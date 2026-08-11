@@ -128,6 +128,17 @@ struct UblkCompletionTraceEvent {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct UblkCompletionTraceEventInput {
+    qid: u16,
+    tag: u16,
+    generation_token: u64,
+    operation_kind: UblkCompletionOperationKind,
+    lifecycle_state: &'static str,
+    terminal_result: Option<i32>,
+    source: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct PendingCompletionCqe {
     generation_token: u64,
     operation_kind: UblkCompletionOperationKind,
@@ -210,15 +221,15 @@ impl UblkCompletionTrace {
             let slot = self.slots.entry((qid, tag)).or_default();
             slot.current_generation_token
         };
-        self.push_event(
+        self.push_event(UblkCompletionTraceEventInput {
             qid,
             tag,
             generation_token,
-            UblkCompletionOperationKind::Fetch,
-            "fetch_submitted",
-            None,
-            "initial_fetch_req_submit",
-        );
+            operation_kind: UblkCompletionOperationKind::Fetch,
+            lifecycle_state: "fetch_submitted",
+            terminal_result: None,
+            source: "initial_fetch_req_submit",
+        });
     }
 
     pub fn record_fetch_cqe_error(
@@ -241,15 +252,15 @@ impl UblkCompletionTrace {
         } else {
             ("fetch_cqe_error", "fetch_req_cqe")
         };
-        self.push_event(
+        self.push_event(UblkCompletionTraceEventInput {
             qid,
             tag,
             generation_token,
-            UblkCompletionOperationKind::Fetch,
-            state,
-            Some(result),
+            operation_kind: UblkCompletionOperationKind::Fetch,
+            lifecycle_state: state,
+            terminal_result: Some(result),
             source,
-        );
+        });
     }
 
     pub fn record_completion_cqe(&mut self, qid: u16, tag: u16) {
@@ -262,15 +273,15 @@ impl UblkCompletionTrace {
         let Some(pending) = slot.pending_completion_cqe.take() else {
             return;
         };
-        self.push_event(
+        self.push_event(UblkCompletionTraceEventInput {
             qid,
             tag,
-            pending.generation_token,
-            pending.operation_kind,
-            "completion_cqe",
-            Some(pending.terminal_result),
-            "commit_and_fetch_cqe",
-        );
+            generation_token: pending.generation_token,
+            operation_kind: pending.operation_kind,
+            lifecycle_state: "completion_cqe",
+            terminal_result: Some(pending.terminal_result),
+            source: "commit_and_fetch_cqe",
+        });
     }
 
     pub fn record_request_fetched(
@@ -300,15 +311,15 @@ impl UblkCompletionTrace {
         } else {
             "fetch_req_cqe"
         };
-        self.push_event(
+        self.push_event(UblkCompletionTraceEventInput {
             qid,
             tag,
             generation_token,
             operation_kind,
-            state,
-            None,
+            lifecycle_state: state,
+            terminal_result: None,
             source,
-        );
+        });
     }
 
     pub fn record_completion_submitted(&mut self, qid: u16, tag: u16, result: i32) {
@@ -330,15 +341,15 @@ impl UblkCompletionTrace {
             terminal_result: result,
         });
         self.completed_requests = self.completed_requests.saturating_add(1);
-        self.push_event(
+        self.push_event(UblkCompletionTraceEventInput {
             qid,
             tag,
             generation_token,
             operation_kind,
-            "completion_submitted",
-            Some(result),
-            "daemon_commit_and_fetch_submit",
-        );
+            lifecycle_state: "completion_submitted",
+            terminal_result: Some(result),
+            source: "daemon_commit_and_fetch_submit",
+        });
     }
 
     pub fn record_completion_submit_failed(&mut self, qid: u16, tag: u16, result: i32) {
@@ -354,15 +365,15 @@ impl UblkCompletionTrace {
         let operation_kind = slot
             .in_flight_operation_kind
             .unwrap_or(UblkCompletionOperationKind::Unknown(0));
-        self.push_event(
+        self.push_event(UblkCompletionTraceEventInput {
             qid,
             tag,
             generation_token,
             operation_kind,
-            "completion_submit_failed",
-            Some(result),
-            "daemon_commit_and_fetch_submit",
-        );
+            lifecycle_state: "completion_submit_failed",
+            terminal_result: Some(result),
+            source: "daemon_commit_and_fetch_submit",
+        });
     }
 
     pub fn record_releases(&mut self) {
@@ -391,25 +402,25 @@ impl UblkCompletionTrace {
                 queue_generation_token = slot.current_generation_token;
             }
             if let Some((generation_token, operation_kind)) = request_release {
-                self.push_event(
+                self.push_event(UblkCompletionTraceEventInput {
                     qid,
                     tag,
                     generation_token,
                     operation_kind,
-                    "request_released",
-                    Some(-libc::ECANCELED),
-                    "data_queue_release",
-                );
+                    lifecycle_state: "request_released",
+                    terminal_result: Some(-libc::ECANCELED),
+                    source: "data_queue_release",
+                });
             }
-            self.push_event(
+            self.push_event(UblkCompletionTraceEventInput {
                 qid,
                 tag,
-                queue_generation_token,
-                UblkCompletionOperationKind::Release,
-                "queue_released",
-                None,
-                "data_queue_release",
-            );
+                generation_token: queue_generation_token,
+                operation_kind: UblkCompletionOperationKind::Release,
+                lifecycle_state: "queue_released",
+                terminal_result: None,
+                source: "data_queue_release",
+            });
         }
     }
 
@@ -423,16 +434,16 @@ impl UblkCompletionTrace {
         fs::write(path, self.to_json())
     }
 
-    fn push_event(
-        &mut self,
-        qid: u16,
-        tag: u16,
-        generation_token: u64,
-        operation_kind: UblkCompletionOperationKind,
-        lifecycle_state: &'static str,
-        terminal_result: Option<i32>,
-        source: &'static str,
-    ) {
+    fn push_event(&mut self, input: UblkCompletionTraceEventInput) {
+        let UblkCompletionTraceEventInput {
+            qid,
+            tag,
+            generation_token,
+            operation_kind,
+            lifecycle_state,
+            terminal_result,
+            source,
+        } = input;
         self.events.push(UblkCompletionTraceEvent {
             sequence: self.next_sequence,
             qid,
@@ -452,12 +463,11 @@ impl UblkCompletionTrace {
         out.push_str("  \"report_version\": 1,\n");
         out.push_str("  \"generated_by\": \"tidefs-block-volume-adapter-daemon\",\n");
         out.push_str("  \"claim_ids\": [\n");
-        let _ = writeln!(out, "    \"{}\"", UBLK_COMPLETION_ARTIFACT_CLAIM_ID);
+        let _ = writeln!(out, "    \"{UBLK_COMPLETION_ARTIFACT_CLAIM_ID}\"");
         out.push_str("  ],\n");
         let _ = writeln!(
             out,
-            "  \"evidence_class\": \"{}\",",
-            UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS
+            "  \"evidence_class\": \"{UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS}\","
         );
         out.push_str("  \"evidence_scope\": \"bounded runtime uBLK daemon qid/tag completion lifecycle trace\",\n");
         let _ = writeln!(out, "  \"scenario\": \"{}\",", self.scenario);
@@ -468,7 +478,7 @@ impl UblkCompletionTrace {
             } else {
                 ","
             };
-            let _ = writeln!(out, "    \"{}\"{}", non_claim, comma);
+            let _ = writeln!(out, "    \"{non_claim}\"{comma}");
         }
         out.push_str("  ],\n");
         let _ = writeln!(out, "  \"nr_hw_queues\": {},", self.nr_hw_queues);
@@ -501,7 +511,7 @@ impl UblkCompletionTrace {
             );
             match event.terminal_result {
                 Some(result) => {
-                    let _ = writeln!(out, "      \"terminal_result\": {},", result);
+                    let _ = writeln!(out, "      \"terminal_result\": {result},");
                 }
                 None => out.push_str("      \"terminal_result\": null,\n"),
             }

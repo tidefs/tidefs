@@ -123,7 +123,7 @@ impl DirtyRange {
 /// `DirtyRange`s sorted by offset.  `mark_dirty` inserts and
 /// coalesces; `flush_inode` removes and returns the dirty set
 /// so the writeback path can issue writes.
-/// admission: AdmissionPermit  service_curve: ServiceCurve
+/// admission: LocalAdmissionPermit  service_curve: filesystem-owned bounded work
 #[derive(Clone, Debug, Default)]
 pub struct DirtyPageTracker {
     ranges: BTreeMap<InodeId, Vec<DirtyRange>>,

@@ -531,13 +531,7 @@ mod tests {
 
         // Write an orphan index that includes the live inode.
         let mut orphan = OrphanIndex::new();
-        let orphan_entry = tidefs_orphan_index::OrphanEntry::new(
-            live_id.get(),
-            1,
-            1,
-            tidefs_orphan_index::OrphanEntryFlags::NONE,
-        );
-        orphan.insert(live_id.get(), orphan_entry);
+        orphan.insert(live_id.get());
         store
             .put(orphan_index_object_key(), &orphan.encode_log())
             .expect("put orphan index");

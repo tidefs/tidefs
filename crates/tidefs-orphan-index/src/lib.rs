@@ -3,20 +3,22 @@
 
 //! Persistent orphan index with append-only log persistence.
 //!
-//! Tracks inodes unlinked while still open, survives crashes, and enables
-//! recovery of O_TMPFILE temporary files. Uses an in-memory B+tree for fast
-//! lookups and an append-only log format with BLAKE3 checksums for durability.
+//! Tracks zero-link inodes for crash recovery. Uses an in-memory B+tree for
+//! fast lookups and an append-only log format with BLAKE3 checksums for
+//! durability. The committed inode and namespace state own reachability; this
+//! index is a reconstructible cleanup accelerator.
 //!
 //! ## Design
 //!
-//! The in-memory index is a key-only B+tree mapping `OrphanKey` (inode ID) to
-//! `OrphanEntry` (generation, nlink, flags). Persistence uses an append-only
-//! log where each entry is serialized with a domain-separated BLAKE3 checksum.
+//! The in-memory index is a key-only B+tree of `OrphanKey` inode IDs.
+//! Persistence uses an append-only log where each key is serialized with a
+//! domain-separated BLAKE3 checksum.
 //! On mount, `recover_from_log()` scans the log, verifies checksums, and
 //! returns surviving entries. Corrupted log entries are detected and reported
 //! but do not block recovery of intact entries.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
+#[cfg(any(feature = "policy-observation", test))]
 use std::fmt;
 use std::vec::Vec;
 
@@ -24,6 +26,7 @@ use tidefs_binary_schema_checksum::blake3_domain_digest;
 use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
 use tidefs_btree::{BPlusTree, BTreeError};
 use tidefs_commit_group::store::CommitGroupStore;
+#[cfg(any(feature = "policy-observation", test))]
 use tidefs_performance_contract::{AdmissionPermit, ResourceDomain, WorkClass};
 use tidefs_types_orphan_index_core::{
     OrphanCursor, OrphanKey, OrphanLogIncompleteTail, OrphanLogRecoveryReport,
@@ -47,11 +50,11 @@ pub const ORPHAN_INDEX_SPEC_REF: &str = ORPHAN_INDEX_SPEC;
 /// Schema identity for orphan log entries.
 const ORPHAN_LOG_FAMILY: SchemaFamilyId = SchemaFamilyId::BINARY_SCHEMA;
 const ORPHAN_LOG_TYPE: SchemaTypeId = SchemaTypeId(300);
-const ORPHAN_LOG_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
+const ORPHAN_LOG_VERSION: SchemaVersion = SchemaVersion::new(2, 0);
 const ORPHAN_LOG_DOMAIN: DomainTag = DomainTag::ExternalPayload;
 
-/// On-disk size of a single serialized `OrphanEntry` in bytes.
-const ENTRY_ENCODED_SIZE: usize = 24;
+/// On-disk size of a single serialized orphan inode ID in bytes.
+const ENTRY_ENCODED_SIZE: usize = 8;
 
 /// Size of a BLAKE3-256 checksum in bytes.
 const CHECKSUM_SIZE: usize = 32;
@@ -59,177 +62,8 @@ const CHECKSUM_SIZE: usize = 32;
 /// Total size of one log record: encoded entry + checksum.
 const LOG_RECORD_SIZE: usize = ENTRY_ENCODED_SIZE + CHECKSUM_SIZE;
 
-// ---------------------------------------------------------------------------
-// OrphanEntryFlags
-// ---------------------------------------------------------------------------
-
-/// Per-entry flags indicating the nature of the orphan.
-///
-/// Stored as a bitfield in the on-disk `OrphanEntry` record.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct OrphanEntryFlags(pub u8);
-
-impl OrphanEntryFlags {
-    /// No flags set — a regular unlinked-but-open file.
-    pub const NONE: Self = OrphanEntryFlags(0);
-
-    /// Entry was created via `O_TMPFILE` (anonymous temporary file).
-    pub const O_TMPFILE: Self = OrphanEntryFlags(1 << 0);
-
-    /// The orphan is a directory (unlinked while still open).
-    pub const IS_DIRECTORY: Self = OrphanEntryFlags(1 << 1);
-
-    /// Returns `true` if the `O_TMPFILE` flag is set.
-    #[must_use]
-    pub const fn is_otmpfile(self) -> bool {
-        self.0 & Self::O_TMPFILE.0 != 0
-    }
-
-    /// Returns `true` if the `IS_DIRECTORY` flag is set.
-    #[must_use]
-    pub const fn is_directory(self) -> bool {
-        self.0 & Self::IS_DIRECTORY.0 != 0
-    }
-
-    /// Returns `true` if no flags are set.
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-}
-
-impl std::fmt::Display for OrphanEntryFlags {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut first = true;
-        if self.is_otmpfile() {
-            write!(f, "O_TMPFILE")?;
-            first = false;
-        }
-        if self.is_directory() {
-            if !first {
-                write!(f, "|")?;
-            }
-            write!(f, "IS_DIRECTORY")?;
-            first = false;
-        }
-        if first {
-            write!(f, "NONE")?;
-        }
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// OrphanEntry
-// ---------------------------------------------------------------------------
-
-/// On-disk record for a single orphaned inode.
-///
-/// Serialized as a fixed-size 24-byte record:
-///
-/// | Offset | Size | Field            |
-/// |--------|------|------------------|
-/// | 0      | 8    | inode_id (LE)    |
-/// | 8      | 8    | generation (LE)  |
-/// | 16     | 4    | nlink_at_unlink  |
-/// | 20     | 1    | flags            |
-/// | 21     | 3    | creating_pid (LE, lower 24 bits) |
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OrphanEntry {
-    /// Inode number of the orphaned file/directory.
-    pub inode_id: u64,
-    /// Generation counter at unlink time (detects inode reuse).
-    pub generation: u64,
-    /// Link count at the moment of unlink (typically 0 for O_TMPFILE,
-    /// or the last nlink before reaching 0 for unlinked-but-open).
-    pub nlink_at_unlink: u32,
-    /// Flags indicating the nature of this orphan entry.
-    pub flags: OrphanEntryFlags,
-    /// PID of the process that created this tmpfile (O_TMPFILE entries).
-    /// Zero for non-tmpfile entries or entries recovered from old logs.
-    pub creating_pid: u32,
-}
-
-impl OrphanEntry {
-    /// Create a new `OrphanEntry`.
-    #[must_use]
-    pub const fn new(
-        inode_id: u64,
-        generation: u64,
-        nlink_at_unlink: u32,
-        flags: OrphanEntryFlags,
-    ) -> Self {
-        Self {
-            inode_id,
-            generation,
-            nlink_at_unlink,
-            flags,
-            creating_pid: 0,
-        }
-    }
-
-    /// Serialize to a fixed-size 24-byte buffer.
-    #[must_use]
-    pub fn encode(&self) -> [u8; ENTRY_ENCODED_SIZE] {
-        let mut buf = [0u8; ENTRY_ENCODED_SIZE];
-        buf[0..8].copy_from_slice(&self.inode_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.generation.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.nlink_at_unlink.to_le_bytes());
-        buf[20] = self.flags.0;
-        // bytes 21-23: lower 24 bits of creating_pid (little-endian)
-        let pid_bytes = (self.creating_pid & 0x00FF_FFFF).to_le_bytes();
-        buf[21..24].copy_from_slice(&pid_bytes[..3]);
-        buf
-    }
-
-    /// Deserialize from a 24-byte buffer.
-    #[must_use]
-    pub fn decode(data: &[u8; ENTRY_ENCODED_SIZE]) -> Self {
-        let inode_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
-        let generation = u64::from_le_bytes(data[8..16].try_into().unwrap());
-        let nlink_at_unlink = u32::from_le_bytes(data[16..20].try_into().unwrap());
-        let flags = OrphanEntryFlags(data[20]);
-        let creating_pid = {
-            let mut pid = [0u8; 4];
-            pid[..3].copy_from_slice(&data[21..24]);
-            u32::from_le_bytes(pid)
-        };
-        Self {
-            creating_pid,
-            inode_id,
-            generation,
-            nlink_at_unlink,
-            flags,
-        }
-    }
-
-    /// Create an O_TMPFILE orphan entry with the creating process PID.
-    #[must_use]
-    pub fn new_tmpfile(inode_id: u64, generation: u64, creating_pid: u32) -> Self {
-        Self {
-            inode_id,
-            generation,
-            nlink_at_unlink: 0,
-            flags: OrphanEntryFlags::O_TMPFILE,
-            creating_pid,
-        }
-    }
-
-    /// Create an O_TMPFILE orphan entry with the creating process PID.
-    #[must_use]
-    pub const fn is_otmpfile(&self) -> bool {
-        self.flags.is_otmpfile()
-    }
-
-    /// Returns `true` if this entry is a directory.
-    #[must_use]
-    pub const fn is_directory(&self) -> bool {
-        self.flags.is_directory()
-    }
-}
-
 /// Orphan-index admission permit validation failure.
+#[cfg(any(feature = "policy-observation", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrphanIndexAdmissionError {
     WrongWorkClass {
@@ -242,6 +76,7 @@ pub enum OrphanIndexAdmissionError {
     },
 }
 
+#[cfg(any(feature = "policy-observation", test))]
 impl fmt::Display for OrphanIndexAdmissionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -261,8 +96,10 @@ impl fmt::Display for OrphanIndexAdmissionError {
     }
 }
 
+#[cfg(any(feature = "policy-observation", test))]
 impl std::error::Error for OrphanIndexAdmissionError {}
 
+#[cfg(any(feature = "policy-observation", test))]
 fn validate_orphan_index_permit(permit: &AdmissionPermit) -> Result<(), OrphanIndexAdmissionError> {
     let charge = permit.charge();
     if charge.work_class != WorkClass::MetadataMutation {
@@ -290,17 +127,17 @@ fn validate_orphan_index_permit(permit: &AdmissionPermit) -> Result<(), OrphanIn
 /// mutations that modify the durable orphan log must route through this index.
 /// Persistent orphan index backed by a key-only B+tree.
 ///
-/// The in-memory B+tree stores `(OrphanKey, OrphanEntry)` pairs for fast
-/// lookup. Persistence uses an append-only log format with BLAKE3
-/// domain-separated checksums per entry.
+/// The B+tree value is `()` because committed inode state, not this derivative
+/// cleanup index, owns generation, link count, node kind, and reachability.
+/// Persistence uses an append-only log of checksummed inode IDs.
 #[derive(Clone, Debug)]
 pub struct OrphanIndex {
-    tree: BPlusTree<OrphanKey, OrphanEntry, MAX_LEAF, MAX_INTERNAL>,
+    tree: BPlusTree<OrphanKey, (), MAX_LEAF, MAX_INTERNAL>,
     /// Set to true when the index has been mutated and needs persistence.
     dirty: bool,
     /// Inserts pending the current TXG commit. Tracked so abort_pending
     /// can roll them back.
-    pending_inserts: BTreeMap<OrphanKey, OrphanEntry>,
+    pending_inserts: BTreeSet<OrphanKey>,
     /// Removes pending the current TXG commit. Tracked so abort_pending
     /// can restore the removed entries.
     pending_removes: BTreeSet<OrphanKey>,
@@ -319,22 +156,21 @@ impl OrphanIndex {
     pub fn new() -> Self {
         Self {
             tree: BPlusTree::new(),
-            pending_inserts: BTreeMap::new(),
+            pending_inserts: BTreeSet::new(),
             pending_removes: BTreeSet::new(),
             dirty: false,
             watermark: OrphanReplayWatermark::NONE,
         }
     }
 
-    /// Create an orphan index from a slice of `OrphanEntry` values.
+    /// Create an orphan index from a slice of inode IDs.
     ///
-    /// Entries are inserted in order; duplicate inode IDs cause the
-    /// last entry to win.
+    /// Duplicate inode IDs coalesce into one key.
     #[must_use]
-    pub fn from_entries(entries: &[OrphanEntry]) -> Self {
+    pub fn from_inode_ids(inode_ids: &[u64]) -> Self {
         let mut idx = Self::new();
-        for entry in entries {
-            idx.insert(entry.inode_id, *entry);
+        for &inode_id in inode_ids {
+            idx.insert(inode_id);
         }
         idx.clear_dirty();
         idx
@@ -342,39 +178,29 @@ impl OrphanIndex {
 
     // -- mutation --
 
-    /// Insert an inode entry into the orphan index.
+    /// Insert an inode ID into the orphan index.
     ///
-    /// Called when an inode's `nlink` reaches 0 (last unlink, or last
-    /// close after unlink). The `inode_id` parameter must match
-    /// `entry.inode_id`.
+    /// Called when the committed inode's `nlink` reaches zero.
     ///
     /// Returns `true` if the entry was newly inserted (was not already
     /// present).
     ///
-    /// # Panics
-    ///
-    /// Panics if `inode_id != entry.inode_id`.
-    pub fn insert(&mut self, inode_id: u64, entry: OrphanEntry) -> bool {
-        assert_eq!(
-            inode_id, entry.inode_id,
-            "inode_id {inode_id} != entry.inode_id {}",
-            entry.inode_id
-        );
+    pub fn insert(&mut self, inode_id: u64) -> bool {
         let key = OrphanKey::from_inode_id(inode_id);
-        let is_new = self.tree.insert(key, entry).is_none();
-        self.dirty = true;
+        let is_new = self.tree.insert(key, ()).is_none();
+        self.dirty |= is_new;
         is_new
     }
 
-    /// Insert an inode entry after validating an orphan-index metadata permit.
+    /// Insert an inode ID after validating an orphan-index metadata permit.
+    #[cfg(any(feature = "policy-observation", test))]
     pub fn insert_admitted(
         &mut self,
         inode_id: u64,
-        entry: OrphanEntry,
         permit: &AdmissionPermit,
     ) -> Result<bool, OrphanIndexAdmissionError> {
         validate_orphan_index_permit(permit)?;
-        Ok(self.insert(inode_id, entry))
+        Ok(self.insert(inode_id))
     }
 
     /// Remove an inode from the orphan index after successful cleanup.
@@ -390,6 +216,7 @@ impl OrphanIndex {
     }
 
     /// Remove an inode entry after validating an orphan-index metadata permit.
+    #[cfg(any(feature = "policy-observation", test))]
     pub fn remove_admitted(
         &mut self,
         inode_id: u64,
@@ -406,13 +233,6 @@ impl OrphanIndex {
     pub fn contains(&self, inode_id: u64) -> bool {
         let key = OrphanKey::from_inode_id(inode_id);
         self.tree.contains_key(&key)
-    }
-
-    /// Get the `OrphanEntry` for an inode, if present.
-    #[must_use]
-    pub fn get(&self, inode_id: u64) -> Option<&OrphanEntry> {
-        let key = OrphanKey::from_inode_id(inode_id);
-        self.tree.get(&key)
     }
 
     /// Return the number of orphaned inodes.
@@ -435,91 +255,6 @@ impl OrphanIndex {
         self.dirty = true;
     }
 
-    // -- O_TMPFILE lifecycle --
-
-    /// Insert an O_TMPFILE anonymous inode into the orphan index.
-    ///
-    /// Called when  creates an anonymous inode (nlink==0).
-    /// The entry is created with the  flag and the PID of the
-    /// creating process so the timeout reaper can clean up if the process
-    /// exits without linking.
-    ///
-    ///  is recorded for commit-group ordering but does not gate the
-    /// in-memory insert.
-    ///
-    /// Returns  if the entry was newly inserted.
-    pub fn insert_tmpfile(
-        &mut self,
-        inode_id: u64,
-        generation: u64,
-        creating_pid: u32,
-        _txg: u64,
-    ) -> bool {
-        let entry = OrphanEntry::new_tmpfile(inode_id, generation, creating_pid);
-        self.insert(inode_id, entry)
-    }
-
-    /// Insert an O_TMPFILE entry after validating an orphan-index metadata permit.
-    pub fn insert_tmpfile_admitted(
-        &mut self,
-        inode_id: u64,
-        generation: u64,
-        creating_pid: u32,
-        txg: u64,
-        permit: &AdmissionPermit,
-    ) -> Result<bool, OrphanIndexAdmissionError> {
-        validate_orphan_index_permit(permit)?;
-        Ok(self.insert_tmpfile(inode_id, generation, creating_pid, txg))
-    }
-
-    /// Remove a tmpfile entry from the orphan index when it is linked into
-    /// the namespace via .
-    ///
-    /// Called when a previously-anonymous O_TMPFILE inode receives a
-    /// directory entry (nlink becomes 1). The inode is no longer orphaned
-    /// and must be removed from the index.
-    ///
-    /// Returns  if the inode was present and removed.
-    pub fn remove_on_link(&mut self, inode_id: u64, _txg: u64) -> bool {
-        self.remove(inode_id)
-    }
-
-    /// Remove an O_TMPFILE entry after validating an orphan-index metadata permit.
-    pub fn remove_on_link_admitted(
-        &mut self,
-        inode_id: u64,
-        txg: u64,
-        permit: &AdmissionPermit,
-    ) -> Result<bool, OrphanIndexAdmissionError> {
-        validate_orphan_index_permit(permit)?;
-        Ok(self.remove_on_link(inode_id, txg))
-    }
-
-    /// Scan for O_TMPFILE entries whose creating process has exited.
-    ///
-    /// Iterates all entries in the index. For each entry with the
-    ///  flag set, checks whether the process identified by
-    ///  is still alive (by testing ).
-    /// Returns the list of inode IDs whose creating process is dead
-    /// and should be reaped.
-    ///
-    /// Entries with  (recovered from old logs or
-    /// created by pre-PID-tracking code) are always included in the
-    /// reap list since their creating process is unknowable.
-    #[must_use]
-    pub fn tmpfile_timeout_reap(&self) -> Vec<u64> {
-        let mut reap = Vec::new();
-        for entry in self.iter() {
-            if !entry.is_otmpfile() {
-                continue;
-            }
-            if entry.creating_pid == 0 || !pid_is_alive(entry.creating_pid) {
-                reap.push(entry.inode_id);
-            }
-        }
-        reap
-    }
-
     /// Validate the internal B+tree structure.
     ///
     /// # Errors
@@ -531,27 +266,26 @@ impl OrphanIndex {
 
     // -- iteration --
 
-    /// Iterate over all orphan entries in inode order.
-    pub fn iter(&self) -> impl Iterator<Item = OrphanEntry> {
-        self.tree.entries().into_iter().map(|(_key, entry)| entry)
+    /// Iterate over all orphan inode IDs in order.
+    pub fn iter(&self) -> impl Iterator<Item = u64> {
+        self.tree
+            .entries()
+            .into_iter()
+            .map(|(key, ())| key.to_inode_id())
     }
 
     /// Collect all orphaned inode IDs in order.
     #[must_use]
     pub fn collect_inode_ids(&self) -> Vec<u64> {
-        self.tree
-            .entries()
-            .into_iter()
-            .map(|(key, _entry)| key.to_inode_id())
-            .collect()
+        self.iter().collect()
     }
 
     // -- persistence: append-only log --
 
     /// Compute the BLAKE3 domain-separated checksum for an encoded entry.
-    fn entry_checksum(entry_bytes: &[u8; ENTRY_ENCODED_SIZE]) -> [u8; CHECKSUM_SIZE] {
+    fn entry_checksum(inode_bytes: &[u8; ENTRY_ENCODED_SIZE]) -> [u8; CHECKSUM_SIZE] {
         blake3_domain_digest(
-            entry_bytes,
+            inode_bytes,
             ORPHAN_LOG_FAMILY,
             ORPHAN_LOG_TYPE,
             ORPHAN_LOG_VERSION,
@@ -562,20 +296,20 @@ impl OrphanIndex {
     /// Encode the entire index as an append-only log buffer.
     ///
     /// Format: `[u32 LE entry_count][u64 LE watermark_position][entries...]`
-    /// Each entry record: `[u8; 24 encoded_entry][u8; 32 BLAKE3 checksum]`
+    /// Each entry record: `[u64 LE inode_id][u8; 32 BLAKE3 checksum]`
     ///
     /// The log is designed to be written atomically via the object store.
     /// On crash, `recover_from_log()` scans and verifies each record.
     #[must_use]
     pub fn encode_log(&self) -> Vec<u8> {
-        let entries: Vec<OrphanEntry> = self.iter().collect();
+        let inode_ids: Vec<u64> = self.iter().collect();
         // Format: 4-byte count | 8-byte watermark position | entries...
-        let mut buf = Vec::with_capacity(12 + entries.len() * LOG_RECORD_SIZE);
-        let count: u32 = entries.len() as u32;
+        let mut buf = Vec::with_capacity(12 + inode_ids.len() * LOG_RECORD_SIZE);
+        let count: u32 = inode_ids.len() as u32;
         buf.extend_from_slice(&count.to_le_bytes());
         buf.extend_from_slice(&self.watermark.position.to_le_bytes());
-        for entry in entries {
-            let enc = entry.encode();
+        for inode_id in inode_ids {
+            let enc = inode_id.to_le_bytes();
             buf.extend_from_slice(&enc);
             let csum = Self::entry_checksum(&enc);
             buf.extend_from_slice(&csum);
@@ -634,12 +368,12 @@ impl OrphanIndex {
                 .unwrap();
             let actual_csum = Self::entry_checksum(&entry_bytes);
 
-            let entry = OrphanEntry::decode(&entry_bytes);
+            let inode_id = u64::from_le_bytes(entry_bytes);
             if actual_csum == expected_csum {
-                idx.insert(entry.inode_id, entry);
+                idx.insert(inode_id);
                 report.replayed_entries += 1;
             } else {
-                report.corrupted_inodes.push(entry.inode_id);
+                report.corrupted_inodes.push(inode_id);
             }
             offset += LOG_RECORD_SIZE;
         }
@@ -649,9 +383,8 @@ impl OrphanIndex {
 
     /// Recover the orphan index from an append-only log buffer.
     ///
-    /// This compatibility wrapper preserves the historic return shape while
-    /// [`Self::recover_from_log_report`] exposes the full operator-visible
-    /// recovery classification.
+    /// [`Self::recover_from_log_report`] additionally exposes the full
+    /// operator-visible recovery classification.
     pub fn recover_from_log(data: &[u8]) -> Result<(Self, Vec<u64>), LogRecoverError> {
         Self::recover_from_log_report(data).map(|(idx, report)| (idx, report.corrupted_inodes))
     }
@@ -697,30 +430,22 @@ impl OrphanIndex {
         self.advance_watermark(cursor.position);
     }
 
-    /// Insert an inode entry into the orphan index within the current TXG.
+    /// Insert an inode ID into the orphan index within the current TXG.
     ///
-    /// The entry is immediately visible to `contains()`, `get()`, and
-    /// `iter()`. The insert is tracked as "pending commit" so that an
+    /// The inode is immediately visible to `contains()` and `iter()`. The
+    /// insert is tracked as "pending commit" so that an
     /// abort before the next `commit_pending()` can roll it back.
     ///
-    /// Returns `true` if the entry was newly inserted (not already
-    /// present in the tree).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `inode_id != entry.inode_id`.
-    pub fn insert_crash_safe(&mut self, inode_id: u64, entry: OrphanEntry) -> bool {
-        assert_eq!(
-            inode_id, entry.inode_id,
-            "inode_id {inode_id} != entry.inode_id {}",
-            entry.inode_id
-        );
+    /// Returns `true` if the inode was newly inserted.
+    pub fn insert_crash_safe(&mut self, inode_id: u64) -> bool {
         let key = OrphanKey::from_inode_id(inode_id);
-        self.pending_removes.remove(&key);
-        let is_new = self.tree.insert(key, entry).is_none();
+        let cancelled_remove = self.pending_removes.remove(&key);
+        let is_new = self.tree.insert(key, ()).is_none();
         if is_new {
             self.dirty = true;
-            self.pending_inserts.insert(key, entry);
+            if !cancelled_remove {
+                self.pending_inserts.insert(key);
+            }
         }
         is_new
     }
@@ -734,14 +459,13 @@ impl OrphanIndex {
     /// Returns `true` if the inode was present and removed.
     pub fn remove_crash_safe(&mut self, inode_id: u64) -> bool {
         let key = OrphanKey::from_inode_id(inode_id);
-        if self.pending_inserts.remove(&key).is_some() {
+        if self.pending_inserts.remove(&key) {
             self.tree.delete(&key);
             return true;
         }
-        if let Some(entry) = self.tree.delete(&key) {
+        if self.tree.delete(&key).is_some() {
             self.dirty = true;
             self.pending_removes.insert(key);
-            self.pending_inserts.insert(key, entry);
             return true;
         }
         false
@@ -758,20 +482,15 @@ impl OrphanIndex {
     /// Abort all pending operations: rolls back inserts and restores
     /// removes to their pre-TXG state.
     pub fn abort_pending(&mut self) {
-        let inserts: Vec<OrphanKey> = self.pending_inserts.keys().copied().collect();
+        let inserts: Vec<OrphanKey> = self.pending_inserts.iter().copied().collect();
         for key in &inserts {
             if self.pending_removes.contains(key) {
                 continue;
             }
             self.tree.delete(key);
         }
-        let restores: Vec<(OrphanKey, OrphanEntry)> = self
-            .pending_removes
-            .iter()
-            .filter_map(|k| self.pending_inserts.get(k).map(|e| (*k, *e)))
-            .collect();
-        for (key, entry) in restores {
-            self.tree.insert(key, entry);
+        for &key in &self.pending_removes {
+            self.tree.insert(key, ());
         }
         self.dirty = false;
         self.pending_inserts.clear();
@@ -918,129 +637,10 @@ impl std::fmt::Display for LogRecoverError {
 
 impl std::error::Error for LogRecoverError {}
 
-/// Check whether a process with the given PID is still alive on Linux.
-///
-/// Tests for the existence of `/proc/<pid>/`. Returns `true` if the
-/// process directory exists (process is alive), `false` otherwise.
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    std::path::Path::new(&format!("/proc/{pid}")).is_dir()
-}
 #[cfg(test)]
 mod tests {
     use super::*;
     use tidefs_types_orphan_index_core::OrphanLogRecoveryClass;
-
-    // Helper to create a simple entry
-    fn make_entry(inode_id: u64) -> OrphanEntry {
-        OrphanEntry::new(inode_id, inode_id * 10, 0, OrphanEntryFlags::NONE)
-    }
-
-    fn make_otmpfile_entry(inode_id: u64) -> OrphanEntry {
-        OrphanEntry::new(inode_id, inode_id * 10, 0, OrphanEntryFlags::O_TMPFILE)
-    }
-
-    fn make_dir_entry(inode_id: u64) -> OrphanEntry {
-        OrphanEntry::new(inode_id, inode_id * 10, 1, OrphanEntryFlags::IS_DIRECTORY)
-    }
-
-    // ── OrphanEntryFlags ─────────────────────────────────────────────
-
-    #[test]
-    fn flags_none() {
-        let f = OrphanEntryFlags::NONE;
-        assert!(!f.is_otmpfile());
-        assert!(!f.is_directory());
-        assert!(f.is_empty());
-        assert_eq!(format!("{f}"), "NONE");
-    }
-
-    #[test]
-    fn flags_otmpfile() {
-        let f = OrphanEntryFlags::O_TMPFILE;
-        assert!(f.is_otmpfile());
-        assert!(!f.is_directory());
-        assert!(!f.is_empty());
-        assert_eq!(format!("{f}"), "O_TMPFILE");
-    }
-
-    #[test]
-    fn flags_directory() {
-        let f = OrphanEntryFlags::IS_DIRECTORY;
-        assert!(!f.is_otmpfile());
-        assert!(f.is_directory());
-        assert_eq!(format!("{f}"), "IS_DIRECTORY");
-    }
-
-    #[test]
-    fn flags_combined() {
-        let f = OrphanEntryFlags(OrphanEntryFlags::O_TMPFILE.0 | OrphanEntryFlags::IS_DIRECTORY.0);
-        assert!(f.is_otmpfile());
-        assert!(f.is_directory());
-        assert!(format!("{f}").contains("O_TMPFILE"));
-        assert!(format!("{f}").contains("IS_DIRECTORY"));
-    }
-
-    // ── OrphanEntry encode/decode round-trip ────────────────────────
-
-    #[test]
-    fn entry_roundtrip_basic() {
-        let entry = make_entry(42);
-        let enc = entry.encode();
-        let dec = OrphanEntry::decode(&enc);
-        assert_eq!(entry, dec);
-    }
-
-    #[test]
-    fn entry_roundtrip_otmpfile() {
-        let entry = make_otmpfile_entry(100);
-        let enc = entry.encode();
-        let dec = OrphanEntry::decode(&enc);
-        assert_eq!(entry, dec);
-        assert!(dec.is_otmpfile());
-        assert!(!dec.is_directory());
-    }
-
-    #[test]
-    fn entry_roundtrip_directory() {
-        let entry = make_dir_entry(200);
-        let enc = entry.encode();
-        let dec = OrphanEntry::decode(&enc);
-        assert_eq!(entry, dec);
-        assert!(dec.is_directory());
-        assert!(!dec.is_otmpfile());
-    }
-
-    #[test]
-    fn entry_roundtrip_boundary_values() {
-        let entry = OrphanEntry::new(u64::MAX, 0, u32::MAX, OrphanEntryFlags(0xFF));
-        let enc = entry.encode();
-        let dec = OrphanEntry::decode(&enc);
-        assert_eq!(entry, dec);
-    }
-
-    #[test]
-    fn entry_encoded_size() {
-        let enc = make_entry(1).encode();
-        assert_eq!(enc.len(), ENTRY_ENCODED_SIZE);
-    }
-
-    #[test]
-    fn entry_flags_accessors() {
-        let e = make_otmpfile_entry(1);
-        assert!(e.is_otmpfile());
-        assert!(!e.is_directory());
-
-        let e = make_dir_entry(2);
-        assert!(e.is_directory());
-        assert!(!e.is_otmpfile());
-
-        let e = make_entry(3);
-        assert!(!e.is_otmpfile());
-        assert!(!e.is_directory());
-    }
 
     // ── OrphanIndex: basic CRUD ──────────────────────────────────────
 
@@ -1057,7 +657,7 @@ mod tests {
     #[test]
     fn insert_and_contains() {
         let mut idx = OrphanIndex::new();
-        assert!(idx.insert(42, make_entry(42)));
+        assert!(idx.insert(42));
         assert!(idx.contains(42));
         assert!(!idx.contains(99));
         assert_eq!(idx.len(), 1);
@@ -1074,7 +674,7 @@ mod tests {
             .try_admit_metadata(0)
             .expect("metadata permit admitted");
         assert!(idx
-            .insert_admitted(42, make_entry(42), &insert_permit)
+            .insert_admitted(42, &insert_permit)
             .expect("insert admitted"));
         state.release(insert_permit).expect("release insert permit");
 
@@ -1084,30 +684,6 @@ mod tests {
         assert!(idx
             .remove_admitted(42, &remove_permit)
             .expect("remove admitted"));
-        state.release(remove_permit).expect("release remove permit");
-    }
-
-    #[test]
-    fn admitted_tmpfile_insert_and_remove_accept_metadata_permits() {
-        let mut state = tidefs_performance_contract::WriteAdmissionState::new(
-            tidefs_performance_contract::WriteAdmissionConfig::new(0, 0, 0, 2),
-        );
-        let mut idx = OrphanIndex::new();
-
-        let insert_permit = state
-            .try_admit_metadata(0)
-            .expect("metadata permit admitted");
-        assert!(idx
-            .insert_tmpfile_admitted(42, 7, 1234, 0, &insert_permit)
-            .expect("tmpfile insert admitted"));
-        state.release(insert_permit).expect("release insert permit");
-
-        let remove_permit = state
-            .try_admit_metadata(1)
-            .expect("metadata permit admitted");
-        assert!(idx
-            .remove_on_link_admitted(42, 0, &remove_permit)
-            .expect("tmpfile remove admitted"));
         state.release(remove_permit).expect("release remove permit");
     }
 
@@ -1124,7 +700,7 @@ mod tests {
         let mut idx = OrphanIndex::new();
 
         let err = idx
-            .insert_admitted(42, make_entry(42), &dirty_permit)
+            .insert_admitted(42, &dirty_permit)
             .expect_err("dirty permit must not admit orphan-index metadata");
 
         assert_eq!(
@@ -1140,32 +716,15 @@ mod tests {
     #[test]
     fn insert_duplicate_rejected() {
         let mut idx = OrphanIndex::new();
-        assert!(idx.insert(1, make_entry(1)));
-        assert!(!idx.insert(1, make_entry(1)));
+        assert!(idx.insert(1));
+        assert!(!idx.insert(1));
         assert_eq!(idx.len(), 1);
-    }
-
-    #[test]
-    fn insert_duplicate_overwrites_entry() {
-        let mut idx = OrphanIndex::new();
-        idx.insert(1, make_entry(1));
-        let otmp = make_otmpfile_entry(1);
-        idx.insert(1, otmp);
-        let got = idx.get(1).unwrap();
-        assert!(got.is_otmpfile());
-    }
-
-    #[test]
-    #[should_panic(expected = "inode_id 1 != entry.inode_id 2")]
-    fn insert_mismatched_id_panics() {
-        let mut idx = OrphanIndex::new();
-        idx.insert(1, make_entry(2));
     }
 
     #[test]
     fn remove_entry() {
         let mut idx = OrphanIndex::new();
-        idx.insert(5, make_entry(5));
+        idx.insert(5);
         assert!(idx.contains(5));
         assert!(idx.remove(5));
         assert!(!idx.contains(5));
@@ -1179,23 +738,11 @@ mod tests {
     }
 
     #[test]
-    fn get_entry() {
-        let mut idx = OrphanIndex::new();
-        let entry = make_otmpfile_entry(77);
-        idx.insert(77, entry);
-        let got = idx.get(77).unwrap();
-        assert_eq!(got.inode_id, 77);
-        assert_eq!(got.generation, 770);
-        assert!(got.is_otmpfile());
-        assert!(idx.get(99).is_none());
-    }
-
-    #[test]
     fn multiple_inserts_ordered() {
         let mut idx = OrphanIndex::new();
         let ids = [100u64, 50, 200, 150, 1];
         for &id in &ids {
-            idx.insert(id, make_entry(id));
+            idx.insert(id);
         }
         assert_eq!(idx.len(), 5);
         let collected = idx.collect_inode_ids();
@@ -1206,18 +753,18 @@ mod tests {
     #[test]
     fn iter_yields_ordered_entries() {
         let mut idx = OrphanIndex::new();
-        idx.insert(30, make_dir_entry(30));
-        idx.insert(10, make_otmpfile_entry(10));
-        idx.insert(20, make_entry(20));
-        let ids: Vec<u64> = idx.iter().map(|e| e.inode_id).collect();
+        idx.insert(30);
+        idx.insert(10);
+        idx.insert(20);
+        let ids: Vec<u64> = idx.iter().collect();
         assert_eq!(ids, vec![10, 20, 30]);
     }
 
     #[test]
     fn clear_empties_index() {
         let mut idx = OrphanIndex::new();
-        idx.insert(1, make_entry(1));
-        idx.insert(2, make_entry(2));
+        idx.insert(1);
+        idx.insert(2);
         idx.clear();
         assert!(idx.is_empty());
         assert_eq!(idx.len(), 0);
@@ -1228,10 +775,10 @@ mod tests {
         let mut idx = OrphanIndex::new();
         let count = 1000u64;
         for i in (0..count).rev() {
-            idx.insert(i + 1, make_entry(i + 1));
+            idx.insert(i + 1);
         }
         assert_eq!(idx.len(), count as usize);
-        let collected: Vec<u64> = idx.iter().map(|e| e.inode_id).collect();
+        let collected: Vec<u64> = idx.iter().collect();
         assert_eq!(collected.len(), count as usize);
         for w in collected.windows(2) {
             assert!(w[0] < w[1]);
@@ -1254,7 +801,7 @@ mod tests {
     #[test]
     fn encode_log_single_entry() {
         let mut idx = OrphanIndex::new();
-        idx.insert(42, make_entry(42));
+        idx.insert(42);
         let log = idx.encode_log();
         assert_eq!(log.len(), 12 + LOG_RECORD_SIZE);
         // Count
@@ -1292,7 +839,7 @@ mod tests {
     #[test]
     fn encode_log_persists_watermark_position() {
         let mut idx = OrphanIndex::new();
-        idx.insert(42, make_entry(42));
+        idx.insert(42);
         idx.advance_watermark(42);
 
         let log = idx.encode_log();
@@ -1305,8 +852,8 @@ mod tests {
     #[test]
     fn truncated_tail_recovery_preserves_watermark_header() {
         let mut idx = OrphanIndex::new();
-        idx.insert(1, make_entry(1));
-        idx.insert(2, make_entry(2));
+        idx.insert(1);
+        idx.insert(2);
         idx.advance_watermark(1);
 
         let mut log = idx.encode_log();
@@ -1322,30 +869,20 @@ mod tests {
     #[test]
     fn roundtrip_log_single_entry() {
         let mut idx = OrphanIndex::new();
-        let entry = make_otmpfile_entry(42);
-        idx.insert(42, entry);
+        idx.insert(42);
         let log = idx.encode_log();
 
         let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
         assert!(corrupted.is_empty());
         assert_eq!(recovered.len(), 1);
-        let got = recovered.get(42).unwrap();
-        assert_eq!(got.inode_id, 42);
-        assert_eq!(got.generation, 420);
-        assert!(got.is_otmpfile());
+        assert!(recovered.contains(42));
     }
 
     #[test]
     fn roundtrip_log_multiple_entries() {
         let mut idx = OrphanIndex::new();
         for i in 1..=50u64 {
-            if i % 3 == 0 {
-                idx.insert(i, make_otmpfile_entry(i));
-            } else if i % 5 == 0 {
-                idx.insert(i, make_dir_entry(i));
-            } else {
-                idx.insert(i, make_entry(i));
-            }
+            idx.insert(i);
         }
         let log = idx.encode_log();
 
@@ -1355,11 +892,6 @@ mod tests {
         for i in 1..=50u64 {
             assert!(recovered.contains(i), "missing inode {i}");
         }
-        // Spot-check flag preservation
-        assert!(recovered.get(3).unwrap().is_otmpfile());
-        assert!(recovered.get(5).unwrap().is_directory());
-        assert!(!recovered.get(1).unwrap().is_otmpfile());
-        assert!(!recovered.get(1).unwrap().is_directory());
     }
 
     // -- Crash-safe insert/remove with commit/abort semantics ------
@@ -1367,9 +899,8 @@ mod tests {
     #[test]
     fn insert_crash_safe_immediately_visible() {
         let mut idx = OrphanIndex::new();
-        assert!(idx.insert_crash_safe(42, make_entry(42)));
+        assert!(idx.insert_crash_safe(42));
         assert!(idx.contains(42));
-        assert!(idx.get(42).is_some());
         assert_eq!(idx.len(), 1);
         assert!(idx.is_dirty());
         assert!(idx.has_pending());
@@ -1379,7 +910,7 @@ mod tests {
     #[test]
     fn insert_crash_safe_visible_after_commit() {
         let mut idx = OrphanIndex::new();
-        idx.insert_crash_safe(42, make_entry(42));
+        idx.insert_crash_safe(42);
         assert!(idx.contains(42));
         assert!(idx.has_pending());
         idx.commit_pending();
@@ -1392,7 +923,7 @@ mod tests {
     #[test]
     fn insert_crash_safe_aborted_rolled_back() {
         let mut idx = OrphanIndex::new();
-        idx.insert_crash_safe(42, make_entry(42));
+        idx.insert_crash_safe(42);
         assert!(idx.contains(42));
         idx.abort_pending();
         assert!(!idx.contains(42));
@@ -1404,7 +935,7 @@ mod tests {
     #[test]
     fn remove_crash_safe_immediately_removed() {
         let mut idx = OrphanIndex::new();
-        idx.insert(42, make_entry(42));
+        idx.insert(42);
         idx.clear_dirty();
         assert!(!idx.is_dirty());
         assert!(idx.remove_crash_safe(42));
@@ -1417,7 +948,7 @@ mod tests {
     #[test]
     fn remove_crash_safe_gone_after_commit() {
         let mut idx = OrphanIndex::new();
-        idx.insert(42, make_entry(42));
+        idx.insert(42);
         idx.remove_crash_safe(42);
         idx.commit_pending();
         assert!(!idx.contains(42));
@@ -1428,7 +959,7 @@ mod tests {
     #[test]
     fn remove_crash_safe_cancels_pending_insert() {
         let mut idx = OrphanIndex::new();
-        idx.insert_crash_safe(42, make_entry(42));
+        idx.insert_crash_safe(42);
         assert!(idx.contains(42));
         assert!(idx.remove_crash_safe(42));
         assert!(!idx.contains(42));
@@ -1440,7 +971,7 @@ mod tests {
     #[test]
     fn remove_crash_safe_aborted_restores_entry() {
         let mut idx = OrphanIndex::new();
-        idx.insert(42, make_entry(42));
+        idx.insert(42);
         idx.clear_dirty();
         idx.remove_crash_safe(42);
         assert!(!idx.contains(42));
@@ -1455,7 +986,7 @@ mod tests {
     fn concurrent_insert_and_commit() {
         let mut idx = OrphanIndex::new();
         for i in 1..=100u64 {
-            idx.insert_crash_safe(i, make_entry(i));
+            idx.insert_crash_safe(i);
         }
         assert_eq!(idx.pending_count(), 100);
         assert_eq!(idx.len(), 100);
@@ -1481,7 +1012,7 @@ mod tests {
     #[test]
     fn remove_crash_safe_after_insert_crash_safe_same_txg() {
         let mut idx = OrphanIndex::new();
-        idx.insert_crash_safe(5, make_entry(5));
+        idx.insert_crash_safe(5);
         assert!(idx.contains(5));
         idx.remove_crash_safe(5);
         assert!(!idx.contains(5));
@@ -1493,7 +1024,7 @@ mod tests {
     #[test]
     fn crash_simulated_recovery_insert_commit_then_kill() {
         let mut idx = OrphanIndex::new();
-        idx.insert_crash_safe(42, make_entry(42));
+        idx.insert_crash_safe(42);
         idx.commit_pending();
         let log = idx.encode_log();
         let (recovered, _) = OrphanIndex::recover_from_log(&log).unwrap();
@@ -1503,8 +1034,8 @@ mod tests {
     #[test]
     fn clear_also_clears_pending() {
         let mut idx = OrphanIndex::new();
-        idx.insert_crash_safe(1, make_entry(1));
-        idx.insert(2, make_entry(2));
+        idx.insert_crash_safe(1);
+        idx.insert(2);
         idx.remove_crash_safe(2);
         assert!(idx.has_pending());
         idx.clear();
@@ -1516,8 +1047,8 @@ mod tests {
     #[test]
     fn commit_to_txg_clears_pending() {
         let mut idx = OrphanIndex::new();
-        idx.insert_crash_safe(10, make_entry(10));
-        idx.insert_crash_safe(20, make_otmpfile_entry(20));
+        idx.insert_crash_safe(10);
+        idx.insert_crash_safe(20);
         assert!(idx.has_pending());
         assert!(idx.is_dirty());
 
@@ -1554,22 +1085,23 @@ mod tests {
     }
 
     #[test]
-    fn insert_clears_pending_remove() {
+    fn crash_safe_insert_cancels_pending_remove() {
         let mut idx = OrphanIndex::new();
-        idx.insert(42, make_entry(42));
+        idx.insert(42);
         idx.clear_dirty();
         idx.remove_crash_safe(42);
         assert!(idx.has_pending());
-        assert!(idx.insert(42, make_otmpfile_entry(42)));
+        assert!(idx.insert_crash_safe(42));
+        assert!(!idx.has_pending());
+        idx.abort_pending();
         assert!(idx.contains(42));
-        assert!(idx.get(42).unwrap().is_otmpfile());
     }
 
     #[test]
     fn remove_clears_pending_sets() {
         let mut idx = OrphanIndex::new();
-        idx.insert_crash_safe(1, make_entry(1));
-        idx.insert(2, make_entry(2));
+        idx.insert_crash_safe(1);
+        idx.insert(2);
         assert!(idx.contains(1));
         assert!(idx.contains(2));
         assert!(idx.remove(1));
@@ -1597,8 +1129,8 @@ mod tests {
     fn recover_truncated_entry_graceful() {
         // Create a valid log with 2 entries, then truncate the last entry
         let mut idx = OrphanIndex::new();
-        idx.insert(1, make_entry(1));
-        idx.insert(2, make_entry(2));
+        idx.insert(1);
+        idx.insert(2);
         let mut log = idx.encode_log();
         // Truncate halfway through the second entry
         let new_len = 12 + LOG_RECORD_SIZE + 10; // header(12) + first full entry + 10 bytes of second
@@ -1615,8 +1147,8 @@ mod tests {
     #[test]
     fn recover_report_classifies_incomplete_tail() {
         let mut idx = OrphanIndex::new();
-        idx.insert(1, make_entry(1));
-        idx.insert(2, make_entry(2));
+        idx.insert(1);
+        idx.insert(2);
         idx.advance_watermark(10);
         let mut log = idx.encode_log();
         log.truncate(12 + LOG_RECORD_SIZE + 7);
@@ -1637,9 +1169,9 @@ mod tests {
     #[test]
     fn recover_corrupted_checksum() {
         let mut idx = OrphanIndex::new();
-        idx.insert(1, make_entry(1));
-        idx.insert(2, make_entry(2));
-        idx.insert(3, make_entry(3));
+        idx.insert(1);
+        idx.insert(2);
+        idx.insert(3);
         let mut log = idx.encode_log();
 
         // Corrupt the checksum of the second entry after the 12-byte header.
@@ -1657,8 +1189,8 @@ mod tests {
     #[test]
     fn recover_report_classifies_corrupt_log() {
         let mut idx = OrphanIndex::new();
-        idx.insert(1, make_entry(1));
-        idx.insert(2, make_entry(2));
+        idx.insert(1);
+        idx.insert(2);
         let mut log = idx.encode_log();
 
         let second_csum_start = 12 + LOG_RECORD_SIZE + ENTRY_ENCODED_SIZE;
@@ -1676,17 +1208,16 @@ mod tests {
     #[test]
     fn recover_corrupted_entry_data() {
         let mut idx = OrphanIndex::new();
-        idx.insert(10, make_otmpfile_entry(10));
-        idx.insert(20, make_dir_entry(20));
+        idx.insert(10);
+        idx.insert(20);
         let mut log = idx.encode_log();
 
-        // Corrupt the generation field of the first entry (offset 8-15 in entry bytes)
-        // This preserves the inode_id so the corrupted vector reports the correct ID.
+        // Corrupt the first inode ID while leaving its checksum unchanged.
         let entry_data_start = 12; // after count (4) + watermark (8) header
-        log[entry_data_start + 10] ^= 0xFF; // flip a byte in generation field
+        log[entry_data_start] ^= 0xFF;
 
         let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
-        assert_eq!(corrupted, vec![10]);
+        assert_eq!(corrupted.len(), 1);
         assert_eq!(recovered.len(), 1);
         assert!(recovered.contains(20));
         assert!(!recovered.contains(10));
@@ -1698,7 +1229,7 @@ mod tests {
     fn batch_recover_from_start() {
         let mut idx = OrphanIndex::new();
         for i in 1..=50u64 {
-            idx.insert(i, make_entry(i));
+            idx.insert(i);
         }
 
         let budget = OrphanRecoveryBudget {
@@ -1716,7 +1247,7 @@ mod tests {
     fn batch_recover_exhausts() {
         let mut idx = OrphanIndex::new();
         for i in 1..=5u64 {
-            idx.insert(i, make_entry(i));
+            idx.insert(i);
         }
         let budget = OrphanRecoveryBudget {
             max_orphans_per_tick: 100,
@@ -1741,7 +1272,7 @@ mod tests {
     fn batch_recover_resumes_from_cursor() {
         let mut idx = OrphanIndex::new();
         for i in 1..=30u64 {
-            idx.insert(i, make_entry(i));
+            idx.insert(i);
         }
         let budget = OrphanRecoveryBudget {
             max_orphans_per_tick: 10,
@@ -1757,23 +1288,20 @@ mod tests {
         assert_eq!(total, 30);
     }
 
-    // ── from_entries constructor ─────────────────────────────────────
+    // ── from_inode_ids constructor ──────────────────────────────────
 
     #[test]
-    fn from_entries_constructs_correctly() {
-        let entries = vec![make_entry(10), make_otmpfile_entry(20), make_dir_entry(30)];
-        let idx = OrphanIndex::from_entries(&entries);
+    fn from_inode_ids_constructs_correctly() {
+        let idx = OrphanIndex::from_inode_ids(&[10, 20, 30]);
         assert_eq!(idx.len(), 3);
         assert!(idx.contains(10));
         assert!(idx.contains(20));
         assert!(idx.contains(30));
-        assert!(idx.get(20).unwrap().is_otmpfile());
-        assert!(idx.get(30).unwrap().is_directory());
     }
 
     #[test]
-    fn from_entries_empty() {
-        let idx = OrphanIndex::from_entries(&[]);
+    fn from_inode_ids_empty() {
+        let idx = OrphanIndex::from_inode_ids(&[]);
         assert!(idx.is_empty());
     }
 
@@ -1783,7 +1311,7 @@ mod tests {
     fn validate_large_tree() {
         let mut idx = OrphanIndex::new();
         for i in 0..500u64 {
-            idx.insert(i, make_entry(i));
+            idx.insert(i);
         }
         assert!(idx.validate().is_ok());
     }
@@ -1793,7 +1321,7 @@ mod tests {
         let mut idx = OrphanIndex::new();
         let count = MAX_LEAF + 10;
         for i in 0..count as u64 {
-            idx.insert(i, make_entry(i));
+            idx.insert(i);
         }
         assert_eq!(idx.len(), count);
         assert!(idx.validate().is_ok());
@@ -1804,7 +1332,7 @@ mod tests {
         let mut idx = OrphanIndex::new();
         let count = MAX_LEAF as u64 * MAX_INTERNAL as u64 * 4;
         for i in 0..count {
-            idx.insert(i, make_entry(i));
+            idx.insert(i);
         }
         assert_eq!(idx.len(), count as usize);
         assert!(idx.tree.depth() >= 2, "expected multi-level tree");
@@ -1814,32 +1342,13 @@ mod tests {
     #[test]
     fn insert_boundary_values() {
         let mut idx = OrphanIndex::new();
-        // Use explicit generation values to avoid overflow in make_entry helper
-        idx.insert(
-            u64::MAX,
-            OrphanEntry::new(u64::MAX, 1, 0, OrphanEntryFlags::NONE),
-        );
-        idx.insert(0, OrphanEntry::new(0, 0, 0, OrphanEntryFlags::NONE));
-        idx.insert(1, OrphanEntry::new(1, 10, 0, OrphanEntryFlags::NONE));
+        idx.insert(u64::MAX);
+        idx.insert(0);
+        idx.insert(1);
         assert_eq!(idx.len(), 3);
         assert!(idx.contains(0));
         assert!(idx.contains(1));
         assert!(idx.contains(u64::MAX));
-    }
-
-    // ── O_TMPFILE flag persistence round-trip ────────────────────────
-
-    #[test]
-    fn otmpfile_flag_roundtrip_through_log() {
-        let mut idx = OrphanIndex::new();
-        let otmp = OrphanEntry::new(100, 500, 0, OrphanEntryFlags::O_TMPFILE);
-        idx.insert(100, otmp);
-        let log = idx.encode_log();
-        let (recovered, _) = OrphanIndex::recover_from_log(&log).unwrap();
-        let got = recovered.get(100).unwrap();
-        assert!(got.is_otmpfile());
-        assert_eq!(got.generation, 500);
-        assert_eq!(got.nlink_at_unlink, 0);
     }
 
     // ── Crash recovery: partial log resilience ───────────────────────
@@ -1850,7 +1359,7 @@ mod tests {
         // made it to disk
         let mut idx = OrphanIndex::new();
         for i in 1..=5u64 {
-            idx.insert(i, make_entry(i));
+            idx.insert(i);
         }
         let full_log = idx.encode_log();
         // Keep header + 3.5 entries
@@ -1869,193 +1378,17 @@ mod tests {
     #[test]
     fn checksum_uniqueness_across_entries() {
         // Different entries must produce different checksums
-        let e1 = make_entry(1);
-        let e2 = make_entry(2);
-        let c1 = OrphanIndex::entry_checksum(&e1.encode());
-        let c2 = OrphanIndex::entry_checksum(&e2.encode());
+        let c1 = OrphanIndex::entry_checksum(&1u64.to_le_bytes());
+        let c2 = OrphanIndex::entry_checksum(&2u64.to_le_bytes());
         assert_ne!(c1, c2);
     }
 
     #[test]
     fn checksum_same_entry_same_checksum() {
-        let e = make_entry(42);
-        let c1 = OrphanIndex::entry_checksum(&e.encode());
-        let c2 = OrphanIndex::entry_checksum(&e.encode());
+        let encoded = 42u64.to_le_bytes();
+        let c1 = OrphanIndex::entry_checksum(&encoded);
+        let c2 = OrphanIndex::entry_checksum(&encoded);
         assert_eq!(c1, c2);
-    }
-    // -- O_TMPFILE orphan index lifecycle tests --
-
-    #[test]
-    fn tmpfile_insert_and_lookup() {
-        let mut idx = OrphanIndex::new();
-        assert!(idx.insert_tmpfile(10, 100, 1234, 0));
-        assert!(idx.contains(10));
-        let entry = idx.get(10).unwrap();
-        assert!(entry.is_otmpfile());
-        assert_eq!(entry.inode_id, 10);
-        assert_eq!(entry.generation, 100);
-        assert_eq!(entry.nlink_at_unlink, 0);
-        assert_eq!(entry.creating_pid, 1234);
-    }
-
-    #[test]
-    fn tmpfile_insert_duplicate_returns_false() {
-        let mut idx = OrphanIndex::new();
-        assert!(idx.insert_tmpfile(1, 10, 100, 0));
-        assert!(!idx.insert_tmpfile(1, 10, 200, 0));
-        assert_eq!(idx.len(), 1);
-    }
-
-    #[test]
-    fn tmpfile_remove_on_link() {
-        let mut idx = OrphanIndex::new();
-        idx.insert_tmpfile(5, 50, 999, 0);
-        assert!(idx.contains(5));
-        assert!(idx.remove_on_link(5, 0));
-        assert!(!idx.contains(5));
-        assert!(idx.is_empty());
-    }
-
-    #[test]
-    fn tmpfile_remove_on_link_nonexistent() {
-        let mut idx = OrphanIndex::new();
-        assert!(!idx.remove_on_link(999, 0));
-    }
-
-    #[test]
-    fn tmpfile_timeout_reap_process_alive() {
-        let alive_pid = std::process::id();
-        let mut idx = OrphanIndex::new();
-        idx.insert_tmpfile(10, 100, alive_pid, 0);
-        // The current test process is alive, so this tmpfile should not be reaped.
-        let reap = idx.tmpfile_timeout_reap();
-        assert!(
-            reap.is_empty(),
-            "current process should be alive, not reaped"
-        );
-    }
-
-    #[test]
-    fn tmpfile_timeout_reap_process_dead() {
-        // Use a very high PID that almost certainly doesn't exist
-        let dead_pid: u32 = 0xFFFFFE;
-        let mut idx = OrphanIndex::new();
-        idx.insert_tmpfile(20, 200, dead_pid, 0);
-        let reap = idx.tmpfile_timeout_reap();
-        assert_eq!(reap, vec![20]);
-    }
-
-    #[test]
-    fn tmpfile_timeout_reap_zero_pid_always_reaped() {
-        // PID 0 means unknown (old log recovery), always reap
-        let mut idx = OrphanIndex::new();
-        idx.insert_tmpfile(30, 300, 0, 0);
-        let reap = idx.tmpfile_timeout_reap();
-        assert_eq!(reap, vec![30]);
-    }
-
-    #[test]
-    fn tmpfile_timeout_reap_skips_non_otmpfile() {
-        let mut idx = OrphanIndex::new();
-        // Regular unlinked file (not O_TMPFILE)
-        let entry = OrphanEntry::new(40, 400, 0, OrphanEntryFlags::NONE);
-        idx.insert(40, entry);
-        let reap = idx.tmpfile_timeout_reap();
-        assert!(reap.is_empty());
-    }
-
-    #[test]
-    fn tmpfile_timeout_reap_mixed_alive_and_dead() {
-        let mut idx = OrphanIndex::new();
-        // The current test process is alive.
-        idx.insert_tmpfile(1, 10, std::process::id(), 0);
-        // Dead PID
-        idx.insert_tmpfile(2, 20, 0xFFFFFD, 0);
-        let reap = idx.tmpfile_timeout_reap();
-        assert_eq!(reap, vec![2]);
-    }
-
-    #[test]
-    fn tmpfile_insert_link_remove_cycle() {
-        let mut idx = OrphanIndex::new();
-        // Create tmpfile
-        assert!(idx.insert_tmpfile(100, 1000, 42, 0));
-        assert_eq!(idx.len(), 1);
-        // Link it
-        assert!(idx.remove_on_link(100, 0));
-        assert_eq!(idx.len(), 0);
-        // Second remove should be no-op
-        assert!(!idx.remove_on_link(100, 0));
-    }
-
-    #[test]
-    fn tmpfile_insert_reap_cycle() {
-        let mut idx = OrphanIndex::new();
-        idx.insert_tmpfile(200, 2000, 0xFFFFFC, 0);
-        // Process dead -> should reap
-        let reap = idx.tmpfile_timeout_reap();
-        assert_eq!(reap, vec![200]);
-        // After reaping, the entry is still in the index (caller must remove)
-        assert!(idx.contains(200));
-        idx.remove(200);
-        assert!(!idx.contains(200));
-    }
-
-    // -- PID persistence round-trip --
-
-    #[test]
-    fn pid_encode_decode_roundtrip() {
-        let entry = OrphanEntry::new_tmpfile(50, 500, 0x123456);
-        let enc = entry.encode();
-        let dec = OrphanEntry::decode(&enc);
-        assert_eq!(dec.inode_id, 50);
-        assert_eq!(dec.generation, 500);
-        assert!(dec.is_otmpfile());
-        assert_eq!(dec.creating_pid, 0x123456);
-    }
-
-    #[test]
-    fn pid_encode_decode_max_24bit() {
-        // Maximum 24-bit value
-        let entry = OrphanEntry::new_tmpfile(60, 600, 0x00FF_FFFF);
-        let enc = entry.encode();
-        let dec = OrphanEntry::decode(&enc);
-        assert_eq!(dec.creating_pid, 0x00FF_FFFF);
-    }
-
-    #[test]
-    fn pid_encode_decode_truncated_to_24bit() {
-        // Values above 24 bits are truncated
-        let entry = OrphanEntry::new_tmpfile(70, 700, 0x01FF_FFFF);
-        let enc = entry.encode();
-        let dec = OrphanEntry::decode(&enc);
-        assert_eq!(dec.creating_pid, 0x00FF_FFFF);
-    }
-
-    #[test]
-    fn pid_roundtrip_through_log() {
-        let mut idx = OrphanIndex::new();
-        idx.insert_tmpfile(80, 800, 0xABCDEF, 0);
-        let log = idx.encode_log();
-        let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
-        assert!(corrupted.is_empty());
-        let got = recovered.get(80).unwrap();
-        assert!(got.is_otmpfile());
-        assert_eq!(got.creating_pid, 0xABCDEF);
-    }
-
-    #[test]
-    fn pid_zero_entry_roundtrip_through_log() {
-        // Existing entries with PID=0 should survive the log
-        let mut idx = OrphanIndex::new();
-        let entry = OrphanEntry::new(90, 900, 0, OrphanEntryFlags::O_TMPFILE);
-        idx.insert(90, entry);
-        let log = idx.encode_log();
-        let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
-        assert!(corrupted.is_empty());
-        let got = recovered.get(90).unwrap();
-        assert!(got.is_otmpfile());
-        assert_eq!(got.creating_pid, 0);
     }
     // ── TXG commit pipeline tests ──────────────────────────────────
 
@@ -2107,7 +1440,7 @@ mod tests {
         let mut store = MemCommitGroupStore::new();
         let mut idx = OrphanIndex::new();
 
-        idx.insert_crash_safe(42, make_entry(42));
+        idx.insert_crash_safe(42);
         assert!(idx.is_dirty());
         assert!(idx.contains(42));
 
@@ -2126,13 +1459,7 @@ mod tests {
         let mut idx = OrphanIndex::new();
 
         for i in 1..=50u64 {
-            if i % 3 == 0 {
-                idx.insert_crash_safe(i, make_otmpfile_entry(i));
-            } else if i % 5 == 0 {
-                idx.insert_crash_safe(i, make_dir_entry(i));
-            } else {
-                idx.insert_crash_safe(i, make_entry(i));
-            }
+            idx.insert_crash_safe(i);
         }
         assert!(idx.is_dirty());
 
@@ -2143,9 +1470,7 @@ mod tests {
         assert!(corrupted.is_empty());
         assert_eq!(recovered.len(), 50);
         assert!(recovered.contains(3));
-        assert!(recovered.get(3).unwrap().is_otmpfile());
         assert!(recovered.contains(5));
-        assert!(recovered.get(5).unwrap().is_directory());
     }
 
     #[test]
@@ -2155,7 +1480,7 @@ mod tests {
 
         {
             let mut idx = OrphanIndex::new();
-            idx.insert_crash_safe(orphan_id, make_entry(orphan_id));
+            idx.insert_crash_safe(orphan_id);
             assert!(idx.contains(orphan_id));
             idx.commit_to_txg(&mut store, "orphan-idx").unwrap();
         }
@@ -2174,7 +1499,7 @@ mod tests {
 
         {
             let mut idx = OrphanIndex::new();
-            idx.insert_crash_safe(orphan_id, make_entry(orphan_id));
+            idx.insert_crash_safe(orphan_id);
             assert!(idx.is_dirty());
         }
 
@@ -2191,9 +1516,9 @@ mod tests {
 
         {
             let mut idx = OrphanIndex::new();
-            idx.insert_crash_safe(1, make_entry(1));
-            idx.insert_crash_safe(2, make_entry(2));
-            idx.insert_crash_safe(3, make_entry(3));
+            idx.insert_crash_safe(1);
+            idx.insert_crash_safe(2);
+            idx.insert_crash_safe(3);
             idx.commit_to_txg(&mut store, "orphan-idx").unwrap();
         }
 
@@ -2228,7 +1553,7 @@ mod tests {
     #[test]
     fn txg_clear_marks_dirty() {
         let mut idx = OrphanIndex::new();
-        idx.insert(1, make_entry(1));
+        idx.insert(1);
         idx.clear_dirty();
         assert!(!idx.is_dirty());
 
@@ -2252,7 +1577,7 @@ mod tests {
         let count = 100u64;
 
         for i in 1..=count {
-            idx.insert_crash_safe(i, make_entry(i));
+            idx.insert_crash_safe(i);
         }
         assert!(idx.is_dirty());
         assert_eq!(idx.len(), count as usize);
@@ -2272,9 +1597,9 @@ mod tests {
     fn txg_corrupted_log_recovery_returns_partial() {
         let mut store = MemCommitGroupStore::new();
         let mut idx = OrphanIndex::new();
-        idx.insert_crash_safe(1, make_entry(1));
-        idx.insert_crash_safe(2, make_entry(2));
-        idx.insert_crash_safe(3, make_entry(3));
+        idx.insert_crash_safe(1);
+        idx.insert_crash_safe(2);
+        idx.insert_crash_safe(3);
 
         let mut encoded = idx.encode_log();
         let csum_start = 12 + super::LOG_RECORD_SIZE + super::ENTRY_ENCODED_SIZE;
@@ -2299,10 +1624,6 @@ mod tests {
 mod watermark_tests {
     use super::*;
     use tidefs_types_orphan_index_core::{OrphanCursor, OrphanReplayWatermark};
-
-    fn make_entry(inode_id: u64) -> OrphanEntry {
-        OrphanEntry::new(inode_id, inode_id, 0, OrphanEntryFlags::NONE)
-    }
 
     // -- watermark start state --
 
@@ -2371,8 +1692,8 @@ mod watermark_tests {
     #[test]
     fn encode_log_with_entries_and_watermark() {
         let mut idx = OrphanIndex::new();
-        idx.insert(10, make_entry(10));
-        idx.insert(20, make_entry(20));
+        idx.insert(10);
+        idx.insert(20);
         idx.advance_watermark(30);
         let log = idx.encode_log();
         assert_eq!(u32::from_le_bytes(log[0..4].try_into().unwrap()), 2);
@@ -2384,7 +1705,7 @@ mod watermark_tests {
     #[test]
     fn recover_from_log_restores_watermark() {
         let mut idx = OrphanIndex::new();
-        idx.insert(1, make_entry(1));
+        idx.insert(1);
         idx.advance_watermark(100);
         let log = idx.encode_log();
 
@@ -2405,7 +1726,7 @@ mod watermark_tests {
     #[test]
     fn recover_from_log_zero_watermark_is_none() {
         let mut idx = OrphanIndex::new();
-        idx.insert(5, make_entry(5));
+        idx.insert(5);
         // watermark remains NONE (0)
         let log = idx.encode_log();
 
@@ -2420,8 +1741,8 @@ mod watermark_tests {
     #[test]
     fn recover_partial_log_half_entry_preserves_watermark() {
         let mut idx = OrphanIndex::new();
-        idx.insert(1, make_entry(1));
-        idx.insert(2, make_entry(2));
+        idx.insert(1);
+        idx.insert(2);
         idx.advance_watermark(42);
         let full_log = idx.encode_log();
         // Truncate halfway through the second entry
@@ -2440,8 +1761,8 @@ mod watermark_tests {
     fn pipeline_insert_encode_recover_watermark() {
         let mut idx = OrphanIndex::new();
         // Simulate: orphan entries inserted, then watermark advanced after replay
-        idx.insert(10, make_entry(10));
-        idx.insert(20, make_entry(20));
+        idx.insert(10);
+        idx.insert(20);
         idx.advance_watermark(25);
         let log = idx.encode_log();
 
@@ -2461,9 +1782,9 @@ mod watermark_tests {
     #[test]
     fn watermark_advance_after_recovery_incremental() {
         let mut idx = OrphanIndex::new();
-        idx.insert(10, make_entry(10));
-        idx.insert(20, make_entry(20));
-        idx.insert(30, make_entry(30));
+        idx.insert(10);
+        idx.insert(20);
+        idx.insert(30);
         idx.advance_watermark(15);
         let log = idx.encode_log();
 

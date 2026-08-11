@@ -14,23 +14,49 @@ description = "Background scrub service for periodic segment-level checksum veri
 
 [dependencies]
 tidefs-background-scheduler = { workspace = true }
-tidefs-rebuild-planner = { workspace = true }
-tidefs-locator-table = { workspace = true }
+tidefs-rebuild-planner = { workspace = true, optional = true }
+tidefs-locator-table = { workspace = true, optional = true }
 tidefs-local-object-store = { workspace = true }
 tidefs-recovery-loop = { workspace = true }
+tidefs-types-incremental-job-core = { workspace = true, optional = true }
+tidefs-erasure-coding = { workspace = true, optional = true }
+tidefs-checksum-tree = { workspace = true }
+tidefs-types-reclaim-queue-core = { workspace = true, optional = true }
+tidefs-durability-layout = { workspace = true, optional = true }
+tidefs-verification-engine = { workspace = true, optional = true }
+tidefs-replication-model = { workspace = true, optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+bincode = { workspace = true, optional = true }
+blake3 = "1"
+
+[features]
+default = []
+distributed-repair = [
+    "dep:tidefs-rebuild-planner",
+    "dep:tidefs-locator-table",
+    "dep:tidefs-types-incremental-job-core",
+    "dep:tidefs-erasure-coding",
+    "dep:tidefs-types-reclaim-queue-core",
+    "dep:tidefs-durability-layout",
+    "dep:tidefs-verification-engine",
+    "dep:tidefs-replication-model",
+    "dep:serde",
+    "dep:bincode",
+]
+full = ["distributed-repair"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tidefs-rebuild-planner = { workspace = true }
+tidefs-locator-table = { workspace = true }
 tidefs-types-incremental-job-core = { workspace = true }
 tidefs-erasure-coding = { workspace = true }
-tidefs-checksum-tree = { workspace = true }
 tidefs-types-reclaim-queue-core = { workspace = true }
 tidefs-durability-layout = { workspace = true }
 tidefs-verification-engine = { workspace = true }
 tidefs-replication-model = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 bincode = { workspace = true }
-blake3 = "1"
-
-[dev-dependencies]
-tempfile = { workspace = true }
 
 [lib]
 name = "tidefs_scrub"
@@ -39,3 +65,4 @@ path = "src/lib.rs"
 [[test]]
 name = "scrub_repair_validation"
 path = "tests/scrub_repair_validation.rs"
+required-features = ["distributed-repair"]

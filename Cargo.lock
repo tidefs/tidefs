@@ -2466,6 +2466,7 @@ version = "0.421.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tidefs-commit_group",
  "tidefs-membership-epoch",
  "tidefs-rebuild-planner",
  "tidefs-rebuild-runtime",
@@ -2661,7 +2662,6 @@ dependencies = [
  "tidefs-local-object-store",
  "tidefs-online-defrag",
  "tidefs-orphan-index",
- "tidefs-performance-contract",
  "tidefs-pool-scan",
  "tidefs-posix-acl",
  "tidefs-posix-semantics",
@@ -2830,7 +2830,6 @@ dependencies = [
  "tidefs-dir-index",
  "tidefs-intent-log",
  "tidefs-local-filesystem",
- "tidefs-orphan-index",
  "tidefs-types-polymorphic-directory-index-core",
  "tidefs-types-vfs-core",
 ]
@@ -2949,7 +2948,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tidefs-durability-layout",
  "tidefs-membership-epoch",
- "tidefs-replication-model",
  "tidefs-storage-intent-core",
 ]
 
@@ -2993,7 +2991,6 @@ dependencies = [
  "tidefs-binary_schema-checksum",
  "tidefs-checksum-tree",
  "tidefs-commit_group",
- "tidefs-device-removal",
  "tidefs-encryption",
  "tidefs-intent-log",
  "tidefs-local-object-store",
@@ -3043,14 +3040,12 @@ dependencies = [
  "tidefs-dataset-lifecycle",
  "tidefs-dir-index",
  "tidefs-extent-map",
- "tidefs-flow-commit-coordinator",
  "tidefs-inode-attributes",
  "tidefs-intent-log",
  "tidefs-invalidation-feed",
  "tidefs-local-filesystem",
  "tidefs-local-object-store",
  "tidefs-lock-service",
- "tidefs-orphan-index",
  "tidefs-performance-contract",
  "tidefs-permission",
  "tidefs-pool-import",
@@ -3231,13 +3226,11 @@ dependencies = [
  "tempfile",
  "tidefs-checksum-tree",
  "tidefs-commit_group",
- "tidefs-flow-commit-coordinator",
  "tidefs-intent-log",
  "tidefs-local-object-store",
  "tidefs-membership-epoch",
  "tidefs-rebuild-planner",
  "tidefs-replica-health",
- "tidefs-replication-model",
  "tidefs-vfs-engine",
 ]
 

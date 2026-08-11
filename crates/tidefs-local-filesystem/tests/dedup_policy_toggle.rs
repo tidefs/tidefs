@@ -8,10 +8,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use tidefs_local_filesystem::{LocalFileSystem, DEFAULT_FILE_PERMISSIONS};
-
-const CHUNK_SIZE: usize = 65536; // DEFAULT_FILESYSTEM_CONTENT_CHUNK_SIZE
-const DATA_SIZE: usize = CHUNK_SIZE * 2; // two chunks to exercise multiple chunks
+use tidefs_local_filesystem::{content_chunk_size, LocalFileSystem, DEFAULT_FILE_PERMISSIONS};
 
 fn set_test_key() {
     std::env::set_var("TIDEFS_ROOT_AUTHENTICATION_KEY_HEX", "A".repeat(64));
@@ -42,13 +39,20 @@ fn make_pattern_data(seed: u8, len: usize) -> Vec<u8> {
     buf
 }
 
+fn make_two_chunk_pattern_data(seed: u8) -> Vec<u8> {
+    let len = (content_chunk_size() as usize)
+        .checked_mul(2)
+        .expect("two content chunks must fit in usize");
+    make_pattern_data(seed, len)
+}
+
 // ── Dedup enabled: identical content produces dedup hits ──────────────
 
 #[test]
 fn dedup_enabled_produces_hits_for_duplicate_content() {
     set_test_key();
     let dir = temp_dir("dedup_enabled_hits");
-    let payload = make_pattern_data(0xCD, DATA_SIZE);
+    let payload = make_two_chunk_pattern_data(0xCD);
 
     {
         let mut fs = open_fs(&dir);
@@ -112,7 +116,7 @@ fn dedup_enabled_produces_hits_for_duplicate_content() {
 fn dedup_disabled_produces_no_hits() {
     set_test_key();
     let dir = temp_dir("dedup_disabled_no_hits");
-    let payload = make_pattern_data(0xEF, DATA_SIZE);
+    let payload = make_two_chunk_pattern_data(0xEF);
 
     {
         let mut fs = open_fs(&dir);
@@ -157,8 +161,8 @@ fn dedup_disabled_produces_no_hits() {
 fn toggle_mid_session_only_affects_future_writes() {
     set_test_key();
     let dir = temp_dir("dedup_mid_session");
-    let payload_a = make_pattern_data(0x11, DATA_SIZE);
-    let payload_b = make_pattern_data(0x22, DATA_SIZE);
+    let payload_a = make_two_chunk_pattern_data(0x11);
+    let payload_b = make_two_chunk_pattern_data(0x22);
 
     let mut fs = open_fs(&dir);
     assert!(!fs.is_dedup_enabled());
@@ -218,7 +222,8 @@ fn toggle_mid_session_only_affects_future_writes() {
 fn dedup_stats_defaults_and_ratio() {
     set_test_key();
     let dir = temp_dir("dedup_stats_ratio");
-    let payload = make_pattern_data(0x99, CHUNK_SIZE); // exactly one chunk
+    let chunk_size = content_chunk_size() as usize;
+    let payload = make_pattern_data(0x99, chunk_size); // exactly one chunk
 
     let mut fs = open_fs(&dir);
 
@@ -245,7 +250,7 @@ fn dedup_stats_defaults_and_ratio() {
     // 2 total chunks, 1 dedup hit
     assert_eq!(stats.total_chunks, 2);
     assert_eq!(stats.dedup_hits, 1);
-    assert_eq!(stats.dedup_bytes_saved, CHUNK_SIZE as u64);
+    assert_eq!(stats.dedup_bytes_saved, chunk_size as u64);
     // ratio = 2 / (2 - 1) = 2.0
     assert!(
         (stats.dedup_ratio() - 2.0).abs() < 1e-9,

@@ -6,7 +6,8 @@
 // commit lifecycles, abort paths, batch orchestration, and durability
 // sequence recovery scenarios.
 
-use tidefs_flow_commit_coordinator::{DurabilitySequence, FlowCommitCoordinator, FlowScope};
+use tidefs_commit_group::{DurabilityError, DurabilitySequence};
+use tidefs_flow_commit_coordinator::{FlowCommitCoordinator, FlowScope};
 use tidefs_membership_epoch::{EpochId, MemberId};
 use tidefs_replication_model::{
     FlowCommitClass, FlowState, ObjectDigest, ReplicaChunkState, ReplicaTransferReceipt,
@@ -802,8 +803,6 @@ fn batch_completion_clone_eq() {
 
 #[test]
 fn durability_error_variants_discriminate() {
-    use tidefs_flow_commit_coordinator::DurabilityError;
-
     // All variants are distinct
     let variants = [
         DurabilityError::AlreadyDurable,
@@ -825,8 +824,6 @@ fn durability_error_variants_discriminate() {
 
 #[test]
 fn durability_error_debug_contains_variant_name() {
-    use tidefs_flow_commit_coordinator::DurabilityError;
-
     let e = DurabilityError::AlreadyDurable;
     let debug = format!("{e:?}");
     assert!(debug.contains("AlreadyDurable"));
@@ -838,8 +835,6 @@ fn durability_error_debug_contains_variant_name() {
 
 #[test]
 fn durability_error_clone_preserves_variant() {
-    use tidefs_flow_commit_coordinator::DurabilityError;
-
     let e = DurabilityError::OutOfOrderSubmission;
     let cloned = e;
     assert_eq!(e, cloned); // Copy type, PartialEq

@@ -450,7 +450,7 @@ fn nonzero_receipt_generation(generation: u64) -> Option<u64> {
 fn placement_evidence_for_content_key(
     pool: Option<&Pool>,
     key: Option<ObjectKey>,
-    subject_id: u64,
+    _subject_id: u64,
     expected_generation: Option<u64>,
 ) -> MountedContentPlacementEvidence {
     let Some(key) = key else {
@@ -470,7 +470,8 @@ fn placement_evidence_for_content_key(
     match pool.placement_receipt_for_key(DeviceIoClass::Data, key) {
         Ok(Some(receipt)) => match expected_generation {
             Some(expected_generation) if receipt.generation == expected_generation => {
-                match receipt.shared_receipt_ref_for_subject(subject_id) {
+                #[cfg(feature = "distributed-repair")]
+                match receipt.shared_receipt_ref_for_subject(_subject_id) {
                     Ok(placement_receipt_ref) => MountedContentPlacementEvidence::ReceiptVerified {
                         generation: expected_generation,
                         placement_receipt_ref,
@@ -478,6 +479,10 @@ fn placement_evidence_for_content_key(
                     Err(_) => MountedContentPlacementEvidence::ReceiptUnavailable {
                         expected_generation: Some(expected_generation),
                     },
+                }
+                #[cfg(not(feature = "distributed-repair"))]
+                MountedContentPlacementEvidence::ReceiptObservedButUnbound {
+                    generation: expected_generation,
                 }
             }
             Some(expected_generation) => MountedContentPlacementEvidence::ReceiptStale {
@@ -549,6 +554,7 @@ fn record_scrubbed_block(report: &mut ScrubReport, scrubbed: ScrubbedBlock) {
     }
 }
 
+#[cfg(any(test, feature = "distributed-repair"))]
 pub(crate) fn scrub_inodes_content(
     store: &LocalObjectStore,
     inodes: &BTreeMap<InodeId, InodeRecord>,
@@ -610,8 +616,10 @@ pub(crate) fn scrub_inodes_content_with_pool(
 
 /// Possible actions for resolving a corrupt block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, feature = "distributed-repair"))]
 pub enum RepairStrategy {
     /// Retry from a replica (not yet implemented — requires redundancy).
+    #[cfg(feature = "distributed-repair")]
     Reconstruct,
     /// Mark the block as corrupt and return an error to the caller.
     MarkCorrupt,
@@ -857,7 +865,6 @@ mod tests {
                 expected_generation: Some(_)
             }
         ));
-        assert!(!evidence.placement_evidence.allows_repair_dispatch());
         assert!(evidence.raw_media_diagnostic.object_key_hex.is_some());
         assert!(evidence.raw_media_diagnostic.reason.is_none());
     }
@@ -868,7 +875,8 @@ mod tests {
         let payload = b"chunk plaintext evidence".to_vec();
         let record = test_file_record(17, 4, payload.len() as u64);
         let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off())
+            .expect("encode stale-receipt chunk");
         let checksum = FastBlockChecksum::compute(&encoded);
         let (_, receipt) = pool
             .put_with_receipt(DeviceIoClass::Data, key, &encoded)
@@ -913,10 +921,6 @@ mod tests {
                 observed_generation: receipt.generation,
             }
         );
-        assert!(!scrubbed
-            .evidence
-            .placement_evidence
-            .allows_repair_dispatch());
     }
 
     #[test]
@@ -925,7 +929,8 @@ mod tests {
         let payload = b"receiptless raw chunk".to_vec();
         let record = test_file_record(18, 5, payload.len() as u64);
         let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off())
+            .expect("encode receiptless chunk");
         let checksum = FastBlockChecksum::compute(&encoded);
         pool.raw_primary_store_mut()
             .put(key, &encoded)
@@ -1024,6 +1029,10 @@ mod tests {
         fs.create_file("/test.bin", 0o644).expect("create");
         let data = vec![0xCD; 4096]; // 2 chunks
         fs.write_file("/test.bin", 0, &data).expect("write");
+        // Mounted scrub verifies the committed Pool-readable root.  Publish
+        // the accepted buffer before passing its inode version to the direct
+        // committed-content diagnostic used by this unit test.
+        fs.sync_all().expect("commit scrub test content");
 
         // Read back through scrub
         let inodes = fs.inode_records();

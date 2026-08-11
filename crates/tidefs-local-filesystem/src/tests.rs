@@ -431,18 +431,24 @@ fn stage_probe_file_state(
 }
 
 fn write_staged_content(
-    store: &mut LocalObjectStore,
+    store: &mut Pool,
     staged: &FileSystemState,
     inode_id: InodeId,
     bytes: &[u8],
 ) {
     let record = staged.inodes.get(&inode_id).expect("staged inode exists");
-    store
-        .put(
-            content_object_key_for_version(inode_id, record.data_version),
-            &encode_content(record, bytes),
-        )
-        .expect("write staged content object");
+    let mut pool_store = store.pool_store_mut();
+    write_chunked_content(
+        false,
+        &mut pool_store,
+        record,
+        bytes,
+        &mut DedupIndex::new(),
+        #[cfg(feature = "quorum-write")]
+        None,
+        &staged.content_compression_policy,
+    )
+    .expect("write staged content through Pool");
 }
 
 fn current_content_manifest(fs: &LocalFileSystem, path: &str) -> ContentManifestObject {
@@ -707,174 +713,8 @@ fn apply_crash_boundary(
     bytes: &[u8],
     boundary: CrashInjectionBoundary,
 ) -> CrashRecoveryExpectation {
-    let transaction_id = staged.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
-    match boundary {
-        CrashInjectionBoundary::NoCrash | CrashInjectionBoundary::AfterRootCommitSynced => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            let observed = persist_state_until_boundary(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                fs.root_authentication_key,
-                Some(FilesystemCommitBoundary::RootCommitSynced),
-            )
-            .expect("complete root commit sync");
-            assert_eq!(observed, FilesystemCommitBoundary::RootCommitSynced);
-        }
-        CrashInjectionBoundary::BeforeContentObjects => {
-            fs.store.sync_all().expect("sync previous state only");
-        }
-        CrashInjectionBoundary::AfterContentObjects => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            fs.store.sync_all().expect("sync staged content object");
-        }
-        CrashInjectionBoundary::AfterTransactionInodes => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            write_transaction_inodes(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            fs.store.sync_all().expect("sync staged inodes");
-        }
-        CrashInjectionBoundary::AfterTransactionDirectories => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            write_transaction_inodes(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            write_transaction_directories(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            fs.store.sync_all().expect("sync staged directories");
-        }
-        CrashInjectionBoundary::AfterTransactionSuperblock => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            write_transaction_inodes(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            write_transaction_directories(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            let _root = write_transaction_superblock(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            fs.store
-                .sync_all()
-                .expect("sync staged transaction superblock");
-        }
-        CrashInjectionBoundary::AfterTransactionObjectsSynced => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            let observed = persist_state_until_boundary(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                fs.root_authentication_key,
-                Some(FilesystemCommitBoundary::TransactionObjectsSynced),
-            )
-            .expect("stop after transaction objects sync");
-            assert_eq!(observed, FilesystemCommitBoundary::TransactionObjectsSynced);
-        }
-        CrashInjectionBoundary::AfterMalformedRootCommit => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            write_transaction_inodes(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            write_transaction_directories(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            let root = write_transaction_superblock(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                transaction_id,
-            );
-            fs.store
-                .put(
-                    DeviceIoClass::Data,
-                    root_slot_object_key(root.slot),
-                    b"malformed root-slot bytes with a valid object-store checksum",
-                )
-                .expect("write malformed root commit candidate");
-            fs.store
-                .sync_all()
-                .expect("sync malformed root commit candidate");
-        }
-        CrashInjectionBoundary::AfterRootCommitMissingTransaction => {
-            let (root, _superblock_bytes) = root_for_staged_state(staged, transaction_id);
-            publish_root_commit(
-                fs.store.primary_store_mut().raw_store_mut(),
-                &root,
-                fs.root_authentication_key,
-            )
-            .expect("publish root commit with missing transaction objects");
-            fs.store
-                .sync_all()
-                .expect("sync missing-transaction root commit candidate");
-        }
-        CrashInjectionBoundary::AfterRootCommitWritten => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            let observed = persist_state_until_boundary(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                fs.root_authentication_key,
-                Some(FilesystemCommitBoundary::RootCommitWritten),
-            )
-            .expect("stop after root commit write");
-            assert_eq!(observed, FilesystemCommitBoundary::RootCommitWritten);
-        }
-    }
-    boundary.expected_recovery()
+    apply_crash_matrix_boundary(fs, staged, inode_id, bytes, boundary)
+        .expect("apply Pool-backed crash boundary")
 }
 
 fn assert_recovery_outcome(
@@ -954,20 +794,38 @@ fn create_paths_initialize_posix_times_from_wall_clock() {
 #[test]
 fn create_write_reopen_read_file() {
     let root = temp_root("create-write-reopen");
-    {
+    let accepted_versions = {
         let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
         fs.create_dir("/docs", 0o755).expect("create docs");
         fs.create_file("/docs/hello.txt", 0o644)
             .expect("create file");
-        fs.write_file("/docs/hello.txt", 0, b"hello filesystem")
+        let before = fs.stat("/docs/hello.txt").expect("stat before write");
+        let accepted = fs
+            .write_file("/docs/hello.txt", 0, b"hello filesystem")
             .expect("write file");
+        assert!(accepted.data_version > before.data_version);
+        assert!(accepted.metadata_version > before.metadata_version);
+        assert!(fs.has_dirty_metadata());
+        let visible = fs.stat("/docs/hello.txt").expect("stat pending write");
+        assert_eq!(visible.data_version, accepted.data_version);
+        assert_eq!(visible.metadata_version, accepted.metadata_version);
         fs.sync_all().expect("sync fs");
-    }
+        let committed = fs.stat("/docs/hello.txt").expect("stat committed write");
+        assert_eq!(committed.data_version, accepted.data_version);
+        assert_eq!(committed.metadata_version, accepted.metadata_version);
+        assert!(!fs.has_dirty_metadata());
+        (accepted.data_version, accepted.metadata_version)
+    };
     {
         let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
         assert_eq!(
             fs.read_file("/docs/hello.txt").expect("read file"),
             b"hello filesystem".to_vec()
+        );
+        let reopened = fs.stat("/docs/hello.txt").expect("stat reopened write");
+        assert_eq!(
+            (reopened.data_version, reopened.metadata_version),
+            accepted_versions
         );
         let entries = fs.list_dir("/docs").expect("list docs");
         assert_eq!(entries.len(), 1);
@@ -2204,8 +2062,6 @@ fn mounted_partial_range_rejects_receiptless_raw_chunk_after_open() {
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.set_auto_commit(false)
         .expect("test setup mutation must be admitted");
-    fs.set_dedup_enabled(false)
-        .expect("test setup mutation must be admitted");
     fs.create_file("/data.bin", 0o644).expect("create file");
     let payload = vec![0x5a; content_chunk_size() as usize];
     fs.write_file("/data.bin", 0, &payload)
@@ -2275,6 +2131,7 @@ fn receiptless_newer_root_falls_back_to_older_authenticated_root() {
 }
 
 #[test]
+#[cfg(feature = "data-policy")]
 fn dedup_canonical_payload_substitution_falls_back_to_older_root() {
     let root = temp_root("dedup-canonical-content-address-fallback");
     let older_generation;
@@ -2322,7 +2179,8 @@ fn dedup_canonical_payload_substitution_falls_back_to_older_root() {
             chunk_ref.chunk_index,
             &replacement_payload,
             &ContentCompressionPolicy::off(),
-        );
+        )
+        .expect("encode substituted canonical payload");
         fs.store
             .put(DeviceIoClass::Data, canonical_key, &replacement)
             .expect("publish substituted canonical payload");
@@ -2356,8 +2214,6 @@ fn mounted_partial_mutation_does_not_launder_receiptless_chunk() {
     let root = temp_root("mounted-partial-mutation-receiptless-chunk");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.set_auto_commit(false)
-        .expect("test setup mutation must be admitted");
-    fs.set_dedup_enabled(false)
         .expect("test setup mutation must be admitted");
     fs.create_file("/data.bin", 0o644).expect("create file");
     let payload: Vec<u8> = (0..content_chunk_size() as usize)
@@ -2482,7 +2338,7 @@ fn random_write_updates_only_intersecting_chunk_refs() {
 }
 
 #[test]
-fn overlay_write_records_padded_dirty_bytes() {
+fn overlay_write_records_exact_dirty_range_bytes() {
     let root = temp_root("overlay-write-dirty-bytes");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     let record = fs.create_file("/dirty.bin", 0o644).expect("create file");
@@ -2491,21 +2347,22 @@ fn overlay_write_records_padded_dirty_bytes() {
     fs.set_max_uncommitted_mutations(1_000_000)
         .expect("test setup mutation must be admitted");
 
-    fs.write_file("/dirty.bin", 0, &[0x5a; 4096])
+    const WRITE_LEN: usize = 4096;
+    fs.write_file("/dirty.bin", 0, &[0x5a; WRITE_LEN])
         .expect("write small overlay");
     fs.flush_write_buffer(record.inode_id)
         .expect("flush write buffer");
 
-    assert_eq!(fs.dirty_set.data_bytes, content_chunk_size() as u64);
+    assert_eq!(fs.dirty_set.data_bytes, WRITE_LEN as u64);
     assert_eq!(
         fs.dirty_set.per_inode_bytes.get(&record.inode_id).copied(),
-        Some(content_chunk_size() as u64)
+        Some(WRITE_LEN as u64)
     );
     cleanup(&root);
 }
 
 #[test]
-fn overlay_write_commits_when_padded_dirty_bytes_cross_target() {
+fn overlay_write_commits_when_exact_dirty_bytes_cross_target() {
     let root = temp_root("overlay-write-byte-target");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     let record = fs.create_file("/pressure.bin", 0o644).expect("create file");
@@ -2513,13 +2370,14 @@ fn overlay_write_commits_when_padded_dirty_bytes_cross_target() {
         .expect("test setup mutation must be admitted");
     fs.set_max_uncommitted_mutations(1_000_000)
         .expect("test setup mutation must be admitted");
-    fs.commit_group.config.commit_group_target_bytes = content_chunk_size() as u64;
+    const WRITE_LEN: usize = 4096;
+    fs.commit_group.config.commit_group_target_bytes = WRITE_LEN as u64;
     fs.commit_group.config.commit_group_target_ops = u64::MAX;
     fs.commit_group.config.commit_group_dirty_max_bytes = u64::MAX;
     fs.commit_group.config.commit_group_target_secs = 3600.0;
     let start_commit_group = fs.commit_group.current_commit_group().0;
 
-    fs.write_file("/pressure.bin", 0, &[0xa5; 4096])
+    fs.write_file("/pressure.bin", 0, &[0xa5; WRITE_LEN])
         .expect("write small overlay");
     fs.flush_write_buffer(record.inode_id)
         .expect("flush write buffer");
@@ -2816,6 +2674,10 @@ fn fallocate_extends_through_allocator_and_reports_statfs() {
     let err = fs
         .fallocate_file("/prealloc.bin", content_chunk_size() as u64 * 2, 1)
         .expect_err("third grain exceeds capacity");
+    #[cfg(feature = "policy-observation")]
+    let policy_rejected = matches!(err, FileSystemError::ClaimRejected { .. });
+    #[cfg(not(feature = "policy-observation"))]
+    let policy_rejected = false;
     assert!(
         matches!(
             err,
@@ -2823,7 +2685,7 @@ fn fallocate_extends_through_allocator_and_reports_statfs() {
                 resource: LocalStorageResource::ContentBytes,
                 ..
             }
-        ) || matches!(err, FileSystemError::ClaimRejected { .. })
+        ) || policy_rejected
     );
     cleanup(&root);
 }
@@ -3270,15 +3132,15 @@ fn recovery_probe_reports_selected_root_without_operator_repair() {
 #[test]
 fn recovery_probe_reports_explicit_error_without_guessing_repair() {
     let root = temp_root("recovery-probe-explicit-error");
-    let mut store =
-        LocalObjectStore::open_with_options(&root, options()).expect("open object store");
+    let mut pool = LocalFileSystem::default_development_pool(&root, &options(), None, None)
+        .expect("create development Pool");
     for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
-        store
+        pool.raw_primary_store_mut()
             .put(root_slot_object_key(slot), b"invalid root slot bytes")
             .expect("write invalid root slot");
     }
-    store.sync_all().expect("sync invalid slots");
-    drop(store);
+    pool.sync_all().expect("sync invalid slots");
+    drop(pool);
 
     let report = LocalFileSystem::probe_recovery(&root, options()).expect("probe invalid roots");
     assert_eq!(
@@ -3292,7 +3154,7 @@ fn recovery_probe_reports_explicit_error_without_guessing_repair() {
     assert!(matches!(
         LocalFileSystem::open_with_options(&root, options()),
         Err(FileSystemError::CorruptState { reason })
-            if reason == "root slots exist but no valid committed root could be selected"
+            if reason == "root slots exist but no Pool-authorized committed root could be selected"
     ));
     cleanup(&root);
 }
@@ -3438,7 +3300,7 @@ fn root_authentication_requires_the_matching_external_key() {
     assert!(matches!(
         LocalFileSystem::open_with_root_authentication_key(&root, options(), wrong_key),
         Err(FileSystemError::CorruptState { reason })
-            if reason == "root slots exist but no valid committed root could be selected"
+            if reason == "root slots exist but no Pool-authorized committed root could be selected"
     ));
     cleanup(&root);
 }
@@ -3457,12 +3319,7 @@ fn unauthenticated_newer_root_candidate_is_skipped() {
     let (staged, candidate_path, inode_id, new_bytes) =
         stage_probe_file_state(&fs, b"unauthenticated.txt", b"unauthenticated bytes");
     let transaction_id = staged.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
-    write_staged_content(
-        fs.store.primary_store_mut().raw_store_mut(),
-        &staged,
-        inode_id,
-        &new_bytes,
-    );
+    write_staged_content(&mut fs.store, &staged, inode_id, &new_bytes);
     let root_commit = persist_transaction_objects(
         fs.store.primary_store_mut().raw_store_mut(),
         &staged,
@@ -3474,8 +3331,9 @@ fn unauthenticated_newer_root_candidate_is_skipped() {
         ..root_commit
     };
     fs.store
+        .primary_store_mut()
+        .raw_store_mut()
         .put(
-            DeviceIoClass::Data,
             root_slot_object_key(unauthenticated_root.slot),
             &encode_root_commit(&unauthenticated_root),
         )
@@ -3496,6 +3354,7 @@ fn unauthenticated_newer_root_candidate_is_skipped() {
         reopened.read_file(&candidate_path),
         Err(FileSystemError::NotFound { .. })
     ));
+    drop(reopened);
     cleanup(&root);
 }
 
@@ -3634,6 +3493,7 @@ fn safe_reclamation_preserves_snapshot_roots_for_later_rollback() {
     cleanup(&root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn changed_record_send_receive_round_trips_current_root_and_snapshot() {
     let source_root = temp_root("send-receive-source");
@@ -3779,6 +3639,7 @@ fn changed_record_send_receive_round_trips_current_root_and_snapshot() {
     cleanup(&target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn changed_record_send_receive_excludes_unlinked_extent_maps() {
     let source_root = temp_root("changed-record-send-receive-unlinked-extent-map-source");
@@ -3846,6 +3707,7 @@ fn changed_record_send_receive_excludes_unlinked_extent_maps() {
     cleanup(&target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn changed_record_import_rejects_corrupt_payload_before_publish() {
     let source_root = temp_root("send-receive-corrupt-source");
@@ -4013,12 +3875,7 @@ fn missing_manifest_newer_root_is_skipped_without_operator_repair() {
         b"new bytes behind missing manifest",
     );
     let transaction_id = staged.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
-    write_staged_content(
-        fs.store.primary_store_mut().raw_store_mut(),
-        &staged,
-        inode_id,
-        &new_bytes,
-    );
+    write_staged_content(&mut fs.store, &staged, inode_id, &new_bytes);
     write_transaction_inodes(
         fs.store.primary_store_mut().raw_store_mut(),
         &staged,
@@ -4431,13 +4288,14 @@ fn invalid_newer_same_slot_root_falls_back_to_previous_version_without_operator_
     let same_slot = root_slot_for_transaction(bad_transaction_id);
     assert_eq!(same_slot, root_slot_for_transaction(committed_generation));
     fs.store
+        .raw_primary_store_mut()
         .put(
-            DeviceIoClass::Data,
             root_slot_object_key(same_slot),
             b"newer same-slot root candidate with invalid filesystem meaning",
         )
         .expect("write invalid same-slot root candidate");
     fs.store
+        .raw_primary_store_mut()
         .sync_all()
         .expect("sync invalid same-slot root candidate");
     drop(fs);
@@ -4464,20 +4322,20 @@ fn invalid_newer_same_slot_root_falls_back_to_previous_version_without_operator_
 #[test]
 fn all_root_slots_invalid_reports_explicit_integrity_error_without_fsck() {
     let root = temp_root("all-root-slots-invalid");
-    let mut store =
-        LocalObjectStore::open_with_options(&root, options()).expect("open object store");
+    let mut pool = LocalFileSystem::default_development_pool(&root, &options(), None, None)
+        .expect("create development Pool");
     for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
-        store
+        pool.raw_primary_store_mut()
             .put(root_slot_object_key(slot), b"invalid root slot bytes")
             .expect("write invalid root slot");
     }
-    store.sync_all().expect("sync invalid slots");
-    drop(store);
+    pool.sync_all().expect("sync invalid slots");
+    drop(pool);
 
     assert!(matches!(
         LocalFileSystem::open_with_options(&root, options()),
         Err(FileSystemError::CorruptState { reason })
-            if reason == "root slots exist but no valid committed root could be selected"
+            if reason == "root slots exist but no Pool-authorized committed root could be selected"
     ));
     cleanup(&root);
 }
@@ -4580,27 +4438,42 @@ fn auto_commit_disabled_batches_mutations() {
     assert!(fs.lookup("/a.txt").is_ok());
     assert!(fs.lookup("/b.txt").is_ok());
 
+    let committed = fs
+        .selected_committed_root_summary()
+        .expect("select batched committed root");
+    assert_ne!(
+        committed.transaction_id, committed.generation,
+        "fixture must separate publication identity from logical generation"
+    );
+
+    // A later commit reuses the clean /a.txt and /b.txt inode objects by the
+    // transaction that actually published them, not by the lower logical
+    // generation carried inside that root.
+    fs.create_file("/c.txt", 0o644).expect("create c.txt");
+    fs.commit().expect("commit after batched root");
+    assert!(fs.lookup("/a.txt").is_ok());
+    assert!(fs.lookup("/b.txt").is_ok());
+    assert!(fs.lookup("/c.txt").is_ok());
+
     drop(fs);
     cleanup(&root);
 }
 
 #[test]
-fn auto_commit_disabled_mutations_lost_on_unclean_shutdown() {
-    let root = temp_root("auto-commit-disabled-lost");
+fn auto_commit_disabled_mutations_persist_on_clean_shutdown() {
+    let root = temp_root("auto-commit-disabled-clean-shutdown");
     {
         let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
         fs.set_auto_commit(false)
             .expect("test setup mutation must be admitted");
         fs.create_file("/uncommitted.txt", 0o644)
             .expect("create uncommitted.txt");
-        // Drop without committing simulates unclean shutdown.
+        // Drop is the clean-close safety net and publishes pending state even
+        // when ordinary mutation auto-commit is disabled.
     }
     {
         let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        assert!(matches!(
-            fs.lookup("/uncommitted.txt"),
-            Err(FileSystemError::NotFound { .. })
-        ));
+        assert!(fs.lookup("/uncommitted.txt").is_ok());
     }
     cleanup(&root);
 }
@@ -4818,7 +4691,7 @@ fn rollback_without_transaction_is_rejected() {
 }
 
 #[test]
-fn fsync_data_only_persists_content_without_metadata() {
+fn fsync_data_only_persists_content_and_required_reachability() {
     let root = temp_root("fsync-data-only");
     let content = b"dsync content";
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
@@ -4831,20 +4704,16 @@ fn fsync_data_only_persists_content_without_metadata() {
     // Metadata is dirty (new inode, dir entry), content is dirty.
     assert!(fs.has_dirty_metadata());
     fs.fsync_data_only().expect("fsync data only");
-    // Content was synced to disk but metadata may still be dirty.
-    // Data survives reopen if we force-commit via another path.
+    // fdatasync may omit unrelated metadata, but it must preserve the inode
+    // and namespace state required to retrieve every acknowledged byte.
     drop(fs);
-    // Without a metadata commit, the file may not be reachable.
-    // But if we reopen and commit, the content objects are present.
-    // Test: reopen and verify that a subsequent metadata commit
-    // makes the file reachable.
-    {
-        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        fs.set_auto_commit(false)
-            .expect("test setup mutation must be admitted");
-        // File should not be reachable yet (metadata wasn't committed).
-        assert!(fs.lookup("/dsync.txt").is_err());
-    }
+    let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        fs.read_file("/dsync.txt")
+            .expect("read fdatasync content after reopen"),
+        content.to_vec()
+    );
+    drop(fs);
     cleanup(&root);
 }
 
@@ -5195,28 +5064,42 @@ fn invalid_transaction_manifest_makes_newer_root_candidate_unselectable() {
 
     let (staged, candidate_path, inode_id, new_bytes) =
         stage_probe_file_state(&fs, b"candidate.txt", b"candidate after bad manifest");
-    write_staged_content(
-        fs.store.primary_store_mut().raw_store_mut(),
-        &staged,
-        inode_id,
-        &new_bytes,
-    );
+    write_staged_content(&mut fs.store, &staged, inode_id, &new_bytes);
     let root_commit = persist_transaction_objects(
         fs.store.primary_store_mut().raw_store_mut(),
         &staged,
         staged.generation,
     )
     .expect("write newer transaction objects");
+    let corrupt_manifest = b"corrupt manifest bytes";
+    let superblock_bytes = fs
+        .store
+        .primary_store()
+        .raw_store()
+        .get(transaction_superblock_object_key(
+            root_commit.transaction_id,
+        ))
+        .expect("read transaction superblock")
+        .expect("transaction superblock exists");
+    let corrupt_root = RootCommitRecord {
+        manifest_checksum: checksum64(corrupt_manifest),
+        root_authentication: Some(root_authentication_record_for_bytes(
+            &superblock_bytes,
+            Some(corrupt_manifest),
+        )),
+        ..root_commit
+    };
     fs.store
+        .primary_store_mut()
+        .raw_store_mut()
         .put(
-            DeviceIoClass::Data,
-            transaction_manifest_object_key(root_commit.transaction_id),
-            b"corrupt manifest bytes",
+            transaction_manifest_object_key(corrupt_root.transaction_id),
+            corrupt_manifest,
         )
         .expect("overwrite transaction manifest with corrupt bytes");
     publish_root_commit(
         fs.store.primary_store_mut().raw_store_mut(),
-        &root_commit,
+        &corrupt_root,
         fs.root_authentication_key,
     )
     .expect("publish newer root commit");
@@ -5503,8 +5386,9 @@ fn retention_plan_keeps_same_slot_fallback_location_without_repair() {
     let bad_transaction_id = committed_generation.saturating_add(FILESYSTEM_ROOT_SLOT_COUNT);
     let bad_slot = root_slot_for_transaction(bad_transaction_id);
     fs.store
+        .primary_store_mut()
+        .raw_store_mut()
         .put(
-            DeviceIoClass::Data,
             root_slot_object_key(bad_slot),
             b"invalid newer root slot bytes",
         )
@@ -5532,11 +5416,12 @@ fn retention_plan_keeps_same_slot_fallback_location_without_repair() {
             == root_slot_object_key(root_slot_for_transaction(committed_generation))));
     assert!(!plan.production_recovery_requires_operator_repair());
     assert!(!plan.mutates_storage());
+    drop(reopened);
     cleanup(&root);
 }
 
 #[test]
-fn safe_reclamation_preserves_retained_roots_and_reopens() {
+fn safe_reclamation_fails_closed_and_reopens_with_retained_roots() {
     let root = temp_root("safe-reclamation-gc");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/data.bin", 0o644).expect("create file");
@@ -5545,11 +5430,16 @@ fn safe_reclamation_preserves_retained_roots_and_reopens() {
         expected = vec![round; content_chunk_size() as usize];
         fs.write_file("/data.bin", 0, &expected)
             .expect("write generation");
+        fs.sync_all().expect("commit generation");
     }
-    fs.sync_all().expect("sync before reclamation");
-    let before_stats = fs.stats().object_store;
     let before_plan = fs.safe_root_retention_plan().expect("safe retention plan");
-    assert!(before_plan.retention_policy_satisfied());
+    assert!(
+        before_plan.retention_policy_satisfied(),
+        "retention debt: required {}, available {}, roots {:?}",
+        before_plan.retention_debt.policy_required_committed_roots,
+        before_plan.retention_debt.valid_committed_roots_available,
+        before_plan.audit.valid_committed_roots,
+    );
     assert!(!before_plan.reclaimable_live_object_keys.is_empty());
 
     let report = fs
@@ -5557,7 +5447,11 @@ fn safe_reclamation_preserves_retained_roots_and_reopens() {
         .expect("safe reclaim unprotected objects");
     assert_eq!(report.spec, SAFE_LOCAL_RECLAMATION_GC_SPEC);
     assert!(report.retention_policy_satisfied());
-    assert!(report.mutates_storage());
+    assert!(report.mutating_reclamation_allowed);
+    assert!(
+        !report.mutates_storage(),
+        "block-device reclamation must fail closed while exact root-slot locations are protected"
+    );
     assert!(!report.production_recovery_requires_operator_repair());
     assert_eq!(
         report.protected_committed_roots_preserved,
@@ -5568,12 +5462,16 @@ fn safe_reclamation_preserves_retained_roots_and_reopens() {
         before_plan.protected_root_slot_locations.len()
     );
     assert!(report.store.exact_locations_preserved);
-    assert!(report.store.tombstoned_unprotected_keys > 0);
-    assert!(
-        report.store.segment_count_after <= report.store.segment_count_before.saturating_add(1),
-        "safe reclamation may rotate one checkpoint segment while preserving exact roots"
+    assert_eq!(report.store.tombstoned_unprotected_keys, 0);
+    assert!(report.store.retired_segments.is_empty());
+    assert_eq!(
+        report.store.live_objects_after,
+        report.store.live_objects_before
     );
-    assert!(report.store.segment_count_before <= before_stats.segment_count);
+    assert_eq!(
+        report.store.segment_count_after, report.store.segment_count_before,
+        "fail-closed block-device reclamation must not change segment count"
+    );
     assert_eq!(
         fs.read_file("/data.bin").expect("read after reclamation"),
         expected
@@ -5592,9 +5490,11 @@ fn safe_reclamation_preserves_retained_roots_and_reopens() {
     assert_eq!(audit.outcome, RecoveryAuditOutcome::SelectedCommittedRoot);
     assert!(audit.valid_committed_roots.len() <= DEFAULT_RETAINED_COMMITTED_ROOTS);
     assert!(!audit.production_recovery_requires_operator_repair());
+    drop(reopened);
     cleanup(&root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn changed_record_object_role_preserves_decode_tag() {
     assert_eq!(
@@ -6105,6 +6005,10 @@ fn update_allocator_policy_shrink_below_allocation_triggers_enospc() {
     let err = fs
         .write_file("/f.txt", 1, b"X")
         .expect_err("write should be rejected under shrunk capacity");
+    #[cfg(feature = "policy-observation")]
+    let policy_rejected = matches!(err, FileSystemError::ClaimRejected { .. });
+    #[cfg(not(feature = "policy-observation"))]
+    let policy_rejected = false;
     assert!(
         matches!(
             err,
@@ -6112,7 +6016,7 @@ fn update_allocator_policy_shrink_below_allocation_triggers_enospc() {
                 resource: LocalStorageResource::ContentBytes,
                 ..
             }
-        ) || matches!(err, FileSystemError::ClaimRejected { .. })
+        ) || policy_rejected
     );
 
     cleanup(&root);
@@ -6216,9 +6120,18 @@ fn stage_durable_intent_without_drop(root: &Path, publish_replayed_root: bool) -
             &committed_base,
         )
         .expect("fold durable intent into staged root");
-        crate::persistence::persist_state_with_pool(
+        let previous_root = fs
+            .selected_committed_root_summary()
+            .expect("select crash fixture committed root");
+        let transaction_id = crate::persistence::next_mounted_commit_transaction_id(
+            fs.state.generation,
+            &previous_root,
+        )
+        .expect("select crash fixture replay transaction");
+        crate::persistence::persist_state_with_pool_at_transaction(
             &mut fs.store,
             &fs.state,
+            transaction_id,
             root_authentication_key,
         )
         .expect("publish replayed root");
@@ -6912,6 +6825,7 @@ fn do_commit_clears_intent_log_after_state_persist() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn claim_ledger_tracks_write_allocations() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6967,6 +6881,7 @@ fn claim_ledger_tracks_write_allocations() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn claim_ledger_releases_on_overwrite() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7057,6 +6972,7 @@ fn rename_overwrite_releases_replaced_file_capacity() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn claim_ledger_reports_non_authoritative() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7087,6 +7003,7 @@ fn claim_ledger_reports_non_authoritative() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn claim_ledger_policy_update_resets_ledger() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7121,6 +7038,7 @@ fn claim_ledger_policy_update_resets_ledger() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn authority_scarcity_gates_write_when_ledger_exhausted() {
     // Design rule Rule 3: a write must be rejected by the obligation ledger
     // before the allocator runs, even if physical space is available.
@@ -7175,6 +7093,7 @@ fn authority_scarcity_gates_write_when_ledger_exhausted() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn authority_scarcity_allows_write_after_claim_release() {
     // Releasing a claim (overwrite with smaller data) frees obligation
     // capacity, allowing a new claim.
@@ -7229,6 +7148,7 @@ fn authority_scarcity_allows_write_after_claim_release() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn obligation_ledger_total_blocks_matches_policy_capacity() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7271,6 +7191,7 @@ fn obligation_ledger_total_blocks_matches_policy_capacity() {
 }
 
 #[test]
+#[cfg(feature = "policy-observation")]
 fn authority_scarcity_preserves_write_order_under_contention() {
     // When two small writes fit within the same budget domain, both
     // should succeed in order.
@@ -7499,6 +7420,22 @@ fn flushed_sparse_strided_writes_keep_unwritten_holes_sparse() {
     fs.truncate_file("/aio.dat", file_size)
         .expect("sparse extend");
     let inode_id = fs.stat("/aio.dat").expect("stat sparse file").inode_id;
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    let reclaim_keys_before_writes: BTreeSet<ReclaimObjectKey> = fs
+        .reclaim_queue
+        .lock()
+        .unwrap()
+        .entries()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    let base_record = fs
+        .committed_inode_record(inode_id)
+        .expect("read sparse writeback base record");
+    let replaced_manifest_key = ReclaimObjectKey(
+        *content_object_key_for_version(inode_id, base_record.data_version).as_bytes(),
+    );
 
     for index in 0..write_count {
         let offset = index * step;
@@ -7540,14 +7477,28 @@ fn flushed_sparse_strided_writes_keep_unwritten_holes_sparse() {
         "unwritten chunk between strided writes must remain a zero hole"
     );
 
-    assert_eq!(fs.reclaim_queue_depth(), 0);
-    fs.set_auto_commit(false)
-        .expect("test setup mutation must be admitted");
+    let new_reclaim_entries: Vec<_> = fs
+        .reclaim_queue
+        .lock()
+        .unwrap()
+        .entries()
+        .into_iter()
+        .filter(|(key, _)| !reclaim_keys_before_writes.contains(key))
+        .collect();
+    assert_eq!(
+        new_reclaim_entries,
+        vec![(
+            replaced_manifest_key,
+            ReclaimQueueEntry::new(replaced_manifest_key, -1, ReclaimQueueFamily::Extent),
+        )],
+        "sparse writeback may retire its old manifest but must not queue unwritten hole chunks",
+    );
+    let reclaim_depth_after_writeback = fs.reclaim_queue_depth();
     fs.unlink("/aio.dat").expect("unlink sparse stride file");
     let reclaim_depth = fs.reclaim_queue_depth();
     assert!(
-        reclaim_depth <= write_count as usize + 4,
-        "sparse unlink should queue only materialized chunks plus metadata keys; depth={reclaim_depth}"
+        reclaim_depth.saturating_sub(reclaim_depth_after_writeback) <= write_count as usize + 4,
+        "sparse unlink should queue only materialized chunks plus metadata keys; before={reclaim_depth_after_writeback} after={reclaim_depth}"
     );
 
     drop(fs);
@@ -8150,6 +8101,7 @@ fn device_transform_open_config_rejects_before_pool_creation() {
 }
 
 #[test]
+#[cfg(feature = "data-policy")]
 fn cross_session_dedup_reuses_canonical_objects() {
     let root = temp_root("cross-session-dedup");
     let opts = StoreOptions {
@@ -8202,6 +8154,7 @@ fn cross_session_dedup_reuses_canonical_objects() {
 /// Within-session dedup: two files with identical content written in the same
 /// session should share canonical objects via the in-memory DedupIndex.
 #[test]
+#[cfg(feature = "data-policy")]
 fn within_session_dedup_shares_canonical_objects() {
     let root = temp_root("within-session-dedup");
     let opts = StoreOptions {
@@ -8251,6 +8204,7 @@ fn within_session_dedup_shares_canonical_objects() {
     cleanup(&root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_send_receive_skips_unchanged_objects() {
     let source_root = temp_root("incr-send-source");
@@ -8348,6 +8302,7 @@ fn incremental_send_receive_skips_unchanged_objects() {
     cleanup(&target_root);
 }
 
+#[cfg(feature = "replication-io")]
 struct IncrementalReceiveFixture {
     source_root: PathBuf,
     target_root: PathBuf,
@@ -8358,6 +8313,7 @@ struct IncrementalReceiveFixture {
     new_data: Vec<u8>,
 }
 
+#[cfg(feature = "replication-io")]
 fn make_incremental_receive_fixture(
     name: &str,
     retain_base_snapshot: bool,
@@ -8447,6 +8403,7 @@ fn make_incremental_receive_fixture(
     }
 }
 
+#[cfg(feature = "replication-io")]
 fn selected_root_for_test(root: &Path, key: RootAuthenticationKey) -> CommittedRootSummary {
     let mut fs = LocalFileSystem::open_with_root_authentication_key(root, options(), key)
         .expect("open target for selected root");
@@ -8454,6 +8411,7 @@ fn selected_root_for_test(root: &Path, key: RootAuthenticationKey) -> CommittedR
         .expect("selected current root")
 }
 
+#[cfg(feature = "replication-io")]
 fn assert_incremental_receive_base_root_conflict(
     err: FileSystemError,
     expected_from_root: &CommittedRootSummary,
@@ -8512,6 +8470,7 @@ fn assert_incremental_receive_base_root_conflict(
     }
 }
 
+#[cfg(feature = "replication-io")]
 fn assert_receive_merge_no_common_ancestor(err: FileSystemError) {
     let message = err.to_string();
     match err {
@@ -8534,6 +8493,7 @@ fn assert_receive_merge_no_common_ancestor(err: FileSystemError) {
     );
 }
 
+#[cfg(feature = "replication-io")]
 fn omitted_incremental_content_key(export: &ChangedRecordExport) -> ObjectKey {
     for root in &export.roots {
         let manifest_record = root
@@ -8565,6 +8525,7 @@ fn omitted_incremental_content_key(export: &ChangedRecordExport) -> ObjectKey {
 
 /// End-to-end incremental receive: baseline exported to empty target,
 /// then incremental delta applied on top and verified byte-for-byte.
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_send_receive_end_to_end() {
     let source_root = temp_root("incr-e2e-source");
@@ -8708,6 +8669,7 @@ fn incremental_send_receive_end_to_end() {
     cleanup(&target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_refuses_and_preserves_receiptless_uncommitted_content() {
     let fixture = make_incremental_receive_fixture("incr-receiptless-retry", true, None);
@@ -8845,6 +8807,7 @@ fn incremental_receive_refuses_and_preserves_receiptless_uncommitted_content() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_protected_same_key_content_collision() {
     use crate::receive_merge_planner::{
@@ -8916,6 +8879,7 @@ fn incremental_receive_rejects_protected_same_key_content_collision() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_missing_from_root_without_selecting_new_root() {
     let fixture = make_incremental_receive_fixture("incr-missing-from-root", true, None);
@@ -8947,6 +8911,7 @@ fn incremental_receive_rejects_missing_from_root_without_selecting_new_root() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_replayed_completed_generation() {
     let fixture = make_incremental_receive_fixture("incr-replay-completed", true, None);
@@ -9007,6 +8972,7 @@ fn incremental_receive_rejects_replayed_completed_generation() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_target_missing_base_root() {
     let fixture = make_incremental_receive_fixture("incr-missing-base", true, None);
@@ -9048,6 +9014,7 @@ fn incremental_receive_rejects_target_missing_base_root() {
     cleanup(&other_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_loose_unprotected_base_root() {
     let fixture = make_incremental_receive_fixture("incr-loose-base", false, None);
@@ -9081,6 +9048,7 @@ fn incremental_receive_rejects_loose_unprotected_base_root() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_divergent_base_root_identity() {
     let fixture = make_incremental_receive_fixture("incr-divergent-base", true, None);
@@ -9115,6 +9083,7 @@ fn incremental_receive_rejects_divergent_base_root_identity() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_missing_unchanged_content() {
     let fixture = make_incremental_receive_fixture("incr-missing-unchanged", true, None);
@@ -9154,6 +9123,7 @@ fn incremental_receive_rejects_missing_unchanged_content() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn full_receive_rejects_incremental_stream_for_empty_target() {
     let fixture = make_incremental_receive_fixture("incr-wrong-full-route", true, None);
@@ -9182,6 +9152,7 @@ fn full_receive_rejects_incremental_stream_for_empty_target() {
     cleanup(&empty_target);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_rejects_full_stream_for_existing_target() {
     let fixture = make_incremental_receive_fixture("incr-wrong-incr-route", true, None);
@@ -9210,6 +9181,7 @@ fn incremental_receive_rejects_full_stream_for_existing_target() {
     cleanup(&fixture.target_root);
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_receive_reports_unknown_placement_without_target_epoch() {
     let fixture = make_incremental_receive_fixture("incr-placement-unknown", true, Some(42));
@@ -9263,6 +9235,7 @@ fn incremental_receive_reports_unknown_placement_without_target_epoch() {
 
 /// Test chained incremental receives: baseline → delta1 → delta2.
 /// Each delta carries only the roots created since the previous receive.
+#[cfg(feature = "replication-io")]
 #[test]
 fn incremental_send_receive_chained_deltas() {
     let source_root = temp_root("incr-chain-source");
@@ -9394,6 +9367,7 @@ fn incremental_send_receive_chained_deltas() {
 }
 
 /// Debug: export incremental and validate independently.
+#[cfg(feature = "replication-io")]
 #[test]
 fn debug_incremental_validate() {
     let source_root = temp_root("debug-incr-val-source");
@@ -9488,10 +9462,9 @@ fn debug_incremental_validate() {
 }
 
 #[test]
-fn fsync_file_takes_fast_path_when_intents_pending() {
-    // When intent log has pending data entries for the fsync'd inode,
-    // fsync_file should flush the intent log (fast path) instead of
-    // performing a full do_commit().
+fn fsync_file_commits_pending_intent_through_root() {
+    // A full fsync flushes the replayable intent first, then folds its payload
+    // through Pool authority and publishes a committed replacement root.
     let root = temp_root("fsync-fastpath-file");
     let content = b"fast path data";
     {
@@ -9510,40 +9483,31 @@ fn fsync_file_takes_fast_path_when_intents_pending() {
             .sync_write_intent(ino, 0, content.len() as u64, digest, content)
             .expect("sync_write_intent");
         assert_eq!(reply, IntentLogReplyState::IntentDurable);
-        // After sync_write_intent, entries are flushed to LOG_DEVICE but
-        // remain in the intent log until do_commit() clears them.
-        // pending_flush_count() is 0 because sync() already flushed,
-        // but !is_empty() is true because entries are not cleared.
-        let has_entries = !fs.intent_log.is_empty();
         assert!(
-            has_entries,
+            !fs.intent_log.is_empty(),
             "intent log should have entries after sync_write_intent"
         );
 
-        // fsync_file should take the fast path: flush_and_sync (no-op since
-        // already flushed) and return without doing a full do_commit.
-        fs.fsync_file("/data.bin").expect("fsync_file fast path");
+        fs.fsync_file("/data.bin").expect("fsync_file");
 
-        // After fsync_file fast path, intent log entries are still present
-        // (they were flushed to LOG_DEVICE but not cleared — only do_commit clears).
         assert!(
-            !fs.intent_log.is_empty(),
-            "intent log should NOT be cleared by fast path; only full commit clears"
+            fs.intent_log.is_empty(),
+            "committed intent entries should be cleared after root publication"
         );
-        // State should still be dirty — fast path does not persist state.
         assert!(
-            fs.is_state_dirty(),
-            "state should remain dirty after fast path fsync"
+            !fs.is_state_dirty(),
+            "state should be clean after committed-root fsync"
         );
     }
-    // Reopen: intent log replays, data survives.
+    // Reopen must read the bytes through the committed Pool-backed root; no
+    // intent replay remains necessary.
     {
         let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
         let buf = fs.read_file("/data.bin").expect("read after reopen");
         assert_eq!(
             &buf[..],
             &content[..],
-            "written data should survive crash via intent log replay"
+            "written data should survive through the committed root"
         );
         assert!(
             fs.intent_log.is_empty(),
@@ -9626,10 +9590,11 @@ fn fsync_data_only_takes_fast_path_when_intents_pending() {
 }
 
 #[test]
-fn fsync_directory_takes_fast_path_for_namespace_intents() {
-    // When intent log has NamespaceSyncIntent entries for a directory,
-    // fsync_directory flushes them (fast path) instead of do_commit().
+fn fsync_directory_commits_pending_namespace_intent_through_root() {
+    // Directory fsync flushes its replayable namespace intent first, then
+    // publishes the already-applied namespace through the committed root.
     let root = temp_root("fsync-dir-fastpath");
+    let file_ino;
     {
         let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
         fs.set_auto_commit(false)
@@ -9638,8 +9603,10 @@ fn fsync_directory_takes_fast_path_for_namespace_intents() {
         let dir_ino = dir_rec.inode_id;
 
         // Create a file inside the directory — this dirties the dir.
-        fs.create_file("/mydir/file.txt", 0o644)
+        let file_rec = fs
+            .create_file("/mydir/file.txt", 0o644)
             .expect("create file in dir");
+        file_ino = file_rec.inode_id;
 
         // Record a NamespaceSyncIntent for the directory.
         // This simulates what would happen during mkdir/unlink/rename
@@ -9653,7 +9620,6 @@ fn fsync_directory_takes_fast_path_for_namespace_intents() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        let file_ino = InodeId::new(dir_ino.get() + 1);
         let accepted = fs
             .intent_log
             .append(
@@ -9669,24 +9635,32 @@ fn fsync_directory_takes_fast_path_for_namespace_intents() {
             .expect("append namespace intent");
         assert!(accepted, "namespace intent should be accepted");
 
-        // Fast path: has_pending_namespace_for_dir should return true.
         assert!(
             fs.intent_log.has_pending_namespace_for_dir(dir_ino),
             "should detect pending namespace intent for dir"
         );
 
-        fs.fsync_directory("/mydir")
-            .expect("fsync_directory fast path");
+        fs.fsync_directory("/mydir").expect("fsync_directory");
 
-        // After fast path, intent log still has entries (not cleared).
         assert!(
-            !fs.intent_log.is_empty(),
-            "intent log NOT cleared by fast path"
+            fs.intent_log.is_empty(),
+            "committed namespace intents should be cleared after root publication"
+        );
+        assert!(
+            !fs.is_state_dirty(),
+            "state should be clean after committed-root directory fsync"
         );
     }
-    // NOTE: NamespaceSyncIntent replay is not yet wired (see
-    // intent_log.rs replay_entries_against_state).  Once wired, add a
-    // reopen + verify step here to confirm directory entries survive.
+    {
+        let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+        let file = fs.stat("/mydir/file.txt").expect("stat committed child");
+        assert_eq!(file.inode_id, file_ino);
+        assert_eq!(file.kind(), NodeKind::File);
+        assert!(
+            fs.intent_log.is_empty(),
+            "reopen should not require namespace intent replay"
+        );
+    }
     cleanup(&root);
 }
 
@@ -9787,7 +9761,13 @@ fn admission_check_write_exceeding_quota_is_rejected() {
     let root = temp_root("admit_quota_reject");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/test", 0o644).expect("create file");
-    fs.state.space_accounting.set_quota(256); // tiny quota
+    fs.state.quota_table.set_quota(
+        ROOT_INODE_ID,
+        QuotaConfig {
+            hard_limit_bytes: 256,
+            ..QuotaConfig::default()
+        },
+    );
 
     let result = fs.write_file("/test", 0, &[0u8; 512]);
     assert!(result.is_err());
@@ -9833,7 +9813,13 @@ fn admission_check_sparse_truncate_expand_does_not_charge_quota() {
     let root = temp_root("admit_trunc_expand");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/test", 0o644).expect("create file");
-    fs.state.space_accounting.set_quota(512); // 512 bytes quota
+    fs.state.quota_table.set_quota(
+        ROOT_INODE_ID,
+        QuotaConfig {
+            hard_limit_bytes: crate::quota::allocation_grains_for_len(64),
+            ..QuotaConfig::default()
+        },
+    );
 
     // Create small file
     let record = fs.write_file("/test", 0, &[65u8; 64]).unwrap();
@@ -10040,6 +10026,7 @@ fn get_dir_changes_non_directory_returns_none() {
 // Issue #1579: 9/9 source-owned replication/rebuild canonical components have crate implementations.
 // These tests exercise the local-filesystem ↔ quorum-write-runtime integration.
 
+#[cfg(feature = "quorum-write")]
 fn quorum_options(replica_paths: Vec<PathBuf>) -> StoreOptions {
     StoreOptions {
         max_segment_bytes: 16 * 1024,
@@ -10061,6 +10048,7 @@ fn quorum_options(replica_paths: Vec<PathBuf>) -> StoreOptions {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn open_with_quorum_two_replicas_creates_and_reads_file() {
     let primary = temp_root("quorum-create-read");
     let r1 = primary.join("replica-1");
@@ -10077,6 +10065,8 @@ fn open_with_quorum_two_replicas_creates_and_reads_file() {
         .write_file("/shared-file", 0, content)
         .expect("write file");
     assert_eq!(record.size, content.len() as u64);
+    fs.fsync_file("/shared-file")
+        .expect("fsync replicated file");
 
     // Read back through the filesystem
     let read_back = fs.read_file("/shared-file").expect("read file");
@@ -10101,6 +10091,7 @@ fn open_with_quorum_two_replicas_creates_and_reads_file() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_file_create_and_stat_fans_out_to_replicas() {
     let primary = temp_root("quorum-create-stat");
     let r1 = primary.join("replica-1");
@@ -10113,12 +10104,14 @@ fn quorum_file_create_and_stat_fans_out_to_replicas() {
 
     fs.create_file("/visible", 0o644).expect("create file");
     fs.write_file("/visible", 0, b"visible data")
-        .expect("write triggers commit_group commit to replicas");
+        .expect("write visible data");
+    fs.fsync_file("/visible")
+        .expect("fsync visible data to replicas");
     let inode = fs.stat("/visible").expect("stat file");
     assert!(inode.is_file_like());
 
-    // After create + stat (which triggers a commit_group commit), replicas should
-    // contain the superblock and inode objects that the primary wrote.
+    // After fsync publishes the buffered data, every replica must contain
+    // durable quorum content. Stat is observation, not a durability barrier.
     for replica_path in &[&r1, &r2] {
         let replica_store =
             LocalObjectStore::open_with_options(replica_path, StoreOptions::test_fast())
@@ -10136,6 +10129,7 @@ fn quorum_file_create_and_stat_fans_out_to_replicas() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_multi_file_writes_visible_on_all_replicas() {
     let primary = temp_root("quorum-multi-write");
     let r1 = primary.join("replica-1");
@@ -10153,6 +10147,8 @@ fn quorum_multi_file_writes_visible_on_all_replicas() {
     fs.create_file("/b", 0o644).expect("create b");
     fs.write_file("/a", 0, data_a).expect("write a");
     fs.write_file("/b", 0, data_b).expect("write b");
+    fs.fsync_file("/a").expect("fsync a to replicas");
+    fs.fsync_file("/b").expect("fsync b to replicas");
 
     let read_a = fs.read_file("/a").expect("read a");
     let read_b = fs.read_file("/b").expect("read b");
@@ -10177,6 +10173,7 @@ fn quorum_multi_file_writes_visible_on_all_replicas() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_file_delete_fans_out_to_replicas() {
     let primary = temp_root("quorum-delete");
     let r1 = primary.join("replica-1");
@@ -10220,6 +10217,7 @@ fn quorum_file_delete_fans_out_to_replicas() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_reopen_after_close_persists_data() {
     let primary = temp_root("quorum-reopen");
     let r1 = primary.join("replica-1");
@@ -10249,6 +10247,7 @@ fn quorum_reopen_after_close_persists_data() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_reopen_with_quorum_persists_across_both() {
     let primary = temp_root("quorum-reopen-both");
     let r1 = primary.join("replica-1");
@@ -10723,7 +10722,7 @@ fn mounted_dataset_spacebook_counters_use_mounted_dataset_id() {
 }
 
 #[test]
-fn cache_governor_charges_mounted_dataset_partition() {
+fn inode_cache_governor_charges_mounted_dataset_partition() {
     let root = temp_root("mounted-dataset-cache-governor");
     let mounted_dataset_id = [0x73; 16];
     let next_dataset_id = [0x74; 16];
@@ -10755,6 +10754,7 @@ fn cache_governor_charges_mounted_dataset_partition() {
         .expect("create file");
     fs.write_file("/cache-owned.bin", 0, payload)
         .expect("write file");
+    fs.sync_all().expect("commit file through Pool authority");
     assert_eq!(
         fs.read_file("/cache-owned.bin").expect("read file"),
         payload.to_vec()
@@ -10768,7 +10768,8 @@ fn cache_governor_charges_mounted_dataset_partition() {
             mounted_partition,
             tidefs_cache_core::BudgetCategory::DataCache
         ),
-        payload.len() as u64
+        0,
+        "Pool content reads must not recreate the removed whole-file cache"
     );
     assert!(
         governor.partition_used(
@@ -10951,6 +10952,7 @@ fn block_device_dataset_catalog_create_persists_across_reopen() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_single_replica_opens_and_works() {
     let primary = temp_root("quorum-single");
     let r1 = primary.join("replica-1");
@@ -10963,6 +10965,7 @@ fn quorum_single_replica_opens_and_works() {
     let content = b"single replica data";
     fs.create_file("/solo", 0o644).expect("create file");
     fs.write_file("/solo", 0, content).expect("write file");
+    fs.fsync_file("/solo").expect("fsync single-replica file");
 
     let read_back = fs.read_file("/solo").expect("read file");
     assert_eq!(read_back, content);
@@ -10978,6 +10981,7 @@ fn quorum_single_replica_opens_and_works() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_write_rename_and_read_from_replicas() {
     let primary = temp_root("quorum-rename");
     let r1 = primary.join("replica-1");
@@ -11020,6 +11024,7 @@ fn quorum_write_rename_and_read_from_replicas() {
 }
 
 #[test]
+#[cfg(feature = "quorum-write")]
 fn quorum_bad_replica_path_graceful_degradation() {
     let primary = temp_root("quorum-degrade");
     let bad_path = primary.join("does-not-exist");
@@ -12911,6 +12916,104 @@ fn feature_flag_mount_gate_empty_flags_succeeds() {
 }
 
 #[test]
+#[cfg(not(feature = "data-policy"))]
+fn feature_flag_mount_gate_refuses_data_policy_without_build_feature() {
+    use tidefs_types_dataset_feature_flags_core::{
+        FeatureClass, FeatureName, FEATURE_COMPRESSION_ZSTD,
+    };
+
+    let root = temp_root("feature-gate-disabled-data-policy");
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("first open");
+        let name = FeatureName::from_str(FEATURE_COMPRESSION_ZSTD).expect("zstd feature name");
+        fs.feature_flags_mut()
+            .expect("access feature flags")
+            .enable_feature(name, FeatureClass::RoCompat)
+            .expect("stage known feature");
+        assert!(matches!(
+            fs.persist_feature_flags(),
+            Err(FileSystemError::Unsupported { .. })
+        ));
+
+        // Seed the persisted unsupported state below the guarded API to prove
+        // that the default mount path also refuses it rather than silently
+        // treating the feature as available.
+        let roots = fs
+            .feature_flags
+            .persist(&mut fs.store)
+            .expect("persist test fixture feature tree");
+        fs.store
+            .put(
+                DeviceIoClass::Data,
+                feature_flags_roots_object_key(),
+                &roots.encode(),
+            )
+            .expect("persist test fixture roots");
+        fs.store.sync_all().expect("sync test fixture roots");
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    }
+
+    assert!(matches!(
+        LocalFileSystem::open_with_options(&root, options()),
+        Err(FileSystemError::Unsupported { .. })
+    ));
+    cleanup(&root);
+}
+
+#[test]
+#[cfg(not(feature = "data-policy"))]
+fn pool_property_persistence_refuses_compression_without_build_feature() {
+    use tidefs_dataset_properties::{PropertyKey, PropertyValue};
+
+    let root = temp_root("property-gate-disabled-data-policy");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open");
+    fs.pool_properties_mut()
+        .expect("access pool properties")
+        .set_local(
+            PropertyKey::new("compression.algorithm"),
+            PropertyValue::String("zstd".into()),
+        );
+    assert!(matches!(
+        fs.persist_pool_properties(),
+        Err(FileSystemError::Unsupported { .. })
+    ));
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
+#[cfg(feature = "data-policy")]
+fn mount_refuses_persisted_non_string_compression_algorithm() {
+    use tidefs_dataset_properties::{PropertyKey, PropertyValue};
+
+    let root = temp_root("property-gate-non-string-compression");
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("first open");
+        fs.pool_properties_mut()
+            .expect("access pool properties")
+            .set_local(
+                PropertyKey::new("compression.algorithm"),
+                PropertyValue::Bool(true),
+            );
+        fs.persist_pool_properties()
+            .expect("persist non-string compression property fixture");
+    }
+
+    let err = LocalFileSystem::open_with_options(&root, options())
+        .expect_err("non-string persisted compression property must refuse mount");
+    assert!(matches!(
+        err,
+        FileSystemError::Unsupported {
+            operation: "resolve mounted compression policy",
+            reason: "persisted local compression.algorithm must be a string naming off, none, lz4, zstd, or zstd-3",
+        }
+    ));
+    cleanup(&root);
+}
+
+#[test]
+#[cfg(feature = "data-policy")]
 fn feature_flag_mount_gate_known_features_succeeds() {
     use tidefs_types_dataset_feature_flags_core::{
         FeatureClass, FeatureName, FEATURE_COMPRESSION_ZSTD,
@@ -13556,6 +13659,7 @@ fn truncate_and_fallocate_advance_subtree_rev() {
 
 // ── Cross-pool receive authorization tests ──────────────────────────────
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn cross_pool_authorization_matches_exact_tuple() {
     let auth = crate::types::CrossPoolReceiveAuthorization {
@@ -13580,6 +13684,7 @@ fn cross_pool_authorization_matches_exact_tuple() {
     assert!(!auth.matches(&sender4));
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn validate_sender_authority_local_only_passes() {
     use crate::send_receive::validate_sender_authority_for_receive;
@@ -13597,6 +13702,7 @@ fn validate_sender_authority_local_only_passes() {
     );
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn validate_sender_authority_same_pool_passes() {
     use crate::send_receive::validate_sender_authority_for_receive;
@@ -13618,6 +13724,7 @@ fn validate_sender_authority_same_pool_passes() {
     );
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn validate_sender_authority_cross_pool_unauthorized() {
     use crate::send_receive::validate_sender_authority_for_receive;
@@ -13638,6 +13745,7 @@ fn validate_sender_authority_cross_pool_unauthorized() {
     }
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn validate_sender_authority_cross_pool_with_matching_authorization() {
     use crate::send_receive::validate_sender_authority_for_receive;
@@ -13664,6 +13772,7 @@ fn validate_sender_authority_cross_pool_with_matching_authorization() {
     );
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn validate_sender_authority_cross_pool_authorization_mismatch_epoch() {
     use crate::send_receive::validate_sender_authority_for_receive;
@@ -13692,6 +13801,7 @@ fn validate_sender_authority_cross_pool_authorization_mismatch_epoch() {
     }
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn validate_sender_authority_cross_pool_authorization_mismatch_uuid() {
     use crate::send_receive::validate_sender_authority_for_receive;
@@ -13720,6 +13830,7 @@ fn validate_sender_authority_cross_pool_authorization_mismatch_uuid() {
     }
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn error_display_cross_pool_unauthorized() {
     let err = crate::error::FileSystemError::CrossPoolReceiveUnauthorized {
@@ -13736,6 +13847,7 @@ fn error_display_cross_pool_unauthorized() {
     );
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn error_display_authorization_mismatch() {
     let err = crate::error::FileSystemError::CrossPoolReceiveAuthorizationMismatch {
@@ -13752,6 +13864,7 @@ fn error_display_authorization_mismatch() {
     );
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn error_display_malformed_sender_authority() {
     let err = crate::error::FileSystemError::MalformedSenderAuthority {
@@ -13768,6 +13881,7 @@ fn error_display_malformed_sender_authority() {
     );
 }
 
+#[cfg(feature = "replication-io")]
 #[test]
 fn error_display_stale_sender_generation() {
     let err = crate::error::FileSystemError::StaleSenderGeneration {

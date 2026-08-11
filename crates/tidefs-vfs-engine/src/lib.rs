@@ -649,7 +649,7 @@ pub trait VfsEngine {
         Err(Errno::ENOSYS)
     }
 
-    /// Create an unnamed temporary file linked into `parent` (O_TMPFILE).
+    /// Create an unnamed temporary file in `parent` (O_TMPFILE).
     ///
     /// The file has no directory entry until linked via `linkat`. Returns
     /// attributes and open handle.

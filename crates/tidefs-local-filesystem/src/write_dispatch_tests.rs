@@ -180,21 +180,40 @@ proptest! {
             let fs = LocalFileSystem::open_with_options(&root, wd_options()).expect("reopen fs");
             let record = fs.stat("/data.bin").expect("stat");
             prop_assert_eq!(record.size, expected.len() as u64);
+            prop_assert_eq!(
+                fs.read_file("/data.bin").expect("read reopened file"),
+                expected.clone(),
+                "reopened Pool-backed content must preserve accepted bytes"
+            );
 
-            let content_key = content_object_key_for_version(record.inode_id, record.data_version);
-            let raw = fs.store.primary_store().get(content_key)
-                .expect("read content obj")
-                .expect("content obj exists");
-            let manifest = decode_content_manifest(&raw).expect("decode manifest");
+            let layout = MountedContentReadAuthority::new(&fs.store)
+                .read_layout(record.inode_id, &record)
+                .expect("read content layout through mounted Pool authority");
+            let ContentLayout::Chunked(manifest) = layout else {
+                panic!("full-content dispatch must publish a chunked layout");
+            };
 
             prop_assert_eq!(manifest.file_size, expected.len() as u64);
             prop_assert_eq!(manifest.chunk_size, content_chunk_size());
 
-            if !expected.is_empty() {
-                let expected_chunks = content_chunk_count(expected.len() as u64)
-                    .expect("chunk count") as usize;
-                prop_assert_eq!(manifest.chunks.len(), expected_chunks,
-                    "manifest chunk count must match expected");
+            let expected_chunks = content_chunk_count(expected.len() as u64)
+                .expect("chunk count") as usize;
+            prop_assert!(
+                manifest.chunks.len() <= expected_chunks,
+                "sparse manifest cannot exceed the logical chunk count"
+            );
+            let chunk_size = content_chunk_size() as usize;
+            for chunk_index in 0..expected_chunks {
+                let start = chunk_index * chunk_size;
+                let end = expected.len().min(start + chunk_size);
+                if find_chunk_in_manifest(&manifest, chunk_index as u64)
+                    .is_none_or(ContentChunkRef::is_hole)
+                {
+                    prop_assert!(
+                        expected[start..end].iter().all(|byte| *byte == 0),
+                        "only zero-filled logical chunks may be sparse"
+                    );
+                }
             }
         }
         wd_cleanup(&root);
@@ -972,8 +991,7 @@ fn wd_current_content_manifest(fs: &LocalFileSystem, path: &str) -> ContentManif
     let content_key = content_object_key_for_version(record.inode_id, record.data_version);
     let raw = fs
         .store
-        .primary_store()
-        .get(content_key)
+        .get(DeviceIoClass::Data, content_key)
         .expect("read content object")
         .expect("content object exists");
     decode_content_manifest(&raw).expect("decode manifest")
@@ -1152,6 +1170,11 @@ fn non_contiguous_buffered_writes_in_one_chunk_flush_once() {
             .expect("read buffered chunk"),
         expected[..chunk]
     );
+    let accepted_record = fs.stat("/chunk.bin").expect("stat accepted patches");
+    assert!(
+        accepted_record.data_version > base_record.data_version,
+        "accepted buffered writes must advance the visible content identity"
+    );
 
     fs.flush_write_buffer(record.inode_id)
         .expect("flush chunk patches");
@@ -1159,8 +1182,8 @@ fn non_contiguous_buffered_writes_in_one_chunk_flush_once() {
     let patched_manifest = wd_current_content_manifest(&fs, "/chunk.bin");
     assert_eq!(
         patched_record.data_version,
-        base_record.data_version + 1,
-        "one chunk-local flush should perform one content rewrite"
+        accepted_record.data_version,
+        "one chunk-local flush must materialize the accepted content identity without inventing another"
     );
     assert_eq!(
         patched_manifest.chunks[0].data_version,
@@ -1214,6 +1237,11 @@ fn multi_chunk_writeback_batch_updates_touched_chunks_once() {
         fs.read_file("/batch.bin").expect("read buffered image"),
         expected
     );
+    let accepted_record = fs.stat("/batch.bin").expect("stat accepted patches");
+    assert!(
+        accepted_record.data_version > base_record.data_version,
+        "accepted buffered writes must advance the visible content identity"
+    );
 
     fs.flush_write_buffer(record.inode_id)
         .expect("flush batched patches");
@@ -1221,8 +1249,8 @@ fn multi_chunk_writeback_batch_updates_touched_chunks_once() {
     let patched_manifest = wd_current_content_manifest(&fs, "/batch.bin");
     assert_eq!(
         patched_record.data_version,
-        base_record.data_version + 1,
-        "multi-chunk writeback batch should publish one content version"
+        accepted_record.data_version,
+        "multi-chunk writeback must materialize the accepted content identity without inventing another"
     );
     let by_index: BTreeMap<u64, _> = patched_manifest
         .chunks
@@ -1306,6 +1334,11 @@ fn extending_writeback_batch_preserves_sparse_manifest_once() {
         .expect("write first extending patch");
     fs.write_file("/extend.bin", second_offset as u64, &second_patch)
         .expect("write second extending patch");
+    let accepted_record = fs.stat("/extend.bin").expect("stat accepted extensions");
+    assert!(
+        accepted_record.data_version > base_record.data_version,
+        "accepted extending writes must advance the visible content identity"
+    );
 
     fs.flush_write_buffer(record.inode_id)
         .expect("flush extending batch");
@@ -1313,8 +1346,8 @@ fn extending_writeback_batch_preserves_sparse_manifest_once() {
     let patched_manifest = wd_current_content_manifest(&fs, "/extend.bin");
     assert_eq!(
         patched_record.data_version,
-        base_record.data_version + 1,
-        "extending writeback batch should publish one content version"
+        accepted_record.data_version,
+        "extending writeback must materialize the accepted content identity without inventing another"
     );
 
     let by_index: BTreeMap<u64, _> = patched_manifest
@@ -1462,6 +1495,11 @@ fn holetest_style_mixed_writeback_flushes_one_coalesced_image() {
         fs.read_file("/mixed.bin").expect("read buffered image"),
         expected
     );
+    let accepted_record = fs.stat("/mixed.bin").expect("stat accepted mixed writes");
+    assert!(
+        accepted_record.data_version > base_record.data_version,
+        "accepted mixed writes must advance the visible content identity"
+    );
 
     fs.flush_write_buffer(record.inode_id)
         .expect("flush mixed writeback");
@@ -1469,8 +1507,8 @@ fn holetest_style_mixed_writeback_flushes_one_coalesced_image() {
     let patched_manifest = wd_current_content_manifest(&fs, "/mixed.bin");
     assert_eq!(
         patched_record.data_version,
-        base_record.data_version + 1,
-        "coalesced mixed writeback should perform one content rewrite"
+        accepted_record.data_version,
+        "coalesced mixed writeback must materialize the accepted content identity without inventing another"
     );
     assert!(patched_manifest
         .chunks
@@ -1527,14 +1565,20 @@ fn holetest_style_autoflush_keeps_future_markers_buffered() {
             .expect("mmap page writeback");
         expected[page_start..page_start + page_size].copy_from_slice(&page_bytes);
     }
+    let accepted_record = fs
+        .stat("/mixed.bin")
+        .expect("stat accepted autoflush writes");
+    assert!(
+        accepted_record.data_version > base_record.data_version,
+        "accepted autoflush writes must advance the visible content identity"
+    );
 
     fs.flush_write_buffer(record.inode_id)
         .expect("final explicit flush is empty");
     let patched_record = fs.stat("/mixed.bin").expect("stat patched");
     assert_eq!(
-        patched_record.data_version,
-        base_record.data_version + 3,
-        "three chunk-sized foreground batches should publish three rewrites"
+        patched_record.data_version, accepted_record.data_version,
+        "an empty final flush must not invent another content identity"
     );
     assert_eq!(fs.read_file("/mixed.bin").expect("read final"), expected);
 
@@ -1776,18 +1820,36 @@ fn write_buffer_flush_threshold_setter_changes_autoflush_batch_size() {
     fs.write_file("/batched.bin", 0, &data)
         .expect("first chunk");
     assert_eq!(
-        fs.stat("/batched.bin").expect("stat first").data_version,
+        fs.buffered_write_base_records
+            .get(&record.inode_id)
+            .expect("first write retains Pool-readable base")
+            .data_version,
         record.data_version,
+        "first 1 MiB write must retain the prior Pool-readable version"
+    );
+    assert!(
+        fs.read_from_write_buffer(record.inode_id, 0, data.len())
+            .is_some(),
         "first 1 MiB write must stay buffered below the 2 MiB threshold"
     );
 
     fs.write_file("/batched.bin", data.len() as u64, &data)
         .expect("second chunk");
-    assert_eq!(
-        fs.stat("/batched.bin").expect("stat second").data_version,
-        record.data_version + 1,
-        "second 1 MiB write crosses the configured threshold and flushes once"
+    assert!(
+        fs.read_from_write_buffer(record.inode_id, 0, data.len() * 2)
+            .is_none(),
+        "second 1 MiB write crosses the configured threshold and drains the buffer"
     );
+    assert!(
+        !fs.buffered_write_base_records
+            .contains_key(&record.inode_id),
+        "completed writeback must retire the saved Pool base record"
+    );
+    let committed = fs.stat("/batched.bin").expect("stat committed file");
+    let bytes = MountedContentReadAuthority::new(&fs.store)
+        .read_all(record.inode_id, &committed)
+        .expect("read threshold-flushed content through Pool authority");
+    assert_eq!(bytes, [data.as_slice(), data.as_slice()].concat());
 
     drop(fs);
     wd_cleanup(&root);

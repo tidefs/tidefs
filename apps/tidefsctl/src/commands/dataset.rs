@@ -30,6 +30,14 @@ use bincode;
 
 use crate::parser::{self, DatasetTarget, PropertyAssignment};
 
+fn feature_available_in_current_build(feature: &FeatureName) -> bool {
+    let is_data_policy = matches!(
+        feature.as_str(),
+        "org.tidefs:compression_lz4" | "org.tidefs:compression_zstd" | "org.tidefs:dedup"
+    );
+    !is_data_policy || cfg!(feature = "data-policy")
+}
+
 /// Sub-subcommands for `tidefsctl dataset`.
 #[derive(Subcommand, Debug)]
 pub enum DatasetCommand {
@@ -1478,6 +1486,12 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
         }
         match FeatureName::from_str(feature_str) {
             Some(name) => {
+                if !feature_available_in_current_build(&name) {
+                    eprintln!(
+                        "tidefsctl dataset set-strategy: feature '{feature_str}' requires a data-policy build"
+                    );
+                    process::exit(1);
+                }
                 let flags = match fs.feature_flags_mut() {
                     Ok(flags) => flags,
                     Err(err) => {
@@ -1555,6 +1569,7 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
                 eprintln!("feature flags persisted for dataset '{}'", args.name);
                 // Refresh runtime policies so new writes use the updated
                 // compression/dedup settings immediately, without remount.
+                #[cfg(feature = "data-policy")]
                 if let Err(e) = fs.refresh_policies_from_features() {
                     eprintln!(
                         "tidefsctl dataset set-strategy: failed to refresh mounted policies: {e}"
@@ -1602,14 +1617,19 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
     }
 
     let supported = SupportedFeaturesV1::current();
+    let available: Vec<_> = supported
+        .as_slice()
+        .iter()
+        .filter(|name| feature_available_in_current_build(name))
+        .cloned()
+        .collect();
     let ff = fs.feature_flags();
     let mut enabled_count = 0u32;
     let mut skipped_count = 0u32;
     let mut failed: Vec<(String, String)> = Vec::new();
 
     // Collect features to enable: all supported features not already active.
-    let to_enable: Vec<_> = supported
-        .as_slice()
+    let to_enable: Vec<_> = available
         .iter()
         .filter(|name| !ff.is_enabled(name))
         .cloned()
@@ -1619,7 +1639,7 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
         println!(
             "dataset '{}': all {} supported features are already enabled",
             args.name,
-            supported.len()
+            available.len()
         );
         return;
     }
@@ -1628,7 +1648,7 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
         "dataset '{}': upgrading from {} enabled to {} supported features...",
         args.name,
         ff.len(),
-        supported.len()
+        available.len()
     );
 
     let mut pending = to_enable;
@@ -1710,6 +1730,7 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
         match fs.persist_feature_flags() {
             Ok(()) => {
                 eprintln!("feature flags persisted for dataset '{}'", args.name);
+                #[cfg(feature = "data-policy")]
                 if let Err(e) = fs.refresh_policies_from_features() {
                     eprintln!("tidefsctl dataset upgrade: failed to refresh mounted policies: {e}");
                     process::exit(1);

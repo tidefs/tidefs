@@ -108,6 +108,13 @@ const BLOCK_DATA_FORMAT_VERSION: u32 = 1;
 const FORMAT_MANIFEST_FILE_NAME: &str = "format_manifest";
 /// Well-known object name for committed compaction publication manifests.
 const COMPACTION_PUBLISH_MANIFEST_OBJECT_NAME: &str = "tidefs-compaction-publish-manifest";
+/// Well-known object name for the mounted filesystem's exact deferred-reclaim queue.
+///
+/// This is distinct from the object-store's physical reclaim queues: the
+/// filesystem queue retains logical object-key obligations until every
+/// mountable root has stopped referencing them and `Pool::delete()` has
+/// completed the receipt-authoritative handoff.
+pub const FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME: &str = "tidefs-filesystem-reclaim-queue-v1";
 /// Prefix for hidden target objects staged by verified compaction rewrites.
 const COMPACTION_TARGET_KEY_PREFIX: [u8; 8] = *b"TFSCMPCT";
 const COMPACTION_MANIFEST_MAGIC: &[u8; 8] = b"TFSCMPM1";
@@ -611,8 +618,8 @@ fn is_compaction_target_key(key: ObjectKey) -> bool {
     key.as_bytes()[..8] == COMPACTION_TARGET_KEY_PREFIX
 }
 
-fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 6] {
-    static KEYS: OnceLock<[ObjectKey; 6]> = OnceLock::new();
+fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 7] {
+    static KEYS: OnceLock<[ObjectKey; 7]> = OnceLock::new();
     KEYS.get_or_init(|| {
         [
             ObjectKey::from_name(RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
@@ -620,6 +627,7 @@ fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 6] {
             ObjectKey::from_name(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
             ObjectKey::from_name(RECLAIM_RECEIPTS_OBJECT_NAME.as_bytes()),
             ObjectKey::from_name(SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME.as_bytes()),
+            ObjectKey::from_name(FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
             compaction_publish_manifest_key(),
         ]
     })
@@ -974,17 +982,16 @@ impl LocalObjectStore {
                 payload_checksum: record.payload_checksum,
             };
 
+            // History is the physical put-record sequence. A prior live
+            // location was already recorded when its put was scanned, so an
+            // overwrite or delete must not append that location again.
             match record.kind {
                 RecordKind::Put => {
-                    if let Some(old) = index.insert(record.key, location) {
-                        history.entry(record.key).or_default().push(old);
-                    }
+                    index.insert(record.key, location);
                     history.entry(record.key).or_default().push(location);
                 }
                 RecordKind::Delete => {
-                    if let Some(old) = index.remove(&record.key) {
-                        history.entry(record.key).or_default().push(old);
-                    }
+                    index.remove(&record.key);
                 }
             }
 
@@ -7814,6 +7821,47 @@ mod block_device_open_tests {
     }
 
     #[test]
+    fn block_device_replay_records_each_physical_version_once() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let key = ObjectKey::from_name(b"block-device/version-history");
+
+        {
+            let mut store = LocalObjectStore::open_block_device(&image, StoreOptions::test_fast())
+                .expect("open block image");
+            for payload in [b"version-1".as_slice(), b"version-2", b"version-3"] {
+                store.put(key, payload).expect("write version");
+            }
+            store.sync_all().expect("sync versions");
+        }
+
+        let reopened = LocalObjectStore::open_block_device(&image, StoreOptions::test_fast())
+            .expect("reopen block image");
+        let versions = reopened.version_locations_of(key);
+        assert_eq!(versions.len(), 3, "one location per physical put record");
+        assert_eq!(
+            versions
+                .iter()
+                .map(|location| location.record_offset)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            versions.len(),
+            "version history must not repeat a physical record"
+        );
+        for (location, expected) in versions
+            .iter()
+            .zip([b"version-1", b"version-2", b"version-3"])
+        {
+            assert_eq!(
+                reopened
+                    .get_at_location(*location)
+                    .expect("read physical version"),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn block_device_compacts_live_records_on_append_full() {
         let dir = tempdir().expect("tempdir");
         let image = create_block_image(&dir);
@@ -10535,11 +10583,10 @@ mod segment_cleaner_integration_tests {
 mod reserve_ledger_integration_tests {
     use super::*;
     use tempfile::tempdir;
-    use tidefs_reserve_ledger::{BudgetDomainId, ReserveClass};
+    use tidefs_reserve_ledger::ReserveClass;
 
     fn make_ledger(capacity: u64) -> ReserveLedger {
-        let id = BudgetDomainId::from_str("test");
-        let mut rl = ReserveLedger::new(1u64, id, ReserveClass::Rebuild, 100_000, 200_000);
+        let mut rl = ReserveLedger::new(1u64, ReserveClass::Rebuild, 100_000, 200_000);
         rl.set_capacity(capacity);
         rl
     }

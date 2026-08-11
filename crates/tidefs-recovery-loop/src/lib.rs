@@ -16,6 +16,7 @@ pub use recovery_loop::compute_committed_root_digest;
 pub use recovery_loop::validate_committed_root;
 
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "distributed-recovery", test))]
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::path::Path;
 
@@ -91,8 +92,11 @@ impl Default for RecoveryPolicy {
     }
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 use tidefs_membership_epoch::{DomainId, HealthClass};
+#[cfg(any(feature = "distributed-recovery", test))]
 use tidefs_rebuild_planner::RebuildPlanner;
+#[cfg(any(feature = "distributed-recovery", test))]
 use tidefs_replica_health::{tracker::ReplicaHealthTracker, ChunkId, NodeId};
 
 use tidefs_commit_group::{
@@ -102,12 +106,14 @@ use tidefs_local_object_store::LocalObjectStore;
 use tidefs_vfs_engine::VfsEngine;
 
 /// Gate constant for the failure recovery loop.
+#[cfg(any(feature = "distributed-recovery", test))]
 pub const FAILURE_RECOVERY_LOOP_GATE_PC_010_5: &str =
     "failure recovery loop covers detect, scope, plan, execute, verify phases";
 
 // ── Recovery priority ────────────────────────────────────────────────
 
 /// Priority tiers for the continuous failure recovery loop.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum RecoveryPriority {
     /// Normal steady-state replication. Priority 0.
@@ -123,6 +129,7 @@ pub enum RecoveryPriority {
 /// Events that can trigger a recovery response.
 ///
 /// Classified into priority tiers by [`classify_trigger`].
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RecoveryTrigger {
     /// A storage node has failed or become unreachable.
@@ -142,6 +149,7 @@ pub enum RecoveryTrigger {
 /// - `DeviceFailure` maps to `CatchupRepair` (redundancy degraded).
 /// - `CorruptionDetected` maps to `LossRebuild` (integrity at risk).
 #[must_use]
+#[cfg(any(feature = "distributed-recovery", test))]
 pub fn classify_trigger(trigger: &RecoveryTrigger) -> RecoveryPriority {
     match trigger {
         RecoveryTrigger::NodeFailure { .. } => RecoveryPriority::LossRebuild,
@@ -152,6 +160,7 @@ pub fn classify_trigger(trigger: &RecoveryTrigger) -> RecoveryPriority {
 // ── Recovery phase ───────────────────────────────────────────────────
 
 /// Phase of the 5-phase continuous recovery loop.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryPhase {
     Detect,
@@ -167,6 +176,7 @@ pub enum RecoveryPhase {
 ///
 /// When clients are slow, recovery slows down; when clients are idle,
 /// recovery speeds up. Explicit, not opaque like Ceph mclock weights.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Debug)]
 pub struct RecoveryThrottle {
     pub max_concurrent_per_domain: usize,
@@ -177,6 +187,7 @@ pub struct RecoveryThrottle {
     pub throttle_aggressiveness: f64,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl RecoveryThrottle {
     #[must_use]
     pub fn new(
@@ -236,6 +247,7 @@ impl RecoveryThrottle {
 ///
 /// Prevents all replicas in a failure domain from being recovered
 /// simultaneously, and enforces an aggregate cluster-wide limit.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Debug)]
 pub struct CascadingFailureGuard {
     pub domain_batch_limits: BTreeMap<DomainId, usize>,
@@ -243,6 +255,7 @@ pub struct CascadingFailureGuard {
     pub max_aggregate_recovery_load: usize,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionDecision {
     Admitted,
@@ -256,6 +269,7 @@ pub enum AdmissionDecision {
     },
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl CascadingFailureGuard {
     #[must_use]
     pub fn new(max_aggregate_recovery_load: usize) -> Self {
@@ -311,6 +325,7 @@ impl CascadingFailureGuard {
 // ── NodeRecoveryBudget ───────────────────────────────────────────────
 
 /// Per-node recovery resource budget.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct NodeRecoveryBudget {
     pub node_id: NodeId,
@@ -322,6 +337,7 @@ pub struct NodeRecoveryBudget {
     pub current_recovery_memory: u64,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl NodeRecoveryBudget {
     #[must_use]
     pub fn new(
@@ -370,6 +386,7 @@ impl NodeRecoveryBudget {
 // ── Rebuild scope ───────────────────────────────────────────────────
 
 /// Scoped loss assessment determining how many replicas to rebuild.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct RebuildScope {
     pub chunks_affected: usize,
@@ -380,6 +397,7 @@ pub struct RebuildScope {
 
 /// Compute how many replicas need rebuilding to restore quorum.
 #[must_use]
+#[cfg(any(feature = "distributed-recovery", test))]
 pub fn compute_rebuild_scope(
     required_replicas: usize,
     surviving_count: usize,
@@ -408,6 +426,7 @@ pub fn compute_rebuild_scope(
 // ── Recovery action ─────────────────────────────────────────────────
 
 /// A recovery action for a single chunk.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub enum RecoveryAction {
     NoAction,
@@ -424,6 +443,7 @@ pub enum RecoveryAction {
     },
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl RecoveryAction {
     /// Derive the recovery priority tier for this action.
     ///
@@ -443,6 +463,7 @@ impl RecoveryAction {
 }
 
 /// Records the recovery action taken and its rationale.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryActionReceipt {
     pub chunk_id: ChunkId,
@@ -455,6 +476,7 @@ pub struct RecoveryActionReceipt {
 
 /// Select the appropriate recovery action for a degraded chunk.
 #[must_use]
+#[cfg(any(feature = "distributed-recovery", test))]
 pub fn select_recovery_action(
     chunk_id: ChunkId,
     required_replicas: usize,
@@ -525,6 +547,7 @@ pub fn select_recovery_action(
 // ── RecoveryProgressReceipt ──────────────────────────────────────────
 
 /// External observability: emitted periodically, reports recovery progress.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryProgressReceipt {
     pub epoch: u64,
@@ -538,6 +561,7 @@ pub struct RecoveryProgressReceipt {
     pub priority_distribution: BTreeMap<RecoveryPriority, u64>,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl RecoveryProgressReceipt {
     #[must_use]
     pub fn new(epoch: u64, phase: RecoveryPhase) -> Self {
@@ -561,6 +585,7 @@ impl RecoveryProgressReceipt {
 ///
 /// For each trigger, the plan computes affected objects via locator-table
 /// reverse-lookup and schedules rebuilds via the placement algorithm.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Debug, Clone)]
 pub struct RecoveryPlan {
     /// The trigger that initiated this plan.
@@ -575,6 +600,7 @@ pub struct RecoveryPlan {
     pub created_at_ns: u64,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl RecoveryPlan {
     /// Create a new recovery plan from a trigger.
     #[must_use]
@@ -623,6 +649,7 @@ impl RecoveryPlan {
 // ── RecoveryStats ─────────────────────────────────────────────────────
 
 /// Aggregated recovery statistics for observability and progress tracking.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Clone, Debug, Default)]
 pub struct RecoveryStats {
     /// Number of distinct recovery triggers currently active.
@@ -638,6 +665,7 @@ pub struct RecoveryStats {
     pub estimated_completion_secs: f64,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl RecoveryStats {
     /// Create a new zeroed stats accumulator.
     #[must_use]
@@ -685,6 +713,7 @@ impl RecoveryStats {
 // ── RecoveryLoop ─────────────────────────────────────────────────────
 
 /// The continuous failure recovery loop orchestrator.
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Debug)]
 pub struct RecoveryLoop {
     pub phase: RecoveryPhase,
@@ -702,6 +731,7 @@ pub struct RecoveryLoop {
     pub stats: RecoveryStats,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl RecoveryLoop {
     #[must_use]
     pub fn new(
@@ -909,12 +939,14 @@ impl RecoveryLoop {
 
 // ── Errors ───────────────────────────────────────────────────────────
 
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Debug)]
 pub enum RecoveryLoopError {
     Paused,
     ThrottlePaused,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl std::fmt::Display for RecoveryLoopError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -929,6 +961,7 @@ impl std::fmt::Display for RecoveryLoopError {
 ///
 /// Higher-priority items (`LossRebuild`) are dispatched before
 /// lower-priority ones (`CatchupRepair`, `SteadyReplication`).
+#[cfg(any(feature = "distributed-recovery", test))]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RecoveryWorkItem {
     /// The event that triggered this work item.
@@ -939,6 +972,7 @@ pub struct RecoveryWorkItem {
     pub description: String,
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl RecoveryWorkItem {
     /// Create a new work item, classifying the trigger into its
     /// priority tier automatically.
@@ -953,12 +987,14 @@ impl RecoveryWorkItem {
     }
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl Ord for RecoveryWorkItem {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.priority.cmp(&other.priority)
     }
 }
 
+#[cfg(any(feature = "distributed-recovery", test))]
 impl PartialOrd for RecoveryWorkItem {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))

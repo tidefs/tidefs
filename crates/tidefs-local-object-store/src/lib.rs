@@ -914,6 +914,7 @@ pub use pool::{
 };
 pub mod device;
 pub mod device_health;
+#[cfg(any(feature = "distributed-repair", test))]
 pub mod parity_raid;
 pub mod pool_label;
 

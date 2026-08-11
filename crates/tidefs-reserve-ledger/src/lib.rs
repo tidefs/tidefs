@@ -22,13 +22,18 @@
 //! - `conservation_audit` — verifies no receipt sequence violates reserve invariants
 //!
 use std::fmt;
+#[cfg(any(feature = "policy-observation", test))]
 use tidefs_claim_ledger::{ClaimClass, ClaimLedger, ClaimLedgerError, ClaimLedgerReport};
-use tidefs_types_claim_ledger_core::StorageAuthorityToken;
+#[cfg(any(feature = "policy-observation", test))]
 pub use tidefs_types_claim_ledger_core::{BudgetDomainId, ClaimId};
 
+#[cfg(any(feature = "policy-observation", test))]
 mod persistence;
+#[cfg(any(feature = "policy-observation", test))]
 mod receipt;
+#[cfg(any(feature = "policy-observation", test))]
 pub use persistence::ReserveLedgerRecord;
+#[cfg(any(feature = "policy-observation", test))]
 pub use receipt::*;
 
 // ---------------------------------------------------------------------------
@@ -69,6 +74,7 @@ impl ReserveClass {
     }
 
     /// Map reserve class to the corresponding claim class for admission.
+    #[cfg(any(feature = "policy-observation", test))]
     pub const fn to_claim_class(self) -> ClaimClass {
         match self {
             Self::Rebuild => ClaimClass::Rebuild,
@@ -310,8 +316,6 @@ impl WritePriority {
 pub struct ReserveLedger {
     /// Unique reservation identifier.
     pub reservation_id: u64,
-    /// Which budget domain this reserve protects.
-    pub budget_domain_ref: BudgetDomainId,
     /// What kind of reserve this is.
     pub reserve_class: ReserveClass,
     /// Minimum guaranteed bytes (reserve floor).
@@ -322,9 +326,6 @@ pub struct ReserveLedger {
     pub pressure_state: ReservePressureState,
     /// Who holds portions of this reserve.
     pub reserve_holders: Vec<ReserveHolderRecord>,
-    /// Receipt for this reserve's issuance.
-    pub issuance_receipt_ref: StorageAuthorityToken,
-
     // --- Segment-level reservation (allocation pipeline) ---
     /// Total segment capacity (0 = unconfigured).
     pub segment_capacity: u64,
@@ -340,7 +341,6 @@ impl ReserveLedger {
     /// Create a new reserve ledger.
     pub fn new(
         reservation_id: u64,
-        budget_domain_ref: BudgetDomainId,
         reserve_class: ReserveClass,
         floor_bytes: u64,
         ceiling_bytes: u64,
@@ -351,13 +351,11 @@ impl ReserveLedger {
         );
         Self {
             reservation_id,
-            budget_domain_ref,
             reserve_class,
             reserve_floor_bytes: floor_bytes,
             reserve_ceiling_bytes: ceiling_bytes,
             pressure_state: ReservePressureState::Healthy,
             reserve_holders: Vec::new(),
-            issuance_receipt_ref: StorageAuthorityToken::ABSENT,
             segment_capacity: 0,
             segments_reserved: 0,
             next_token_id: 1,
@@ -565,6 +563,7 @@ impl fmt::Display for ReserveLedger {
 ///
 /// Binds a claim ledger and reserve ledger together with placement policy
 /// and quota constraints.
+#[cfg(any(feature = "policy-observation", test))]
 #[derive(Clone, Debug)]
 pub struct BudgetDomain {
     /// Unique domain identifier.
@@ -579,10 +578,9 @@ pub struct BudgetDomain {
     pub claim_ledger: ClaimLedger,
     /// Reserve ledger for this domain.
     pub reserve_ledger: ReserveLedger,
-    /// Receipt for this domain's issuance.
-    pub issuance_receipt_ref: StorageAuthorityToken,
 }
 
+#[cfg(any(feature = "policy-observation", test))]
 impl BudgetDomain {
     /// Create a new budget domain.
     pub fn new(
@@ -601,12 +599,10 @@ impl BudgetDomain {
             claim_ledger: ClaimLedger::new(1_u64, domain_id),
             reserve_ledger: ReserveLedger::new(
                 1_u64,
-                domain_id,
                 reserve_class,
                 reserve_floor_bytes,
                 reserve_ceiling_bytes,
             ),
-            issuance_receipt_ref: StorageAuthorityToken::ABSENT,
         }
     }
 
@@ -726,6 +722,7 @@ impl BudgetDomain {
     }
 }
 
+#[cfg(any(feature = "policy-observation", test))]
 impl fmt::Display for BudgetDomain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.show())
@@ -736,6 +733,7 @@ impl fmt::Display for BudgetDomain {
 // BudgetDomainReport — operator-queryable breakdown
 // ---------------------------------------------------------------------------
 
+#[cfg(any(feature = "policy-observation", test))]
 #[derive(Clone, Debug)]
 pub struct BudgetDomainReport {
     pub domain_id: String,
@@ -781,6 +779,7 @@ pub enum ReserveLedgerError {
     InvalidSegmentCount,
 }
 
+#[cfg(any(feature = "policy-observation", test))]
 #[derive(Debug, thiserror::Error)]
 pub enum BudgetDomainError {
     #[error("admission denied for domain {domain}: class={claim_class}, pressure={pressure}, reason={reason}")]
@@ -1068,8 +1067,7 @@ mod tests {
 
     #[test]
     fn reserve_ledger_holder_operations() {
-        let mut ledger =
-            ReserveLedger::new(1, test_domain(), ReserveClass::Rebuild, 100_000, 200_000);
+        let mut ledger = ReserveLedger::new(1, ReserveClass::Rebuild, 100_000, 200_000);
 
         ledger
             .add_holder(ReserveHolderRecord {
@@ -1114,7 +1112,7 @@ mod tests {
     // --- Segment-reservation API tests ---
 
     fn new_ledger() -> ReserveLedger {
-        ReserveLedger::new(1, test_domain(), ReserveClass::Rebuild, 100_000, 200_000)
+        ReserveLedger::new(1, ReserveClass::Rebuild, 100_000, 200_000)
     }
 
     #[test]

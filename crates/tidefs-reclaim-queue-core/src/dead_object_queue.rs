@@ -19,14 +19,16 @@ use core::fmt;
 
 use tidefs_binary_schema_checksum::blake3_domain_digest;
 use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
+#[cfg(feature = "distributed-repair")]
 use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
 use tidefs_types_orphan_index_core::OrphanReplayWatermark;
-use tidefs_types_reclaim_queue_core::{
-    DeadObjectEntry, DeadObjectReceiptPolicy, DeadObjectReplacementReceipt, ObjectKey,
-};
+#[cfg(any(feature = "distributed-repair", test))]
+use tidefs_types_reclaim_queue_core::DeadObjectReceiptPolicy;
+use tidefs_types_reclaim_queue_core::{DeadObjectEntry, DeadObjectReplacementReceipt, ObjectKey};
 
 /// Reason a shared placement receipt reference cannot authorize dead-object reclaim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "distributed-repair")]
 pub enum PlacementReceiptRefReclaimError {
     /// Generation- or epoch-zero compatibility receipts are not durable placement authority.
     SyntheticReceipt,
@@ -44,6 +46,7 @@ pub enum PlacementReceiptRefReclaimError {
     },
 }
 
+#[cfg(feature = "distributed-repair")]
 impl fmt::Display for PlacementReceiptRefReclaimError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -71,6 +74,7 @@ impl fmt::Display for PlacementReceiptRefReclaimError {
 /// Convert the shared distributed receipt policy into the dead-object queue
 /// policy projection without changing the persisted queue format.
 #[must_use]
+#[cfg(feature = "distributed-repair")]
 pub const fn dead_object_policy_from_placement_ref(
     policy: ReceiptRedundancyPolicy,
 ) -> DeadObjectReceiptPolicy {
@@ -95,6 +99,7 @@ pub const fn dead_object_policy_from_placement_ref(
 /// dead-object queue. This helper only admits exact-key, non-synthetic,
 /// policy-satisfying refs so callers cannot accidentally make receipt-bound
 /// reclaim looser than the queue's existing gate.
+#[cfg(feature = "distributed-repair")]
 pub fn replacement_receipt_from_placement_ref(
     retired_object_key: ObjectKey,
     placement_ref: PlacementReceiptRef,
@@ -135,6 +140,7 @@ pub fn replacement_receipt_from_placement_ref(
 }
 
 /// Attach canonical placement receipt evidence to a dead-object entry.
+#[cfg(feature = "distributed-repair")]
 pub fn dead_object_entry_with_placement_ref(
     entry: DeadObjectEntry,
     placement_ref: PlacementReceiptRef,
@@ -894,6 +900,7 @@ impl core::fmt::Display for DeadObjectQueueDecodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "distributed-repair")]
     use tidefs_replication_model::{ReceiptRedundancyPolicy, ReplicatedSubjectId};
 
     fn oid(byte: u8) -> ObjectKey {
@@ -922,6 +929,7 @@ mod tests {
         DeadObjectReplacementReceipt::replicated(oid(id), 7, 1, 2, 4096, digest(id))
     }
 
+    #[cfg(feature = "distributed-repair")]
     fn placement_ref(
         key: ObjectKey,
         generation: u64,
@@ -1301,6 +1309,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn placement_ref_bridge_authorizes_receipt_bound_dequeue() {
         let key = oid(0x70);
         let entry = DeadObjectEntry::new(key, [0x70; 16], 5, true, 4);
@@ -1322,6 +1331,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn placement_ref_bridge_rejects_synthetic_receipts() {
         let key = oid(0x71);
         let entry = DeadObjectEntry::new(key, [0x71; 16], 5, true, 4);
@@ -1337,6 +1347,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn placement_ref_bridge_rejects_epoch_zero_receipts() {
         let key = oid(0x74);
         let entry = DeadObjectEntry::new(key, [0x74; 16], 5, true, 4);
@@ -1358,6 +1369,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn placement_ref_bridge_rejects_object_key_mismatch() {
         let entry = DeadObjectEntry::new(oid(0x72), [0x72; 16], 5, true, 4);
         let placement_ref = placement_ref(
@@ -1379,6 +1391,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn placement_ref_bridge_rejects_malformed_policy() {
         let key = oid(0x74);
         let entry = DeadObjectEntry::new(key, [0x74; 16], 5, true, 4);
@@ -1395,6 +1408,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn placement_ref_bridge_rejects_under_width_receipts() {
         let key = oid(0x75);
         let entry = DeadObjectEntry::new(key, [0x75; 16], 5, true, 4);

@@ -54,7 +54,6 @@ use tidefs_cache_core::page_cache::PageCache;
 use tidefs_cache_core::path_lookup_cache::PathLookupCache;
 use tidefs_cache_core::{BackpressureSignal, BudgetCategory, Governor, GovernorConfig};
 use tidefs_local_filesystem::fuse_fsync::DirtyFlush;
-use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex};
 use tidefs_permission::{
     check_access, InodeAttr as PermissionInodeAttr, MountIdentity, PosixAclEntry, ACCESS_EXECUTE,
     ACCESS_READ, ACCESS_WRITE,
@@ -2899,10 +2898,6 @@ pub struct FuseVfsAdapter {
     mmap_coherency: Arc<MmapCoherency>,
     /// FUSE kernel cache invalidation notifier, filled after mount.
     notifier: Arc<Mutex<Option<fuser::Notifier>>>,
-    /// Orphan index for tracking inodes unlinked while still open.
-    /// On last-close of an nlink==0 inode, an entry is inserted here
-    /// so the cleanup engine can reclaim the inode's space.
-    orphan_index: Mutex<OrphanIndex>,
     /// Inodes whose lifetime has been exposed to the kernel while FUSE
     /// writeback-cache is active. Linux can issue a late handle-less
     /// timestamp-only setattr for these inodes after the backing engine has
@@ -2996,7 +2991,6 @@ impl FuseVfsAdapter {
             suppress_dir_atime: false,
             notifier: notifier.clone(),
             mmap_coherency,
-            orphan_index: Mutex::new(OrphanIndex::new()),
             writeback_seen_inodes: Mutex::new(HashSet::new()),
             relatime_read_atime_pending: Mutex::new(HashSet::new()),
             dataset_id: Some(ROOT_DATASET_ID),
@@ -3195,16 +3189,6 @@ impl FuseVfsAdapter {
         txg_cycle: Arc<crate::txg_cycle::CommitGroupCycle>,
     ) -> Self {
         self.txg_cycle = txg_cycle;
-        self
-    }
-
-    /// Attach an [`OrphanIndex`] for tracking unlinked-but-open inodes.
-    ///
-    /// When set, `dispatch_release` will insert orphan entries on last-close
-    /// of nlink==0 inodes so the cleanup engine can reclaim their space.
-    #[must_use]
-    pub fn with_orphan_index(self, oi: OrphanIndex) -> Self {
-        *self.orphan_index.lock().unwrap() = oi;
         self
     }
 
@@ -4445,6 +4429,7 @@ impl FuseVfsAdapter {
         .unwrap();
 
         result?;
+        drop(e);
 
         // Capacity tracking for freed space is handled by the engine's
         // CapacityAuthority (record_free) during unlink dispatch.
@@ -4454,31 +4439,11 @@ impl FuseVfsAdapter {
         }
         self.record_dentry_child_mutation(parent, name);
 
-        // When unlink succeeds and nlink reaches 0 but open handles
-        // still reference the inode, insert into the orphan index so
-        // the last-close handler in dispatch_release can trigger
-        // cleanup-engine reclamation (#5527, #5549).
         let refcount = {
             let fht = self.file_handles.lock().unwrap();
             fht.open_ref_count(child_inode_for_delete.get())
         };
-        if refcount > 0 {
-            // The inode was unlinked while open: orphan it.
-            if let Ok(attrs) = e.getattr(child_inode_for_delete, None, ctx) {
-                if attrs.posix.nlink == 0 {
-                    let entry = OrphanEntry::new(
-                        child_inode_for_delete.get(),
-                        attrs.generation.get(),
-                        0,
-                        OrphanEntryFlags::NONE,
-                    );
-                    self.orphan_index
-                        .lock()
-                        .unwrap()
-                        .insert(child_inode_for_delete.get(), entry);
-                }
-            }
-        } else if child_attr.posix.nlink <= 1 {
+        if refcount == 0 && child_attr.posix.nlink <= 1 {
             self.invalidate_caches_after_inode_data_unreachable(child_inode_for_delete.get());
         }
 
@@ -4750,8 +4715,7 @@ impl FuseVfsAdapter {
                 if self.writeback_cache_enabled
                     && fh.is_none()
                     && is_timestamp_only_setattr(attr)
-                    && (self.orphan_index.lock().unwrap().contains(ino)
-                        || self.is_writeback_seen_inode(ino)) =>
+                    && self.is_writeback_seen_inode(ino) =>
             {
                 return Ok(orphan_timestamp_attr_out(ino, attr, ctx));
             }
@@ -7802,31 +7766,6 @@ impl FuseVfsAdapter {
             }
         }
 
-        // On last-close, if the inode was unlinked while still open
-        // (nlink == 0), insert it into the orphan index so the cleanup
-        // engine (#5527, #5549) can reclaim its space.
-        if is_last_close {
-            let e = self.engine.lock().unwrap();
-            if let Ok(attrs) = e.getattr(
-                InodeId::new(ino),
-                None,
-                &RequestCtx {
-                    uid: 0,
-                    gid: 0,
-                    pid: 0,
-                    umask: 0,
-                    groups: vec![0],
-                },
-            ) {
-                if attrs.posix.nlink == 0 {
-                    let entry =
-                        OrphanEntry::new(ino, attrs.generation.get(), 0, OrphanEntryFlags::NONE);
-                    self.orphan_index.lock().unwrap().insert(ino, entry);
-                    self.invalidate_caches_after_inode_data_unreachable(ino);
-                }
-            }
-        }
-
         // Finalize any pending extent operations on the engine handle.
         // The engine.release() contract requires the caller to have
         // completed or cancelled all pending operations before release,
@@ -8372,9 +8311,9 @@ impl FuseVfsAdapter {
     ) -> Result<VfsOpenDispatch, Errno> {
         Self::validate_open_flags(open_flags)?;
         let engine_open_flags = Self::engine_open_flags(open_flags);
-        // Route O_TMPFILE to the anonymous temporary-file path.
-        // The `ino` is the parent directory; the engine creates an
-        // unlinked inode and returns (attr, handle).
+        // Route O_TMPFILE to the unnamed-file operation. The `ino` is the
+        // parent directory; the engine creates a canonical zero-link inode
+        // and returns (attr, handle).
         if engine_open_flags & LINUX_O_TMPFILE != 0 {
             let file_mode = 0o666 & !ctx.umask;
             return self.dispatch_tmpfile(ctx, ino, file_mode, engine_open_flags);
@@ -8440,8 +8379,8 @@ impl FuseVfsAdapter {
         self.dispatch_open_entry(ctx, ino, open_flags)
     }
 
-    /// Internal dispatch for O_TMPFILE: creates an anonymous temporary file
-    /// in `parent_dir` and returns an open handle.  The inode has no
+    /// Internal dispatch for O_TMPFILE: creates an unnamed regular file
+    /// in `parent_dir` and returns an open handle. The inode has no
     /// directory entry until linked via `linkat`.
     ///
     /// Engine contract: `tmpfile(parent, mode, flags, ctx)` returns
@@ -29378,7 +29317,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_tmpfile_creates_anonymous_file_and_returns_handle() {
+    fn dispatch_tmpfile_creates_unnamed_file_and_returns_handle() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
         let root = fixture
@@ -29431,7 +29370,7 @@ mod tests {
     #[test]
     fn dispatch_tmpfile_engine_roundtrip() {
         // Verify the engine-level tmpfile path is functional: create, write,
-        // read back, and verify the inode is truly anonymous (no dentry).
+        // read back, and verify the inode is unnamed (no dentry).
         let fixture = adapter_fixture();
         let ctx = root_ctx();
         let (root_id, attr, engine_fh) = {
@@ -29456,16 +29395,13 @@ mod tests {
                 .expect("read");
             assert_eq!(readback, payload);
         }
-        // The anonymous inode must not appear in the root directory.
+        // The unnamed inode must not appear in the root directory.
         {
             let engine = fixture.adapter.engine.lock().unwrap();
             let dh = engine.opendir(root_id, &ctx).expect("opendir root");
             let (entries, _more) = engine.readdir(&dh, 0, &ctx).expect("readdir root");
             let visible = entries.iter().any(|e| e.inode_id.get() == ino);
-            assert!(
-                !visible,
-                "anonymous tmpfile inode must not appear in readdir"
-            );
+            assert!(!visible, "unnamed tmpfile inode must not appear in readdir");
             engine.releasedir(&dh).expect("releasedir root");
         }
         // Release the engine handle.
@@ -35197,10 +35133,6 @@ mod tests {
             .adapter
             .dispatch_unlink(&ctx, root.get(), name)
             .expect("unlink after close");
-        assert!(
-            !fixture.adapter.orphan_index.lock().unwrap().contains(ino),
-            "closed unlink should not create an orphan entry"
-        );
 
         let mut set = SetAttr::new();
         set.valid = FATTR_MTIME;
@@ -35212,7 +35144,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_orphan_timestamp_only_setattr_after_release_succeeds() {
+    fn writeback_seen_open_unlinked_timestamp_only_setattr_after_release_succeeds() {
         let mut fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let name = b"writeback-open-unlink-mtime.txt";
@@ -35234,10 +35166,6 @@ mod tests {
             .adapter
             .dispatch_unlink(&ctx, root.get(), name)
             .expect("unlink while open");
-        assert!(
-            fixture.adapter.orphan_index.lock().unwrap().contains(ino),
-            "unlink while open should register orphan before release"
-        );
 
         fixture
             .adapter
@@ -35249,7 +35177,7 @@ mod tests {
             assert_eq!(
                 engine.getattr(InodeId::new(ino), None, &ctx).unwrap_err(),
                 Errno::ENOENT,
-                "engine should have reclaimed the anonymous tmpfile"
+                "engine should reclaim the open-unlinked inode on final release"
             );
         }
 
@@ -35259,7 +35187,7 @@ mod tests {
         fixture
             .adapter
             .dispatch_setattr(&ctx, 304, ino, &set, None)
-            .expect("late orphan timestamp-only setattr");
+            .expect("late writeback timestamp-only setattr");
     }
 
     #[test]

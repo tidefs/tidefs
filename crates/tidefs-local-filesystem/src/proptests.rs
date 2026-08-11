@@ -116,7 +116,8 @@ proptest! {
         fs.truncate_file("/data.bin", trunc_len).expect("truncate file");
 
         let read_back = fs.read_file("/data.bin").expect("read file");
-        let expected: Vec<u8> = initial.iter().take(trunc_len as usize).copied().collect();
+        let mut expected = initial;
+        expected.resize(trunc_len as usize, 0);
         prop_assert_eq!(read_back, expected);
 
         prop_cleanup(&root);
@@ -171,42 +172,48 @@ proptest! {
         fs.create_file("/data.bin", 0o644).expect("create file");
         fs.write_file("/data.bin", 0, &initial).expect("write initial");
 
+        let inode_id = fs.stat("/data.bin").expect("stat initial write").inode_id;
+        fs.flush_write_buffer(inode_id)
+            .expect("materialize initial write through Pool authority");
         let record_before = fs.stat("/data.bin").expect("stat before patch");
-        let content_key_before = content_object_key_for_version(record_before.inode_id, record_before.data_version);
-        let bytes_before = fs.store.primary_store().get(content_key_before)
-            .expect("read content obj")
-            .expect("content obj exists before");
-        let manifest_before = decode_content_manifest(&bytes_before).expect("decode manifest before");
+        let layout_before = MountedContentReadAuthority::new(&fs.store)
+            .read_layout(inode_id, &record_before)
+            .expect("read initial layout through Pool authority");
+        let ContentLayout::Chunked(manifest_before) = layout_before else {
+            panic!("random write dispatch must publish a chunked initial layout");
+        };
 
         let chunk_sz = FILESYSTEM_CONTENT_CHUNK_SIZE as u64;
         let patch_offset = patch_offset.min(initial.len() as u64);
         fs.write_file("/data.bin", patch_offset, &patch_bytes).expect("write patch");
 
+        fs.flush_write_buffer(inode_id)
+            .expect("materialize patch through Pool authority");
         let record_after = fs.stat("/data.bin").expect("stat after patch");
-        let content_key_after = content_object_key_for_version(record_after.inode_id, record_after.data_version);
-        let bytes_after = fs.store.primary_store().get(content_key_after)
-            .expect("read content obj after")
-            .expect("content obj exists after");
-        let manifest_after = decode_content_manifest(&bytes_after).expect("decode manifest after");
+        let layout_after = MountedContentReadAuthority::new(&fs.store)
+            .read_layout(inode_id, &record_after)
+            .expect("read patched layout through Pool authority");
+        let ContentLayout::Chunked(manifest_after) = layout_after else {
+            panic!("random write dispatch must publish a chunked patched layout");
+        };
 
         let patch_start_chunk = patch_offset / chunk_sz;
         let patch_end = patch_offset + patch_bytes.len() as u64;
         let patch_end_chunk = if patch_end == 0 { 0 } else { (patch_end - 1) / chunk_sz };
 
-        for (i, before_chunk) in manifest_before.chunks.iter().enumerate() {
-            let ci = i as u64;
-            if ci < patch_start_chunk || ci > patch_end_chunk {
-                if let Some(after_chunk) = manifest_after.chunks.get(i) {
-                    if !before_chunk.is_hole() && !after_chunk.is_hole() {
-                        // Use assert! instead of prop_assert_eq! to avoid format_args! closure capture
-                        assert!(
-                            before_chunk.data_version == after_chunk.data_version,
-                            "chunk index {ci}: data_version changed from {} to {} but should be preserved",
-                            before_chunk.data_version,
-                            after_chunk.data_version,
-                        );
-                    }
-                }
+        for before_chunk in &manifest_before.chunks {
+            let ci = before_chunk.chunk_index;
+            if (ci < patch_start_chunk || ci > patch_end_chunk) && !before_chunk.is_hole() {
+                let after_chunk = manifest_after
+                    .chunks
+                    .iter()
+                    .find(|chunk| chunk.chunk_index == ci)
+                    .expect("unchanged materialized chunk must remain in patched layout");
+                assert!(
+                    !after_chunk.is_hole()
+                        && before_chunk.data_version == after_chunk.data_version,
+                    "chunk index {ci}: unchanged Pool content identity was not preserved",
+                );
             }
         }
 
@@ -291,7 +298,12 @@ proptest! {
             dir_rev: 0,
             subtree_rev: 0,
         };
-        let encoded = encode_content_chunk(&record, chunk_index, &payload, &ContentCompressionPolicy::zstd_default());
+        #[cfg(feature = "data-policy")]
+        let compression_policy = ContentCompressionPolicy::zstd_default();
+        #[cfg(not(feature = "data-policy"))]
+        let compression_policy = ContentCompressionPolicy::off();
+        let encoded = encode_content_chunk(&record, chunk_index, &payload, &compression_policy)
+            .expect("encode content chunk");
         let decoded = decode_content_chunk(&encoded)
             .expect("decode content chunk roundtrip");
 
@@ -311,12 +323,16 @@ proptest! {
         fs.create_file("/data.bin", 0o644).expect("create file");
         fs.write_file("/data.bin", 0, &bytes).expect("write file");
 
+        let inode_id = fs.stat("/data.bin").expect("stat pending file").inode_id;
+        fs.flush_write_buffer(inode_id)
+            .expect("materialize file through Pool authority");
         let record = fs.stat("/data.bin").expect("stat file");
-        let content_key = content_object_key_for_version(record.inode_id, record.data_version);
-        let manifest_bytes = fs.store.primary_store().get(content_key)
-            .expect("read content obj")
-            .expect("content obj exists");
-        let manifest = decode_content_manifest(&manifest_bytes).expect("decode manifest");
+        let layout = MountedContentReadAuthority::new(&fs.store)
+            .read_layout(inode_id, &record)
+            .expect("read manifest through Pool authority");
+        let ContentLayout::Chunked(manifest) = layout else {
+            panic!("full-content dispatch must publish a chunked layout");
+        };
 
         // Manifest metadata matches the inode.
         prop_assert_eq!(manifest.inode_id, record.inode_id);
@@ -365,24 +381,26 @@ proptest! {
             let mut fs = LocalFileSystem::open_with_options(&root, prop_options()).expect("open fs");
             fs.create_file("/data.bin", 0o644).expect("create file");
             fs.write_file("/data.bin", 0, &bytes).expect("write file");
+            fs.sync_all().expect("sync");
 
             let record = fs.stat("/data.bin").expect("stat");
-            let content_key = content_object_key_for_version(record.inode_id, record.data_version);
-            let raw = fs.store.primary_store().get(content_key)
-                .expect("read")
-                .expect("exists");
-            manifest_before = decode_content_manifest(&raw).expect("decode before");
-
-            fs.sync_all().expect("sync");
+            let layout = MountedContentReadAuthority::new(&fs.store)
+                .read_layout(record.inode_id, &record)
+                .expect("read synced layout through Pool authority");
+            let ContentLayout::Chunked(manifest) = layout else {
+                panic!("synced full-content dispatch must publish a chunked layout");
+            };
+            manifest_before = manifest;
         }
         {
             let fs = LocalFileSystem::open_with_options(&root, prop_options()).expect("reopen fs");
             let record = fs.stat("/data.bin").expect("stat after reopen");
-            let content_key = content_object_key_for_version(record.inode_id, record.data_version);
-            let raw = fs.store.primary_store().get(content_key)
-                .expect("read after reopen")
-                .expect("exists after reopen");
-            let manifest_after = decode_content_manifest(&raw).expect("decode after reopen");
+            let layout = MountedContentReadAuthority::new(&fs.store)
+                .read_layout(record.inode_id, &record)
+                .expect("read reopened layout through Pool authority");
+            let ContentLayout::Chunked(manifest_after) = layout else {
+                panic!("reopened full-content dispatch must retain a chunked layout");
+            };
 
             prop_assert_eq!(manifest_before, manifest_after,
                 "manifest must be byte-identical after reopen");

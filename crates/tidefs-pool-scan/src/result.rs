@@ -187,6 +187,7 @@ impl PoolScanResult {
     /// membership identity authority. Devices without a valid label fingerprint
     /// or without a mapped member id are omitted from the evidence set.
     #[must_use]
+    #[cfg(any(feature = "distributed-repair", test))]
     pub fn epoch_bound_scan_evidence<F>(
         &self,
         prior_epoch_id: u64,
@@ -238,6 +239,7 @@ impl PoolScanResult {
     /// Export committed member evidence together with completed evacuation
     /// receipts observed for this scan.
     #[must_use]
+    #[cfg(any(feature = "distributed-repair", test))]
     pub fn committed_member_evidence<F>(
         &self,
         prior_epoch_id: u64,
@@ -259,6 +261,7 @@ impl PoolScanResult {
 }
 
 /// Pool-scan member evidence plus completed device-evacuation receipts.
+#[cfg(any(feature = "distributed-repair", test))]
 #[derive(Clone, Debug)]
 pub struct CommittedMemberEvidence {
     /// Epoch-bound member-label evidence derived from the pool scan.

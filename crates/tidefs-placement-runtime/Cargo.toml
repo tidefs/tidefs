@@ -27,10 +27,16 @@ tidefs-node-join = { workspace = true }
 tidefs-rebuild-planner = { workspace = true }
 tidefs-replica-health = { workspace = true }
 tidefs-durability-layout = { workspace = true }
-tidefs-device-removal = { workspace = true }
+tidefs-device-removal = { workspace = true, optional = true }
 tidefs-locator-table = { workspace = true }
 
+[features]
+default = []
+device-removal = ["dep:tidefs-device-removal"]
+full = ["device-removal"]
+
 [dev-dependencies]
+tidefs-device-removal = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

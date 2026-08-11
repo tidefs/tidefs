@@ -1767,11 +1767,11 @@ impl ReclaimConsumerService {
 // into the reclaim pipeline.
 // =========================================================================
 
-#[cfg(test)]
+#[cfg(any(feature = "dedup", test))]
 use tidefs_dedup::{locator_id_to_object_key, RemoveConsumerOutcome};
 
 /// Accumulated stats for one [`DedupReclaimWriter::process_outcomes`] call.
-#[cfg(test)]
+#[cfg(any(feature = "dedup", test))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DedupReclaimStats {
     /// Number of dedup outcomes examined.
@@ -1784,7 +1784,7 @@ pub struct DedupReclaimStats {
     pub deltas_applied: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(feature = "dedup", test))]
 impl DedupReclaimStats {
     /// Zero-valued stats.
     pub const ZERO: Self = Self {
@@ -1827,12 +1827,12 @@ impl DedupReclaimStats {
 ///     &mut freer,
 /// );
 /// ```text
-#[cfg(test)]
+#[cfg(any(feature = "dedup", test))]
 pub struct DedupReclaimWriter {
     live_counts: SegmentLiveCounts,
 }
 
-#[cfg(test)]
+#[cfg(any(feature = "dedup", test))]
 impl DedupReclaimWriter {
     /// Create a new writer wrapping the given live-counts state.
     ///
@@ -1924,7 +1924,7 @@ impl DedupReclaimWriter {
 }
 
 /// Errors returned by [`DedupReclaimWriter::process_outcomes`].
-#[cfg(test)]
+#[cfg(any(feature = "dedup", test))]
 #[derive(Debug)]
 pub enum DedupReclaimError<R: fmt::Debug + fmt::Display, F: fmt::Debug + fmt::Display> {
     /// The segment resolver failed to map a locator-derived object key.
@@ -1943,7 +1943,7 @@ pub enum DedupReclaimError<R: fmt::Debug + fmt::Display, F: fmt::Debug + fmt::Di
     },
 }
 
-#[cfg(test)]
+#[cfg(any(feature = "dedup", test))]
 impl<R: fmt::Debug + fmt::Display, F: fmt::Debug + fmt::Display> fmt::Display
     for DedupReclaimError<R, F>
 {

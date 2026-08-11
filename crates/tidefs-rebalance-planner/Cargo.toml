@@ -18,7 +18,7 @@ thiserror = "2"
 tidefs-membership-epoch = { workspace = true }
 tidefs-replication-model = { workspace = true }
 tidefs-rebuild-planner = { workspace = true }
-tidefs-placement-planner = { workspace = true }
+tidefs-placement-planner = { workspace = true, features = ["membership"] }
 tidefs-replica-health = { workspace = true }
 tidefs-commit_group = { workspace = true }
 tidefs-space-accounting = { workspace = true }

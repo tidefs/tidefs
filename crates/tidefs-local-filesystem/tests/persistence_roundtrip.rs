@@ -13,7 +13,6 @@ use std::fs;
 use tidefs_local_filesystem::{
     LocalFileSystem, DEFAULT_DIRECTORY_PERMISSIONS, DEFAULT_FILE_PERMISSIONS,
 };
-use tidefs_local_object_store::{LocalObjectStore, StoreOptions};
 
 // ---------------------------------------------------------------------------
 // PersistenceHarness
@@ -41,10 +40,6 @@ impl PersistenceHarness {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create temp dir");
-
-        let opts = StoreOptions::test_fast();
-        let store = LocalObjectStore::open_with_options(&root, opts).expect("open store");
-        drop(store);
 
         let fs = LocalFileSystem::open(&root).expect("open filesystem");
 
@@ -793,25 +788,56 @@ mod symlink_persistence {
 mod corruption_detection {
     use super::*;
     use std::fs;
+    use std::io::{Read, Seek, SeekFrom, Write};
 
     use tidefs_local_filesystem::LocalFileSystem;
-    use tidefs_local_object_store::StoreOptions;
+    use tidefs_local_object_store::{segment_file_name, StoreOptions};
 
-    /// List all keys in the object store and overwrite each with garbage.
+    /// Flip a payload byte in every current record on the Pool data device.
     /// Returns the number of corrupted keys.
     fn corrupt_all_keys(root: &std::path::Path) -> usize {
         let opts = StoreOptions::test_fast();
-        let mut pool = tidefs_local_filesystem::LocalFileSystem::default_development_pool(
+        let pool = tidefs_local_filesystem::LocalFileSystem::default_development_pool(
             root, &opts, None, None,
         )
         .expect("open pool for corruption");
-        let store = pool.raw_primary_store_mut();
+        let store = pool.raw_primary_store();
         let keys = store.list_keys();
-        let count = keys.len();
+        let mut corrupted = 0;
         for key in keys {
-            let _ = store.put(key, b"corrupted-by-test-garbage-bytes");
+            let Some(location) = store.location_of(key) else {
+                continue;
+            };
+            if location.payload_len == 0 {
+                continue;
+            }
+            let segments_dir = store.segments_dir();
+            let segment_path =
+                if segments_dir.is_file() || (segments_dir.exists() && !segments_dir.is_dir()) {
+                    segments_dir.to_path_buf()
+                } else {
+                    segments_dir.join(segment_file_name(location.segment_id))
+                };
+            let payload_offset = location.payload_offset;
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&segment_path)
+                .expect("open Pool segment for corruption");
+            file.seek(SeekFrom::Start(payload_offset))
+                .expect("seek to current record payload");
+            let mut byte = [0_u8; 1];
+            file.read_exact(&mut byte)
+                .expect("read current record payload byte");
+            byte[0] ^= 0xff;
+            file.seek(SeekFrom::Start(payload_offset))
+                .expect("seek back to current record payload");
+            file.write_all(&byte)
+                .expect("corrupt current record payload byte");
+            file.sync_data().expect("persist record corruption");
+            corrupted += 1;
         }
-        count
+        corrupted
     }
 
     #[test]

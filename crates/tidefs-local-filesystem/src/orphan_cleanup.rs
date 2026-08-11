@@ -2,9 +2,10 @@
 //! Mount-time orphan cleanup triggered during LocalFileSystem::open recovery.
 //!
 //! After intent log replay, inodes that reached nlink==0 before an unclean
-//! shutdown remain in the persistent orphan index. `cleanup_orphans` reclaims
-//! their content objects, extent maps, directory entries, and block allocator
-//! space, then removes the orphan index entry.
+//! shutdown remain in the persistent orphan index. `cleanup_orphans` removes
+//! their namespace, inode, and extent-map state, then removes the orphan index
+//! entry. The mounted caller queues exact content keys separately through
+//! strict Pool authority before invoking this metadata cleanup.
 //!
 //! ## Design
 //!
@@ -18,15 +19,9 @@
 //!
 use std::sync::{Arc, Mutex};
 
-use tidefs_local_object_store::LocalObjectStore;
 use tidefs_orphan_index::OrphanIndex;
-use tidefs_reclaim_queue_core::BPlusTreeReclaimQueue;
-use tidefs_types_reclaim_queue_core::ObjectKey as ReclaimObjectKey;
-use tidefs_types_reclaim_queue_core::QueueFamily as ReclaimQueueFamily;
-use tidefs_types_reclaim_queue_core::ReclaimQueueEntry;
 use tidefs_types_vfs_core::InodeId;
 
-use crate::object_keys::content_object_key_for_version;
 use crate::Result;
 
 /// Statistics from a mount-time orphan cleanup pass.
@@ -43,8 +38,9 @@ pub(crate) struct OrphanCleanupStats {
     pub directory_entries_removed: usize,
     /// Extent maps freed.
     pub extent_maps_freed: usize,
-    /// Content objects deleted from the object store.
-    pub content_objects_deleted: usize,
+    /// Exact content/inode reclaim entries queued by the mounted caller before
+    /// metadata cleanup. This module never scans or deletes mounted content.
+    pub reclaim_entries_queued: usize,
 }
 
 impl OrphanCleanupStats {
@@ -61,26 +57,22 @@ impl OrphanCleanupStats {
 /// Called from `LocalFileSystem::open` after intent log replay and before
 /// background services start.  For each orphaned inode:
 ///
-/// 1. If the inode still exists in the inode table with nlink > 0 but no
-///    directory entry points at it, treat only the orphan-index entry as stale.
-/// 2. If the inode still exists in the inode table with nlink==0, remove it
-///    and record a reclaim delta for its content size.
+/// 1. If the inode still exists in the inode table with nlink > 0, treat only
+///    the orphan-index entry as stale. The committed inode and namespace own
+///    reachability; this index is a reconstructible cleanup accelerator.
+/// 2. If the inode still exists in the inode table with nlink==0, remove it.
 /// 3. Scan all directories for stale entries pointing to this inode and
 ///    remove them.
 /// 4. Free the extent map if present.
-/// 5. Delete versioned content objects from the object store.
-/// 6. Remove the orphan index entry.
+/// 5. Remove the orphan index entry.
 ///
 /// Inodes with nlink > 0 that appear in the orphan index are inconsistent.
-/// If they still have directory entries, the orphan index wins and the entries
-/// are stale unlink remnants. If they have no directory entry, cleanup leaves
-/// the inode content alone to avoid destroying an unreachable but still-linked
-/// record and removes only the orphan index entry.
+/// Cleanup leaves the committed inode and namespace untouched and removes only
+/// the stale index entry. An auxiliary index must never overrule a committed
+/// live inode and delete reachable data.
 pub(crate) fn cleanup_orphans(
-    store: &mut LocalObjectStore,
     state: &mut crate::FileSystemState,
     orphan_index: &Arc<Mutex<OrphanIndex>>,
-    reclaim_queue: &Arc<Mutex<BPlusTreeReclaimQueue>>,
 ) -> Result<OrphanCleanupStats> {
     let mut stats = OrphanCleanupStats::default();
 
@@ -104,36 +96,26 @@ pub(crate) fn cleanup_orphans(
 
         // 1. If the inode still exists in the inode table, handle it.
         //    Normal path: nlink==0 on an inode that should have been
-        //    removed. Record a reclaim delta and remove the inode record.
+        //    removed. The mounted caller already queued exact content and
+        //    inode keys through Pool authority; remove only metadata here.
         if let Some(record) = state.inodes.get(&inode_id) {
-            let has_directory_entry = state
-                .directories
-                .values()
-                .any(|dir| dir.values().any(|entry| entry.inode_id == inode_id));
-
-            if record.nlink == 0 || has_directory_entry {
-                let freed_bytes = record.size;
+            if record.nlink == 0 {
                 let was_directory = record.carries_child_namespace();
-                let mut key = [0u8; 32];
-                key[..8].copy_from_slice(&inode_id_raw.to_be_bytes());
-                let rq_entry = ReclaimQueueEntry::new(
-                    ReclaimObjectKey(key),
-                    -((freed_bytes as i64).saturating_abs()),
-                    ReclaimQueueFamily::Extent,
-                );
-                reclaim_queue.lock().unwrap().insert(rq_entry);
 
                 Arc::make_mut(&mut state.inodes).remove(&inode_id);
                 state.last_inode_write_tx.remove(&inode_id);
                 state.last_dir_write_tx.remove(&inode_id);
+                state.last_extent_map_write_tx.remove(&inode_id);
+                state.known_inode_ids.remove(&inode_id);
+                state.dirty_inodes.insert(inode_id);
                 if was_directory {
                     Arc::make_mut(&mut state.directories).remove(&inode_id);
                     state.dirty_dirs.remove(&inode_id);
                 }
                 stats.inodes_removed_from_state += 1;
             } else {
-                // nlink > 0 with no directory entry: inconsistent but no
-                // reachable stale name exists. Remove only the orphan marker.
+                // A live committed inode always wins over a stale derivative
+                // orphan marker, whether or not a directory entry is visible.
                 orphan_index.lock().unwrap().remove(inode_id_raw);
                 stats.orphans_cleaned += 1;
                 continue;
@@ -156,9 +138,11 @@ pub(crate) fn cleanup_orphans(
                     stats.directory_entries_removed += 1;
                 }
                 if !stale_names.is_empty() {
+                    state.dirty_dirs.insert(dir_id);
                     // Update parent directory size.
                     if let Some(parent_inode) = Arc::make_mut(&mut state.inodes).get_mut(&dir_id) {
                         parent_inode.size = dir.len() as u64;
+                        state.dirty_inodes.insert(dir_id);
                     }
                 }
             }
@@ -174,100 +158,13 @@ pub(crate) fn cleanup_orphans(
             .is_some()
         {
             stats.extent_maps_freed += 1;
+            state.dirty_inodes.insert(inode_id);
         }
         state.dirty_extent_maps.remove(&inode_id);
 
-        // 4. Delete versioned content objects from the object store. Walk forward until we see
-        // two consecutive misses to avoid scanning u64::MAX versions.
-        let mut misses = 0_u64;
-        for dv in 0_u64.. {
-            let version_key = content_object_key_for_version(inode_id, dv);
-            match store.delete(version_key) {
-                Ok(true) => {
-                    stats.content_objects_deleted += 1;
-                    misses = 0;
-                }
-                Ok(false) => {
-                    misses += 1;
-                    if misses >= 2 {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    misses += 1;
-                    if misses >= 2 {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // 5. Per-chunk dedup refcount cleanup (#6167).
-        //    A crash after record_reclaim_delta's synchronous deletes could
-        //    leave orphaned per-chunk keys that reference canonical dedup
-        //    objects.  Walk chunk keys to find redirects, decrement refcounts,
-        //    and delete canonical data/refcount objects when refcount reaches 0.
-        {
-            let mut dv = 0_u64;
-            let mut dv_misses = 0_u64;
-            while dv_misses < 2 {
-                let mut ci = 0_u64;
-                let mut ci_misses = 0_u64;
-                while ci_misses < 2 {
-                    let ckey =
-                        crate::object_keys::content_chunk_object_key_for_version(inode_id, dv, ci);
-                    if let Ok(Some(payload)) = store.get(ckey) {
-                        ci_misses = 0;
-                        if crate::encoding::is_dedup_redirect(&payload) {
-                            if let Ok(canonical_key) =
-                                crate::encoding::decode_dedup_redirect(&payload)
-                            {
-                                if let Ok(Some(canon_data)) = store.get(canonical_key) {
-                                    if let Ok(chunk) =
-                                        crate::encoding::decode_content_chunk(&canon_data)
-                                    {
-                                        let fp = crate::encoding::compute_content_fingerprint(
-                                            &chunk.bytes,
-                                        );
-                                        if let Ok(true) =
-                                            crate::dedup_refcount::DedupRefCount::decrement(
-                                                store, &fp,
-                                            )
-                                        {
-                                            let canon_data_key =
-                                                crate::object_keys::content_dedup_object_key(&fp);
-                                            let rq_entry = ReclaimQueueEntry::new(
-                                                ReclaimObjectKey(*canon_data_key.as_bytes()),
-                                                -1,
-                                                ReclaimQueueFamily::Extent,
-                                            );
-                                            reclaim_queue.lock().unwrap().insert(rq_entry);
-                                            // Refcount key already deleted by DedupRefCount::decrement
-                                            // when the count reached zero.
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        let _ = store.delete(ckey);
-                        stats.content_objects_deleted += 1;
-                    } else {
-                        ci_misses += 1;
-                        if ci_misses >= 2 {
-                            break;
-                        }
-                    }
-                    ci = ci.saturating_add(1);
-                }
-                dv += 1;
-                dv_misses += 1;
-                if dv > 16 {
-                    break;
-                }
-            }
-        }
-
-        // 6. Remove the orphan index entry.
+        // 4. Remove the orphan index entry. Content remains owned by the
+        // mounted queue until retained-root and receipt preflight authorizes
+        // logical Pool deletion.
         orphan_index.lock().unwrap().remove(inode_id_raw);
         stats.orphans_cleaned += 1;
     }
@@ -277,13 +174,12 @@ pub(crate) fn cleanup_orphans(
     }
 
     eprintln!(
-        "orphan-cleanup: reclaimed {} orphans ({} state inodes, {} dir \
-         entries, {} extent maps, {} content objects)",
+        "orphan-cleanup: reconciled {} orphans ({} state inodes, {} dir \
+         entries, {} extent maps)",
         stats.orphans_cleaned,
         stats.inodes_removed_from_state,
         stats.directory_entries_removed,
         stats.extent_maps_freed,
-        stats.content_objects_deleted,
     );
 
     Ok(stats)
@@ -320,16 +216,10 @@ fn reconcile_directory_topology(state: &mut crate::FileSystemState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags};
-
-    fn orphan_entry(inode_id: u64) -> OrphanEntry {
-        OrphanEntry::new(inode_id, inode_id, 0, OrphanEntryFlags::NONE)
-    }
     use std::collections::BTreeMap;
     use std::sync::Arc as StdArc;
 
     use tidefs_orphan_index::OrphanIndex;
-    use tidefs_reclaim_queue_core::BPlusTreeReclaimQueue;
     use tidefs_types_vfs_core::{Generation, InodeId, NodeKind, ROOT_INODE_ID};
 
     use crate::types::{ContentCompressionPolicy, InodeRecord, NamespaceEntry};
@@ -388,22 +278,14 @@ mod tests {
         }
     }
 
-    fn make_temp_store() -> (tempfile::TempDir, LocalObjectStore) {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let store = LocalObjectStore::open(tmp.path()).expect("open store");
-        (tmp, store)
-    }
-
     // ── basic unit tests ────────────────────────────────────────────
 
     #[test]
     fn empty_orphan_index_returns_idle() {
-        let (_tmp, mut store) = make_temp_store();
         let mut state = make_cleanup_state();
         let orphan_index = Arc::new(Mutex::new(OrphanIndex::new()));
-        let reclaim_queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
 
-        let stats = cleanup_orphans(&mut store, &mut state, &orphan_index, &reclaim_queue)
+        let stats = cleanup_orphans(&mut state, &orphan_index)
             .expect("cleanup should succeed on empty index");
 
         assert!(stats.is_idle());
@@ -413,17 +295,13 @@ mod tests {
 
     #[test]
     fn orphan_not_in_state_is_cleaned() {
-        let (_tmp, mut store) = make_temp_store();
         let mut state = make_cleanup_state();
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(999, orphan_entry(999));
+            idx.insert(999);
             idx
         }));
-        let reclaim_queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-
-        let stats = cleanup_orphans(&mut store, &mut state, &orphan_index, &reclaim_queue)
-            .expect("cleanup should succeed");
+        let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
 
         assert_eq!(stats.orphans_found, 1);
         assert_eq!(stats.orphans_cleaned, 1);
@@ -433,7 +311,6 @@ mod tests {
 
     #[test]
     fn orphan_still_in_state_with_nlink_zero_is_removed() {
-        let (_tmp, mut store) = make_temp_store();
         let mut state = make_cleanup_state();
         let orphan_inode_id = InodeId::new(42);
         let orphan_inode = InodeRecord {
@@ -460,26 +337,20 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(42, orphan_entry(42));
+            idx.insert(42);
             idx
         }));
-        let reclaim_queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-
-        let stats = cleanup_orphans(&mut store, &mut state, &orphan_index, &reclaim_queue)
-            .expect("cleanup should succeed");
+        let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
 
         assert_eq!(stats.orphans_found, 1);
         assert_eq!(stats.orphans_cleaned, 1);
         assert_eq!(stats.inodes_removed_from_state, 1);
         assert!(orphan_index.lock().unwrap().is_empty());
         assert!(!state.inodes.contains_key(&orphan_inode_id));
-        // Reclaim delta recorded.
-        assert!(!reclaim_queue.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn orphan_with_nlink_positive_and_directory_entry_is_reclaimed() {
-        let (_tmp, mut store) = make_temp_store();
+    fn stale_orphan_marker_does_not_delete_linked_inode() {
         let mut state = make_cleanup_state();
         let orphan_inode_id = InodeId::new(77);
         let orphan_inode = InodeRecord {
@@ -490,7 +361,7 @@ mod tests {
             mode: 0o644,
             uid: 1000,
             gid: 1000,
-            nlink: 1, // stale positive nlink; orphan index is authoritative
+            nlink: 1,
             size: 1024,
             data_version: 3,
             metadata_version: 3,
@@ -519,28 +390,29 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(77, orphan_entry(77));
+            idx.insert(77);
             idx
         }));
-        let reclaim_queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-
-        let stats = cleanup_orphans(&mut store, &mut state, &orphan_index, &reclaim_queue)
-            .expect("cleanup should succeed");
+        let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
 
         assert_eq!(stats.orphans_found, 1);
         assert_eq!(stats.orphans_cleaned, 1);
-        assert_eq!(stats.inodes_removed_from_state, 1);
-        assert_eq!(stats.directory_entries_removed, 1);
-        assert!(!state.inodes.contains_key(&orphan_inode_id));
+        assert_eq!(stats.inodes_removed_from_state, 0);
+        assert_eq!(stats.directory_entries_removed, 0);
+        assert!(state.inodes.contains_key(&orphan_inode_id));
         let root_dir = state.directories.get(&ROOT_INODE_ID).unwrap();
-        assert!(!root_dir.contains_key(b"linked.txt".as_slice()));
-        assert!(!reclaim_queue.lock().unwrap().is_empty());
+        assert_eq!(
+            root_dir
+                .get(b"linked.txt".as_slice())
+                .expect("linked entry must survive stale orphan marker")
+                .inode_id,
+            orphan_inode_id
+        );
         assert!(orphan_index.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn orphan_directory_reconciles_parent_link_count() {
-        let (_tmp, mut store) = make_temp_store();
+    fn stale_orphan_marker_does_not_delete_linked_directory() {
         let mut state = make_cleanup_state();
         let orphan_inode_id = InodeId::new(88);
         let orphan_inode = InodeRecord {
@@ -585,25 +457,29 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(88, orphan_entry(88));
+            idx.insert(88);
             idx
         }));
-        let reclaim_queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
+        let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
 
-        let stats = cleanup_orphans(&mut store, &mut state, &orphan_index, &reclaim_queue)
-            .expect("cleanup should succeed");
-
-        assert_eq!(stats.directory_entries_removed, 1);
-        assert!(!state.inodes.contains_key(&orphan_inode_id));
-        assert!(!state.directories.contains_key(&orphan_inode_id));
+        assert_eq!(stats.inodes_removed_from_state, 0);
+        assert_eq!(stats.directory_entries_removed, 0);
+        assert!(state.inodes.contains_key(&orphan_inode_id));
+        assert!(state.directories.contains_key(&orphan_inode_id));
         let root = state.inodes.get(&ROOT_INODE_ID).unwrap();
-        assert_eq!(root.size, 0);
-        assert_eq!(root.nlink, 2);
+        assert_eq!(root.nlink, 3);
+        assert_eq!(
+            state.directories[&ROOT_INODE_ID]
+                .get(b"stale-dir".as_slice())
+                .expect("linked directory must survive stale orphan marker")
+                .inode_id,
+            orphan_inode_id
+        );
+        assert!(orphan_index.lock().unwrap().is_empty());
     }
 
     #[test]
     fn orphan_with_nlink_positive_without_directory_entry_is_left_alone() {
-        let (_tmp, mut store) = make_temp_store();
         let mut state = make_cleanup_state();
         let orphan_inode_id = InodeId::new(78);
         let orphan_inode = InodeRecord {
@@ -630,26 +506,21 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(78, orphan_entry(78));
+            idx.insert(78);
             idx
         }));
-        let reclaim_queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-
-        let stats = cleanup_orphans(&mut store, &mut state, &orphan_index, &reclaim_queue)
-            .expect("cleanup should succeed");
+        let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
 
         assert_eq!(stats.orphans_found, 1);
         assert_eq!(stats.orphans_cleaned, 1);
         assert_eq!(stats.inodes_removed_from_state, 0);
         assert_eq!(stats.directory_entries_removed, 0);
         assert!(state.inodes.contains_key(&orphan_inode_id));
-        assert!(reclaim_queue.lock().unwrap().is_empty());
         assert!(orphan_index.lock().unwrap().is_empty());
     }
 
     #[test]
     fn stale_directory_entries_are_removed() {
-        let (_tmp, mut store) = make_temp_store();
         let mut state = make_cleanup_state();
         let orphan_inode_id = InodeId::new(55);
 
@@ -670,13 +541,10 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(55, orphan_entry(55));
+            idx.insert(55);
             idx
         }));
-        let reclaim_queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-
-        let stats = cleanup_orphans(&mut store, &mut state, &orphan_index, &reclaim_queue)
-            .expect("cleanup should succeed");
+        let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
 
         assert_eq!(stats.directory_entries_removed, 1);
         assert!(orphan_index.lock().unwrap().is_empty());
@@ -687,7 +555,6 @@ mod tests {
 
     #[test]
     fn extent_map_is_freed() {
-        let (_tmp, mut store) = make_temp_store();
         let mut state = make_cleanup_state();
         let orphan_inode_id = InodeId::new(33);
 
@@ -701,13 +568,10 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(33, orphan_entry(33));
+            idx.insert(33);
             idx
         }));
-        let reclaim_queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-
-        let stats = cleanup_orphans(&mut store, &mut state, &orphan_index, &reclaim_queue)
-            .expect("cleanup should succeed");
+        let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
 
         assert_eq!(stats.extent_maps_freed, 1);
         assert!(!state
@@ -720,19 +584,15 @@ mod tests {
 
     #[test]
     fn multiple_orphans_all_cleaned() {
-        let (_tmp, mut store) = make_temp_store();
         let mut state = make_cleanup_state();
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
             for i in 1..=50u64 {
-                idx.insert(i, orphan_entry(i));
+                idx.insert(i);
             }
             idx
         }));
-        let reclaim_queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-
-        let stats = cleanup_orphans(&mut store, &mut state, &orphan_index, &reclaim_queue)
-            .expect("cleanup should succeed");
+        let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
 
         assert_eq!(stats.orphans_found, 50);
         assert_eq!(stats.orphans_cleaned, 50);
@@ -741,34 +601,32 @@ mod tests {
 
     #[test]
     fn cleanup_is_idempotent() {
-        let (_tmp, mut store) = make_temp_store();
         let mut state = make_cleanup_state();
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(1, orphan_entry(1));
-            idx.insert(2, orphan_entry(2));
+            idx.insert(1);
+            idx.insert(2);
             idx
         }));
-        let reclaim_queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-
-        let stats1 = cleanup_orphans(&mut store, &mut state, &orphan_index, &reclaim_queue)
-            .expect("first cleanup");
+        let stats1 = cleanup_orphans(&mut state, &orphan_index).expect("first cleanup");
         assert_eq!(stats1.orphans_cleaned, 2);
 
-        let stats2 = cleanup_orphans(&mut store, &mut state, &orphan_index, &reclaim_queue)
-            .expect("second cleanup");
+        let stats2 = cleanup_orphans(&mut state, &orphan_index).expect("second cleanup");
         assert!(stats2.is_idle());
         assert_eq!(stats2.orphans_cleaned, 0);
     }
 
     #[test]
-    fn content_objects_are_deleted() {
-        let (_tmp, mut store) = make_temp_store();
+    fn metadata_cleanup_does_not_delete_raw_content() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut store =
+            tidefs_local_object_store::LocalObjectStore::open(tmp.path()).expect("open store");
         let mut state = make_cleanup_state();
         let inode_id = InodeId::new(42);
 
-        // Write a content object that should be deleted.
-        let content_key = content_object_key_for_version(inode_id, 1);
+        // Raw content is not an orphan-cleanup authority. The mounted caller
+        // queues exact keys separately after strict Pool receipt validation.
+        let content_key = crate::object_keys::content_object_key_for_version(inode_id, 1);
         store
             .put(content_key, b"test content")
             .expect("put content");
@@ -776,19 +634,19 @@ mod tests {
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
-            idx.insert(42, orphan_entry(42));
+            idx.insert(42);
             idx
         }));
-        let reclaim_queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
+        let stats = cleanup_orphans(&mut state, &orphan_index).expect("cleanup should succeed");
 
-        let stats = cleanup_orphans(&mut store, &mut state, &orphan_index, &reclaim_queue)
-            .expect("cleanup should succeed");
-
-        assert!(stats.content_objects_deleted >= 1);
+        assert_eq!(stats.reclaim_entries_queued, 0);
         assert!(orphan_index.lock().unwrap().is_empty());
 
-        // Verify content was deleted.
-        let found = store.get(content_key).expect("get after delete");
-        assert!(found.is_none(), "content object should have been deleted");
+        let found = store.get(content_key).expect("get after cleanup");
+        assert_eq!(
+            found,
+            Some(b"test content".to_vec()),
+            "metadata cleanup must not inspect or delete raw mounted content"
+        );
     }
 }

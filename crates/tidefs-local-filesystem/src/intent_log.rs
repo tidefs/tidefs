@@ -230,9 +230,9 @@ impl LogDeviceFile {
     }
 }
 
-/// Exact committed-root base against which a data intent was recorded.
+/// Exact committed-root base against which a replayable Pool intent was recorded.
 ///
-/// Data replay is legal only when recovery selected this transaction,
+/// Pool replay is legal only when recovery selected this transaction,
 /// generation, and transaction-manifest checksum.  The checksum is part of
 /// the identity because transaction/generation equality alone cannot
 /// distinguish divergent committed-root candidates.
@@ -1851,9 +1851,9 @@ fn replay_metadata_setattr_intent_with_pool(
             })?;
     validate_metadata_setattr_inode_identity(&current, updated)?;
 
-    if entry.root_anchor.transaction_id != entry.root_anchor.generation
+    if entry.root_anchor.transaction_id < entry.root_anchor.generation
         || entry.root_anchor.generation > updated.metadata_version
-        || entry.root_anchor.manifest_checksum != IntegrityDigest64::ZERO
+        || entry.root_anchor.manifest_checksum == IntegrityDigest64::ZERO
     {
         return Err(FileSystemError::CorruptState {
             reason: "Pool intent replay metadata setattr has an invalid generation anchor",
@@ -2093,7 +2093,7 @@ pub(crate) fn replay_entry(
                     ci,
                     chunk_data,
                     &state.content_compression_policy,
-                );
+                )?;
                 let checksum = checksum64(&encoded_chunk);
 
                 let chunk_key = content_chunk_object_key_for_version(*inode_id, tick, ci);
@@ -2418,7 +2418,7 @@ impl ReplayBatcher {
                     ci,
                     chunk_data,
                     &state.content_compression_policy,
-                );
+                )?;
                 let checksum = checksum64(&encoded_chunk);
 
                 let chunk_key = content_chunk_object_key_for_version(inode_id, tick, ci);
@@ -2616,6 +2616,7 @@ impl ReplayBatcher {
                     patches: &patches,
                     allow_holes: true,
                     dedup_index: &mut dedup_index,
+                    #[cfg(feature = "quorum-write")]
                     quorum_store: None,
                     compression_policy: &compression_policy,
                 },
@@ -2660,20 +2661,35 @@ fn is_data_intent(entry_kind: &IntentLogEntryKind) -> bool {
     )
 }
 
+fn pool_replay_target_generation(entry_kind: &IntentLogEntryKind) -> Option<u64> {
+    match entry_kind {
+        IntentLogEntryKind::SyncWriteRange { data_version, .. }
+        | IntentLogEntryKind::OdsyncDataRange { data_version, .. }
+        | IntentLogEntryKind::SharedMmapMsync { data_version, .. } => Some(*data_version),
+        IntentLogEntryKind::NamespaceCreateIntent(intent) => {
+            Some(intent.inode.data_version.max(intent.inode.metadata_version))
+        }
+        IntentLogEntryKind::MetadataSetattrIntent(updated) => {
+            Some(updated.data_version.max(updated.metadata_version))
+        }
+        IntentLogEntryKind::FsyncDirtyDrain { .. }
+        | IntentLogEntryKind::NamespaceSyncIntent { .. }
+        | IntentLogEntryKind::PressureFallback
+        | IntentLogEntryKind::CrashReplayReconcile => None,
+    }
+}
+
 fn selected_for_pool_replay(
     entry: &IntentLogEntry,
     selection: PoolReplaySelection,
     committed_base: &IntentLogRootAnchor,
 ) -> bool {
     match selection {
-        PoolReplaySelection::AfterCommittedBase => match &entry.entry_kind {
-            IntentLogEntryKind::SyncWriteRange { data_version, .. }
-            | IntentLogEntryKind::OdsyncDataRange { data_version, .. }
-            | IntentLogEntryKind::SharedMmapMsync { data_version, .. } => {
-                *data_version > committed_base.generation
-            }
-            _ => entry.root_anchor.transaction_id > committed_base.transaction_id,
-        },
+        PoolReplaySelection::AfterCommittedBase => pool_replay_target_generation(&entry.entry_kind)
+            .map_or_else(
+                || entry.root_anchor.transaction_id > committed_base.transaction_id,
+                |target_generation| target_generation > committed_base.generation,
+            ),
         PoolReplaySelection::LiveDataOnly => match &entry.entry_kind {
             IntentLogEntryKind::SyncWriteRange { data_version, .. }
             | IntentLogEntryKind::OdsyncDataRange { data_version, .. }
@@ -2826,6 +2842,16 @@ fn plan_pool_replay(
                 reason: "Pool intent replay has an invalid root-anchor generation",
             });
         }
+        if matches!(
+            &entry.entry_kind,
+            IntentLogEntryKind::NamespaceCreateIntent(_)
+                | IntentLogEntryKind::MetadataSetattrIntent(_)
+        ) && anchor != committed_base
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay metadata is bound to a different committed-base root",
+            });
+        }
         if !is_data_intent(&entry.entry_kind) {
             // Preserve intent-log order. A metadata record following a data
             // generation must observe that generation's receipt-backed
@@ -2838,9 +2864,12 @@ fn plan_pool_replay(
                 &mut data_generations,
             );
         }
-        if !is_data_intent(&entry.entry_kind) {
-            // Non-data entries retain their existing replay-generation anchor.
-            // Data-entry anchors instead identify the committed predecessor.
+        if matches!(
+            &entry.entry_kind,
+            IntentLogEntryKind::NamespaceSyncIntent { .. }
+        ) {
+            // This record kind still carries its standalone replay tick in the
+            // anchor because it has no embedded versioned metadata record.
             state_generation = state_generation.max(anchor.generation);
         }
 
@@ -3843,7 +3872,7 @@ mod tests {
     }
 
     #[test]
-    fn load_missing_entry_below_head_stops_at_gap() {
+    fn load_missing_entry_below_head_fails_closed() {
         let (mut store, _dir) = test_store();
         let entry0 = sync_write_raw_record(0);
         let entry2 = sync_write_raw_record(2);
@@ -3860,11 +3889,14 @@ mod tests {
             .put(intent_log_head_object_key(), &3u64.to_le_bytes())
             .expect("store head");
 
-        let log = IntentLog::load(&store).expect("load with gap");
+        let result = IntentLog::load(&store);
 
-        assert_eq!(log.len(), 1);
-        assert_eq!(log.next_entry_id(), 1);
-        assert_eq!(log.entries[0].entry_id, 0);
+        assert!(matches!(
+            result,
+            Err(FileSystemError::CorruptState {
+                reason: "intent log contains a gap before its durable head"
+            })
+        ));
     }
 
     #[test]
@@ -4218,13 +4250,31 @@ mod tests {
     // Byte-based space pressure tests (#3424)
     // ──────────────────────────────────────────────────────────────────
 
+    fn pressure_entry(index: u64) -> IntentLogEntryKind {
+        IntentLogEntryKind::SyncWriteRange {
+            inode_id: InodeId::new(100 + index),
+            offset: index * 4096,
+            length: 4096,
+            payload_digest: IntegrityDigest64(0xCAFE0000 + index),
+            base_data_version: 0,
+            data_version: 1,
+        }
+    }
+
     fn pressure_config() -> IntentLogConfig {
+        let entry = IntentLogEntry {
+            entry_id: 1,
+            entry_kind: pressure_entry(0),
+            root_anchor: test_root_anchor(),
+            timestamp_ns: test_timestamp(),
+        };
+        let entry_len = try_encoded_entry_len(&entry).expect("encode pressure fixture") as u64;
         IntentLogConfig {
-            max_batch_entries: 64,
+            max_batch_entries: 1024,
             adaptive_flush: false,
             flush_interval_us: 0,
             pressure_depth_threshold: 1024,
-            log_max_bytes: 1_000_000,
+            log_max_bytes: entry_len * 100,
             pressure_warning_threshold: 0.50,
             pressure_sync_threshold: 0.75,
             pressure_critical_threshold: 0.90,
@@ -4248,22 +4298,14 @@ mod tests {
     fn compute_pressure_level_warning_at_50_percent() {
         let (mut store, _dir) = test_store();
         let mut log = IntentLog::with_config(pressure_config());
-        // Append entries totaling ~600k bytes to cross 50%
-        // Each entry is roughly 60 bytes
-        for i in 0..10_000 {
-            let _ = log.append(
+        for i in 0..50 {
+            log.append(
                 &mut store,
-                IntentLogEntryKind::SyncWriteRange {
-                    inode_id: InodeId::new(100 + i),
-                    offset: i * 4096,
-                    length: 4096,
-                    payload_digest: IntegrityDigest64(0xCAFE0000 + i),
-                    base_data_version: 0,
-                    data_version: 1,
-                },
+                pressure_entry(i),
                 test_root_anchor(),
                 test_timestamp(),
-            );
+            )
+            .expect("append warning-pressure entry");
         }
         assert_eq!(log.compute_pressure_level(), LogSpacePressureLevel::Warning);
     }
@@ -4272,21 +4314,16 @@ mod tests {
     fn compute_pressure_level_sync_at_75_percent() {
         let (mut store, _dir) = test_store();
         let mut log = IntentLog::with_config(pressure_config());
-        // ~750k bytes
-        for i in 0..12_500 {
-            let _ = log.append(
+        // The 76th append observes the 75% pre-append level and records a
+        // throttle event while leaving the resulting level in Sync.
+        for i in 0..76 {
+            log.append(
                 &mut store,
-                IntentLogEntryKind::SyncWriteRange {
-                    inode_id: InodeId::new(100 + i),
-                    offset: i * 4096,
-                    length: 4096,
-                    payload_digest: IntegrityDigest64(0xCAFE0000 + i),
-                    base_data_version: 0,
-                    data_version: 1,
-                },
+                pressure_entry(i),
                 test_root_anchor(),
                 test_timestamp(),
-            );
+            )
+            .expect("append sync-pressure entry");
         }
         assert_eq!(log.compute_pressure_level(), LogSpacePressureLevel::Sync);
         assert!(log.space_stats().write_throttle_events > 0);
@@ -5322,14 +5359,14 @@ mod tests {
         (fs, dir, inode_id, committed_state, committed_base)
     }
 
-    fn pool_metadata_entry(entry_id: u64, updated: InodeRecord) -> IntentLogEntry {
+    fn pool_metadata_entry(
+        entry_id: u64,
+        updated: InodeRecord,
+        committed_base: &IntentLogRootAnchor,
+    ) -> IntentLogEntry {
         IntentLogEntry {
             entry_id,
-            root_anchor: IntentLogRootAnchor {
-                transaction_id: updated.metadata_version,
-                generation: updated.metadata_version,
-                manifest_checksum: IntegrityDigest64::ZERO,
-            },
+            root_anchor: committed_base.clone(),
             entry_kind: IntentLogEntryKind::MetadataSetattrIntent(updated),
             timestamp_ns: test_timestamp(),
         }
@@ -5502,7 +5539,11 @@ mod tests {
         updated.metadata_version =
             crate::allocation::next_generation_after(committed_state.generation);
         updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
-        let log = log_from_entries(vec![pool_metadata_entry(0, updated.clone())]);
+        let log = log_from_entries(vec![pool_metadata_entry(
+            0,
+            updated.clone(),
+            &committed_base,
+        )]);
 
         let replayed =
             replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
@@ -5530,7 +5571,11 @@ mod tests {
             fs.state.generation.max(updated.metadata_version),
         );
         updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
-        let log = log_from_entries(vec![pool_metadata_entry(0, updated.clone())]);
+        let log = log_from_entries(vec![pool_metadata_entry(
+            0,
+            updated.clone(),
+            &committed_base,
+        )]);
         fs.state = committed_state;
 
         for _ in 0..2 {
@@ -5557,7 +5602,11 @@ mod tests {
         updated.data_version = committed_state.generation.saturating_add(100);
         updated.metadata_version = updated.data_version.saturating_add(1);
         updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
-        let log = log_from_entries(vec![pool_metadata_entry(0, updated.clone())]);
+        let log = log_from_entries(vec![pool_metadata_entry(
+            0,
+            updated.clone(),
+            &committed_base,
+        )]);
 
         replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
             .expect_err("missing content must not authorize metadata transition");
@@ -5607,7 +5656,10 @@ mod tests {
         updated.mode = S_IFREG | 0o600;
         updated.metadata_version = target_data_version;
         updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
-        let log = log_from_entries(vec![data_entry, pool_metadata_entry(1, updated)]);
+        let log = log_from_entries(vec![
+            data_entry,
+            pool_metadata_entry(1, updated, &committed_base),
+        ]);
 
         let replayed =
             replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)

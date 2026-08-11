@@ -2,26 +2,31 @@
 use std::fmt;
 
 use tidefs_local_object_store::StoreError;
+#[cfg(feature = "replication-io")]
 use tidefs_receive_stream::ReceiverRefusalReason;
+#[cfg(feature = "policy-observation")]
 use tidefs_storage_intent_read_serving::ReadServingDecisionRecord;
 use tidefs_types_space_accounting_core::AdmissionResult;
 use tidefs_types_vfs_core::{InodeId, LockConflict, NodeKind};
 
-use crate::types::{
-    CommittedRootSummary, CrashRecoveryExpectation, FilesystemCommitBoundary, LocalStorageResource,
-};
+#[cfg(feature = "replication-io")]
+use crate::types::CommittedRootSummary;
+use crate::types::{CrashRecoveryExpectation, FilesystemCommitBoundary, LocalStorageResource};
 
+#[cfg(feature = "replication-io")]
 pub const INCREMENTAL_RECEIVE_BASE_ROOT_CONFLICT_OPERATOR_ACTIONS: &str =
     "delete-and-re-receive into a fresh target; create a data-retaining base snapshot if the base content exists but is unprotected; or rollback to a shared ancestor snapshot matching from_root, then retry";
 
 /// Identity fields from an incremental receive stream's `from_root`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "replication-io")]
 pub struct IncrementalReceiveBaseRootIdentity {
     pub transaction_id: u64,
     pub generation: u64,
     pub superblock_checksum: u64,
 }
 
+#[cfg(feature = "replication-io")]
 impl IncrementalReceiveBaseRootIdentity {
     pub fn from_summary(summary: &CommittedRootSummary) -> Self {
         Self {
@@ -127,6 +132,7 @@ pub enum FileSystemError {
         operation: &'static str,
         reason: &'static str,
     },
+    #[cfg(feature = "replication-io")]
     IncrementalReceiveBaseRootConflict {
         from_root: IncrementalReceiveBaseRootIdentity,
         found_in_recovery_audit: bool,
@@ -169,12 +175,14 @@ pub enum FileSystemError {
     },
     /// Runtime read-serving refused a byte-serving path before content was
     /// fetched from cache, local storage, or a remote source.
+    #[cfg(feature = "policy-observation")]
     ReadServingRefused {
         decision: Box<ReadServingDecisionRecord>,
     },
     /// Claim rejected by the obligation ledger — authority scarcity gate.
     /// The request has been denied because the budget domain is exhausted
     /// after accounting for current claims and active reserves.
+    #[cfg(feature = "policy-observation")]
     ClaimRejected {
         budget_domain: String,
         reason: &'static str,
@@ -214,26 +222,31 @@ pub enum FileSystemError {
     },
     /// Distributed-stream sender authority fields are invalid or malformed
     /// (zero pool UUID, zero epoch, or zero membership generation).
+    #[cfg(feature = "replication-io")]
     MalformedSenderAuthority {
         reason: &'static str,
     },
     /// A distributed receive stream carries cross-pool sender authority but
     /// no per-receive authorization was provided for that sender pool.
+    #[cfg(feature = "replication-io")]
     CrossPoolReceiveUnauthorized {
         sender_pool_uuid: [u8; 16],
     },
     /// A cross-pool receive authorization was provided but one or more fields
     /// do not match the stream's declared sender authority.
+    #[cfg(feature = "replication-io")]
     CrossPoolReceiveAuthorizationMismatch {
         field: &'static str,
     },
     /// The sender membership generation or pool epoch is older than the
     /// receiver can accept.
+    #[cfg(feature = "replication-io")]
     StaleSenderGeneration {
         reason: &'static str,
     },
     /// Distributed snapshot receive was refused/deferred with a stable
     /// receiver-side reason that maps to the scheduler admission policy.
+    #[cfg(feature = "replication-io")]
     ReceiveStreamRefused {
         reason: ReceiverRefusalReason,
     },
@@ -357,6 +370,7 @@ impl fmt::Display for FileSystemError {
             Self::Unsupported { operation, reason } => {
                 write!(f, "unsupported {operation}: {reason}")
             }
+            #[cfg(feature = "replication-io")]
             Self::IncrementalReceiveBaseRootConflict {
                 from_root,
                 found_in_recovery_audit,
@@ -402,6 +416,7 @@ impl fmt::Display for FileSystemError {
             Self::SizeOverflow { requested } => {
                 write!(f, "file size or offset is too large: {requested}")
             }
+            #[cfg(feature = "policy-observation")]
             Self::ReadServingRefused { decision } => write!(
                 f,
                 "read-serving refused bytes: state={:?} requested_source={:?} refusal={:?} rejected=0x{:x}",
@@ -410,6 +425,7 @@ impl fmt::Display for FileSystemError {
                 decision.refusal,
                 decision.rejected_reasons.0,
             ),
+            #[cfg(feature = "policy-observation")]
             Self::ClaimRejected {
                 budget_domain,
                 reason,
@@ -432,9 +448,11 @@ impl fmt::Display for FileSystemError {
             Self::LifecycleError { reason } => write!(f, "mount refused by lifecycle: {reason}"),
             Self::DatasetLocked { reason } => write!(f, "dataset is locked: {reason}"),
             Self::DirtyAdmissionRejected { reason } => write!(f, "write admission rejected: {reason}"),
+            #[cfg(feature = "replication-io")]
             Self::MalformedSenderAuthority { reason } => {
                 write!(f, "malformed sender authority in receive stream: {reason}")
             }
+            #[cfg(feature = "replication-io")]
             Self::CrossPoolReceiveUnauthorized { sender_pool_uuid } => {
                 write!(f, "cross-pool receive not authorized: sender pool UUID ")?;
                 for byte in sender_pool_uuid {
@@ -442,12 +460,15 @@ impl fmt::Display for FileSystemError {
                 }
                 write!(f, " is not the local pool and no exact authorization was provided")
             }
+            #[cfg(feature = "replication-io")]
             Self::CrossPoolReceiveAuthorizationMismatch { field } => {
                 write!(f, "cross-pool receive authorization mismatch: {field} does not match the stream sender authority")
             }
+            #[cfg(feature = "replication-io")]
             Self::StaleSenderGeneration { reason } => {
                 write!(f, "stale sender generation: {reason}")
             }
+            #[cfg(feature = "replication-io")]
             Self::ReceiveStreamRefused { reason } => write!(
                 f,
                 "receive stream refused: {} (suggested action: {:?})",
@@ -499,6 +520,7 @@ impl FileSystemError {
         )
     }
 
+    #[cfg(feature = "replication-io")]
     pub const fn receiver_refusal_reason(&self) -> Option<ReceiverRefusalReason> {
         match self {
             Self::ReceiveStreamRefused { reason } => Some(*reason),
@@ -598,10 +620,10 @@ impl From<tidefs_dataset_lifecycle::LifecycleError> for FileSystemError {
     }
 }
 
-impl From<tidefs_performance_contract::AdmissionError> for FileSystemError {
-    fn from(e: tidefs_performance_contract::AdmissionError) -> Self {
+impl From<crate::admission::LocalAdmissionError> for FileSystemError {
+    fn from(e: crate::admission::LocalAdmissionError) -> Self {
         FileSystemError::DirtyAdmissionRejected {
-            reason: format!("{e:?}"),
+            reason: e.to_string(),
         }
     }
 }
@@ -1184,6 +1206,7 @@ mod tests {
             FileSystemError::SizeOverflow {
                 requested: u64::MAX,
             },
+            #[cfg(feature = "policy-observation")]
             FileSystemError::ClaimRejected {
                 budget_domain: "default".into(),
                 reason: "exhausted",

@@ -12,21 +12,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tidefs_local_filesystem::human::local_filesystem::{
     audit_recovery_with_root_authentication_key, no_production_fsck_failure_model_cases,
     posix_subset_entries, run_crash_recovery_matrix_with_root_authentication_key,
-    ChangedRecordExport, CrashInjectionBoundary, LocalFilesystem, RootAuthenticationKey,
-    RootRetentionPolicy, StoreOptions, FILESYSTEM_CONTENT_CHUNK_SIZE,
-    FILESYSTEM_CONTENT_OBJECT_PREFIX, FILESYSTEM_FORMAT_VERSION, FILESYSTEM_ROOT_OBJECT_PREFIX,
-    FILESYSTEM_ROOT_SLOT_COUNT, FILESYSTEM_TRANSACTION_OBJECT_PREFIX,
-    FORMAL_NO_PRODUCTION_FSCK_FAILURE_MODEL, LOCAL_SNAPSHOT_ROLLBACK_SPEC,
-    LOCAL_STORAGE_ALLOCATOR_GRAIN_BYTES, LOCAL_STORAGE_ALLOCATOR_SPEC,
-    MOUNT_INVARIANT_GATE_IS_NOT_FSCK, ONLINE_VERIFIER_IS_NOT_FSCK, ONLINE_VERIFIER_SPEC,
-    POSIX_SUBSET_POLICY_VERSION, POSIX_SUBSET_SPEC, PRODUCTION_RECOVERY_DOCTRINE,
-    RECOVERY_AUDIT_IS_NOT_FSCK, RETENTION_RECLAMATION_IS_NOT_FSCK,
+    CrashInjectionBoundary, LocalFilesystem, RootAuthenticationKey, RootRetentionPolicy,
+    StoreOptions, FILESYSTEM_CONTENT_CHUNK_SIZE, FILESYSTEM_CONTENT_OBJECT_PREFIX,
+    FILESYSTEM_FORMAT_VERSION, FILESYSTEM_ROOT_OBJECT_PREFIX, FILESYSTEM_ROOT_SLOT_COUNT,
+    FILESYSTEM_TRANSACTION_OBJECT_PREFIX, FORMAL_NO_PRODUCTION_FSCK_FAILURE_MODEL,
+    LOCAL_SNAPSHOT_ROLLBACK_SPEC, LOCAL_STORAGE_ALLOCATOR_GRAIN_BYTES,
+    LOCAL_STORAGE_ALLOCATOR_SPEC, MOUNT_INVARIANT_GATE_IS_NOT_FSCK, ONLINE_VERIFIER_IS_NOT_FSCK,
+    ONLINE_VERIFIER_SPEC, POSIX_SUBSET_POLICY_VERSION, POSIX_SUBSET_SPEC,
+    PRODUCTION_RECOVERY_DOCTRINE, RECOVERY_AUDIT_IS_NOT_FSCK, RETENTION_RECLAMATION_IS_NOT_FSCK,
     ROOT_AUTHENTICATION_ALGORITHM_SUITE_ID, ROOT_AUTHENTICATION_CODE_LEN,
     ROOT_AUTHENTICATION_DIGEST_LEN, ROOT_AUTHENTICATION_ENV_VAR, ROOT_AUTHENTICATION_KEY_LEN,
     ROOT_AUTHENTICATION_MAGIC_ASCII, ROOT_AUTHENTICATION_POLICY_EPOCH,
     ROOT_AUTHENTICATION_RECORD_VERSION, ROOT_AUTHENTICATION_SPEC, SAFE_LOCAL_RECLAMATION_GC_SPEC,
-    SEND_RECEIVE_CHANGED_RECORD_SPEC, SEND_RECEIVE_STREAM_MAGIC_ASCII, SEND_RECEIVE_STREAM_VERSION,
     SNAPSHOT_CATALOG_MAGIC_ASCII,
+};
+#[cfg(feature = "replication-io")]
+use tidefs_local_filesystem::human::local_filesystem::{
+    ChangedRecordExport, SEND_RECEIVE_CHANGED_RECORD_SPEC, SEND_RECEIVE_STREAM_MAGIC_ASCII,
+    SEND_RECEIVE_STREAM_VERSION,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -54,9 +57,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("safe_local_reclamation.spec={SAFE_LOCAL_RECLAMATION_GC_SPEC}");
     println!("snapshot_rollback.spec={LOCAL_SNAPSHOT_ROLLBACK_SPEC}");
     println!("snapshot_rollback.catalog_magic={SNAPSHOT_CATALOG_MAGIC_ASCII}");
-    println!("send_receive.spec={SEND_RECEIVE_CHANGED_RECORD_SPEC}");
-    println!("send_receive.stream_magic={SEND_RECEIVE_STREAM_MAGIC_ASCII}");
-    println!("send_receive.stream_version={SEND_RECEIVE_STREAM_VERSION}");
+    #[cfg(feature = "replication-io")]
+    {
+        println!("send_receive.spec={SEND_RECEIVE_CHANGED_RECORD_SPEC}");
+        println!("send_receive.stream_magic={SEND_RECEIVE_STREAM_MAGIC_ASCII}");
+        println!("send_receive.stream_version={SEND_RECEIVE_STREAM_VERSION}");
+    }
     println!("online_verifier.spec={ONLINE_VERIFIER_SPEC}");
     println!("online_verifier.law={ONLINE_VERIFIER_IS_NOT_FSCK}");
     let root_authentication_key = RootAuthenticationKey::demo_key();
@@ -139,6 +145,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     run_safe_reclamation_demo(root_authentication_key)?;
     run_snapshot_reclamation_demo(root_authentication_key)?;
+    #[cfg(feature = "replication-io")]
     run_send_receive_demo(root_authentication_key)?;
 
     let preflight = LocalFilesystem::probe_recovery_with_root_authentication_key(
@@ -633,6 +640,7 @@ fn run_snapshot_reclamation_demo(
     Ok(())
 }
 
+#[cfg(feature = "replication-io")]
 fn run_send_receive_demo(source_key: RootAuthenticationKey) -> Result<(), Box<dyn Error>> {
     let source_root = temp_named_root("tidefs-filesystem-send-receive-source");
     let target_root = temp_named_root("tidefs-filesystem-send-receive-target");

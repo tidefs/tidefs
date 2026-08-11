@@ -5,8 +5,9 @@ TFR-005. Produced under GitHub issue #746.
 
 This document separates the content-identity use of `data_version` from the
 storage-liveness and reclaim-ordering evidence that reclaim paths must use.
-It is a documentation slice only: it does not change reclaim dispatch, rebake
-policy, storage format, object keys, or runtime behavior.
+The mounted runtime now persists its exact logical reclaim queue through Pool
+placement authority; physical receipt-bound release remains a separate,
+deliberately disabled boundary without root-bound clearance evidence.
 
 ## Upstream Blocker
 
@@ -159,6 +160,11 @@ change those paths.
   every currently mountable root-ring fallback and recursively retained
   snapshot or clone, then uses strict current Pool receipts for the logical
   handoff. Receipt uncertainty keeps the exact local entry pending.
+- The mounted B+tree queue is integrity encoded into
+  `tidefs-filesystem-reclaim-queue-v1`, loaded only through a strict current
+  Pool receipt, retained by object-store compaction, and persisted before a
+  root publication can make the source object unreachable. Reopen therefore
+  cannot forget deferred work that remains protected by an older root slot.
 - `tick_background_services(...)` deliberately does not call the Pool's
   receipt-bound physical drain. The lower queue survives background ticks and
   reopen until the missing root-bound placement token exists.
@@ -168,13 +174,12 @@ change those paths.
 - `crates/tidefs-local-filesystem/src/lib.rs:3974`-`:4004` promotes deferred
   rewrite trims only after `replacement_key_receipt_is_durable(...)` reports
   the replacement key stable.
-- `crates/tidefs-local-filesystem/src/orphan_cleanup.rs:183`-`:194` deletes
-  versioned orphan content object keys by scanning `data_version` values. This
-  is key discovery for today's format, not an authority that lower versions
-  are always reclaimable.
-- `crates/tidefs-local-filesystem/src/orphan_cleanup.rs:220`-`:228` scans
-  orphan chunk keys by `(data_version, chunk_index)` when cleaning dedup
-  redirects, again as key discovery rather than a liveness proof.
+- Mount-time orphan recovery queues exact manifest and per-chunk keys from a
+  still-present inode record and strict Pool-readable layout before changing
+  metadata. `orphan_cleanup.rs` has no object-store handle and performs only
+  inode, namespace, extent-map, and orphan-marker reconciliation. When a
+  committed unlink already removed the inode record, the persisted queue is
+  the surviving content-key authority.
 - `crates/tidefs-local-filesystem/src/background_reclaim.rs:36`-`:44` and
   `:90`-`:123` still describe deterministic B-tree-order reclaim queue
   processing for the model/test surface. The production liveness decision must
@@ -191,16 +196,16 @@ change those paths.
   content `data_version` it can find.
 - Reclaim may use content keys that contain `data_version` to find the object
   to delete, but the delete must be authorized by the reclaim liveness guard.
-- Orphan cleanup may scan versioned key names to discover stale keys in the
-  current format, but that scan does not define ordering, reachability, or
-  storage-format compatibility.
+- Orphan cleanup must not scan versioned raw-store key names. It may queue
+  only keys derived from a committed inode record and strict Pool-readable
+  content layout; otherwise the exact persisted queue retains the obligation.
 - Implementation issues #675 and #676 (now closed) resolved the policy and runtime changes for receipt-driven read/scrub/repair/rebuild consumers and rebake/reclaim trims. This document named the boundary those slices preserved.
 
 ## Non-Claims
 
 This document does not:
 
-- change code, on-disk format, object key names, or runtime behavior;
-- change reclaim dispatch, rebake policy, deadlist policy, or orphan cleanup;
+- authorize the receipt-bound physical drain or physical space reuse;
+- change rebake policy or deadlist clearance evidence;
 - close TFR-005;
 - does not implement the runtime changes that #675 and #676 resolved.

@@ -27,7 +27,6 @@ use crate::error::{
     INCREMENTAL_RECEIVE_BASE_ROOT_CONFLICT_OPERATOR_ACTIONS,
 };
 use crate::fs_io_error;
-use crate::load_state_from_transaction;
 use crate::object_keys::*;
 use crate::persist_transaction_objects;
 use crate::receive_merge_planner::{locate_common_ancestor, ReceiveMergeStreamLineageManifest};
@@ -61,7 +60,7 @@ pub(crate) struct PreparedChangedRecordExport {
 }
 
 pub(crate) fn export_changed_records_from_root(
-    store: &mut LocalObjectStore,
+    pool: &mut Pool,
     current_root: &CommittedRootSummary,
     current_state: &FileSystemState,
     root_authentication_key: RootAuthenticationKey,
@@ -75,7 +74,7 @@ pub(crate) fn export_changed_records_from_root(
     for source_root in source_roots {
         if seen.insert(RootIdentity::from_summary(&source_root)) {
             roots.push(export_changed_record_root(
-                store,
+                pool,
                 &source_root,
                 root_authentication_key,
             )?);
@@ -121,7 +120,7 @@ pub(crate) fn export_changed_records_from_root(
 /// The receiver must already possess the `from_root` state; only new or
 /// modified objects (by object key + checksum) are included.
 pub(crate) fn export_incremental_changed_records(
-    store: &mut LocalObjectStore,
+    pool: &mut Pool,
     from_root: &CommittedRootSummary,
     to_root: &CommittedRootSummary,
     current_state: &FileSystemState,
@@ -151,7 +150,7 @@ pub(crate) fn export_incremental_changed_records(
     let from_root_commit = root_commit_from_summary(from_root);
     let from_manifest_key = transaction_manifest_object_key(from_root_commit.transaction_id);
     let from_manifest_bytes =
-        store
+        pool.raw_primary_store()
             .get(from_manifest_key)?
             .ok_or(FileSystemError::CorruptState {
                 reason: "incremental send: from_root is missing its transaction manifest",
@@ -175,7 +174,7 @@ pub(crate) fn export_incremental_changed_records(
         if !seen_root_ids.insert(RootIdentity::from_summary(source_root)) {
             continue;
         }
-        let root_export = export_changed_record_root(store, source_root, root_authentication_key)?;
+        let root_export = export_changed_record_root(pool, source_root, root_authentication_key)?;
         let mut filtered_records: Vec<ChangedObjectRecord> = Vec::new();
 
         for record in &root_export.records {
@@ -242,7 +241,7 @@ pub(crate) fn export_incremental_changed_records(
 }
 
 pub(crate) fn export_changed_record_root(
-    store: &mut LocalObjectStore,
+    pool: &mut Pool,
     source_root: &CommittedRootSummary,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<ChangedRecordRoot> {
@@ -254,13 +253,15 @@ pub(crate) fn export_changed_record_root(
     }
 
     let root = root_commit_from_summary(source_root);
-    let _validated_state = load_state_from_transaction(store, &root, root_authentication_key)?;
+    let _validated_state =
+        crate::recovery::load_state_from_transaction_pool(pool, &root, root_authentication_key)?;
     let manifest_key = transaction_manifest_object_key(root.transaction_id);
-    let manifest_bytes = store
-        .get(manifest_key)?
-        .ok_or(FileSystemError::CorruptState {
-            reason: "send/receive export root is missing its transaction manifest",
-        })?;
+    let manifest_bytes =
+        pool.raw_primary_store()
+            .get(manifest_key)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "send/receive export root is missing its transaction manifest",
+            })?;
     if checksum64(&manifest_bytes) != root.manifest_checksum {
         return Err(FileSystemError::CorruptState {
             reason: "send/receive export manifest checksum does not match root",
@@ -281,11 +282,22 @@ pub(crate) fn export_changed_record_root(
     }];
     let mut canonical_dedup_keys: BTreeSet<ObjectKey> = BTreeSet::new();
     for entry in manifest.entries {
-        let payload = store
-            .get(entry.object_key)?
-            .ok_or(FileSystemError::CorruptState {
-                reason: "send/receive export manifest references a missing object",
-            })?;
+        let payload = if matches!(
+            entry.role,
+            TransactionManifestObjectRole::VersionedContent
+                | TransactionManifestObjectRole::VersionedContentChunk
+        ) {
+            pool.get_with_current_receipt(
+                tidefs_local_object_store::DeviceIoClass::Data,
+                entry.object_key,
+            )?
+            .map(|(payload, _receipt)| payload)
+        } else {
+            pool.raw_primary_store().get(entry.object_key)?
+        }
+        .ok_or(FileSystemError::CorruptState {
+            reason: "send/receive export manifest references a missing object",
+        })?;
         if checksum64(&payload) != entry.checksum {
             return Err(FileSystemError::CorruptState {
                 reason: "send/receive export object checksum does not match manifest",
@@ -314,7 +326,10 @@ pub(crate) fn export_changed_record_root(
     // addressed and may be shared across files/versions.  Without
     // them the receive side cannot resolve dedup redirects.
     for canonical_key in &canonical_dedup_keys {
-        if let Some(payload) = store.get(*canonical_key)? {
+        if let Some((payload, _receipt)) = pool.get_with_current_receipt(
+            tidefs_local_object_store::DeviceIoClass::Data,
+            *canonical_key,
+        )? {
             records.push(ChangedObjectRecord {
                 role: ChangedRecordObjectRole::VersionedContentChunk,
                 object_key: *canonical_key,
@@ -2256,6 +2271,7 @@ fn normalize_received_content_receipts(
             inode,
             &content,
             &mut dedup_index,
+            #[cfg(feature = "quorum-write")]
             None,
             &state.content_compression_policy,
         )?;

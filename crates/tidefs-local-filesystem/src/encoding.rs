@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "replication-io")]
 use std::io::Cursor;
 
+#[cfg(feature = "replication-io")]
 use tidefs_extent_map::ExtentMap;
 use tidefs_local_object_store::{checksum64, IntegrityDigest64, ObjectKey};
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind};
@@ -576,322 +578,345 @@ pub(crate) fn decode_committed_root_summary(
     })
 }
 
-pub(crate) fn encode_changed_record_export(export: &ChangedRecordExport) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&SEND_RECEIVE_STREAM_MAGIC_BYTES);
-    let stream_version =
-        changed_record_stream_version(export.from_root.is_some(), export.placement_epoch.is_some());
-    push_u16(&mut out, stream_version);
-    push_u16(&mut out, CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT);
-    encode_committed_root_summary(&mut out, &export.current_root);
-    // For incremental streams (version >= 2), encode the baseline root.
-    if let Some(ref from_root) = export.from_root {
-        encode_committed_root_summary(&mut out, from_root);
-    }
-    // For placement-epoch streams (version >= 3), encode the epoch.
-    if let Some(epoch) = export.placement_epoch {
-        push_u64(&mut out, epoch);
-    }
-    push_u16(&mut out, export.transform_contract.as_u16());
-    push_u16(
-        &mut out,
-        encode_changed_record_typed_transform_metadata(
-            ChangedRecordTypedTransformMetadata::for_contract(export.transform_contract),
-        ),
-    );
-    push_u64(&mut out, export.roots.len() as u64);
-    for root in &export.roots {
-        encode_committed_root_summary(&mut out, &root.source_root);
-        push_u64(&mut out, root.records.len() as u64);
-        for record in &root.records {
-            push_u16(&mut out, record.role.as_u16());
-            push_u16(&mut out, 0); // reserved
-            out.extend_from_slice(&record.object_key.as_bytes32());
-            push_u64(&mut out, record.checksum.get());
-            push_u64(&mut out, record.payload.len() as u64);
-            out.extend_from_slice(&record.payload);
-        }
-    }
-    out
-}
+#[cfg(feature = "replication-io")]
+mod replication_encoding {
+    use super::*;
 
-pub(crate) fn decode_changed_record_export(bytes: &[u8]) -> Result<ChangedRecordExport> {
-    let mut decoder = Decoder::new("local filesystem send/receive stream", bytes);
-    decoder.expect_magic(SEND_RECEIVE_STREAM_MAGIC_BYTES)?;
-    let stream_version = decoder.read_u16()?;
-    let envelope = decode_changed_record_stream_version(stream_version)?;
-    let flags = decoder.read_u16()?;
-    if flags & !CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT != 0 {
-        return Err(FileSystemError::Decode {
-            object: "local filesystem send/receive stream",
-            reason: "reserved stream flags are set",
-        });
-    }
-    let current_root = decode_committed_root_summary(&mut decoder)?;
-    let from_root = if envelope.incremental {
-        Some(decode_committed_root_summary(&mut decoder)?)
-    } else {
-        None
-    };
-    let placement_epoch = if envelope.has_placement_epoch {
-        Some(decoder.read_u64()?)
-    } else {
-        None
-    };
-    if flags & CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT == 0 {
-        return Err(FileSystemError::Decode {
-            object: "local filesystem send/receive stream",
-            reason: "stream is missing transform contract",
-        });
-    }
-    let transform_contract = ChangedRecordTransformContract::try_from(decoder.read_u16()?)?;
-    let transform_metadata = decode_changed_record_typed_transform_metadata(decoder.read_u16()?)?;
-    if transform_metadata != ChangedRecordTypedTransformMetadata::for_contract(transform_contract) {
-        return Err(FileSystemError::Decode {
-            object: "local filesystem send/receive stream",
-            reason: "typed transform metadata does not match transform contract",
-        });
-    }
-    let root_count = decoder.read_count()?;
-    let mut roots = Vec::with_capacity(root_count);
-    let mut total_records = 0_u64;
-    let mut payload_bytes = 0_u64;
-    for _ in 0..root_count {
-        let source_root = decode_committed_root_summary(&mut decoder)?;
-        let record_count = decoder.read_count()?;
-        let mut records = Vec::with_capacity(record_count);
-        for _ in 0..record_count {
-            let role = ChangedRecordObjectRole::try_from(decoder.read_u16()?).map_err(|_| {
-                FileSystemError::Decode {
-                    object: "local filesystem send/receive stream",
-                    reason: "unknown changed-record role",
-                }
-            })?;
-            if decoder.read_u16()? != 0 {
-                return Err(FileSystemError::Decode {
-                    object: "local filesystem send/receive stream",
-                    reason: "reserved changed-record field is non-zero",
-                });
+    pub(crate) fn encode_changed_record_export(export: &ChangedRecordExport) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&SEND_RECEIVE_STREAM_MAGIC_BYTES);
+        let stream_version = changed_record_stream_version(
+            export.from_root.is_some(),
+            export.placement_epoch.is_some(),
+        );
+        push_u16(&mut out, stream_version);
+        push_u16(&mut out, CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT);
+        encode_committed_root_summary(&mut out, &export.current_root);
+        // For incremental streams (version >= 2), encode the baseline root.
+        if let Some(ref from_root) = export.from_root {
+            encode_committed_root_summary(&mut out, from_root);
+        }
+        // For placement-epoch streams (version >= 3), encode the epoch.
+        if let Some(epoch) = export.placement_epoch {
+            push_u64(&mut out, epoch);
+        }
+        push_u16(&mut out, export.transform_contract.as_u16());
+        push_u16(
+            &mut out,
+            encode_changed_record_typed_transform_metadata(
+                ChangedRecordTypedTransformMetadata::for_contract(export.transform_contract),
+            ),
+        );
+        push_u64(&mut out, export.roots.len() as u64);
+        for root in &export.roots {
+            encode_committed_root_summary(&mut out, &root.source_root);
+            push_u64(&mut out, root.records.len() as u64);
+            for record in &root.records {
+                push_u16(&mut out, record.role.as_u16());
+                push_u16(&mut out, 0); // reserved
+                out.extend_from_slice(&record.object_key.as_bytes32());
+                push_u64(&mut out, record.checksum.get());
+                push_u64(&mut out, record.payload.len() as u64);
+                out.extend_from_slice(&record.payload);
             }
-            let mut key_bytes = [0_u8; 32];
-            key_bytes.copy_from_slice(decoder.read_bytes(32)?);
-            let checksum = IntegrityDigest64(decoder.read_u64()?);
-            let payload_len = decoder.read_count()?;
-            let payload = decoder.read_bytes(payload_len)?.to_vec();
-            validate_changed_record_payload(role, &payload)?;
-            payload_bytes = payload_bytes.checked_add(payload.len() as u64).ok_or(
-                FileSystemError::SizeOverflow {
-                    requested: u64::MAX,
-                },
-            )?;
-            total_records = total_records.saturating_add(1);
-            records.push(ChangedObjectRecord {
-                role,
-                object_key: ObjectKey::from_bytes32(key_bytes),
-                checksum,
-                payload,
-            });
         }
-        roots.push(ChangedRecordRoot {
-            source_root,
-            records,
-        });
-    }
-    decoder.finish()?;
-    let incremental = from_root.is_some();
-    Ok(ChangedRecordExport {
-        spec: SEND_RECEIVE_CHANGED_RECORD_SPEC,
-        stream_version,
-        from_root,
-        current_root,
-        roots,
-        total_records,
-        payload_bytes,
-        production_fsck_required: false,
-        incremental,
-        placement_epoch,
-        transform_contract,
-    })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ChangedRecordEnvelopeVersion {
-    incremental: bool,
-    has_placement_epoch: bool,
-}
-
-fn changed_record_stream_version(incremental: bool, has_placement_epoch: bool) -> u16 {
-    match (incremental, has_placement_epoch) {
-        (false, false) => 1,
-        (true, false) => 2,
-        (false, true) => 3,
-        (true, true) => 4,
-    }
-}
-
-const CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT: u16 = 0x0001;
-
-// The existing transform-contract metadata word carries five independent
-// typed decisions. Zero remains the no-device-transform representation, so
-// transform-disabled stream bytes keep their current shape.
-const CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED: u16 = 1 << 0;
-const CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED: u16 = 1 << 1;
-const CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED: u16 = 1 << 2;
-const CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY: u16 = 1 << 3;
-const CHANGED_RECORD_TRANSFORM_REFUSAL: u16 = 1 << 4;
-const CHANGED_RECORD_TYPED_TRANSFORM_METADATA_MASK: u16 = CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED
-    | CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED
-    | CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED
-    | CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY
-    | CHANGED_RECORD_TRANSFORM_REFUSAL;
-
-fn encode_changed_record_typed_transform_metadata(
-    metadata: ChangedRecordTypedTransformMetadata,
-) -> u16 {
-    let mut bits = 0_u16;
-    if metadata.plaintext_identity
-        == ChangedRecordPlaintextIdentity::RequiresTypedMountedContentIdentity
-    {
-        bits |= CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED;
-    }
-    if metadata.transform_frame_identity
-        == ChangedRecordTransformFrameIdentity::MissingTypedCompressionEncryptionFrameIdentity
-    {
-        bits |= CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED;
-    }
-    if metadata.checksum_layer == ChangedRecordChecksumLayer::RequiresTypedMountedTransformChecksum
-    {
-        bits |= CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED;
-    }
-    if metadata.stored_frame_contract
-        == ChangedRecordStoredFrameContract::RawMediaBytesNotMountedContentAuthority
-    {
-        bits |= CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY;
-    }
-    if metadata.refusal_state == ChangedRecordTransformRefusalState::MissingTypedTransformMetadata {
-        bits |= CHANGED_RECORD_TRANSFORM_REFUSAL;
-    }
-    bits
-}
-
-fn decode_changed_record_typed_transform_metadata(
-    bits: u16,
-) -> Result<ChangedRecordTypedTransformMetadata> {
-    if bits & !CHANGED_RECORD_TYPED_TRANSFORM_METADATA_MASK != 0 {
-        return Err(FileSystemError::Decode {
-            object: "local filesystem send/receive stream",
-            reason: "reserved typed transform metadata bits are set",
-        });
+        out
     }
 
-    Ok(ChangedRecordTypedTransformMetadata {
-        plaintext_identity: if bits & CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED != 0 {
-            ChangedRecordPlaintextIdentity::RequiresTypedMountedContentIdentity
-        } else {
-            ChangedRecordPlaintextIdentity::StoredFrameBytesAreMountedPlaintext
-        },
-        transform_frame_identity: if bits & CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED != 0 {
-            ChangedRecordTransformFrameIdentity::MissingTypedCompressionEncryptionFrameIdentity
-        } else {
-            ChangedRecordTransformFrameIdentity::NotApplicableNoDeviceTransforms
-        },
-        checksum_layer: if bits & CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED != 0 {
-            ChangedRecordChecksumLayer::RequiresTypedMountedTransformChecksum
-        } else {
-            ChangedRecordChecksumLayer::StoredFrameBytes
-        },
-        stored_frame_contract: if bits & CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY != 0 {
-            ChangedRecordStoredFrameContract::RawMediaBytesNotMountedContentAuthority
-        } else {
-            ChangedRecordStoredFrameContract::StoredFrameNoDeviceTransforms
-        },
-        refusal_state: if bits & CHANGED_RECORD_TRANSFORM_REFUSAL != 0 {
-            ChangedRecordTransformRefusalState::MissingTypedTransformMetadata
-        } else {
-            ChangedRecordTransformRefusalState::ReplayReady
-        },
-    })
-}
-
-fn decode_changed_record_stream_version(
-    stream_version: u16,
-) -> Result<ChangedRecordEnvelopeVersion> {
-    let envelope = match stream_version {
-        1 => ChangedRecordEnvelopeVersion {
-            incremental: false,
-            has_placement_epoch: false,
-        },
-        2 => ChangedRecordEnvelopeVersion {
-            incremental: true,
-            has_placement_epoch: false,
-        },
-        3 => ChangedRecordEnvelopeVersion {
-            incremental: false,
-            has_placement_epoch: true,
-        },
-        4 => ChangedRecordEnvelopeVersion {
-            incremental: true,
-            has_placement_epoch: true,
-        },
-        _ => {
+    pub(crate) fn decode_changed_record_export(bytes: &[u8]) -> Result<ChangedRecordExport> {
+        let mut decoder = Decoder::new("local filesystem send/receive stream", bytes);
+        decoder.expect_magic(SEND_RECEIVE_STREAM_MAGIC_BYTES)?;
+        let stream_version = decoder.read_u16()?;
+        let envelope = decode_changed_record_stream_version(stream_version)?;
+        let flags = decoder.read_u16()?;
+        if flags & !CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT != 0 {
             return Err(FileSystemError::Decode {
                 object: "local filesystem send/receive stream",
-                reason: "unsupported stream version",
-            })
+                reason: "reserved stream flags are set",
+            });
         }
-    };
-    Ok(envelope)
-}
-
-fn validate_changed_record_payload(role: ChangedRecordObjectRole, payload: &[u8]) -> Result<()> {
-    match role {
-        ChangedRecordObjectRole::TransactionManifest => {
-            decode_transaction_manifest(payload)?;
-        }
-        ChangedRecordObjectRole::TransactionSuperblock => {
-            decode_superblock(payload)?;
-        }
-        ChangedRecordObjectRole::TransactionInode => {
-            decode_inode(payload)?;
-        }
-        ChangedRecordObjectRole::TransactionDirectory => {
-            decode_directory(payload)?;
-        }
-        ChangedRecordObjectRole::VersionedContent => {
-            if payload.starts_with(&CONTENT_MANIFEST_MAGIC)
-                || payload.starts_with(&CONTENT_MANIFEST_SPARSE_MAGIC)
-            {
-                decode_content_manifest(payload)?;
-            } else {
-                decode_content(payload)?;
-            }
-        }
-        ChangedRecordObjectRole::VersionedContentChunk => {
-            if is_dedup_redirect(payload) {
-                decode_dedup_redirect(payload)?;
-            } else {
-                decode_content_chunk(payload)?;
-            }
-        }
-        ChangedRecordObjectRole::TransactionSnapshotCatalogEntry => {
-            decode_snapshot_record(payload)?;
-        }
-        ChangedRecordObjectRole::TransactionExtentMap => {
-            let mut cursor = Cursor::new(payload);
-            ExtentMap::deserialize(&mut cursor).map_err(|_| FileSystemError::Decode {
+        let current_root = decode_committed_root_summary(&mut decoder)?;
+        let from_root = if envelope.incremental {
+            Some(decode_committed_root_summary(&mut decoder)?)
+        } else {
+            None
+        };
+        let placement_epoch = if envelope.has_placement_epoch {
+            Some(decoder.read_u64()?)
+        } else {
+            None
+        };
+        if flags & CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT == 0 {
+            return Err(FileSystemError::Decode {
                 object: "local filesystem send/receive stream",
-                reason: "extent-map changed-record payload did not decode",
-            })?;
-            if cursor.position() != payload.len() as u64 {
-                return Err(FileSystemError::Decode {
-                    object: "local filesystem send/receive stream",
-                    reason: "extent-map changed-record payload has trailing bytes",
+                reason: "stream is missing transform contract",
+            });
+        }
+        let transform_contract = ChangedRecordTransformContract::try_from(decoder.read_u16()?)?;
+        let transform_metadata =
+            decode_changed_record_typed_transform_metadata(decoder.read_u16()?)?;
+        if transform_metadata
+            != ChangedRecordTypedTransformMetadata::for_contract(transform_contract)
+        {
+            return Err(FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "typed transform metadata does not match transform contract",
+            });
+        }
+        let root_count = decoder.read_count()?;
+        let mut roots = Vec::with_capacity(root_count);
+        let mut total_records = 0_u64;
+        let mut payload_bytes = 0_u64;
+        for _ in 0..root_count {
+            let source_root = decode_committed_root_summary(&mut decoder)?;
+            let record_count = decoder.read_count()?;
+            let mut records = Vec::with_capacity(record_count);
+            for _ in 0..record_count {
+                let role =
+                    ChangedRecordObjectRole::try_from(decoder.read_u16()?).map_err(|_| {
+                        FileSystemError::Decode {
+                            object: "local filesystem send/receive stream",
+                            reason: "unknown changed-record role",
+                        }
+                    })?;
+                if decoder.read_u16()? != 0 {
+                    return Err(FileSystemError::Decode {
+                        object: "local filesystem send/receive stream",
+                        reason: "reserved changed-record field is non-zero",
+                    });
+                }
+                let mut key_bytes = [0_u8; 32];
+                key_bytes.copy_from_slice(decoder.read_bytes(32)?);
+                let checksum = IntegrityDigest64(decoder.read_u64()?);
+                let payload_len = decoder.read_count()?;
+                let payload = decoder.read_bytes(payload_len)?.to_vec();
+                validate_changed_record_payload(role, &payload)?;
+                payload_bytes = payload_bytes.checked_add(payload.len() as u64).ok_or(
+                    FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    },
+                )?;
+                total_records = total_records.saturating_add(1);
+                records.push(ChangedObjectRecord {
+                    role,
+                    object_key: ObjectKey::from_bytes32(key_bytes),
+                    checksum,
+                    payload,
                 });
             }
+            roots.push(ChangedRecordRoot {
+                source_root,
+                records,
+            });
+        }
+        decoder.finish()?;
+        let incremental = from_root.is_some();
+        Ok(ChangedRecordExport {
+            spec: SEND_RECEIVE_CHANGED_RECORD_SPEC,
+            stream_version,
+            from_root,
+            current_root,
+            roots,
+            total_records,
+            payload_bytes,
+            production_fsck_required: false,
+            incremental,
+            placement_epoch,
+            transform_contract,
+        })
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct ChangedRecordEnvelopeVersion {
+        pub(crate) incremental: bool,
+        pub(crate) has_placement_epoch: bool,
+    }
+
+    fn changed_record_stream_version(incremental: bool, has_placement_epoch: bool) -> u16 {
+        match (incremental, has_placement_epoch) {
+            (false, false) => 1,
+            (true, false) => 2,
+            (false, true) => 3,
+            (true, true) => 4,
         }
     }
-    Ok(())
+
+    const CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT: u16 = 0x0001;
+
+    // The existing transform-contract metadata word carries five independent
+    // typed decisions. Zero remains the no-device-transform representation, so
+    // transform-disabled stream bytes keep their current shape.
+    const CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED: u16 = 1 << 0;
+    const CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED: u16 = 1 << 1;
+    const CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED: u16 = 1 << 2;
+    const CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY: u16 = 1 << 3;
+    const CHANGED_RECORD_TRANSFORM_REFUSAL: u16 = 1 << 4;
+    pub(crate) const CHANGED_RECORD_TYPED_TRANSFORM_METADATA_MASK: u16 =
+        CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED
+            | CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED
+            | CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED
+            | CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY
+            | CHANGED_RECORD_TRANSFORM_REFUSAL;
+
+    pub(crate) fn encode_changed_record_typed_transform_metadata(
+        metadata: ChangedRecordTypedTransformMetadata,
+    ) -> u16 {
+        let mut bits = 0_u16;
+        if metadata.plaintext_identity
+            == ChangedRecordPlaintextIdentity::RequiresTypedMountedContentIdentity
+        {
+            bits |= CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED;
+        }
+        if metadata.transform_frame_identity
+            == ChangedRecordTransformFrameIdentity::MissingTypedCompressionEncryptionFrameIdentity
+        {
+            bits |= CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED;
+        }
+        if metadata.checksum_layer
+            == ChangedRecordChecksumLayer::RequiresTypedMountedTransformChecksum
+        {
+            bits |= CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED;
+        }
+        if metadata.stored_frame_contract
+            == ChangedRecordStoredFrameContract::RawMediaBytesNotMountedContentAuthority
+        {
+            bits |= CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY;
+        }
+        if metadata.refusal_state
+            == ChangedRecordTransformRefusalState::MissingTypedTransformMetadata
+        {
+            bits |= CHANGED_RECORD_TRANSFORM_REFUSAL;
+        }
+        bits
+    }
+
+    pub(crate) fn decode_changed_record_typed_transform_metadata(
+        bits: u16,
+    ) -> Result<ChangedRecordTypedTransformMetadata> {
+        if bits & !CHANGED_RECORD_TYPED_TRANSFORM_METADATA_MASK != 0 {
+            return Err(FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "reserved typed transform metadata bits are set",
+            });
+        }
+
+        Ok(ChangedRecordTypedTransformMetadata {
+            plaintext_identity: if bits & CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED != 0 {
+                ChangedRecordPlaintextIdentity::RequiresTypedMountedContentIdentity
+            } else {
+                ChangedRecordPlaintextIdentity::StoredFrameBytesAreMountedPlaintext
+            },
+            transform_frame_identity: if bits & CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED
+                != 0
+            {
+                ChangedRecordTransformFrameIdentity::MissingTypedCompressionEncryptionFrameIdentity
+            } else {
+                ChangedRecordTransformFrameIdentity::NotApplicableNoDeviceTransforms
+            },
+            checksum_layer: if bits & CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED != 0 {
+                ChangedRecordChecksumLayer::RequiresTypedMountedTransformChecksum
+            } else {
+                ChangedRecordChecksumLayer::StoredFrameBytes
+            },
+            stored_frame_contract: if bits & CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY != 0 {
+                ChangedRecordStoredFrameContract::RawMediaBytesNotMountedContentAuthority
+            } else {
+                ChangedRecordStoredFrameContract::StoredFrameNoDeviceTransforms
+            },
+            refusal_state: if bits & CHANGED_RECORD_TRANSFORM_REFUSAL != 0 {
+                ChangedRecordTransformRefusalState::MissingTypedTransformMetadata
+            } else {
+                ChangedRecordTransformRefusalState::ReplayReady
+            },
+        })
+    }
+
+    pub(crate) fn decode_changed_record_stream_version(
+        stream_version: u16,
+    ) -> Result<ChangedRecordEnvelopeVersion> {
+        let envelope = match stream_version {
+            1 => ChangedRecordEnvelopeVersion {
+                incremental: false,
+                has_placement_epoch: false,
+            },
+            2 => ChangedRecordEnvelopeVersion {
+                incremental: true,
+                has_placement_epoch: false,
+            },
+            3 => ChangedRecordEnvelopeVersion {
+                incremental: false,
+                has_placement_epoch: true,
+            },
+            4 => ChangedRecordEnvelopeVersion {
+                incremental: true,
+                has_placement_epoch: true,
+            },
+            _ => {
+                return Err(FileSystemError::Decode {
+                    object: "local filesystem send/receive stream",
+                    reason: "unsupported stream version",
+                })
+            }
+        };
+        Ok(envelope)
+    }
+
+    fn validate_changed_record_payload(
+        role: ChangedRecordObjectRole,
+        payload: &[u8],
+    ) -> Result<()> {
+        match role {
+            ChangedRecordObjectRole::TransactionManifest => {
+                decode_transaction_manifest(payload)?;
+            }
+            ChangedRecordObjectRole::TransactionSuperblock => {
+                decode_superblock(payload)?;
+            }
+            ChangedRecordObjectRole::TransactionInode => {
+                decode_inode(payload)?;
+            }
+            ChangedRecordObjectRole::TransactionDirectory => {
+                decode_directory(payload)?;
+            }
+            ChangedRecordObjectRole::VersionedContent => {
+                if payload.starts_with(&CONTENT_MANIFEST_MAGIC)
+                    || payload.starts_with(&CONTENT_MANIFEST_SPARSE_MAGIC)
+                {
+                    decode_content_manifest(payload)?;
+                } else {
+                    decode_content(payload)?;
+                }
+            }
+            ChangedRecordObjectRole::VersionedContentChunk => {
+                if is_dedup_redirect(payload) {
+                    decode_dedup_redirect(payload)?;
+                } else {
+                    decode_content_chunk(payload)?;
+                }
+            }
+            ChangedRecordObjectRole::TransactionSnapshotCatalogEntry => {
+                decode_snapshot_record(payload)?;
+            }
+            ChangedRecordObjectRole::TransactionExtentMap => {
+                let mut cursor = Cursor::new(payload);
+                ExtentMap::deserialize(&mut cursor).map_err(|_| FileSystemError::Decode {
+                    object: "local filesystem send/receive stream",
+                    reason: "extent-map changed-record payload did not decode",
+                })?;
+                if cursor.position() != payload.len() as u64 {
+                    return Err(FileSystemError::Decode {
+                        object: "local filesystem send/receive stream",
+                        reason: "extent-map changed-record payload has trailing bytes",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
+
+#[cfg(feature = "replication-io")]
+pub(crate) use replication_encoding::*;
 
 // ── Polymorphic xattr encode/decode ────────────────────────────────────────
 
@@ -1445,13 +1470,13 @@ pub(crate) fn encode_content_chunk(
     chunk_index: u64,
     bytes: &[u8],
     policy: &ContentCompressionPolicy,
-) -> Vec<u8> {
-    // Validate policy parameters; on misconfiguration, treat as uncompressed.
-    let policy = if policy.validate().is_ok() {
-        policy
-    } else {
-        &ContentCompressionPolicy::off()
-    };
+) -> Result<Vec<u8>> {
+    policy
+        .validate()
+        .map_err(|reason| FileSystemError::Unsupported {
+            operation: "encode content with invalid compression policy",
+            reason,
+        })?;
 
     let mut out = Vec::new();
     out.extend_from_slice(&CONTENT_CHUNK_MAGIC);
@@ -1461,6 +1486,12 @@ pub(crate) fn encode_content_chunk(
     let (algorithm, stored) = match policy.algorithm {
         ContentCompressionAlgorithm::None => (ContentCompressionAlgorithm::None, bytes.to_vec()),
         ContentCompressionAlgorithm::Zstd => {
+            #[cfg(not(feature = "data-policy"))]
+            return Err(FileSystemError::Unsupported {
+                operation: "encode zstd-compressed content",
+                reason: "zstd content encoding requires the data-policy feature",
+            });
+            #[cfg(feature = "data-policy")]
             if bytes.len() >= policy.min_savings_bytes {
                 match zstd::encode_all(bytes, policy.level) {
                     Ok(compressed) if compressed.len() + policy.min_savings_bytes < bytes.len() => {
@@ -1473,6 +1504,12 @@ pub(crate) fn encode_content_chunk(
             }
         }
         ContentCompressionAlgorithm::Lz4 => {
+            #[cfg(not(feature = "data-policy"))]
+            return Err(FileSystemError::Unsupported {
+                operation: "encode lz4-compressed content",
+                reason: "lz4 content encoding requires the data-policy feature",
+            });
+            #[cfg(feature = "data-policy")]
             if bytes.len() >= policy.min_savings_bytes {
                 // lz4_flex compress_prepend_size embeds the original size in the
                 // compressed output; decompress_size_prepended recovers it.
@@ -1494,7 +1531,7 @@ pub(crate) fn encode_content_chunk(
     push_u64(&mut out, chunk_index);
     push_u64(&mut out, stored.len() as u64);
     out.extend_from_slice(&stored);
-    out
+    Ok(out)
 }
 
 pub(crate) fn decode_content_chunk(bytes: &[u8]) -> Result<ContentChunkObject> {
@@ -1523,11 +1560,23 @@ pub(crate) fn decode_content_chunk(bytes: &[u8]) -> Result<ContentChunkObject> {
     let result_bytes = match algorithm {
         ContentCompressionAlgorithm::None => stored_payload,
         ContentCompressionAlgorithm::Zstd => {
+            #[cfg(not(feature = "data-policy"))]
+            return Err(FileSystemError::Unsupported {
+                operation: "decode zstd-compressed content",
+                reason: "zstd content decoding requires the data-policy feature",
+            });
+            #[cfg(feature = "data-policy")]
             zstd::decode_all(&stored_payload[..]).map_err(|_| FileSystemError::CorruptState {
                 reason: "zstd decompression of content chunk payload failed",
             })?
         }
         ContentCompressionAlgorithm::Lz4 => {
+            #[cfg(not(feature = "data-policy"))]
+            return Err(FileSystemError::Unsupported {
+                operation: "decode lz4-compressed content",
+                reason: "lz4 content decoding requires the data-policy feature",
+            });
+            #[cfg(feature = "data-policy")]
             lz4_flex::block::decompress_size_prepended(&stored_payload[..]).map_err(|_| {
                 FileSystemError::CorruptState {
                     reason: "lz4 decompression of content chunk payload failed",
@@ -1704,11 +1753,11 @@ pub(crate) fn push_i64(out: &mut Vec<u8>, value: i64) {
 pub(crate) fn compute_content_fingerprint(
     uncompressed_bytes: &[u8],
 ) -> crate::types::ContentFingerprint {
-    let hash = tidefs_dedup::DedupHash::compute_domain_separated(
-        crate::constants::CONTENT_DEDUP_FINGERPRINT_DOMAIN,
-        uncompressed_bytes,
-    );
-    crate::types::ContentFingerprint::from_dedup_hash(hash)
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(crate::constants::CONTENT_DEDUP_FINGERPRINT_DOMAIN);
+    hasher.update(&(uncompressed_bytes.len() as u64).to_le_bytes());
+    hasher.update(uncompressed_bytes);
+    crate::types::ContentFingerprint::from_bytes32(hasher.finalize().into())
 }
 
 pub(crate) fn is_dedup_redirect(bytes: &[u8]) -> bool {
@@ -2017,6 +2066,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "replication-io")]
     fn root_summary(transaction_id: u64) -> CommittedRootSummary {
         CommittedRootSummary {
             slot: 0,
@@ -2037,6 +2087,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "replication-io")]
     fn changed_record_export(
         from_root: Option<CommittedRootSummary>,
         placement_epoch: Option<u64>,
@@ -2062,6 +2113,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "replication-io")]
     fn encoded_stream_version(encoded: &[u8]) -> u16 {
         u16::from_le_bytes(
             encoded
@@ -2071,6 +2123,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "replication-io")]
     fn changed_record_transform_metadata_bits_offset(encoded: &[u8]) -> usize {
         let mut decoder = Decoder::new("local filesystem send/receive stream", encoded);
         decoder
@@ -2156,6 +2209,7 @@ mod tests {
         assert_xattr_root_decode_refusal(&bytes, "reserved field is non-zero");
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn changed_record_version_authority_derives_vfssend1_envelope_versions() {
         for (from_root, placement_epoch, expected_version) in [
@@ -2180,6 +2234,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn changed_record_version_authority_rejects_missing_transform_contract() {
         let export = changed_record_export(None, None, Vec::new());
@@ -2197,6 +2252,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn changed_record_typed_transform_metadata_roundtrips_each_contract() {
         for (contract, expected_bits) in [
@@ -2218,6 +2274,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn changed_record_decode_rejects_transform_metadata_contract_mismatch() {
         let mut export = changed_record_export(None, None, Vec::new());
@@ -2238,6 +2295,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn changed_record_version_authority_rejects_unsupported_vfssend1_envelope_version() {
         let export = changed_record_export(None, None, Vec::new());
@@ -2255,6 +2313,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn changed_record_version_authority_rejects_inode_payload_without_explicit_posix_timestamps() {
         let payload = inode_payload_with_format_version(4);
@@ -2277,6 +2336,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "replication-io")]
     #[test]
     fn changed_record_version_authority_rejects_extent_map_payload_trailing_bytes() {
         let mut payload = Vec::new();
@@ -2303,6 +2363,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "replication-io")]
     fn inode_payload_with_format_version(version: u16) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&INODE_MAGIC);

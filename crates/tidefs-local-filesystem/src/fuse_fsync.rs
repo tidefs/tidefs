@@ -355,7 +355,7 @@ impl DirtyFlush for LocalFsDirtyFlush<'_> {
     }
 
     fn flush_all(&self) -> Result<(), FsyncDispatchError> {
-        self.fs.borrow_mut().sync_all_dirty().map_err(|e| match e {
+        self.fs.borrow_mut().fsync_all().map_err(|e| match e {
             FileSystemError::NoSpace { .. } => FsyncDispatchError::NoSpace,
             _ => FsyncDispatchError::IoError,
         })
@@ -860,8 +860,10 @@ mod tests {
                 snap_after.fsync_total_ns > 0,
                 "fsync latency should be non-zero"
             );
-            // Writes now populate the intent log, so the fast path is taken.
-            assert_eq!(snap_after.fsync_intent_log_fast_path_count, 1);
+            // Buffered writes are materialized directly through Pool authority,
+            // so this path earns durability from the committed-root fallback.
+            assert_eq!(snap_after.fsync_intent_log_fast_path_count, 0);
+            assert_eq!(snap_after.fsync_do_commit_fallback_count, 1);
         }
         let _ = std::fs::remove_dir_all(&root);
     }

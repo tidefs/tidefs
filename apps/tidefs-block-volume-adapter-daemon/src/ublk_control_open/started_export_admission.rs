@@ -423,15 +423,13 @@ impl UblkStartedExportAdmissionArtifact {
         out.push_str("  \"claim_ids\": [\n");
         let _ = writeln!(
             out,
-            "    \"{}\",",
-            UBLK_STARTED_EXPORT_ADMISSION_ARTIFACT_CLAIM_ID
+            "    \"{UBLK_STARTED_EXPORT_ADMISSION_ARTIFACT_CLAIM_ID}\","
         );
-        let _ = writeln!(out, "    \"{}\"", UBLK_COMPLETION_ARTIFACT_CLAIM_ID);
+        let _ = writeln!(out, "    \"{UBLK_COMPLETION_ARTIFACT_CLAIM_ID}\"");
         out.push_str("  ],\n");
         let _ = writeln!(
             out,
-            "  \"evidence_class\": \"{}\",",
-            UBLK_STARTED_EXPORT_ADMISSION_ARTIFACT_EVIDENCE_CLASS
+            "  \"evidence_class\": \"{UBLK_STARTED_EXPORT_ADMISSION_ARTIFACT_EVIDENCE_CLASS}\","
         );
         out.push_str("  \"evidence_scope\": \"bounded started uBLK export admission and daemon-owned data-queue service-loop trace\",\n");
         out.push_str("  \"scenario\": \"qemu-ublk-smoke\",\n");

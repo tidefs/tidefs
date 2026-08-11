@@ -400,6 +400,7 @@ impl std::fmt::Display for ConservationViolation {
 pub fn conservation_audit(
     receipts: &[ReserveReceipt],
     ledger: &ReserveLedger,
+    budget_domain: &BudgetDomainId,
     free_bytes: u64,
 ) -> Result<(), Vec<ConservationViolation>> {
     let mut violations: Vec<ConservationViolation> = Vec::new();
@@ -407,7 +408,7 @@ pub fn conservation_audit(
     // Only audit receipts belonging to this ledger's budget domain
     let domain_receipts: Vec<&ReserveReceipt> = receipts
         .iter()
-        .filter(|r| &r.budget_domain == &ledger.budget_domain_ref)
+        .filter(|r| &r.budget_domain == budget_domain)
         .collect();
 
     // Collect unique (domain, class) pairs from receipts
@@ -543,11 +544,11 @@ mod tests {
     }
 
     fn test_ledger() -> ReserveLedger {
-        ReserveLedger::new(1, test_domain(), ReserveClass::Rebuild, 100_000, 200_000)
+        ReserveLedger::new(1, ReserveClass::Rebuild, 100_000, 200_000)
     }
 
     fn test_ledger_snapshot() -> ReserveLedger {
-        ReserveLedger::new(2, test_domain(), ReserveClass::Snapshot, 50_000, 100_000)
+        ReserveLedger::new(2, ReserveClass::Snapshot, 50_000, 100_000)
     }
 
     // --- ReceiptLog basics ---
@@ -755,7 +756,7 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        let result = conservation_audit(log.receipts(), &ledger, 500_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 500_000);
         assert!(result.is_ok(), "expected clean audit, got {:?}", result);
     }
 
@@ -782,7 +783,7 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        let result = conservation_audit(log.receipts(), &ledger, 500_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 500_000);
         assert!(result.is_err());
         let violations = result.unwrap_err();
         assert!(
@@ -810,7 +811,7 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        let result = conservation_audit(log.receipts(), &ledger, 500_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 500_000);
         assert!(result.is_err());
         let violations = result.unwrap_err();
         assert!(
@@ -850,7 +851,7 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        let result = conservation_audit(log.receipts(), &ledger, 500_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 500_000);
         assert!(result.is_ok(), "expected clean audit, got {:?}", result);
     }
 
@@ -871,7 +872,7 @@ mod tests {
         );
 
         // free_bytes (50_000) < floor (100_000) but receipts claim Healthy
-        let result = conservation_audit(log.receipts(), &ledger, 50_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 50_000);
         assert!(result.is_err());
         let violations = result.unwrap_err();
         assert!(
@@ -897,7 +898,7 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        let result = conservation_audit(log.receipts(), &ledger, 50_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 50_000);
         assert!(result.is_ok(), "expected clean audit, got {:?}", result);
     }
 
@@ -915,7 +916,7 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        let result = conservation_audit(log.receipts(), &ledger, 10_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 10_000);
         assert!(result.is_ok(), "expected clean audit, got {:?}", result);
     }
 
@@ -935,7 +936,7 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        let result = conservation_audit(log.receipts(), &ledger, 100_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 100_000);
         assert!(result.is_err());
         let violations = result.unwrap_err();
         assert!(
@@ -961,7 +962,7 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        let result = conservation_audit(log.receipts(), &ledger, 500_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 500_000);
         assert!(result.is_ok(), "expected clean audit, got {:?}", result);
     }
 
@@ -981,7 +982,7 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        let result = conservation_audit(log.receipts(), &ledger, 500_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 500_000);
         assert!(result.is_err());
         let violations = result.unwrap_err();
         assert!(
@@ -1032,7 +1033,7 @@ mod tests {
 
         assert_eq!(log.net_admitted_bytes(), 0);
 
-        let result = conservation_audit(log.receipts(), &ledger, 500_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 500_000);
         assert!(result.is_ok(), "expected clean audit, got {:?}", result);
     }
 
@@ -1052,7 +1053,7 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        let result = conservation_audit(log.receipts(), &ledger, 50_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 50_000);
         assert!(result.is_err());
         let violations = result.unwrap_err();
         assert!(
@@ -1079,7 +1080,7 @@ mod tests {
         );
 
         // free = 80_000 < floor = 100_000, state = Encroached (not Violated/Emergency)
-        let result = conservation_audit(log.receipts(), &ledger, 80_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 80_000);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1110,7 +1111,7 @@ mod tests {
             ValidationTier::Informational,
         );
 
-        let result = conservation_audit(log.receipts(), &ledger, 500_000);
+        let result = conservation_audit(log.receipts(), &ledger, &test_domain(), 500_000);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1125,9 +1126,8 @@ mod tests {
         let mut log = ReceiptLog::new();
         let dom_a = BudgetDomainId::from_str("dom_a");
         let dom_b = BudgetDomainId::from_str("dom_b");
-        let ledger_a = ReserveLedger::new(1, dom_a.clone(), ReserveClass::Rebuild, 50_000, 100_000);
-        let ledger_b =
-            ReserveLedger::new(2, dom_b.clone(), ReserveClass::Failover, 50_000, 100_000);
+        let ledger_a = ReserveLedger::new(1, ReserveClass::Rebuild, 50_000, 100_000);
+        let ledger_b = ReserveLedger::new(2, ReserveClass::Failover, 50_000, 100_000);
 
         log.record_allocate(
             ReserveClass::Rebuild,
@@ -1159,10 +1159,10 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        let r_a = conservation_audit(log.receipts(), &ledger_a, 500_000);
+        let r_a = conservation_audit(log.receipts(), &ledger_a, &dom_a, 500_000);
         assert!(r_a.is_ok(), "domain A should be clean, got {:?}", r_a);
 
-        let r_b = conservation_audit(log.receipts(), &ledger_b, 500_000);
+        let r_b = conservation_audit(log.receipts(), &ledger_b, &dom_b, 500_000);
         assert!(r_b.is_err());
         assert!(r_b
             .unwrap_err()

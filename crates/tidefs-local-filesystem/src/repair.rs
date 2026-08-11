@@ -6,15 +6,21 @@
 //! severity. Repair outcomes are recorded in a `RepairLog` for audit
 //! and recovery.
 
-use crate::scrub::{RepairStrategy, ScrubBlockId, ScrubBlockKind, ScrubReport, ScrubViolation};
+use crate::scrub::{RepairStrategy, ScrubBlockKind, ScrubViolation};
+#[cfg(feature = "distributed-repair")]
+use crate::scrub::{ScrubBlockId, ScrubReport};
+#[cfg(feature = "distributed-repair")]
 use crate::types::InodeRecord;
+#[cfg(feature = "distributed-repair")]
 use std::sync::Arc;
+#[cfg(feature = "distributed-repair")]
 use tidefs_scrub::repair_scheduling::RepairReplacementReceiptEvidence;
 
 // ── Repair outcome recording ──────────────────────────────────────────
 
 /// Outcome of applying a single repair action.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "distributed-repair")]
 pub struct RepairEntry {
     pub block_id: ScrubBlockId,
     pub strategy: RepairStrategy,
@@ -23,6 +29,7 @@ pub struct RepairEntry {
 
 /// What happened after repair was applied.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "distributed-repair")]
 pub enum RepairOutcome {
     /// File truncated to the given byte size.
     Truncated { new_size: u64 },
@@ -45,6 +52,7 @@ pub enum RepairOutcome {
     Skipped,
 }
 
+#[cfg(feature = "distributed-repair")]
 impl RepairOutcome {
     /// Durable replacement evidence that downstream consumers may use.
     pub fn replacement_receipt_evidence(&self) -> Option<RepairReplacementReceiptEvidence> {
@@ -72,6 +80,7 @@ impl RepairOutcome {
 
 /// Why a scheduled repair candidate was rejected before writeback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "distributed-repair")]
 pub enum RepairAuthorityMismatch {
     MissingInode,
     DataVersionStale { candidate: u64, current: u64 },
@@ -84,6 +93,7 @@ pub enum RepairAuthorityMismatch {
 
 /// Storage operation that failed during repair application.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "distributed-repair")]
 pub enum RepairStorageOperation {
     ReadSourceObject,
     WriteRepairedObject,
@@ -91,6 +101,7 @@ pub enum RepairStorageOperation {
 
 /// Why reconstruction could not produce repaired bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "distributed-repair")]
 pub enum RepairUnrepairableReason {
     MissingSourceObject,
     NotErasureEncoded,
@@ -101,10 +112,12 @@ pub enum RepairUnrepairableReason {
 
 /// Log of repairs applied during a resolver pass.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg(feature = "distributed-repair")]
 pub struct RepairLog {
     pub entries: Vec<RepairEntry>,
 }
 
+#[cfg(feature = "distributed-repair")]
 impl RepairLog {
     pub fn new() -> Self {
         Self::default()
@@ -129,6 +142,7 @@ impl RepairLog {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ResolverContext {
     /// Whether redundancy/replication is available for reconstruction.
+    #[cfg(feature = "distributed-repair")]
     pub redundancy_available: bool,
 }
 
@@ -140,6 +154,9 @@ pub struct ResolverContext {
 ///   `Truncate` (preserve known-good data)
 /// - Otherwise → `MarkCorrupt`
 pub fn resolve_violation(violation: &ScrubViolation, ctx: ResolverContext) -> RepairStrategy {
+    #[cfg(not(feature = "distributed-repair"))]
+    let _ = ctx;
+    #[cfg(feature = "distributed-repair")]
     if ctx.redundancy_available {
         return RepairStrategy::Reconstruct;
     }
@@ -159,6 +176,7 @@ pub fn resolve_violation(violation: &ScrubViolation, ctx: ResolverContext) -> Re
 /// remove a corrupt chunk and all chunks after it.
 ///
 /// Returns `None` if the corrupt chunk is at index 0 (nothing to keep).
+#[cfg(feature = "distributed-repair")]
 pub fn truncate_offset_for_chunk(
     _inode: &InodeRecord,
     corrupt_chunk_index: u64,
@@ -181,6 +199,7 @@ pub fn truncate_offset_for_chunk(
 /// `RepairOutcome::Skipped`. The caller must apply repairs via
 /// `apply_repair_entries()` to produce actual outcomes.
 #[allow(dead_code)]
+#[cfg(feature = "distributed-repair")]
 pub fn resolve_all(report: &ScrubReport, ctx: ResolverContext) -> RepairLog {
     let mut log = RepairLog::new();
 
@@ -200,8 +219,10 @@ pub fn resolve_all(report: &ScrubReport, ctx: ResolverContext) -> RepairLog {
 mod tests {
     use super::*;
     use crate::scrub::{ScrubBlockId, ScrubBlockKind, ScrubBlockOutcome, ScrubViolation};
+    #[cfg(feature = "distributed-repair")]
     use crate::types::InodeRecord;
     use tidefs_local_object_store::IntegrityDigest64;
+    #[cfg(feature = "distributed-repair")]
     use tidefs_types_vfs_core::{Generation, InodeId, NodeKind};
 
     fn make_violation_with_kind(kind: ScrubBlockKind) -> ScrubViolation {
@@ -219,6 +240,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "distributed-repair")]
     fn make_inode(size: u64) -> InodeRecord {
         InodeRecord {
             rdev: 0,
@@ -272,6 +294,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn redundancy_available_returns_reconstruct() {
         let v = make_violation_with_kind(ScrubBlockKind::ContentChunk { chunk_index: 5 });
         let ctx = ResolverContext {
@@ -281,6 +304,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn redundancy_overrides_even_for_inline() {
         let v = make_violation_with_kind(ScrubBlockKind::InlineContent);
         let ctx = ResolverContext {
@@ -292,12 +316,14 @@ mod tests {
     // ── Truncate offset tests ────────────────────────────────────────
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn truncate_offset_chunk_0_returns_none() {
         let inode = make_inode(100);
         assert_eq!(truncate_offset_for_chunk(&inode, 0, &[50, 50]), None);
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn truncate_offset_chunk_1_sums_preceding() {
         let inode = make_inode(100);
         let sizes = vec![50u32, 50];
@@ -305,6 +331,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn truncate_offset_chunk_2_sums_two_preceding() {
         let inode = make_inode(300);
         let sizes = vec![100u32, 100, 100];
@@ -312,6 +339,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn truncate_offset_index_beyond_sizes_returns_none() {
         let inode = make_inode(200);
         assert_eq!(truncate_offset_for_chunk(&inode, 5, &[100, 100]), None);
@@ -320,6 +348,7 @@ mod tests {
     // ── Repair log tests ─────────────────────────────────────────────
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn repair_log_new_is_empty() {
         let log = RepairLog::new();
         assert!(log.is_empty());
@@ -327,6 +356,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn repair_log_records_entries() {
         let mut log = RepairLog::new();
         let v = make_violation_with_kind(ScrubBlockKind::ContentChunk { chunk_index: 0 });
@@ -339,6 +369,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "distributed-repair")]
     fn resolve_all_produces_one_entry_per_violation() {
         let v = make_violation_with_kind(ScrubBlockKind::ContentChunk { chunk_index: 2 });
         let mut report = crate::scrub::ScrubReport::empty();
@@ -352,18 +383,25 @@ mod tests {
 
 // ── Repair application ────────────────────────────────────────────────
 
+#[cfg(feature = "distributed-repair")]
 use std::collections::BTreeMap;
+#[cfg(feature = "distributed-repair")]
 use tidefs_local_object_store::LocalObjectStore;
+#[cfg(feature = "distributed-repair")]
 use tidefs_types_vfs_core::InodeId;
 
+#[cfg(feature = "distributed-repair")]
 use crate::content::read_content_layout_from_store;
+#[cfg(feature = "distributed-repair")]
 use crate::records::ContentLayout;
+#[cfg(feature = "distributed-repair")]
 use crate::FileSystemState;
 
 /// Apply repair entries to the filesystem state and object store.
 ///
 /// Returns a new `RepairLog` with actual outcomes recorded.
 #[allow(dead_code)]
+#[cfg(feature = "distributed-repair")]
 pub fn apply_repair_entries(
     log: &RepairLog,
     state: &mut FileSystemState,
@@ -384,6 +422,7 @@ pub fn apply_repair_entries(
     applied
 }
 
+#[cfg(feature = "distributed-repair")]
 pub(crate) fn apply_one_repair(
     entry: &RepairEntry,
     state: &mut FileSystemState,
@@ -393,6 +432,7 @@ pub(crate) fn apply_one_repair(
     apply_one_repair_with_replacement_evidence(entry, state, store, content_layout_cache, None)
 }
 
+#[cfg(feature = "distributed-repair")]
 pub(crate) fn apply_one_repair_with_replacement_evidence(
     entry: &RepairEntry,
     state: &mut FileSystemState,
@@ -420,6 +460,7 @@ pub(crate) fn apply_one_repair_with_replacement_evidence(
     }
 }
 
+#[cfg(feature = "distributed-repair")]
 fn apply_truncate(
     inode_id: InodeId,
     entry: &RepairEntry,
@@ -481,6 +522,7 @@ fn apply_truncate(
 ///
 /// Returns `Unrepairable(NotErasureEncoded)` when the content was never
 /// erasure-encoded.
+#[cfg(feature = "distributed-repair")]
 fn apply_reconstruct(
     inode_id: InodeId,
     data_version: u64,
@@ -611,7 +653,7 @@ fn apply_reconstruct(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "distributed-repair"))]
 mod apply_tests {
     use super::*;
     use crate::scrub::{

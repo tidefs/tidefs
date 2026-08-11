@@ -89,33 +89,42 @@ The repository is not short of implementations; it has too many overlapping
 ones in the default graph:
 
 - 166 root-workspace packages plus four excluded fuzz packages are present.
-- The default normal dependency closure of `tidefsctl` is 112 of 166 workspace
-  packages; selecting its explicit `full` feature reaches 117. Its manifest
-  now has 17 required and 12 optional normal dependencies. The default parser,
-  help, source modules, and direct dependency edges therefore carry only the
-  local pool, mount, device, dataset, snapshot, defrag, live-owner, and status
-  families.
-- The POSIX daemon now has 35 direct normal dependencies in its default local
-  build and 41 with its explicit `full` feature. Its default has no direct
+- The default normal dependency closure of `tidefsctl` is 77 of 166 workspace
+  packages (189 total); selecting its explicit `full` feature reaches 98
+  workspace packages (220 total). Its manifest now has 16 required and 13
+  optional normal dependencies. The default parser, help, source modules, and
+  direct dependency edges therefore carry only the local pool, mount, device,
+  dataset, snapshot, defrag, live-owner, and status families.
+- The POSIX daemon now has 34 direct normal dependencies in its default local
+  build and 40 with its explicit `full` feature. Its default has no direct
   normal edge to block-volume core, `bincode`, cluster, performance-contract,
   POSIX receipt schema/package-profile, or workload packages. `cluster`,
   `receipt-demo`, `scrub-observation`, and `workload-telemetry` each own one
   optional source/dependency family; `full` aggregates those four for retained
   development packaging.
-- The daemon's default normal tree still reaches 108 of 166 workspace packages
-  (200 total packages including external crates), versus 111 workspace and 203
-  total with `full`. The remaining cluster, membership, transport,
-  performance-contract, and storage-policy reachability comes through required
-  deeper owners such as `tidefs-local-filesystem`, `tidefs-local-object-store`,
-  `tidefs-orphan-index`, and their dependencies. The LocalFileSystem slice must
-  contract those paths; this adapter slice neither hides them nor overstates
-  their removal.
+- The daemon's default normal tree reaches 76 of 166 workspace packages (175
+  total packages including external crates), versus 89 workspace and 188 total
+  with `full`. Its default carrier also excludes the distributed, claim,
+  performance, storage-intent read-serving, and quorum-write families removed
+  from the standalone `tidefs-local-filesystem`; its explicit features restore
+  the adapter's retained cluster, replication, data-policy, receipt,
+  observation, and telemetry surfaces.
 - `fuse_vfs_adapter.rs` is 43,876 lines, `local-filesystem/src/lib.rs` is
   17,692, `vfs_engine_impl.rs` is 16,391, and the binary daemon `main.rs` is
   3,900 lines. The remaining size is concentrated in three
   mixed-authority carriers plus validation and smoke command source.
 - Mounted pool admission no longer selects fixed roots or replays filesystem
   transactions; Pool-backed local-filesystem recovery owns mounted state.
+- The default `tidefs-local-filesystem` normal tree is 58 workspace packages
+  (136 total) and excludes device-removal, replication-model, erasure-coding,
+  claim-ledger, performance-contract, storage-intent read-serving, and
+  quorum-write families. Its explicit `full` feature restores the retained
+  optional subsystems and reaches 95 workspace packages (183 total).
+- These normal-edge counts use `cargo tree --locked --offline
+  --no-default-features -e normal -p <package>` and add `--all-features` only
+  for the corresponding `full` census. Keeping `--no-default-features`
+  explicit prevents unrelated workspace feature unification from inflating a
+  carrier's reported default closure.
 - The daemon validation CLI now reaches the same library runtime as
   `tidefsctl`; it no longer constructs a second recovery, namespace, FUSE, or
   shutdown stack.
@@ -148,7 +157,7 @@ must be repaired only after assigning them to the target owners above.
 | VFS and namespace | `tidefs-vfs-engine`, `tidefs-namespace`, `tidefs-inode-table`, `tidefs-local-filesystem`, `tidefs-dir-index`, `tidefs-extent-map`, `tidefs-object-io` | Local filesystem operation dispatch, path resolution, inode state, directory indexing, file extent mapping, and object offset bridging. |
 | POSIX metadata and access checks | `tidefs-permission`, `tidefs-posix-acl`, `tidefs-xattr-storage`, `tidefs-posix-semantics`, `tidefs-inode-attributes`, `tidefs-lock-service` | Permission, ACL, extended-attribute, inode-attribute, semantic-definition, and advisory-lock code used by filesystem paths. |
 | Local object and pool storage | `tidefs-local-object-store`, `tidefs-block-allocator`, `tidefs-space-accounting`, `tidefs-commit_group`, `tidefs-intent-log`, `tidefs-pool-import`, `tidefs-pool-scan`, `tidefs-pool-allocator`, `tidefs-spacemap-allocator`, `tidefs-reserve-ledger` | Local object persistence, allocation/accounting, transaction grouping, intent logging, pool scan/import, and reserve-ledger ownership. |
-| Dataset and cleanup state | `tidefs-dataset-catalog`, `tidefs-dataset-lifecycle`, `tidefs-dataset-properties`, `tidefs-dataset-feature-flags`, `tidefs-cleanup-queue-core`, `tidefs-reclaim-queue-core`, `tidefs-reclaim`, `tidefs-segment-cleaner`, `tidefs-compaction`, `tidefs-dedup` | Dataset metadata, cleanup/reclaim queues, segment maintenance, compaction, and dedup model code. |
+| Dataset and cleanup state | `tidefs-dataset-catalog`, `tidefs-dataset-lifecycle`, `tidefs-dataset-properties`, `tidefs-dataset-feature-flags`, `tidefs-cleanup-queue-core`, `tidefs-reclaim-queue-core`, `tidefs-reclaim`, `tidefs-segment-cleaner`, `tidefs-compaction`, `tidefs-dedup` | Dataset metadata, segment maintenance, compaction, and dedup model code. The mounted logical reclaim queue is a Pool-receipted filesystem system object persisted before root publication; object-store receipt-bound queues remain the separate physical-release authority. |
 | Integrity and transforms | `tidefs-checksum-tree`, `tidefs-compression`, `tidefs-encryption`, `tidefs-scrub-core`, `tidefs-verification-engine`, `tidefs-erasure-coding`, `tidefs-erasure-coded-store`, `tidefs-anti-entropy-auditor`, `tidefs-btree`, `tidefs-frame` | Checksum, compression, encryption, scrub, verification, erasure-coding, anti-entropy, B-tree, and framed-I/O code. |
 | Storage intent and scheduling | `tidefs-storage-intent-*`, `tidefs-background-scheduler`, `tidefs-data-cleaner`, `tidefs-flow-commit-coordinator`, `tidefs-incremental-job-core`, `tidefs-relocation-planner`, `tidefs-relocation-governor`, `tidefs-online-defrag` | Policy, media-capability, cost, prefetch, satisfaction, scheduling, background work, relocation, and defrag planning code. |
 | Block-volume adapter | `tidefs-block-volume-adapter-core`, `tidefs-block-volume-adapter-ublk-control-runtime`, `tidefs-env-ublk-model`, `tidefs-ublk-abi`, `tidefs-block-kmod`, `tidefs-kernel-storage-io` | Shared block adapter contracts, ublk control probing, model surface, ublk ABI, block-kernel module, and kernel storage I/O code. |

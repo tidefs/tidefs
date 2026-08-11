@@ -42,7 +42,6 @@ use persistence::{
     PersistentSwapMode,
 };
 use tidefs_dir_index::SwapMode;
-use tidefs_orphan_index::OrphanIndex;
 
 #[cfg(feature = "persistent-dir-index")]
 use tidefs_dir_index::persistent::PersistentDirIndex;
@@ -506,7 +505,6 @@ pub struct Namespace {
     inode_table: Arc<MemInodeTable>,
     dirs: Arc<RwLock<HashMap<Inode, DirBackend>>>,
     symlink_targets: RwLock<HashMap<Inode, Vec<u8>>>,
-    orphan_index: RwLock<OrphanIndex>,
     #[allow(dead_code)]
     persistent_inodes: Option<Arc<dyn PersistentInodeStore>>,
     #[allow(dead_code)]
@@ -888,7 +886,6 @@ impl Namespace {
             inode_table,
             dirs: Arc::new(RwLock::new(dirs)),
             symlink_targets: RwLock::new(HashMap::new()),
-            orphan_index: RwLock::new(OrphanIndex::new()),
             #[cfg(feature = "persistent-dir-index")]
             persistent_object_store_root: None,
             #[cfg(feature = "persistent-dir-index")]
@@ -917,7 +914,6 @@ impl Namespace {
             persistent_dirs_shared: false,
             policy,
             dataset_identity: NamespaceDatasetIdentity::default(),
-            orphan_index: RwLock::new(OrphanIndex::new()),
             ..ns
         }
     }
@@ -997,7 +993,6 @@ impl Namespace {
             persistent_dirs_shared,
             inode_table,
             dirs: dirs_arc,
-            orphan_index: RwLock::new(OrphanIndex::new()),
             symlink_targets: RwLock::new(HashMap::new()),
             #[cfg(feature = "persistent-dir-index")]
             persistent_object_store_root: None,
@@ -1256,7 +1251,6 @@ impl Namespace {
             inode_table,
             dirs: Arc::new(RwLock::new(dirs)),
             symlink_targets: RwLock::new(HashMap::new()),
-            orphan_index: RwLock::new(OrphanIndex::new()),
             persistent_object_store_root: Some(store.root().to_path_buf()),
             persistent_manifest_dirs: RwLock::new(manifest_dirs),
             policy,
@@ -1751,66 +1745,6 @@ impl Namespace {
             .insert(ino, target.to_vec());
 
         Ok(ino)
-    }
-
-    // ------------------------------------------------------------------
-    // Orphan index / O_TMPFILE integration
-    // ------------------------------------------------------------------
-
-    /// Track an anonymous O_TMPFILE inode in the orphan index.
-    ///
-    /// Called when `open(O_TMPFILE)` creates an inode with nlink==0.
-    /// The entry is stored with the O_TMPFILE flag and the creating
-    /// process PID so the timeout reaper can clean up if the process
-    /// exits without linking.
-    pub fn track_anonymous_inode(
-        &self,
-        inode_id: u64,
-        generation: u64,
-        creating_pid: u32,
-        txg: u64,
-    ) -> Result<bool, NamespaceError> {
-        self.ensure_mutation_allowed("track anonymous namespace inode")?;
-        Ok(self.orphan_index.write().unwrap().insert_tmpfile(
-            inode_id,
-            generation,
-            creating_pid,
-            txg,
-        ))
-    }
-
-    /// Remove an inode from the orphan index when it is linked into
-    /// the namespace.
-    ///
-    /// Called when a previously-anonymous O_TMPFILE inode receives a
-    /// directory entry via `linkat`, making nlink==1. The inode is
-    /// no longer orphaned.
-    ///
-    /// Returns `true` if the inode was in the orphan index and removed.
-    pub fn on_orphan_link(&self, inode_id: u64, txg: u64) -> Result<bool, NamespaceError> {
-        self.ensure_mutation_allowed("link anonymous namespace inode")?;
-        Ok(self
-            .orphan_index
-            .write()
-            .unwrap()
-            .remove_on_link(inode_id, txg))
-    }
-
-    /// Scan the orphan index for O_TMPFILE entries whose creating
-    /// process has exited.
-    ///
-    /// Returns the list of inode IDs that should be reaped. The caller
-    /// is responsible for reclaiming the extents and removing the entry
-    /// from the index.
-    #[must_use]
-    pub fn reap_tmpfile_timeouts(&self) -> Vec<u64> {
-        self.orphan_index.read().unwrap().tmpfile_timeout_reap()
-    }
-
-    /// Return the number of entries in the orphan index.
-    #[must_use]
-    pub fn orphan_count(&self) -> usize {
-        self.orphan_index.read().unwrap().len()
     }
 
     /// Return the byte-preserved target for a symbolic link inode.
@@ -2834,10 +2768,6 @@ mod tests {
         ));
         assert!(matches!(
             namespace.rename(ROOT_INODE, "same", ROOT_INODE, "same"),
-            Err(NamespaceError::MutationRequiresReopen { .. })
-        ));
-        assert!(matches!(
-            namespace.track_anonymous_inode(9, 1, 1, 0),
             Err(NamespaceError::MutationRequiresReopen { .. })
         ));
     }
@@ -4942,93 +4872,6 @@ mod tests {
             handle.join().expect("thread panicked");
         }
     }
-    // ── Orphan index / O_TMPFILE integration tests ──────────────────
-
-    #[test]
-    fn orphan_index_starts_empty() {
-        let ns = Namespace::new();
-        assert_eq!(ns.orphan_count(), 0);
-    }
-
-    #[test]
-    fn track_anonymous_inode_inserts_into_orphan_index() {
-        let ns = Namespace::new();
-        assert!(ns.track_anonymous_inode(10, 100, 1234, 0).unwrap());
-        assert_eq!(ns.orphan_count(), 1);
-    }
-
-    #[test]
-    fn track_anonymous_inode_duplicate_returns_false() {
-        let ns = Namespace::new();
-        assert!(ns.track_anonymous_inode(1, 10, 100, 0).unwrap());
-        assert!(!ns.track_anonymous_inode(1, 20, 200, 0).unwrap());
-        assert_eq!(ns.orphan_count(), 1);
-    }
-
-    #[test]
-    fn on_orphan_link_removes_from_index() {
-        let ns = Namespace::new();
-        ns.track_anonymous_inode(5, 50, 999, 0).unwrap();
-        assert_eq!(ns.orphan_count(), 1);
-        assert!(ns.on_orphan_link(5, 0).unwrap());
-        assert_eq!(ns.orphan_count(), 0);
-    }
-
-    #[test]
-    fn on_orphan_link_nonexistent_returns_false() {
-        let ns = Namespace::new();
-        assert!(!ns.on_orphan_link(999, 0).unwrap());
-    }
-
-    #[test]
-    fn reap_tmpfile_timeouts_uses_process_liveness() {
-        let ns = Namespace::new();
-        // PID 1 (init) is always alive
-        ns.track_anonymous_inode(10, 100, 1, 0).unwrap();
-        let reap = ns.reap_tmpfile_timeouts();
-        assert!(reap.is_empty(), "PID 1 should be alive");
-    }
-
-    #[test]
-    fn reap_tmpfile_timeouts_detects_dead_process() {
-        let ns = Namespace::new();
-        // Very high PID that does not exist
-        ns.track_anonymous_inode(20, 200, 0xFFFFFD, 0).unwrap();
-        let reap = ns.reap_tmpfile_timeouts();
-        assert_eq!(reap, vec![20]);
-    }
-
-    #[test]
-    fn track_link_reap_cycle() {
-        let ns = Namespace::new();
-        // Create tmpfile
-        assert!(ns.track_anonymous_inode(100, 1000, 42, 0).unwrap());
-        assert_eq!(ns.orphan_count(), 1);
-        // Link it
-        assert!(ns.on_orphan_link(100, 0).unwrap());
-        assert_eq!(ns.orphan_count(), 0);
-        // Link again is no-op
-        assert!(!ns.on_orphan_link(100, 0).unwrap());
-    }
-
-    #[test]
-    fn multiple_tmpfiles_mixed_reap() {
-        let ns = Namespace::new();
-        // PID 1 is alive
-        ns.track_anonymous_inode(1, 10, 1, 0).unwrap();
-        // Dead PID
-        ns.track_anonymous_inode(2, 20, 0xFFFFFC, 0).unwrap();
-        // Zero PID (old recovery) is always reaped
-        ns.track_anonymous_inode(3, 30, 0, 0).unwrap();
-        let reap = ns.reap_tmpfile_timeouts();
-        // Both dead-PID and zero-PID should be reaped
-        assert_eq!(reap.len(), 2);
-        assert!(reap.contains(&2));
-        assert!(reap.contains(&3));
-        // PID 1 should not be reaped
-        assert!(!reap.contains(&1));
-    }
-
     // ------------------------------------------------------------------
     // mknod special node kind / rdev preservation tests (#6635)
     // ------------------------------------------------------------------

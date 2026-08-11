@@ -16,10 +16,12 @@ use std::fs;
 use std::{env, sync::Once};
 
 use tidefs_local_filesystem::{
-    LocalFileSystem, DEFAULT_DIRECTORY_PERMISSIONS, DEFAULT_FILE_PERMISSIONS,
+    content_object_key_for_version, LocalFileSystem, DEFAULT_DIRECTORY_PERMISSIONS,
+    DEFAULT_FILE_PERMISSIONS,
 };
 use tidefs_local_object_store::{
-    CrashInjectionConfig, FaultInjectionConfig, LocalObjectStore, ObjectKey, StoreOptions,
+    CrashInjectionConfig, FaultInjectionConfig, LocalObjectStore, ObjectKey, ObjectLocation,
+    StoreOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -345,6 +347,18 @@ fn corrupt_segment_byte(seg_path: &std::path::Path, offset: u64) {
     buf[0] ^= 0xFF;
     file.seek(SeekFrom::Start(offset)).expect("seek back");
     file.write_all(&buf).expect("write corrupted byte");
+    file.sync_data().expect("persist corrupted byte");
+}
+
+fn object_record_path(store: &LocalObjectStore, location: ObjectLocation) -> std::path::PathBuf {
+    let segments_dir = store.segments_dir();
+    if segments_dir.is_file() || (segments_dir.exists() && !segments_dir.is_dir()) {
+        segments_dir.to_path_buf()
+    } else {
+        segments_dir.join(tidefs_local_object_store::segment_file_name(
+            location.segment_id,
+        ))
+    }
 }
 
 /// Corrupt a single byte at the given offset in a segment file.
@@ -421,7 +435,7 @@ fn scrub_detects_injected_byte_corruption() {
     let root = temp_root("scrub-fault");
 
     // Phase 1: create committed filesystem content with known checksums.
-    {
+    let content_key = {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
         fs.create_dir("/scrub", DEFAULT_DIRECTORY_PERMISSIONS)
             .expect("mkdir scrub");
@@ -434,35 +448,28 @@ fn scrub_detects_injected_byte_corruption() {
                 .expect("write data file");
         }
         fs.sync_all().expect("sync clean");
-    }
+        let inode = fs.stat("/scrub/data_0.txt").expect("stat scrub file");
+        content_object_key_for_version(inode.inode_id, inode.data_version)
+    };
 
     // Phase 2: corrupt segment bytes on disk to trigger checksum mismatches.
     // The online verifier must detect these and report IssuesFound.
     {
-        let store =
-            LocalObjectStore::open_with_options(&root, opts()).expect("open store for corruption");
-        let keys = store.list_keys();
-        let mut corrupted: u32 = 0;
-        for key in &keys {
-            let locs = store.version_locations_of(*key);
-            for loc in &locs {
-                let seg_path = store
-                    .segments_dir()
-                    .join(tidefs_local_object_store::segment_file_name(loc.segment_id));
-                let payload_start =
-                    loc.record_offset + tidefs_local_object_store::RECORD_HEADER_LEN as u64;
-                // Corrupt a single byte in the payload, invalidating the checksum.
-                corrupt_segment_byte(&seg_path, payload_start);
-                corrupted += 1;
-                if corrupted >= 3 {
-                    break;
-                }
-            }
-            if corrupted >= 3 {
-                break;
-            }
+        let store_options = opts();
+        let pool = LocalFileSystem::default_development_pool(&root, &store_options, None, None)
+            .expect("open Pool for corruption");
+        let store = pool.raw_primary_store();
+        let locations = store.version_locations_of(content_key);
+        assert!(
+            !locations.is_empty(),
+            "selected live content object must have physical records"
+        );
+        for location in locations {
+            let seg_path = object_record_path(store, location);
+            // Corrupt every retained version so append-only local fallback
+            // cannot legitimately recover the selected content object.
+            corrupt_segment_byte(&seg_path, location.payload_offset);
         }
-        drop(store);
     }
 
     // Phase 3: run the online verifier — must detect checksum mismatches.
@@ -813,6 +820,7 @@ fn crash_test_child_workload() {
             let _ = fs.sync_all();
         }
         // Repair hooks: trigger repair_cycle
+        #[cfg(feature = "distributed-repair")]
         CrashInjectionPoint::RepairBeforeApply
         | CrashInjectionPoint::RepairBeforeWriteback
         | CrashInjectionPoint::RepairAfterWriteback => {
@@ -1469,6 +1477,7 @@ fn double_crash_recovery_chain_preserves_committed_roots() {
 /// REL-STOR-014: interrupted repair scenario for the storage recovery
 /// failure-injection campaign.
 #[test]
+#[cfg(feature = "distributed-repair")]
 fn interrupted_repair_preserves_committed_data() {
     set_test_key();
     let root = temp_root("interrupted-repair");
@@ -1489,28 +1498,23 @@ fn interrupted_repair_preserves_committed_data() {
 
     // -- Phase 2: Inject corruption into a segment file on disk ---------
     {
-        let store =
-            LocalObjectStore::open_with_options(&root, store_opts.clone()).expect("open store");
-        let segments_dir = store.segments_dir().to_path_buf();
+        let pool = LocalFileSystem::default_development_pool(&root, &store_opts, None, None)
+            .expect("open Pool for corruption");
+        let store = pool.raw_primary_store();
         let keys = store.list_keys();
 
         let mut corrupted = false;
         for key in &keys {
             let locs = store.version_locations_of(*key);
             if let Some(loc) = locs.first() {
-                let seg_path =
-                    segments_dir.join(tidefs_local_object_store::segment_file_name(loc.segment_id));
-                let payload_start =
-                    loc.record_offset + tidefs_local_object_store::RECORD_HEADER_LEN as u64;
-
-                corrupt_segment_byte(&seg_path, payload_start);
+                let seg_path = object_record_path(store, *loc);
+                corrupt_segment_byte(&seg_path, loc.payload_offset);
                 corrupted = true;
             }
             if corrupted {
                 break;
             }
         }
-        drop(store);
     }
 
     // -- Phase 3: Crash during repair (RepairBeforeApply hook) ----------
@@ -1617,21 +1621,16 @@ fn missing_device_graceful_detection() {
         drop(fs);
     }
 
-    // -- Phase 2: Simulate device loss — delete segment files -----------
-    let segments_dir = root.join("segments");
+    // -- Phase 2: Simulate loss of the configured Pool data device -------
+    let pool = LocalFileSystem::default_development_pool(&root, &opts(), None, None)
+        .expect("open Pool to locate data device");
+    let device_path = pool.raw_primary_store().segments_dir().to_path_buf();
+    drop(pool);
     assert!(
-        segments_dir.is_dir(),
-        "segments dir must exist before device loss"
+        device_path.is_file(),
+        "selected Pool data device must exist before device loss"
     );
-
-    // Remove all segment files from the segments directory
-    for entry in std::fs::read_dir(&segments_dir).expect("read segments dir") {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        if path.is_file() {
-            std::fs::remove_file(&path).expect("remove segment file");
-        }
-    }
+    std::fs::remove_file(&device_path).expect("remove selected Pool data device");
 
     // -- Phase 3: Reopen after device loss -------------------------------
     // Two valid outcomes:
@@ -1916,6 +1915,7 @@ fn chaos_cycle_child_workload() {
             let _ = fs.fallocate_file("/chaos_alloc.txt", 0, 4096);
             let _ = fs.sync_all();
         }
+        #[cfg(feature = "distributed-repair")]
         CrashInjectionPoint::RepairBeforeApply
         | CrashInjectionPoint::RepairBeforeWriteback
         | CrashInjectionPoint::RepairAfterWriteback => {
@@ -1991,6 +1991,7 @@ fn chaos_soak_crash_recovery_campaign() {
         .iter()
         .copied()
         .filter(|p| !p.is_recovery_hook())
+        .filter(|p| cfg!(feature = "distributed-repair") || !p.is_repair_hook())
         .collect();
 
     let root_str = root.to_str().unwrap();
@@ -2079,6 +2080,7 @@ fn chaos_soak_crash_recovery_campaign() {
 /// the 12 crate-level tests in repair_scheduling.rs) ensures duplicate
 /// mark_repaired/mark_failed/ingest operations are safe no-ops.
 #[test]
+#[cfg(feature = "distributed-repair")]
 fn repair_cycle_repeated_calls_idempotent() {
     set_test_key();
     let root = temp_root("repair-idempotent");

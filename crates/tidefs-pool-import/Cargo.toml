@@ -19,7 +19,6 @@ dataset mount readiness, and pool activation. Phase 3 of pool import/export.
 tidefs-auth = { workspace = true }
 tidefs-pool-scan = { workspace = true }
 tidefs-local-object-store = { workspace = true }
-tidefs-device-removal = { workspace = true }
 tidefs-types-pool-label-core = { workspace = true, features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 tidefs-commit_group = { workspace = true }
