@@ -8818,20 +8818,27 @@ impl LocalFileSystem {
         // same commit boundary.
         self.begin_mutation("write mounted file data")?;
         if physical_admit_bytes > 0 {
-            let handle = match self.reserve_with_hierarchy_replacement_credit(
-                physical_admit_bytes,
-                replacement_credit_bytes,
-            ) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    self.rollback_mutation_delta();
-                    return Err(error);
+            let reservation_error = {
+                match self.reserve_with_hierarchy_replacement_credit(
+                    physical_admit_bytes,
+                    replacement_credit_bytes,
+                ) {
+                    Ok(handle) => {
+                        // Immediately commit: reserved bytes become transient
+                        // used bytes until the dirty buffer either flushes or
+                        // is discarded.  Consuming the handle inside this
+                        // scope releases its immutable borrow before rollback
+                        // can mutate the transaction delta.
+                        handle.commit();
+                        None
+                    }
+                    Err(error) => Some(error),
                 }
             };
-            // Immediately commit: reserved bytes become transient used bytes
-            // until the dirty buffer either flushes or is discarded.
-            // The handle is consumed here, releasing the immutable borrow on self.
-            handle.commit();
+            if let Some(error) = reservation_error {
+                self.rollback_mutation_delta();
+                return Err(error);
+            }
         }
         check_crash_hook(CrashInjectionPoint::OpWriteBeforeExtentUpdate);
         // Buffered writes change the read overlay immediately, but the
@@ -18572,7 +18579,7 @@ mod recovery_integration_tests {
 
         // Session 2: reopen and verify data survived.
         {
-            let mut fs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
+            let fs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
                 &root,
                 LocalFileSystemOpenConfig {
                     options: test_options(),
