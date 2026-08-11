@@ -2044,11 +2044,6 @@ impl MountedRawStoreDiagnostics<'_> {
         Ok(self.store.verify_checksum_tree(key, &tree).map(Some)?)
     }
 
-    fn current_content_object_exists(&self, record: &InodeRecord) -> bool {
-        let key = content_object_key_for_version(record.inode_id, record.data_version);
-        self.store.contains_key(key)
-    }
-
     fn suspect_log_stats(&self) -> SuspectLogStats {
         self.store.suspect_log().stats()
     }
@@ -4525,20 +4520,22 @@ impl LocalFileSystem {
             .verify_file_checksum_tree(&record, block_size)
     }
 
-    /// Diagnostic current content-object presence projection.
+    /// Diagnostic current receipt-backed content-object presence projection.
     ///
     /// This intentionally answers only whether the file's current
-    /// `(inode_id, data_version)` content object exists in the mounted
-    /// filesystem's lower store. It does not expose raw object-store keys,
-    /// payloads, or store handles to mounted callers.
+    /// `(inode_id, data_version)` content object can be read through one
+    /// strict current Pool placement receipt. It does not expose object-store
+    /// keys, payloads, receipts, or store handles to mounted callers.
     pub fn current_content_object_exists_for_diagnostic(
         &self,
         path: impl AsRef<str>,
     ) -> Result<bool> {
         let record = self.stat(path)?;
+        let key = content_object_key_for_version(record.inode_id, record.data_version);
         Ok(self
-            .mounted_raw_store_diagnostics()
-            .current_content_object_exists(&record))
+            .store
+            .get_with_current_receipt(DeviceIoClass::Data, key)?
+            .is_some())
     }
 
     /// Return the committed root pointer from the transaction-group manager
@@ -8210,20 +8207,33 @@ impl LocalFileSystem {
         Ok(())
     }
 
-    /// Flush buffered writes for a single inode to the object store.
-    pub fn flush_write_buffer(&mut self, inode_id: InodeId) -> Result<()> {
+    fn materialize_write_buffer(&mut self, inode_id: InodeId) -> Result<bool> {
         self.ensure_mutation_allowed("flush inode write buffer")?;
         self.snapshot_write_buffers_for_rollback();
         let segments = match self.write_buffers.get_mut(&inode_id) {
             Some(wb) if !wb.is_empty() => wb.drain(),
             Some(_) => {
                 self.write_buffers.remove(&inode_id);
-                return Ok(());
+                return Ok(false);
             }
-            None => return Ok(()),
+            None => return Ok(false),
         };
         self.write_buffers.remove(&inode_id);
-        self.flush_drained_write_segments(inode_id, segments)
+        self.flush_drained_write_segments(inode_id, segments)?;
+        Ok(true)
+    }
+
+    /// Flush buffered writes for a single inode to the object store.
+    pub fn flush_write_buffer(&mut self, inode_id: InodeId) -> Result<()> {
+        if self.materialize_write_buffer(inode_id)? {
+            // Accepted buffered bytes already belong to this commit group.
+            // Decide whether to publish only after their Pool content and
+            // extent state are complete. `do_commit()` uses the internal
+            // materialization path below, so flushing from a commit cannot
+            // recursively start another commit.
+            self.commit_mutation(())?;
+        }
+        Ok(())
     }
 
     /// Flush all write buffers to the object store.
@@ -8231,7 +8241,7 @@ impl LocalFileSystem {
         self.ensure_mutation_allowed("flush all write buffers")?;
         let inodes: Vec<InodeId> = self.write_buffers.keys().copied().collect();
         for inode_id in inodes {
-            self.flush_write_buffer(inode_id)?;
+            self.materialize_write_buffer(inode_id)?;
         }
         Ok(())
     }
@@ -13898,21 +13908,27 @@ impl LocalFileSystem {
     ) -> Result<()> {
         let mut current_entries = BTreeMap::new();
         for live_record in self.state.inodes.values() {
-            if !live_record.is_file_like() || Some(live_record.inode_id) == replaced_inode {
+            if !live_record.is_file_like() {
                 continue;
             }
             // Accepted buffered writes are immediately visible through
             // state.inodes, but their new content identity is not Pool-readable
-            // until writeback. Capacity projection must therefore retain the
-            // last materialized record for every other buffered inode.
+            // until writeback. Capacity projection and replaced-content
+            // validation must therefore use the last materialized record.
             let pool_readable_record = self
                 .buffered_write_base_records
                 .get(&live_record.inode_id)
                 .unwrap_or(live_record);
-            merge_allocation_entries(
-                &mut current_entries,
-                content_allocation_entries_for_inode_pool(&self.store, pool_readable_record)?,
-            );
+            let inode_entries =
+                content_allocation_entries_for_inode_pool(&self.store, pool_readable_record)?;
+            // A replacement does not reserve both the old and planned live
+            // inode images, but it still must prove every current chunk
+            // through strict Pool receipt authority before the old image can
+            // be superseded.
+            if Some(live_record.inode_id) == replaced_inode {
+                continue;
+            }
+            merge_allocation_entries(&mut current_entries, inode_entries);
         }
         merge_allocation_entries(&mut current_entries, planned_entries);
         self.ensure_content_capacity_for_current_entries(current_entries)
@@ -17440,6 +17456,11 @@ mod orphan_index_integration_tests {
         let count = 10u64;
         {
             let mut fs = LocalFileSystem::open(&root).expect("open");
+            // Keep this recovery case deterministic: the production scheduler
+            // may otherwise reclaim part of the orphan set while a loaded
+            // test process is still constructing it. Reopen below owns the
+            // reclamation boundary this test is meant to exercise.
+            fs.stop_background_scheduler();
             for i in 1..=count {
                 let path = format!("/orphan_{i}");
                 fs.create_file(&path, 0o644).expect("create_file");

@@ -2338,7 +2338,7 @@ fn random_write_updates_only_intersecting_chunk_refs() {
 }
 
 #[test]
-fn overlay_write_records_padded_dirty_bytes() {
+fn overlay_write_records_exact_dirty_range_bytes() {
     let root = temp_root("overlay-write-dirty-bytes");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     let record = fs.create_file("/dirty.bin", 0o644).expect("create file");
@@ -2347,21 +2347,22 @@ fn overlay_write_records_padded_dirty_bytes() {
     fs.set_max_uncommitted_mutations(1_000_000)
         .expect("test setup mutation must be admitted");
 
-    fs.write_file("/dirty.bin", 0, &[0x5a; 4096])
+    const WRITE_LEN: usize = 4096;
+    fs.write_file("/dirty.bin", 0, &[0x5a; WRITE_LEN])
         .expect("write small overlay");
     fs.flush_write_buffer(record.inode_id)
         .expect("flush write buffer");
 
-    assert_eq!(fs.dirty_set.data_bytes, content_chunk_size() as u64);
+    assert_eq!(fs.dirty_set.data_bytes, WRITE_LEN as u64);
     assert_eq!(
         fs.dirty_set.per_inode_bytes.get(&record.inode_id).copied(),
-        Some(content_chunk_size() as u64)
+        Some(WRITE_LEN as u64)
     );
     cleanup(&root);
 }
 
 #[test]
-fn overlay_write_commits_when_padded_dirty_bytes_cross_target() {
+fn overlay_write_commits_when_exact_dirty_bytes_cross_target() {
     let root = temp_root("overlay-write-byte-target");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     let record = fs.create_file("/pressure.bin", 0o644).expect("create file");
@@ -2369,13 +2370,14 @@ fn overlay_write_commits_when_padded_dirty_bytes_cross_target() {
         .expect("test setup mutation must be admitted");
     fs.set_max_uncommitted_mutations(1_000_000)
         .expect("test setup mutation must be admitted");
-    fs.commit_group.config.commit_group_target_bytes = content_chunk_size() as u64;
+    const WRITE_LEN: usize = 4096;
+    fs.commit_group.config.commit_group_target_bytes = WRITE_LEN as u64;
     fs.commit_group.config.commit_group_target_ops = u64::MAX;
     fs.commit_group.config.commit_group_dirty_max_bytes = u64::MAX;
     fs.commit_group.config.commit_group_target_secs = 3600.0;
     let start_commit_group = fs.commit_group.current_commit_group().0;
 
-    fs.write_file("/pressure.bin", 0, &[0xa5; 4096])
+    fs.write_file("/pressure.bin", 0, &[0xa5; WRITE_LEN])
         .expect("write small overlay");
     fs.flush_write_buffer(record.inode_id)
         .expect("flush write buffer");
@@ -7418,6 +7420,22 @@ fn flushed_sparse_strided_writes_keep_unwritten_holes_sparse() {
     fs.truncate_file("/aio.dat", file_size)
         .expect("sparse extend");
     let inode_id = fs.stat("/aio.dat").expect("stat sparse file").inode_id;
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    let reclaim_keys_before_writes: BTreeSet<ReclaimObjectKey> = fs
+        .reclaim_queue
+        .lock()
+        .unwrap()
+        .entries()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    let base_record = fs
+        .committed_inode_record(inode_id)
+        .expect("read sparse writeback base record");
+    let replaced_manifest_key = ReclaimObjectKey(
+        *content_object_key_for_version(inode_id, base_record.data_version).as_bytes(),
+    );
 
     for index in 0..write_count {
         let offset = index * step;
@@ -7459,14 +7477,28 @@ fn flushed_sparse_strided_writes_keep_unwritten_holes_sparse() {
         "unwritten chunk between strided writes must remain a zero hole"
     );
 
-    assert_eq!(fs.reclaim_queue_depth(), 0);
-    fs.set_auto_commit(false)
-        .expect("test setup mutation must be admitted");
+    let new_reclaim_entries: Vec<_> = fs
+        .reclaim_queue
+        .lock()
+        .unwrap()
+        .entries()
+        .into_iter()
+        .filter(|(key, _)| !reclaim_keys_before_writes.contains(key))
+        .collect();
+    assert_eq!(
+        new_reclaim_entries,
+        vec![(
+            replaced_manifest_key,
+            ReclaimQueueEntry::new(replaced_manifest_key, -1, ReclaimQueueFamily::Extent),
+        )],
+        "sparse writeback may retire its old manifest but must not queue unwritten hole chunks",
+    );
+    let reclaim_depth_after_writeback = fs.reclaim_queue_depth();
     fs.unlink("/aio.dat").expect("unlink sparse stride file");
     let reclaim_depth = fs.reclaim_queue_depth();
     assert!(
-        reclaim_depth <= write_count as usize + 4,
-        "sparse unlink should queue only materialized chunks plus metadata keys; depth={reclaim_depth}"
+        reclaim_depth.saturating_sub(reclaim_depth_after_writeback) <= write_count as usize + 4,
+        "sparse unlink should queue only materialized chunks plus metadata keys; before={reclaim_depth_after_writeback} after={reclaim_depth}"
     );
 
     drop(fs);
@@ -10690,7 +10722,7 @@ fn mounted_dataset_spacebook_counters_use_mounted_dataset_id() {
 }
 
 #[test]
-fn cache_governor_charges_mounted_dataset_partition() {
+fn inode_cache_governor_charges_mounted_dataset_partition() {
     let root = temp_root("mounted-dataset-cache-governor");
     let mounted_dataset_id = [0x73; 16];
     let next_dataset_id = [0x74; 16];
@@ -10722,6 +10754,7 @@ fn cache_governor_charges_mounted_dataset_partition() {
         .expect("create file");
     fs.write_file("/cache-owned.bin", 0, payload)
         .expect("write file");
+    fs.sync_all().expect("commit file through Pool authority");
     assert_eq!(
         fs.read_file("/cache-owned.bin").expect("read file"),
         payload.to_vec()
@@ -10735,7 +10768,8 @@ fn cache_governor_charges_mounted_dataset_partition() {
             mounted_partition,
             tidefs_cache_core::BudgetCategory::DataCache
         ),
-        payload.len() as u64
+        0,
+        "Pool content reads must not recreate the removed whole-file cache"
     );
     assert!(
         governor.partition_used(
