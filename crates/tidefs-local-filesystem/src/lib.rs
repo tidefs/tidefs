@@ -8811,11 +8811,23 @@ impl LocalFileSystem {
             &dirty_charge_ranges,
         )?;
         let logical_growth_bytes = new_size.saturating_sub(record.size);
+        // A buffered write is one mounted mutation even when it reaches the
+        // foreground writeback threshold immediately.  Start rollback
+        // authority before accepting its capacity hold so a threshold flush
+        // can publish the inode, Pool content, and accounting delta in the
+        // same commit boundary.
+        self.begin_mutation("write mounted file data")?;
         if physical_admit_bytes > 0 {
-            let handle = self.reserve_with_hierarchy_replacement_credit(
+            let handle = match self.reserve_with_hierarchy_replacement_credit(
                 physical_admit_bytes,
                 replacement_credit_bytes,
-            )?;
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.rollback_mutation_delta();
+                    return Err(error);
+                }
+            };
             // Immediately commit: reserved bytes become transient used bytes
             // until the dirty buffer either flushes or is discarded.
             // The handle is consumed here, releasing the immutable borrow on self.
@@ -8872,7 +8884,7 @@ impl LocalFileSystem {
         // any tracked buffer.  The permit conserves dirty-byte and
         // dirty-op budget until the commit group SYNC releases it.
         if let Err(err) = self.try_admit_write(physical_admit_bytes, 1) {
-            self.capacity_authority.record_free(physical_admit_bytes);
+            self.rollback_mutation_delta();
             return Err(err);
         }
         let should_flush = {
@@ -8913,81 +8925,85 @@ impl LocalFileSystem {
             .extent_allocator
             .allocate_extent(inode_id.0, offset, bytes_len, None);
         self.state.dirty_extent_maps.insert(inode_id);
+
+        // These deltas describe the accepted write whose pending inode and
+        // content are already dirty above.  Record them before a possible
+        // threshold flush: rewrite_content may synchronously publish the
+        // transaction, and that root must never precede its capacity truth.
+        if delta_bytes > 0 {
+            self.state
+                .quota_table
+                .apply_delta(inode_ancestors, delta_bytes, 0);
+        }
+        if logical_growth_bytes > 0 {
+            self.state
+                .space_accounting
+                .accumulate_delta(SpaceDelta::new_write(logical_growth_bytes));
+        }
+        self.state
+            .space_accounting
+            .track_physical_write(physical_admit_bytes);
         if should_flush {
             if let Err(err) = self.flush_write_buffer(inode_id) {
-                if let Some((
-                    old_write_buffer,
-                    old_base_record,
-                    old_live_record,
-                    old_extent_allocator,
-                    old_dirty_extent_maps,
-                    old_dirty_ranges,
-                    old_generation,
-                    old_dirty_content,
-                    old_dirty_inodes,
-                    old_dirty_dirs,
-                    old_dirty_set,
-                )) = foreground_flush_rollback
-                {
-                    match old_write_buffer {
-                        Some(wb) => {
-                            self.write_buffers.insert(inode_id, wb);
+                if !err.keeps_live_state_on_error() {
+                    self.rollback_mutation_delta();
+                    if let Some((
+                        old_write_buffer,
+                        old_base_record,
+                        old_live_record,
+                        old_extent_allocator,
+                        old_dirty_extent_maps,
+                        old_dirty_ranges,
+                        old_generation,
+                        old_dirty_content,
+                        old_dirty_inodes,
+                        old_dirty_dirs,
+                        old_dirty_set,
+                    )) = foreground_flush_rollback
+                    {
+                        match old_write_buffer {
+                            Some(wb) => {
+                                self.write_buffers.insert(inode_id, wb);
+                            }
+                            None => {
+                                self.write_buffers.remove(&inode_id);
+                            }
                         }
-                        None => {
-                            self.write_buffers.remove(&inode_id);
+                        match old_base_record {
+                            Some(record) => {
+                                self.buffered_write_base_records.insert(inode_id, record);
+                            }
+                            None => {
+                                self.buffered_write_base_records.remove(&inode_id);
+                            }
                         }
+                        match old_live_record {
+                            Some(record) => {
+                                Arc::make_mut(&mut self.state.inodes).insert(inode_id, record);
+                            }
+                            None => {
+                                Arc::make_mut(&mut self.state.inodes).remove(&inode_id);
+                            }
+                        }
+                        self.extent_allocator = old_extent_allocator;
+                        self.state.dirty_extent_maps = old_dirty_extent_maps;
+                        self.state.generation = old_generation;
+                        self.state.dirty_content = old_dirty_content;
+                        self.state.dirty_inodes = old_dirty_inodes;
+                        self.state.dirty_dirs = old_dirty_dirs;
+                        self.dirty_set = old_dirty_set;
+                        self.inode_cache.borrow_mut().invalidate(inode_id);
+                        self.writeback_range_tracker
+                            .lock()
+                            .expect("locked")
+                            .restore_ranges(old_dirty_ranges);
                     }
-                    match old_base_record {
-                        Some(record) => {
-                            self.buffered_write_base_records.insert(inode_id, record);
-                        }
-                        None => {
-                            self.buffered_write_base_records.remove(&inode_id);
-                        }
-                    }
-                    match old_live_record {
-                        Some(record) => {
-                            Arc::make_mut(&mut self.state.inodes).insert(inode_id, record);
-                        }
-                        None => {
-                            Arc::make_mut(&mut self.state.inodes).remove(&inode_id);
-                        }
-                    }
-                    self.extent_allocator = old_extent_allocator;
-                    self.state.dirty_extent_maps = old_dirty_extent_maps;
-                    self.state.generation = old_generation;
-                    self.state.dirty_content = old_dirty_content;
-                    self.state.dirty_inodes = old_dirty_inodes;
-                    self.state.dirty_dirs = old_dirty_dirs;
-                    self.dirty_set = old_dirty_set;
-                    self.inode_cache.borrow_mut().invalidate(inode_id);
-                    self.writeback_range_tracker
-                        .lock()
-                        .expect("locked")
-                        .restore_ranges(old_dirty_ranges);
                 }
                 return Err(err);
             }
         }
 
         let result = self.inode(inode_id)?.clone();
-        if delta_bytes > 0 {
-            self.state
-                .quota_table
-                .apply_delta(inode_ancestors, delta_bytes, 0);
-        }
-        // Capacity admission uses worst-case physical write pressure, while
-        // committed logical usage only grows when the file grows.
-        if logical_growth_bytes > 0 {
-            self.state
-                .space_accounting
-                .accumulate_delta(SpaceDelta::new_write(logical_growth_bytes));
-        }
-        if bytes_len > 0 {
-            self.state
-                .space_accounting
-                .track_physical_write(physical_admit_bytes);
-        }
         // Capacity reservation was committed inline before the write.
         // On error paths the caller must rollback via capacity_authority.record_free.
         Ok(result)
@@ -18556,7 +18572,7 @@ mod recovery_integration_tests {
 
         // Session 2: reopen and verify data survived.
         {
-            let fs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
+            let mut fs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
                 &root,
                 LocalFileSystemOpenConfig {
                     options: test_options(),
@@ -18577,12 +18593,16 @@ mod recovery_integration_tests {
                 "data must survive fsync + reopen"
             );
 
-            // The durable commit group from session 1 should be preserved.
+            // Recovery must never regress behind the fsync boundary.  Clean
+            // close is allowed to publish a later root while draining other
+            // mounted state, so exact equality is not the durability rule.
             let after_reopen = fs.durable_commit_group();
-            assert_eq!(
-                after_reopen, durable_after_fsync,
-                "durable_commit_group must survive reopen: {after_reopen} != {durable_after_fsync}"
+            assert!(
+                after_reopen >= durable_after_fsync,
+                "durable_commit_group regressed across reopen: {after_reopen} < {durable_after_fsync}"
             );
+            fs.fsync_wait_barrier(2)
+                .expect("recovered sync gate covers the durable file boundary");
         }
 
         // Cleanup

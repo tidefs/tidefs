@@ -1029,6 +1029,10 @@ mod tests {
         fs.create_file("/test.bin", 0o644).expect("create");
         let data = vec![0xCD; 4096]; // 2 chunks
         fs.write_file("/test.bin", 0, &data).expect("write");
+        // Mounted scrub verifies the committed Pool-readable root.  Publish
+        // the accepted buffer before passing its inode version to the direct
+        // committed-content diagnostic used by this unit test.
+        fs.sync_all().expect("commit scrub test content");
 
         // Read back through scrub
         let inodes = fs.inode_records();
