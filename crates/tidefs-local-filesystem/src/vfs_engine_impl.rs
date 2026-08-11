@@ -8825,9 +8825,12 @@ mod tests {
                 .mounted_data_ranges(attr.inode_id)
                 .expect("canonical sparse Pool ranges");
             assert_eq!(ranges.len(), 16);
+            // The canonical Pool carrier allocates chunk-granular content.
+            // Each sub-chunk write therefore owns one materialized chunk even
+            // though the unwritten half still reads as a sparse zero region.
             assert_eq!(
                 ranges.iter().map(|(start, end)| end - start).sum::<u64>(),
-                (16 * chunk_len) as u64
+                16 * crate::constants::FILESYSTEM_CONTENT_CHUNK_SIZE as u64
             );
         }
 

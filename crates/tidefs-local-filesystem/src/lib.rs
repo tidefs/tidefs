@@ -8816,6 +8816,8 @@ impl LocalFileSystem {
         // authority before accepting its capacity hold so a threshold flush
         // can publish the inode, Pool content, and accounting delta in the
         // same commit boundary.
+        let mutation_was_active = self.mutation_delta.is_some();
+        let mutation_had_commit_group_write = self.mutation_recorded_commit_group_write;
         self.begin_mutation("write mounted file data")?;
         if physical_admit_bytes > 0 {
             let reservation_error = {
@@ -8836,7 +8838,14 @@ impl LocalFileSystem {
                 }
             };
             if let Some(error) = reservation_error {
-                self.rollback_mutation_delta();
+                // Admission refused this operation before it changed mounted
+                // state. Preserve any earlier accepted mutations in the open
+                // commit group instead of rolling the whole group back.
+                if mutation_was_active {
+                    self.mutation_recorded_commit_group_write = mutation_had_commit_group_write;
+                } else {
+                    self.discard_mutation_delta();
+                }
                 return Err(error);
             }
         }
@@ -8880,19 +8889,24 @@ impl LocalFileSystem {
         } else {
             None
         };
-        if bytes_len > 0 {
-            self.writeback_range_tracker
-                .lock()
-                .expect("locked")
-                .mark_dirty(inode_id, offset, bytes_len);
-        }
         self.snapshot_write_buffers_for_rollback();
         // Acquire a write-admission permit before dirty bytes enter
         // any tracked buffer.  The permit conserves dirty-byte and
         // dirty-op budget until the commit group SYNC releases it.
         if let Err(err) = self.try_admit_write(physical_admit_bytes, 1) {
-            self.rollback_mutation_delta();
+            if mutation_was_active {
+                self.capacity_authority.record_free(physical_admit_bytes);
+                self.mutation_recorded_commit_group_write = mutation_had_commit_group_write;
+            } else {
+                self.rollback_mutation_delta();
+            }
             return Err(err);
+        }
+        if bytes_len > 0 {
+            self.writeback_range_tracker
+                .lock()
+                .expect("locked")
+                .mark_dirty(inode_id, offset, bytes_len);
         }
         let should_flush = {
             let wb = self
