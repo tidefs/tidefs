@@ -113,7 +113,9 @@ pub mod xattr_integrity;
 pub mod xfstests_harness;
 
 pub mod capacity;
+#[cfg(feature = "cluster")]
 pub mod clustered_lock_forwarder;
+#[cfg(feature = "cluster")]
 pub mod clustered_mount;
 pub mod fusewire;
 pub mod ingress;
@@ -2077,6 +2079,7 @@ mod idmapped_mount_tests {
 
 // Re-export the clustered POSIX mount admission boundary so callers can use
 // the daemon crate as the mount-runtime API surface.
+#[cfg(feature = "cluster")]
 pub use clustered_mount::{
     ClusteredPosixAuthoritySnapshot, ClusteredPosixMountAdmissionError, ClusteredPosixMountRuntime,
 };

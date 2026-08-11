@@ -295,6 +295,67 @@ fn spawn_child_holding_lock(
     }
 }
 
+fn spawn_child_waiting_for_lock(
+    path: &Path,
+    lock_type: libc::c_short,
+    start: i64,
+    len: i64,
+) -> io::Result<libc::pid_t> {
+    let path = c_path(path)?;
+    let mut ready_pipe = [-1; 2];
+    pipe(&mut ready_pipe)?;
+
+    // SAFETY: fork is used only by this process-control test; parent and child
+    // close their inherited pipe fds on the paths below.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let err = io::Error::last_os_error();
+        close_fd(ready_pipe[0]);
+        close_fd(ready_pipe[1]);
+        return Err(err);
+    }
+
+    if pid == 0 {
+        close_fd(ready_pipe[0]);
+        // SAFETY: `path` is a NUL-terminated CString that remains alive in the
+        // child for the duration of the open call; the returned fd is child-owned.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd < 0 {
+            write_i32_fd(ready_pipe[1], errno());
+            close_fd(ready_pipe[1]);
+            // SAFETY: the child reports its open failure and exits without
+            // running parent cleanup code.
+            unsafe { libc::_exit(1) };
+        }
+
+        write_i32_fd(ready_pipe[1], 0);
+        close_fd(ready_pipe[1]);
+        let lock = flock(lock_type, start, len);
+        // SAFETY: `fd` is open and child-owned, and `lock` remains alive for
+        // the blocking fcntl call. The parent deliberately kills this child
+        // while the request is waiting.
+        let result = unsafe { libc::fcntl(fd, libc::F_SETLKW, &lock) };
+        close_fd(fd);
+        // SAFETY: the child exits immediately after its blocking call returns.
+        unsafe { libc::_exit(if result == 0 { 0 } else { 1 }) };
+    }
+
+    close_fd(ready_pipe[1]);
+    let child_errno = read_i32_fd(ready_pipe[0]);
+    close_fd(ready_pipe[0]);
+    if child_errno == 0 {
+        Ok(pid)
+    } else {
+        let mut status = 0;
+        // SAFETY: `pid` is the forked child for this helper, and `status` is
+        // valid output storage for waitpid.
+        unsafe {
+            let _ = libc::waitpid(pid, &mut status, 0);
+        }
+        Err(io::Error::from_raw_os_error(child_errno))
+    }
+}
+
 fn child_lock_attempt(
     path: &Path,
     lock_type: libc::c_short,
@@ -599,28 +660,38 @@ fn read_lock_upgrades_to_write_lock_on_same_fd() {
 
     lock_file(&file, libc::F_RDLCK as libc::c_short, 0, 128).expect("acquire read lock");
 
-    // Confirm a read lock is held
+    // F_GETLK reports only locks that would block the caller. The caller's
+    // own read lock therefore appears unlocked, while a different process
+    // may share the read lock but may not acquire a write lock.
     let conflict = get_lock(&file, libc::F_WRLCK as libc::c_short, 0, 128).expect("getlk");
     assert_eq!(
         conflict.l_type,
-        libc::F_RDLCK as libc::c_short,
-        "getlk should report a read lock"
+        libc::F_UNLCK as libc::c_short,
+        "getlk should not report the caller's own read lock"
     );
+    child_lock_attempt(&path, libc::F_RDLCK as libc::c_short, 0, 128)
+        .expect("another process should share the read lock");
+    let err = child_lock_attempt(&path, libc::F_WRLCK as libc::c_short, 0, 128)
+        .expect_err("another process write lock should conflict with the read lock");
+    assert_conflict_errno(&err);
 
     // Upgrade to write lock on the same fd
     lock_file(&file, libc::F_WRLCK as libc::c_short, 0, 128).expect("upgrade to write lock");
 
-    // Confirm write lock is held
+    // The upgraded lock still does not conflict with its own F_GETLK query.
+    // A different process must now conflict on both read and write requests.
     let conflict = get_lock(&file, libc::F_WRLCK as libc::c_short, 0, 128).expect("getlk");
     assert_eq!(
         conflict.l_type,
-        libc::F_WRLCK as libc::c_short,
-        "getlk should report a write lock after upgrade"
+        libc::F_UNLCK as libc::c_short,
+        "getlk should not report the caller's own upgraded write lock"
     );
 
-    // Another process must be blocked from write lock
+    let err = child_lock_attempt(&path, libc::F_RDLCK as libc::c_short, 0, 128)
+        .expect_err("child read lock should conflict after write upgrade");
+    assert_conflict_errno(&err);
     let err = child_lock_attempt(&path, libc::F_WRLCK as libc::c_short, 0, 128)
-        .expect_err("child write lock should conflict");
+        .expect_err("child write lock should conflict after write upgrade");
     assert_conflict_errno(&err);
 
     unlock_file(&file, 0, 128).expect("unlock");
@@ -676,6 +747,39 @@ fn process_sigkill_releases_locks_and_unblocks_setlkw_waiter() {
 }
 
 // ── BSD flock(2) helpers ──────────────────────────────────────────────
+
+#[test]
+fn killing_setlkw_waiter_cancels_deferred_lock_request() {
+    let _guard = test_lock();
+    let mount = MountedVfs::new();
+    let path = mount.path("/sigkill-waiter-file");
+    fs::write(&path, b"lock target").expect("create lock target");
+
+    let holder = open_read_write(&path);
+    lock_file(&holder, libc::F_WRLCK as libc::c_short, 0, 128).expect("hold write lock");
+    let waiter_pid = spawn_child_waiting_for_lock(&path, libc::F_WRLCK as libc::c_short, 0, 128)
+        .expect("spawn blocking lock waiter");
+
+    thread::sleep(Duration::from_millis(200));
+    let mut status = 0;
+    // SAFETY: `waiter_pid` is the child created above, and WNOHANG only
+    // observes whether its blocking lock request has returned.
+    let wait_result = unsafe { libc::waitpid(waiter_pid, &mut status, libc::WNOHANG) };
+    assert_eq!(wait_result, 0, "F_SETLKW waiter should still be blocked");
+
+    // SAFETY: `waiter_pid` names the blocked child created by this test.
+    unsafe {
+        libc::kill(waiter_pid, libc::SIGKILL);
+        libc::waitpid(waiter_pid, &mut status, 0);
+    }
+
+    // The session receive loop must process FUSE_INTERRUPT and make the
+    // deferred worker abandon its waiter before the held range is released.
+    thread::sleep(Duration::from_millis(600));
+    unlock_file(&holder, 0, 128).expect("release holder lock");
+    child_lock_attempt_until_success(&path, libc::F_WRLCK as libc::c_short, 0, 128)
+        .expect("killed waiter must not acquire an orphaned lock");
+}
 
 extern "C" {
     #[link_name = "flock"]
@@ -835,6 +939,7 @@ fn child_flock_attempt(path: &Path, operation: libc::c_int) -> io::Result<()> {
 fn child_flock_attempt_until_success(path: &Path, operation: libc::c_int) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut last_error = None;
+    let operation = operation | libc::LOCK_NB;
     while Instant::now() < deadline {
         match child_flock_attempt(path, operation) {
             Ok(()) => return Ok(()),
@@ -860,7 +965,7 @@ fn flock_shared_locks_share_concurrently() {
 
     bsd_flock(&file, libc::LOCK_SH).expect("parent shared flock");
     child_flock_attempt(&path, libc::LOCK_SH).expect("child shared flock should share");
-    let err = child_flock_attempt(&path, libc::LOCK_EX)
+    let err = child_flock_attempt(&path, libc::LOCK_EX | libc::LOCK_NB)
         .expect_err("child exclusive flock should conflict with shared holder");
     assert_conflict_errno(&err);
 
@@ -876,10 +981,10 @@ fn flock_exclusive_blocks_other_locks() {
     let file = open_read_write(&path);
 
     bsd_flock(&file, libc::LOCK_EX).expect("parent exclusive flock");
-    let err = child_flock_attempt(&path, libc::LOCK_EX)
+    let err = child_flock_attempt(&path, libc::LOCK_EX | libc::LOCK_NB)
         .expect_err("child exclusive flock should conflict");
     assert_conflict_errno(&err);
-    let err = child_flock_attempt(&path, libc::LOCK_SH)
+    let err = child_flock_attempt(&path, libc::LOCK_SH | libc::LOCK_NB)
         .expect_err("child shared flock should conflict with exclusive holder");
     assert_conflict_errno(&err);
 
@@ -897,8 +1002,8 @@ fn flock_lock_nb_returns_eagain_on_conflict() {
     let file = open_read_write(&path);
 
     bsd_flock(&file, libc::LOCK_EX).expect("parent exclusive flock");
-    let err = bsd_flock(&file, libc::LOCK_EX | libc::LOCK_NB)
-        .expect_err("LOCK_EX|LOCK_NB should conflict on same fd");
+    let err = child_flock_attempt(&path, libc::LOCK_EX | libc::LOCK_NB)
+        .expect_err("LOCK_EX|LOCK_NB should conflict on another description");
     assert_conflict_errno(&err);
 
     bsd_flock(&file, libc::LOCK_UN).expect("unlock");
@@ -913,7 +1018,7 @@ fn flock_close_releases_all_locks() {
     let file = open_read_write(&path);
 
     bsd_flock(&file, libc::LOCK_EX).expect("parent exclusive flock");
-    let err = child_flock_attempt(&path, libc::LOCK_EX)
+    let err = child_flock_attempt(&path, libc::LOCK_EX | libc::LOCK_NB)
         .expect_err("child exclusive flock should conflict before close");
     assert_conflict_errno(&err);
 
@@ -935,7 +1040,7 @@ fn flock_upgrade_from_shared_to_exclusive() {
     bsd_flock(&file, libc::LOCK_EX).expect("upgrade to exclusive flock");
 
     // Another process should be blocked
-    let err = child_flock_attempt(&path, libc::LOCK_EX)
+    let err = child_flock_attempt(&path, libc::LOCK_EX | libc::LOCK_NB)
         .expect_err("child exclusive flock should conflict after upgrade");
     assert_conflict_errno(&err);
 
@@ -952,7 +1057,7 @@ fn flock_process_exit_releases_locks() {
     let mut child = spawn_child_holding_flock(&path, libc::LOCK_EX).expect("child exclusive flock");
     let child_pid = child.pid;
 
-    let err = child_flock_attempt(&path, libc::LOCK_EX)
+    let err = child_flock_attempt(&path, libc::LOCK_EX | libc::LOCK_NB)
         .expect_err("second child should conflict with flock holder");
     assert_conflict_errno(&err);
 

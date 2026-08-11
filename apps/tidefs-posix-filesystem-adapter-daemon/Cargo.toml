@@ -30,7 +30,7 @@ tidefs-cache-core = { workspace = true }
 tidefs-extent-map = { workspace = true }
 tidefs-types-extent-map-core = { workspace = true }
 tidefs-permission = { workspace = true }
-tidefs-lock-service = { workspace = true }
+tidefs-lock-service = { workspace = true, optional = true }
 tidefs-posix-semantics = { workspace = true }
 tidefs-background-scheduler = { workspace = true }
 tidefs-local-object-store = { workspace = true }
@@ -57,7 +57,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 
 [features]
 default = []
-cluster = ["dep:bincode", "dep:tidefs-cluster"]
+cluster = ["dep:bincode", "dep:tidefs-cluster", "dep:tidefs-lock-service"]
 data-policy = ["tidefs-local-filesystem/data-policy"]
 receipt-demo = [
     "tidefs-types-posix-filesystem-adapter-core/wake-receipt",

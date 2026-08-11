@@ -1164,11 +1164,13 @@ impl LockType {
     }
 }
 
-/// POSIX advisory byte-range lock for one process.
+/// POSIX advisory byte-range lock.
 ///
-/// `pid` identifies the owning process (used for conflict detection).
-/// `owner` identifies the file-description (FUSE `lock_owner`, used for
-/// per-fd release on close).
+/// A non-zero `owner` is the kernel-supplied FUSE `lock_owner` identity used
+/// for conflict detection, range replacement, and release on close. It carries
+/// the kernel's POSIX or OFD ownership identity for that request. Internal
+/// callers that do not have that boundary use `owner == 0`, making `pid` the
+/// identity.
 /// `len == 0` means the range extends from `start` to end-of-file.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct LockRange {
@@ -1227,9 +1229,23 @@ impl LockRange {
             && !range_is_strictly_before(other.end_exclusive(), self.start)
     }
 
+    /// Return whether two ranges belong to the same advisory-lock owner.
+    ///
+    /// FUSE supplies a non-zero `lock_owner` carrying the kernel's POSIX or OFD
+    /// ownership identity. Internal callers that do not have that boundary
+    /// keep `owner == 0` and use the process id as their ownership identity.
+    #[must_use]
+    pub const fn same_owner(self, other: Self) -> bool {
+        if self.owner != 0 || other.owner != 0 {
+            self.owner != 0 && self.owner == other.owner
+        } else {
+            self.pid == other.pid
+        }
+    }
+
     #[must_use]
     pub fn conflicts_with(self, other: Self) -> bool {
-        self.pid != other.pid
+        !self.same_owner(other)
             && self.overlaps(other)
             && self.lock_type.conflicts_with(other.lock_type)
     }
@@ -1314,14 +1330,14 @@ impl LockList {
             return Err(conflict);
         }
 
-        self.remove_pid_range(requested.pid, requested);
+        self.remove_owner_range(requested);
         self.locks.push(requested);
         self.normalize();
         Ok(())
     }
 
     pub fn release(&mut self, requested: LockRange) {
-        self.remove_pid_range(requested.pid, requested);
+        self.remove_owner_range(requested);
         self.normalize();
     }
 
@@ -1333,10 +1349,10 @@ impl LockList {
         self.locks.retain(|lock| lock.owner != owner);
     }
 
-    fn remove_pid_range(&mut self, pid: u32, requested: LockRange) {
+    fn remove_owner_range(&mut self, requested: LockRange) {
         let mut replacement = alloc::vec::Vec::with_capacity(self.locks.len() + 1);
         for existing in self.locks.drain(..) {
-            if existing.pid != pid || !existing.overlaps(requested) {
+            if !existing.same_owner(requested) || !existing.overlaps(requested) {
                 replacement.push(existing);
                 continue;
             }
@@ -1350,6 +1366,7 @@ impl LockList {
             (
                 lock.start,
                 lock.end_exclusive().unwrap_or(u64::MAX),
+                lock.owner,
                 lock.pid,
                 lock.lock_type,
             )
@@ -7841,6 +7858,43 @@ mod tests {
         };
         assert_eq!(ls.typ, 1);
         assert_eq!(ls.pid, 42);
+    }
+
+    #[test]
+    fn lock_range_prefers_fuse_owner_over_shared_pid() {
+        let left = LockRange::new(0, 100, LockType::Write, 10, 42);
+        let same = LockRange::new(25, 10, LockType::Write, 10, 42);
+        let other = LockRange::new(25, 10, LockType::Write, 20, 42);
+
+        assert!(left.same_owner(same));
+        assert!(!left.conflicts_with(same));
+        assert!(!left.same_owner(other));
+        assert!(left.conflicts_with(other));
+    }
+
+    #[test]
+    fn lock_list_replaces_and_unlocks_only_the_fuse_owner() {
+        let mut locks = LockList::new();
+        locks
+            .acquire(LockRange::new(0, 100, LockType::Write, 10, 42))
+            .unwrap();
+        locks
+            .acquire(LockRange::new(25, 25, LockType::Read, 10, 42))
+            .unwrap();
+        locks
+            .acquire(LockRange::new(150, 25, LockType::Write, 20, 42))
+            .unwrap();
+
+        locks.release(LockRange::new(25, 25, LockType::Unlock, 10, 42));
+
+        assert_eq!(locks.len(), 3);
+        assert!(locks
+            .locks()
+            .iter()
+            .any(|lock| lock.owner == 20 && lock.start == 150));
+        assert!(locks
+            .query_conflict(LockRange::new(150, 1, LockType::Read, 30, 42,))
+            .is_some());
     }
 
     #[test]

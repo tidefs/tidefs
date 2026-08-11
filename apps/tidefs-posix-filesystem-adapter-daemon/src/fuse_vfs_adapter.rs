@@ -10,8 +10,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::capacity::{
@@ -45,9 +45,9 @@ use crate::workload_observer::WorkloadObserver;
 use crate::write_dispatch::DaemonWriteDispatch;
 use crate::writeback_reclaim::WritebackInodeCache;
 use fuser::{
-    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyBmap, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLock, ReplyLseek,
-    ReplyOpen, ReplyPoll, ReplyStatfs, ReplyStatx, ReplyWrite, ReplyXattr, Request,
+    AbortHandle, FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyBmap, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLock,
+    ReplyLseek, ReplyOpen, ReplyPoll, ReplyStatfs, ReplyStatx, ReplyWrite, ReplyXattr, Request,
 };
 use tidefs_background_scheduler::{BackgroundScheduler, BackgroundService};
 use tidefs_cache_core::page_cache::PageCache;
@@ -2810,7 +2810,8 @@ pub struct FuseVfsAdapter {
     file_handles: Mutex<AdapterFileHandleTable>,
     dir_handles: Mutex<AdapterDirHandleTable>,
     dentry_policy: DentryPolicy,
-    lock_dispatch: DaemonLockDispatch,
+    lock_dispatch: Arc<Mutex<DaemonLockDispatch>>,
+    lock_wait_shutdown: Arc<AtomicBool>,
     governor: Governor,
     fuse_admission_hard_policy: FuseAdmissionHardPolicy,
     prune_notify_sink: Arc<dyn FusePruneNotifySink>,
@@ -2950,7 +2951,8 @@ impl FuseVfsAdapter {
             dir_handles: Mutex::new(AdapterDirHandleTable::default()),
             dentry_policy: base_dentry_policy.for_timestamp_policy(timestamp_policy, false),
             base_dentry_policy,
-            lock_dispatch: DaemonLockDispatch::new(),
+            lock_dispatch: Arc::new(Mutex::new(DaemonLockDispatch::new())),
+            lock_wait_shutdown: Arc::new(AtomicBool::new(false)),
             governor,
             fuse_admission_hard_policy: FuseAdmissionHardPolicy::default(),
             prune_notify_sink: Arc::new(UnsupportedFusePruneNotifySink),
@@ -2999,6 +3001,12 @@ impl FuseVfsAdapter {
             #[cfg(feature = "workload-telemetry")]
             signature_cache: Arc::new(MaterializedSignatureCache::new()),
         })
+    }
+
+    fn lock_dispatch_guard(&self) -> Result<MutexGuard<'_, DaemonLockDispatch>, LockDispatchError> {
+        self.lock_dispatch
+            .lock()
+            .map_err(|_| LockDispatchError::Internal("local lock dispatch poisoned".into()))
     }
 
     pub fn engine_handle(&self) -> crate::live_owner::LiveOwnerEngine {
@@ -3122,7 +3130,12 @@ impl FuseVfsAdapter {
         if self.file_handles.lock().unwrap().open_ref_count(ino) != 0 {
             return false;
         }
-        if !self.lock_dispatch.is_empty() {
+        if !self
+            .lock_dispatch
+            .lock()
+            .map(|dispatch| dispatch.is_empty())
+            .unwrap_or(false)
+        {
             return false;
         }
         if self.inode_has_dirty_trackers(ino) || self.inode_has_dirty_page_cache_mirrors(ino) {
@@ -6865,6 +6878,8 @@ impl FuseVfsAdapter {
         // the adapter-level POSIX lock tracker).  Per FUSE protocol
         // locks are released on close(); flush fires on every close().
         self.lock_dispatch
+            .lock()
+            .map_err(|_| Errno::EIO)?
             .release_by_owner_and_inode(lock_owner, ino);
 
         Ok(())
@@ -7818,6 +7833,8 @@ impl FuseVfsAdapter {
             }
             // Release from the DaemonLockDispatch (adapter-level POSIX lock tracker).
             self.lock_dispatch
+                .lock()
+                .map_err(|_| Errno::EIO)?
                 .release_by_owner_and_inode(lock_owner, ino);
         }
         if let Some(efh) = efh {
@@ -8786,12 +8803,82 @@ fn encode_fuse_statx_out(statx: &StatxReply) -> Vec<u8> {
 
 // ── FusePosixLockDispatch impl for FuseVfsAdapter ───────────────────
 
+const BLOCKING_LOCK_INTERRUPT_POLL: Duration = Duration::from_millis(500);
+
+fn complete_blocking_setlkw(
+    lock_dispatch: Arc<Mutex<DaemonLockDispatch>>,
+    lock_wait_shutdown: Arc<AtomicBool>,
+    abort_handle: Option<AbortHandle>,
+    request: crate::fuse_posix_lock::FusePosixLockRequest,
+    reply: ReplyEmpty,
+) {
+    let setlk_request = FuseSetlkRequest {
+        fh: request.fh,
+        owner: request.lock_owner,
+        lk: FuseLockIn {
+            start: request.start,
+            end: request.end,
+            typ: request.typ as u32,
+            pid: request.pid,
+        },
+        lk_flags: 0,
+        sleep: true,
+    };
+
+    'retry: loop {
+        if lock_wait_shutdown.load(Ordering::Acquire)
+            || abort_handle.as_ref().is_some_and(AbortHandle::is_aborted)
+        {
+            reply.reply_errno(Errno::EINTR);
+            return;
+        }
+
+        let result = match lock_dispatch.lock() {
+            Ok(mut dispatch) => dispatch.setlkw(request.ino, &setlk_request),
+            Err(_) => {
+                reply.reply_errno(Errno::EIO);
+                return;
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                reply.ok();
+                return;
+            }
+            Err(LockDispatchError::Blocked { signal }) => loop {
+                if lock_wait_shutdown.load(Ordering::Acquire)
+                    || abort_handle.as_ref().is_some_and(AbortHandle::is_aborted)
+                {
+                    match lock_dispatch.lock() {
+                        Ok(mut dispatch) => dispatch.cancel_waiter(&signal),
+                        Err(_) => {
+                            reply.reply_errno(Errno::EIO);
+                            return;
+                        }
+                    }
+                    reply.reply_errno(Errno::EINTR);
+                    return;
+                }
+
+                if signal.wait_timeout(BLOCKING_LOCK_INTERRUPT_POLL) {
+                    continue 'retry;
+                }
+            },
+            Err(error) => {
+                reply.reply_errno(error.to_errno());
+                return;
+            }
+        }
+    }
+}
+
 impl crate::fuse_posix_lock::FusePosixLockDispatch for FuseVfsAdapter {
     fn getlk(
         &mut self,
         request: crate::fuse_posix_lock::FusePosixLockRequest,
     ) -> Result<Option<LockRange>, LockDispatchError> {
-        self.lock_dispatch.getlk_by_value(
+        self.lock_dispatch_guard()?.getlk_by_value(
             request.ino,
             request.lock_owner,
             request.start,
@@ -8805,7 +8892,7 @@ impl crate::fuse_posix_lock::FusePosixLockDispatch for FuseVfsAdapter {
         &mut self,
         request: crate::fuse_posix_lock::FusePosixLockRequest,
     ) -> Result<(), LockDispatchError> {
-        self.lock_dispatch.setlk_by_value(
+        self.lock_dispatch_guard()?.setlk_by_value(
             request.ino,
             request.lock_owner,
             request.start,
@@ -8833,7 +8920,7 @@ impl crate::fuse_posix_lock::FusePosixLockDispatch for FuseVfsAdapter {
             lk_flags: 0,
             sleep: true,
         };
-        self.lock_dispatch.setlkw(ino, &request)
+        self.lock_dispatch_guard()?.setlkw(ino, &request)
     }
 
     fn flock(
@@ -8843,7 +8930,8 @@ impl crate::fuse_posix_lock::FusePosixLockDispatch for FuseVfsAdapter {
         lock_owner: u64,
         typ: u32,
     ) -> Result<(), LockDispatchError> {
-        self.lock_dispatch.flock_by_value(ino, lock_owner, typ)
+        self.lock_dispatch_guard()?
+            .flock_by_value(ino, lock_owner, typ)
     }
 }
 
@@ -8892,15 +8980,25 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn destroy(&mut self) {
-        // Step 1: drain deferred forget entries before teardown
+        // Step 1: stop deferred advisory-lock waits before tearing down the
+        // carrier. Reset wakes registered waiters; the shutdown flag makes
+        // each worker answer EINTR instead of reacquiring against discarded
+        // mount-session state.
+        self.lock_wait_shutdown.store(true, Ordering::Release);
+        match self.lock_dispatch.lock() {
+            Ok(mut dispatch) => dispatch.reset(),
+            Err(_) => eprintln!("FuseVfsAdapter::destroy: local lock dispatch poisoned"),
+        }
+
+        // Step 2: drain deferred forget entries before teardown
         self.drain_all_forget_refs();
 
-        // Step 2: drain writeback + sync + commit-group barrier
+        // Step 3: drain writeback + sync + commit-group barrier
         if let Err(e) = self.shutdown() {
             eprintln!("FuseVfsAdapter::destroy: shutdown error: {e}");
         }
 
-        // Step 3: write a final committed root so the next mount can
+        // Step 4: write a final committed root so the next mount can
         // recover cleanly without intent-log replay from scratch.
         if let Err(e) = self.txg_cycle.commit_current() {
             eprintln!("FuseVfsAdapter::destroy: final commit error: {e:?}");
@@ -9961,8 +10059,8 @@ impl Filesystem for FuseVfsAdapter {
         const FUSE_LK_FLOCK: u32 = 1 << 0;
         if !sleep && lk_flags & FUSE_LK_FLOCK != 0 {
             match self
-                .lock_dispatch
-                .flock_by_value(ino, lock_owner, typ as u32)
+                .lock_dispatch_guard()
+                .and_then(|mut dispatch| dispatch.flock_by_value(ino, lock_owner, typ as u32))
             {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.reply_errno(e.to_errno()),
@@ -9981,35 +10079,28 @@ impl Filesystem for FuseVfsAdapter {
             pid,
         };
         if sleep {
-            // Blocking setlkw: block on a WaiterSignal until the lock is
-            // granted or the request is interrupted.  No arbitrary timeout.
-            loop {
-                if _req.abort_handle().is_some_and(|h| h.is_aborted()) {
-                    reply.reply_errno(Errno::EINTR);
-                    return;
-                }
-                match FusePosixLockDispatch::setlkw(self, lock_request) {
-                    Ok(()) => {
-                        reply.ok();
-                        return;
-                    }
-                    Err(LockDispatchError::Blocked { signal }) => {
-                        // Block with periodic wakeups to check for
-                        // FUSE_INTERRUPT.  When woken, retry acquisition.
-                        while !signal.wait_timeout(Duration::from_millis(500)) {
-                            if _req.abort_handle().is_some_and(|h| h.is_aborted()) {
-                                reply.reply_errno(Errno::EINTR);
-                                return;
-                            }
-                        }
-                        // Woken by release — loop back to retry.
-                        continue;
-                    }
-                    Err(e) => {
-                        reply.reply_errno(e.to_errno());
-                        return;
-                    }
-                }
+            // Session::run receives and dispatches requests serially. Keep
+            // that loop free to process FLUSH, RELEASE, DESTROY, and
+            // FUSE_INTERRUPT while this owned reply waits for the lock.
+            let lock_dispatch = Arc::clone(&self.lock_dispatch);
+            let lock_wait_shutdown = Arc::clone(&self.lock_wait_shutdown);
+            let abort_handle = _req.abort_handle();
+            let unique = _req.unique();
+            let spawn_result = std::thread::Builder::new()
+                .name(format!("tidefs-setlkw-{unique}"))
+                .spawn(move || {
+                    complete_blocking_setlkw(
+                        lock_dispatch,
+                        lock_wait_shutdown,
+                        abort_handle,
+                        lock_request,
+                        reply,
+                    );
+                });
+            if let Err(error) = spawn_result {
+                // Dropping the unspawned closure drops ReplyEmpty; fuser's
+                // reply guard sends EIO and clears the abort registration.
+                eprintln!("tidefs-vfs: failed to spawn SETLKW waiter: {error}");
             }
         } else {
             match FusePosixLockDispatch::setlk(self, lock_request) {
