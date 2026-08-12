@@ -11,6 +11,21 @@
   dataShapeValidationPackage,
 }:
 
+let
+  syncWriteCrashHelper = pkgs.pkgsStatic.stdenv.mkDerivation {
+    pname = "tidefs-sync-write-crash-helper";
+    version = "1";
+    dontUnpack = true;
+    buildPhase = ''
+      $CC -O2 -Wall -Wextra -Werror ${./tidefs-sync-write-crash-helper.c} \
+        -o tidefs-sync-write-crash-helper
+    '';
+    installPhase = ''
+      mkdir -p $out/bin
+      install -m 0755 tidefs-sync-write-crash-helper $out/bin/
+    '';
+  };
+in
 pkgs.writeShellScriptBin "tidefs-fuse-vm-test-runner" ''
   set -euo pipefail
 
@@ -25,6 +40,7 @@ pkgs.writeShellScriptBin "tidefs-fuse-vm-test-runner" ''
   TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
   ACK_VALIDATION="${ackValidationPackage}/bin/storage-intent-ack-runtime-validation"
   DATA_SHAPE_VALIDATION="${dataShapeValidationPackage}/bin/storage-intent-data-shape-runtime-validation"
+  SYNC_WRITE_CRASH_HELPER="${syncWriteCrashHelper}/bin/tidefs-sync-write-crash-helper"
   BASE64="${pkgs.coreutils}/bin/base64"
   B3SUM="${pkgs.b3sum}/bin/b3sum"
   JQ="${pkgs.jq}/bin/jq"
@@ -34,6 +50,7 @@ pkgs.writeShellScriptBin "tidefs-fuse-vm-test-runner" ''
   VALIDATION_DIR="''${TIDEFS_FUSE_VM_TEST_VALIDATION_DIR:-/tmp/tidefs-validation/fuse-vm-test}"
   ACK_RECEIPT_RUNTIME=0
   DATA_SHAPE_RUNTIME=0
+  SYNC_WRITE_CRASH=0
   KEEP_TMP=0
 
   usage() {
@@ -51,6 +68,7 @@ Options:
   --validation-dir DIR           Host directory for qemu-boot.log and summary
   --ack-receipt-runtime          Run the mounted acknowledgment receipt rows
   --data-shape-runtime           Run the data-shape helper evidence rows
+  --sync-write-crash             Crash-test O_SYNC/O_DSYNC with both cache modes
   --keep-tmp                     Keep generated initrd/run directory
   --help, -h                     Show this help
 EOF
@@ -74,6 +92,10 @@ EOF
         DATA_SHAPE_RUNTIME=1
         shift
         ;;
+      --sync-write-crash)
+        SYNC_WRITE_CRASH=1
+        shift
+        ;;
       --keep-tmp)
         KEEP_TMP=1
         shift
@@ -90,7 +112,7 @@ EOF
     esac
   done
 
-  FOCUSED_MODE_COUNT=$((ACK_RECEIPT_RUNTIME + DATA_SHAPE_RUNTIME))
+  FOCUSED_MODE_COUNT=$((ACK_RECEIPT_RUNTIME + DATA_SHAPE_RUNTIME + SYNC_WRITE_CRASH))
   if [ "$FOCUSED_MODE_COUNT" -gt 1 ]; then
     echo "ERROR: focused runtime options are mutually exclusive" >&2
     exit 2
@@ -122,6 +144,10 @@ EOF
         exit 2
       fi
     done
+  fi
+  if [ "$SYNC_WRITE_CRASH" -eq 1 ] && [ ! -x "$SYNC_WRITE_CRASH_HELPER" ]; then
+    echo "ERROR: dependency not found: $SYNC_WRITE_CRASH_HELPER" >&2
+    exit 2
   fi
 
   echo "=== TideFS FUSE VM Test ==="
@@ -184,7 +210,7 @@ EOF
   }
 
   copy_binary "$BUSYBOX" "$RUN_DIR/bin/busybox"
-  for applet in sh ls cat echo mount umount grep dmesg sleep timeout poweroff reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync expr head tail cut kill ps test seq date uname tr sed tee true false env printf basename dirname readlink chmod insmod truncate; do
+  for applet in sh ls cat echo mount umount grep dmesg sleep timeout poweroff reboot mknod mkdir rmdir dd stat cp mv rm touch find wc cmp sync expr head tail cut kill ps test seq date uname tr sed tee true false env printf basename dirname readlink chmod insmod truncate; do
     ln -sf busybox "$RUN_DIR/bin/$applet"
   done
 
@@ -215,6 +241,9 @@ EOF
 
   copy_binary "$TIDEFSCTL" "$RUN_DIR/bin/tidefsctl"
   copy_runtime_deps "$BUSYBOX" "$TIDEFSCTL"
+  if [ "$SYNC_WRITE_CRASH" -eq 1 ]; then
+    copy_binary "$SYNC_WRITE_CRASH_HELPER" "$RUN_DIR/bin/tidefs-sync-write-crash-helper"
+  fi
   if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
     copy_binary "$ACK_VALIDATION" "$RUN_DIR/bin/storage-intent-ack-runtime-validation"
     copy_runtime_deps "$ACK_VALIDATION"
@@ -252,6 +281,7 @@ export PATH=/bin
 export LD_LIBRARY_PATH=/usr/lib:/lib:/lib64
 ACK_RECEIPT_RUNTIME=__ACK_RECEIPT_RUNTIME__
 DATA_SHAPE_RUNTIME=__DATA_SHAPE_RUNTIME__
+SYNC_WRITE_CRASH=__SYNC_WRITE_CRASH__
 GITHUB_RUN_ID="__GITHUB_RUN_ID__"
 GITHUB_RUN_ATTEMPT="__GITHUB_RUN_ATTEMPT__"
 GITHUB_SHA="__GITHUB_SHA__"
@@ -378,6 +408,209 @@ if [ "$DATA_SHAPE_RUNTIME" -eq 1 ]; then
     finish
 fi
 
+if [ "$SYNC_WRITE_CRASH" -eq 1 ]; then
+    export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141
+    SYNC_WRITE_PASSED=0
+    SYNC_WRITE_PRODUCT_FAILED=0
+    SYNC_WRITE_HARNESS_FAILED=0
+
+    sync_write_product_fail() {
+        echo "PRODUCT FAIL: $1 -- $2"
+        SYNC_WRITE_PRODUCT_FAILED=$((SYNC_WRITE_PRODUCT_FAILED + 1))
+    }
+
+    sync_write_harness_fail() {
+        echo "HARNESS FAIL: $1 -- $2"
+        SYNC_WRITE_HARNESS_FAILED=$((SYNC_WRITE_HARNESS_FAILED + 1))
+    }
+
+    wait_for_mount() {
+        WAIT_MOUNTPOINT="$1"
+        WAIT_PID="$2"
+        for WAIT_I in $(seq 30); do
+            if mountpoint -q "$WAIT_MOUNTPOINT" 2>/dev/null; then
+                return 0
+            fi
+            if ! kill -0 "$WAIT_PID" 2>/dev/null; then
+                return 1
+            fi
+            sleep 1
+        done
+        return 1
+    }
+
+    cleanup_sync_write_row() {
+        CLEANUP_MNT="$1"
+        CLEANUP_HELPER_PID="$2"
+        CLEANUP_MOUNT_PID="$3"
+        CLEANUP_RELEASE="$4"
+        touch "$CLEANUP_RELEASE" 2>/dev/null || true
+        if [ -n "$CLEANUP_HELPER_PID" ] && kill -0 "$CLEANUP_HELPER_PID" 2>/dev/null; then
+            kill -KILL "$CLEANUP_HELPER_PID" 2>/dev/null || true
+            wait "$CLEANUP_HELPER_PID" 2>/dev/null || true
+        fi
+        umount -l "$CLEANUP_MNT" 2>/dev/null || true
+        if [ -n "$CLEANUP_MOUNT_PID" ] && kill -0 "$CLEANUP_MOUNT_PID" 2>/dev/null; then
+            kill -KILL "$CLEANUP_MOUNT_PID" 2>/dev/null || true
+            wait "$CLEANUP_MOUNT_PID" 2>/dev/null || true
+        fi
+    }
+
+    run_sync_write_crash_row() {
+        SYNC_MODE="$1"
+        CACHE_MODE="$2"
+        ROW="''${SYNC_MODE}_writeback_''${CACHE_MODE}"
+        ROOT="/tmp/tidefs-sync-write-crash-$ROW"
+        DEVICE="$ROOT/device.tidefs"
+        MNT="$ROOT/mnt"
+        POOL="sync_write_''${SYNC_MODE}_''${CACHE_MODE}"
+        TEST_FILE="$MNT/payload.bin"
+        EXPECTED_FILE="$ROOT/expected.bin"
+        RELEASE="$ROOT/release-helper"
+        HELPER_LOG="$ROOT/helper.log"
+        MOUNT_LOG="$ROOT/mount.log"
+        REMOUNT_LOG="$ROOT/remount.log"
+        PAYLOAD="TIDEFS_''${SYNC_MODE}_WRITEBACK_''${CACHE_MODE}_CRASH_V1"
+        EXPECTED_LENGTH=$(printf '%s' "$PAYLOAD" | wc -c)
+        HELPER_PID=""
+        MOUNT_PID=""
+
+        rm -rf "$ROOT"
+        mkdir -p "$MNT"
+        printf '%s' "$PAYLOAD" > "$EXPECTED_FILE"
+        truncate -s 268435456 "$DEVICE"
+        if ! tidefsctl pool create "$POOL" --file-devices --devices "$DEVICE" >"$ROOT/create.log" 2>&1; then
+            cat "$ROOT/create.log"
+            sync_write_product_fail "$ROW" "fresh pool creation failed"
+            rm -rf "$ROOT"
+            return
+        fi
+
+        if [ "$CACHE_MODE" = "enabled" ]; then
+            tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" --writeback-cache >"$MOUNT_LOG" 2>&1 &
+        else
+            tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" >"$MOUNT_LOG" 2>&1 &
+        fi
+        MOUNT_PID=$!
+        if ! wait_for_mount "$MNT" "$MOUNT_PID"; then
+            cat "$MOUNT_LOG"
+            sync_write_product_fail "$ROW" "fresh mount did not become ready"
+            cleanup_sync_write_row "$MNT" "$HELPER_PID" "$MOUNT_PID" "$RELEASE"
+            rm -rf "$ROOT"
+            return
+        fi
+
+        tidefs-sync-write-crash-helper "$SYNC_MODE" "$TEST_FILE" "$RELEASE" "$PAYLOAD" >"$HELPER_LOG" 2>&1 &
+        HELPER_PID=$!
+        WRITE_RETURNED=0
+        for MARKER_I in $(seq 30); do
+            if grep -q "^WRITE_SUCCEEDED mode=$SYNC_MODE bytes=$EXPECTED_LENGTH$" "$HELPER_LOG" 2>/dev/null; then
+                WRITE_RETURNED=1
+                break
+            fi
+            if ! kill -0 "$HELPER_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        if [ "$WRITE_RETURNED" -ne 1 ]; then
+            cat "$HELPER_LOG" 2>/dev/null || true
+            if kill -0 "$HELPER_PID" 2>/dev/null; then
+                sync_write_harness_fail "$ROW" "helper did not publish its successful-write marker"
+            else
+                wait "$HELPER_PID" 2>/dev/null || true
+                HELPER_PID=""
+                sync_write_product_fail "$ROW" "synchronous mounted write did not succeed"
+            fi
+            cleanup_sync_write_row "$MNT" "$HELPER_PID" "$MOUNT_PID" "$RELEASE"
+            rm -rf "$ROOT"
+            return
+        fi
+
+        if ! kill -0 "$MOUNT_PID" 2>/dev/null; then
+            sync_write_product_fail "$ROW" "mount owner exited before crash injection"
+            cleanup_sync_write_row "$MNT" "$HELPER_PID" "$MOUNT_PID" "$RELEASE"
+            rm -rf "$ROOT"
+            return
+        fi
+        if ! kill -KILL "$MOUNT_PID" 2>/dev/null; then
+            sync_write_harness_fail "$ROW" "could not SIGKILL captured mount-owner PID $MOUNT_PID"
+            cleanup_sync_write_row "$MNT" "$HELPER_PID" "$MOUNT_PID" "$RELEASE"
+            rm -rf "$ROOT"
+            return
+        fi
+        wait "$MOUNT_PID" 2>/dev/null || true
+        if kill -0 "$MOUNT_PID" 2>/dev/null; then
+            sync_write_harness_fail "$ROW" "captured mount-owner PID remained alive after SIGKILL"
+            cleanup_sync_write_row "$MNT" "$HELPER_PID" "$MOUNT_PID" "$RELEASE"
+            rm -rf "$ROOT"
+            return
+        fi
+        MOUNT_PID=""
+
+        touch "$RELEASE"
+        if ! wait "$HELPER_PID"; then
+            cat "$HELPER_LOG" 2>/dev/null || true
+            HELPER_PID=""
+            sync_write_harness_fail "$ROW" "writer helper failed after daemon death was confirmed"
+            cleanup_sync_write_row "$MNT" "$HELPER_PID" "$MOUNT_PID" "$RELEASE"
+            rm -rf "$ROOT"
+            return
+        fi
+        HELPER_PID=""
+
+        if ! umount -l "$MNT" 2>"$ROOT/detach.err"; then
+            cat "$ROOT/detach.err" 2>/dev/null || true
+            sync_write_product_fail "$ROW" "dead FUSE connection could not be detached"
+            rm -rf "$ROOT"
+            return
+        fi
+
+        if [ "$CACHE_MODE" = "enabled" ]; then
+            tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" --writeback-cache >"$REMOUNT_LOG" 2>&1 &
+        else
+            tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" >"$REMOUNT_LOG" 2>&1 &
+        fi
+        MOUNT_PID=$!
+        if ! wait_for_mount "$MNT" "$MOUNT_PID"; then
+            cat "$REMOUNT_LOG"
+            sync_write_product_fail "$ROW" "fresh recovery remount did not become ready"
+            cleanup_sync_write_row "$MNT" "$HELPER_PID" "$MOUNT_PID" "$RELEASE"
+            rm -rf "$ROOT"
+            return
+        fi
+
+        ACTUAL_LENGTH=$(wc -c < "$TEST_FILE" 2>/dev/null || echo missing)
+        if [ "$ACTUAL_LENGTH" != "$EXPECTED_LENGTH" ] || ! cmp -s "$EXPECTED_FILE" "$TEST_FILE"; then
+            sync_write_product_fail "$ROW" "expected $EXPECTED_LENGTH exact bytes after crash, got $ACTUAL_LENGTH"
+            cleanup_sync_write_row "$MNT" "$HELPER_PID" "$MOUNT_PID" "$RELEASE"
+            rm -rf "$ROOT"
+            return
+        fi
+
+        if ! umount "$MNT" || ! wait "$MOUNT_PID"; then
+            sync_write_harness_fail "$ROW" "recovery mount did not shut down cleanly"
+            cleanup_sync_write_row "$MNT" "$HELPER_PID" "$MOUNT_PID" "$RELEASE"
+            rm -rf "$ROOT"
+            return
+        fi
+        MOUNT_PID=""
+        echo "PASS: sync_write_crash_$ROW"
+        SYNC_WRITE_PASSED=$((SYNC_WRITE_PASSED + 1))
+        rm -rf "$ROOT"
+    }
+
+    run_sync_write_crash_row sync disabled
+    run_sync_write_crash_row dsync disabled
+    run_sync_write_crash_row sync enabled
+    run_sync_write_crash_row dsync enabled
+    echo "sync_write_crash_summary: passed=$SYNC_WRITE_PASSED product_failed=$SYNC_WRITE_PRODUCT_FAILED harness_failed=$SYNC_WRITE_HARNESS_FAILED environment_refused=$REFUSED"
+    if [ "$SYNC_WRITE_PASSED" -ne 4 ] || [ "$SYNC_WRITE_PRODUCT_FAILED" -ne 0 ] || [ "$SYNC_WRITE_HARNESS_FAILED" -ne 0 ] || [ "$REFUSED" -ne 0 ]; then
+        FAILED=$((FAILED + SYNC_WRITE_PRODUCT_FAILED + SYNC_WRITE_HARNESS_FAILED + 1))
+    fi
+    finish
+fi
+
 export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141
 LIFECYCLE_ROOT=/tmp/tidefs-canonical-lifecycle
 DEVICE="$LIFECYCLE_ROOT/device0.tidefs"
@@ -476,6 +709,7 @@ INITSCRIPT
 
   sed -i "s|__ACK_RECEIPT_RUNTIME__|$ACK_RECEIPT_RUNTIME|g" "$RUN_DIR/init"
   sed -i "s|__DATA_SHAPE_RUNTIME__|$DATA_SHAPE_RUNTIME|g" "$RUN_DIR/init"
+  sed -i "s|__SYNC_WRITE_CRASH__|$SYNC_WRITE_CRASH|g" "$RUN_DIR/init"
   sed -i "s|__GITHUB_RUN_ID__|''${GITHUB_RUN_ID:-local}|g" "$RUN_DIR/init"
   sed -i "s|__GITHUB_RUN_ATTEMPT__|''${GITHUB_RUN_ATTEMPT:-1}|g" "$RUN_DIR/init"
   sed -i "s|__GITHUB_SHA__|''${GITHUB_SHA:-unknown}|g" "$RUN_DIR/init"
@@ -503,7 +737,9 @@ INITSCRIPT
   set -e
 
   cp "$VAL_LOG" "$VALIDATION_DIR/qemu-boot.log"
-  cp "$RUN_DIR/init" "$VALIDATION_DIR/init-script"
+  if [ "$SYNC_WRITE_CRASH" -ne 1 ]; then
+    cp "$RUN_DIR/init" "$VALIDATION_DIR/init-script"
+  fi
 
   extract_between() {
     local start="$1"
@@ -566,6 +802,33 @@ INITSCRIPT
   FAILC=$(count_serial_lines '^FAIL:')
   REFUSALC=$(count_serial_lines '^REFUSAL:')
   DONEC=$(count_serial_lines '^TIDEFS_FUSE_VM_TEST_DONE$')
+  if [ "$SYNC_WRITE_CRASH" -eq 1 ]; then
+    SYNC_PASSC=$(count_serial_lines '^PASS: sync_write_crash_')
+    SYNC_PRODUCT_FAILC=$(count_serial_lines '^PRODUCT FAIL:')
+    SYNC_HARNESS_FAILC=$(count_serial_lines '^HARNESS FAIL:')
+    echo "=== TideFS synchronous-write crash results ==="
+    grep -E '^(PASS: sync_write_crash_|PRODUCT FAIL:|HARNESS FAIL:|REFUSAL:|sync_write_crash_summary:)' "$VAL_LOG" 2>/dev/null || true
+    echo "Validation: $SYNC_PASSC passed, $SYNC_PRODUCT_FAILC product-failed, $SYNC_HARNESS_FAILC harness-failed, $REFUSALC environment-refused"
+    echo "Validation log: $VALIDATION_DIR/qemu-boot.log"
+    if [ "$QEMU_STATUS" -eq 124 ]; then
+      echo "VALIDATION: HARNESS FAIL -- QEMU timed out after ''${TIMEOUT_SEC}s" >&2
+      exit 1
+    fi
+    if [ "$DONEC" -eq 0 ]; then
+      echo "VALIDATION: HARNESS FAIL -- guest did not emit completion marker" >&2
+      exit 1
+    fi
+    if [ "$REFUSALC" -gt 0 ]; then
+      echo "VALIDATION: ENVIRONMENT REFUSAL -- $REFUSALC refusal(s)" >&2
+      exit 2
+    fi
+    if [ "$SYNC_PRODUCT_FAILC" -gt 0 ] || [ "$SYNC_HARNESS_FAILC" -gt 0 ] || [ "$SYNC_PASSC" -ne 4 ]; then
+      echo "VALIDATION: NON-PASS -- expected four passing synchronous-write crash rows" >&2
+      exit 1
+    fi
+    echo "VALIDATION: PASS"
+    exit 0
+  fi
   if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
     if [ ! -s "$ack_artifact" ] || [ ! -s "$ack_manifest" ]; then
       echo "FAIL: ack_runtime_artifact_capture -- evidence payload or manifest is missing" >&2
