@@ -8,22 +8,35 @@
 //! plus an initial committed-root region so that pool import can locate
 //! a valid starting epoch.
 
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{flock, FlockOperation};
 use tidefs_commit_group::{
     seal_commit_hash, CommitGroupId, CommitGroupWriter, CommittedRootBlock, RootPointer,
 };
 use tidefs_encryption::StoreKey;
 use tidefs_local_object_store::device_layout::{
-    encode_device_layout_v1, DeviceLayoutPolicy, MIN_SEGMENT_SIZE_BYTES,
+    decode_device_layout_v1, encode_device_layout_v1, DeviceLayoutPolicy, DeviceLayoutV1,
+    MIN_SEGMENT_SIZE_BYTES,
+};
+use tidefs_local_object_store::pool::{
+    bootstrap_labelled_pool, preflight_labelled_pool_bootstrap, PoolBootstrapConfig,
+    PoolBootstrapMember,
+};
+use tidefs_local_object_store::{
+    DeviceBacking, EncryptionConfig as StoreEncryptionConfig, StoreEncryptionKey, StoreError,
 };
 use tidefs_pool_scan::PoolDeviceBacking;
 use tidefs_types_pool_label_core::{
-    decode_label, encode_label_with_device_layout, encode_vcrl_ledger_into, pool_guid_to_uuid32,
-    seal_label_with_device_layout, vcrl_required_len, DeviceClass, DeviceLayoutV1Bytes, LabelError,
-    PoolLabelV1, PoolState, VcrlEntry, POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE, POOL_LABEL_SIZE,
+    decode_device_layout_v1_bytes, decode_label, encode_label_with_device_layout,
+    encode_vcrl_ledger_into, pool_guid_to_uuid32, seal_label_with_device_layout, vcrl_required_len,
+    DeviceClass, DeviceLayoutV1Bytes, LabelError, PoolLabelV1, PoolState, VcrlEntry,
+    POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE, POOL_LABEL_SIZE,
+    POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 
 use crate::committed_root::{
@@ -37,8 +50,16 @@ pub use tidefs_types_pool_label_core::PoolRedundancyPolicy as RedundancyPolicy;
 
 const LABEL_AND_COMMIT_MIN_DEVICE_BYTES: u64 =
     (2 * POOL_LABEL_SIZE as u64) + COMMIT_RECORD_REGION_OFFSET + COMMIT_RECORD_REGION_MAX;
-const MIN_DEVICE_BYTES: u64 = if LABEL_AND_COMMIT_MIN_DEVICE_BYTES > MIN_SEGMENT_SIZE_BYTES {
-    LABEL_AND_COMMIT_MIN_DEVICE_BYTES
+const STORE_MIN_DEVICE_BYTES: u64 =
+    tidefs_local_object_store::LocalObjectStore::minimum_block_device_capacity();
+const MIN_DEVICE_BYTES: u64 = if LABEL_AND_COMMIT_MIN_DEVICE_BYTES > STORE_MIN_DEVICE_BYTES {
+    if LABEL_AND_COMMIT_MIN_DEVICE_BYTES > MIN_SEGMENT_SIZE_BYTES {
+        LABEL_AND_COMMIT_MIN_DEVICE_BYTES
+    } else {
+        MIN_SEGMENT_SIZE_BYTES
+    }
+} else if STORE_MIN_DEVICE_BYTES > MIN_SEGMENT_SIZE_BYTES {
+    STORE_MIN_DEVICE_BYTES
 } else {
     MIN_SEGMENT_SIZE_BYTES
 };
@@ -152,6 +173,15 @@ pub enum CreateError {
     },
     /// Label encoding or sealing error.
     Label(LabelError),
+    /// Existing media cannot be proven to be blank or one exact fresh retry.
+    AmbiguousMedia {
+        /// Device path whose current state was refused.
+        device_path: PathBuf,
+        /// Exact reason the state is not safe to continue.
+        reason: String,
+    },
+    /// Pool-owned object-store bootstrap rejected the media.
+    Store(StoreError),
     /// No devices were specified.
     NoDevices,
     /// The requested redundancy policy cannot be satisfied by the device set.
@@ -205,6 +235,15 @@ impl std::fmt::Display for CreateError {
                 }
             }
             Self::Label(e) => write!(f, "label error: {e}"),
+            Self::AmbiguousMedia {
+                device_path,
+                reason,
+            } => write!(
+                f,
+                "refusing ambiguous pool-creation media {}: {reason}",
+                device_path.display()
+            ),
+            Self::Store(error) => write!(f, "Pool object-store bootstrap failed: {error}"),
             Self::InvalidRedundancyPolicy {
                 policy,
                 device_count,
@@ -247,6 +286,12 @@ impl From<LabelError> for CreateError {
     }
 }
 
+impl From<StoreError> for CreateError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal: open-device handle
 // ---------------------------------------------------------------------------
@@ -264,6 +309,8 @@ struct CreationDevice {
     capacity_bytes: u64,
     /// Explicit backing media classification.
     backing: PoolDeviceBacking,
+    /// Stable identity used to reject aliases of the same underlying media.
+    media_identity: (u8, u64, u64),
     /// Opened read/write file handle.
     file: File,
 }
@@ -279,7 +326,7 @@ impl CreationDevice {
             }
         })?;
 
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
@@ -288,11 +335,26 @@ impl CreationDevice {
                 msg: format!("{e}"),
             })?;
 
-        let capacity_bytes =
-            tidefs_pool_scan::device_capacity_bytes(path).map_err(|e| CreateError::DeviceOpen {
+        flock(&file, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
+            CreateError::DeviceOpen {
+                device_path: path.to_path_buf(),
+                msg: format!("device is already owned by another pool operation: {e}"),
+            }
+        })?;
+        let capacity_bytes = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| CreateError::DeviceOpen {
                 device_path: path.to_path_buf(),
                 msg: format!("device capacity: {e}"),
             })?;
+        let metadata = file.metadata().map_err(|e| CreateError::DeviceOpen {
+            device_path: path.to_path_buf(),
+            msg: format!("device identity: {e}"),
+        })?;
+        let media_identity = match backing {
+            PoolDeviceBacking::BlockDevice => (1, metadata.rdev(), 0),
+            PoolDeviceBacking::RegularFileDev => (2, metadata.dev(), metadata.ino()),
+        };
 
         // Reject devices that are too small.
         if capacity_bytes < MIN_DEVICE_BYTES {
@@ -308,6 +370,7 @@ impl CreationDevice {
             device_index,
             capacity_bytes,
             backing,
+            media_identity,
             file,
         })
     }
@@ -326,7 +389,14 @@ impl CreationDevice {
     }
 
     /// Read and decode a pool label at `offset`.
+    #[cfg(test)]
     fn read_label_at(&mut self, offset: u64) -> Result<PoolLabelV1, CreateError> {
+        let buf = self.read_label_bytes_at(offset)?;
+        decode_label(&buf).map_err(CreateError::Label)
+    }
+
+    /// Read one complete fixed-offset label slot without interpreting it.
+    fn read_label_bytes_at(&mut self, offset: u64) -> Result<Vec<u8>, CreateError> {
         let mut buf = vec![0u8; POOL_LABEL_SIZE];
         self.file
             .seek(SeekFrom::Start(offset))
@@ -341,7 +411,7 @@ impl CreationDevice {
                 msg: format!("read at {offset}: {e}"),
             })?;
 
-        decode_label(&buf).map_err(CreateError::Label)
+        Ok(buf)
     }
 
     /// Encode and write a sealed label at `offset`.
@@ -351,7 +421,11 @@ impl CreationDevice {
         device_layout_v1: Option<&DeviceLayoutV1Bytes>,
         offset: u64,
     ) -> Result<(), CreateError> {
-        let mut buf = vec![0u8; POOL_LABEL_SIZE];
+        // Only the current encoded header belongs to the label write. The
+        // leading 256 KiB reservation overlaps fixed bootstrap root regions;
+        // rewriting zero padding here would destroy those separately-owned
+        // records during retry or final dual-label convergence.
+        let mut buf = vec![0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
         encode_label_with_device_layout(label, device_layout_v1, &mut buf)?;
 
         self.file
@@ -426,37 +500,147 @@ impl CreationDevice {
         self.flush_and_sync("system area")?;
         Ok(())
     }
+}
 
-    /// Zero the first 64 KiB of the data region (after the pool label).
-    ///
-    /// The data region starts at offset [`POOL_LABEL_SIZE`] and holds
-    /// the object-store format header and record data.  Zeroing ensures
-    /// that any stale format headers or records from a previous pool
-    /// incarnation are cleared before first mount.
-    fn zero_data_region_start(&mut self) -> Result<(), CreateError> {
-        // Data region starts after the commit-record region:
-        // COMMIT_RECORD_REGION_OFFSET (8 KiB) + COMMIT_RECORD_REGION_MAX (256 KiB) = 270336
-        let data_start: u64 = COMMIT_RECORD_REGION_OFFSET + COMMIT_RECORD_REGION_MAX;
-        let zero_len = 65536u64; // 64 KiB, enough for format header + first records
-                                 // Clamp to device capacity to avoid writing past end of small devices.
-        let len = zero_len.min(self.capacity_bytes.saturating_sub(data_start));
-        if len == 0 {
-            return Ok(());
-        }
-        let zeroes = vec![0u8; len as usize];
-        self.file
-            .seek(SeekFrom::Start(data_start))
-            .map_err(|e| CreateError::Io {
-                device_path: Some(self.device_path.clone()),
-                msg: format!("seek data region: {e}"),
-            })?;
-        self.file.write_all(&zeroes).map_err(|e| CreateError::Io {
-            device_path: Some(self.device_path.clone()),
-            msg: format!("zero data region: {e}"),
-        })?;
-        self.flush_and_sync("data region zero")?;
-        Ok(())
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidCreationLabel {
+    label: PoolLabelV1,
+    layout_bytes: DeviceLayoutV1Bytes,
+    layout: DeviceLayoutV1,
+}
+
+#[derive(Clone, Debug)]
+enum CreationLabelState {
+    Blank,
+    Retry {
+        valid: ValidCreationLabel,
+        leading_blank: bool,
+        trailing_blank: bool,
+    },
+}
+
+fn ambiguous_media(
+    device_path: &Path,
+    reason: impl Into<String>,
+) -> Result<CreationLabelState, CreateError> {
+    Err(CreateError::AmbiguousMedia {
+        device_path: device_path.to_path_buf(),
+        reason: reason.into(),
+    })
+}
+
+fn decode_creation_label_copy(
+    device_path: &Path,
+    copy_name: &'static str,
+    raw: &[u8],
+    label_owned_end: usize,
+) -> Result<Option<ValidCreationLabel>, CreateError> {
+    // The leading reservation overlaps fixed-region roots beginning at the
+    // commit-record offset. Bytes before that boundary, and all bytes after
+    // the trailing header, remain label-owned and must be blank for a fresh
+    // retry.
+    let header = &raw[..POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+    if raw[POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE..label_owned_end]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(CreateError::AmbiguousMedia {
+            device_path: device_path.to_path_buf(),
+            reason: format!("{copy_name} label has unexpected extension bytes"),
+        });
     }
+    if header.iter().all(|byte| *byte == 0) {
+        return Ok(None);
+    }
+    let label = decode_label(raw).map_err(|error| CreateError::AmbiguousMedia {
+        device_path: device_path.to_path_buf(),
+        reason: format!("{copy_name} label is nonblank but invalid: {error}"),
+    })?;
+    let layout_bytes = decode_device_layout_v1_bytes(raw)
+        .map_err(|error| CreateError::AmbiguousMedia {
+            device_path: device_path.to_path_buf(),
+            reason: format!("{copy_name} label DeviceLayoutV1 is invalid: {error}"),
+        })?
+        .ok_or_else(|| CreateError::AmbiguousMedia {
+            device_path: device_path.to_path_buf(),
+            reason: format!("{copy_name} label lacks DeviceLayoutV1 authority"),
+        })?;
+    let layout =
+        decode_device_layout_v1(&layout_bytes).map_err(|error| CreateError::AmbiguousMedia {
+            device_path: device_path.to_path_buf(),
+            reason: format!("{copy_name} label DeviceLayoutV1 is corrupt: {error}"),
+        })?;
+    Ok(Some(ValidCreationLabel {
+        label,
+        layout_bytes,
+        layout,
+    }))
+}
+
+fn inspect_creation_labels(handle: &mut CreationDevice) -> Result<CreationLabelState, CreateError> {
+    let leading_raw = handle.read_label_bytes_at(0)?;
+    let trailing_offset = handle.capacity_bytes - POOL_LABEL_SIZE as u64;
+    let trailing_raw = handle.read_label_bytes_at(trailing_offset)?;
+    let leading = decode_creation_label_copy(
+        &handle.device_path,
+        "leading",
+        &leading_raw,
+        COMMIT_RECORD_REGION_OFFSET as usize,
+    )?;
+    let trailing = decode_creation_label_copy(
+        &handle.device_path,
+        "trailing",
+        &trailing_raw,
+        POOL_LABEL_SIZE,
+    )?;
+
+    match (leading, trailing) {
+        (None, None) => Ok(CreationLabelState::Blank),
+        (Some(valid), None) => Ok(CreationLabelState::Retry {
+            valid,
+            leading_blank: false,
+            trailing_blank: true,
+        }),
+        (None, Some(valid)) => Ok(CreationLabelState::Retry {
+            valid,
+            leading_blank: true,
+            trailing_blank: false,
+        }),
+        (Some(leading), Some(trailing)) if leading == trailing => Ok(CreationLabelState::Retry {
+            valid: leading,
+            leading_blank: false,
+            trailing_blank: false,
+        }),
+        (Some(_), Some(_)) => {
+            ambiguous_media(&handle.device_path, "leading and trailing labels conflict")
+        }
+    }
+}
+
+fn object_store_backing(backing: PoolDeviceBacking) -> DeviceBacking {
+    match backing {
+        PoolDeviceBacking::BlockDevice => DeviceBacking::BlockDevice,
+        PoolDeviceBacking::RegularFileDev => DeviceBacking::RegularFileDev,
+    }
+}
+
+fn canonical_creation_label(
+    mut label: PoolLabelV1,
+    layout_bytes: &DeviceLayoutV1Bytes,
+) -> Result<PoolLabelV1, CreateError> {
+    label = seal_label_with_device_layout(label, Some(layout_bytes))?;
+    let mut encoded = vec![0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+    encode_label_with_device_layout(&label, Some(layout_bytes), &mut encoded)?;
+    decode_label(&encoded).map_err(CreateError::Label)
+}
+
+fn store_encryption_config(config: &PoolCreateConfig) -> Option<StoreEncryptionConfig> {
+    config.encryption_key.as_ref().map(|key| {
+        StoreEncryptionConfig::new(
+            StoreEncryptionKey::from_bytes(key.as_bytes())
+                .expect("tidefs-encryption StoreKey is exactly 32 bytes"),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -509,53 +693,70 @@ impl PoolCreator {
             return Err(CreateError::NoDevices);
         }
 
-        // Generate or use the provided pool GUID.
-        let pool_guid = match config.pool_guid {
-            Some(guid) => guid,
-            None => filesystem_uuid().map_err(|e| CreateError::Io {
-                device_path: None,
-                msg: format!("generate pool GUID: {e}"),
-            })?,
-        };
-
-        let device_count = devices.len() as u32;
+        let device_count = u32::try_from(devices.len()).map_err(|_| CreateError::Io {
+            device_path: None,
+            msg: "pool device count exceeds u32".to_string(),
+        })?;
         validate_redundancy_policy(config.redundancy, device_count)?;
 
-        // Phase 1: open and validate every device.
+        // Phase 1: open every exact path and classify both label copies before
+        // generating identity or mutating any media.
         let mut handles: Vec<CreationDevice> = Vec::with_capacity(device_count as usize);
+        let mut label_states = Vec::with_capacity(device_count as usize);
+        let mut seen_media = BTreeSet::new();
         for (i, path) in devices.iter().enumerate() {
             let mut handle = CreationDevice::open(path, i as u32)?;
-
-            // Check for an existing label with a conflicting pool GUID.
-            match handle.read_label_at(0) {
-                Ok(existing) => {
-                    if existing.pool_guid != pool_guid {
-                        return Err(CreateError::DeviceAlreadyLabeled {
-                            device_path: path.clone(),
-                            existing_pool_guid: existing.pool_guid,
-                        });
-                    }
-                    // Same pool GUID: device is already labeled for this
-                    // pool — overwriting is safe (idempotent re-creation
-                    // of a fresh pool).
-                }
-                Err(CreateError::Label(_)) => {
-                    // No valid existing label — fine, we are creating one.
-                }
-                Err(e) => return Err(e),
+            if !seen_media.insert(handle.media_identity) {
+                return Err(CreateError::AmbiguousMedia {
+                    device_path: path.clone(),
+                    reason: "the same underlying device was supplied more than once".to_string(),
+                });
             }
-
+            label_states.push(inspect_creation_labels(&mut handle)?);
             handles.push(handle);
         }
 
-        // Phase 2: build one label per device.
-        let mut labels: Vec<PoolLabelV1> = Vec::with_capacity(device_count as usize);
-        for handle in &handles {
-            let device_guid = filesystem_uuid().map_err(|e| CreateError::Io {
-                device_path: None,
-                msg: format!("generate device GUID: {e}"),
-            })?;
+        let existing_label =
+            label_states
+                .iter()
+                .enumerate()
+                .find_map(|(index, state)| match state {
+                    CreationLabelState::Retry { valid, .. } => Some((index, &valid.label)),
+                    CreationLabelState::Blank => None,
+                });
+        let pool_guid = if let Some((first_index, first)) = existing_label {
+            if let Some(requested) = config.pool_guid {
+                if requested != first.pool_guid {
+                    return Err(CreateError::DeviceAlreadyLabeled {
+                        device_path: handles[first_index].device_path.clone(),
+                        existing_pool_guid: first.pool_guid,
+                    });
+                }
+            }
+            first.pool_guid
+        } else {
+            match config.pool_guid {
+                Some(guid) => guid,
+                None => filesystem_uuid().map_err(|e| CreateError::Io {
+                    device_path: None,
+                    msg: format!("generate pool GUID: {e}"),
+                })?,
+            }
+        };
 
+        // Phase 2: compute the exact intended label and layout for every
+        // member, preserving all identity from a coherent retry.
+        let mut labels: Vec<PoolLabelV1> = Vec::with_capacity(device_count as usize);
+        let mut device_layouts: Vec<DeviceLayoutV1Bytes> =
+            Vec::with_capacity(device_count as usize);
+        for (handle, state) in handles.iter().zip(&label_states) {
+            let device_guid = match state {
+                CreationLabelState::Blank => filesystem_uuid().map_err(|e| CreateError::Io {
+                    device_path: None,
+                    msg: format!("generate device GUID: {e}"),
+                })?,
+                CreationLabelState::Retry { valid, .. } => valid.label.device_guid,
+            };
             let mut label = PoolLabelV1::new(pool_guid, device_guid, &config.pool_name);
             label.pool_state = PoolState::Exported;
             label.device_index = handle.device_index;
@@ -578,13 +779,6 @@ impl PoolCreator {
             if config.encryption_key.is_some() {
                 label.set_encrypted();
             }
-
-            labels.push(label);
-        }
-
-        let mut device_layouts: Vec<DeviceLayoutV1Bytes> =
-            Vec::with_capacity(device_count as usize);
-        for handle in &handles {
             let layout = DeviceLayoutPolicy::Slice0Small
                 .compute(handle.capacity_bytes)
                 .map_err(|e| CreateError::Io {
@@ -593,25 +787,85 @@ impl PoolCreator {
                 })?;
             let mut bytes = [0u8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
             encode_device_layout_v1(&layout, &mut bytes);
+            let label = canonical_creation_label(label, &bytes)?;
+
+            if let CreationLabelState::Retry { valid, .. } = state {
+                if valid.label != label || valid.layout != layout || valid.layout_bytes != bytes {
+                    return Err(CreateError::AmbiguousMedia {
+                        device_path: handle.device_path.clone(),
+                        reason: "existing label does not match the exact requested fresh topology"
+                            .to_string(),
+                    });
+                }
+            }
+            labels.push(label);
             device_layouts.push(bytes);
         }
 
-        // Phase 3: seal labels with BLAKE3 and write dual copies.
+        let bootstrap_config = PoolBootstrapConfig {
+            pool_guid,
+            members: handles
+                .iter()
+                .zip(&labels)
+                .zip(&device_layouts)
+                .map(|((handle, label), device_layout_v1)| {
+                    Ok(PoolBootstrapMember {
+                        file: handle.file.try_clone().map_err(|e| CreateError::Io {
+                            device_path: Some(handle.device_path.clone()),
+                            msg: format!("retain bootstrap device handle: {e}"),
+                        })?,
+                        path: handle.device_path.clone(),
+                        backing: object_store_backing(handle.backing),
+                        device_index: handle.device_index,
+                        capacity_bytes: handle.capacity_bytes,
+                        device_guid: label.device_guid,
+                        expected_label: label.clone(),
+                        device_layout_v1: *device_layout_v1,
+                        label_was_present: matches!(
+                            label_states[handle.device_index as usize],
+                            CreationLabelState::Retry { .. }
+                        ),
+                    })
+                })
+                .collect::<Result<Vec<_>, CreateError>>()?,
+            encryption: store_encryption_config(config),
+        };
+        let bootstrap_admission = preflight_labelled_pool_bootstrap(bootstrap_config)?;
+
+        // Phase 3: establish at least one valid topology label on each member.
+        // A retry preserves an already-valid copy and fills only a blank peer;
+        // it never overwrites a conflicting or corrupt copy.
         for (i, label) in labels.iter().enumerate() {
             let device_layout = &device_layouts[i];
-            let sealed = seal_label_with_device_layout(label.clone(), Some(device_layout))?;
-
-            // Label 0 at offset 0.
-            handles[i].write_label_at(&sealed, Some(device_layout), 0)?;
-
-            // Label 1 near the end of the device.
             let label1_offset = handles[i]
                 .capacity_bytes
                 .saturating_sub(POOL_LABEL_SIZE as u64);
-            handles[i].write_label_at(&sealed, Some(device_layout), label1_offset)?;
+            match &label_states[i] {
+                CreationLabelState::Blank => {
+                    handles[i].write_label_at(label, Some(device_layout), 0)?;
+                    handles[i].write_label_at(label, Some(device_layout), label1_offset)?;
+                }
+                CreationLabelState::Retry {
+                    leading_blank,
+                    trailing_blank,
+                    ..
+                } => {
+                    if *leading_blank {
+                        handles[i].write_label_at(label, Some(device_layout), 0)?;
+                    }
+                    if *trailing_blank {
+                        handles[i].write_label_at(label, Some(device_layout), label1_offset)?;
+                    }
+                }
+            }
         }
 
-        // Phase 4: create initial committed root (epoch 1, txg 1).
+        // Phase 4: Pool owns the immutable Store identity and generation-zero
+        // marker. It rereads every exact label before mutation and every Store
+        // copy after sync.
+        bootstrap_labelled_pool(bootstrap_admission)?;
+
+        // Phase 5: create initial committed root (epoch 1, txg 1).
         let commitment_hash = seal_commit_hash(INITIAL_TXG, CommitGroupId(INITIAL_TXG), None, &[]);
         let root_pointer = RootPointer::new(CommitGroupId(INITIAL_TXG), 0);
 
@@ -633,11 +887,13 @@ impl PoolCreator {
             handle.write_system_area(&system_area)?;
         }
 
-        // Phase 5: zero the start of the data region on every device so
-        // that stale format headers and records from previous pool
-        // incarnations cannot be recovered by the object-store scan.
-        for handle in &mut handles {
-            handle.zero_data_region_start()?;
+        // Phase 6: converge both label copies only after Store bootstrap and
+        // initial fixed-region roots are durable.
+        for (i, label) in labels.iter().enumerate() {
+            let device_layout = &device_layouts[i];
+            let label1_offset = handles[i].capacity_bytes - POOL_LABEL_SIZE as u64;
+            handles[i].write_label_at(label, Some(device_layout), 0)?;
+            handles[i].write_label_at(label, Some(device_layout), label1_offset)?;
         }
 
         let committed_root = CommittedRoot::new(root_pointer, commitment_hash, INITIAL_TXG, 0);
@@ -1224,6 +1480,33 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn create_pool_bootstrap_refuses_second_creator_without_mutation() {
+        let (_dir, dev) = setup_single_device(MIN_DEVICE_BYTES);
+        let held = CreationDevice::open(&dev, 0).expect("hold first creator lock");
+        let before = std::fs::read(&dev).expect("snapshot locked device");
+        let config = PoolCreateConfig {
+            pool_name: "second-creator".into(),
+            pool_guid: Some([0xA6; 16]),
+            redundancy: RedundancyPolicy::replicated(1),
+            encryption_key: None,
+            clustered: false,
+        };
+
+        match PoolCreator::create_pool(std::slice::from_ref(&dev), &config) {
+            Err(CreateError::DeviceOpen { msg, .. }) => {
+                assert!(msg.contains("already owned by another pool operation"));
+            }
+            other => panic!("expected competing creator refusal, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&dev).expect("reread locked device"),
+            before,
+            "competing creator changed media"
+        );
+        drop(held);
+    }
+
     // -- label content tests --
 
     #[test]
@@ -1435,27 +1718,233 @@ mod tests {
         assert_eq!(label.pool_state, PoolState::Exported);
     }
 
-    // -- re-creation (idempotent) test --
+    // -- strict fresh-bootstrap retry tests --
 
     #[test]
-    fn recreate_same_pool_is_allowed() {
+    fn create_pool_bootstrap_fresh_retry_adopts_generated_pool_and_device_guids() {
         let (_dir, dev) = setup_single_device(MIN_DEVICE_BYTES);
-        let guid = [0xFFu8; 16];
         let config = PoolCreateConfig {
-            pool_name: "recreate".into(),
-            pool_guid: Some(guid),
+            pool_name: "fresh-retry".into(),
+            pool_guid: None,
             redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
 
-        // First creation succeeds.
         let outcome1 = PoolCreator::create_pool(&[dev.clone()], &config).unwrap();
-        assert_eq!(outcome1.pool_guid, guid);
-
-        // Second creation with the same GUID succeeds (idempotent re-init).
         let outcome2 = PoolCreator::create_pool(&[dev.clone()], &config).unwrap();
-        assert_eq!(outcome2.pool_guid, guid);
+
+        assert_eq!(outcome2.pool_guid, outcome1.pool_guid);
+        assert_eq!(outcome2.device_guids, outcome1.device_guids);
+    }
+
+    #[test]
+    fn create_pool_bootstrap_accepts_valid_and_blank_interrupted_label_pair() {
+        let (_dir, dev) = setup_single_device(MIN_DEVICE_BYTES);
+        let config = PoolCreateConfig {
+            pool_name: "label-retry".into(),
+            pool_guid: Some([0xA1; 16]),
+            redundancy: RedundancyPolicy::replicated(1),
+            encryption_key: None,
+            clustered: false,
+        };
+        let first = PoolCreator::create_pool(&[dev.clone()], &config).unwrap();
+
+        // Simulate interruption while publishing the leading label header.
+        // Fixed-root bytes elsewhere in the overlapping reservation remain.
+        let mut file = OpenOptions::new().write(true).open(&dev).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&vec![0; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE])
+            .unwrap();
+        file.sync_all().unwrap();
+
+        let retried = PoolCreator::create_pool(&[dev.clone()], &config).unwrap();
+        assert_eq!(retried.pool_guid, first.pool_guid);
+        assert_eq!(retried.device_guids, first.device_guids);
+
+        let mut handle = CreationDevice::open(&dev, 0).unwrap();
+        let leading = handle.read_label_at(0).unwrap();
+        let trailing = handle
+            .read_label_at(handle.capacity_bytes - POOL_LABEL_SIZE as u64)
+            .unwrap();
+        assert_eq!(leading, trailing);
+    }
+
+    #[test]
+    fn create_pool_bootstrap_converges_partially_labelled_member_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev0 = temp_device(&dir, "dev0", MIN_DEVICE_BYTES);
+        let dev1 = temp_device(&dir, "dev1", MIN_DEVICE_BYTES);
+        let config = PoolCreateConfig {
+            pool_name: "member-label-retry".into(),
+            pool_guid: None,
+            redundancy: RedundancyPolicy::replicated(1),
+            encryption_key: None,
+            clustered: false,
+        };
+        let first = PoolCreator::create_pool(&[dev0.clone(), dev1.clone()], &config).unwrap();
+
+        let (leading, trailing) = {
+            let mut member0 = CreationDevice::open(&dev0, 0).unwrap();
+            let trailing_offset = member0.capacity_bytes - POOL_LABEL_SIZE as u64;
+            (
+                read_raw_label_at(&mut member0, 0),
+                read_raw_label_at(&mut member0, trailing_offset),
+            )
+        };
+        for path in [&dev0, &dev1] {
+            let file = OpenOptions::new().write(true).open(path).unwrap();
+            file.set_len(0).unwrap();
+            file.set_len(MIN_DEVICE_BYTES).unwrap();
+            file.sync_all().unwrap();
+        }
+        let mut member0 = OpenOptions::new().write(true).open(&dev0).unwrap();
+        member0
+            .write_all(&leading[..POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE])
+            .unwrap();
+        member0
+            .seek(SeekFrom::Start(MIN_DEVICE_BYTES - POOL_LABEL_SIZE as u64))
+            .unwrap();
+        member0
+            .write_all(&trailing[..POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE])
+            .unwrap();
+        member0.sync_all().unwrap();
+
+        let retried = PoolCreator::create_pool(&[dev0.clone(), dev1.clone()], &config).unwrap();
+        assert_eq!(retried.pool_guid, first.pool_guid);
+        assert_eq!(retried.device_guids[0], first.device_guids[0]);
+        assert_ne!(retried.device_guids[1], [0; 16]);
+
+        let converged = PoolCreator::create_pool(&[dev0, dev1], &config).unwrap();
+        assert_eq!(converged.pool_guid, retried.pool_guid);
+        assert_eq!(converged.device_guids, retried.device_guids);
+    }
+
+    #[test]
+    fn create_pool_bootstrap_encrypted_fresh_retry_converges() {
+        let (_dir, dev) = setup_single_device(MIN_DEVICE_BYTES);
+        let config = PoolCreateConfig {
+            pool_name: "encrypted-bootstrap".into(),
+            pool_guid: None,
+            redundancy: RedundancyPolicy::replicated(1),
+            encryption_key: Some(StoreKey::generate()),
+            clustered: false,
+        };
+
+        let first = PoolCreator::create_pool(&[dev.clone()], &config).unwrap();
+        let retried = PoolCreator::create_pool(&[dev], &config).unwrap();
+
+        assert!(retried.encrypted);
+        assert_eq!(retried.pool_guid, first.pool_guid);
+        assert_eq!(retried.device_guids, first.device_guids);
+        assert_eq!(
+            retried.encryption_key_fingerprint,
+            first.encryption_key_fingerprint
+        );
+    }
+
+    #[test]
+    fn create_pool_bootstrap_refuses_used_same_guid_pool() {
+        let (_dir, dev) = setup_single_device(MIN_DEVICE_BYTES);
+        let config = PoolCreateConfig {
+            pool_name: "used-pool".into(),
+            pool_guid: Some([0xA2; 16]),
+            redundancy: RedundancyPolicy::replicated(1),
+            encryption_key: None,
+            clustered: false,
+        };
+        PoolCreator::create_pool(&[dev.clone()], &config).unwrap();
+
+        let pool_config = tidefs_local_object_store::PoolConfig {
+            name: config.pool_name.clone(),
+            root_path: _dir.path().join("metadata"),
+            devices: vec![tidefs_local_object_store::DeviceConfig {
+                path: dev.clone(),
+                backing: tidefs_local_object_store::DeviceBacking::RegularFileDev,
+                class: tidefs_local_object_store::DeviceClass::Data,
+                media_class: Default::default(),
+                kind: tidefs_local_object_store::DeviceKind::Block { path: dev.clone() },
+                compression: None,
+                encryption: None,
+            }],
+        };
+        let mut pool_properties = tidefs_local_object_store::PoolProperties::default();
+        pool_properties.redundancy_policy =
+            tidefs_local_object_store::PoolRedundancyPolicy::replicated(1);
+        let mut pool = tidefs_local_object_store::Pool::open(
+            pool_config,
+            pool_properties,
+            &tidefs_local_object_store::StoreOptions::default(),
+        )
+        .unwrap();
+        pool.put(
+            tidefs_local_object_store::DeviceIoClass::Data,
+            tidefs_local_object_store::ObjectKey::from_name(b"used-pool"),
+            b"live payload",
+        )
+        .unwrap();
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        assert!(matches!(
+            PoolCreator::create_pool(&[dev], &config),
+            Err(CreateError::Store(StoreError::InvalidOptions { .. }))
+        ));
+    }
+
+    #[test]
+    fn create_pool_bootstrap_refuses_stale_label_extension_bytes() {
+        let (_dir, dev) = setup_single_device(MIN_DEVICE_BYTES);
+        let config = PoolCreateConfig {
+            pool_name: "stale-label-extension".into(),
+            pool_guid: Some([0xA4; 16]),
+            redundancy: RedundancyPolicy::replicated(1),
+            encryption_key: None,
+            clustered: false,
+        };
+        PoolCreator::create_pool(&[dev.clone()], &config).unwrap();
+
+        let mut file = OpenOptions::new().write(true).open(&dev).unwrap();
+        file.seek(SeekFrom::Start(
+            MIN_DEVICE_BYTES - POOL_LABEL_SIZE as u64
+                + POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE as u64,
+        ))
+        .unwrap();
+        file.write_all(&[0xA5]).unwrap();
+        file.sync_all().unwrap();
+
+        assert!(matches!(
+            PoolCreator::create_pool(&[dev], &config),
+            Err(CreateError::AmbiguousMedia { reason, .. })
+                if reason.contains("extension bytes")
+        ));
+    }
+
+    #[test]
+    fn create_pool_bootstrap_refuses_reordered_missing_and_extra_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev0 = temp_device(&dir, "dev0", MIN_DEVICE_BYTES);
+        let dev1 = temp_device(&dir, "dev1", MIN_DEVICE_BYTES);
+        let dev2 = temp_device(&dir, "dev2", MIN_DEVICE_BYTES);
+        let config = PoolCreateConfig {
+            pool_name: "exact-topology".into(),
+            pool_guid: Some([0xA3; 16]),
+            redundancy: RedundancyPolicy::replicated(1),
+            encryption_key: None,
+            clustered: false,
+        };
+        PoolCreator::create_pool(&[dev0.clone(), dev1.clone()], &config).unwrap();
+
+        for attempted in [
+            vec![dev1.clone(), dev0.clone()],
+            vec![dev0.clone()],
+            vec![dev0, dev1, dev2],
+        ] {
+            assert!(matches!(
+                PoolCreator::create_pool(&attempted, &config),
+                Err(CreateError::AmbiguousMedia { .. })
+            ));
+        }
     }
 
     // -- CreateError Display test --

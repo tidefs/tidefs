@@ -27,6 +27,7 @@ tidefs-checksum-tree = { workspace = true }
 tidefs-binary_schema-checksum = { workspace = true }
 tidefs-intent-log = { workspace = true }
 blake3 = "=1.5.5"
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

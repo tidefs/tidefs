@@ -91,6 +91,34 @@ type StoreHistory = BTreeMap<ObjectKey, Vec<ObjectLocation>>;
 type BlockIndexScan = (StoreIndex, StoreHistory, u64, u64);
 type IndexCheckpoint = Option<(StoreIndex, StoreHistory, u64)>;
 
+/// Immutable identity of one byte-addressable member of a labelled Pool.
+///
+/// Mutable topology, capacity, and layout stay in Pool label authority.  A
+/// device can be grown, reordered, exported, or admitted to a later topology
+/// without changing the incarnation of the object log stored on it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlockStoreIdentity {
+    pub pool_guid: [u8; 16],
+    pub device_guid: [u8; 16],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BlockStoreBootstrapInspection {
+    pub identity: Option<BlockStoreIdentity>,
+    pub record: Option<(ObjectKey, Vec<u8>)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlockFormatHeader {
+    identity: BlockStoreIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockFormatHeaderState {
+    Blank,
+    Current(BlockFormatHeader),
+}
+
 /// Offset where the pool commit-record region ends and the object-store
 /// data region begins.  The commit-record region occupies bytes
 /// [8192, 8192 + 256 KiB) = [8192, 270336).  Object records start
@@ -98,12 +126,13 @@ type IndexCheckpoint = Option<(StoreIndex, StoreHistory, u64)>;
 /// object-store record scanning.
 const BLOCK_DEVICE_DATA_REGION_OFFSET: u64 = 270_336;
 
-/// Magic bytes for the block-device data-region format header.
-const BLOCK_DATA_MAGIC: &[u8; 6] = b"VFSBLK";
+/// Magic bytes for the identity-bound block-device data-region format header.
+const BLOCK_DATA_MAGIC: [u8; 8] = *b"TFSBLK2\0";
 /// Size of the block-device format header.
-const BLOCK_DATA_FORMAT_HEADER_SIZE: u64 = 64;
+const BLOCK_DATA_FORMAT_HEADER_SIZE: u64 = 80;
 /// Block-device format version.
-const BLOCK_DATA_FORMAT_VERSION: u32 = 1;
+const BLOCK_DATA_FORMAT_VERSION: u32 = 2;
+const BLOCK_DATA_FORMAT_CHECKSUM_OFFSET: usize = 48;
 /// Well-known file name for the store format manifest (JSON).
 const FORMAT_MANIFEST_FILE_NAME: &str = "format_manifest";
 /// Well-known object name for committed compaction publication manifests.
@@ -930,6 +959,20 @@ impl LocalObjectStore {
         BLOCK_DEVICE_DATA_REGION_OFFSET + BLOCK_DATA_FORMAT_HEADER_SIZE
     }
 
+    /// Minimum raw byte-device capacity accepted by the current Store layout.
+    ///
+    /// Pool creation consumes this value without duplicating private header
+    /// sizes or offsets owned by this crate.
+    #[must_use]
+    pub const fn minimum_block_device_capacity() -> u64 {
+        // Pool layout authority operates on Store-visible capacity, which
+        // excludes the trailing label reservation and must retain at least one
+        // minimum layout segment after the fixed Store header.
+        Self::block_device_data_start()
+            + crate::device_layout::MIN_SEGMENT_SIZE_BYTES
+            + POOL_LABEL_SIZE as u64
+    }
+
     fn scan_block_device_for_index(
         file: &mut File,
         data_start: u64,
@@ -1023,71 +1066,337 @@ impl LocalObjectStore {
         Ok((index, history, next_sequence, cursor))
     }
 
-    /// Write a block-device format header at `data_start`.
-    ///
-    /// The format header contains a magic marker, format version, and a
-    /// random pool generation number that uniquely identifies this pool
-    /// incarnation. On subsequent opens, the generation is compared; if
-    /// it differs, the data region is treated as uninitialized (stale
-    /// data from a previous pool creation).
-    fn write_block_format_header(file: &mut File, data_start: u64) -> Result<u64> {
-        let generation: u64 = rand::random();
-        let mut header = [0u8; BLOCK_DATA_FORMAT_HEADER_SIZE as usize];
-        header[0..6].copy_from_slice(BLOCK_DATA_MAGIC);
-        header[6..10].copy_from_slice(&BLOCK_DATA_FORMAT_VERSION.to_le_bytes());
-        header[10..18].copy_from_slice(&generation.to_le_bytes());
-        file.seek(SeekFrom::Start(data_start))
-            .map_err(|e| StoreError::Io {
-                operation: "write_block_format_seek",
-                path: PathBuf::from("<block-device>"),
-                source: e,
-            })?;
-        file.write_all(&header).map_err(|e| StoreError::Io {
-            operation: "write_block_format_write",
-            path: PathBuf::from("<block-device>"),
-            source: e,
-        })?;
-        file.flush().map_err(|e| StoreError::Io {
-            operation: "write_block_format_flush",
-            path: PathBuf::from("<block-device>"),
-            source: e,
-        })?;
-        Ok(generation)
+    fn encode_block_format_header(identity: BlockStoreIdentity) -> [u8; 80] {
+        let mut encoded = [0u8; BLOCK_DATA_FORMAT_HEADER_SIZE as usize];
+        encoded[0..8].copy_from_slice(&BLOCK_DATA_MAGIC);
+        encoded[8..12].copy_from_slice(&BLOCK_DATA_FORMAT_VERSION.to_le_bytes());
+        encoded[12..16].copy_from_slice(&(BLOCK_DATA_FORMAT_HEADER_SIZE as u32).to_le_bytes());
+        encoded[16..32].copy_from_slice(&identity.pool_guid);
+        encoded[32..48].copy_from_slice(&identity.device_guid);
+        let checksum = blake3::hash(&encoded[..BLOCK_DATA_FORMAT_CHECKSUM_OFFSET]);
+        encoded[BLOCK_DATA_FORMAT_CHECKSUM_OFFSET..].copy_from_slice(checksum.as_bytes());
+        encoded
     }
 
-    /// Read and validate the block-device format header.
-    /// Returns `Some(generation)` if valid, `None` if uninitialized or stale.
-    fn read_block_format_header(file: &mut File, data_start: u64) -> Result<Option<u64>> {
-        let mut header = [0u8; BLOCK_DATA_FORMAT_HEADER_SIZE as usize];
+    fn decode_block_format_header(encoded: &[u8; 80]) -> Result<BlockFormatHeaderState> {
+        if encoded.iter().all(|byte| *byte == 0) {
+            return Ok(BlockFormatHeaderState::Blank);
+        }
+        if encoded[0..8] != BLOCK_DATA_MAGIC {
+            return Err(StoreError::InvalidOptions {
+                reason: "block-device store format header has invalid or retired magic",
+            });
+        }
+        if u32::from_le_bytes(encoded[8..12].try_into().unwrap()) != BLOCK_DATA_FORMAT_VERSION
+            || u32::from_le_bytes(encoded[12..16].try_into().unwrap())
+                != BLOCK_DATA_FORMAT_HEADER_SIZE as u32
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "block-device store format header has an incompatible version or size",
+            });
+        }
+        if encoded[BLOCK_DATA_FORMAT_CHECKSUM_OFFSET..]
+            != *blake3::hash(&encoded[..BLOCK_DATA_FORMAT_CHECKSUM_OFFSET]).as_bytes()
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "block-device store format header checksum mismatch",
+            });
+        }
+        let mut pool_guid = [0u8; 16];
+        pool_guid.copy_from_slice(&encoded[16..32]);
+        let mut device_guid = [0u8; 16];
+        device_guid.copy_from_slice(&encoded[32..48]);
+        Ok(BlockFormatHeaderState::Current(BlockFormatHeader {
+            identity: BlockStoreIdentity {
+                pool_guid,
+                device_guid,
+            },
+        }))
+    }
+
+    fn read_block_format_header(
+        file: &mut File,
+        data_start: u64,
+    ) -> Result<BlockFormatHeaderState> {
+        let mut encoded = [0u8; BLOCK_DATA_FORMAT_HEADER_SIZE as usize];
         file.seek(SeekFrom::Start(data_start))
-            .map_err(|e| StoreError::Io {
+            .map_err(|source| StoreError::Io {
                 operation: "read_block_format_seek",
                 path: PathBuf::from("<block-device>"),
-                source: e,
+                source,
             })?;
-        match file.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => {
-                return Err(StoreError::Io {
-                    operation: "read_block_format_read",
+        file.read_exact(&mut encoded)
+            .map_err(|source| StoreError::Io {
+                operation: "read_block_format_read",
+                path: PathBuf::from("<block-device>"),
+                source,
+            })?;
+        Self::decode_block_format_header(&encoded)
+    }
+
+    fn validate_block_format_identity(
+        header: BlockFormatHeader,
+        expected: BlockStoreIdentity,
+    ) -> Result<()> {
+        if header.identity != expected {
+            return Err(StoreError::InvalidOptions {
+                reason:
+                    "block-device store format identity does not match the labelled Pool member",
+            });
+        }
+        Ok(())
+    }
+
+    fn block_bootstrap_tail_is_blank(
+        file: &mut File,
+        data_start: u64,
+        data_end: u64,
+    ) -> Result<bool> {
+        let mut cursor = data_start;
+        let mut buffer = [0u8; 64 * 1024];
+        while cursor < data_end {
+            let remaining = data_end - cursor;
+            let len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+            file.seek(SeekFrom::Start(cursor))
+                .map_err(|source| StoreError::Io {
+                    operation: "inspect_block_bootstrap_tail_seek",
                     path: PathBuf::from("<block-device>"),
-                    source: e,
+                    source,
+                })?;
+            file.read_exact(&mut buffer[..len])
+                .map_err(|source| StoreError::Io {
+                    operation: "inspect_block_bootstrap_tail_read",
+                    path: PathBuf::from("<block-device>"),
+                    source,
+                })?;
+            if buffer[..len].iter().any(|byte| *byte != 0) {
+                return Ok(false);
+            }
+            cursor += len as u64;
+        }
+        Ok(true)
+    }
+
+    fn read_block_bootstrap_record(
+        file: &mut File,
+        device_path: &Path,
+        data_start: u64,
+        data_end: u64,
+    ) -> Result<Option<(ObjectKey, Vec<u8>)>> {
+        if data_end.saturating_sub(data_start) < RECORD_HEADER_LEN_U64 {
+            return Err(StoreError::InvalidOptions {
+                reason: "block-device store bootstrap region is too small for a record",
+            });
+        }
+        file.seek(SeekFrom::Start(data_start))
+            .map_err(|source| StoreError::Io {
+                operation: "inspect_block_bootstrap_record_seek",
+                path: PathBuf::from("<block-device>"),
+                source,
+            })?;
+        let mut header = [0u8; RECORD_HEADER_LEN];
+        file.read_exact(&mut header)
+            .map_err(|source| StoreError::Io {
+                operation: "inspect_block_bootstrap_record_header",
+                path: PathBuf::from("<block-device>"),
+                source,
+            })?;
+        if header.iter().all(|byte| *byte == 0) {
+            if Self::block_bootstrap_tail_is_blank(file, data_start, data_end)? {
+                return Ok(None);
+            }
+            return Err(StoreError::InvalidOptions {
+                reason: "blank block-device store prefix has a nonblank physical tail",
+            });
+        }
+
+        let decoded =
+            decode_stored_record_after_header(file, device_path, 0, data_start, data_end, header)?;
+        let record = decoded.header;
+        if record.format_version != RECORD_FORMAT_VERSION
+            || record.kind != RecordKind::Put
+            || record.sequence != 0
+            || record.compression_algorithm != 0
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "block-device store bootstrap record is not one current internal put",
+            });
+        }
+        if !Self::block_bootstrap_tail_is_blank(file, decoded.range.end_offset, data_end)? {
+            return Err(StoreError::InvalidOptions {
+                reason: "block-device store bootstrap contains records or bytes after its marker",
+            });
+        }
+        Ok(Some((record.key, decoded.payload)))
+    }
+
+    fn inspect_block_device_bootstrap_file(
+        file: &mut File,
+        device_path: &Path,
+        data_end: u64,
+    ) -> Result<BlockStoreBootstrapInspection> {
+        let capacity = file
+            .seek(SeekFrom::End(0))
+            .map_err(|source| StoreError::Io {
+                operation: "inspect_block_bootstrap_capacity",
+                path: device_path.to_path_buf(),
+                source,
+            })?;
+        if data_end != capacity.saturating_sub(POOL_LABEL_SIZE as u64)
+            || data_end < Self::block_device_data_start()
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "block-device store bootstrap capacity or layout boundary mismatch",
+            });
+        }
+        match Self::read_block_format_header(file, BLOCK_DEVICE_DATA_REGION_OFFSET)? {
+            BlockFormatHeaderState::Current(header) => Ok(BlockStoreBootstrapInspection {
+                identity: Some(header.identity),
+                record: Self::read_block_bootstrap_record(
+                    file,
+                    device_path,
+                    Self::block_device_data_start(),
+                    data_end,
+                )?,
+            }),
+            BlockFormatHeaderState::Blank => {
+                if !Self::block_bootstrap_tail_is_blank(
+                    file,
+                    Self::block_device_data_start(),
+                    data_end,
+                )? {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "missing block-device store header has unexpected physical objects",
+                    });
+                }
+                Ok(BlockStoreBootstrapInspection {
+                    identity: None,
+                    record: None,
                 })
             }
         }
-        if &header[0..6] != BLOCK_DATA_MAGIC {
-            return Ok(None);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inspect_block_device_bootstrap(
+        device_path: impl AsRef<Path>,
+        data_end: u64,
+    ) -> Result<BlockStoreBootstrapInspection> {
+        let device_path = device_path.as_ref();
+        let mut file = File::open(device_path).map_err(|source| StoreError::Io {
+            operation: "inspect_block_bootstrap_open",
+            path: device_path.to_path_buf(),
+            source,
+        })?;
+        Self::inspect_block_device_bootstrap_file(&mut file, device_path, data_end)
+    }
+
+    pub(crate) fn inspect_open_block_device_bootstrap(
+        file: &mut File,
+        device_path: &Path,
+        capacity_bytes: u64,
+    ) -> Result<BlockStoreBootstrapInspection> {
+        Self::inspect_block_device_bootstrap_file(
+            file,
+            device_path,
+            capacity_bytes.saturating_sub(POOL_LABEL_SIZE as u64),
+        )
+    }
+
+    pub(crate) fn initialize_block_device_bootstrap(
+        device_path: impl AsRef<Path>,
+        expected: BlockStoreIdentity,
+    ) -> Result<()> {
+        let device_path = device_path.as_ref();
+        let mut capacity_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(device_path)
+            .map_err(|source| StoreError::Io {
+                operation: "initialize_block_bootstrap_capacity_open",
+                path: device_path.to_path_buf(),
+                source,
+            })?;
+        let capacity = capacity_file
+            .seek(SeekFrom::End(0))
+            .map_err(|source| StoreError::Io {
+                operation: "initialize_block_bootstrap_capacity",
+                path: device_path.to_path_buf(),
+                source,
+            })?;
+        let data_end = capacity.saturating_sub(POOL_LABEL_SIZE as u64);
+        let inspection =
+            Self::inspect_block_device_bootstrap_file(&mut capacity_file, device_path, data_end)?;
+        Self::initialize_open_block_device_bootstrap_after_inspection(
+            &mut capacity_file,
+            device_path,
+            expected,
+            &inspection,
+        )
+    }
+
+    pub(crate) fn initialize_open_block_device_bootstrap_after_inspection(
+        file: &mut File,
+        device_path: &Path,
+        expected: BlockStoreIdentity,
+        inspection: &BlockStoreBootstrapInspection,
+    ) -> Result<()> {
+        match inspection {
+            BlockStoreBootstrapInspection {
+                identity: Some(identity),
+                ..
+            } => {
+                Self::validate_block_format_identity(
+                    BlockFormatHeader {
+                        identity: *identity,
+                    },
+                    expected,
+                )?;
+                return Ok(());
+            }
+            BlockStoreBootstrapInspection {
+                identity: None,
+                record: None,
+            } => {}
+            BlockStoreBootstrapInspection {
+                identity: None,
+                record: Some(_),
+            } => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "headerless block-device store contains a bootstrap record",
+                })
+            }
         }
-        let version = u32::from_le_bytes([header[6], header[7], header[8], header[9]]);
-        if version != BLOCK_DATA_FORMAT_VERSION {
-            return Ok(None);
+
+        match Self::read_block_format_header(file, BLOCK_DEVICE_DATA_REGION_OFFSET)? {
+            BlockFormatHeaderState::Current(header) => {
+                return Self::validate_block_format_identity(header, expected)
+            }
+            BlockFormatHeaderState::Blank => {}
         }
-        let generation = u64::from_le_bytes([
-            header[10], header[11], header[12], header[13], header[14], header[15], header[16],
-            header[17],
-        ]);
-        Ok(Some(generation))
+        let encoded = Self::encode_block_format_header(expected);
+        file.seek(SeekFrom::Start(BLOCK_DEVICE_DATA_REGION_OFFSET))
+            .map_err(|source| StoreError::Io {
+                operation: "initialize_block_bootstrap_seek",
+                path: device_path.to_path_buf(),
+                source,
+            })?;
+        file.write_all(&encoded).map_err(|source| StoreError::Io {
+            operation: "initialize_block_bootstrap_write",
+            path: device_path.to_path_buf(),
+            source,
+        })?;
+        file.sync_all().map_err(|source| StoreError::Io {
+            operation: "initialize_block_bootstrap_sync",
+            path: device_path.to_path_buf(),
+            source,
+        })?;
+        match Self::read_block_format_header(file, BLOCK_DEVICE_DATA_REGION_OFFSET)? {
+            BlockFormatHeaderState::Current(header) if header.identity == expected => Ok(()),
+            _ => Err(StoreError::InvalidOptions {
+                reason: "block-device store bootstrap header did not persist",
+            }),
+        }
     }
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_options(root, StoreOptions::default())
@@ -1505,48 +1814,127 @@ impl LocalObjectStore {
         Ok(report)
     }
 
-    /// Open a block device or development regular file as a single-segment store.
+    /// Open an initialized block device or development regular file read-only.
     ///
-    /// The backing file/device is treated as a single append-only segment.
-    /// Objects are written sequentially starting at offset 4096 (after
-    /// the superblock region). On open, the data region is scanned to
-    /// rebuild the in-memory index.
+    /// This unbound inspection surface never initializes or mutates media.
+    /// Product callers that know Pool labels should use
+    /// [`Self::open_block_device_read_only_existing`] to validate exact Pool
+    /// and device identity as well.
     pub fn open_block_device(device_path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
-        Self::open_block_device_with_mode(device_path, options, StoreOpenMode::WritableCreate)
+        Self::open_block_device_with_mode(
+            device_path,
+            options,
+            StoreOpenMode::ReadOnlyExisting,
+            None,
+        )
+    }
+
+    pub(crate) fn open_block_device_writable_unbound(
+        device_path: impl AsRef<Path>,
+        options: StoreOptions,
+    ) -> Result<Self> {
+        Self::open_block_device_with_mode(device_path, options, StoreOpenMode::WritableCreate, None)
     }
 
     /// Open an existing block-device store without permitting writes.
     ///
-    /// Unlike [`Self::open_block_device`], this refuses an uninitialized or
-    /// incompatible format header instead of creating one. The backing handle
-    /// is opened read-only, so the returned store is suitable for concurrent
-    /// integrity inspection of an already-mounted pool.
-    pub(crate) fn open_block_device_read_only_existing(
+    /// The backing handle is opened read-only, so the returned store is
+    /// suitable for concurrent integrity inspection of an already-mounted
+    /// pool. Like every ordinary opener, it refuses an uninitialized or
+    /// incompatible format header.
+    pub fn open_block_device_read_only_existing(
         device_path: impl AsRef<Path>,
         options: StoreOptions,
+        pool_guid: [u8; 16],
+        device_guid: [u8; 16],
     ) -> Result<Self> {
-        Self::open_block_device_with_mode(device_path, options, StoreOpenMode::ReadOnlyExisting)
+        Self::open_block_device_with_mode(
+            device_path,
+            options,
+            StoreOpenMode::ReadOnlyExisting,
+            Some(BlockStoreIdentity {
+                pool_guid,
+                device_guid,
+            }),
+        )
+    }
+
+    pub(crate) fn open_block_device_writable_existing(
+        device_path: impl AsRef<Path>,
+        options: StoreOptions,
+        expected_identity: BlockStoreIdentity,
+    ) -> Result<Self> {
+        Self::open_block_device_with_mode(
+            device_path,
+            options,
+            StoreOpenMode::WritableCreate,
+            Some(expected_identity),
+        )
+    }
+
+    pub(crate) fn open_block_device_writable_existing_file(
+        file: File,
+        device_path: PathBuf,
+        options: StoreOptions,
+        expected_identity: BlockStoreIdentity,
+    ) -> Result<Self> {
+        Self::open_block_device_file(
+            file,
+            device_path,
+            options,
+            StoreOpenMode::WritableCreate,
+            Some(expected_identity),
+        )
     }
 
     pub(crate) fn open_block_device_preflight_existing(
         device_path: impl AsRef<Path>,
         options: StoreOptions,
+        expected_identity: BlockStoreIdentity,
     ) -> Result<Self> {
-        Self::open_block_device_with_mode(device_path, options, StoreOpenMode::PreflightExisting)
+        Self::open_block_device_with_mode(
+            device_path,
+            options,
+            StoreOpenMode::PreflightExisting,
+            Some(expected_identity),
+        )
     }
 
     fn open_block_device_with_mode(
         device_path: impl AsRef<Path>,
+        options: StoreOptions,
+        mode: StoreOpenMode,
+        expected_identity: Option<BlockStoreIdentity>,
+    ) -> Result<Self> {
+        let device_path = device_path.as_ref().to_path_buf();
+        let mut open_options = OpenOptions::new();
+        open_options.read(true);
+        if mode.is_writable() {
+            open_options.write(true);
+        }
+        let file = open_options
+            .open(&device_path)
+            .map_err(|e| StoreError::Io {
+                operation: "block_device_open",
+                path: device_path.clone(),
+                source: e,
+            })?;
+        Self::open_block_device_file(file, device_path, options, mode, expected_identity)
+    }
+
+    fn open_block_device_file(
+        mut file: File,
+        device_path: PathBuf,
         mut options: StoreOptions,
         mode: StoreOpenMode,
+        expected_identity: Option<BlockStoreIdentity>,
     ) -> Result<Self> {
         options.validate()?;
         if !mode.is_writable() {
             options.repair_torn_tail = false;
         }
-        let device_path = device_path.as_ref().to_path_buf();
 
-        let metadata = std::fs::metadata(&device_path).map_err(|e| StoreError::Io {
+        let metadata = file.metadata().map_err(|e| StoreError::Io {
             operation: "block_device_stat",
             path: device_path.clone(),
             source: e,
@@ -1563,19 +1951,6 @@ impl LocalObjectStore {
             });
         }
 
-        let mut open_options = OpenOptions::new();
-        open_options.read(true);
-        if mode.is_writable() {
-            open_options.write(true);
-        }
-        let mut file = open_options
-            .open(&device_path)
-            .map_err(|e| StoreError::Io {
-                operation: "block_device_open",
-                path: device_path.clone(),
-                source: e,
-            })?;
-
         let capacity = file.seek(SeekFrom::End(0)).map_err(|e| StoreError::Io {
             operation: "block_device_seek_end",
             path: device_path.clone(),
@@ -1585,25 +1960,24 @@ impl LocalObjectStore {
         let format_start: u64 = BLOCK_DEVICE_DATA_REGION_OFFSET;
         let data_start: u64 = Self::block_device_data_start();
         // Minimum usable capacity: label 0 + commit region + format header + label 1
-        let min_capacity = POOL_LABEL_SIZE as u64 + data_start + POOL_LABEL_SIZE as u64;
+        let min_capacity = Self::minimum_block_device_capacity();
         if capacity < min_capacity {
             return Err(StoreError::InvalidOptions {
-                reason: "block device too small for pool layout (minimum 800 KiB)",
+                reason: "block device too small for the current pool Store layout",
             });
         }
 
-        // Read the existing format header. Writable mounts retain the
-        // pre-release initialization behavior; inspection must never create
-        // or repair storage merely because the header is absent or invalid.
-        let _generation = match Self::read_block_format_header(&mut file, format_start)? {
-            Some(gen) => gen,
-            None if mode.is_writable() => Self::write_block_format_header(&mut file, format_start)?,
-            None => {
+        let header = match Self::read_block_format_header(&mut file, format_start)? {
+            BlockFormatHeaderState::Current(header) => header,
+            BlockFormatHeaderState::Blank => {
                 return Err(StoreError::InvalidOptions {
-                    reason: "read-only block-device open requires an existing valid format header",
+                    reason: "existing block-device open requires an initialized format header",
                 })
             }
         };
+        if let Some(expected) = expected_identity {
+            Self::validate_block_format_identity(header, expected)?;
+        }
 
         let (index, history, next_sequence, current_offset) = Self::scan_block_device_for_index(
             &mut file,
@@ -5908,6 +6282,9 @@ impl LocalObjectStore {
             segment_path(&self.segments_dir, location.segment_id)
         };
         let mut file = File::open(&path).map_err(|source| io_error("open", &path, source))?;
+        let data_end = file
+            .seek(SeekFrom::End(0))
+            .map_err(|source| io_error("seek end", &path, source))?;
         let expected_payload_offset = checked_record_offset(
             location.record_offset,
             RECORD_HEADER_LEN_U64,
@@ -5926,7 +6303,15 @@ impl LocalObjectStore {
         let mut header = [0_u8; RECORD_HEADER_LEN];
         file.read_exact(&mut header)
             .map_err(|source| io_error("read_exact header", &path, source))?;
-        let record = decode_header(&header, location.segment_id, location.record_offset)?;
+        let decoded = decode_stored_record_after_header(
+            &mut file,
+            &path,
+            location.segment_id,
+            location.record_offset,
+            data_end,
+            header,
+        )?;
+        let record = decoded.header;
         if record.kind != RecordKind::Put
             || record.key != location.key
             || record.sequence != location.sequence
@@ -5939,67 +6324,7 @@ impl LocalObjectStore {
                 reason: "header no longer matches the in-memory location index",
             });
         }
-        let record_range =
-            checked_record_range(record, location.segment_id, location.record_offset)?;
-
-        let payload_len =
-            usize::try_from(location.payload_len).map_err(|_| StoreError::PayloadTooLarge {
-                len: location.payload_len,
-                max: usize::MAX as u64,
-            })?;
-        let mut payload = vec![0_u8; payload_len];
-        file.read_exact(&mut payload)
-            .map_err(|source| io_error("read_exact payload", &path, source))?;
-        let footer = if record_has_footer(record.format_version) {
-            let mut footer_bytes = [0_u8; RECORD_FOOTER_LEN];
-            file.read_exact(&mut footer_bytes)
-                .map_err(|source| io_error("read_exact footer", &path, source))?;
-            decode_footer(
-                &footer_bytes,
-                record,
-                location.segment_id,
-                record_range.footer_offset,
-            )?;
-            Some(footer_bytes)
-        } else {
-            None
-        };
-        if record_has_production_integrity_trailer(record.format_version) {
-            let mut trailer = [0_u8; INTEGRITY_TRAILER_V2_LEN];
-            file.read_exact(&mut trailer)
-                .map_err(|source| io_error("read_exact integrity trailer V2", &path, source))?;
-            let footer = footer.ok_or(StoreError::CorruptHeader {
-                segment_id: location.segment_id,
-                offset: location.record_offset,
-                reason: "integrity trailer V2 requires a footer-bearing record",
-            })?;
-            let decoded_trailer = decode_integrity_trailer_v2(&trailer)?;
-            verify_integrity_trailer_v2(
-                &decoded_trailer,
-                record,
-                &header,
-                &payload,
-                &footer,
-                location.segment_id,
-                record_range
-                    .integrity_trailer_offset
-                    .ok_or(StoreError::CorruptHeader {
-                        segment_id: location.segment_id,
-                        offset: location.record_offset,
-                        reason: "integrity trailer V2 range is absent from record layout",
-                    })?,
-            )?;
-        }
-        let actual = checksum64(&payload);
-        if actual != location.payload_checksum {
-            return Err(StoreError::ChecksumMismatch {
-                segment_id: location.segment_id,
-                offset: location.payload_offset,
-                expected: location.payload_checksum,
-                actual,
-            });
-        }
-        Ok((payload, record.compression_algorithm))
+        Ok((decoded.payload, record.compression_algorithm))
     }
 
     fn read_location(&self, location: ObjectLocation) -> Result<Vec<u8>> {
@@ -6808,6 +7133,12 @@ struct CheckedRecordRange {
     end_offset: u64,
 }
 
+struct DecodedStoredRecord {
+    header: RecordHeader,
+    range: CheckedRecordRange,
+    payload: Vec<u8>,
+}
+
 fn checked_record_offset(base: u64, len: u64, segment_id: u64, record_offset: u64) -> Result<u64> {
     base.checked_add(len).ok_or(StoreError::CorruptHeader {
         segment_id,
@@ -6872,6 +7203,85 @@ fn checked_record_range(
         footer_offset,
         integrity_trailer_offset,
         end_offset,
+    })
+}
+
+fn decode_stored_record_after_header(
+    file: &mut File,
+    path: &Path,
+    segment_id: u64,
+    record_offset: u64,
+    data_end: u64,
+    header_bytes: [u8; RECORD_HEADER_LEN],
+) -> Result<DecodedStoredRecord> {
+    let header = decode_header(&header_bytes, segment_id, record_offset)?;
+    let range = checked_record_range(header, segment_id, record_offset)?;
+    if range.end_offset > data_end {
+        return Err(StoreError::CorruptHeader {
+            segment_id,
+            offset: record_offset,
+            reason: "record extends beyond the admitted data region",
+        });
+    }
+
+    let payload_len =
+        usize::try_from(header.payload_len).map_err(|_| StoreError::PayloadTooLarge {
+            len: header.payload_len,
+            max: usize::MAX as u64,
+        })?;
+    let mut payload = vec![0_u8; payload_len];
+    file.read_exact(&mut payload)
+        .map_err(|source| io_error("read_exact payload", path, source))?;
+    let actual = checksum64(&payload);
+    if actual != header.payload_checksum {
+        return Err(StoreError::ChecksumMismatch {
+            segment_id,
+            offset: range.payload_offset,
+            expected: header.payload_checksum,
+            actual,
+        });
+    }
+
+    let footer = if record_has_footer(header.format_version) {
+        let mut footer_bytes = [0_u8; RECORD_FOOTER_LEN];
+        file.read_exact(&mut footer_bytes)
+            .map_err(|source| io_error("read_exact footer", path, source))?;
+        decode_footer(&footer_bytes, header, segment_id, range.footer_offset)?;
+        Some(footer_bytes)
+    } else {
+        None
+    };
+    if record_has_production_integrity_trailer(header.format_version) {
+        let mut trailer = [0_u8; INTEGRITY_TRAILER_V2_LEN];
+        file.read_exact(&mut trailer)
+            .map_err(|source| io_error("read_exact integrity trailer V2", path, source))?;
+        let footer = footer.ok_or(StoreError::CorruptHeader {
+            segment_id,
+            offset: record_offset,
+            reason: "integrity trailer V2 requires a footer-bearing record",
+        })?;
+        let decoded_trailer = decode_integrity_trailer_v2(&trailer)?;
+        verify_integrity_trailer_v2(
+            &decoded_trailer,
+            header,
+            &header_bytes,
+            &payload,
+            &footer,
+            segment_id,
+            range
+                .integrity_trailer_offset
+                .ok_or(StoreError::CorruptHeader {
+                    segment_id,
+                    offset: record_offset,
+                    reason: "integrity trailer V2 range is absent from record layout",
+                })?,
+        )?;
+    }
+
+    Ok(DecodedStoredRecord {
+        header,
+        range,
+        payload,
     })
 }
 
@@ -8301,13 +8711,70 @@ mod block_device_open_tests {
     use super::*;
     use tempfile::tempdir;
 
-    const BLOCK_IMAGE_BYTES: u64 = 1024 * 1024;
+    const BLOCK_IMAGE_BYTES: u64 = LocalObjectStore::minimum_block_device_capacity();
 
-    fn create_block_image(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    fn block_test_identity() -> BlockStoreIdentity {
+        BlockStoreIdentity {
+            pool_guid: [0x31; 16],
+            device_guid: [0x42; 16],
+        }
+    }
+
+    fn create_blank_block_image(dir: &tempfile::TempDir) -> std::path::PathBuf {
         let image = dir.path().join("pool.img");
         let file = File::create(&image).expect("create image");
         file.set_len(BLOCK_IMAGE_BYTES).expect("size image");
+        drop(file);
         image
+    }
+
+    fn create_block_image(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let image = create_blank_block_image(dir);
+        LocalObjectStore::initialize_block_device_bootstrap(&image, block_test_identity())
+            .expect("initialize explicit test Store identity");
+        image
+    }
+
+    fn block_bootstrap_data_end() -> u64 {
+        BLOCK_IMAGE_BYTES - POOL_LABEL_SIZE as u64
+    }
+
+    fn write_raw_bootstrap_record(
+        image: &Path,
+        kind: RecordKind,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> u64 {
+        let record = RecordHeader {
+            format_version: RECORD_FORMAT_VERSION,
+            kind,
+            sequence: 0,
+            key,
+            payload_len: payload.len() as u64,
+            payload_checksum: checksum64(payload),
+            compression_algorithm: 0,
+        };
+        let offset = LocalObjectStore::block_device_data_start();
+        let range = checked_record_range(record, 0, offset).expect("bootstrap record range");
+        let mut header = [0; RECORD_HEADER_LEN];
+        encode_header(&mut header, record);
+        let footer = encode_footer(record);
+        let trailer = encode_integrity_trailer_v2(&build_integrity_trailer_v2(
+            record, &header, payload, &footer,
+        ));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(image)
+            .expect("open image for raw bootstrap record");
+        file.seek(SeekFrom::Start(offset))
+            .expect("seek bootstrap record");
+        file.write_all(&header).expect("write bootstrap header");
+        file.write_all(payload).expect("write bootstrap payload");
+        file.write_all(&footer).expect("write bootstrap footer");
+        file.write_all(&trailer).expect("write bootstrap trailer");
+        file.sync_all().expect("sync bootstrap record");
+        range.end_offset
     }
 
     fn block_options(record_bytes: u64) -> StoreOptions {
@@ -8331,14 +8798,232 @@ mod block_device_open_tests {
     }
 
     #[test]
-    fn open_block_device_accepts_regular_file_dev_backing() {
+    fn pool_bootstrap_public_raw_open_is_read_only_and_identity_mismatch_fails() {
         let dir = tempdir().expect("tempdir");
         let image = create_block_image(&dir);
+        let before = std::fs::read(&image).expect("snapshot initialized image");
 
-        let store = LocalObjectStore::open_block_device(&image, StoreOptions::test_fast())
+        let mut store = LocalObjectStore::open_block_device(&image, StoreOptions::test_fast())
             .expect("open regular file backing");
 
         assert!(store.block_device_mode);
+        assert!(store.is_read_only());
+        assert!(matches!(
+            store.put(ObjectKey::from_name(b"public-read-only"), b"refused"),
+            Err(StoreError::ReadOnly { operation: "put" })
+        ));
+        drop(store);
+
+        let mut wrong_pool_guid = block_test_identity().pool_guid;
+        wrong_pool_guid[0] ^= 0xff;
+        assert!(matches!(
+            LocalObjectStore::open_block_device_read_only_existing(
+                &image,
+                StoreOptions::test_fast(),
+                wrong_pool_guid,
+                block_test_identity().device_guid,
+            ),
+            Err(StoreError::InvalidOptions { reason }) if reason.contains("identity does not match")
+        ));
+        assert_eq!(
+            std::fs::read(&image).expect("reread initialized image"),
+            before,
+            "read-only or identity-mismatch open changed media"
+        );
+    }
+
+    #[test]
+    fn pool_bootstrap_ordinary_opens_never_initialize_blank_media() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_blank_block_image(&dir);
+        let before = std::fs::read(&image).expect("snapshot blank image");
+
+        let opens = [
+            LocalObjectStore::open_block_device(&image, StoreOptions::test_fast()),
+            LocalObjectStore::open_block_device_writable_existing(
+                &image,
+                StoreOptions::test_fast(),
+                block_test_identity(),
+            ),
+            LocalObjectStore::open_block_device_read_only_existing(
+                &image,
+                StoreOptions::test_fast(),
+                block_test_identity().pool_guid,
+                block_test_identity().device_guid,
+            ),
+            LocalObjectStore::open_block_device_preflight_existing(
+                &image,
+                StoreOptions::test_fast(),
+                block_test_identity(),
+            ),
+        ];
+        for result in opens {
+            assert!(matches!(
+                result,
+                Err(StoreError::InvalidOptions { reason })
+                    if reason.contains("requires an initialized format header")
+            ));
+            assert_eq!(
+                std::fs::read(&image).expect("reread blank image"),
+                before,
+                "ordinary open changed blank media"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_bootstrap_blank_inspection_and_matching_header_retry() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_blank_block_image(&dir);
+        let blank =
+            LocalObjectStore::inspect_block_device_bootstrap(&image, block_bootstrap_data_end())
+                .expect("inspect blank bootstrap region");
+        assert_eq!(blank.identity, None);
+        assert_eq!(blank.record, None);
+
+        LocalObjectStore::initialize_block_device_bootstrap(&image, block_test_identity())
+            .expect("initialize blank bootstrap region");
+        let initialized =
+            LocalObjectStore::inspect_block_device_bootstrap(&image, block_bootstrap_data_end())
+                .expect("inspect initialized bootstrap region");
+        assert_eq!(initialized.identity, Some(block_test_identity()));
+        assert_eq!(initialized.record, None);
+
+        let before_retry = std::fs::read(&image).expect("snapshot initialized image");
+        LocalObjectStore::initialize_block_device_bootstrap(&image, block_test_identity())
+            .expect("retry matching header");
+        assert_eq!(
+            std::fs::read(&image).expect("reread initialized image"),
+            before_retry,
+            "matching-header retry rewrote media"
+        );
+    }
+
+    #[test]
+    fn pool_bootstrap_refuses_foreign_and_corrupt_headers_without_mutation() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let before_foreign = std::fs::read(&image).expect("snapshot initialized image");
+        let foreign = BlockStoreIdentity {
+            pool_guid: [0x91; 16],
+            device_guid: [0x92; 16],
+        };
+        assert!(matches!(
+            LocalObjectStore::initialize_block_device_bootstrap(&image, foreign),
+            Err(StoreError::InvalidOptions { reason })
+                if reason.contains("identity does not match")
+        ));
+        assert_eq!(
+            std::fs::read(&image).expect("reread after foreign retry"),
+            before_foreign
+        );
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image)
+            .expect("open image for corrupt header");
+        file.seek(SeekFrom::Start(BLOCK_DEVICE_DATA_REGION_OFFSET + 48))
+            .expect("seek header checksum");
+        file.write_all(&[0x5a]).expect("corrupt header checksum");
+        file.sync_all().expect("sync corrupt header");
+        drop(file);
+        let corrupt_before = std::fs::read(&image).expect("snapshot corrupt image");
+        assert!(
+            LocalObjectStore::initialize_block_device_bootstrap(&image, block_test_identity())
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&image).expect("reread corrupt image"),
+            corrupt_before,
+            "corrupt-header refusal changed media"
+        );
+    }
+
+    #[test]
+    fn pool_bootstrap_refuses_headerless_nonblank_and_torn_records() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_blank_block_image(&dir);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image)
+            .expect("open blank image");
+        file.seek(SeekFrom::Start(LocalObjectStore::block_device_data_start()))
+            .expect("seek data region");
+        file.write_all(&[0x7f]).expect("write stray byte");
+        file.sync_all().expect("sync stray byte");
+        drop(file);
+        let before = std::fs::read(&image).expect("snapshot headerless nonblank image");
+        assert!(matches!(
+            LocalObjectStore::initialize_block_device_bootstrap(&image, block_test_identity()),
+            Err(StoreError::InvalidOptions { reason })
+                if reason.contains("missing block-device store header")
+        ));
+        assert_eq!(std::fs::read(&image).expect("reread image"), before);
+
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image)
+            .expect("open initialized image");
+        file.seek(SeekFrom::Start(LocalObjectStore::block_device_data_start()))
+            .expect("seek record region");
+        file.write_all(&RECORD_MAGIC[..4])
+            .expect("write torn record prefix");
+        file.sync_all().expect("sync torn record prefix");
+        assert!(LocalObjectStore::inspect_block_device_bootstrap(
+            &image,
+            block_bootstrap_data_end()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pool_bootstrap_refuses_tombstones_and_bytes_after_one_marker() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        write_raw_bootstrap_record(
+            &image,
+            RecordKind::Delete,
+            ObjectKey::from_name(b"bootstrap-tombstone"),
+            &[],
+        );
+        assert!(matches!(
+            LocalObjectStore::inspect_block_device_bootstrap(
+                &image,
+                block_bootstrap_data_end()
+            ),
+            Err(StoreError::InvalidOptions { reason })
+                if reason.contains("not one current internal put")
+        ));
+
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let end = write_raw_bootstrap_record(
+            &image,
+            RecordKind::Put,
+            ObjectKey::from_name(b"one-marker"),
+            b"marker",
+        );
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image)
+            .expect("open image after marker");
+        file.seek(SeekFrom::Start(end)).expect("seek after marker");
+        file.write_all(&[1]).expect("write byte after marker");
+        file.sync_all().expect("sync byte after marker");
+        assert!(matches!(
+            LocalObjectStore::inspect_block_device_bootstrap(
+                &image,
+                block_bootstrap_data_end()
+            ),
+            Err(StoreError::InvalidOptions { reason })
+                if reason.contains("records or bytes after its marker")
+        ));
     }
 
     #[test]
@@ -8363,8 +9048,11 @@ mod block_device_open_tests {
         let key = ObjectKey::from_name(b"block-device/version-history");
 
         {
-            let mut store = LocalObjectStore::open_block_device(&image, StoreOptions::test_fast())
-                .expect("open block image");
+            let mut store = LocalObjectStore::open_block_device_writable_unbound(
+                &image,
+                StoreOptions::test_fast(),
+            )
+            .expect("open block image");
             for payload in [b"version-1".as_slice(), b"version-2", b"version-3"] {
                 store.put(key, payload).expect("write version");
             }
@@ -8404,8 +9092,8 @@ mod block_device_open_tests {
         let record_bytes = 128 * 1024;
         let options = block_options(record_bytes);
         let payload_len = options.max_object_bytes() as usize;
-        let mut store =
-            LocalObjectStore::open_block_device(&image, options).expect("open block image");
+        let mut store = LocalObjectStore::open_block_device_writable_unbound(&image, options)
+            .expect("open block image");
         let key = ObjectKey::from_name(b"block-device/overwrite");
         let mut latest = Vec::new();
 
@@ -8434,8 +9122,8 @@ mod block_device_open_tests {
         let record_bytes = 80 * 1024;
         let options = block_options(record_bytes);
         let payload_len = options.max_object_bytes() as usize;
-        let mut store =
-            LocalObjectStore::open_block_device(&image, options).expect("open block image");
+        let mut store = LocalObjectStore::open_block_device_writable_unbound(&image, options)
+            .expect("open block image");
         let deleted_a = ObjectKey::from_name(b"block-device/delete/a");
         let deleted_b = ObjectKey::from_name(b"block-device/delete/b");
         let live_keys = [
@@ -8493,8 +9181,8 @@ mod block_device_open_tests {
         let record_bytes = 80 * 1024;
         let options = block_options(record_bytes);
         let payload_len = options.max_object_bytes() as usize;
-        let mut store =
-            LocalObjectStore::open_block_device(&image, options).expect("open block image");
+        let mut store = LocalObjectStore::open_block_device_writable_unbound(&image, options)
+            .expect("open block image");
         let dead = ObjectKey::from_name(b"block-device/compact-retaining/dead");
         let live_a = ObjectKey::from_name(b"block-device/compact-retaining/live-a");
         let live_b = ObjectKey::from_name(b"block-device/compact-retaining/live-b");
@@ -8586,9 +9274,11 @@ mod block_device_open_tests {
         }
 
         const RECLAIM_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
-        let mut store =
-            LocalObjectStore::open_block_device(&image, block_options(RECLAIM_SEGMENT_BYTES))
-                .expect("open block image");
+        let mut store = LocalObjectStore::open_block_device_writable_unbound(
+            &image,
+            block_options(RECLAIM_SEGMENT_BYTES),
+        )
+        .expect("open block image");
         let key = ObjectKey::from_name(b"block-device/receipt-bound/delete");
         let live_key = ObjectKey::from_name(b"block-device/receipt-bound/live");
         let live_payload = b"live append-log payload";
