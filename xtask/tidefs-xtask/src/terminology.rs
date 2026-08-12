@@ -197,11 +197,9 @@ pub const HUMAN_API_ALIASES: &[HumanApiAliasEntry] = &[
 
 const DEMO_STDOUT_SURFACES: &[&str] = &[
     "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
-    "apps/tidefs-filesystem-demo/src/main.rs",
     "apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs",
     "apps/tidefs-scrub/src/main.rs",
     "apps/tidefs-storage-node/src/main.rs",
-    "apps/tidefs-store-demo/src/main.rs",
     "apps/tidefsctl/src/main.rs",
     "xtask/tidefs-xtask/src/main.rs",
 ];

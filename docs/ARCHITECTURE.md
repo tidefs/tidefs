@@ -25,8 +25,6 @@ block ordinary implementation work.
 | `apps/tidefs-scrub` | Scrub tool whose useful operator behavior is to consolidate into `tidefsctl`. |
 | `apps/tidefs-block-volume-adapter-daemon` | Block-mode source retained outside the first local mounted carrier. |
 | `apps/tidefs-storage-node` | Cluster-mode source retained outside the first local mounted carrier. |
-| `apps/tidefs-filesystem-demo` | Harness signal to migrate into carrier tests before deleting the demo package. |
-| `apps/tidefs-store-demo` | Harness signal to migrate into carrier tests before deleting the demo package. |
 
 The app list describes binaries present in the workspace. It is not release or
 operator-readiness evidence.
@@ -87,8 +85,8 @@ Pool-backed filesystem root before accepting mounted work.
 The repository is not short of implementations; it has too many overlapping
 ones in the default graph:
 
-- 166 root-workspace packages plus four excluded fuzz packages are present.
-- The default normal dependency closure of `tidefsctl` is 72 of 166 workspace
+- 164 root-workspace packages plus four excluded fuzz packages are present.
+- The default normal dependency closure of `tidefsctl` is 72 of 164 workspace
   packages (183 total); selecting its explicit `full` feature reaches 98
   workspace packages (220 total). Its manifest now has 16 required and 13
   optional normal dependencies. The default parser, help, source modules, and
@@ -103,7 +101,7 @@ ones in the default graph:
   authority; `receipt-demo` and `workload-telemetry` each own one optional
   source/dependency family. `full` aggregates them with the retained data-policy
   and replication forwarding features for development packaging.
-- The daemon's default normal tree reaches 71 of 166 workspace packages (169
+- The daemon's default normal tree reaches 71 of 164 workspace packages (169
   total packages including external crates), versus 88 workspace and 187 total
   with `full`. Its default carrier also excludes the distributed, claim,
   performance, storage-intent read-serving, and quorum-write families removed
@@ -216,7 +214,7 @@ and focused carrier tests. Publication claims remain a separate decision.
 
 ## Package-Root Disposition
 
-This target disposition covers all 166 workspace members and all four excluded
+This target disposition covers all 164 workspace members and all four excluded
 fuzz package roots. `docs/workspace-package-classification.md` remains the
 current-consumer inventory while this section decides the target dependency
 shape.
@@ -430,18 +428,12 @@ The fuzz roots remain preserved and independently runnable. Extraction means
 they stay outside the default carrier build, as they already do; it is not a
 request to remove their corpora or findings.
 
-### Delete After Signal Migration: Two Workspace Packages
-
-```text
-tidefs-filesystem-demo
-tidefs-store-demo
-```
-
-These are not product carriers. They currently feed `nix/tidefs-validation.sh`,
-packaged binary smoke checks, FUSE VM setup, and `tidefs-xtask` source checks.
-Move the useful write/read/replay/snapshot/send-receive and object-store smoke
-signal to focused tests through `tidefsctl` and `run_mount`, update those exact
-consumers, and only then delete the demo packages in a reviewable removal PR.
+The non-carrier `tidefs-filesystem-demo` and `tidefs-store-demo` packages were
+deleted after their write/read/replay/snapshot/send-receive and object-store
+signal was already owned by focused Pool/local-filesystem tests and the
+selected `tidefsctl`/`run_mount` carrier. Their broad-validation, packaging,
+and source-marker consumers were removed with them instead of preserving a
+second demonstration path.
 
 The daemon binary's duplicate local `mount-vfs` and `smoke-mount` paths were
 deleted after their mounted signal moved to `tidefsctl pool create` plus

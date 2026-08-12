@@ -26,16 +26,10 @@ pub fn check_local_object_store_current_workspace() -> Result<(), StorageCheckEr
     })?;
     let mut missing = Vec::new();
 
-    check_workspace_members(
-        &root,
-        &["crates/tidefs-local-object-store", "apps/tidefs-store-demo"],
-        &mut missing,
-    );
+    check_workspace_members(&root, &["crates/tidefs-local-object-store"], &mut missing);
     for rel in [
         "crates/tidefs-local-object-store/Cargo.toml",
         "crates/tidefs-local-object-store/src/lib.rs",
-        "apps/tidefs-store-demo/Cargo.toml",
-        "apps/tidefs-store-demo/src/main.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -118,10 +112,7 @@ pub fn check_local_object_store_on_disk_format_current_workspace() -> Result<(),
     })?;
     let mut missing = Vec::new();
 
-    for rel in [
-        "crates/tidefs-local-object-store/src/lib.rs",
-        "apps/tidefs-store-demo/src/main.rs",
-    ] {
+    for rel in ["crates/tidefs-local-object-store/src/lib.rs"] {
         check_required_file(&root, rel, &mut missing);
     }
     check_source_markers_in_src_dir(
@@ -156,20 +147,6 @@ pub fn check_local_object_store_on_disk_format_current_workspace() -> Result<(),
             "history: BTreeMap<ObjectKey, Vec<ObjectLocation>>",
             "UnsupportedVersion",
             "local_object_store_on_disk_format_spec_covers_storage_005_topics",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-store-demo/src/main.rs",
-        &[
-            "on_disk_format_spec",
-            "on_disk_format.rules",
-            "on_disk_format.rule topic",
-            "record_footer_magic",
-            "record_format_version_v1_no_footer",
-            "record_format_version_v2_footer",
-            "production_integrity.trailer_magic",
         ],
         &mut missing,
     );
@@ -234,7 +211,6 @@ pub fn check_production_integrity_current_workspace() -> Result<(), StorageCheck
         "docs/ROOT_AUTHENTICATION_OW015.md",
         "crates/tidefs-local-object-store/src/lib.rs",
         "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-store-demo/src/main.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -261,18 +237,6 @@ pub fn check_production_integrity_current_workspace() -> Result<(), StorageCheck
             "KeyHandling",
             "Validation",
             "production_integrity_policy_covers_storage_006_acceptance_gate",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-store-demo/src/main.rs",
-        &[
-            "production_integrity_policy",
-            "production_integrity.object_digest",
-            "production_integrity.root_authentication",
-            "production_integrity.migration_record_version",
-            "production_integrity.rule topic",
         ],
         &mut missing,
     );
@@ -340,7 +304,6 @@ pub fn check_production_integrity_v3_current_workspace() -> Result<(), StorageCh
 
     for rel in [
         "crates/tidefs-local-object-store/src/lib.rs",
-        "apps/tidefs-store-demo/src/main.rs",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -369,18 +332,6 @@ pub fn check_production_integrity_v3_current_workspace() -> Result<(), StorageCh
             "new_records_use_v3_production_integrity_trailer",
             "record_version_2_footer_record_replays_as_compatibility_input",
             "production_integrity_trailer_mismatch_rejects_replay",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-store-demo/src/main.rs",
-        &[
-            "record_format_version_v2_footer",
-            "production_integrity.trailer_magic",
-            "production_integrity.trailer_len",
-            "replay.v3_records_seen",
-            "replay.production_integrity_records_seen",
         ],
         &mut missing,
     );
@@ -431,7 +382,6 @@ pub fn check_root_authentication_current_workspace() -> Result<(), StorageCheckE
     for rel in [
         "docs/ROOT_AUTHENTICATION_OW015.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
         "apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs",
         "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         "nix/tidefs-validation.sh",
@@ -458,19 +408,6 @@ pub fn check_root_authentication_current_workspace() -> Result<(), StorageCheckE
             "has_root_authentication",
             "root_authentication_requires_the_matching_external_key",
             "unauthenticated_newer_root_candidate_is_skipped",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "root_authentication.spec",
-            "root_authentication.env_var",
-            "root_authentication.demo_key=explicit-fixture",
-            "run_crash_recovery_matrix_with_root_authentication_key",
-            "open_with_root_authentication_key",
-            "audit_recovery_with_root_authentication_key",
         ],
         &mut missing,
     );
@@ -544,7 +481,6 @@ pub fn check_local_snapshots_current_workspace() -> Result<(), StorageCheckError
     for rel in [
         "docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -567,17 +503,6 @@ pub fn check_local_snapshots_current_workspace() -> Result<(), StorageCheckError
             "snapshot_rollback_restores_an_isolated_committed_root",
             "safe_reclamation_preserves_snapshot_roots_for_later_rollback",
             "allocator_counts_snapshot_roots_hidden_behind_newer_slots",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "snapshot_rollback.spec",
-            "snapshot.create.name",
-            "snapshot.rollback.published_generation",
-            "snapshot_reclamation.protects_snapshot_root",
         ],
         &mut missing,
     );
@@ -632,7 +557,6 @@ pub fn check_send_receive_current_workspace() -> Result<(), StorageCheckError> {
     for rel in [
         "docs/SEND_RECEIVE_VERSION_AUTHORITY.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -652,18 +576,6 @@ pub fn check_send_receive_current_workspace() -> Result<(), StorageCheckError> {
             "rewrite_snapshot_roots_for_import",
             "changed_record_send_receive_round_trips_current_root_and_snapshot",
             "changed_record_import_rejects_corrupt_payload_before_publish",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "send_receive.spec",
-            "send_receive.export_roots",
-            "send_receive.staging_validated_before_publish",
-            "send_receive.destination_root_reauthentication",
-            "send_receive.rollback_read_matches",
         ],
         &mut missing,
     );
@@ -718,7 +630,6 @@ pub fn check_online_verifier_current_workspace() -> Result<(), StorageCheckError
     for rel in [
         "crates/tidefs-local-object-store/src/lib.rs",
         "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -751,18 +662,6 @@ pub fn check_online_verifier_current_workspace() -> Result<(), StorageCheckError
             "read_only_open_does_not_initialize_missing_store",
             "read_only_open_does_not_rotate_full_segment",
             "read_only_store_rejects_mutating_put",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "online_verifier.spec",
-            "online_verifier.law",
-            "online_verifier.outcome",
-            "online_verifier.mutating_repair_attempted",
-            "online_verifier.production_requires_operator_repair",
         ],
         &mut missing,
     );
@@ -802,19 +701,10 @@ pub fn check_local_filesystem_current_workspace() -> Result<(), StorageCheckErro
     })?;
     let mut missing = Vec::new();
 
-    check_workspace_members(
-        &root,
-        &[
-            "crates/tidefs-local-filesystem",
-            "apps/tidefs-filesystem-demo",
-        ],
-        &mut missing,
-    );
+    check_workspace_members(&root, &["crates/tidefs-local-filesystem"], &mut missing);
     for rel in [
         "crates/tidefs-local-filesystem/Cargo.toml",
         "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-filesystem-demo/Cargo.toml",
-        "apps/tidefs-filesystem-demo/src/main.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -927,7 +817,6 @@ pub fn check_chunked_file_layout_current_workspace() -> Result<(), StorageCheckE
     let mut missing = Vec::new();
     for rel in [
         "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -952,16 +841,6 @@ pub fn check_chunked_file_layout_current_workspace() -> Result<(), StorageCheckE
             "read_content_chunk_from_store",
             "random_write_updates_only_intersecting_chunk_refs",
             "truncate_rewrites_boundary_chunk_and_drops_tail_refs",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "content_layout.chunk_size",
-            "content_layout.manifest_object=versioned-content-object",
-            "content_layout.chunk_objects=versioned-content-chunks",
         ],
         &mut missing,
     );
@@ -1004,7 +883,6 @@ pub fn check_local_storage_allocator_current_workspace() -> Result<(), StorageCh
         "docs/CAPACITY_ACCOUNTING_AUTHORITY.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -1041,17 +919,6 @@ pub fn check_local_storage_allocator_current_workspace() -> Result<(), StorageCh
             "CapacityAuthority",
             "libc::ENOSPC",
             "vfs_adapter_dispatch_fallocate_mode_zero_readback_zeros",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "local_storage_allocator.spec",
-            "allocator_report.current_namespace_allocated_bytes",
-            "allocator_report.reusable_free_bytes",
-            "statfs.blocks",
         ],
         &mut missing,
     );
@@ -1190,7 +1057,6 @@ pub fn check_no_production_fsck_failure_model_current_workspace() -> Result<(), 
     for rel in [
         "crates/tidefs-local-filesystem/src/lib.rs",
         "crates/tidefs-local-object-store/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -1224,16 +1090,6 @@ pub fn check_no_production_fsck_failure_model_current_workspace() -> Result<(), 
             "checksum_mismatch_rejects_replay",
             "truncated_tail_is_repaired_without_losing_committed_record",
             "non-final segment ended in the middle of a record",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "formal_failure_model",
-            "no_fsck_failure_model.cases",
-            "no_fsck_failure_model.case class",
         ],
         &mut missing,
     );
@@ -1275,7 +1131,6 @@ pub fn check_crash_injection_recovery_current_workspace() -> Result<(), StorageC
     for rel in [
         "crates/tidefs-local-filesystem/src/lib.rs",
         "crates/tidefs-local-object-store/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -1329,18 +1184,6 @@ pub fn check_crash_injection_recovery_current_workspace() -> Result<(), StorageC
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "run_crash_recovery_matrix",
-            "crash_matrix.passed",
-            "crash_matrix.cases_executed",
-            "crash_matrix.explicit_error_observed",
-            "crash_matrix.case boundary",
-        ],
-        &mut missing,
-    );
 
     // Verify BackgroundOrphanReclamation registration at mount.
     check_required_file(
@@ -1377,10 +1220,7 @@ pub fn check_recovery_probe_current_workspace() -> Result<(), StorageCheckError>
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
-    for rel in [
-        "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
-    ] {
+    for rel in ["crates/tidefs-local-filesystem/src/lib.rs"] {
         check_required_file(&root, rel, &mut missing);
     }
     check_source_markers_in_src_dir(
@@ -1405,18 +1245,6 @@ pub fn check_recovery_probe_current_workspace() -> Result<(), StorageCheckError>
             "recovery_probe_reports_explicit_error_without_guessing_repair",
             "recovery_audit_reports_manifested_committed_root_without_fsck",
             "missing_manifest_newer_root_is_skipped_without_operator_repair",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "recovery_probe.preflight_outcome",
-            "recovery_probe.outcome",
-            "recovery_probe.production_requires_operator_repair",
-            "recovery_audit.outcome",
-            "recovery_audit.production_fsck_required",
         ],
         &mut missing,
     );
@@ -1455,10 +1283,7 @@ pub fn check_recovery_manifest_audit_current_workspace() -> Result<(), StorageCh
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
-    for rel in [
-        "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
-    ] {
+    for rel in ["crates/tidefs-local-filesystem/src/lib.rs"] {
         check_required_file(&root, rel, &mut missing);
     }
     check_source_markers_in_src_dir(
@@ -1483,17 +1308,6 @@ pub fn check_recovery_manifest_audit_current_workspace() -> Result<(), StorageCh
             "missing_manifest_newer_root_is_skipped_without_operator_repair",
             "transaction_manifest_is_written_and_validated_without_repair",
             "invalid_transaction_manifest_makes_newer_root_candidate_unselectable",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "recovery_audit_law",
-            "recovery_audit.live_outcome",
-            "recovery_audit.production_fsck_required",
-            "recovery_audit.checked_transaction_manifests",
         ],
         &mut missing,
     );
@@ -1533,10 +1347,7 @@ pub fn check_mount_invariant_gate_current_workspace() -> Result<(), StorageCheck
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
-    for rel in [
-        "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
-    ] {
+    for rel in ["crates/tidefs-local-filesystem/src/lib.rs"] {
         check_required_file(&root, rel, &mut missing);
     }
     check_source_markers_in_src_dir(
@@ -1555,18 +1366,6 @@ pub fn check_mount_invariant_gate_current_workspace() -> Result<(), StorageCheck
             "bad_link_count_committed_root_is_skipped_before_mount_without_fsck",
             "unreachable_inode_committed_root_is_skipped_before_mount_without_fsck",
             "mount_invariant_gate_reports_live_namespace_without_repair",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "mount_invariant_gate_law",
-            "mount_invariant.inode_count",
-            "mount_invariant.reachable_inode_count",
-            "mount_invariant.production_fsck_required",
-            "replay.mount_invariant_reachable",
         ],
         &mut missing,
     );
@@ -1606,10 +1405,7 @@ pub fn check_preview_posix_subset_current_workspace() -> Result<(), StorageCheck
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
-    for rel in [
-        "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
-    ] {
+    for rel in ["crates/tidefs-local-filesystem/src/lib.rs"] {
         check_required_file(&root, rel, &mut missing);
     }
     check_source_markers_in_src_dir(
@@ -1640,17 +1436,6 @@ pub fn check_preview_posix_subset_current_workspace() -> Result<(), StorageCheck
             "xattr/acl",
             "mknod-device/fifo/socket",
             "posix_subset_covers_storage_104_acceptance_gate",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "preview_posix_subset_spec",
-            "preview_posix_subset.policy_version",
-            "preview_posix_subset.entries",
-            "preview_posix_subset.entry topic",
         ],
         &mut missing,
     );
@@ -2940,10 +2725,7 @@ pub fn check_root_retention_current_workspace() -> Result<(), StorageCheckError>
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
-    for rel in [
-        "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
-    ] {
+    for rel in ["crates/tidefs-local-filesystem/src/lib.rs"] {
         check_required_file(&root, rel, &mut missing);
     }
     check_source_markers_in_src_dir(
@@ -2968,22 +2750,6 @@ pub fn check_root_retention_current_workspace() -> Result<(), StorageCheckError>
             "retention_plan_reports_debt_when_policy_needs_more_roots_than_exist",
             "retention_policy_rejects_below_no_fsck_fallback_floor",
             "retention_plan_keeps_same_slot_fallback_location_without_repair",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "retention_reclamation_law",
-            "retention_plan.policy_required_committed_roots",
-            "retention_plan.valid_committed_roots_available",
-            "retention_plan.missing_committed_roots",
-            "retention_plan.has_retention_debt",
-            "retention_plan.protected_committed_roots",
-            "retention_plan.protected_root_slot_locations",
-            "retention_plan.mutating_reclamation_allowed",
-            "retention_plan.production_fsck_required",
         ],
         &mut missing,
     );
@@ -3027,7 +2793,6 @@ pub fn check_safe_local_reclamation_current_workspace() -> Result<(), StorageChe
         "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
         "crates/tidefs-local-object-store/src/lib.rs",
         "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -3058,19 +2823,6 @@ pub fn check_safe_local_reclamation_current_workspace() -> Result<(), StorageChe
             "safe_reclamation_preserves_retained_roots_and_reopens",
             "safe reclamation lost a protected root-slot location",
             "safe reclamation changed the selected committed root",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-filesystem-demo/src/main.rs",
-        &[
-            "safe_local_reclamation.spec",
-            "safe_reclamation.retention_policy_satisfied",
-            "safe_reclamation.protected_root_slot_locations_preserved",
-            "safe_reclamation.tombstoned_unprotected_keys",
-            "safe_reclamation.retired_segments",
-            "safe_reclamation.reopen_read_matches",
         ],
         &mut missing,
     );

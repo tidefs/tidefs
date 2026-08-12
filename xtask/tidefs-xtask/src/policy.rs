@@ -2239,8 +2239,6 @@ fn classify_app_family(name: &str) -> Family {
         Family::ExplanationQuery
     } else if name == "tidefs-observe-cored" {
         Family::Observe
-    } else if name == "tidefs-store-demo" || name == "tidefs-filesystem-demo" {
-        Family::Storage
     } else if name == "tidefs-stress" {
         Family::Test
     } else if name == "tidefs-scrub" || name == "tidefs-storage-node" {
@@ -2983,14 +2981,6 @@ mod tests {
         assert_eq!(kind, NodeKind::Library);
         assert_eq!(family, Family::Storage);
         assert_eq!(class, CrateClass::Core);
-
-        let (kind, family, class) = classify_member(
-            Path::new("apps/tidefs-filesystem-demo/Cargo.toml"),
-            "tidefs-filesystem-demo",
-        );
-        assert_eq!(kind, NodeKind::AppRoot);
-        assert_eq!(family, Family::Storage);
-        assert_eq!(class, CrateClass::ServiceRoot);
 
         let (kind, family, class) =
             classify_member(Path::new("apps/tidefsctl/Cargo.toml"), "tidefsctl");

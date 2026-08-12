@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 166 |
+| Workspace packages | 164 |
 | Explicitly excluded package roots | 4 |
-| Discovered package manifests | 170 |
-| Classified package roots | 170 |
+| Discovered package manifests | 168 |
+| Classified package roots | 168 |
 
 ## TFR-002 Category Mapping
 
@@ -26,7 +26,7 @@ root.
 | TFR-002 category | Current roles | Count | Boundary |
 | --- | --- | ---: | --- |
 | `product` | `product-code`, `adapter-operator` | 144 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
-| `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 24 | Repo policy tooling, CI/developer support, demos, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
+| `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 22 | Repo policy tooling, CI/developer support, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
 | `third-party` | `vendored-third-party` | 1 | Vendored or forked upstream code carried with separate provenance. |
 | `delete` | `scaffold-transitional`, `archive-delete-candidate` | 0 | No current package root is classified for deletion. Both roles are retired and rejected by `check-workspace-policy`; any future dead-scaffolding candidate must reference TFR-002/TFR-013 evidence and an issue-backed delete/archive plan. |
 
@@ -55,7 +55,7 @@ holding area.
 | `product-code` | 129 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
-| `proof-harness` | 12 |
+| `proof-harness` | 10 |
 | `vendored-third-party` | 1 |
 | `standalone-fuzz` | 4 |
 | `scaffold-transitional` | 0 |
@@ -71,11 +71,9 @@ one-line justification. The table keeps the five machine-checked columns so
 | Package root | Package | Cargo status | Role | Disposition |
 | --- | --- | --- | --- | --- |
 | `apps/tidefs-block-volume-adapter-daemon` | `tidefs-block-volume-adapter-daemon` | `workspace-member` | `adapter-operator` | operator entrypoint for the ublk adapter; live runtime validation required before release claims. |
-| `apps/tidefs-filesystem-demo` | `tidefs-filesystem-demo` | `workspace-member` | `proof-harness` | demo entrypoint kept for `nix/tidefs-validation.sh` and the packaged workspace binary smoke path that exercises Local Filesystem write/read/replay/snapshot/send-receive output; harness signal only, not release proof. |
 | `apps/tidefs-posix-filesystem-adapter-daemon` | `tidefs-posix-filesystem-adapter-daemon` | `workspace-member` | `adapter-operator` | operator entrypoint and FUSE validation harness; preview mount surface only. |
 | `apps/tidefs-scrub` | `tidefs-scrub` | `workspace-member` | `adapter-operator` | operator entrypoint for scrub/repair plumbing; not release proof by itself. |
 | `apps/tidefs-storage-node` | `tidefs-storage-node` | `workspace-member` | `adapter-operator` | operator entrypoint for storage-node experiments; cluster authority remains TFR-017. |
-| `apps/tidefs-store-demo` | `tidefs-store-demo` | `workspace-member` | `proof-harness` | demo entrypoint kept for `nix/tidefs-validation.sh`, packaged workspace binary checks, and the FUSE VM smoke path that runs object-store write/read/replay before mount validation; harness signal only, not release proof. |
 | `apps/tidefsctl` | `tidefsctl` | `workspace-member` | `adapter-operator` | operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open. |
 | `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `workspace-member` | `product-code` | live entrypoint for anti-entropy audit admission; issue #815 evidence covers Merkle proof validation, comparison-history accounting, repair-trigger receipts, SuspectLog feeding, and scrub admission while release claims remain limited by the review register. |
 | `crates/tidefs-auth` | `tidefs-auth` | `workspace-member` | `policy-tooling` | current policy/tooling surface; not a production-readiness claim. |
@@ -247,10 +245,8 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 
 | Package root | Package | Role | Disposition |
 | --- | --- | --- | --- |
-| `apps/tidefs-filesystem-demo` | `tidefs-filesystem-demo` | `proof-harness` | demo entrypoint kept for `nix/tidefs-validation.sh` and packaged workspace binary smoke coverage of Local Filesystem write/read/replay/snapshot/send-receive output; harness signal only. |
 | `apps/tidefs-scrub` | `tidefs-scrub` | `adapter-operator` | operator entrypoint for scrub/repair plumbing; not release proof by itself. |
 | `apps/tidefs-storage-node` | `tidefs-storage-node` | `adapter-operator` | operator entrypoint for storage-node experiments; cluster authority remains TFR-017. |
-| `apps/tidefs-store-demo` | `tidefs-store-demo` | `proof-harness` | demo entrypoint kept for `nix/tidefs-validation.sh`, packaged workspace binary checks, and FUSE VM object-store write/read/replay smoke before mount validation; harness signal only. |
 | `apps/tidefsctl` | `tidefsctl` | `adapter-operator` | operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open. |
 | `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `product-code` | live entrypoint for anti-entropy audit admission; zero reverse dependencies reflect service-integration boundaries, not placeholder status; issue #815 records focused Merkle-to-repair validation evidence. |
 | `crates/tidefs-block-kmod` | `tidefs-block-kmod` | `adapter-operator` | operator entrypoint for the kernel block-volume adapter; PR #1093 records source/stub audit and unit validation while kernel-build release claims remain behind focused validation. |
