@@ -2,9 +2,6 @@ name: RDMA
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '43 2 * * *'
-
 permissions:
   contents: read
 

@@ -238,14 +238,15 @@ may use non-secret repository variables for scheduling gates, such as
   workflows only; the validation tier for a change must still name the runtime,
   kernel, xfstests, RDMA, or release-candidate lane that exercises the affected
   behavior.
-- `xfstests` and `RDMA` are scheduled/manual lanes for longer filesystem and
+- `xfstests` and `RDMA` are manual lanes for longer filesystem and
   transport work. Manual `xfstests` dispatch accepts a `target` and an
   optional space-separated `tests` list. Use the smallest known failing row set
   such as `generic/003` for `fuse` or `k7-vfs` while debugging an isolated
   failure. The `kmod-smoke` target accepts only its internal smoke labels,
   `authority/missing-pool` and `configured-pool-member`, and fails closed for
   upstream xfstests row names. Reserve broad target dispatches such as
-  `target=fuse` or `target=all` for acceptance gates, scheduled coverage, or
+  `target=fuse` or `target=all` for acceptance gates, explicit milestone
+  coverage, or
   when the failure set is not yet isolated. `RDMA` dispatch runs two matrix
   targets: `host-probe` for non-mutating runner capability inspection and
   `qemu-two-node` for multi-process distributed transport evidence. The host
@@ -282,9 +283,10 @@ Secret Policy, dependency, and actionlint lanes use the `nix` subset; QEMU and
 kernel validation lanes add `kvm`; xfstests adds `xfstests`; and RDMA adds
 `rdma`.
 
-The path-gated QEMU push and scheduled self-hosted jobs stay skipped until the
-repository variable `TIDEFS_SELF_HOSTED_READY` is set to `1`. Manual dispatch
-ignores that gate so a specific lane can be run during bring-up.
+The path-gated QEMU push jobs stay skipped until the repository variable
+`TIDEFS_SELF_HOSTED_READY` is set to `1`. Manual dispatch ignores that gate so
+a specific lane can be run during bring-up. The longer xfstests and RDMA lanes
+run only when explicitly dispatched for an issue or milestone.
 
 Draft pull requests are not integration candidates, so required self-hosted PR
 checks skip them until the PR is marked ready for review. The `ready_for_review`
