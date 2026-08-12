@@ -47,18 +47,27 @@ struct MountedVfs {
 
 impl MountedVfs {
     fn new() -> Self {
+        Self::new_with_catalog_snapshot(false)
+    }
+
+    fn new_with_catalog_snapshot(create_snapshot: bool) -> Self {
         let root = unique_test_root();
         let store = root.join("store");
         let mount = root.join("mnt");
         fs::create_dir_all(&store).expect("create store dir");
         fs::create_dir_all(&mount).expect("create mount dir");
 
-        let filesystem = LocalFileSystem::open_with_root_authentication_key(
+        let mut filesystem = LocalFileSystem::open_with_root_authentication_key(
             &store,
             StoreOptions::default(),
             RootAuthenticationKey::demo_key(),
         )
         .expect("open local filesystem");
+        if create_snapshot {
+            filesystem
+                .create_snapshot("catalog-entry")
+                .expect("create nonempty snapshot catalog");
+        }
         let engine = VfsLocalFileSystem::new(filesystem);
         let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create FUSE VFS adapter");
         let session = fuser::spawn_mount2(adapter, &mount, &mount_options()).expect("mount FUSE");
@@ -100,6 +109,51 @@ fn readdir_vfs_empty_directory_returns_no_entries() {
     assert!(
         entries.is_empty(),
         "empty dir should list no entries, got {entries:?}"
+    );
+}
+
+#[test]
+fn readdir_vfs_real_dot_snapshot_survives_nonempty_catalog() {
+    let mnt = MountedVfs::new_with_catalog_snapshot(true);
+
+    let root_snapshot = mnt.path("/.snapshot");
+    fs::create_dir(&root_snapshot).expect("create real root .snapshot");
+    fs::write(root_snapshot.join("root.txt"), b"real root directory")
+        .expect("write root .snapshot content");
+
+    let parent = mnt.path("/nested");
+    fs::create_dir(&parent).expect("create nested parent");
+    let nested_snapshot = parent.join(".snapshot");
+    fs::create_dir(&nested_snapshot).expect("create real nested .snapshot");
+    fs::write(nested_snapshot.join("nested.txt"), b"real nested directory")
+        .expect("write nested .snapshot content");
+
+    let root_entries: BTreeSet<String> = fs::read_dir(&root_snapshot)
+        .expect("list real root .snapshot")
+        .map(|entry| {
+            let entry = entry.expect("root .snapshot entry");
+            assert!(entry.metadata().expect("root entry metadata").is_file());
+            entry.file_name().to_string_lossy().into_owned()
+        })
+        .collect();
+    assert_eq!(root_entries, BTreeSet::from(["root.txt".to_string()]));
+    assert_eq!(
+        fs::read(root_snapshot.join("root.txt")).expect("read root .snapshot content"),
+        b"real root directory"
+    );
+
+    let nested_entries: BTreeSet<String> = fs::read_dir(&nested_snapshot)
+        .expect("list real nested .snapshot")
+        .map(|entry| {
+            let entry = entry.expect("nested .snapshot entry");
+            assert!(entry.metadata().expect("nested entry metadata").is_file());
+            entry.file_name().to_string_lossy().into_owned()
+        })
+        .collect();
+    assert_eq!(nested_entries, BTreeSet::from(["nested.txt".to_string()]));
+    assert_eq!(
+        fs::read(nested_snapshot.join("nested.txt")).expect("read nested .snapshot content"),
+        b"real nested directory"
     );
 }
 

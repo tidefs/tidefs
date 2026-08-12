@@ -59,8 +59,8 @@ pub use tidefs_types_vfs_core::{
     FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE,
     FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, F_RDLCK, F_UNLCK, F_WRLCK,
     RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, ROOT_INODE_ID, SEEK_CUR, SEEK_END,
-    SEEK_SET, SNAPSHOT_NAMESPACE_ROOT_INODE_ID, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK,
-    S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID, S_ISVTX, XATTR_CREATE, XATTR_REPLACE,
+    SEEK_SET, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID,
+    S_ISUID, S_ISVTX, XATTR_CREATE, XATTR_REPLACE,
 };
 
 // Re-export new VFS engine types from sub-modules.
@@ -1848,25 +1848,6 @@ pub trait VfsEngineStatFs: VfsEngine {
         _request: &LivePoolAdminRequest,
     ) -> Result<LivePoolAdminResponse, Errno> {
         Err(Errno::EOPNOTSUPP)
-    }
-
-    /// Return the current snapshot catalog generation when this dataset has at
-    /// least one snapshot catalog entry.
-    ///
-    /// This is an adapter-facing namespace capability. Engines without a
-    /// snapshot catalog keep the default so synthetic snapshot browsing
-    /// entries are not exposed.
-    fn snapshot_catalog_generation(&self) -> Option<Generation> {
-        None
-    }
-
-    /// Resolve a visible snapshot catalog name to its synthetic inode identity.
-    ///
-    /// The returned generation is the catalog generation that guards the
-    /// synthetic identity. Engines without a browsable snapshot catalog keep
-    /// the default fail-closed lookup behavior.
-    fn snapshot_catalog_lookup(&self, _name: &[u8]) -> Result<(InodeId, Generation), Errno> {
-        Err(Errno::ENOENT)
     }
 }
 

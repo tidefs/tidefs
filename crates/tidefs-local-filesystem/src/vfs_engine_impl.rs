@@ -5806,21 +5806,6 @@ impl VfsEngineStatFs for VfsLocalFileSystem {
     ) -> std::result::Result<LivePoolAdminResponse, Errno> {
         self.handle_live_pool_admin_request(request)
     }
-
-    fn snapshot_catalog_generation(&self) -> Option<Generation> {
-        self.fs.borrow().snapshot_catalog_generation()
-    }
-
-    fn snapshot_catalog_lookup(
-        &self,
-        name: &[u8],
-    ) -> std::result::Result<(InodeId, Generation), Errno> {
-        self.fs
-            .borrow()
-            .snapshot_catalog_lookup(name)
-            .map_err(|err| map_errno(&err))?
-            .ok_or(Errno::ENOENT)
-    }
 }
 
 /// Convert a LockSpec (FUSE protocol) to a LockRange (internal tracker type).
