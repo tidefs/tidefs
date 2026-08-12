@@ -5965,7 +5965,12 @@ mod tests {
 
     #[test]
     fn fdatasync_inode_accepts_pool_placed_buffered_content() {
-        let (engine, _td, _devices) = temp_fs_with_block_devices(2);
+        let (engine, td, devices) = temp_fs_with_block_devices(2);
+        engine
+            .fs
+            .borrow_mut()
+            .set_auto_commit(false)
+            .expect("disable auto-commit for mounted fdatasync boundary");
         let root = engine.get_root_inode(&ctx()).expect("root inode");
         let (_attr, fh) = engine
             .create(root, b"pool-fdatasync.txt", 0o644, O_RDWR, &ctx())
@@ -5993,6 +5998,36 @@ mod tests {
                 .current_content_object_exists_for_diagnostic("/pool-fdatasync.txt")
                 .expect("Pool content diagnostic"),
             "fdatasync must retain a current receipt-backed content object",
+        );
+
+        // Model abrupt mount-owner death: forbid Drop from committing anything
+        // that fdatasync itself did not publish, then reopen the same devices.
+        engine.fs.borrow_mut().arm_mutation_reopen_fence();
+        drop(engine);
+
+        let reopened = LocalFileSystem::open_with_block_devices(
+            td.path().join("metadata"),
+            &devices,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("reopen fdatasync block-device filesystem");
+        let reopened_engine = VfsLocalFileSystem::new(reopened);
+        let root = reopened_engine
+            .get_root_inode(&ctx())
+            .expect("reopened root inode");
+        let attr = reopened_engine
+            .lookup(root, b"pool-fdatasync.txt", &ctx())
+            .expect("lookup fdatasync file after reopen");
+        assert_eq!(attr.posix.size, payload.len() as u64);
+        let fh = reopened_engine
+            .open(attr.inode_id, O_RDONLY, &ctx())
+            .expect("open fdatasync file after reopen");
+        assert_eq!(
+            reopened_engine
+                .read(&fh, 0, payload.len() as u32, &ctx())
+                .expect("read fdatasync file after reopen"),
+            payload,
         );
     }
 

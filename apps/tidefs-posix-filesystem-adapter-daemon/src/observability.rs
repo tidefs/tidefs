@@ -326,7 +326,6 @@ pub fn emit_all_summaries() {
     HIST_READ.emit_summary("fuse_read");
     HIST_METADATA.emit_summary("fuse_metadata");
     HIST_BG_SCHEDULER.emit_summary("bg_scheduler_cycle");
-    crate::observability::emit_commit_group_summary();
 }
 
 /// A point-in-time snapshot of a [`LatencyHistogram`].
@@ -679,43 +678,4 @@ impl<'a> Drop for LatencyTimer<'a> {
     fn drop(&mut self) {
         self.histogram.record(self.start.elapsed());
     }
-}
-
-// ---------------------------------------------------------------------------
-// CommitGroupMetrics -- transaction group observability
-// ---------------------------------------------------------------------------
-
-/// Global commit_group metrics, updated after each periodic commit.
-pub static COMMIT_GROUP_CURRENT_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static TXG_COMMITTED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static TXG_DURABLE_HIGH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Snapshot of commit_group observability counters.
-#[derive(Debug, Clone, Copy)]
-pub struct CommitGroupSnapshot {
-    pub current_commit_group_id: u64,
-    pub committed_count: u64,
-    pub durable_high: u64,
-}
-
-impl CommitGroupSnapshot {
-    /// Capture the current commit_group observability state.
-    pub fn now() -> Self {
-        Self {
-            current_commit_group_id: COMMIT_GROUP_CURRENT_ID
-                .load(std::sync::atomic::Ordering::Relaxed),
-            committed_count: TXG_COMMITTED_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-            durable_high: TXG_DURABLE_HIGH.load(std::sync::atomic::Ordering::Relaxed),
-        }
-    }
-}
-
-/// Emit a human-readable commit_group summary to stderr.
-pub fn emit_commit_group_summary() {
-    let snap = CommitGroupSnapshot::now();
-    eprintln!(
-        "txg_observability current_id={} committed={} durable_high={}",
-        snap.current_commit_group_id, snap.committed_count, snap.durable_high,
-    );
 }

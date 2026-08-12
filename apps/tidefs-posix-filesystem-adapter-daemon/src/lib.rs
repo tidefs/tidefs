@@ -81,7 +81,6 @@ pub mod trace;
 // pub mod fuse_preview (deleted)
 pub mod coherency_profile;
 pub mod dispatch_helpers;
-pub mod fsync_handler;
 pub mod fuse_create_unlink_dispatch;
 pub mod fuse_flush_fsync;
 pub mod fuse_posix_lock;
@@ -103,7 +102,6 @@ pub const DAEMON_CACHE_AUTHORITY_MODEL_VERSION: &str = "v0.420";
 pub mod mount_options;
 pub mod read_cache;
 pub mod readdir_dispatch;
-pub mod txg_cycle;
 #[cfg(feature = "workload-telemetry")]
 pub mod workload_observer;
 pub mod write_dispatch;
@@ -139,7 +137,6 @@ use tidefs_background_scheduler::{
     TickReport,
 };
 use tidefs_dataset_lifecycle::SyncGuarantee;
-use tidefs_intent_log::IntentLogBuffer;
 use tidefs_vfs_engine::{
     LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminOutput,
     LivePoolAdminRequest, LivePoolAdminResponseBody,
@@ -334,8 +331,6 @@ pub struct MountRuntimeOptions {
     pub mount_options: mount_options::MountOptions,
     /// Per-dataset write-acknowledgment durability guarantee.
     pub sync_guarantee: SyncGuarantee,
-    /// Enable inline intent-log records for eligible buffered writes.
-    pub intent_log_write: bool,
     /// Content capacity admitted by the local storage allocator.
     pub content_capacity_bytes: u64,
     /// Maximum dirty-page age for the FUSE writeback cache.
@@ -370,7 +365,6 @@ impl Default for MountRuntimeOptions {
             root_authentication_key: None,
             mount_options,
             sync_guarantee: SyncGuarantee::Local,
-            intent_log_write: false,
             content_capacity_bytes: tidefs_local_filesystem::LocalStorageAllocatorPolicy::default()
                 .content_capacity_bytes,
             writeback_cache_timeout_secs: 60,
@@ -390,7 +384,6 @@ impl Default for MountRuntimeOptions {
 struct EffectiveMountMode {
     read_only: bool,
     writeback_cache: bool,
-    intent_log_write: bool,
     background_scrub_interval_secs: u64,
 }
 
@@ -399,7 +392,6 @@ fn effective_mount_mode(config: &MountConfig) -> EffectiveMountMode {
     EffectiveMountMode {
         read_only,
         writeback_cache: config.writeback_cache && !read_only,
-        intent_log_write: config.runtime.intent_log_write && !read_only,
         background_scrub_interval_secs: if read_only {
             0
         } else {
@@ -441,7 +433,6 @@ mod effective_mount_mode_tests {
             EffectiveMountMode {
                 read_only: true,
                 writeback_cache: false,
-                intent_log_write: false,
                 background_scrub_interval_secs: 0,
             }
         );
@@ -450,14 +441,12 @@ mod effective_mount_mode_tests {
     #[test]
     fn snapshot_export_forces_read_only_mode() {
         let mut config = config(false, Some("snap0"), true);
-        config.runtime.intent_log_write = true;
         config.runtime.background_scrub_interval_secs = 60;
         assert_eq!(
             effective_mount_mode(&config),
             EffectiveMountMode {
                 read_only: true,
                 writeback_cache: false,
-                intent_log_write: false,
                 background_scrub_interval_secs: 0,
             }
         );
@@ -470,7 +459,6 @@ mod effective_mount_mode_tests {
             EffectiveMountMode {
                 read_only: false,
                 writeback_cache: true,
-                intent_log_write: false,
                 background_scrub_interval_secs: 0,
             }
         );
@@ -485,7 +473,6 @@ mod effective_mount_mode_tests {
             sync_guarantee: SyncGuarantee::Local,
             allow_other: true,
             dev: true,
-            intent_log_write: false,
         };
 
         let kernel_options = fuse_mount_options_for_mode(&options, true);
@@ -1190,12 +1177,6 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     adapter = adapter
         .with_timestamp_policy(adapter_timestamp_policy)
         .with_suppress_dir_atime(config.runtime.mount_options.suppress_dir_atime);
-    if effective_mode.intent_log_write {
-        adapter = adapter.with_intent_log_buffer(Arc::new(IntentLogBuffer::new()));
-    } else {
-        adapter = adapter.without_intent_log_write();
-    }
-
     let shutdown = Arc::new(AtomicBool::new(false));
     install_signal_handlers(Arc::clone(&shutdown)).map_err(|e| format!("signal handler: {e}"))?;
     let live_owner_engine = adapter.engine_handle();

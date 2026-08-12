@@ -95,10 +95,6 @@ pub struct MountOptions {
     /// When true, allow special character and block devices on the mounted
     /// filesystem by passing the kernel FUSE `dev` mount option.
     pub dev: bool,
-    /// When true, tiny buffered writes may record inline `BufferedWrite`
-    /// entries before acknowledging the kernel. Larger writes are left to the
-    /// storage commit path so the FUSE hot path does not hash user payloads.
-    pub intent_log_write: bool,
 }
 
 impl Default for MountOptions {
@@ -110,7 +106,6 @@ impl Default for MountOptions {
             sync_guarantee: SyncGuarantee::Local,
             allow_other: false,
             dev: false,
-            intent_log_write: false,
         }
     }
 }
@@ -120,9 +115,7 @@ impl MountOptions {
     ///
     /// Supported keys: `atime`, `strictatime`, `relatime`, `noatime`,
     /// `nodiratime`, `diratime`,
-    /// `sync`, `async`, `allow_other`, `noallow_other`, `dev`, `nodev`,
-    /// `intent_log_write=true`,
-    /// `intent_log_write=false`.
+    /// `sync`, `async`, `allow_other`, `noallow_other`, `dev`, `nodev`.
     /// Unknown options produce an error.
     ///
     /// If multiple atime-policy options appear, the last one wins.
@@ -160,8 +153,6 @@ impl MountOptions {
                 "noallow_other" => opts.allow_other = false,
                 "dev" => opts.dev = true,
                 "nodev" => opts.dev = false,
-                "intent_log_write=true" => opts.intent_log_write = true,
-                "intent_log_write=false" => opts.intent_log_write = false,
                 other => {
                     // Explicitly refuse idmapped mount attempts.
                     // TideFS does not support idmapped mounts; this is the
@@ -171,14 +162,9 @@ impl MountOptions {
                             "TideFS does not support idmapped mounts.                              Mount refused -- idmapped mounts are not yet supported.".to_string()
                         );
                     }
-                    if other.starts_with("intent_log_write=") || other == "intent_log_write" {
-                        return Err(format!(
-                            "mount option `{other}`: intent_log_write requires                              =true or =false"
-                        ));
-                    }
                     return Err(format!(
                         "unsupported mount option `{other}`; \
-                         supported: atime, relatime, noatime, nodiratime, diratime, sync, async,                          allow_other, noallow_other, dev, nodev,                          intent_log_write=true|false.                          Idmapped mounts are not supported."
+                         supported: atime, relatime, noatime, nodiratime, diratime, sync, async,                          allow_other, noallow_other, dev, nodev.                          Idmapped mounts are not supported."
                     ));
                 }
             }
@@ -299,7 +285,6 @@ mod tests {
         assert!(!opts.sync);
         assert!(!opts.allow_other);
         assert!(!opts.dev);
-        assert!(!opts.intent_log_write);
     }
 
     #[test]
@@ -436,7 +421,6 @@ mod tests {
             sync_guarantee: SyncGuarantee::Local,
             allow_other: true,
             dev: true,
-            intent_log_write: true,
         };
         let v = opts.to_fuse_mount_options();
         assert!(v.contains(&fuser::MountOption::NoAtime));
@@ -454,7 +438,6 @@ mod tests {
             sync_guarantee: SyncGuarantee::Local,
             allow_other: false,
             dev: false,
-            intent_log_write: true,
         };
         assert_eq!(
             opts.to_fuse_mount_options(),
@@ -471,55 +454,10 @@ mod tests {
             sync_guarantee: SyncGuarantee::Local,
             allow_other: false,
             dev: false,
-            intent_log_write: true,
         };
         assert_eq!(
             opts.to_fuse_mount_options(),
             vec![fuser::MountOption::Relatime]
-        );
-    }
-    // -- intent_log_write mount-option parsing ------------------------
-
-    #[test]
-    fn mount_options_intent_log_write_defaults_false() {
-        let opts = MountOptions::default();
-        assert!(!opts.intent_log_write);
-    }
-
-    #[test]
-    fn mount_options_parse_intent_log_write_true() {
-        let opts = MountOptions::parse("intent_log_write=true").unwrap();
-        assert!(opts.intent_log_write);
-    }
-
-    #[test]
-    fn mount_options_parse_intent_log_write_false() {
-        let opts = MountOptions::parse("intent_log_write=false").unwrap();
-        assert!(!opts.intent_log_write);
-    }
-
-    #[test]
-    fn mount_options_parse_intent_log_write_combined() {
-        let opts = MountOptions::parse("noatime,intent_log_write=false").unwrap();
-        assert_eq!(opts.timestamp_policy, TimestampPolicy::NoAtime);
-        assert!(!opts.intent_log_write);
-    }
-
-    #[test]
-    fn mount_options_parse_intent_log_write_bare_rejected() {
-        let err = MountOptions::parse("intent_log_write").unwrap_err();
-        assert!(
-            err.contains("requires"),
-            "bare intent_log_write should be rejected: {err}"
-        );
-    }
-
-    #[test]
-    fn mount_options_parse_intent_log_write_bad_value_rejected() {
-        let err = MountOptions::parse("intent_log_write=1").unwrap_err();
-        assert!(
-            err.contains("intent_log_write"),
-            "bad value should be rejected: {err}"
         );
     }
 }

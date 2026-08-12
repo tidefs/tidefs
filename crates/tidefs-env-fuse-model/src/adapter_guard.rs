@@ -12,7 +12,6 @@ use std::path::Path;
 const ADAPTER_BOUNDARY_FILES: &[&str] = &[
     "apps/tidefs-posix-filesystem-adapter-daemon/src/capacity/dispatch.rs",
     "apps/tidefs-posix-filesystem-adapter-daemon/src/dispatch_helpers.rs",
-    "apps/tidefs-posix-filesystem-adapter-daemon/src/fsync_handler.rs",
     "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_create_unlink_dispatch.rs",
     "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_flush_fsync.rs",
     "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_rename.rs",

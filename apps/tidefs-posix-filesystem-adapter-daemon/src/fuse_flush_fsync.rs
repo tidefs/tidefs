@@ -526,26 +526,6 @@ impl DirtyFlush for PageCacheDirtyFlush<'_> {
 
         Ok(())
     }
-    fn fdatasync_inode(
-        &self,
-        _inode_id: InodeId,
-        datasync: bool,
-    ) -> Result<(), FsyncDispatchError> {
-        // After writeback drain, issue a lightweight fdatasync on the
-        // backing file descriptor via the engine.  This converges dirty
-        // pages with durable storage without the full commit-group commit.
-        self.engine
-            .fdatasync_inode(self.efh, datasync, self.ctx)
-            .map_err(|e| {
-                if e == Errno::ENOSPC {
-                    FsyncDispatchError::NoSpace
-                } else if e == Errno::EINTR {
-                    FsyncDispatchError::Interrupted
-                } else {
-                    FsyncDispatchError::IoError
-                }
-            })
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -718,13 +718,9 @@ fn fsync_fast_path_preserves_intent_log_entries() {
     }
 }
 
-/// fsync_data_only_file retains intent-log entries after the fast path.
-///
-/// Unlike fsync_file, fsync_data_only_file returns early after the
-/// intent-log flush without calling do_commit(), so the intent log
-/// entries survive for crash replay.
+/// fdatasync publishes the recoverable root before clearing covered intents.
 #[test]
-fn fdatasync_fast_path_preserves_intent_log_entries() {
+fn fdatasync_publishes_root_before_clearing_intent_log_entries() {
     set_test_key();
     let payload: Vec<u8> = b"fdatasync-fast-path-keep-intents-test-data-01-sync-intent".to_vec();
     let dir = temp_dir("fdatasync_keep_intents");
@@ -743,10 +739,17 @@ fn fdatasync_fast_path_preserves_intent_log_entries() {
         fs.fsync_data_only_file("/fdatakeep")
             .expect("fsync_data_only_file");
         assert!(
-            fs.intent_log_entry_count() > 0,
-            "intent-log entries must NOT be cleared by fdatasync fast path"
+            fs.intent_log_is_empty(),
+            "fdatasync must clear covered intents only after root publication"
         );
-        fs.commit().expect("commit clears fdatasync intents");
+    }
+    {
+        let fs = open_fs(&dir);
+        assert_eq!(
+            fs.read_file("/fdatakeep")
+                .expect("read fdatasync content after reopen"),
+            payload,
+        );
     }
 }
 
@@ -810,17 +813,17 @@ fn intent_log_cleared_after_full_commit() {
             fs.intent_log_entry_count() > 0,
             "sync_write_intent must produce intent-log entries"
         );
-        // take the fast path first — entries must survive
+        // fdatasync itself publishes the root and clears covered intents.
         fs.fsync_data_only_file("/commitme")
-            .expect("fsync data-only fast path");
+            .expect("fdatasync root publication");
         assert!(
-            fs.intent_log_entry_count() > 0,
-            "fdatasync fast path must not clear intent log"
+            fs.intent_log_is_empty(),
+            "fdatasync must clear intent log after publishing a new root"
         );
 
-        // Now a full commit — entries must be cleared after the root
-        // is published.
-        fs.commit().expect("commit after fast-path fsync");
+        // A later full commit remains idempotent.
+        fs.commit()
+            .expect("commit after fdatasync root publication");
         assert!(
             fs.intent_log_is_empty(),
             "do_commit must clear intent log after publishing a new root"

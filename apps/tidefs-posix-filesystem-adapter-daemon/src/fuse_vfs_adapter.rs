@@ -80,7 +80,6 @@ use tidefs_vfs_engine::{
 };
 
 use crate::mount_options::TimestampPolicy;
-use tidefs_intent_log::{IntentLogBuffer, IntentLogRecord as IlRecord};
 use tidefs_local_filesystem::PATH_MAX_BYTES;
 
 fn fuse_op_diagnostics_enabled() -> bool {
@@ -89,13 +88,6 @@ fn fuse_op_diagnostics_enabled() -> bool {
         Ok("1") | Ok("true") | Ok("yes")
     )
 }
-
-/// Compile-time authority guard: filesystem intent recording and crash
-/// recovery go through the canonical `tidefs_intent_log::IntentLogBuffer`
-/// / `tidefs_intent_log::IntentLogReader` path.  The object-store WAL
-/// (`tidefs_local_object_store::intent_log`) handles raw object mutations
-/// only and must not be used for filesystem-level intent recording.
-const _CANONICAL_INTENT_LOG_AUTHORITY: () = {};
 
 // Matches the committed LocalFileSystem root dataset id.
 const ROOT_DATASET_ID: tidefs_dataset_catalog::DatasetId =
@@ -2850,26 +2842,8 @@ pub struct FuseVfsAdapter {
     pub(crate) rename_dispatch: FuseRenameDispatch,
     /// WritebackInodeCache for per-inode dirty tracking and reclaim protection.
     writeback_cache: Mutex<WritebackInodeCache>,
-    fsync_handler: crate::fsync_handler::FsyncHandler,
     /// Background scheduler for deferred maintenance services (writeback, cleaning, compaction).
     background_scheduler: Arc<Mutex<Option<BackgroundScheduler>>>,
-
-    /// Lock-free intent-log buffer for tiny buffered-write crash safety.
-    /// When set, small writes may append inline `BufferedWrite` records before
-    /// acknowledging the kernel. Larger writes intentionally do not append a
-    /// digest-only `Write` record because BLAKE3 is prohibited in the FUSE hot
-    /// path; storage commit/replay owns durable large-payload identity.
-    ///
-    /// # Intent-log authority
-    ///
-    /// Filesystem crash recovery goes through the canonical
-    /// [tidefs_intent_log::IntentLogBuffer] / [tidefs_intent_log::IntentLogReader]
-    /// path.  The object-store WAL (tidefs_local_object_store::intent_log) handles
-    /// raw object mutations only and must not be used for filesystem intent recording.
-    pub(crate) intent_log_buffer: Option<Arc<IntentLogBuffer>>,
-    /// When true, eligible buffered writes are recorded in the intent log.
-    /// Togglable for testing and explicit opt-in mounts.
-    pub(crate) intent_log_write_enabled: bool,
 
     /// When true, the kernel writeback cache is active. FUSE_WRITE_CACHE
     /// flagged writes are accepted and routed through the dirty-page tracker.
@@ -2884,7 +2858,6 @@ pub struct FuseVfsAdapter {
     writeback_range_tracker:
         Option<Arc<Mutex<tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker>>>,
     read_only: bool,
-    txg_cycle: Arc<crate::txg_cycle::CommitGroupCycle>,
     /// When true, every write waits for the full fsync durability path before
     /// replying to the kernel, matching the FUSE `sync` mount option.
     force_sync_writes: bool,
@@ -2977,12 +2950,8 @@ impl FuseVfsAdapter {
             )),
             rename_dispatch: FuseRenameDispatch::new(),
             writeback_cache: Mutex::new(WritebackInodeCache::new(1024)),
-            fsync_handler: crate::fsync_handler::FsyncHandler::new(None),
             background_scheduler: Arc::new(Mutex::new(None)),
-            intent_log_buffer: None,
-            intent_log_write_enabled: false,
             read_only: false,
-            txg_cycle: Arc::new(crate::txg_cycle::CommitGroupCycle::new()),
             writeback_cache_enabled: false,
             writeback_cache_timeout: 60,
             writeback_cache_stats: Mutex::new(WritebackCacheStats::new()),
@@ -3193,15 +3162,6 @@ impl FuseVfsAdapter {
 
     pub fn with_block_volume(self, target: Box<dyn BlockVolumeWriteTarget + Send>) -> Self {
         *self.block_volume.lock().unwrap() = Some(target);
-        self
-    }
-
-    /// Attach a store-root-aware commit_group cycle (replaces the default).
-    pub fn with_commit_group_cycle(
-        mut self,
-        txg_cycle: Arc<crate::txg_cycle::CommitGroupCycle>,
-    ) -> Self {
-        self.txg_cycle = txg_cycle;
         self
     }
 
@@ -3424,11 +3384,6 @@ impl FuseVfsAdapter {
             sched.set_preempt_signal(flag);
         }
     }
-    /// Accessor for the commit_group cycle, so main() can spawn the periodic commit loop.
-    pub fn txg_cycle_cell(&self) -> Arc<crate::txg_cycle::CommitGroupCycle> {
-        Arc::clone(&self.txg_cycle)
-    }
-
     /// Attach a [`PageCache`] from tidefs-cache-core for writeback dirty
     /// tracking and flush/fsync dirty-page iteration.
     ///
@@ -3452,36 +3407,6 @@ impl FuseVfsAdapter {
         self.writeback_page_cache = Some(cache);
         self
     }
-    /// Attach a [`FsyncHandler`] for commit_group durability coordination.
-    ///
-    /// When set, `dispatch_fsync_file` will wait on the commit_group sync gate
-    /// after the engine fsync to guarantee transaction group durability.
-    /// When `None` (default), the engine's sync path alone provides durability.
-    #[must_use]
-    pub fn with_fsync_handler(mut self, handler: crate::fsync_handler::FsyncHandler) -> Self {
-        self.fsync_handler = handler;
-        self
-    }
-
-    /// Attach a lock-free [`IntentLogBuffer`] for buffered-write crash safety.
-    ///
-    /// When set and `intent_log_write_enabled` is true, tiny buffered writes
-    /// append inline `BufferedWrite` records before the kernel is acknowledged.
-    /// Larger writes are not hashed or copied into this hot-path buffer.
-    #[must_use]
-    pub fn with_intent_log_buffer(mut self, buffer: Arc<IntentLogBuffer>) -> Self {
-        self.intent_log_buffer = Some(buffer);
-        self.intent_log_write_enabled = true;
-        self
-    }
-
-    /// Disable intent-log recording for buffered writes (for testing).
-    #[must_use]
-    pub fn without_intent_log_write(mut self) -> Self {
-        self.intent_log_write_enabled = false;
-        self
-    }
-
     fn ctx_from_req(req: &Request<'_>) -> RequestCtx {
         let gid = req.gid();
         RequestCtx {
@@ -5894,25 +5819,6 @@ impl FuseVfsAdapter {
             if written > 0 {
                 self.invalidate_inode_metadata_local(ino);
             }
-            // Record write intent before acknowledging to kernel.
-            if written > 0 && self.intent_log_write_enabled && !sparse_zero_noop {
-                if let Some(ref buf) = self.intent_log_buffer {
-                    let txg_id = self
-                        .txg_cycle
-                        .current_commit_group_id
-                        .load(Ordering::Relaxed);
-                    let written_data = &data[..written as usize];
-                    if written_data.len() <= 256 {
-                        let record = IlRecord::BufferedWrite {
-                            ino,
-                            offset: effective_offset as u64,
-                            length: written as u64,
-                            data: written_data.to_vec(),
-                        };
-                        buf.append(record, txg_id);
-                    }
-                }
-            }
             if written > 0 && is_writeback_cached && !sparse_zero_noop {
                 self.writeback_cache_stats
                     .lock()
@@ -6039,25 +5945,6 @@ impl FuseVfsAdapter {
                                         data,
                                         write_flags,
                                     );
-                                }
-                                // Record write intent before acknowledging to kernel.
-                                if self.intent_log_write_enabled {
-                                    if let Some(ref buf) = self.intent_log_buffer {
-                                        let txg_id = self
-                                            .txg_cycle
-                                            .current_commit_group_id
-                                            .load(Ordering::Relaxed);
-                                        let written_data = &data[..written as usize];
-                                        if written_data.len() <= 256 {
-                                            let record = IlRecord::BufferedWrite {
-                                                ino,
-                                                offset: effective_offset as u64,
-                                                length: written as u64,
-                                                data: written_data.to_vec(),
-                                            };
-                                            buf.append(record, txg_id);
-                                        }
-                                    }
                                 }
                             }
                             Ok(written)
@@ -6281,10 +6168,6 @@ impl FuseVfsAdapter {
             let mut wc = self.writeback_cache.lock().unwrap();
             wc.insert(ino);
             wc.mark_dirty(ino, u64::from(written));
-            // Queue the write into the commit_group accumulator for periodic
-            // transaction group commit.
-            self.txg_cycle
-                .queue_write(ino, offset, &data[..written as usize]);
         }
         // Notify the shared writeback range tracker so the writeback
         // flush service can drain dirty ranges to storage.
@@ -6368,7 +6251,6 @@ impl FuseVfsAdapter {
             wc.insert(ino);
         }
         self.reconcile_writeback_inode_cache_after_authoritative_range(ino);
-        self.txg_cycle.queue_write(ino, offset, written_data);
         Ok(())
     }
 
@@ -6983,24 +6865,10 @@ impl FuseVfsAdapter {
                     }
                 }
             }
-        } // Phase 2b: fdatasync durability barrier.
-          // After the writeback drain, issue a lightweight fdatasync(2)
-          // on the backing file descriptor to converge dirty pages with
-          // durable storage before the full engine fsync.  This is a no-op
-          // when the inode has no dirty content (already flushed above).
-        {
-            let engine = self.engine.lock().unwrap();
-            let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-                self.writeback_page_cache.as_ref(),
-                &**engine,
-                efh,
-                ctx,
-            );
-            tidefs_local_filesystem::fuse_fsync::map_cache_error(
-                bridge.fdatasync_inode(efh.inode_id, datasync),
-            )?;
-        } // Phase 3: Engine fsync for metadata persistence.
-          // Record storage-sync latency separately from dispatch/protocol overhead.
+        }
+        // Phase 3: one engine durability call chooses fsync or fdatasync and
+        // publishes through LocalFileSystem's canonical root authority.
+        // Record storage-sync latency separately from dispatch/protocol overhead.
         {
             // Use try_lock with bounded retry to avoid blocking indefinitely
             // on the engine lock when a background thread (commit_group,
@@ -7031,14 +6899,7 @@ impl FuseVfsAdapter {
             fs_res?;
         }
 
-        // Phase 4: Commit_group durability barrier.
-        // Wait for the transaction group containing this inode's dirty
-        // data to be committed and durable. When no sync gate is
-        // configured, this is a no-op (the engine's sync path already
-        // provides durability).
-        self.commit_current_txg_barrier("fsync")?;
         self.invalidate_inode_metadata_after_engine_write(ino);
-        self.fsync_handler.handle_fsync(ino, datasync)?;
         Ok(())
     }
 
@@ -7128,29 +6989,24 @@ impl FuseVfsAdapter {
         e.syncfs(ctx)?;
         drop(e);
 
-        self.commit_current_txg_barrier("syncfs")?;
-
         // Drain all inodes from the writeback range tracker after
         // filesystem-wide flush so the background flush service (#4657)
         // sees a clean slate.
         if let Some(ref tracker) = self.writeback_range_tracker {
-            let _ = tracker.lock().unwrap().collect_dirty_ranges();
+            let mut tracker = tracker.lock().unwrap();
+            let dirty_inodes: Vec<InodeId> = tracker
+                .collect_dirty_ranges()
+                .into_iter()
+                .map(|(inode, _)| inode)
+                .collect();
+            for inode in dirty_inodes {
+                tracker.flush_inode(inode);
+            }
         }
-
-        // Phase 3: Commit_group durability barrier.
-        // Wait for all pending transaction groups to be committed.
-        self.fsync_handler.handle_syncfs()?;
 
         self.writeback_cache_stats.lock().unwrap().record_flush();
         crate::observability::HIST_SYNCFS.record(_start.elapsed());
         Ok(())
-    }
-
-    fn commit_current_txg_barrier(&self, op: &str) -> Result<(), Errno> {
-        self.txg_cycle.commit_current().map(|_| ()).map_err(|e| {
-            eprintln!("FuseVfsAdapter::{op}: commit_group barrier failed: {e:?}");
-            Errno::EIO
-        })
     }
 
     /// Graceful shutdown: flush all dirty pages through the writeback
@@ -8997,12 +8853,6 @@ impl Filesystem for FuseVfsAdapter {
         if let Err(e) = self.shutdown() {
             eprintln!("FuseVfsAdapter::destroy: shutdown error: {e}");
         }
-
-        // Step 4: write a final committed root so the next mount can
-        // recover cleanly without intent-log replay from scratch.
-        if let Err(e) = self.txg_cycle.commit_current() {
-            eprintln!("FuseVfsAdapter::destroy: final commit error: {e:?}");
-        }
     }
 
     fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
@@ -10740,29 +10590,6 @@ mod tests {
             .mkdir(root, name, 0o777, &root_ctx)
             .expect("create writable test parent")
             .inode_id
-    }
-
-    fn adapter_fixture_with_txg_store_root() -> AdapterFixture {
-        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "tidefs-vfs-adapter-txg-{}-{temp_id}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create temp root");
-        let local_fs = LocalFileSystem::open_with_root_authentication_key(
-            &root,
-            StoreOptions::test_fast(),
-            RootAuthenticationKey::demo_key(),
-        )
-        .expect("open local filesystem");
-        let engine = VfsLocalFileSystem::new(local_fs);
-        let txg_cycle = Arc::new(crate::txg_cycle::CommitGroupCycle::with_store_root(
-            root.clone(),
-        ));
-        let adapter = FuseVfsAdapter::new(Box::new(engine))
-            .expect("create adapter")
-            .with_commit_group_cycle(txg_cycle);
-        AdapterFixture { adapter, root }
     }
 
     /// Create a standalone adapter for builder-ordering tests without the
@@ -16777,82 +16604,6 @@ mod tests {
             .expect("dispatch_read");
 
         assert_eq!(read_back, payload);
-    }
-
-    #[test]
-    fn vfs_adapter_dispatch_fsync_commits_txg_cycle() {
-        let fixture = adapter_fixture();
-        let ctx = root_ctx();
-        let payload = b"fsync txg barrier payload";
-        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"fsync-txg.bin",
-            libc::O_RDWR as u32,
-        );
-
-        fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, payload, 0)
-            .expect("dispatch_write");
-        assert_eq!(
-            fixture
-                .adapter
-                .txg_cycle_cell()
-                .committed_count
-                .load(Ordering::Relaxed),
-            0
-        );
-
-        fixture
-            .adapter
-            .dispatch_fsync(&ctx, inode.get(), adapter_fh)
-            .expect("dispatch_fsync");
-
-        assert_eq!(
-            fixture
-                .adapter
-                .txg_cycle_cell()
-                .committed_count
-                .load(Ordering::Relaxed),
-            1
-        );
-    }
-
-    #[test]
-    fn vfs_adapter_dispatch_fsync_persists_txg_root_file() {
-        let fixture = adapter_fixture_with_txg_store_root();
-        let ctx = root_ctx();
-        let payload = b"fsync persisted txg root payload";
-        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"fsync-persisted-txg.bin",
-            libc::O_RDWR as u32,
-        );
-
-        fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, payload, 0)
-            .expect("dispatch_write");
-        fixture
-            .adapter
-            .dispatch_fsync(&ctx, inode.get(), adapter_fh)
-            .expect("dispatch_fsync");
-
-        let root_file = fixture
-            .root
-            .join(tidefs_local_object_store::txg_manager::COMMITTED_ROOT_FILE);
-        assert!(root_file.is_file(), "fsync must publish the txg root file");
-        let loaded = crate::txg_cycle::CommitGroupCycle::load_persisted_root(&fixture.root)
-            .expect("load persisted root");
-        let committed_id = fixture
-            .adapter
-            .txg_cycle_cell()
-            .current_commit_group_id
-            .load(Ordering::Relaxed);
-        assert!(loaded.commit_group_id.is_valid());
-        assert_eq!(loaded.commit_group_id.0, committed_id);
     }
 
     #[test]
@@ -38910,44 +38661,6 @@ mod tests {
         assert!(!tracker.lock().unwrap().is_dirty(ino_b));
     }
 
-    #[test]
-    fn dispatch_syncfs_commits_txg_cycle() {
-        let fixture = adapter_fixture();
-        let ctx = root_ctx();
-        let (ino_a, fh_a, _efh_a) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"syncfs-txg-a.txt",
-            libc::O_RDWR as u32,
-        );
-        let (ino_b, fh_b, _efh_b) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"syncfs-txg-b.txt",
-            libc::O_RDWR as u32,
-        );
-
-        fixture
-            .adapter
-            .dispatch_write(&ctx, ino_a.get(), fh_a, 0, b"AAAA", 0)
-            .expect("write A");
-        fixture
-            .adapter
-            .dispatch_write(&ctx, ino_b.get(), fh_b, 0, b"BBBB", 0)
-            .expect("write B");
-
-        fixture.adapter.dispatch_syncfs(&ctx).expect("syncfs");
-
-        assert_eq!(
-            fixture
-                .adapter
-                .txg_cycle_cell()
-                .committed_count
-                .load(Ordering::Relaxed),
-            1
-        );
-    }
-
     // ── O_DIRECT read/write tests ────────────────────────────────────────
 
     #[test]
@@ -40119,28 +39832,10 @@ mod tests {
         assert_eq!(page.data(), payload.as_slice());
         assert!(!page.is_dirty());
 
-        assert_eq!(
-            fixture
-                .adapter
-                .txg_cycle_cell()
-                .committed_count
-                .load(Ordering::Relaxed),
-            0,
-            "clean write-through writes must still stage a txg barrier"
-        );
         fixture
             .adapter
             .dispatch_syncfs(&ctx)
             .expect("syncfs after clean write-through write");
-        assert_eq!(
-            fixture
-                .adapter
-                .txg_cycle_cell()
-                .committed_count
-                .load(Ordering::Relaxed),
-            1,
-            "syncfs must commit the clean write-through txg descriptor"
-        );
     }
 
     #[test]
@@ -42790,35 +42485,6 @@ mod tests {
     }
 
     #[test]
-    fn writeback_cached_large_write_skips_hot_intent_record() {
-        let mut fixture = adapter_fixture_with_writeback_cache();
-        let buf = Arc::new(IntentLogBuffer::new());
-        let ctx = root_ctx();
-        let (inode, adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"wb-large-intent.txt",
-            libc::O_RDWR as u32,
-        );
-        fixture.adapter.intent_log_buffer = Some(Arc::clone(&buf));
-        fixture.adapter.intent_log_write_enabled = true;
-
-        let data = vec![0xCDu8; 4096];
-        let written = fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, &data, FUSE_WRITE_CACHE)
-            .expect("writeback-cached large write");
-
-        assert_eq!(written, data.len() as u32);
-        let frames = buf.drain_since(0);
-        assert!(
-            frames.is_empty(),
-            "large writeback-cached writes must not hash payloads in the FUSE hot path"
-        );
-        assert_eq!(buf.data_count(), 0);
-    }
-
-    #[test]
     fn writeback_cache_stats_records_multiple_write_bufs() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
@@ -42960,249 +42626,6 @@ mod tests {
         );
     }
 
-    // ── Intent-log buffered-write recording tests ──────────────────────
-
-    #[test]
-    fn intent_log_buffered_write_appends_record() {
-        let mut fixture = adapter_fixture();
-        let buf = Arc::new(IntentLogBuffer::new());
-        let ctx = root_ctx();
-        let (inode, _adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"intent-log-write.txt",
-            libc::O_RDWR as u32,
-        );
-        let open = fixture
-            .adapter
-            .dispatch_open_entry(&ctx, inode.get(), libc::O_RDWR as u32)
-            .expect("open");
-        fixture.adapter.intent_log_buffer = Some(Arc::clone(&buf));
-        fixture.adapter.intent_log_write_enabled = true;
-
-        let data = b"hello intent log";
-        let written = fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), open.adapter_fh, 0, data, 0)
-            .expect("write should succeed");
-        assert_eq!(written, data.len() as u32);
-        assert!(!buf.is_empty(), "intent log buffer should have a record");
-        assert_eq!(buf.len(), 1);
-        let frames = buf.drain_since(0);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(
-            frames[0].txg_id,
-            fixture
-                .adapter
-                .txg_cycle
-                .current_commit_group_id
-                .load(Ordering::Relaxed)
-        );
-        let decoded = &frames[0].record;
-        match decoded {
-            IlRecord::BufferedWrite {
-                ino: r_ino,
-                offset: r_offset,
-                length,
-                data: inline_data,
-            } => {
-                assert_eq!(*r_ino, inode.get());
-                assert_eq!(*r_offset, 0);
-                assert_eq!(*length, data.len() as u64);
-                assert_eq!(inline_data.as_slice(), data);
-            }
-            _ => panic!("expected BufferedWrite record, got {decoded:?}"),
-        }
-    }
-
-    #[test]
-    fn intent_log_write_disabled_skips_buffer() {
-        let mut fixture = adapter_fixture();
-        let buf = Arc::new(IntentLogBuffer::new());
-        let ctx = root_ctx();
-        let (inode, _adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"intent-log-skip.txt",
-            libc::O_RDWR as u32,
-        );
-        let open = fixture
-            .adapter
-            .dispatch_open_entry(&ctx, inode.get(), libc::O_RDWR as u32)
-            .expect("open");
-        fixture.adapter.intent_log_buffer = Some(Arc::clone(&buf));
-        fixture.adapter.intent_log_write_enabled = false;
-
-        let written = fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), open.adapter_fh, 0, b"should not log", 0)
-            .expect("write should succeed");
-        assert_eq!(written as usize, b"should not log".len());
-        assert!(
-            buf.is_empty(),
-            "intent log buffer should be empty when disabled"
-        );
-    }
-
-    #[test]
-    fn intent_log_no_buffer_attached_is_noop() {
-        let mut fixture = adapter_fixture();
-        let ctx = root_ctx();
-        let (inode, _adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"intent-log-no-buf.txt",
-            libc::O_RDWR as u32,
-        );
-        let open = fixture
-            .adapter
-            .dispatch_open_entry(&ctx, inode.get(), libc::O_RDWR as u32)
-            .expect("open");
-        fixture.adapter.intent_log_write_enabled = true;
-
-        let written = fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), open.adapter_fh, 0, b"no buffer test", 0)
-            .expect("write should succeed");
-        assert_eq!(written, 14);
-    }
-
-    #[test]
-    fn intent_log_large_writes_skip_hot_hash_records() {
-        let mut fixture = adapter_fixture();
-        let buf = Arc::new(IntentLogBuffer::new());
-        let ctx = root_ctx();
-        let (inode, _adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"intent-log-hash.txt",
-            libc::O_RDWR as u32,
-        );
-        let open = fixture
-            .adapter
-            .dispatch_open_entry(&ctx, inode.get(), libc::O_RDWR as u32)
-            .expect("open");
-        fixture.adapter.intent_log_buffer = Some(Arc::clone(&buf));
-        fixture.adapter.intent_log_write_enabled = true;
-
-        let data = [0xABu8; 512];
-        fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), open.adapter_fh, 0, &data, 0)
-            .unwrap();
-        fixture
-            .adapter
-            .dispatch_write(
-                &ctx,
-                inode.get(),
-                open.adapter_fh,
-                data.len() as i64,
-                &data,
-                0,
-            )
-            .unwrap();
-
-        let frames = buf.drain_since(0);
-        assert!(
-            frames.is_empty(),
-            "large writes must not create digest-only intent records"
-        );
-        assert_eq!(buf.data_count(), 0);
-    }
-
-    #[test]
-    fn intent_log_zero_length_write_does_not_record() {
-        let mut fixture = adapter_fixture();
-        let buf = Arc::new(IntentLogBuffer::new());
-        let ctx = root_ctx();
-        let (inode, _adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"intent-log-zero.txt",
-            libc::O_RDWR as u32,
-        );
-        let open = fixture
-            .adapter
-            .dispatch_open_entry(&ctx, inode.get(), libc::O_RDWR as u32)
-            .expect("open");
-        fixture.adapter.intent_log_buffer = Some(Arc::clone(&buf));
-        fixture.adapter.intent_log_write_enabled = true;
-
-        let written = fixture
-            .adapter
-            .dispatch_write(&ctx, inode.get(), open.adapter_fh, 0, b"", 0)
-            .expect("zero-length write");
-        assert_eq!(written, 0);
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn intent_log_writeback_cached_write_appends_record() {
-        let mut fixture = adapter_fixture();
-        let buf = Arc::new(IntentLogBuffer::new());
-        let ctx = root_ctx();
-        let (inode, _adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"intent-log-wb.txt",
-            libc::O_RDWR as u32,
-        );
-        let open = fixture
-            .adapter
-            .dispatch_open_entry(&ctx, inode.get(), libc::O_RDWR as u32)
-            .expect("open");
-        fixture.adapter.intent_log_buffer = Some(Arc::clone(&buf));
-        fixture.adapter.intent_log_write_enabled = true;
-
-        let data = b"writeback cached data";
-        let written = fixture
-            .adapter
-            .dispatch_write(
-                &ctx,
-                inode.get(),
-                open.adapter_fh,
-                0,
-                data,
-                FUSE_WRITE_CACHE,
-            )
-            .expect("writeback-cached write");
-        assert_eq!(written, data.len() as u32);
-        assert!(
-            !buf.is_empty(),
-            "writeback-cached write should record in intent log"
-        );
-    }
-
-    #[test]
-    fn intent_log_multiple_writes_accumulate_in_buffer() {
-        let mut fixture = adapter_fixture();
-        let buf = Arc::new(IntentLogBuffer::new());
-        let ctx = root_ctx();
-        let (inode, _adapter_fh, _efh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"intent-log-multi.txt",
-            libc::O_RDWR as u32,
-        );
-        let open = fixture
-            .adapter
-            .dispatch_open_entry(&ctx, inode.get(), libc::O_RDWR as u32)
-            .expect("open");
-        fixture.adapter.intent_log_buffer = Some(Arc::clone(&buf));
-        fixture.adapter.intent_log_write_enabled = true;
-
-        for i in 0..5 {
-            let data = format!("write {i}").into_bytes();
-            let offset = i * 100;
-            fixture
-                .adapter
-                .dispatch_write(&ctx, inode.get(), open.adapter_fh, offset as i64, &data, 0)
-                .unwrap();
-        }
-        assert_eq!(buf.len(), 5, "five writes should produce five records");
-        let frames = buf.drain_since(0);
-        assert_eq!(frames.len(), 5);
-    }
     // ── Writeback cache builder ordering tests ──────────────────────────
 
     /// Default adapter: writeback_cache_enabled=false (safe direct-write).
