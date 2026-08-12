@@ -50,16 +50,6 @@ pub trait DirtyFlush {
     ///
     /// Used by `umount` and administrative sync operations.
     fn flush_all(&self) -> Result<(), FsyncDispatchError>;
-    /// Issue a data-only durability barrier for a single inode.
-    ///
-    /// Unlike [`flush_inode`], this method calls `fdatasync(2)` on the
-    /// backing file descriptor without the full commit-group machinery.
-    /// Use this after writeback-drain to converge dirty pages with durable
-    /// storage before acknowledging an fsync reply.
-    ///
-    /// When the inode has no dirty pages the implementation should be a
-    /// no-op to avoid unnecessary fdatasync overhead.
-    fn fdatasync_inode(&self, inode_id: InodeId, datasync: bool) -> Result<(), FsyncDispatchError>;
 }
 
 // ── Error type ───────────────────────────────────────────────────────────
@@ -288,19 +278,6 @@ impl DirtyFlush for StubDirtyFlush {
         *self.flush_all_calls.borrow_mut() += 1;
         Ok(())
     }
-
-    fn fdatasync_inode(
-        &self,
-        inode_id: InodeId,
-        _datasync: bool,
-    ) -> Result<(), FsyncDispatchError> {
-        // Stub: record the call for test verification, return Ok.
-        self.flush_inode_calls.borrow_mut().push((inode_id, true));
-        if let Some(err) = *self.inject_error.borrow() {
-            return Err(err);
-        }
-        Ok(())
-    }
 }
 
 // ── LocalFsDirtyFlush — production DirtyFlush via LocalFileSystem ─────────
@@ -359,17 +336,6 @@ impl DirtyFlush for LocalFsDirtyFlush<'_> {
             FileSystemError::NoSpace { .. } => FsyncDispatchError::NoSpace,
             _ => FsyncDispatchError::IoError,
         })
-    }
-
-    fn fdatasync_inode(&self, inode_id: InodeId, datasync: bool) -> Result<(), FsyncDispatchError> {
-        self.fs
-            .borrow_mut()
-            .fdatasync_inode(inode_id, datasync)
-            .map_err(|e| match e {
-                FileSystemError::NoSpace { .. } => FsyncDispatchError::NoSpace,
-                FileSystemError::NotFound { .. } => FsyncDispatchError::IoError,
-                _ => FsyncDispatchError::IoError,
-            })
     }
 }
 
@@ -967,41 +933,5 @@ mod tests {
             .flush_inode(InodeId::new(1), true)
             .expect("fdatasync nonexistent inode should be noop");
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn local_fs_fdatasync_inode_noop_for_clean_inode() {
-        let root = std::env::temp_dir().join("s5_localfs_fdatasync_clean");
-        if root.exists() {
-            let _ = std::fs::remove_dir_all(&root);
-        }
-        let fs = RefCell::new(crate::LocalFileSystem::open(&root).expect("open fs"));
-        let flush = LocalFsDirtyFlush::new(&fs);
-
-        // fdatasync on a nonexistent inode should be a no-op via the stub.
-        let result = flush.fdatasync_inode(InodeId::new(999), true);
-        assert!(
-            result.is_ok(),
-            "fdatasync on clean inode should succeed (no-op)"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn stub_fdatasync_inode_records_call() {
-        let stub = StubDirtyFlush::new();
-        let ino = InodeId::new(42);
-        stub.fdatasync_inode(ino, false).expect("stub fdatasync");
-        let calls = stub.flush_inode_calls.borrow();
-        assert_eq!(calls.len(), 1, "stub should record fdatasync call");
-        assert_eq!(calls[0], (ino, true));
-    }
-
-    #[test]
-    fn stub_fdatasync_inode_injects_error() {
-        let stub = StubDirtyFlush::new();
-        stub.set_error(FsyncDispatchError::IoError);
-        let result = stub.fdatasync_inode(InodeId::new(1), true);
-        assert_eq!(result, Err(FsyncDispatchError::IoError));
     }
 }

@@ -45,10 +45,6 @@ pub struct PoolMountRuntimeArgs {
     #[arg(long = "sync")]
     pub sync: bool,
 
-    /// Record eligible buffered writes in the intent log
-    #[arg(long = "intent-log-write")]
-    pub intent_log_write: bool,
-
     /// Mounted filesystem content-capacity limit in bytes
     #[arg(long = "content-capacity-bytes")]
     pub content_capacity_bytes: Option<u64>,
@@ -97,7 +93,6 @@ impl Default for PoolMountRuntimeArgs {
             writeback_cache: false,
             options: None,
             sync: false,
-            intent_log_write: false,
             content_capacity_bytes: None,
             writeback_cache_timeout_secs: None,
             drain_timeout_secs: None,
@@ -649,8 +644,6 @@ pub fn handle_mount(args: PoolMountArgs) {
     if args.runtime.sync {
         runtime.mount_options.sync = true;
     }
-    runtime.intent_log_write =
-        args.runtime.intent_log_write || runtime.mount_options.intent_log_write;
     if let Some(bytes) = args.runtime.content_capacity_bytes {
         if bytes == 0 {
             eprintln!("tidefsctl pool mount: --content-capacity-bytes must be greater than zero");

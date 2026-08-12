@@ -14,7 +14,6 @@ description = "POSIX filesystem adapter operator entrypoint and FUSE validation 
 
 [dependencies]
 tidefs-workload = { workspace = true, optional = true }
-tidefs-intent-log = { workspace = true }
 blake3 = { version = "1", default-features = false }
 fuser = { version = "0.14.0", features = ["abi-7-30", "abi-7-32"] }
 libc = "0.2"
@@ -25,7 +24,6 @@ tidefs-dataset-catalog = { workspace = true }
 tidefs-invalidation-feed = { workspace = true }
 tidefs-dir-index = { workspace = true }
 tidefs-posix-acl = { workspace = true }
-tidefs-commit_group = { workspace = true }
 tidefs-cache-core = { workspace = true }
 tidefs-extent-map = { workspace = true }
 tidefs-types-extent-map-core = { workspace = true }

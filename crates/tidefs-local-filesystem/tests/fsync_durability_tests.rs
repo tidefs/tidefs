@@ -113,11 +113,9 @@ fn fsync_flush_writes_to_object_store() {
     cleanup(&root);
 }
 
-/// fdatasync (sync_inode_data_only) flushes data but skips the full metadata
-/// commit_group commit. Verify the content object exists but metadata may not be
-/// committed (the file may be unreachable until a metadata commit occurs).
+/// fdatasync persists content plus the metadata required to retrieve it.
 #[test]
-fn fdatasync_persists_data_object_skips_metadata_commit() {
+fn fdatasync_persists_data_and_required_reachability() {
     setup_auth_env();
     let root = temp_root("fdatasync-data-only");
     let data = vec![0xCDu8; 2048];
@@ -140,21 +138,19 @@ fn fdatasync_persists_data_object_skips_metadata_commit() {
         );
     }
 
-    // Without a metadata commit, the file may be unreachable on reopen.
     {
         let fs = LocalFileSystem::open_with_options(&root, opts()).expect("reopen fs");
-        // The file might not be in the namespace since metadata wasn't committed.
-        // But the content object is durable in the store (verified above).
-        // This is the defining semantic of fdatasync: data durable, metadata may lag.
-        let _ = fs.lookup("/fdat.txt");
+        assert_eq!(
+            fs.read_file("/fdat.txt")
+                .expect("read fdatasync file after reopen"),
+            data,
+        );
     }
 
     cleanup(&root);
 }
 
-/// Compare fsync_file vs fsync_data_only_file: both persist data, but after
-/// fsync_file the file is reachable on reopen; after fsync_data_only_file only
-/// the content object is guaranteed.
+/// Both fsync and fdatasync preserve the root fields required to retrieve data.
 #[test]
 fn fsync_vs_fdatasync_reachability_after_reopen() {
     setup_auth_env();
@@ -171,7 +167,7 @@ fn fsync_vs_fdatasync_reachability_after_reopen() {
         fs.fsync_file("/a.txt").expect("fsync a.txt");
     }
 
-    // File B: fdatasync only (data committed, metadata may not be).
+    // File B: fdatasync publishes data plus required reachability metadata.
     {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
         fs.set_auto_commit(false)
@@ -183,16 +179,18 @@ fn fsync_vs_fdatasync_reachability_after_reopen() {
             .expect("fsync_data_only b.txt");
     }
 
-    // After reopen: file A is reachable, file B may not be.
+    // After reopen both acknowledged files are reachable with exact bytes.
     {
         let fs = LocalFileSystem::open_with_options(&root, opts()).expect("reopen fs");
         assert!(
             fs.lookup("/a.txt").is_ok(),
             "fsync'd file must be reachable"
         );
-        // fdatasync'd file may or may not be reachable (metadata commit timing).
-        // We just confirm the lookup doesn't panic.
-        let _ = fs.lookup("/b.txt");
+        assert_eq!(
+            fs.read_file("/b.txt")
+                .expect("fdatasync'd file must be reachable"),
+            b"BBBB",
+        );
     }
 
     cleanup(&root);

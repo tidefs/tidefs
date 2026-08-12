@@ -12758,62 +12758,12 @@ impl LocalFileSystem {
         result
     }
 
-    /// Sync only the data extents of a single file (fdatasync semantics).
-    ///
-    /// Unlike `fsync_file`, this skips metadata-only flushes (size, timestamps
-    /// already durable); only data extents are persisted. The intent log fast
-    /// path is used when available; otherwise content objects for this inode
-    /// are ensured durable individually.
+    /// Synchronize one file through the canonical fdatasync root authority.
     pub fn fsync_data_only_file(&mut self, path: impl AsRef<str>) -> Result<()> {
         self.ensure_mutation_allowed("synchronize mounted file data")?;
         check_crash_hook(CrashInjectionPoint::OpFsyncBeforeFlush);
-        let started = Instant::now();
         let attr = self.stat(path.as_ref())?;
-        self.flush_write_buffer(attr.inode_id)?;
-        if self.intent_log.has_pending_data_for_inode(attr.inode_id) {
-            self.intent_log
-                .flush_and_sync(self.store.raw_primary_store_mut())?;
-            self.store.sync_all().map_err(FileSystemError::from)?;
-            self.fsync_stats
-                .fsync_intent_log_fast_path_count
-                .fetch_add(1, Ordering::Relaxed);
-            self.fsync_stats
-                .fdatasync_count
-                .fetch_add(1, Ordering::Relaxed);
-            self.fsync_stats
-                .fdatasync_total_ns
-                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            self.record_durable_intent_ack_receipt(
-                LocalAckOperation::Fdatasync,
-                LocalAckReceiptTarget::inode(attr.inode_id.get()),
-                None,
-            );
-            return Ok(());
-        }
-        if self.state.dirty_content.contains(&attr.inode_id) {
-            let record =
-                self.state
-                    .inodes
-                    .get(&attr.inode_id)
-                    .ok_or(FileSystemError::CorruptState {
-                        reason: "dirty content inode not found in state",
-                    })?;
-            validate_versioned_content_with_pool(&self.store, record)?;
-            self.store.sync_all().map_err(FileSystemError::from)?;
-            self.mark_content_clean(attr.inode_id);
-            self.record_full_local_placement_ack_receipt(
-                LocalAckOperation::Fdatasync,
-                LocalAckReceiptTarget::inode(attr.inode_id.get()),
-                None,
-            );
-        }
-        self.fsync_stats
-            .fdatasync_count
-            .fetch_add(1, Ordering::Relaxed);
-        self.fsync_stats
-            .fdatasync_total_ns
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        Ok(())
+        self.fdatasync_inode(attr.inode_id, true)
     }
 
     /// Flush a single file for the FUSE close path.
@@ -12932,23 +12882,10 @@ impl LocalFileSystem {
 
     pub fn fsync_data_only(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("synchronize filesystem data")?;
-        // Filesystem-scoped fdatasync covers every accepted dirty range.  A
-        // buffered write has already advanced its live inode version, so drain
-        // the buffers before either intent-log persistence or Pool validation
-        // observes that version.
+        // Filesystem-scoped fdatasync covers every accepted dirty range and
+        // every root field needed to recover those ranges.  Publish once
+        // through the same root authority as per-inode fdatasync.
         self.flush_all_write_buffers()?;
-        // Intent log fast path: flush pending data entries instead of
-        // walking dirty inodes and flushing content objects individually.
-        if self.intent_log.pending_flush_count() > 0 {
-            self.intent_log
-                .flush_and_sync(self.store.raw_primary_store_mut())?;
-            self.record_durable_intent_ack_receipt(
-                LocalAckOperation::Fdatasync,
-                LocalAckReceiptTarget::FILESYSTEM,
-                None,
-            );
-            return Ok(());
-        }
         let dirty_inodes: Vec<InodeId> = self.state.dirty_content.iter().copied().collect();
         for inode_id in &dirty_inodes {
             let record = self
@@ -12960,11 +12897,10 @@ impl LocalFileSystem {
                 })?;
             validate_versioned_content_with_pool(&self.store, record)?;
         }
+        let had_pending_intent = self.intent_log.pending_flush_count() > 0;
+        self.do_commit()?;
         self.store.sync_all().map_err(FileSystemError::from)?;
-        for inode_id in &dirty_inodes {
-            self.mark_content_clean(*inode_id);
-        }
-        if !dirty_inodes.is_empty() {
+        if !dirty_inodes.is_empty() || had_pending_intent {
             self.record_full_local_placement_ack_receipt(
                 LocalAckOperation::Fdatasync,
                 LocalAckReceiptTarget::FILESYSTEM,
@@ -13031,60 +12967,10 @@ impl LocalFileSystem {
         result
     }
 
-    /// Sync only the data extents of a single inode (fdatasync semantics).
-    ///
-    /// Like `fsync_data_only_file` but operates directly on an `InodeId`.
-    /// Skips metadata-only flushes; only data extents are persisted.
+    /// Synchronize one inode through the canonical fdatasync root authority.
     pub fn sync_inode_data_only(&mut self, inode_id: InodeId) -> Result<()> {
-        self.ensure_mutation_allowed("synchronize mounted inode data")?;
         check_crash_hook(CrashInjectionPoint::OpFsyncBeforeFlush);
-        let started = Instant::now();
-        self.flush_write_buffer(inode_id)?;
-        let had_pending_intent = self.intent_log.has_pending_data_for_inode(inode_id);
-        if self.intent_log.has_pending_data_for_inode(inode_id) {
-            self.intent_log
-                .flush_and_sync(self.store.raw_primary_store_mut())?;
-            self.fsync_stats
-                .fsync_intent_log_fast_path_count
-                .fetch_add(1, Ordering::Relaxed);
-            // Fall through — committed-root commit is the primary
-            // durability path; intent-log replay recovered during the next
-            // pool import provides an additional safety net. Persist data
-            // through the content-object path for immediate durability.
-        }
-        let had_dirty_content = self.state.dirty_content.contains(&inode_id);
-        if self.state.dirty_content.contains(&inode_id) {
-            let record = self
-                .state
-                .inodes
-                .get(&inode_id)
-                .ok_or(FileSystemError::CorruptState {
-                    reason: "dirty content inode not found in state during sync_inode_data_only",
-                })?;
-            validate_versioned_content_with_pool(&self.store, record)?;
-            self.store.sync_all().map_err(FileSystemError::from)?;
-            self.mark_content_clean(inode_id);
-        }
-        if had_dirty_content {
-            self.record_full_local_placement_ack_receipt(
-                LocalAckOperation::Fdatasync,
-                LocalAckReceiptTarget::inode(inode_id.get()),
-                None,
-            );
-        } else if had_pending_intent {
-            self.record_durable_intent_ack_receipt(
-                LocalAckOperation::Fdatasync,
-                LocalAckReceiptTarget::inode(inode_id.get()),
-                None,
-            );
-        }
-        self.fsync_stats
-            .fdatasync_count
-            .fetch_add(1, Ordering::Relaxed);
-        self.fsync_stats
-            .fdatasync_total_ns
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        Ok(())
+        self.fdatasync_inode(inode_id, true)
     }
 
     /// Drain all dirty inodes, ensuring every file with pending writes
@@ -13123,16 +13009,13 @@ impl LocalFileSystem {
         }
         Ok(())
     }
-    /// Issue a data-only durability barrier for a single inode (fdatasync
-    /// semantics) without performing a full commit_group commit.
+    /// Issue a data-only durability barrier for a single inode.
     ///
-    /// Flushes the write buffer, ensures content objects are written to the
-    /// segment file, and calls sync_data on the backing store for a lightweight
-    /// fdatasync(2)-equivalent barrier.  This is faster than sync_inode_data_only
-    /// because it skips the full commit machinery.
-    ///
-    /// When datasync is true, only data extents are flushed; metadata is
-    /// skipped.  When the inode has no dirty content the call is a no-op.
+    /// `fdatasync` may omit metadata unrelated to retrieving the file data, but
+    /// it cannot acknowledge content whose size, extents, or inode remain
+    /// unreachable from the recovery root.  The current mounted authority
+    /// publishes the complete dirty filesystem root here.  A narrower future
+    /// implementation must retain the same recovery boundary.
     pub fn fdatasync_inode(&mut self, inode_id: InodeId, datasync: bool) -> Result<()> {
         self.ensure_mutation_allowed("synchronize mounted inode data")?;
         let started = Instant::now();
@@ -13154,14 +13037,13 @@ impl LocalFileSystem {
             .ok_or(FileSystemError::NotFound {
                 path: format!("inode {inode_id:?}"),
             })?;
-        // Buffered mounted writes publish their versioned content through
-        // PoolStoreMut together with placement receipts. Validate that same
-        // Pool authority before syncing; the raw primary store is not a
-        // mounted-content namespace and may legitimately lack the logical
-        // object even though the Pool can read it.
+        // Validate the same Pool placement authority that recovery will use,
+        // then publish the root that makes the bytes reachable.  `do_commit`
+        // owns the clean transition and real commit-group sync gate; a
+        // content-only store flush cannot substitute for that root authority.
         let _ = self.read_committed_content_layout(inode_id, record)?;
-        self.store.sync_data().map_err(FileSystemError::from)?;
-        self.mark_content_clean(inode_id);
+        self.do_commit()?;
+        self.store.sync_all().map_err(FileSystemError::from)?;
         self.record_full_local_placement_ack_receipt(
             LocalAckOperation::Fdatasync,
             LocalAckReceiptTarget::inode(inode_id.get()),
