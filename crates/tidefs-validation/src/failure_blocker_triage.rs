@@ -205,7 +205,7 @@ const GATE_SPECS: &[GateSpec] = &[
         authority_paths: &[
             "docs/REVIEW_TODO_REGISTER.md",
             "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
-            "docs/RELEASE_READINESS_VERDICT_CONTRACT.md",
+            "README.md",
             "validation/claims.toml",
         ],
     },
@@ -381,7 +381,7 @@ const GATE_SPECS: &[GateSpec] = &[
         authority_paths: &[
             "docs/OPERATOR_UAPI_AUTHORITY.md",
             "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
-            "docs/RELEASE_READINESS_VERDICT_CONTRACT.md",
+            "README.md",
             "docs/CLAIMS_GATE_POLICY.md",
             "validation/claims.toml",
         ],
@@ -409,7 +409,7 @@ const GATE_SPECS: &[GateSpec] = &[
         ],
         authority_paths: &[
             "docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md",
-            "docs/RELEASE_READINESS_VERDICT_CONTRACT.md",
+            "README.md",
             "docs/GITHUB_CI.md",
             "validation/claims.toml",
         ],

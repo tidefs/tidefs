@@ -263,9 +263,9 @@ may use non-secret repository variables for scheduling gates, such as
   claim. Newer dispatches for the same branch and profile cancel older queued
   or running copies so superseded release-candidate runs do not leave stale
   self-hosted index jobs in the runner queue.
-  The evidence index is consumed by the release-readiness verdict contract
-  (`docs/RELEASE_READINESS_VERDICT_CONTRACT.md`), which defines the boundary
-  between gate-local readiness receipts and whole-product admission.
+  The evidence index is a bounded milestone-run index only. It does not feed
+  an automated whole-product verdict; any release requires an explicit
+  operator-owned publication decision against the README Product Contract.
 
 ## Runner Contract
 

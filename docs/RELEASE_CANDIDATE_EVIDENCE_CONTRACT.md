@@ -306,12 +306,10 @@ If the assertions fail, the step exits non-zero and the evidence index is not
 uploaded. An index that passes self-validation is structurally self-consistent
 but does not assert lane-level correctness or product readiness.
 
-The `tidefs-xtask release-readiness-verdict` command is the executable
-fail-closed consumer for a downloaded
-`release-candidate-evidence-index/index.json`. It reads that path explicitly
-alongside the claim registry, source identity, and any other admission inputs,
-then emits a separate verdict artifact. The evidence index remains an input to
-that verdict boundary and still carries `product_readiness: not_claimed`.
+No repository command consumes this index into a whole-product verdict. The
+index remains a bounded milestone-run summary and carries
+`product_readiness: not_claimed`. Any publication decision is operator-owned
+and must assess current Product Contract behavior directly.
 
 ---
 
@@ -332,9 +330,8 @@ The `nix` lane has no associated lane-local manifest and is recorded as
 
 When auditing a candidate run, treat an `absent` manifest as unreviewed scope
 that a separate claims-gate or lane-local validation workflow must cover before
-the candidate's lane evidence can be considered complete for a product
-readiness decision. The candidate index itself makes no product-readiness
-claim.
+the candidate's lane evidence can be considered complete for publication
+review. The candidate index itself makes no product-readiness claim.
 
 ---
 
@@ -402,12 +399,10 @@ standalone lane workflows.
 
 ### Gate role
 
-The release candidate evidence index is a **gate input**, not a gate verdict.
-The verdict boundary that consumes this evidence index and the other inputs
-listed below is defined in `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`. That
-contract records required evidence families, explicit non-claims, and the
-distinction between gate-local readiness receipts and whole-product admission.
-A product readiness decision must combine the index with:
+The release candidate evidence index is a **bounded run index**, not a verdict.
+It may inform an explicit operator-owned publication review, which must assess
+the Product Contract and current carrier behavior rather than treating this
+index as product admission. Relevant review inputs include:
 
 - Lane-local manifest review through current workflow/source state or live
   issue state. Historical completed issues 643-646 are provenance only, not

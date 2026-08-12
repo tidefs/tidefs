@@ -81,7 +81,7 @@ required_evidence_classes = [
 authority_paths = [
   "docs/REVIEW_TODO_REGISTER.md",
   "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
-  "docs/RELEASE_READINESS_VERDICT_CONTRACT.md",
+  "README.md",
   "validation/claims.toml",
 ]
 admission_rule = "Crash/replay wording may strengthen only when the model, runtime crash oracle, namespace runtime, storage-intent fault, and claims-gate evidence validate without widening beyond their declared scope."
@@ -302,7 +302,7 @@ blockers = [
 [[product_admission_gates]]
 id = "operator-uapi-release-verdict"
 status = "blocked"
-scope = "operator UAPI truth, release-readiness verdict ownership, and externally readable product wording"
+scope = "operator UAPI truth and externally readable product wording"
 claim_ids = [
   "storage.local.successor_comparator.v1",
   "storage.distributed.successor_comparator.v1",
@@ -317,13 +317,13 @@ required_evidence_classes = [
 authority_paths = [
   "docs/OPERATOR_UAPI_AUTHORITY.md",
   "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
-  "docs/RELEASE_READINESS_VERDICT_CONTRACT.md",
+  "README.md",
   "docs/CLAIMS_GATE_POLICY.md",
   "validation/claims.toml",
 ]
-admission_rule = "Operator or release-facing wording may strengthen only when local, distributed, and umbrella successor claims validate and the release-readiness verdict owner records a current verdict that consumes the claim evidence without widening it."
+admission_rule = "Operator or release-facing wording may strengthen only when local, distributed, and umbrella successor claims validate and an explicit operator-owned publication decision confirms matching Product Contract behavior without widening it."
 blockers = [
-  "No release-readiness verdict exists, and claims-gate status alone is not a whole-product admission decision.",
+  "No operator-owned publication decision exists, and claims-gate status alone is not a whole-product admission decision.",
   "The split local, distributed, and umbrella successor claims all remain blocked.",
 ]
 
@@ -353,14 +353,14 @@ required_evidence_classes = [
 ]
 authority_paths = [
   "docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md",
-  "docs/RELEASE_READINESS_VERDICT_CONTRACT.md",
+  "README.md",
   "docs/GITHUB_CI.md",
   "validation/claims.toml",
 ]
-admission_rule = "A proof packet may support product wording only when every consumed claim validates, the evidence manifests are current, the verdict boundary records open gaps/non-claims, and no gate-local receipt is treated as whole-product admission."
+admission_rule = "A proof packet may support product wording only when every consumed claim validates, the evidence manifests are current, an explicit operator-owned publication decision records open gaps/non-claims, and no gate-local receipt is treated as whole-product admission."
 blockers = [
-  "The evidence packet is an admission map, not a release-readiness verdict.",
-  "Several referenced claims remain planned or blocked, and no current release-readiness verdict consumes the full product-spine evidence set.",
+  "The evidence packet is an input, not a release decision.",
+  "Several referenced claims remain planned or blocked, and no current operator-owned publication decision covers the full Product Contract.",
 ]
 
 [[claims]]
