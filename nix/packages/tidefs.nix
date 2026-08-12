@@ -13,9 +13,7 @@
   workspaceBins ? [
     "tidefs-block-volume-adapter-daemon"
     "tidefs-storage-node"
-    "tidefs-filesystem-demo"
     "tidefs-posix-filesystem-adapter-daemon"
-    "tidefs-store-demo"
     "tidefsctl"
     "tidefs-xtask"
   ],

@@ -2450,17 +2450,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tidefs-filesystem-demo"
-version = "0.421.0"
-dependencies = [
- "fuser",
- "tidefs-local-filesystem",
- "tidefs-local-object-store",
- "tidefs-posix-filesystem-adapter-daemon",
- "tidefs-vfs-engine",
-]
-
-[[package]]
 name = "tidefs-flow-commit-coordinator"
 version = "0.421.0"
 dependencies = [
@@ -3591,13 +3580,6 @@ dependencies = [
  "tidefs-transport",
  "tidefs-types-pool-label-core",
  "tokio",
-]
-
-[[package]]
-name = "tidefs-store-demo"
-version = "0.421.0"
-dependencies = [
- "tidefs-local-object-store",
 ]
 
 [[package]]

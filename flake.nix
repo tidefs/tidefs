@@ -65,9 +65,7 @@
           });
           workspaceBins = [
             "tidefs-block-volume-adapter-daemon"
-            "tidefs-filesystem-demo"
             "tidefs-posix-filesystem-adapter-daemon"
-            "tidefs-store-demo"
             "tidefs-storage-node"
             "tidefsctl"
             "tidefs-xtask"
@@ -145,7 +143,7 @@
             };
             cargoBuildFlags = [
               "--workspace"
-              "--features" "tidefs-filesystem-demo/full,tidefs-local-filesystem/full,tidefs-posix-filesystem-adapter-daemon/full,tidefs-validation/full,tidefsctl/full"
+              "--features" "tidefs-local-filesystem/full,tidefs-posix-filesystem-adapter-daemon/full,tidefs-validation/full,tidefsctl/full"
             ];
             workspaceBins = workspaceBins;
           };

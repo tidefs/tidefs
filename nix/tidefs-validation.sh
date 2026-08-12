@@ -117,8 +117,6 @@ run_step cargo-fmt cargo fmt --check
 run_step cargo-clippy cargo clippy --workspace --all-targets
 run_step cargo-test cargo test --workspace --all-targets
 run_step cargo-deny-licenses cargo deny check licenses
-run_step store-demo cargo run -p tidefs-store-demo
-run_step filesystem-demo cargo run -p tidefs-filesystem-demo
 run_step block-volume-host-preflight cargo run -p tidefs-block-volume-adapter-daemon -- preflight-host
 run_step block-volume-ublk-control-open cargo run -p tidefs-block-volume-adapter-daemon -- ublk-control-open
 run_step block-volume-ublk-control-readonly-probe cargo run -p tidefs-block-volume-adapter-daemon -- ublk-control-readonly-probe
