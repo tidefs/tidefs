@@ -21,7 +21,6 @@ mod observe;
 mod platform;
 mod policy;
 mod qemu_pin;
-mod release_readiness;
 mod storage;
 mod terminology;
 mod trace_oracle;
@@ -724,9 +723,6 @@ fn main() {
                 eprintln!("{err}");
                 process::exit(1);
             }
-        }
-        Some("release-readiness-verdict" | "product-readiness-verdict") => {
-            release_readiness::run(args);
         }
         Some("validate-claim") => {
             let mut format = claims::ClaimValidationFormat::Summary;
@@ -2311,7 +2307,6 @@ fn print_summary() {
     println!("send_receive_check_command=check-send-receive");
     println!("online_verifier_check_command=check-online-verifier");
     println!("claims_gate_check_command=check-claims-gate");
-    println!("release_readiness_verdict_command=release-readiness-verdict");
     println!("claim_validate_command=validate-claim");
     println!("claim_gate_check_command=check-claim-gate");
     println!("abandoned_worktrees_check_command=check-abandoned-worktrees");
@@ -2394,9 +2389,6 @@ fn print_help() {
     println!("  qemu-pin-manifest        alias for collect-qemu-pin-manifest");
     println!("  perf-gate [--baseline <path>] [--current-run <path>] [sha] [profile] [backend] [cache]  run performance regression gate");
     println!("  performance-gate         alias for perf-gate");
-    println!(
-        "  release-readiness-verdict assemble a fail-closed product-readiness verdict artifact"
-    );
     println!("  check-observation-substrate validate current VFS truth-view markers");
     println!("  check-adaptive-governor alias for check-observation-substrate");
     println!(

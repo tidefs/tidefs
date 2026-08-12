@@ -26,8 +26,7 @@ statement.
   [encryption secret handles](security/pool-encryption-secret-handle-boundary.md),
   [transport security](security/transport-security-boundary.md), and
   [encryption threat model](security/unified-storage-encryption-threat-model.md).
-- Publication and release: [claims guardrails](CLAIMS_GATE_POLICY.md),
-  [release-candidate evidence](RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md), and
-  [release-readiness review](RELEASE_READINESS_VERDICT_CONTRACT.md).
+- Publication and release: [claims guardrails](CLAIMS_GATE_POLICY.md) and
+  [release-candidate evidence](RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md).
 
 Use the live issue to select any narrower subsystem document under `docs/`.

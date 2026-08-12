@@ -2,11 +2,10 @@
 
 Maturity: current policy guardrail.
 
-This document is a current policy guardrail. It does not declare a release-readiness
-verdict. The release-readiness boundary, including required evidence families,
-explicit non-claims, and the distinction between gate-local receipts and whole-product
-admission, is defined in `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`.
-TideFS has not had a public release. Internal formats, fixtures, daemons,
+This document is a current policy guardrail. It does not authorize a release.
+The README Product Contract defines TideFS's product shape and current support
+boundary; an explicit operator-owned publication decision is required for any
+release. TideFS has not had a public release. Internal formats, fixtures, daemons,
 transport paths, and design sketches in this repository are pre-release work
 unless a current GitHub issue or current policy document names an external
 ABI, protocol, or operator-owned data set that must be preserved.

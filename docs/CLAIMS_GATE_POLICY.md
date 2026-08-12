@@ -86,7 +86,7 @@ only registry-backed path by which successor/comparator wording can consume
 product-spine evidence. A design document, proof-train label, implementation
 issue, CI workflow, benchmark row, or gate-local receipt may inform one of
 those gates, but it cannot bypass the referenced claim ids or the
-release-readiness verdict boundary.
+explicit operator-owned publication decision.
 
 Until the matching split claim id and the umbrella boundary validate with
 current evidence manifests, TideFS docs, release notes, generated claim text,
@@ -104,9 +104,9 @@ Disallowed wording includes:
 - unqualified OpenZFS/Ceph-class fulfillment;
 - average benchmark wins used as superiority permission;
 - storage-intent row labels treated as product admission;
-- blocked release-ready, production-ready, GA-ready, or stable-release
-  statements without a verdict artifact owned by
-  `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`.
+- blocked release-ready, production-ready, GA-ready, or stable-release statements
+  without matching Product Contract behavior and an explicit operator-owned
+  publication decision.
 
 The successor comparator claims remain blocked until their registry-required
 evidence classes are present and current, including:
