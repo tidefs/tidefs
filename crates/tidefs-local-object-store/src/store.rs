@@ -40,7 +40,7 @@ use std::convert::TryFrom;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileExt, FileTypeExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 // already imported above
@@ -466,6 +466,11 @@ pub struct LocalObjectStore {
     pub(crate) free_map: PoolAllocator,
     current_offset: u64,
     current_file: File,
+    /// Exact raw capacity captured from the retained byte-device handle at
+    /// admission.  Keeping it here avoids seeking a duplicated descriptor:
+    /// `File::try_clone` shares the open-file-description offset and would
+    /// disturb the writer even when used only for a read-side size probe.
+    block_device_capacity: Option<u64>,
     segment_created_at: Instant,
     segment_write_count: u64,
     index: BTreeMap<ObjectKey, ObjectLocation>,
@@ -2004,6 +2009,7 @@ impl LocalObjectStore {
             free_map,
             current_offset,
             current_file: file,
+            block_device_capacity: Some(capacity),
             segment_created_at: Instant::now(),
             segment_write_count: 0,
             index,
@@ -2320,6 +2326,7 @@ impl LocalObjectStore {
             free_map,
             current_offset,
             current_file,
+            block_device_capacity: None,
             index,
             history,
             current_io_class: IoClass::AsyncData,
@@ -2895,19 +2902,11 @@ impl LocalObjectStore {
     /// capacity to FUSE clients.
     #[must_use]
     pub fn capacity_bytes(&self) -> u64 {
-        // Block-device mode: Linux block-device metadata length can be zero;
-        // seek to the end of a cloned descriptor to discover usable capacity.
         if self.block_device_mode {
-            match self
-                .current_file
-                .try_clone()
-                .and_then(|mut file| file.seek(SeekFrom::End(0)))
-            {
-                Ok(raw) => {
-                    return raw.saturating_sub(POOL_LABEL_SIZE as u64);
-                }
-                Err(_) => return 0,
-            }
+            return self
+                .block_device_capacity
+                .unwrap_or(0)
+                .saturating_sub(POOL_LABEL_SIZE as u64);
         }
         self.options
             .segment_count
@@ -6276,15 +6275,6 @@ impl LocalObjectStore {
     }
 
     fn read_location_stored_payload(&self, location: ObjectLocation) -> Result<(Vec<u8>, u8)> {
-        let path = if self.block_device_mode {
-            self.root.clone()
-        } else {
-            segment_path(&self.segments_dir, location.segment_id)
-        };
-        let mut file = File::open(&path).map_err(|source| io_error("open", &path, source))?;
-        let data_end = file
-            .seek(SeekFrom::End(0))
-            .map_err(|source| io_error("seek end", &path, source))?;
         let expected_payload_offset = checked_record_offset(
             location.record_offset,
             RECORD_HEADER_LEN_U64,
@@ -6298,6 +6288,55 @@ impl LocalObjectStore {
                 reason: "location payload offset does not match record layout",
             });
         }
+
+        if self.block_device_mode {
+            let path = &self.root;
+            let data_end = self
+                .block_device_capacity
+                .unwrap_or(0)
+                .saturating_sub(POOL_LABEL_SIZE as u64);
+            let mut header = [0_u8; RECORD_HEADER_LEN];
+            self.current_file
+                .read_exact_at(&mut header, location.record_offset)
+                .map_err(|source| io_error("read_exact_at header", path, source))?;
+
+            let record = decode_header(&header, location.segment_id, location.record_offset)?;
+            let range = checked_record_range(record, location.segment_id, location.record_offset)?;
+            if range.end_offset > data_end {
+                return Err(StoreError::CorruptHeader {
+                    segment_id: location.segment_id,
+                    offset: location.record_offset,
+                    reason: "record extends beyond the admitted data region",
+                });
+            }
+            let tail_len =
+                usize::try_from(range.end_offset - range.payload_offset).map_err(|_| {
+                    StoreError::PayloadTooLarge {
+                        len: record.payload_len,
+                        max: usize::MAX as u64,
+                    }
+                })?;
+            let mut tail = vec![0_u8; tail_len];
+            self.current_file
+                .read_exact_at(&mut tail, range.payload_offset)
+                .map_err(|source| io_error("read_exact_at record", path, source))?;
+            let mut tail = io::Cursor::new(tail);
+            let decoded = decode_stored_record_after_header(
+                &mut tail,
+                path,
+                location.segment_id,
+                location.record_offset,
+                data_end,
+                header,
+            )?;
+            return validate_location_record(location, decoded);
+        }
+
+        let path = segment_path(&self.segments_dir, location.segment_id);
+        let mut file = File::open(&path).map_err(|source| io_error("open", &path, source))?;
+        let data_end = file
+            .seek(SeekFrom::End(0))
+            .map_err(|source| io_error("seek end", &path, source))?;
         file.seek(SeekFrom::Start(location.record_offset))
             .map_err(|source| io_error("seek", &path, source))?;
         let mut header = [0_u8; RECORD_HEADER_LEN];
@@ -6311,20 +6350,7 @@ impl LocalObjectStore {
             data_end,
             header,
         )?;
-        let record = decoded.header;
-        if record.kind != RecordKind::Put
-            || record.key != location.key
-            || record.sequence != location.sequence
-            || record.payload_len != location.payload_len
-            || record.payload_checksum != location.payload_checksum
-        {
-            return Err(StoreError::CorruptHeader {
-                segment_id: location.segment_id,
-                offset: location.record_offset,
-                reason: "header no longer matches the in-memory location index",
-            });
-        }
-        Ok((decoded.payload, record.compression_algorithm))
+        validate_location_record(location, decoded)
     }
 
     fn read_location(&self, location: ObjectLocation) -> Result<Vec<u8>> {
@@ -7207,7 +7233,7 @@ fn checked_record_range(
 }
 
 fn decode_stored_record_after_header(
-    file: &mut File,
+    file: &mut impl Read,
     path: &Path,
     segment_id: u64,
     record_offset: u64,
@@ -7283,6 +7309,26 @@ fn decode_stored_record_after_header(
         range,
         payload,
     })
+}
+
+fn validate_location_record(
+    location: ObjectLocation,
+    decoded: DecodedStoredRecord,
+) -> Result<(Vec<u8>, u8)> {
+    let record = decoded.header;
+    if record.kind != RecordKind::Put
+        || record.key != location.key
+        || record.sequence != location.sequence
+        || record.payload_len != location.payload_len
+        || record.payload_checksum != location.payload_checksum
+    {
+        return Err(StoreError::CorruptHeader {
+            segment_id: location.segment_id,
+            offset: location.record_offset,
+            reason: "header no longer matches the in-memory location index",
+        });
+    }
+    Ok((decoded.payload, record.compression_algorithm))
 }
 
 pub(crate) fn encode_footer(record: RecordHeader) -> [u8; RECORD_FOOTER_LEN] {
