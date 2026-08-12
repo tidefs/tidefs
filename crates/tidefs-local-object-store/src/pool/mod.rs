@@ -2578,10 +2578,7 @@ impl Pool {
                 device_guid: *device_guid,
             })
             .collect();
-        for (device, identity) in config.devices.iter().zip(&identities) {
-            initialize_candidate_store_identity(device, *identity)?;
-        }
-        let mut devices = open_devices_with_identities(&config, options, Some(&identities))?;
+        let mut devices = open_candidate_devices(&config, options, &identities)?;
         let reserved_placement_receipt_generation_through =
             initialize_receipt_generation_high_water(&mut devices, pool_guid)?;
         let next_placement_receipt_generation = 1;
@@ -3059,9 +3056,7 @@ impl Pool {
             })
             .collect();
         let mut devices = match mode {
-            PoolOpenMode::Writable => {
-                open_devices_with_identities(&config, options, Some(&identities))?
-            }
+            PoolOpenMode::Writable => open_devices_existing(&config, options, &identities)?,
             PoolOpenMode::ReadOnlyExisting => {
                 open_devices_read_only_existing(&config, options, &identities)?
             }
@@ -5430,12 +5425,11 @@ impl Pool {
             pool_guid: self.pool_guid,
             device_guid,
         };
-        initialize_candidate_store_identity(&config, identity)?;
-        let mut device = open_single_device(
+        let mut device = open_candidate_device(
             &config,
             &dev_opts,
             options.is_test_fast_harness_fixture(),
-            Some(identity),
+            identity,
         )?;
         device.install_pool_raw_mutation_guard(Arc::clone(&self.raw_store_mutation_allowed));
         seed_receipt_generation_high_water_on_candidate(
@@ -5519,12 +5513,11 @@ impl Pool {
             pool_guid: self.pool_guid,
             device_guid: spare_device_guid,
         };
-        initialize_candidate_store_identity(&spare_config, identity)?;
-        let mut new_device = open_single_device(
+        let mut new_device = open_candidate_device(
             &spare_config,
             &dev_opts,
             options.is_test_fast_harness_fixture(),
-            Some(identity),
+            identity,
         )?;
         new_device.install_pool_raw_mutation_guard(Arc::clone(&self.raw_store_mutation_allowed));
         seed_receipt_generation_high_water_on_candidate(
@@ -6303,12 +6296,11 @@ impl Pool {
             pool_guid: self.pool_guid,
             device_guid: replacement_evidence.new_device_guid,
         };
-        initialize_candidate_store_identity(&new_config, replacement_identity)?;
-        let mut new_device = open_single_device(
+        let mut new_device = open_candidate_device(
             &new_config,
             options,
             options.is_test_fast_harness_fixture(),
-            Some(replacement_identity),
+            replacement_identity,
         )?;
         new_device.install_pool_raw_mutation_guard(Arc::clone(&self.raw_store_mutation_allowed));
         if resuming {
@@ -7422,12 +7414,12 @@ impl<'a> PoolStoreMut<'a> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn open_devices_with_identities(
+fn open_devices_existing(
     config: &PoolConfig,
     options: &StoreOptions,
-    identities: Option<&[BlockStoreIdentity]>,
+    identities: &[BlockStoreIdentity],
 ) -> Result<Vec<Device>> {
-    if identities.is_some_and(|identities| identities.len() != config.devices.len()) {
+    if identities.len() != config.devices.len() {
         return Err(StoreError::InvalidOptions {
             reason: "writable Pool Store identity count does not match topology",
         });
@@ -7437,15 +7429,39 @@ fn open_devices_with_identities(
     config
         .devices
         .iter()
-        .enumerate()
-        .map(|(index, vc)| {
+        .zip(identities)
+        .map(|(vc, identity)| {
             let mut dev_opts = options.clone();
             dev_opts.max_segment_bytes = vc.media_class.default_segment_size();
-            open_single_device(
-                vc,
-                &dev_opts,
+            open_single_device(vc, &dev_opts, allow_legacy_directory_shims, Some(*identity))
+        })
+        .collect()
+}
+
+fn open_candidate_devices(
+    config: &PoolConfig,
+    options: &StoreOptions,
+    identities: &[BlockStoreIdentity],
+) -> Result<Vec<Device>> {
+    if identities.len() != config.devices.len() {
+        return Err(StoreError::InvalidOptions {
+            reason: "new Pool Store identity count does not match topology",
+        });
+    }
+    let allow_legacy_directory_shims =
+        options.is_test_fast_harness_fixture() || is_legacy_single_directory_store_bridge(config);
+    config
+        .devices
+        .iter()
+        .zip(identities)
+        .map(|(device, identity)| {
+            let mut device_options = options.clone();
+            device_options.max_segment_bytes = device.media_class.default_segment_size();
+            open_candidate_device(
+                device,
+                &device_options,
                 allow_legacy_directory_shims,
-                identities.map(|identities| identities[index]),
+                *identity,
             )
         })
         .collect()
@@ -7871,19 +7887,37 @@ fn byte_addressable_path_raw_capacity(device_root: &Path) -> Result<u64> {
         })
 }
 
-fn initialize_candidate_store_identity(
+fn open_candidate_device(
     config: &DeviceConfig,
+    options: &StoreOptions,
+    allow_legacy_directory_shims: bool,
     identity: BlockStoreIdentity,
-) -> Result<()> {
+) -> Result<Device> {
     if let DeviceKind::Block { path } = &config.kind {
         if !config.backing.is_byte_addressable_pool_member() {
             return Err(StoreError::InvalidOptions {
                 reason: "DeviceKind::Block requires block-device or regular-file backing",
             });
         }
-        LocalObjectStore::initialize_block_device_bootstrap(path, identity)?;
+        let file = LocalObjectStore::initialize_and_retain_block_device_bootstrap(path, identity)?;
+        let device = Device::open_single_block_writable_existing_file(
+            file,
+            path.clone(),
+            options.clone(),
+            identity,
+        )?;
+        let device = if let Some(ref encryption) = config.encryption {
+            Device::open_encrypted(device, encryption.clone())
+        } else {
+            device
+        };
+        return Ok(if let Some(ref compression) = config.compression {
+            Device::open_compressed(device, compression.clone())
+        } else {
+            device
+        });
     }
-    Ok(())
+    open_single_device(config, options, allow_legacy_directory_shims, None)
 }
 
 fn pool_config_has_label_authority(config: &PoolConfig) -> bool {

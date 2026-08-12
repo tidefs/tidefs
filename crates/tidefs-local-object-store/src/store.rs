@@ -1308,10 +1308,18 @@ impl LocalObjectStore {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn initialize_block_device_bootstrap(
         device_path: impl AsRef<Path>,
         expected: BlockStoreIdentity,
     ) -> Result<()> {
+        Self::initialize_and_retain_block_device_bootstrap(device_path, expected).map(drop)
+    }
+
+    pub(crate) fn initialize_and_retain_block_device_bootstrap(
+        device_path: impl AsRef<Path>,
+        expected: BlockStoreIdentity,
+    ) -> Result<File> {
         let device_path = device_path.as_ref();
         let mut capacity_file = OpenOptions::new()
             .read(true)
@@ -1337,7 +1345,8 @@ impl LocalObjectStore {
             device_path,
             expected,
             &inspection,
-        )
+        )?;
+        Ok(capacity_file)
     }
 
     pub(crate) fn initialize_open_block_device_bootstrap_after_inspection(
@@ -8942,6 +8951,53 @@ mod block_device_open_tests {
             std::fs::read(&image).expect("reread initialized image"),
             before_retry,
             "matching-header retry rewrote media"
+        );
+    }
+
+    #[test]
+    fn pool_bootstrap_retained_handle_survives_path_replacement() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_blank_block_image(&dir);
+        let retained = LocalObjectStore::initialize_and_retain_block_device_bootstrap(
+            &image,
+            block_test_identity(),
+        )
+        .expect("initialize and retain exact image");
+        let admitted_image = dir.path().join("admitted.img");
+        std::fs::rename(&image, &admitted_image).expect("move admitted image");
+        let replacement = File::create(&image).expect("create replacement pathname");
+        replacement
+            .set_len(BLOCK_IMAGE_BYTES)
+            .expect("size replacement pathname");
+        drop(replacement);
+
+        let key = ObjectKey::from_name(b"retained-handle-write");
+        let mut store = LocalObjectStore::open_block_device_writable_existing_file(
+            retained,
+            image.clone(),
+            StoreOptions::test_fast(),
+            block_test_identity(),
+        )
+        .expect("open retained admitted image");
+        store
+            .put(key, b"exact admitted media")
+            .expect("write retained admitted image");
+        store.sync_all().expect("sync retained admitted image");
+        drop(store);
+
+        assert!(std::fs::read(&image)
+            .expect("read replacement pathname")
+            .iter()
+            .all(|byte| *byte == 0));
+        let reopened = LocalObjectStore::open_block_device_writable_existing(
+            &admitted_image,
+            StoreOptions::test_fast(),
+            block_test_identity(),
+        )
+        .expect("reopen exact admitted image");
+        assert_eq!(
+            reopened.get(key).expect("read retained-handle write"),
+            Some(b"exact admitted media".to_vec())
         );
     }
 
