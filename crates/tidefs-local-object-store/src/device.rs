@@ -30,8 +30,8 @@ use crate::device_health::{
 };
 use crate::io_scheduler::IoClass as SchedClass;
 use crate::{
-    LocalObjectStore, ObjectKey, ObjectLocation, Result, ScrubStats, StoreError, StoreOptions,
-    StoreRetentionCompactionReport, StoredObject,
+    BlockStoreIdentity, LocalObjectStore, ObjectKey, ObjectLocation, Result, ScrubStats,
+    StoreError, StoreOptions, StoreRetentionCompactionReport, StoredObject,
 };
 use tracing;
 
@@ -561,8 +561,8 @@ impl SingleDevice {
     /// Uses [`LocalObjectStore::open_block_device`] instead of the
     /// directory object-store path. All I/O goes directly to the
     /// byte-addressable backing without segment files or directory operations.
-    pub fn open_block(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
-        let store = LocalObjectStore::open_block_device(path, options)?;
+    pub(crate) fn open_block(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
+        let store = LocalObjectStore::open_block_device_writable_unbound(path, options)?;
         Ok(Self::from_block_store(store))
     }
 
@@ -570,16 +570,45 @@ impl SingleDevice {
     fn open_block_read_only_existing(
         path: impl AsRef<Path>,
         options: StoreOptions,
+        identity: BlockStoreIdentity,
     ) -> Result<Self> {
-        let store = LocalObjectStore::open_block_device_read_only_existing(path, options)?;
+        let store = LocalObjectStore::open_block_device_read_only_existing(
+            path,
+            options,
+            identity.pool_guid,
+            identity.device_guid,
+        )?;
         Ok(Self::from_block_store(store))
     }
 
     fn open_block_preflight_existing(
         path: impl AsRef<Path>,
         options: StoreOptions,
+        identity: BlockStoreIdentity,
     ) -> Result<Self> {
-        let store = LocalObjectStore::open_block_device_preflight_existing(path, options)?;
+        let store =
+            LocalObjectStore::open_block_device_preflight_existing(path, options, identity)?;
+        Ok(Self::from_block_store(store))
+    }
+
+    fn open_block_writable_existing(
+        path: impl AsRef<Path>,
+        options: StoreOptions,
+        identity: BlockStoreIdentity,
+    ) -> Result<Self> {
+        let store = LocalObjectStore::open_block_device_writable_existing(path, options, identity)?;
+        Ok(Self::from_block_store(store))
+    }
+
+    fn open_block_writable_existing_file(
+        file: std::fs::File,
+        path: PathBuf,
+        options: StoreOptions,
+        identity: BlockStoreIdentity,
+    ) -> Result<Self> {
+        let store = LocalObjectStore::open_block_device_writable_existing_file(
+            file, path, options, identity,
+        )?;
         Ok(Self::from_block_store(store))
     }
 
@@ -3549,7 +3578,7 @@ impl Device {
     }
 
     /// Create a single block-device-backed device.
-    pub fn open_single_block(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
+    pub(crate) fn open_single_block(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
         SingleDevice::open_block(path, options).map(Device::Single)
     }
 
@@ -3557,15 +3586,35 @@ impl Device {
     pub(crate) fn open_single_block_read_only_existing(
         path: impl AsRef<Path>,
         options: StoreOptions,
+        identity: BlockStoreIdentity,
     ) -> Result<Self> {
-        SingleDevice::open_block_read_only_existing(path, options).map(Device::Single)
+        SingleDevice::open_block_read_only_existing(path, options, identity).map(Device::Single)
     }
 
     pub(crate) fn open_single_block_preflight_existing(
         path: impl AsRef<Path>,
         options: StoreOptions,
+        identity: BlockStoreIdentity,
     ) -> Result<Self> {
-        SingleDevice::open_block_preflight_existing(path, options).map(Device::Single)
+        SingleDevice::open_block_preflight_existing(path, options, identity).map(Device::Single)
+    }
+
+    pub(crate) fn open_single_block_writable_existing(
+        path: impl AsRef<Path>,
+        options: StoreOptions,
+        identity: BlockStoreIdentity,
+    ) -> Result<Self> {
+        SingleDevice::open_block_writable_existing(path, options, identity).map(Device::Single)
+    }
+
+    pub(crate) fn open_single_block_writable_existing_file(
+        file: std::fs::File,
+        path: PathBuf,
+        options: StoreOptions,
+        identity: BlockStoreIdentity,
+    ) -> Result<Self> {
+        SingleDevice::open_block_writable_existing_file(file, path, options, identity)
+            .map(Device::Single)
     }
 
     /// Create a mirror device from a set of paths.

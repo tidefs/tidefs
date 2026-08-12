@@ -1006,8 +1006,20 @@ fn scan_block_devices_for_integrity(device_paths: &[std::path::PathBuf]) -> Opti
     let mut suspect_unresolved: u64 = 0;
     let mut any_device_opened = false;
 
-    for dev_path in device_paths {
-        let store = match LocalObjectStore::open_block_device(dev_path, StoreOptions::default()) {
+    let entries = tidefs_pool_scan::scan_labels(device_paths).ok()?;
+    for entry in entries {
+        if !entry.label_valid {
+            continue;
+        }
+        let (Some(pool_guid), Some(device_guid)) = (entry.pool_guid, entry.device_guid) else {
+            continue;
+        };
+        let store = match LocalObjectStore::open_block_device_read_only_existing(
+            &entry.device_path,
+            StoreOptions::default(),
+            pool_guid,
+            device_guid,
+        ) {
             Ok(s) => s,
             Err(_) => continue,
         };

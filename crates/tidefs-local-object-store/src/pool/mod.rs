@@ -50,8 +50,9 @@ use crate::device_manager::{DeviceManager, SparePolicy};
 use crate::io_scheduler::IoClass as SchedClass;
 use crate::log_device::{LogDeviceWriter, LOG_DEVICE_HEADER_SIZE};
 use crate::{
-    LocalObjectStore, ObjectKey, ObjectLocation, Result, ScrubStats, StoreError, StoreOptions,
-    StoreRetentionCompactionReport, StoreStats, StoredObject,
+    BlockStoreBootstrapInspection, BlockStoreIdentity, LocalObjectStore, ObjectKey, ObjectLocation,
+    Result, ScrubStats, StoreError, StoreOptions, StoreRetentionCompactionReport, StoreStats,
+    StoredObject,
 };
 use tidefs_block_allocator::{BlockAllocator, BlockId, TrimRequest};
 use tidefs_durability_layout::{
@@ -75,6 +76,41 @@ use tidefs_types_reclaim_queue_core::{
 const RECEIPT_GENERATION_HIGH_WATER_MAGIC: [u8; 8] = *b"TFSPGH1\0";
 const RECEIPT_GENERATION_HIGH_WATER_ENCODED_LEN: usize = 64;
 const RECEIPT_GENERATION_RESERVATION_SIZE: u64 = 4096;
+
+/// One exact labelled byte-addressable member admitted for fresh Pool bootstrap.
+#[derive(Debug)]
+pub struct PoolBootstrapMember {
+    /// Exact creator-opened media handle retained across admission and
+    /// bootstrap. The path is diagnostic and topology state, not I/O authority.
+    pub file: fs::File,
+    pub path: PathBuf,
+    pub backing: DeviceBacking,
+    pub device_index: u32,
+    pub capacity_bytes: u64,
+    pub device_guid: [u8; 16],
+    pub expected_label: PoolLabelV1,
+    pub device_layout_v1: pool_label::DeviceLayoutV1Bytes,
+    /// Whether this exact member already carried a valid same-Pool label when
+    /// the creation attempt began. Only such a member may contain partial
+    /// same-Pool Store bootstrap state; a member that began blank must still
+    /// have a completely blank Store region.
+    pub label_was_present: bool,
+}
+
+/// Pool-owned bootstrap input after the creator has validated label agreement.
+#[derive(Debug)]
+pub struct PoolBootstrapConfig {
+    pub pool_guid: [u8; 16],
+    pub members: Vec<PoolBootstrapMember>,
+    pub encryption: Option<crate::encrypt::EncryptionConfig>,
+}
+
+/// One-shot proof that the exact retained media is safe for fresh bootstrap.
+#[derive(Debug)]
+pub struct PoolBootstrapAdmission {
+    config: PoolBootstrapConfig,
+    inspections: Vec<BlockStoreBootstrapInspection>,
+}
 
 // ---------------------------------------------------------------------------
 // Pool configuration
@@ -2119,6 +2155,243 @@ fn initialize_receipt_generation_high_water(
     Ok(marker.reserved_through)
 }
 
+fn validate_fresh_pool_bootstrap_marker(
+    inspection: &BlockStoreBootstrapInspection,
+    pool_guid: [u8; 16],
+) -> Result<bool> {
+    let Some((key, payload)) = inspection.record.as_ref() else {
+        return Ok(false);
+    };
+    if *key != receipt_generation_high_water_key() {
+        return Err(StoreError::InvalidOptions {
+            reason: "fresh Pool bootstrap contains an unexpected object key",
+        });
+    }
+    let marker = decode_receipt_generation_high_water(payload)?;
+    if marker.pool_guid != pool_guid || marker.reserved_through != 0 {
+        return Err(StoreError::InvalidOptions {
+            reason: "fresh Pool bootstrap marker is foreign or already used",
+        });
+    }
+    Ok(true)
+}
+
+fn inspect_pool_store_bootstrap(
+    config: &mut PoolBootstrapConfig,
+) -> Result<Vec<BlockStoreBootstrapInspection>> {
+    if config.members.is_empty() {
+        return Err(StoreError::InvalidOptions {
+            reason: "fresh Pool bootstrap requires at least one labelled member",
+        });
+    }
+
+    let expected_count =
+        u32::try_from(config.members.len()).map_err(|_| StoreError::InvalidOptions {
+            reason: "fresh Pool bootstrap member count exceeds u32",
+        })?;
+    let mut seen_guids = BTreeSet::new();
+    let mut inspections = Vec::with_capacity(config.members.len());
+    for (index, member) in config.members.iter_mut().enumerate() {
+        if member.device_index != index as u32 || member.device_index >= expected_count {
+            return Err(StoreError::InvalidOptions {
+                reason: "fresh Pool bootstrap member order is not exact",
+            });
+        }
+        if !member.backing.is_byte_addressable_pool_member() {
+            return Err(StoreError::InvalidOptions {
+                reason: "fresh Pool bootstrap requires byte-addressable members",
+            });
+        }
+        if !seen_guids.insert(member.device_guid) {
+            return Err(StoreError::InvalidOptions {
+                reason: "fresh Pool bootstrap contains duplicate device GUIDs",
+            });
+        }
+        if member.expected_label.pool_guid != config.pool_guid
+            || member.expected_label.device_guid != member.device_guid
+            || member.expected_label.device_index != member.device_index
+            || member.expected_label.device_count != expected_count
+            || member.expected_label.device_capacity_bytes != member.capacity_bytes
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "fresh Pool bootstrap expected label does not match member topology",
+            });
+        }
+        let layout = decode_device_layout_v1(&member.device_layout_v1).map_err(|_| {
+            StoreError::InvalidOptions {
+                reason: "fresh Pool bootstrap DeviceLayoutV1 is invalid",
+            }
+        })?;
+        if layout.device_size_bytes != member.capacity_bytes {
+            return Err(StoreError::InvalidOptions {
+                reason: "fresh Pool bootstrap layout capacity does not match member",
+            });
+        }
+        validate_device_layout_policy_record(&layout)?;
+
+        let actual_capacity =
+            member
+                .file
+                .seek(SeekFrom::End(0))
+                .map_err(|source| StoreError::Io {
+                    operation: "pool_bootstrap_member_capacity",
+                    path: member.path.clone(),
+                    source,
+                })?;
+        if actual_capacity != member.capacity_bytes {
+            return Err(StoreError::InvalidOptions {
+                reason: "fresh Pool bootstrap member capacity changed after label inspection",
+            });
+        }
+        let identity = BlockStoreIdentity {
+            pool_guid: config.pool_guid,
+            device_guid: member.device_guid,
+        };
+        let inspection = LocalObjectStore::inspect_open_block_device_bootstrap(
+            &mut member.file,
+            &member.path,
+            member.capacity_bytes,
+        )?;
+        if let Some(actual) = inspection.identity {
+            if actual != identity {
+                return Err(StoreError::InvalidOptions {
+                    reason: "fresh Pool bootstrap Store identity is foreign",
+                });
+            }
+        }
+        validate_fresh_pool_bootstrap_marker(&inspection, config.pool_guid)?;
+        if !member.label_was_present
+            && (inspection.identity.is_some() || inspection.record.is_some())
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "blank member labels conflict with existing Pool Store bootstrap state",
+            });
+        }
+        inspections.push(inspection);
+    }
+    Ok(inspections)
+}
+
+/// Prove that every target Store region is blank or one exact fresh retry.
+///
+/// This is the creator's read-only admission pass before it publishes any pool
+/// label.  It does not initialize, repair, or otherwise mutate media.
+pub fn preflight_labelled_pool_bootstrap(
+    mut config: PoolBootstrapConfig,
+) -> Result<PoolBootstrapAdmission> {
+    let inspections = inspect_pool_store_bootstrap(&mut config)?;
+    Ok(PoolBootstrapAdmission {
+        config,
+        inspections,
+    })
+}
+
+fn validate_pool_bootstrap_labels(config: &mut PoolBootstrapConfig) -> Result<()> {
+    for member in &mut config.members {
+        for offset in [
+            0,
+            member.capacity_bytes - pool_label::POOL_LABEL_SIZE as u64,
+        ] {
+            let mut actual = vec![0u8; pool_label::POOL_LABEL_SIZE];
+            member
+                .file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| member.file.read_exact(&mut actual))
+                .map_err(|source| StoreError::Io {
+                    operation: "pool_bootstrap_read_label",
+                    path: member.path.clone(),
+                    source,
+                })?;
+            let decoded =
+                pool_label::decode_label(&actual).map_err(|_| StoreError::InvalidOptions {
+                    reason: "fresh Pool bootstrap label is corrupt",
+                })?;
+            let layout_bytes = pool_label::decode_device_layout_v1_bytes(&actual)
+                .map_err(|_| StoreError::InvalidOptions {
+                    reason: "fresh Pool bootstrap label layout sidecar is corrupt",
+                })?
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "fresh Pool bootstrap label lacks DeviceLayoutV1",
+                })?;
+            decode_device_layout_v1(&layout_bytes).map_err(|_| StoreError::InvalidOptions {
+                reason: "fresh Pool bootstrap label DeviceLayoutV1 is invalid",
+            })?;
+            if decoded != member.expected_label || layout_bytes != member.device_layout_v1 {
+                return Err(StoreError::InvalidOptions {
+                    reason: "fresh Pool bootstrap label does not match the exact intended topology",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Initialize the immutable Store headers and zero-generation receipt marker
+/// for one already-labelled fresh Pool topology.
+///
+/// Every member is inspected before the first mutation.  Retry accepts only a
+/// missing header, a matching immutable header, and an optional exact
+/// same-Pool zero-generation marker.  Store inspection proves that no other
+/// physical record or non-zero tail exists.
+pub fn bootstrap_labelled_pool(admission: PoolBootstrapAdmission) -> Result<()> {
+    let PoolBootstrapAdmission {
+        mut config,
+        inspections,
+    } = admission;
+    validate_pool_bootstrap_labels(&mut config)?;
+
+    for (member, inspection) in config.members.iter_mut().zip(&inspections) {
+        if inspection.identity.is_none() {
+            LocalObjectStore::initialize_open_block_device_bootstrap_after_inspection(
+                &mut member.file,
+                &member.path,
+                BlockStoreIdentity {
+                    pool_guid: config.pool_guid,
+                    device_guid: member.device_guid,
+                },
+                inspection,
+            )?;
+        }
+    }
+
+    let mut devices = Vec::with_capacity(config.members.len());
+    for member in config.members {
+        let options = StoreOptions::default();
+        let identity = BlockStoreIdentity {
+            pool_guid: config.pool_guid,
+            device_guid: member.device_guid,
+        };
+        let device = Device::open_single_block_writable_existing_file(
+            member.file,
+            member.path,
+            options,
+            identity,
+        )?;
+        let device = if let Some(encryption) = config.encryption.as_ref() {
+            Device::open_encrypted(device, encryption.clone())
+        } else {
+            device
+        };
+        devices.push(device);
+    }
+
+    let marker = ReceiptGenerationHighWater {
+        pool_guid: config.pool_guid,
+        reserved_through: 0,
+    };
+    let encoded = encode_receipt_generation_high_water(marker);
+    for (device, inspection) in devices.iter_mut().zip(&inspections) {
+        if inspection.record.is_none() {
+            device.put_pool_internal(receipt_generation_high_water_key(), &encoded)?;
+        }
+    }
+    sync_receipt_generation_high_water_devices(&mut devices)?;
+    for device in &devices {
+        verify_receipt_generation_high_water_copy(device, marker)?;
+    }
+    Ok(())
+}
+
 fn publish_receipt_generation_high_water(
     devices: &mut [Device],
     pool_guid: [u8; 16],
@@ -2298,7 +2571,14 @@ impl Pool {
         let classes: Vec<DeviceClass> = config.devices.iter().map(|vc| vc.class).collect();
         let class_map = build_class_map(&classes);
 
-        let mut devices = open_devices(&config, options)?;
+        let identities: Vec<_> = device_guids
+            .iter()
+            .map(|device_guid| BlockStoreIdentity {
+                pool_guid,
+                device_guid: *device_guid,
+            })
+            .collect();
+        let mut devices = open_candidate_devices(&config, options, &identities)?;
         let reserved_placement_receipt_generation_through =
             initialize_receipt_generation_high_water(&mut devices, pool_guid)?;
         let next_placement_receipt_generation = 1;
@@ -2745,7 +3025,14 @@ impl Pool {
         // receipt ceiling through a no-create, no-repair, no-replay topology
         // projection before any of those recovery mutations are possible.
         let preflight_reserved_through = if mode == PoolOpenMode::Writable {
-            let preflight_devices = open_devices_preflight_existing(&config, options)?;
+            let identities: Vec<_> = device_guids
+                .iter()
+                .map(|device_guid| BlockStoreIdentity {
+                    pool_guid: pg,
+                    device_guid: *device_guid,
+                })
+                .collect();
+            let preflight_devices = open_devices_preflight_existing(&config, options, &identities)?;
             let reserved_through =
                 receipt_generation_high_water_for_devices(&preflight_devices, pg)?;
             if !locked {
@@ -2761,9 +3048,18 @@ impl Pool {
 
         let classes: Vec<DeviceClass> = config.devices.iter().map(|vc| vc.class).collect();
         let class_map = build_class_map(&classes);
+        let identities: Vec<_> = device_guids
+            .iter()
+            .map(|device_guid| BlockStoreIdentity {
+                pool_guid: pg,
+                device_guid: *device_guid,
+            })
+            .collect();
         let mut devices = match mode {
-            PoolOpenMode::Writable => open_devices(&config, options)?,
-            PoolOpenMode::ReadOnlyExisting => open_devices_read_only_existing(&config, options)?,
+            PoolOpenMode::Writable => open_devices_existing(&config, options, &identities)?,
+            PoolOpenMode::ReadOnlyExisting => {
+                open_devices_read_only_existing(&config, options, &identities)?
+            }
         };
         let reserved_placement_receipt_generation_through =
             receipt_generation_high_water_for_devices(&devices, pg)?;
@@ -5124,8 +5420,17 @@ impl Pool {
         let config_for_record = config.clone();
         let mut dev_opts = options.clone();
         dev_opts.max_segment_bytes = config.media_class.default_segment_size();
-        let mut device =
-            open_single_device(&config, &dev_opts, options.is_test_fast_harness_fixture())?;
+        let device_guid: [u8; 16] = rand::random();
+        let identity = BlockStoreIdentity {
+            pool_guid: self.pool_guid,
+            device_guid,
+        };
+        let mut device = open_candidate_device(
+            &config,
+            &dev_opts,
+            options.is_test_fast_harness_fixture(),
+            identity,
+        )?;
         device.install_pool_raw_mutation_guard(Arc::clone(&self.raw_store_mutation_allowed));
         seed_receipt_generation_high_water_on_candidate(
             &mut device,
@@ -5148,7 +5453,7 @@ impl Pool {
         self.classes.push(config.class);
         self.media_classes.push(config.media_class);
         self.devices.push(device);
-        self.device_guids.push(rand::random());
+        self.device_guids.push(device_guid);
         self.device_layouts.push(device_layout);
         self.class_map = build_class_map(&self.classes);
         self.device_layout_stats
@@ -5204,10 +5509,15 @@ impl Pool {
         // label publication can admit it to the active topology.
         let mut dev_opts = options.clone();
         dev_opts.max_segment_bytes = spare_config.media_class.default_segment_size();
-        let mut new_device = open_single_device(
+        let identity = BlockStoreIdentity {
+            pool_guid: self.pool_guid,
+            device_guid: spare_device_guid,
+        };
+        let mut new_device = open_candidate_device(
             &spare_config,
             &dev_opts,
             options.is_test_fast_harness_fixture(),
+            identity,
         )?;
         new_device.install_pool_raw_mutation_guard(Arc::clone(&self.raw_store_mutation_allowed));
         seed_receipt_generation_high_water_on_candidate(
@@ -5982,8 +6292,16 @@ impl Pool {
         // Open and seed the replacement before it can enter the admitted
         // topology. A stale removed member may advance to the active ceiling,
         // but it may never make that ceiling move backward.
-        let mut new_device =
-            open_single_device(&new_config, options, options.is_test_fast_harness_fixture())?;
+        let replacement_identity = BlockStoreIdentity {
+            pool_guid: self.pool_guid,
+            device_guid: replacement_evidence.new_device_guid,
+        };
+        let mut new_device = open_candidate_device(
+            &new_config,
+            options,
+            options.is_test_fast_harness_fixture(),
+            replacement_identity,
+        )?;
         new_device.install_pool_raw_mutation_guard(Arc::clone(&self.raw_store_mutation_allowed));
         if resuming {
             self.reconcile_receipt_generation_high_water_with_replacement(&mut new_device)?;
@@ -6239,6 +6557,10 @@ impl Pool {
             &replacement.old_config,
             options,
             options.is_test_fast_harness_fixture(),
+            Some(BlockStoreIdentity {
+                pool_guid: self.pool_guid,
+                device_guid: replacement.old_device_guid,
+            }),
         ) {
             Ok(mut old_device) => {
                 old_device
@@ -7092,16 +7414,55 @@ impl<'a> PoolStoreMut<'a> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn open_devices(config: &PoolConfig, options: &StoreOptions) -> Result<Vec<Device>> {
+fn open_devices_existing(
+    config: &PoolConfig,
+    options: &StoreOptions,
+    identities: &[BlockStoreIdentity],
+) -> Result<Vec<Device>> {
+    if identities.len() != config.devices.len() {
+        return Err(StoreError::InvalidOptions {
+            reason: "writable Pool Store identity count does not match topology",
+        });
+    }
     let allow_legacy_directory_shims =
         options.is_test_fast_harness_fixture() || is_legacy_single_directory_store_bridge(config);
     config
         .devices
         .iter()
-        .map(|vc| {
+        .zip(identities)
+        .map(|(vc, identity)| {
             let mut dev_opts = options.clone();
             dev_opts.max_segment_bytes = vc.media_class.default_segment_size();
-            open_single_device(vc, &dev_opts, allow_legacy_directory_shims)
+            open_single_device(vc, &dev_opts, allow_legacy_directory_shims, Some(*identity))
+        })
+        .collect()
+}
+
+fn open_candidate_devices(
+    config: &PoolConfig,
+    options: &StoreOptions,
+    identities: &[BlockStoreIdentity],
+) -> Result<Vec<Device>> {
+    if identities.len() != config.devices.len() {
+        return Err(StoreError::InvalidOptions {
+            reason: "new Pool Store identity count does not match topology",
+        });
+    }
+    let allow_legacy_directory_shims =
+        options.is_test_fast_harness_fixture() || is_legacy_single_directory_store_bridge(config);
+    config
+        .devices
+        .iter()
+        .zip(identities)
+        .map(|(device, identity)| {
+            let mut device_options = options.clone();
+            device_options.max_segment_bytes = device.media_class.default_segment_size();
+            open_candidate_device(
+                device,
+                &device_options,
+                allow_legacy_directory_shims,
+                *identity,
+            )
         })
         .collect()
 }
@@ -7109,14 +7470,21 @@ fn open_devices(config: &PoolConfig, options: &StoreOptions) -> Result<Vec<Devic
 fn open_devices_preflight_existing(
     config: &PoolConfig,
     options: &StoreOptions,
+    identities: &[BlockStoreIdentity],
 ) -> Result<Vec<Device>> {
+    if identities.len() != config.devices.len() {
+        return Err(StoreError::InvalidOptions {
+            reason: "Pool preflight Store identity count does not match topology",
+        });
+    }
     config
         .devices
         .iter()
-        .map(|device_config| {
+        .zip(identities)
+        .map(|(device_config, identity)| {
             let mut device_options = options.clone();
             device_options.max_segment_bytes = device_config.media_class.default_segment_size();
-            open_single_device_preflight_existing(device_config, &device_options)
+            open_single_device_preflight_existing(device_config, &device_options, *identity)
         })
         .collect()
 }
@@ -7124,6 +7492,7 @@ fn open_devices_preflight_existing(
 fn open_single_device_preflight_existing(
     config: &DeviceConfig,
     options: &StoreOptions,
+    identity: BlockStoreIdentity,
 ) -> Result<Device> {
     let device = match &config.kind {
         DeviceKind::Single { path } => {
@@ -7189,7 +7558,7 @@ fn open_single_device_preflight_existing(
                     reason: "DeviceKind::Block requires block-device or regular-file backing",
                 });
             }
-            Device::open_single_block_preflight_existing(path, options.clone())
+            Device::open_single_block_preflight_existing(path, options.clone(), identity)
         }
     }?;
 
@@ -7208,11 +7577,18 @@ fn open_single_device_preflight_existing(
 fn open_devices_read_only_existing(
     config: &PoolConfig,
     options: &StoreOptions,
+    identities: &[BlockStoreIdentity],
 ) -> Result<Vec<Device>> {
+    if identities.len() != config.devices.len() {
+        return Err(StoreError::InvalidOptions {
+            reason: "read-only Pool Store identity count does not match topology",
+        });
+    }
     config
         .devices
         .iter()
-        .map(|device_config| {
+        .zip(identities)
+        .map(|(device_config, identity)| {
             let DeviceKind::Block { path } = &device_config.kind else {
                 return Err(StoreError::InvalidOptions {
                     reason: "read-only pool import supports only DeviceKind::Block members",
@@ -7225,7 +7601,8 @@ fn open_devices_read_only_existing(
             }
             let mut device_options = options.clone();
             device_options.max_segment_bytes = device_config.media_class.default_segment_size();
-            let device = Device::open_single_block_read_only_existing(path, device_options)?;
+            let device =
+                Device::open_single_block_read_only_existing(path, device_options, *identity)?;
             let device = if let Some(ref encryption) = device_config.encryption {
                 Device::open_encrypted(device, encryption.clone())
             } else {
@@ -7244,6 +7621,7 @@ fn open_single_device(
     config: &DeviceConfig,
     options: &StoreOptions,
     allow_legacy_directory_shims: bool,
+    identity: Option<BlockStoreIdentity>,
 ) -> Result<Device> {
     let device = match &config.kind {
         DeviceKind::Single { path } => {
@@ -7309,7 +7687,12 @@ fn open_single_device(
                     reason: "DeviceKind::Block requires block-device or regular-file backing",
                 });
             }
-            Device::open_single_block(path, options.clone())
+            match identity {
+                Some(identity) => {
+                    Device::open_single_block_writable_existing(path, options.clone(), identity)
+                }
+                None => Device::open_single_block(path, options.clone()),
+            }
         }
     }?;
     // Place compression outside encryption so writes compress plaintext first,
@@ -7487,17 +7870,54 @@ fn validate_device_layout_policy_record(layout: &DeviceLayoutV1) -> Result<Devic
 
 fn byte_addressable_device_raw_capacity(device_config: &DeviceConfig) -> Result<u64> {
     let device_root = device_root_path(device_config);
+    byte_addressable_path_raw_capacity(&device_root)
+}
+
+fn byte_addressable_path_raw_capacity(device_root: &Path) -> Result<u64> {
     let mut file = fs::File::open(&device_root).map_err(|source| StoreError::Io {
         operation: "pool_open_device_raw_capacity_open",
-        path: device_root.clone(),
+        path: device_root.to_path_buf(),
         source,
     })?;
     file.seek(SeekFrom::End(0))
         .map_err(|source| StoreError::Io {
             operation: "pool_open_device_raw_capacity_seek_end",
-            path: device_root,
+            path: device_root.to_path_buf(),
             source,
         })
+}
+
+fn open_candidate_device(
+    config: &DeviceConfig,
+    options: &StoreOptions,
+    allow_legacy_directory_shims: bool,
+    identity: BlockStoreIdentity,
+) -> Result<Device> {
+    if let DeviceKind::Block { path } = &config.kind {
+        if !config.backing.is_byte_addressable_pool_member() {
+            return Err(StoreError::InvalidOptions {
+                reason: "DeviceKind::Block requires block-device or regular-file backing",
+            });
+        }
+        let file = LocalObjectStore::initialize_and_retain_block_device_bootstrap(path, identity)?;
+        let device = Device::open_single_block_writable_existing_file(
+            file,
+            path.clone(),
+            options.clone(),
+            identity,
+        )?;
+        let device = if let Some(ref encryption) = config.encryption {
+            Device::open_encrypted(device, encryption.clone())
+        } else {
+            device
+        };
+        return Ok(if let Some(ref compression) = config.compression {
+            Device::open_compressed(device, compression.clone())
+        } else {
+            device
+        });
+    }
+    open_single_device(config, options, allow_legacy_directory_shims, None)
 }
 
 fn pool_config_has_label_authority(config: &PoolConfig) -> bool {
@@ -7801,6 +8221,130 @@ mod tests {
         create_regular_file_device_with_size(path, 2 * 1024 * 1024);
     }
 
+    fn labelled_pool_bootstrap_config(root: &Path, member_count: usize) -> PoolBootstrapConfig {
+        std::fs::create_dir_all(root).expect("create bootstrap fixture root");
+        let capacity_bytes = 2 * 1024 * 1024;
+        let pool_guid = [0x51; 16];
+        let members = (0..member_count)
+            .map(|index| {
+                let path = root.join(format!("member-{index}.img"));
+                create_regular_file_device_with_size(&path, capacity_bytes);
+                let device_guid = deterministic_device_guid(index);
+                let layout = DeviceLayoutPolicy::Slice0Small
+                    .compute(capacity_bytes)
+                    .expect("compute bootstrap fixture layout");
+                let mut layout_bytes = [0; pool_label::POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+                encode_device_layout_v1(&layout, &mut layout_bytes);
+                let mut label = PoolLabelV1::new(pool_guid, device_guid, "bootstrap-fixture");
+                label.pool_state = PoolState::Exported;
+                label.device_index = index as u32;
+                label.device_count = member_count as u32;
+                label.device_capacity_bytes = capacity_bytes;
+                label.system_area_pointer = layout.system_area_offset;
+                label.system_area_size = layout.system_area_len;
+                let label = pool_label::seal_label_with_device_layout(label, Some(&layout_bytes))
+                    .expect("seal bootstrap fixture label");
+                let mut encoded = [0; pool_label::POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+                pool_label::encode_label_with_device_layout(
+                    &label,
+                    Some(&layout_bytes),
+                    &mut encoded,
+                )
+                .expect("encode bootstrap fixture label");
+                let label = pool_label::decode_label(&encoded)
+                    .expect("canonicalize bootstrap fixture label");
+                let mut file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .expect("open bootstrap fixture member");
+                for offset in [0, capacity_bytes - pool_label::POOL_LABEL_SIZE as u64] {
+                    file.seek(SeekFrom::Start(offset))
+                        .expect("seek bootstrap fixture label");
+                    file.write_all(&encoded)
+                        .expect("write bootstrap fixture label");
+                }
+                file.sync_all().expect("sync bootstrap fixture labels");
+                PoolBootstrapMember {
+                    file: fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&path)
+                        .expect("retain bootstrap fixture member"),
+                    path,
+                    backing: DeviceBacking::RegularFileDev,
+                    device_index: index as u32,
+                    capacity_bytes,
+                    device_guid,
+                    expected_label: label,
+                    device_layout_v1: layout_bytes,
+                    label_was_present: true,
+                }
+            })
+            .collect();
+        PoolBootstrapConfig {
+            pool_guid,
+            members,
+            encryption: None,
+        }
+    }
+
+    fn reopen_pool_bootstrap_config(config: &PoolBootstrapConfig) -> PoolBootstrapConfig {
+        PoolBootstrapConfig {
+            pool_guid: config.pool_guid,
+            members: config
+                .members
+                .iter()
+                .map(|member| PoolBootstrapMember {
+                    file: fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&member.path)
+                        .expect("reopen bootstrap fixture member"),
+                    path: member.path.clone(),
+                    backing: member.backing,
+                    device_index: member.device_index,
+                    capacity_bytes: member.capacity_bytes,
+                    device_guid: member.device_guid,
+                    expected_label: member.expected_label.clone(),
+                    device_layout_v1: member.device_layout_v1,
+                    label_was_present: member.label_was_present,
+                })
+                .collect(),
+            encryption: config.encryption.clone(),
+        }
+    }
+
+    fn bootstrap_pool_config(config: &PoolBootstrapConfig) -> Result<()> {
+        let admission = preflight_labelled_pool_bootstrap(reopen_pool_bootstrap_config(config))?;
+        bootstrap_labelled_pool(admission)
+    }
+
+    fn seed_pool_bootstrap_record(
+        config: &PoolBootstrapConfig,
+        member_index: usize,
+        key: ObjectKey,
+        payload: &[u8],
+    ) {
+        let member = &config.members[member_index];
+        let identity = BlockStoreIdentity {
+            pool_guid: config.pool_guid,
+            device_guid: member.device_guid,
+        };
+        LocalObjectStore::initialize_block_device_bootstrap(&member.path, identity)
+            .expect("initialize bootstrap fixture Store header");
+        let mut store = LocalObjectStore::open_block_device_writable_existing(
+            &member.path,
+            StoreOptions::test_fast(),
+            identity,
+        )
+        .expect("open bootstrap fixture Store");
+        store
+            .put_pool_internal(key, payload)
+            .expect("seed bootstrap fixture record");
+        store.sync_all().expect("sync bootstrap fixture record");
+    }
+
     fn regular_file_device_config(path: PathBuf) -> DeviceConfig {
         create_regular_file_device(&path);
         DeviceConfig {
@@ -7851,6 +8395,168 @@ mod tests {
             Ok(_) => panic!("expected InvalidOptions containing {needle:?}, got success"),
             Err(other) => panic!("expected InvalidOptions containing {needle:?}, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pool_bootstrap_converges_partial_headers_and_markers() {
+        let root = temp_dir("bootstrap-partial");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = labelled_pool_bootstrap_config(&root, 2);
+        for member in &config.members {
+            LocalObjectStore::initialize_block_device_bootstrap(
+                &member.path,
+                BlockStoreIdentity {
+                    pool_guid: config.pool_guid,
+                    device_guid: member.device_guid,
+                },
+            )
+            .expect("seed matching partial Store header");
+        }
+        let marker = encode_receipt_generation_high_water(ReceiptGenerationHighWater {
+            pool_guid: config.pool_guid,
+            reserved_through: 0,
+        });
+        seed_pool_bootstrap_record(&config, 0, receipt_generation_high_water_key(), &marker);
+
+        bootstrap_pool_config(&config).expect("converge partial bootstrap");
+        bootstrap_pool_config(&config).expect("retry converged bootstrap");
+        for member in &config.members {
+            let inspection = LocalObjectStore::inspect_block_device_bootstrap(
+                &member.path,
+                member.capacity_bytes - pool_label::POOL_LABEL_SIZE as u64,
+            )
+            .expect("inspect converged member");
+            assert_eq!(
+                inspection.identity,
+                Some(BlockStoreIdentity {
+                    pool_guid: config.pool_guid,
+                    device_guid: member.device_guid,
+                })
+            );
+            assert!(
+                validate_fresh_pool_bootstrap_marker(&inspection, config.pool_guid)
+                    .expect("validate converged marker")
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_bootstrap_refuses_unexpected_foreign_and_nonzero_markers() {
+        let mut unexpected_key_bytes = *receipt_generation_high_water_key().as_bytes();
+        unexpected_key_bytes[8] ^= 0x80;
+        for (suffix, key, marker, reason) in [
+            (
+                "unexpected",
+                ObjectKey::from_bytes32(unexpected_key_bytes),
+                vec![0x77],
+                "unexpected object key",
+            ),
+            (
+                "foreign",
+                receipt_generation_high_water_key(),
+                encode_receipt_generation_high_water(ReceiptGenerationHighWater {
+                    pool_guid: [0x99; 16],
+                    reserved_through: 0,
+                })
+                .to_vec(),
+                "foreign or already used",
+            ),
+            (
+                "nonzero",
+                receipt_generation_high_water_key(),
+                encode_receipt_generation_high_water(ReceiptGenerationHighWater {
+                    pool_guid: [0x51; 16],
+                    reserved_through: 1,
+                })
+                .to_vec(),
+                "foreign or already used",
+            ),
+        ] {
+            let root = temp_dir(suffix);
+            let _ = std::fs::remove_dir_all(&root);
+            let config = labelled_pool_bootstrap_config(&root, 1);
+            seed_pool_bootstrap_record(&config, 0, key, &marker);
+            let before = std::fs::read(&config.members[0].path).expect("snapshot refused member");
+            assert_invalid_options_reason_contains(
+                preflight_labelled_pool_bootstrap(reopen_pool_bootstrap_config(&config)),
+                reason,
+            );
+            assert_eq!(
+                std::fs::read(&config.members[0].path).expect("reread refused member"),
+                before,
+                "bootstrap preflight changed refused {suffix} media"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn pool_bootstrap_refuses_reordered_topology_without_mutation() {
+        let root = temp_dir("bootstrap-reordered");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut config = labelled_pool_bootstrap_config(&root, 2);
+        let before: Vec<_> = config
+            .members
+            .iter()
+            .map(|member| std::fs::read(&member.path).expect("snapshot topology member"))
+            .collect();
+        config.members.swap(0, 1);
+        assert_invalid_options_reason_contains(
+            preflight_labelled_pool_bootstrap(reopen_pool_bootstrap_config(&config)),
+            "member order is not exact",
+        );
+        for (member, expected) in config.members.iter().zip(before.iter().rev()) {
+            assert_eq!(
+                std::fs::read(&member.path).expect("reread topology member"),
+                *expected,
+                "topology refusal changed media"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_bootstrap_mutates_retained_member_after_path_replacement() {
+        let root = temp_dir("bootstrap-retained-handle");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = labelled_pool_bootstrap_config(&root, 1);
+        let original_path = config.members[0].path.clone();
+        let renamed_path = root.join("admitted-member.img");
+        let capacity_bytes = config.members[0].capacity_bytes;
+        let pool_guid = config.pool_guid;
+        let device_guid = config.members[0].device_guid;
+
+        let admission = preflight_labelled_pool_bootstrap(config)
+            .expect("admit exact retained bootstrap member");
+        std::fs::rename(&original_path, &renamed_path)
+            .expect("rename admitted member after preflight");
+        create_regular_file_device_with_size(&original_path, capacity_bytes);
+
+        bootstrap_labelled_pool(admission).expect("bootstrap retained admitted member");
+
+        let inspection = LocalObjectStore::inspect_block_device_bootstrap(
+            &renamed_path,
+            capacity_bytes - pool_label::POOL_LABEL_SIZE as u64,
+        )
+        .expect("inspect renamed admitted member");
+        assert_eq!(
+            inspection.identity,
+            Some(BlockStoreIdentity {
+                pool_guid,
+                device_guid,
+            })
+        );
+        assert!(validate_fresh_pool_bootstrap_marker(&inspection, pool_guid)
+            .expect("validate marker on admitted member"));
+        assert!(
+            std::fs::read(&original_path)
+                .expect("read path replacement")
+                .iter()
+                .all(|byte| *byte == 0),
+            "bootstrap followed the pathname instead of the retained member"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn snapshot_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -8028,6 +8734,7 @@ mod tests {
             .expect("deterministic placement reaches the secondary device");
         pool.sync_all().expect("sync two-device pool");
         let pool_guid = pool.pool_guid();
+        let first_device_guid = pool.device_guid_for_index(0);
         let removal_target_guid = pool.device_guid_for_index(1);
         drop(pool);
 
@@ -8100,6 +8807,8 @@ mod tests {
             LocalObjectStore::open_block_device_read_only_existing(
                 &unformatted_path,
                 options.clone(),
+                pool_guid,
+                first_device_guid,
             ),
             "existing valid format header",
         );
@@ -8185,7 +8894,7 @@ mod tests {
             compression: None,
         };
 
-        let err = open_single_device(&config, &test_options(), false).unwrap_err();
+        let err = open_single_device(&config, &test_options(), false, None).unwrap_err();
         assert!(matches!(err, StoreError::InvalidOptions { reason } if reason.contains("Block")));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -15522,6 +16231,7 @@ mod tests {
             .expect("encrypted raw frame");
         assert_ne!(stored_frame, data_payload);
         let pool_guid = pool.pool_guid;
+        let device_guid = pool.device_guids[0];
         let reserved_through = pool.reserved_placement_receipt_generation_through;
         pool.export().expect("export encrypted pool");
         drop(pool);
@@ -15567,8 +16277,16 @@ mod tests {
         assert!(imported.raw_primary_store().get(raw_key).unwrap().is_none());
         drop(imported);
 
-        let mut marker_device =
-            open_single_device(&config.devices[0], &options, true).expect("open marker device");
+        let mut marker_device = open_single_device(
+            &config.devices[0],
+            &options,
+            true,
+            Some(BlockStoreIdentity {
+                pool_guid,
+                device_guid,
+            }),
+        )
+        .expect("open marker device");
         let mut corrupt = encode_receipt_generation_high_water(ReceiptGenerationHighWater {
             pool_guid,
             reserved_through,

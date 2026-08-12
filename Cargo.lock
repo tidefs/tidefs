@@ -2974,6 +2974,7 @@ name = "tidefs-pool-import"
 version = "0.421.0"
 dependencies = [
  "blake3",
+ "rustix",
  "serde",
  "tempfile",
  "tidefs-auth",
