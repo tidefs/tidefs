@@ -75,9 +75,7 @@ use tidefs_types_vfs_core::{
     FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE,
     FATTR_UID, F_UNLCK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
 };
-use tidefs_vfs_engine::{
-    LockSpec, LseekDataRange, VfsEngine, VfsEngineStatFs, SNAPSHOT_NAMESPACE_ROOT_INODE_ID,
-};
+use tidefs_vfs_engine::{LockSpec, LseekDataRange, VfsEngine, VfsEngineStatFs};
 
 use crate::mount_options::TimestampPolicy;
 use tidefs_local_filesystem::PATH_MAX_BYTES;
@@ -4460,19 +4458,6 @@ impl FuseVfsAdapter {
         self.dispatch_access_check(ctx, ino, mask)
     }
 
-    fn project_snapshot_catalog_directory(
-        mut template: InodeAttr,
-        inode_id: InodeId,
-        generation: Generation,
-    ) -> Result<InodeAttr, Errno> {
-        if template.kind != NodeKind::Dir {
-            return Err(Errno::ENOTDIR);
-        }
-        template.inode_id = inode_id;
-        template.generation = generation;
-        Ok(template)
-    }
-
     /// Resolve a directory entry by name within a parent directory.
     ///
     /// This is the core lookup dispatch: given a parent inode and child name,
@@ -4489,29 +4474,6 @@ impl FuseVfsAdapter {
         name: &[u8],
     ) -> Result<InodeAttr, Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_METADATA);
-
-        // Snapshot catalog lookups must bypass the ordinary positive and
-        // negative caches: catalog generation changes make cached synthetic
-        // identities stale, and deletion must become ENOENT immediately.
-        if parent == SNAPSHOT_NAMESPACE_ROOT_INODE_ID.get() {
-            let e = self.engine.lock().unwrap();
-            let (inode_id, generation) = e.snapshot_catalog_lookup(name)?;
-            let root = e.get_root_inode(ctx)?;
-            let template = e.getattr(root, None, ctx)?;
-            return Self::project_snapshot_catalog_directory(template, inode_id, generation);
-        }
-
-        if name == b".snapshot" {
-            let e = self.engine.lock().unwrap();
-            if let Some(generation) = e.snapshot_catalog_generation() {
-                let template = e.getattr(InodeId::new(parent), None, ctx)?;
-                return Self::project_snapshot_catalog_directory(
-                    template,
-                    SNAPSHOT_NAMESPACE_ROOT_INODE_ID,
-                    generation,
-                );
-            }
-        }
 
         // Check daemon-side negative cache before hitting the engine.
         let now_ns = SystemTime::now()
@@ -7829,12 +7791,7 @@ impl FuseVfsAdapter {
     ) -> Result<(Vec<DirEntry>, bool), Errno> {
         let e = self.engine.lock().unwrap();
         let handle = self.resolve_dir_handle(ino, fh, ctx, &**e)?;
-        let snapshot_catalog_generation = e.snapshot_catalog_generation();
-        let synthetic_cookie_count = if snapshot_catalog_generation.is_some() {
-            3
-        } else {
-            2
-        };
+        let synthetic_cookie_count = 2;
 
         let mut entries: Vec<DirEntry> = Vec::new();
 
@@ -7861,16 +7818,6 @@ impl FuseVfsAdapter {
                 NodeKind::Dir,
                 Generation::new(0),
                 2, // cookie
-            ));
-        }
-
-        if let Some(generation) = snapshot_catalog_generation.filter(|_| offset <= 2) {
-            entries.push(DirEntry::new(
-                b".snapshot".to_vec(),
-                SNAPSHOT_NAMESPACE_ROOT_INODE_ID,
-                NodeKind::Dir,
-                generation,
-                3,
             ));
         }
 
@@ -10526,27 +10473,6 @@ mod tests {
             RootAuthenticationKey::demo_key(),
         )
         .expect("open local filesystem");
-        let engine = VfsLocalFileSystem::new(local_fs);
-        let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
-        AdapterFixture { adapter, root }
-    }
-
-    fn adapter_fixture_with_snapshot() -> AdapterFixture {
-        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "tidefs-vfs-adapter-snapshot-{}-{temp_id}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create temp root");
-        let mut local_fs = LocalFileSystem::open_with_root_authentication_key(
-            &root,
-            StoreOptions::test_fast(),
-            RootAuthenticationKey::demo_key(),
-        )
-        .expect("open local filesystem");
-        local_fs
-            .create_snapshot("snap0")
-            .expect("create catalog snapshot");
         let engine = VfsLocalFileSystem::new(local_fs);
         let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
         AdapterFixture { adapter, root }
@@ -28934,64 +28860,6 @@ mod tests {
     }
 
     #[test]
-    fn vfs_adapter_dispatch_lookup_routes_snapshot_catalog() {
-        let fixture = adapter_fixture_with_snapshot();
-        let ctx = root_ctx();
-        let root = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine.get_root_inode(&ctx).expect("root inode")
-        };
-
-        let catalog = fixture
-            .adapter
-            .dispatch_lookup(&ctx, root.get(), b".snapshot")
-            .expect("lookup snapshot catalog directory");
-        assert_eq!(catalog.inode_id, SNAPSHOT_NAMESPACE_ROOT_INODE_ID);
-        assert_eq!(catalog.kind, NodeKind::Dir);
-
-        let snapshot = fixture
-            .adapter
-            .dispatch_lookup(&ctx, SNAPSHOT_NAMESPACE_ROOT_INODE_ID.get(), b"snap0")
-            .expect("lookup snapshot catalog entry");
-        assert_eq!(snapshot.kind, NodeKind::Dir);
-        assert_ne!(snapshot.inode_id, SNAPSHOT_NAMESPACE_ROOT_INODE_ID);
-        assert_ne!(snapshot.inode_id.get() & (1 << 63), 0);
-        assert_eq!(snapshot.generation, catalog.generation);
-        assert_eq!(
-            fixture
-                .adapter
-                .dispatch_lookup(&ctx, SNAPSHOT_NAMESPACE_ROOT_INODE_ID.get(), b"snap0",)
-                .expect("repeat snapshot catalog lookup"),
-            snapshot
-        );
-        assert_eq!(
-            fixture.adapter.dispatch_lookup(
-                &ctx,
-                SNAPSHOT_NAMESPACE_ROOT_INODE_ID.get(),
-                b"missing",
-            ),
-            Err(Errno::ENOENT)
-        );
-    }
-
-    #[test]
-    fn vfs_adapter_dispatch_lookup_omits_snapshot_catalog_when_empty() {
-        let fixture = adapter_fixture();
-        let ctx = root_ctx();
-        let root = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine.get_root_inode(&ctx).expect("root inode")
-        };
-
-        assert_eq!(
-            fixture
-                .adapter
-                .dispatch_lookup(&ctx, root.get(), b".snapshot"),
-            Err(Errno::ENOENT)
-        );
-    }
-
-    #[test]
     fn vfs_adapter_dispatch_lookup_enotdir() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
@@ -33796,93 +33664,6 @@ mod tests {
 
         assert_eq!(entries.len(), 2);
         assert!(!has_more);
-        fixture
-            .adapter
-            .dispatch_releasedir(dh.dh_id.get())
-            .expect("releasedir");
-    }
-
-    #[test]
-    fn readdir_emits_snapshot_dotdir_when_catalog_is_non_empty() {
-        let mut fixture = adapter_fixture_with_snapshot();
-        let ctx = root_ctx();
-        let root_ino = fixture
-            .adapter
-            .engine
-            .lock()
-            .unwrap()
-            .get_root_inode(&ctx)
-            .expect("root inode");
-        fixture
-            .adapter
-            .dispatch_mkdir(&ctx, root_ino.get(), b"real-dir", 0o755)
-            .expect("mkdir");
-
-        let dh = fixture
-            .adapter
-            .dispatch_opendir(&ctx, root_ino.get())
-            .expect("opendir");
-        let (entries, has_more) = fixture
-            .adapter
-            .dispatch_readdir(&ctx, root_ino.get(), dh.dh_id.get(), 0)
-            .expect("readdir");
-
-        assert!(!has_more);
-        assert_eq!(entries[0].name, b".");
-        assert_eq!(entries[0].cookie, 1);
-        assert_eq!(entries[1].name, b"..");
-        assert_eq!(entries[1].cookie, 2);
-        assert_eq!(entries[2].name, b".snapshot");
-        assert_eq!(entries[2].inode_id, SNAPSHOT_NAMESPACE_ROOT_INODE_ID);
-        assert_eq!(entries[2].kind, NodeKind::Dir);
-        assert_eq!(entries[2].cookie, 3);
-
-        let real = entries
-            .iter()
-            .find(|entry| entry.name == b"real-dir")
-            .expect("real directory entry");
-        assert_eq!(real.cookie, 4);
-
-        fixture
-            .adapter
-            .dispatch_releasedir(dh.dh_id.get())
-            .expect("releasedir");
-    }
-
-    #[test]
-    fn readdir_resume_offsets_account_for_snapshot_dotdir() {
-        let mut fixture = adapter_fixture_with_snapshot();
-        let ctx = root_ctx();
-        let root_ino = fixture
-            .adapter
-            .engine
-            .lock()
-            .unwrap()
-            .get_root_inode(&ctx)
-            .expect("root inode");
-        fixture
-            .adapter
-            .dispatch_mkdir(&ctx, root_ino.get(), b"real-dir", 0o755)
-            .expect("mkdir");
-
-        let dh = fixture
-            .adapter
-            .dispatch_opendir(&ctx, root_ino.get())
-            .expect("opendir");
-        let (after_dotdot, _) = fixture
-            .adapter
-            .dispatch_readdir(&ctx, root_ino.get(), dh.dh_id.get(), 2)
-            .expect("readdir after dotdot");
-        assert_eq!(after_dotdot[0].name, b".snapshot");
-        assert_eq!(after_dotdot[0].cookie, 3);
-
-        let (after_snapshot, _) = fixture
-            .adapter
-            .dispatch_readdir(&ctx, root_ino.get(), dh.dh_id.get(), 3)
-            .expect("readdir after snapshot dotdir");
-        assert_eq!(after_snapshot[0].name, b"real-dir");
-        assert_eq!(after_snapshot[0].cookie, 4);
-
         fixture
             .adapter
             .dispatch_releasedir(dh.dh_id.get())
