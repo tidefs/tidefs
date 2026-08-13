@@ -4,9 +4,13 @@
 > `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
 
 This document is the current source-ownership map and architecture verdict for
-the selected local mounted-filesystem carrier. Its source evidence is the
+all four Product Contract modes. Its implemented source map is most complete
+for the selected local mounted-filesystem carrier; the cross-mode sections
+below select the target owners that later block and clustered carriers must
+reuse rather than building parallel stores. Its source evidence is the
 workspace member list in `Cargo.toml`, package manifests, current runtime call
-paths, `README.md`, and live issue #2388.
+paths, `README.md`, completed local-carrier issue #2388, and live architecture
+issue #2432.
 
 This map is not a capability claim. TideFS remains pre-alpha and does not claim
 production readiness, POSIX completeness, kernel residency, complete block or
@@ -23,8 +27,8 @@ block ordinary implementation work.
 | `apps/tidefs-posix-filesystem-adapter-daemon` | Selected local FUSE carrier library; the binary retains only development test orchestration and has no local mount runtime. |
 | `apps/tidefsctl` | Selected local operator lifecycle and status carrier. |
 | `apps/tidefs-scrub` | Scrub tool whose useful operator behavior is to consolidate into `tidefsctl`. |
-| `apps/tidefs-block-volume-adapter-daemon` | Block-mode source retained outside the first local mounted carrier. |
-| `apps/tidefs-storage-node` | Cluster-mode source retained outside the first local mounted carrier. |
+| `apps/tidefs-block-volume-adapter-daemon` | Retained ublk transport and development backends. It is not a second storage engine or operator lifecycle authority. |
+| `apps/tidefs-storage-node` | Retained cluster transport and ownership substrate. It must consume the shared Pool-backed runtime; its current directory roots and side files are not a clustered storage format. |
 
 The app list describes binaries present in the workspace. It is not release or
 operator-readiness evidence.
@@ -65,6 +69,176 @@ Clean shutdown drains and commits the VFS engine, unmounts and joins the FUSE
 session, exports the pool labels, and then removes the live-owner endpoint.
 Crash recovery reopens the same devices and selects the newest complete
 Pool-backed filesystem root before accepting mounted work.
+
+## Four-Mode Product Architecture
+
+The local mounted carrier is the first proven integration spine, not a license
+to design the other modes around FUSE. All four final modes share one storage
+composition:
+
+```text
+tidefsctl
+  -> local import owner or committed cluster ownership
+  -> one Pool-backed dataset runtime
+       -> one pool catalog/root publication and replay frontier
+       -> filesystem dataset engine -> VFS -> FUSE -> mounted path
+       -> volume dataset engine -> ublk/block front end -> block path
+  -> truthful runtime status from the same owner
+```
+
+The selected dependency and authority direction is:
+
+1. `tidefs-pool-scan` and `tidefs-pool-import` discover devices and own label,
+   topology, import-lock, activation, and export admission. They do not select
+   dataset roots, replay dataset transactions, or serve data.
+2. `tidefs-local-object-store::Pool` owns physical device/object I/O,
+   placement, receipts, allocation, integrity, and durable sync. It remains
+   unaware of filesystem paths, inodes, volume geometry, FUSE, ublk, or cluster
+   membership semantics.
+3. One shared Pool-backed dataset runtime owns the opened `Pool`, pool identity
+   and properties, the canonical `DatasetCatalog`, the table of typed dataset
+   roots, pool-wide capacity/reserve state, transaction publication, replay
+   frontier, pin/drain state, and orderly close. This boundary is factored from
+   the proven Pool-backed publication and recovery machinery currently
+   concentrated in `tidefs-local-filesystem`; it is not a parallel engine.
+4. A filesystem dataset engine owns inode, directory, extent, POSIX metadata,
+   and filesystem snapshot semantics for one `DatasetId`. The existing
+   `LocalFileSystem` and `VfsLocalFileSystem` are the implementation source to
+   separate around this boundary. FUSE remains a projection.
+5. A volume dataset engine owns exact logical capacity, logical and physical
+   block geometry, sparse block extents, read/write, flush/FUA ordering,
+   discard, resize, and volume snapshot semantics for one `DatasetId`. It uses
+   the same Pool transaction/root authority as filesystem datasets. ublk and a
+   future kernel block front end remain projections.
+6. Local mode invokes the shared runtime directly and has no membership,
+   remote lease, remote leader, or network dependency. Clustered mode wraps
+   the same catalog and dataset engines with committed membership, ownership
+   and fencing epochs, placement, replication, handoff, and recovery. It does
+   not define a second catalog, dataset format, object store, or local hot path.
+
+`Pool` is therefore too low to own the catalog, while `LocalFileSystem` is too
+filesystem-specific to remain its owner. `tidefs-dataset-lifecycle` is an
+in-memory lifecycle/model layer and is not the durable pool runtime. The
+shared runtime belongs between raw `Pool` and the filesystem/volume engines;
+its first implementation should extract existing authority rather than add a
+new empty facade.
+
+This composition fixes semantic and on-media authority, not one mandatory
+execution domain. The current FUSE and ublk carriers use the userspace `Pool`
+implementation while the no-daemon kernel target realizes the same pool root,
+catalog, dataset-root, transaction, and replay contract in one
+`KernelPoolCore`. Userspace and kernel front ends must never be concurrent
+independent owners of one imported pool, and a residency transition must
+quiesce and hand off that authority explicitly. Kernel residency therefore
+does not introduce a second format or semantic engine, and it must not require
+an always-running userspace runtime.
+
+### Canonical Pool And Dataset Roots
+
+The shared runtime publishes one pool root that binds all pool-wide truth
+needed to reopen coherently:
+
+- the canonical encoded `DatasetCatalog`;
+- pool properties and capacity/reserve counters;
+- a typed root record for each live `DatasetId`;
+- the current transaction/replay generation; and
+- pending reclaim, pin, and lifecycle obligations that must survive reopen.
+
+Each typed dataset root then points to exactly one semantic engine root:
+
+- filesystem: inode/directory/extent/snapshot state;
+- volume: capacity/geometry/block-extent/snapshot state; or
+- snapshot: a read-only reference to a committed filesystem or volume root.
+
+Publishing the catalog without its referenced typed roots, or publishing a
+typed root without the catalog transition that makes it reachable, is
+forbidden. A crash selects the newest complete pool root and either exposes the
+entire transition or the prior state. Filesystem `fsync`/`syncfs` and block
+flush/FUA converge on this publication machinery while retaining their
+surface-specific dirty-range semantics.
+
+Pool objects owned by a dataset are addressed through a domain-separated
+identity containing the stable `DatasetId`, object kind, logical identity, and
+version or content identity. Volume block zero must therefore never resolve to
+the same mutable object or written-block index in two volumes. Shared immutable
+content may be deduplicated only through an explicit pool-owned reference and
+reclaim authority; an unqualified key such as `b:<offset>` is not a product
+namespace.
+
+### Volume Object And Carrier Boundary
+
+A catalog entry of `DatasetType::Volume` is incomplete unless its committed
+typed root contains at least:
+
+- exact capacity in bytes;
+- logical block size and compatible physical/optimal I/O geometry;
+- discard granularity and explicit discard support/refusal;
+- stable `DatasetId` namespace and current root generation; and
+- resize and snapshot generation state.
+
+The local operator path is:
+
+```text
+tidefsctl dataset create <pool>/<volume> --type volume --size <bytes>
+  -> shared Pool-backed catalog plus volume root publication
+tidefsctl block attach <pool>/<volume>
+  -> local pool owner -> named volume engine -> owned ublk runtime
+  -> /dev/ublkbN -> read/write/flush/FUA/discard
+  -> detach or crash -> reopen the same Pool-backed volume root
+```
+
+The logical block size may have a documented default, but capacity is required
+and exact; neither may be synthesized by the adapter. A pool may own mounted
+filesystems and block exports concurrently, but all front ends attach to the
+same neutral pool owner. The current mounted VFS live owner must be lifted to
+that pool owner instead of teaching `VfsLocalFileSystem` to serve
+`BlockAttach`. Conversely, a standalone local block export must be able to own
+and import a pool without mounting a filesystem.
+
+### Local And Clustered Composition
+
+| Mode | Shared engine | Additional owner | Carrier |
+|---|---|---|---|
+| Local mounted filesystem | Pool runtime plus filesystem dataset engine | In-process import/session owner and local locks | `tidefsctl` -> FUSE mount |
+| Local block-volume export | Pool runtime plus volume dataset engine | In-process export owner and local queue/barrier state | `tidefsctl` -> ublk/block path |
+| Clustered mounted filesystem | The same pool and filesystem formats | Committed membership, dataset ownership/fencing, placement/replication, cross-node cache and lock authority | clustered owner -> FUSE or admitted kernel mount |
+| Clustered block-volume export | The same pool and volume formats | Committed membership, writer fencing, placement/replication, failover/handoff, flush/FUA continuity | clustered owner -> block export path |
+
+Local-to-cluster conversion retains ADR-0007's explicit drain, export/unmount,
+cluster admission, and reopen boundary. It does not translate one format into
+another. Cluster loss or ownership transfer must fence old front ends before a
+new owner serves either dataset type.
+
+### Existing Source Disposition For This Architecture
+
+- **Keep and factor:** Pool device/object I/O; the canonical
+  `DatasetCatalog` encoding and stable IDs; Pool-backed root publication and
+  recovery from `tidefs-local-filesystem`; filesystem inode/directory/extent
+  semantics; low-level ublk control/data-queue code; and cluster membership,
+  fencing, placement, replication, and transport code with demonstrated
+  runtime consumers.
+- **Consolidate:** catalog persistence and pool-wide properties out of
+  `LocalFileSystem` into the shared runtime; `ClusterDatasetCatalog` into a
+  committed ownership/proposal wrapper over the same durable catalog; mounted
+  live-owner routing into a neutral pool owner; and capacity, pin, reclaim,
+  transaction, and teardown decisions currently duplicated by front ends.
+- **Remove from product paths when the shared consumer lands:** the retired
+  directory-backed `tidefsctl block` route, hard-coded volume IDs and geometry,
+  global `b:<offset>` keys and written-block index, storage-node
+  `block-volume-data` side file, receiptless `fs_root` reopen paths, and
+  adapter-local committed-root or recovery decisions.
+- **Retain only as focused development backends when they provide distinct
+  signal:** file-image, in-memory block, model, and ublk boundary probes. A
+  model or its own tests do not justify a parallel product runtime. The large
+  in-memory block admission/receipt structures and clustered catalog mirrors
+  must either be consumed by the selected carrier or be consolidated/deleted
+  after exact consumer review.
+
+The first implementation slice after this decision is the smallest vertical
+part of the named local block carrier that publishes one exact volume root in
+the shared Pool authority and performs real namespaced read/write/flush through
+that root. A catalog-only geometry record, parser-only attach command, ublk-only
+device launch, or second directory/file backend does not satisfy the slice.
 
 ## Current Runtime And Authority Map
 
