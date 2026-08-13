@@ -2906,6 +2906,63 @@ impl LocalFileSystem {
         result.map_err(FileSystemError::from)
     }
 
+    /// Atomically publish one canonical snapshot of a committed Pool volume.
+    pub fn create_volume_snapshot_dataset(
+        &mut self,
+        path: &str,
+    ) -> Result<tidefs_pool_runtime::VolumeSnapshotSummary> {
+        self.ensure_mutation_allowed("create Pool volume snapshot")?;
+        let result = self.store.create_volume_snapshot(path);
+        if matches!(
+            &result,
+            Err(tidefs_pool_runtime::PoolRuntimeError::PublicationOutcomeUncertain(_))
+        ) {
+            self.arm_mutation_reopen_fence();
+        }
+        result.map_err(FileSystemError::from)
+    }
+
+    /// Return checksum-validated canonical Pool volume snapshots.
+    pub fn list_volume_snapshot_datasets(
+        &self,
+    ) -> Result<Vec<tidefs_pool_runtime::VolumeSnapshotSummary>> {
+        self.store
+            .list_volume_snapshots()
+            .map_err(FileSystemError::from)
+    }
+
+    /// Restore a Pool volume from an exact snapshot root while retaining it.
+    pub fn restore_volume_snapshot_dataset(
+        &mut self,
+        path: &str,
+    ) -> Result<tidefs_pool_runtime::VolumeSnapshotRestoreResult> {
+        self.ensure_mutation_allowed("restore Pool volume snapshot")?;
+        let result = self.store.restore_volume_snapshot(path);
+        if matches!(
+            &result,
+            Err(tidefs_pool_runtime::PoolRuntimeError::PublicationOutcomeUncertain(_))
+        ) {
+            self.arm_mutation_reopen_fence();
+        }
+        result.map_err(FileSystemError::from)
+    }
+
+    /// Logically destroy one canonical Pool volume snapshot.
+    pub fn destroy_volume_snapshot_dataset(
+        &mut self,
+        path: &str,
+    ) -> Result<tidefs_pool_runtime::VolumeSnapshotSummary> {
+        self.ensure_mutation_allowed("destroy Pool volume snapshot")?;
+        let result = self.store.destroy_volume_snapshot(path);
+        if matches!(
+            &result,
+            Err(tidefs_pool_runtime::PoolRuntimeError::PublicationOutcomeUncertain(_))
+        ) {
+            self.arm_mutation_reopen_fence();
+        }
+        result.map_err(FileSystemError::from)
+    }
+
     /// Atomically remove one named Pool-backed volume's catalog entry and
     /// typed root. Physical reclaim remains separate.
     pub fn destroy_volume_dataset(&mut self, path: &str) -> Result<DatasetId> {
