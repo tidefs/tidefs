@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use tidefs_local_object_store::{checksum64, pool::Pool, LocalObjectStore, StoreError};
+use tidefs_pool_runtime::{DatasetRootKind, DatasetRootUpdate, PoolRuntime};
 use tidefs_types_vfs_core::InodeId;
 
 use crate::constants::*;
@@ -32,6 +33,7 @@ pub(crate) fn persist_state(
 
 /// Persist a mounted transaction only after every nonempty file-like inode's
 /// content is readable through current Pool placement authority.
+#[cfg(test)]
 pub(crate) fn persist_state_with_pool(
     pool: &mut Pool,
     state: &FileSystemState,
@@ -61,6 +63,77 @@ pub(crate) fn persist_state_with_pool_at_transaction(
         None,
     )?;
     Ok(())
+}
+
+/// Persist filesystem transaction objects, then publish the authenticated
+/// filesystem semantic root together with any staged Pool metadata.
+pub(crate) fn persist_state_with_runtime_at_transaction(
+    runtime: &mut PoolRuntime,
+    state: &FileSystemState,
+    transaction_id: u64,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<RootCommitRecord> {
+    let signed = prepare_state_with_pool_at_transaction(
+        runtime.pool_mut(),
+        state,
+        transaction_id,
+        root_authentication_key,
+    )?;
+    let bytes = encode_root_commit(&signed);
+    let snapshot_roots: Vec<_> = state
+        .snapshots
+        .values()
+        .filter(|record| crate::snapshot::snapshot_record_retains_data(record))
+        .map(|record| {
+            (
+                crate::snapshot::snapshot_record_dataset_id(record),
+                record.root.generation,
+                encode_root_commit(&crate::recovery::root_commit_from_summary(&record.root)),
+            )
+        })
+        .collect();
+    let mut updates = Vec::with_capacity(snapshot_roots.len().saturating_add(1));
+    updates.push(DatasetRootUpdate {
+        dataset_id: tidefs_pool_runtime::ROOT_DATASET_ID,
+        kind: DatasetRootKind::Filesystem,
+        semantic_generation: signed.generation,
+        bytes: &bytes,
+    });
+    updates.extend(snapshot_roots.iter().map(
+        |(dataset_id, semantic_generation, snapshot_bytes)| DatasetRootUpdate {
+            dataset_id: *dataset_id,
+            kind: DatasetRootKind::Snapshot,
+            semantic_generation: *semantic_generation,
+            bytes: snapshot_bytes,
+        },
+    ));
+    runtime.publish_metadata_with_roots(&updates)?;
+    Ok(signed)
+}
+
+/// Write and sync a complete filesystem transaction without choosing its
+/// canonical Pool reachability. Fresh-pool creation uses the returned signed
+/// root in the same catalog/root publication.
+pub(crate) fn prepare_state_with_pool_at_transaction(
+    pool: &mut Pool,
+    state: &FileSystemState,
+    transaction_id: u64,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<RootCommitRecord> {
+    if transaction_id < state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID) {
+        return Err(FileSystemError::CorruptState {
+            reason: "mounted transaction id precedes filesystem state generation",
+        });
+    }
+    let content_entries = pool_content_manifest_entries_for_state(pool, state)?;
+    let root = persist_transaction_objects_with_precomputed_content(
+        pool.raw_primary_store_mut(),
+        state,
+        transaction_id,
+        &content_entries,
+    )?;
+    pool.sync_all()?;
+    sign_root_commit(&root, root_authentication_key)
 }
 
 pub(crate) fn persist_state_with_pool_until_boundary(

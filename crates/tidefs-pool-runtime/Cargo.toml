@@ -1,0 +1,26 @@
+[package]
+name = "tidefs-pool-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+
+description = "Canonical TideFS Pool-backed catalog, dataset-root, and local volume runtime"
+
+[dependencies]
+blake3 = "=1.5.5"
+tidefs-dataset-catalog = { workspace = true }
+tidefs-dataset-properties = { workspace = true }
+tidefs-local-object-store = { workspace = true }
+tidefs-pool-scan = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

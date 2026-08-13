@@ -506,8 +506,8 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
     CommandSurface {
         path: "block attach",
         class: CommandClass::PublicOperator,
-        routing: RoutingSemantics::LiveOwner,
-        summary: "attach an imported pool as a ublk block device through owner authority",
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "export a named Pool volume through the live owner or explicit offline devices",
     },
     #[cfg(feature = "block-volume")]
     CommandSurface {
@@ -522,20 +522,6 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::NoLivePoolState,
         summary: "list attached ublk devices",
-    },
-    #[cfg(feature = "block-volume")]
-    CommandSurface {
-        path: "block send",
-        class: CommandClass::PublicOperator,
-        routing: RoutingSemantics::LiveOwner,
-        summary: "send block-volume state through live owner and transport authority",
-    },
-    #[cfg(feature = "block-volume")]
-    CommandSurface {
-        path: "block receive",
-        class: CommandClass::PublicOperator,
-        routing: RoutingSemantics::LiveOwner,
-        summary: "receive block-volume state through live owner and transport authority",
     },
     CommandSurface {
         path: "dataset create",

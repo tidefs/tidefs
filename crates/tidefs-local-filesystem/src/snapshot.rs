@@ -323,7 +323,7 @@ impl LocalFileSystem {
                 continue;
             }
 
-            if !snapshot_catalog_entry_matches(&self.dataset_catalog, record) {
+            if !snapshot_catalog_entry_matches(self.dataset_catalog(), record) {
                 return Err(FileSystemError::CorruptState {
                     reason: "snapshot authority catalog entry does not match snapshot state",
                 });
@@ -342,12 +342,11 @@ impl LocalFileSystem {
         }
 
         expected_catalog_names.sort();
-        let catalog_entries =
-            self.dataset_catalog
-                .list_children("")
-                .map_err(|_| FileSystemError::CorruptState {
-                    reason: "snapshot authority catalog could not be inspected",
-                })?;
+        let catalog_entries = self.dataset_catalog().list_children("").map_err(|_| {
+            FileSystemError::CorruptState {
+                reason: "snapshot authority catalog could not be inspected",
+            }
+        })?;
         for (entry_name, _dataset_id) in catalog_entries {
             if entry_name.starts_with("root@")
                 && expected_catalog_names.binary_search(&entry_name).is_err()
@@ -391,7 +390,7 @@ impl LocalFileSystem {
                 reason: "snapshot authority record does not retain data",
             });
         }
-        if !snapshot_catalog_entry_matches(&self.dataset_catalog, record) {
+        if !snapshot_catalog_entry_matches(self.dataset_catalog(), record) {
             return Err(FileSystemError::CorruptState {
                 reason: "snapshot authority catalog entry does not match snapshot record",
             });
@@ -424,20 +423,6 @@ impl LocalFileSystem {
         if snapshot_record_retains_data(record) {
             self.lifecycle
                 .unpin_root(snapshot_record_traversal_root(record)?);
-        }
-        Ok(())
-    }
-
-    fn reconcile_snapshot_record_catalog_entry(&mut self, record: &SnapshotRecord) -> Result<()> {
-        if reconcile_snapshot_record_catalog_entry(&mut self.dataset_catalog, record)? {
-            self.persist_dataset_catalog()?;
-        }
-        Ok(())
-    }
-
-    fn remove_snapshot_record_catalog_entry(&mut self, record: &SnapshotRecord) -> Result<()> {
-        if remove_snapshot_record_catalog_entry(&mut self.dataset_catalog, record)? {
-            self.persist_dataset_catalog()?;
         }
         Ok(())
     }
@@ -478,6 +463,7 @@ impl LocalFileSystem {
                 )
             });
             self.store
+                .pool_mut()
                 .raw_primary_store_mut()
                 .enqueue_snapshot_deadlist_candidates(candidates)?;
         }
@@ -489,7 +475,7 @@ impl LocalFileSystem {
         &mut self,
         snapshot_id: &str,
     ) -> Result<()> {
-        let store = self.store.raw_primary_store_mut();
+        let store = self.store.pool_mut().raw_primary_store_mut();
         if store.release_snapshot_extent_pins(snapshot_id) > 0 {
             store.sync_all()?;
         }
@@ -573,13 +559,12 @@ impl LocalFileSystem {
         self.state
             .snapshots
             .insert(clone_name_bytes, record.clone());
+        reconcile_snapshot_record_catalog_entry(self.dataset_catalog_mut()?, &record)?;
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         let summary_snapshot = summary.clone();
         self.commit_mutation(summary_snapshot)?;
         self.pin_snapshot_record_root(&record)?;
-        self.reconcile_snapshot_record_catalog_entry(&record)?;
-
         Ok(clone_summary)
     }
 
@@ -623,11 +608,11 @@ impl LocalFileSystem {
         self.begin_mutation("delete clone")?;
         self.bump_generation();
         self.state.snapshots.remove(&name_bytes);
+        remove_snapshot_record_catalog_entry(self.dataset_catalog_mut()?, &record)?;
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         let summary = self.commit_mutation(record.summary())?;
         self.unpin_snapshot_record_root(&record)?;
-        self.remove_snapshot_record_catalog_entry(&record)?;
         Ok((summary, record))
     }
 
@@ -697,17 +682,11 @@ impl LocalFileSystem {
             hold_tag: record.hold_tag.clone(),
         };
 
-        self.state.snapshots.insert(name_bytes, promoted);
+        self.state.snapshots.insert(name_bytes, promoted.clone());
+        reconcile_snapshot_record_catalog_entry(self.dataset_catalog_mut()?, &promoted)?;
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         self.commit_mutation(())?;
-        let promoted = self.state.snapshots.get(&record.name).cloned().ok_or(
-            FileSystemError::CorruptState {
-                reason: "promoted snapshot record disappeared before catalog reconciliation",
-            },
-        )?;
-        self.reconcile_snapshot_record_catalog_entry(&promoted)?;
-
         Ok(PromoteReport {
             name: name.to_string(),
             previous_origin: origin_str,
@@ -1409,7 +1388,7 @@ mod tests {
     }
 
     fn receipt_bound_dead_object_queue_keys(fs: &LocalFileSystem) -> BTreeSet<ReclaimObjectKey> {
-        receipt_bound_dead_object_queue_keys_from_store(fs.store.raw_primary_store())
+        receipt_bound_dead_object_queue_keys_from_store(fs.store.pool().raw_primary_store())
     }
 
     fn receipt_bound_dead_object_queue_keys_from_store(
@@ -1446,6 +1425,7 @@ mod tests {
 
     fn persisted_dead_object_queue_exists(fs: &LocalFileSystem) -> bool {
         fs.store
+            .pool()
             .raw_primary_store()
             .get_named(b"tidefs-dead-object-reclaim-queue")
             .expect("read persisted dead-object queue")
@@ -1533,10 +1513,12 @@ mod tests {
 
             let pinned_extent = ReclaimObjectKey([0xA5; 32]);
             fs.store
+                .pool_mut()
                 .raw_primary_store_mut()
                 .pin_snapshot_extent("dead-snap", pinned_extent);
             assert!(fs
                 .store
+                .pool()
                 .raw_primary_store()
                 .snapshot_extent_pin_set()
                 .is_pinned(&pinned_extent));
@@ -1558,6 +1540,7 @@ mod tests {
             assert!(persisted_dead_object_queue_exists(&fs));
             assert!(!fs
                 .store
+                .pool()
                 .raw_primary_store()
                 .snapshot_extent_pin_set()
                 .is_pinned(&pinned_extent));

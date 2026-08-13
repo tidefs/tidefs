@@ -1304,13 +1304,26 @@ mod tests {
 
     #[cfg(feature = "block-volume")]
     #[test]
-    fn cli_parse_block_attach_live_pool_positional() {
+    fn cli_parse_block_attach_named_volume() {
         use clap::Parser;
-        let args = Cli::try_parse_from(["tidefsctl", "block", "attach", "mypool"]);
-        assert!(
-            args.is_ok(),
-            "block attach with positional pool should parse"
-        );
+        let args = Cli::try_parse_from(["tidefsctl", "block", "attach", "mypool/vol"]);
+        assert!(args.is_ok(), "named volume target should parse");
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
+    fn cli_parse_block_attach_accepts_explicit_devices() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "block",
+            "attach",
+            "mypool/vol",
+            "--devices",
+            "/dev/loop0",
+            "/dev/loop1",
+        ]);
+        assert!(args.is_ok(), "explicit Pool devices should parse");
     }
 
     #[cfg(feature = "block-volume")]
@@ -1321,7 +1334,7 @@ mod tests {
             "tidefsctl",
             "block",
             "attach",
-            "mypool",
+            "mypool/vol",
             "--backing-dir",
             "/var/lib/tidefs/mypool",
         ]);
@@ -1330,69 +1343,30 @@ mod tests {
 
     #[cfg(feature = "block-volume")]
     #[test]
-    fn cli_parse_block_send_live_pool_positional() {
+    fn cli_parse_block_attach_rejects_unavailable_io_uring_path() {
         use clap::Parser;
-        let args = Cli::try_parse_from([
-            "tidefsctl",
-            "block",
-            "send",
-            "mypool",
-            "--target-addr",
-            "127.0.0.1:9000",
-        ]);
-        assert!(args.is_ok(), "block send with positional pool should parse");
-    }
-
-    #[cfg(feature = "block-volume")]
-    #[test]
-    fn cli_parse_block_send_rejects_backing_dir() {
-        use clap::Parser;
-        let args = Cli::try_parse_from([
-            "tidefsctl",
-            "block",
-            "send",
-            "mypool",
-            "--backing-dir",
-            "/var/lib/tidefs/mypool",
-            "--target-addr",
-            "127.0.0.1:9000",
-        ]);
-        assert!(args.is_err(), "block send backing-dir must be retired");
-    }
-
-    #[cfg(feature = "block-volume")]
-    #[test]
-    fn cli_parse_block_receive_live_pool_positional() {
-        use clap::Parser;
-        let args = Cli::try_parse_from([
-            "tidefsctl",
-            "block",
-            "receive",
-            "mypool",
-            "--source-addr",
-            "127.0.0.1:9000",
-        ]);
+        let args =
+            Cli::try_parse_from(["tidefsctl", "block", "attach", "mypool/vol", "--io-uring"]);
         assert!(
-            args.is_ok(),
-            "block receive with positional pool should parse"
+            args.is_err(),
+            "Pool volume attach must not advertise direct-file io_uring"
         );
     }
 
     #[cfg(feature = "block-volume")]
     #[test]
-    fn cli_parse_block_receive_rejects_backing_dir() {
+    fn cli_parse_block_send_is_removed() {
         use clap::Parser;
-        let args = Cli::try_parse_from([
-            "tidefsctl",
-            "block",
-            "receive",
-            "mypool",
-            "--backing-dir",
-            "/var/lib/tidefs/received",
-            "--source-addr",
-            "127.0.0.1:9000",
-        ]);
-        assert!(args.is_err(), "block receive backing-dir must be retired");
+        let args = Cli::try_parse_from(["tidefsctl", "block", "send", "mypool/vol"]);
+        assert!(args.is_err(), "uncanonical block send must not parse");
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
+    fn cli_parse_block_receive_is_removed() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "block", "receive", "mypool/vol"]);
+        assert!(args.is_err(), "uncanonical block receive must not parse");
     }
 
     // -- Kernel CLI parse tests ------------------------------------------

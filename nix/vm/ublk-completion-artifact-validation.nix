@@ -23,7 +23,6 @@ let
     FIO="${pkgs.fio}/bin/fio"
     BLKDISCARD="${pkgs.util-linux}/bin/blkdiscard"
     TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
-    UBLK_DAEMON="${tidefsPackage}/bin/tidefs-block-volume-adapter-daemon"
     XTASK="${tidefsPackage}/bin/tidefs-xtask"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
 
@@ -38,8 +37,9 @@ let
       cat <<USAGE
 Usage: tidefs-ublk-completion-artifact-validation [--timeout SECONDS] [--disk-size-mb MB] [--validation-dir DIR] [--scenario NAME] [--keep-tmp]
 
-Boot Linux 7.0 in QEMU, run the real tidefsctl ublk attach path, emit a qid/tag
-completion artifact, and validate it with tidefs-xtask.
+Boot Linux 7.0 in QEMU, create a Pool-backed named volume, run the real
+tidefsctl ublk attach path, emit a qid/tag completion artifact, and validate it
+with tidefs-xtask.
 
 Options:
   --timeout SECONDS     QEMU boot timeout (default: $TIMEOUT_SEC)
@@ -85,7 +85,7 @@ USAGE
         ;;
     esac
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$FIO" "$BLKDISCARD" "$TIDEFSCTL" "$UBLK_DAEMON" "$XTASK"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$FIO" "$BLKDISCARD" "$TIDEFSCTL" "$XTASK"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ENVIRONMENT REFUSAL: dependency not found: $dep" >&2
         exit 2
@@ -109,7 +109,6 @@ USAGE
     echo "=== TideFS VAL: ublk completion artifact QEMU ==="
     echo "  Kernel:         $KERNEL_IMG"
     echo "  tidefsctl:      $TIDEFSCTL"
-    echo "  ublk daemon:    $UBLK_DAEMON"
     echo "  tidefs-xtask:   $XTASK"
     echo "  QEMU:           $QEMU_BIN"
     echo "  Accel:          $QEMU_ACCEL_LABEL"
@@ -151,7 +150,6 @@ USAGE
       echo "kernel_package=linuxKernel_7_0"
       echo "qemu_accel=$QEMU_ACCEL_LABEL"
       echo "tidefsctl=$TIDEFSCTL"
-      echo "ublk_daemon=$UBLK_DAEMON"
       echo "xtask=$XTASK"
     } > "$VALIDATION_DIR/environment.txt"
 
@@ -167,7 +165,7 @@ USAGE
     copy_runtime_deps() {
       echo "  Copying exact Nix store runtime dependencies..."
       local deps
-      deps=$("$LDD_BIN" "$BUSYBOX" "$FIO" "$BLKDISCARD" "$TIDEFSCTL" "$UBLK_DAEMON" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
+      deps=$("$LDD_BIN" "$BUSYBOX" "$FIO" "$BLKDISCARD" "$TIDEFSCTL" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
       for lib in $deps; do
         if [ -f "$lib" ]; then
           local lib_dir
@@ -177,7 +175,7 @@ USAGE
         fi
       done
 
-      for binary in "$BUSYBOX" "$FIO" "$BLKDISCARD" "$TIDEFSCTL" "$UBLK_DAEMON"; do
+      for binary in "$BUSYBOX" "$FIO" "$BLKDISCARD" "$TIDEFSCTL"; do
         local ld_so
         ld_so=$("$LDD_BIN" "$binary" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
         if [ -n "$ld_so" ] && [ -f "$ld_so" ]; then
@@ -199,7 +197,6 @@ USAGE
     copy_binary_to_bin "$FIO" fio
     copy_binary_to_bin "$BLKDISCARD" blkdiscard
     copy_binary_to_bin "$TIDEFSCTL" tidefsctl
-    copy_binary_to_bin "$UBLK_DAEMON" tidefs-block-volume-adapter-daemon
     copy_runtime_deps
 
     UBLK_KO=""
@@ -273,35 +270,70 @@ COMPLETION_ARTIFACT=/tmp/validation/ublk/qid-tag-completion-runtime.json
 STARTED_EXPORT_ARTIFACT=/tmp/validation/ublk/started-export-admission-runtime.json
 ERROR_COMPLETION_ARTIFACT=/tmp/validation/ublk/qid-tag-completion-error-injection-runtime.json
 ERROR_STARTED_EXPORT_ARTIFACT=/tmp/validation/ublk/started-export-admission-error-injection-runtime.json
-BACKING_FILE=/tmp/tidefs-ublk-completion.img
-ERROR_BACKING_FILE=/tmp/tidefs-ublk-completion-error.img
-DAEMON_LOG=/tmp/tidefs-ublk-daemon.log
-ERROR_DAEMON_LOG=/tmp/tidefs-ublk-daemon-error.log
+POOL_DEVICE=/dev/vda
+POOL_NAME=ublk_completion_pool
+VOLUME_NAME=completion
+ERROR_VOLUME_NAME=completion_error
+VOLUME_SIZE_BYTES=$((BLOCK_COUNT * 4096))
+ATTACH_LOG=/tmp/tidefs-ublk-attach.log
+ERROR_ATTACH_LOG=/tmp/tidefs-ublk-attach-error.log
 
-start_daemon() {
+create_pool_volumes() {
+    for _ in $(seq 1 30); do
+        [ -b "$POOL_DEVICE" ] && break
+        sleep 1
+    done
+    if [ ! -b "$POOL_DEVICE" ]; then
+        echo "FAIL: Pool device $POOL_DEVICE missing"
+        poweroff -f
+    fi
+
+    echo "--- Create Pool and named volumes ---"
+    if ! tidefsctl pool create "$POOL_NAME" --devices "$POOL_DEVICE" >/tmp/tidefs-pool-create.log 2>&1; then
+        echo "FAIL: Pool create"
+        cat /tmp/tidefs-pool-create.log 2>&1 || true
+        poweroff -f
+    fi
+    if ! tidefsctl dataset create "$POOL_NAME/$VOLUME_NAME" \
+        --type volume --size "$VOLUME_SIZE_BYTES" --devices "$POOL_DEVICE" \
+        >/tmp/tidefs-volume-create.log 2>&1; then
+        echo "FAIL: named volume create"
+        cat /tmp/tidefs-volume-create.log 2>&1 || true
+        poweroff -f
+    fi
+    if [ "$RUN_ERROR_INJECTION" -eq 1 ] && \
+       ! tidefsctl dataset create "$POOL_NAME/$ERROR_VOLUME_NAME" \
+        --type volume --size "$VOLUME_SIZE_BYTES" --devices "$POOL_DEVICE" \
+        >/tmp/tidefs-error-volume-create.log 2>&1; then
+        echo "FAIL: error-injection named volume create"
+        cat /tmp/tidefs-error-volume-create.log 2>&1 || true
+        poweroff -f
+    fi
+    echo "PASS: Pool-backed named volumes created"
+}
+
+start_attach() {
     artifact="$1"
     started_artifact="$2"
-    backing_file="$3"
-    daemon_log="$4"
+    volume_name="$3"
+    attach_log="$4"
     artifact_scenario="$5"
     inject_op="$6"
 
-    rm -f "$backing_file" "$artifact" "$started_artifact" "$daemon_log"
+    rm -f "$artifact" "$started_artifact" "$attach_log"
 
-    echo "--- Start ublk daemon ($artifact_scenario) ---"
+    echo "--- Attach Pool volume through tidefsctl ($artifact_scenario) ---"
     if [ "$inject_op" = none ]; then
         TIDEFS_UBLK_COMPLETION_ARTIFACT="$artifact" \
         TIDEFS_UBLK_COMPLETION_ARTIFACT_SCENARIO="$artifact_scenario" \
         TIDEFS_UBLK_COMPLETION_ARTIFACT_MAX_COMPLETIONS="$MAX_COMPLETIONS" \
         TIDEFS_UBLK_STARTED_EXPORT_ARTIFACT="$started_artifact" \
-          tidefs-block-volume-adapter-daemon ublk-serve \
-            --backing-file "$backing_file" \
-            --create \
-            --block-size 4096 \
-            --block-count "$BLOCK_COUNT" \
+          tidefsctl block attach "$POOL_NAME/$volume_name" \
             --nr-hw-queues "$NR_HW_QUEUES" \
-            --drain-deadline 10 \
-          > "$daemon_log" 2>&1 &
+            --queue-depth 64 \
+            --drain-deadline-secs 10 \
+            --devices "$POOL_DEVICE" \
+          > "$attach_log" 2>&1 &
     else
         TIDEFS_UBLK_COMPLETION_ARTIFACT="$artifact" \
         TIDEFS_UBLK_COMPLETION_ARTIFACT_SCENARIO="$artifact_scenario" \
@@ -309,22 +341,20 @@ start_daemon() {
         TIDEFS_UBLK_COMPLETION_ARTIFACT_INJECT_ERROR_OP="$inject_op" \
         TIDEFS_UBLK_COMPLETION_ARTIFACT_INJECT_ERROR_RESULT=-5 \
         TIDEFS_UBLK_STARTED_EXPORT_ARTIFACT="$started_artifact" \
-          tidefs-block-volume-adapter-daemon ublk-serve \
-            --backing-file "$backing_file" \
-            --create \
-            --block-size 4096 \
-            --block-count "$BLOCK_COUNT" \
+          tidefsctl block attach "$POOL_NAME/$volume_name" \
             --nr-hw-queues "$NR_HW_QUEUES" \
-            --drain-deadline 10 \
-          > "$daemon_log" 2>&1 &
+            --queue-depth 64 \
+            --drain-deadline-secs 10 \
+            --devices "$POOL_DEVICE" \
+          > "$attach_log" 2>&1 &
     fi
-    DAEMON_PID=$!
-    echo "daemon_pid=$DAEMON_PID"
+    ATTACH_PID=$!
+    echo "attach_pid=$ATTACH_PID"
 
     FOUND=0
     for _ in $(seq 1 60); do
-        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
-            echo "FAIL: ublk daemon exited before /dev/ublkb0 appeared"
+        if ! kill -0 "$ATTACH_PID" 2>/dev/null; then
+            echo "FAIL: tidefsctl block attach exited before /dev/ublkb0 appeared"
             break
         fi
         if [ -b /dev/ublkb0 ]; then
@@ -336,13 +366,19 @@ start_daemon() {
 
     if [ "$FOUND" -ne 1 ]; then
         echo "FAIL: ublkb0 did not appear"
-        echo "--- daemon log ---"
-        cat "$daemon_log" 2>&1 || true
+        echo "--- attach log ---"
+        cat "$attach_log" 2>&1 || true
         poweroff -f
     fi
 
     echo "PASS: ublkb0 appeared"
-    blockdev --getsize64 /dev/ublkb0 2>/dev/null || true
+    observed_size=$(blockdev --getsize64 /dev/ublkb0 2>/dev/null || echo 0)
+    if [ "$observed_size" -ne "$VOLUME_SIZE_BYTES" ]; then
+        echo "FAIL: ublkb0 size $observed_size does not match committed named-volume size $VOLUME_SIZE_BYTES"
+        cat "$attach_log" 2>&1 || true
+        poweroff -f
+    fi
+    echo "PASS: ublkb0 committed geometry size=$observed_size"
 }
 
     run_fio_or_fail() {
@@ -360,20 +396,21 @@ start_daemon() {
 }
 
 echo "--- Drive real ublk I/O ---"
-start_daemon "$COMPLETION_ARTIFACT" "$STARTED_EXPORT_ARTIFACT" "$BACKING_FILE" "$DAEMON_LOG" "$SCENARIO" none
+create_pool_volumes
+start_attach "$COMPLETION_ARTIFACT" "$STARTED_EXPORT_ARTIFACT" "$VOLUME_NAME" "$ATTACH_LOG" "$SCENARIO" none
 if [ "$SCENARIO" = "qemu-ublk-qid-tag-runtime" ]; then
-    run_fio_or_fail "fio randrw multi-queue" /tmp/fio-randrw.err "$DAEMON_LOG" \
+    run_fio_or_fail "fio randrw multi-queue" /tmp/fio-randrw.err "$ATTACH_LOG" \
         fio --name=completion-randrw --rw=randrw --rwmixread=50 --size=1M \
         --offset=0 --direct=1 --bs=4k --iodepth=16 --numjobs=2 \
         --ioengine=io_uring --filename=/dev/ublkb0 --allow_file_create=0 \
         --group_reporting --output=/tmp/fio-randrw.json --output-format=json \
         --end_fsync=1
-    run_fio_or_fail "fio FUA write" /tmp/fio-fua-write.err "$DAEMON_LOG" \
+    run_fio_or_fail "fio FUA write" /tmp/fio-fua-write.err "$ATTACH_LOG" \
         fio --name=completion-fua-write --rw=write --size=128K --offset=2M \
         --direct=1 --bs=4k --iodepth=4 --ioengine=io_uring --writefua=1 \
         --filename=/dev/ublkb0 --allow_file_create=0 --output=/tmp/fio-fua-write.json \
         --output-format=json --end_fsync=1
-    run_fio_or_fail "fio read" /tmp/fio-read.err "$DAEMON_LOG" \
+    run_fio_or_fail "fio read" /tmp/fio-read.err "$ATTACH_LOG" \
         fio --name=completion-read --rw=read --size=128K --offset=0 --direct=1 \
         --bs=4k --iodepth=8 --numjobs=2 --ioengine=io_uring --filename=/dev/ublkb0 \
         --allow_file_create=0 --group_reporting --output=/tmp/fio-read.json \
@@ -381,55 +418,55 @@ if [ "$SCENARIO" = "qemu-ublk-qid-tag-runtime" ]; then
     if ! blockdev --flushbufs /dev/ublkb0 2>/tmp/blockdev-flushbufs.err; then
         echo "FAIL: blockdev flushbufs"
         cat /tmp/blockdev-flushbufs.err 2>&1 || true
-        cat "$DAEMON_LOG" 2>&1 || true
+        cat "$ATTACH_LOG" 2>&1 || true
         poweroff -f
     fi
     if ! blkdiscard -f --offset 4194304 --length 65536 /dev/ublkb0 2>/tmp/blkdiscard.err; then
         echo "FAIL: blkdiscard discard"
         cat /tmp/blkdiscard.err 2>&1 || true
-        cat "$DAEMON_LOG" 2>&1 || true
+        cat "$ATTACH_LOG" 2>&1 || true
         poweroff -f
     fi
     if ! blkdiscard -z -f --offset 4259840 --length 65536 /dev/ublkb0 2>/tmp/blkdiscard-zero.err; then
         echo "FAIL: blkdiscard zeroout"
         cat /tmp/blkdiscard-zero.err 2>&1 || true
-        cat "$DAEMON_LOG" 2>&1 || true
+        cat "$ATTACH_LOG" 2>&1 || true
         poweroff -f
     fi
 else
-    run_fio_or_fail "fio randrw" /tmp/fio-randrw.err "$DAEMON_LOG" \
+    run_fio_or_fail "fio randrw" /tmp/fio-randrw.err "$ATTACH_LOG" \
         fio --name=completion-randrw --rw=randrw --rwmixread=50 --size=64K \
         --offset=0 --direct=1 --bs=4k --iodepth=2 --filename=/dev/ublkb0 \
         --allow_file_create=0 --output=/tmp/fio-randrw.json --output-format=json \
         --end_fsync=1
-    run_fio_or_fail "fio read" /tmp/fio-read.err "$DAEMON_LOG" \
+    run_fio_or_fail "fio read" /tmp/fio-read.err "$ATTACH_LOG" \
         fio --name=completion-read --rw=read --size=16K --offset=0 --direct=1 \
         --bs=4k --iodepth=1 --filename=/dev/ublkb0 --allow_file_create=0 \
         --output=/tmp/fio-read.json --output-format=json
 fi
 echo "PASS: fio workloads"
 
-stop_daemon() {
-    daemon_log="$1"
-    echo "--- Stop ublk daemon ---"
-    kill -TERM "$DAEMON_PID" 2>/dev/null || true
+stop_attach() {
+    attach_log="$1"
+    echo "--- Stop tidefsctl block attach ---"
+    kill -TERM "$ATTACH_PID" 2>/dev/null || true
     for _ in $(seq 1 30); do
-        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        if ! kill -0 "$ATTACH_PID" 2>/dev/null; then
             break
         fi
         sleep 1
     done
 
-    if kill -0 "$DAEMON_PID" 2>/dev/null; then
-        echo "FAIL: ublk daemon still running after graceful shutdown"
-        cat "$daemon_log" 2>&1 || true
-        kill -KILL "$DAEMON_PID" 2>/dev/null || true
+    if kill -0 "$ATTACH_PID" 2>/dev/null; then
+        echo "FAIL: tidefsctl block attach still running after graceful shutdown"
+        cat "$attach_log" 2>&1 || true
+        kill -KILL "$ATTACH_PID" 2>/dev/null || true
         poweroff -f
     fi
-    echo "PASS: ublk daemon stopped"
+    echo "PASS: tidefsctl block attach stopped and Pool exported"
 }
 
-stop_daemon "$DAEMON_LOG"
+stop_attach "$ATTACH_LOG"
 
 if [ "$RUN_ERROR_INJECTION" -eq 1 ]; then
     for _ in $(seq 1 30); do
@@ -440,12 +477,12 @@ if [ "$RUN_ERROR_INJECTION" -eq 1 ]; then
     done
     if [ -b /dev/ublkb0 ]; then
         echo "FAIL: ublkb0 remained after success-cycle teardown"
-        cat "$DAEMON_LOG" 2>&1 || true
+        cat "$ATTACH_LOG" 2>&1 || true
         poweroff -f
     fi
 
-    start_daemon "$ERROR_COMPLETION_ARTIFACT" "$ERROR_STARTED_EXPORT_ARTIFACT" "$ERROR_BACKING_FILE" "$ERROR_DAEMON_LOG" "qemu-ublk-qid-tag-runtime-error-injection" write
-    run_fio_or_fail "fio error-injection pre-read" /tmp/fio-error-read.err "$ERROR_DAEMON_LOG" \
+    start_attach "$ERROR_COMPLETION_ARTIFACT" "$ERROR_STARTED_EXPORT_ARTIFACT" "$ERROR_VOLUME_NAME" "$ERROR_ATTACH_LOG" "qemu-ublk-qid-tag-runtime-error-injection" write
+    run_fio_or_fail "fio error-injection pre-read" /tmp/fio-error-read.err "$ERROR_ATTACH_LOG" \
         fio --name=completion-error-preread --rw=read --size=4k --offset=0 \
         --direct=1 --bs=4k --iodepth=1 --filename=/dev/ublkb0 \
         --allow_file_create=0 --output=/tmp/fio-error-read.json \
@@ -460,36 +497,36 @@ if [ "$RUN_ERROR_INJECTION" -eq 1 ]; then
     if [ "$ERROR_WRITE_RC" -eq 0 ]; then
         echo "FAIL: error injection write unexpectedly succeeded"
         cat /tmp/fio-error-write.json 2>&1 || true
-        cat "$ERROR_DAEMON_LOG" 2>&1 || true
+        cat "$ERROR_ATTACH_LOG" 2>&1 || true
         poweroff -f
     fi
     echo "PASS: error injection write refused rc=$ERROR_WRITE_RC"
-    stop_daemon "$ERROR_DAEMON_LOG"
+    stop_attach "$ERROR_ATTACH_LOG"
 fi
 
 if [ ! -s "$COMPLETION_ARTIFACT" ]; then
     echo "FAIL: completion artifact missing"
-    echo "--- daemon log ---"
-    cat "$DAEMON_LOG" 2>&1 || true
+    echo "--- attach log ---"
+    cat "$ATTACH_LOG" 2>&1 || true
     poweroff -f
 fi
 if [ ! -s "$STARTED_EXPORT_ARTIFACT" ]; then
     echo "FAIL: started-export admission artifact missing"
-    echo "--- daemon log ---"
-    cat "$DAEMON_LOG" 2>&1 || true
+    echo "--- attach log ---"
+    cat "$ATTACH_LOG" 2>&1 || true
     poweroff -f
 fi
 if [ "$RUN_ERROR_INJECTION" -eq 1 ]; then
     if [ ! -s "$ERROR_COMPLETION_ARTIFACT" ]; then
         echo "FAIL: error injection completion artifact missing"
-        echo "--- daemon log ---"
-        cat "$ERROR_DAEMON_LOG" 2>&1 || true
+        echo "--- attach log ---"
+        cat "$ERROR_ATTACH_LOG" 2>&1 || true
         poweroff -f
     fi
     if [ ! -s "$ERROR_STARTED_EXPORT_ARTIFACT" ]; then
         echo "FAIL: error injection started-export admission artifact missing"
-        echo "--- daemon log ---"
-        cat "$ERROR_DAEMON_LOG" 2>&1 || true
+        echo "--- attach log ---"
+        cat "$ERROR_ATTACH_LOG" 2>&1 || true
         poweroff -f
     fi
 fi

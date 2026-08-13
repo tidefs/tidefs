@@ -78,11 +78,9 @@ product-grade.
 | `device remove` | `public-operator` | `live-owner` | `local-only` | `visible` | require live-owner authority but refuse dispatch until evacuation receipts and topology/label updates are durable |
 | `device status` | `public-operator` | `live-owner` | `unguarded` | `visible` | query live device status through the live owner; fail closed when no live owner is reachable |
 | `defrag` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | request online extent-map defragmentation for a path |
-| `block attach` | `public-operator` | `live-owner` | `local-only` | `visible` | attach an imported pool as a ublk block device through owner authority |
+| `block attach` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | export a named Pool volume through the live owner or explicit offline devices |
 | `block detach` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | detach an existing ublk device by numeric id |
 | `block list` | `public-operator` | `no-live-pool-state` | `unguarded` | `visible` | list attached ublk devices |
-| `block send` | `public-operator` | `live-owner` | `local-only` | `visible` | send block-volume state through live owner and transport authority |
-| `block receive` | `public-operator` | `live-owner` | `local-only` | `visible` | receive block-volume state through live owner and transport authority |
 | `dataset create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create catalog-backed datasets through owner authority or explicit devices |
 | `dataset list` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list catalog-backed datasets through owner authority or explicit devices |
 | `dataset destroy` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | destroy catalog entries through owner authority or explicit devices |

@@ -113,8 +113,6 @@ const LOCAL_ONLY_COMMANDS: &[&str] = &[
     "snapshot prune-scheduled disable",
     "block attach",
     "block detach",
-    "block send",
-    "block receive",
     "dataset create",
     "dataset destroy",
     "dataset rename",

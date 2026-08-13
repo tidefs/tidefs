@@ -22,6 +22,7 @@ use tidefs_dataset_lifecycle::{
 use tidefs_dataset_properties::{self, PropertyKey, PropertySet, PropertyValue};
 use tidefs_local_filesystem::{FileSystemStatfs, LocalFileSystem, RecoveryPolicy};
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
+use tidefs_pool_runtime::PoolRuntime;
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
@@ -159,6 +160,10 @@ pub struct DatasetCreateArgs {
     /// Dataset type to create
     #[arg(long = "type", value_enum, default_value_t = DatasetTypeArg::Filesystem)]
     pub dataset_type: DatasetTypeArg,
+
+    /// Exact volume capacity in bytes; required for --type volume
+    #[arg(long = "size", value_name = "BYTES")]
+    pub size: Option<u64>,
 
     /// Initial dataset property in key=value form
     #[arg(long = "property", value_name = "KEY=VALUE")]
@@ -955,7 +960,7 @@ fn require_create_admission(
     path: &str,
     parent: &str,
 ) -> Result<(), String> {
-    if !catalog.contains(parent) {
+    if path.contains('/') && !catalog.contains(parent) {
         return Err(format!(
             "parent dataset '{parent}' does not exist in the catalog"
         ));
@@ -964,6 +969,24 @@ fn require_create_admission(
         return Err(format!("dataset '{path}' already exists in the catalog"));
     }
     Ok(())
+}
+
+fn validate_create_capacity(
+    dataset_type: DatasetTypeArg,
+    size: Option<u64>,
+) -> Result<Option<u64>, String> {
+    match (dataset_type, size) {
+        (DatasetTypeArg::Volume, Some(0)) => Err("volume --size must be nonzero".to_string()),
+        (DatasetTypeArg::Volume, Some(size)) if size % 4096 != 0 => {
+            Err("volume --size must be aligned to 4096 bytes".to_string())
+        }
+        (DatasetTypeArg::Volume, Some(size)) => Ok(Some(size)),
+        (DatasetTypeArg::Volume, None) => {
+            Err("--size <bytes> is required for --type volume".to_string())
+        }
+        (_, Some(_)) => Err("--size is valid only with --type volume".to_string()),
+        (_, None) => Ok(None),
+    }
 }
 
 fn destroy_admission_from_catalog(
@@ -1033,6 +1056,8 @@ fn handle_create(args: DatasetCreateArgs) {
     let properties = parse_property_assignments_or_exit(&args.properties, "create", args.json);
     let features = parse_feature_names_or_exit(&args.features, "create", args.json);
     let dataset_type = args.dataset_type.to_dataset_type();
+    let capacity = validate_create_capacity(args.dataset_type, args.size)
+        .unwrap_or_else(|err| exit_dataset_error("create", err, args.json));
     let mountpoint = args
         .mountpoint
         .as_ref()
@@ -1046,125 +1071,162 @@ fn handle_create(args: DatasetCreateArgs) {
         );
     }
 
-    // ── Cluster-authoritative path ─────────────────────────────────
-    #[cfg(feature = "cluster")]
-    if args.cluster {
-        let (node_addr, node_id) =
-            validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "create");
-        let devs = require_devices_for_cluster(devices_ref.map(|d| d), "create");
-        let pool_guid = resolve_cluster_pool_guid(devs, "create");
-
-        let dataset_id = dataset_id_from_name(&full_path);
-        let delta = CatalogDelta::Create {
-            path: full_path.clone(),
-            dataset_id_bytes: dataset_id.as_bytes().to_vec(),
-            dataset_type_u8: dataset_type.to_u8(),
-            creation_txg: 1,
-            properties: property_set_from_assignments(&properties).to_key_value_blob(),
-            flags_u16: DatasetFlags::default_create().bits(),
-        };
-
-        let catalog_version = submit_cluster_delta(node_addr, node_id, pool_guid, &delta, "create");
-
-        if args.json {
-            print_json_or_exit(serde_json::json!({
-                "ok": true,
-                "operation": "create",
-                "pool": target.pool,
-                "dataset": full_path,
-                "id": dataset_id.to_string(),
-                "type": dataset_type.to_string(),
-                "parent": parent,
-                "mountpoint": mountpoint,
-                "properties": property_assignments_json(&properties),
-                "features": features,
-                "catalog_version": catalog_version,
-            }));
-        } else {
-            println!(
-                "dataset '{full_path}' created in clustered pool '{}' (catalog_version={catalog_version})",
-                target.pool
-            );
-            println!("  id={}  parent='{parent}'", format_dataset_id(&dataset_id));
-        }
-        return;
-    }
-
-    let mut fs = open_filesystem_with_live_args(
-        &target.pool,
-        devices_ref,
-        "create",
-        RecoveryPolicy::default(),
-        args.json,
-        super::live_owner::live_admin_args([
-            ("target", LivePoolAdminArg::String(args.target.clone())),
-            ("name", LivePoolAdminArg::String(leaf.to_string())),
-            ("parent", LivePoolAdminArg::String(parent.clone())),
-            (
-                "type",
-                LivePoolAdminArg::String(args.dataset_type.label().to_string()),
-            ),
-            (
-                "mountpoint",
-                super::live_owner::live_admin_optional_string(
-                    mountpoint.as_ref().map(|path| path.to_string()),
-                ),
-            ),
-            (
-                "properties",
-                LivePoolAdminArg::Array(property_assignments_live_admin_args(&properties)),
-            ),
-            (
-                "features",
-                LivePoolAdminArg::Array(
-                    features
-                        .iter()
-                        .cloned()
-                        .map(LivePoolAdminArg::String)
-                        .collect(),
-                ),
-            ),
-            ("sync", LivePoolAdminArg::String(args.sync.clone())),
-        ]),
-    );
-
-    if let Err(err) = require_create_admission(fs.dataset_catalog(), &full_path, &parent) {
-        exit_dataset_error("create", err, args.json);
-    }
-
-    let dataset_id = dataset_id_from_name(&full_path);
-    let property_set = property_set_from_assignments(&properties);
-
-    let catalog = fs.dataset_catalog_mut().unwrap_or_else(|err| {
+    if args.dataset_type == DatasetTypeArg::Snapshot {
         exit_dataset_error(
             "create",
-            format!("filesystem mutation requires reopen: {err}"),
+            "snapshots must be created by the owning filesystem or volume engine",
+            args.json,
+        );
+    }
+
+    if args.dataset_type == DatasetTypeArg::Filesystem {
+        exit_dataset_error(
+            "create",
+            "standalone filesystem creation is not available until a filesystem engine can publish its typed root",
+            args.json,
+        );
+    }
+    let capacity = capacity.unwrap_or_else(|| {
+        exit_dataset_error(
+            "create",
+            "--size <bytes> is required for --type volume",
             args.json,
         )
     });
-    if let Err(err) = catalog.create(
-        &full_path,
-        dataset_id,
-        dataset_type,
-        1,
-        property_set.to_key_value_blob(),
-        DatasetFlags::default_create(),
-        sync_guarantee,
-    ) {
+
+    if mountpoint.is_some() {
         exit_dataset_error(
             "create",
-            format!("catalog error creating '{full_path}': {err}"),
+            "--mountpoint is not valid for a block volume",
+            args.json,
+        );
+    }
+    if !features.is_empty() {
+        exit_dataset_error(
+            "create",
+            "volume feature flags are not available until the volume engine consumes them",
+            args.json,
+        );
+    }
+    if sync_guarantee != SyncGuarantee::Local {
+        exit_dataset_error(
+            "create",
+            "local volume creation supports only --sync local; clustered guarantees require committed cluster ownership",
             args.json,
         );
     }
 
-    if let Err(err) = fs.persist_dataset_catalog() {
+    // ── Cluster-authoritative path ─────────────────────────────────
+    #[cfg(feature = "cluster")]
+    if args.cluster {
         exit_dataset_error(
             "create",
-            format!("failed to persist catalog: {err}"),
+            "clustered dataset creation is refused until committed cluster ownership publishes through the shared Pool runtime",
             args.json,
         );
     }
+
+    let live_args = super::live_owner::live_admin_args([
+        ("target", LivePoolAdminArg::String(args.target.clone())),
+        ("name", LivePoolAdminArg::String(leaf.to_string())),
+        ("parent", LivePoolAdminArg::String(parent.clone())),
+        (
+            "type",
+            LivePoolAdminArg::String(args.dataset_type.label().to_string()),
+        ),
+        (
+            "mountpoint",
+            super::live_owner::live_admin_optional_string(
+                mountpoint.as_ref().map(|path| path.to_string()),
+            ),
+        ),
+        (
+            "properties",
+            LivePoolAdminArg::Array(property_assignments_live_admin_args(&properties)),
+        ),
+        (
+            "features",
+            LivePoolAdminArg::Array(
+                features
+                    .iter()
+                    .cloned()
+                    .map(LivePoolAdminArg::String)
+                    .collect(),
+            ),
+        ),
+        (
+            "size",
+            super::live_owner::live_admin_optional_u64(Some(capacity)),
+        ),
+        ("sync", LivePoolAdminArg::String(args.sync.clone())),
+    ]);
+    let dataset_id = dataset_id_from_name(&full_path);
+    let property_set = property_set_from_assignments(&properties);
+    let geometry = if let Some(devs) = devices_ref.filter(|devs| !devs.is_empty()) {
+        let config = scan_device_pool_config(&target.pool, devs, "create");
+        let lock_dir = PathBuf::from("/run/tidefs/import");
+        let import_owner = match tidefs_pool_import::pool_import_owned(devs, &lock_dir, false, None)
+        {
+            Ok(owner) => owner,
+            Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
+                super::live_owner::route_imported_with_format_and_args(
+                    "dataset",
+                    "create",
+                    &target.pool,
+                    pool_uuid,
+                    args.json,
+                    live_args,
+                )
+            }
+            Err(err) => {
+                exit_dataset_error("create", format!("pool import failed: {err}"), args.json)
+            }
+        };
+        let metadata_dir =
+            super::offline_pool::metadata_dir("dataset", "create", &config.pool_uuid);
+        let result = (|| -> Result<_, String> {
+            let mut runtime = PoolRuntime::open_block_devices(
+                &metadata_dir,
+                devs,
+                &target.pool,
+                PoolRedundancyPolicy::from_label_policy(config.redundancy_policy),
+                &StoreOptions::default(),
+            )
+            .map_err(|err| format!("failed to open canonical Pool runtime: {err}"))?;
+            require_create_admission(runtime.dataset_catalog(), &full_path, &parent)?;
+            runtime
+                .create_volume(
+                    &full_path,
+                    dataset_id,
+                    capacity,
+                    property_set.to_key_value_blob(),
+                    DatasetFlags::default_create(),
+                    sync_guarantee,
+                )
+                .map_err(|err| format!("failed to create canonical Pool volume: {err}"))
+        })();
+        let export_result = import_owner
+            .export()
+            .map_err(|err| format!("failed to export Pool after volume creation: {err}"));
+        match (result, export_result) {
+            (Ok(geometry), Ok(())) => geometry,
+            (Err(error), Ok(())) => exit_dataset_error("create", error, args.json),
+            (Ok(_), Err(export_error)) => exit_dataset_error("create", export_error, args.json),
+            (Err(error), Err(export_error)) => exit_dataset_error(
+                "create",
+                format!("{error}; additionally {export_error}"),
+                args.json,
+            ),
+        }
+    } else {
+        super::live_owner::route_with_format_and_args(
+            "dataset",
+            "create",
+            &target.pool,
+            args.json,
+            live_args,
+        )
+    };
 
     if args.json {
         print_json_or_exit(serde_json::json!({
@@ -1174,6 +1236,8 @@ fn handle_create(args: DatasetCreateArgs) {
             "dataset": full_path,
             "id": dataset_id.to_string(),
             "type": dataset_type.to_string(),
+            "size": geometry.capacity_bytes,
+            "block_size": geometry.block_size_bytes,
             "parent": parent,
             "mountpoint": mountpoint,
             "properties": property_assignments_json(&properties),
@@ -1181,7 +1245,12 @@ fn handle_create(args: DatasetCreateArgs) {
         }));
     } else {
         println!("dataset '{full_path}' created in pool '{}'", target.pool);
-        println!("  id={}  parent='{parent}'", format_dataset_id(&dataset_id));
+        println!(
+            "  id={}  parent='{parent}'  size={}  block_size={}",
+            format_dataset_id(&dataset_id),
+            geometry.capacity_bytes,
+            geometry.block_size_bytes
+        );
     }
 }
 fn handle_list(args: DatasetListArgs) {
@@ -2395,6 +2464,19 @@ mod dataset_lifecycle_command_tests {
 
         let err = require_create_admission(&catalog, "missing/child", "missing").unwrap_err();
         assert!(err.contains("parent dataset 'missing'"));
+    }
+
+    #[test]
+    fn volume_capacity_is_required_exact_and_aligned() {
+        assert_eq!(
+            validate_create_capacity(DatasetTypeArg::Volume, Some(8192)).unwrap(),
+            Some(8192)
+        );
+        assert!(validate_create_capacity(DatasetTypeArg::Volume, None).is_err());
+        assert!(validate_create_capacity(DatasetTypeArg::Volume, Some(0)).is_err());
+        assert!(validate_create_capacity(DatasetTypeArg::Volume, Some(4097)).is_err());
+        assert!(validate_create_capacity(DatasetTypeArg::Filesystem, Some(4096)).is_err());
+        assert!(validate_create_capacity(DatasetTypeArg::Snapshot, Some(4096)).is_err());
     }
 
     #[test]

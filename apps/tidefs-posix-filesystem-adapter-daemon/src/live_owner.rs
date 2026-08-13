@@ -8,6 +8,8 @@
 //! must prove the UUID matches before serving live cached state.
 
 use std::fs;
+#[cfg(feature = "block-volume")]
+use std::io::Read;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -19,6 +21,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(feature = "block-volume")]
+use tidefs_block_volume_adapter_daemon::storage_backend::PoolVolumeBackend;
+#[cfg(feature = "block-volume")]
+use tidefs_block_volume_adapter_daemon::ublk_control_open::run_ublk_live_device;
+#[cfg(feature = "block-volume")]
+use tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem;
 use tidefs_types_vfs_core::RequestCtx;
 use tidefs_vfs_engine::{
     LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminError,
@@ -36,6 +44,7 @@ pub struct LiveOwnerConfig {
     pub backing_dir: PathBuf,
     pub mountpoint: PathBuf,
     pub runtime_dir: PathBuf,
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,10 +57,13 @@ pub struct LiveOwnerManifest {
     pub backing_dir: String,
     pub mountpoint: String,
     pub socket_path: String,
+    pub read_only: bool,
 }
 
 pub struct LiveOwnerHandle {
     shutdown: Arc<AtomicBool>,
+    #[cfg(feature = "block-volume")]
+    block_export: Arc<Mutex<Option<ActiveBlockExport>>>,
     join: Option<JoinHandle<()>>,
     socket_path: PathBuf,
     manifest_path: PathBuf,
@@ -60,6 +72,8 @@ pub struct LiveOwnerHandle {
 impl LiveOwnerHandle {
     pub fn stop(mut self) {
         self.shutdown.store(true, Ordering::Release);
+        #[cfg(feature = "block-volume")]
+        stop_active_block_export(&self.block_export);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -70,6 +84,8 @@ impl LiveOwnerHandle {
 impl Drop for LiveOwnerHandle {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        #[cfg(feature = "block-volume")]
+        stop_active_block_export(&self.block_export);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -80,6 +96,7 @@ impl Drop for LiveOwnerHandle {
 pub fn start_fuse_owner(
     config: LiveOwnerConfig,
     engine: LiveOwnerEngine,
+    #[cfg(feature = "block-volume")] filesystem: SharedLocalFileSystem,
     shutdown: Arc<AtomicBool>,
 ) -> Result<LiveOwnerHandle, String> {
     fs::create_dir_all(&config.runtime_dir).map_err(|err| {
@@ -112,16 +129,42 @@ pub fn start_fuse_owner(
             .to_string(),
         mountpoint: config.mountpoint.display().to_string(),
         socket_path: socket_path.display().to_string(),
+        read_only: config.read_only,
     };
     write_manifest(&manifest_path, &manifest)?;
 
     let thread_manifest = manifest.clone();
     let thread_shutdown = Arc::clone(&shutdown);
+    #[cfg(feature = "block-volume")]
+    let block_export = Arc::new(Mutex::new(None));
+    #[cfg(feature = "block-volume")]
+    let thread_block_export = Arc::clone(&block_export);
     let join = thread::spawn(move || {
+        let mut clients = Vec::<JoinHandle<()>>::new();
         while !thread_shutdown.load(Ordering::Acquire) {
+            reap_finished_clients(&mut clients);
             match listener.accept() {
                 Ok((stream, _addr)) => {
-                    handle_client(stream, &thread_manifest, &engine, &thread_shutdown);
+                    let manifest = thread_manifest.clone();
+                    let engine = Arc::clone(&engine);
+                    #[cfg(feature = "block-volume")]
+                    let filesystem = filesystem.clone();
+                    let shutdown = Arc::clone(&thread_shutdown);
+                    #[cfg(feature = "block-volume")]
+                    let block_export = Arc::clone(&thread_block_export);
+                    let client = thread::spawn(move || {
+                        handle_client(
+                            stream,
+                            &manifest,
+                            &engine,
+                            #[cfg(feature = "block-volume")]
+                            &filesystem,
+                            #[cfg(feature = "block-volume")]
+                            &block_export,
+                            &shutdown,
+                        );
+                    });
+                    clients.push(client);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
@@ -132,14 +175,33 @@ pub fn start_fuse_owner(
                 }
             }
         }
+        #[cfg(feature = "block-volume")]
+        stop_active_block_export(&thread_block_export);
+        for client in clients.drain(..) {
+            let _ = client.join();
+        }
     });
 
     Ok(LiveOwnerHandle {
         shutdown,
+        #[cfg(feature = "block-volume")]
+        block_export,
         join: Some(join),
         socket_path,
         manifest_path,
     })
+}
+
+fn reap_finished_clients(clients: &mut Vec<JoinHandle<()>>) {
+    let mut index = 0;
+    while index < clients.len() {
+        if clients[index].is_finished() {
+            let client = clients.swap_remove(index);
+            let _ = client.join();
+        } else {
+            index += 1;
+        }
+    }
 }
 
 fn prepare_socket_path(path: &Path) -> Result<(), String> {
@@ -175,14 +237,30 @@ fn handle_client(
     stream: UnixStream,
     manifest: &LiveOwnerManifest,
     engine: &LiveOwnerEngine,
+    #[cfg(feature = "block-volume")] filesystem: &SharedLocalFileSystem,
+    #[cfg(feature = "block-volume")] block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
     shutdown: &Arc<AtomicBool>,
 ) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    #[cfg(feature = "block-volume")]
+    let disconnect_monitor = stream.try_clone().ok();
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let response = match reader.read_line(&mut line) {
         Ok(0) => live_admin_malformed("empty live-owner request"),
         Ok(_) => match decode_live_pool_admin_request(&line) {
-            Ok(request) => dispatch_request(request, manifest, engine, shutdown),
+            Ok(request) => dispatch_request(
+                request,
+                manifest,
+                engine,
+                #[cfg(feature = "block-volume")]
+                filesystem,
+                #[cfg(feature = "block-volume")]
+                block_export,
+                #[cfg(feature = "block-volume")]
+                disconnect_monitor,
+                shutdown,
+            ),
             Err(err) => live_admin_typed_error(err),
         },
         Err(err) => live_admin_malformed(format!("read live-owner request: {err}")),
@@ -260,6 +338,9 @@ fn dispatch_request(
     request: LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
     engine: &LiveOwnerEngine,
+    #[cfg(feature = "block-volume")] filesystem: &SharedLocalFileSystem,
+    #[cfg(feature = "block-volume")] block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    #[cfg(feature = "block-volume")] disconnect_monitor: Option<UnixStream>,
     shutdown: &Arc<AtomicBool>,
 ) -> LivePoolAdminResponse {
     if let Err(err) = request.validate_version() {
@@ -273,7 +354,13 @@ fn dispatch_request(
         LivePoolAdminCommand::PoolStatus => pool_status(&request, manifest, engine),
         LivePoolAdminCommand::PoolImport => already_owned(&request, "import", manifest),
         LivePoolAdminCommand::PoolMount => pool_mount_refused(&request, manifest),
-        LivePoolAdminCommand::PoolExport => pool_export(&request, manifest, shutdown),
+        LivePoolAdminCommand::PoolExport => pool_export(
+            &request,
+            manifest,
+            #[cfg(feature = "block-volume")]
+            block_export,
+            shutdown,
+        ),
         LivePoolAdminCommand::PoolDestroy => pool_destroy_refused(&request, manifest),
         LivePoolAdminCommand::PoolGet
         | LivePoolAdminCommand::PoolSet
@@ -298,11 +385,217 @@ fn dispatch_request(
         | LivePoolAdminCommand::SnapshotSend
         | LivePoolAdminCommand::PerformanceAdmissionSnapshot
         | LivePoolAdminCommand::DeviceStatus
-        | LivePoolAdminCommand::DeviceRemove
-        | LivePoolAdminCommand::BlockAttach
-        | LivePoolAdminCommand::BlockSend
-        | LivePoolAdminCommand::BlockReceive => delegate_admin_request(&request, engine),
+        | LivePoolAdminCommand::DeviceRemove => delegate_admin_request(&request, engine),
+        #[cfg(feature = "block-volume")]
+        LivePoolAdminCommand::BlockAttach => block_attach(
+            &request,
+            manifest,
+            filesystem,
+            block_export,
+            disconnect_monitor,
+            shutdown,
+        ),
+        #[cfg(not(feature = "block-volume"))]
+        LivePoolAdminCommand::BlockAttach => unsupported_admin_command_response(&request),
     }
+}
+
+#[cfg(feature = "block-volume")]
+#[derive(Clone)]
+struct ActiveBlockExport {
+    volume: String,
+    shutdown: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "block-volume")]
+fn stop_active_block_export(block_export: &Arc<Mutex<Option<ActiveBlockExport>>>) {
+    if let Some(active) = block_export
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        active.shutdown.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "block-volume")]
+fn reserve_block_export(
+    block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    owner_shutdown: &Arc<AtomicBool>,
+    pool: &str,
+    volume: &str,
+    export_shutdown: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut active = block_export
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if owner_shutdown.load(Ordering::Acquire) {
+        return Err("live owner is shutting down".to_string());
+    }
+    if let Some(existing) = active.as_ref() {
+        return Err(format!(
+            "pool '{pool}' already exports volume '{}'; concurrent block exports are refused",
+            existing.volume
+        ));
+    }
+    *active = Some(ActiveBlockExport {
+        volume: volume.to_string(),
+        shutdown: Arc::clone(export_shutdown),
+    });
+    Ok(())
+}
+
+#[cfg(feature = "block-volume")]
+fn clear_block_export(
+    block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    volume: &str,
+    export_shutdown: &Arc<AtomicBool>,
+) {
+    let mut active = block_export
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if active.as_ref().is_some_and(|current| {
+        current.volume == volume && Arc::ptr_eq(&current.shutdown, export_shutdown)
+    }) {
+        *active = None;
+    }
+}
+
+#[cfg(feature = "block-volume")]
+fn block_attach(
+    request: &LivePoolAdminRequest,
+    manifest: &LiveOwnerManifest,
+    filesystem: &SharedLocalFileSystem,
+    block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    disconnect_monitor: Option<UnixStream>,
+    owner_shutdown: &Arc<AtomicBool>,
+) -> LivePoolAdminResponse {
+    let (volume, nr_hw_queues, queue_depth, drain_deadline_secs) =
+        match block_attach_request_args(&request.args) {
+            Ok(args) => args,
+            Err(err) => return live_admin_typed_error(err),
+        };
+    if owner_shutdown.load(Ordering::Acquire) {
+        return LivePoolAdminResponse::error(1, "live owner is shutting down");
+    }
+
+    let export_shutdown = Arc::new(AtomicBool::new(false));
+    if let Err(message) = reserve_block_export(
+        block_export,
+        owner_shutdown,
+        &manifest.pool_name,
+        volume,
+        &export_shutdown,
+    ) {
+        return LivePoolAdminResponse::error(1, message);
+    }
+    let mut backend =
+        match PoolVolumeBackend::open_mounted(filesystem.clone(), volume, manifest.read_only) {
+            Ok(backend) => backend,
+            Err(err) => {
+                clear_block_export(block_export, volume, &export_shutdown);
+                return LivePoolAdminResponse::error(
+                    1,
+                    format!("open Pool volume '{volume}' for block export: {err}"),
+                );
+            }
+        };
+    if owner_shutdown.load(Ordering::Acquire) {
+        clear_block_export(block_export, volume, &export_shutdown);
+        return LivePoolAdminResponse::error(1, "live owner is shutting down");
+    }
+
+    let disconnect_stop = Arc::new(AtomicBool::new(false));
+    let disconnect_join = disconnect_monitor.map(|stream| {
+        monitor_client_disconnect(
+            stream,
+            Arc::clone(&disconnect_stop),
+            Arc::clone(&export_shutdown),
+        )
+    });
+
+    let result = run_ublk_live_device(
+        None,
+        &mut backend,
+        Arc::clone(&export_shutdown),
+        false,
+        nr_hw_queues,
+        queue_depth,
+        drain_deadline_secs,
+    );
+    disconnect_stop.store(true, Ordering::Release);
+    if let Some(join) = disconnect_join {
+        let _ = join.join();
+    }
+    clear_block_export(block_export, volume, &export_shutdown);
+
+    match result {
+        Ok(_) => LivePoolAdminResponse::ok_text(format!(
+            "block export stopped: {}/{}",
+            manifest.pool_name, volume
+        )),
+        Err(err) => LivePoolAdminResponse::error(
+            1,
+            format!(
+                "block export failed for {}/{}: {err}",
+                manifest.pool_name, volume
+            ),
+        ),
+    }
+}
+
+#[cfg(feature = "block-volume")]
+fn monitor_client_disconnect(
+    mut stream: UnixStream,
+    stop: Arc<AtomicBool>,
+    export_shutdown: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+        let mut byte = [0_u8; 1];
+        while !stop.load(Ordering::Acquire) {
+            match stream.read(&mut byte) {
+                Ok(0) => {
+                    export_shutdown.store(true, Ordering::Release);
+                    break;
+                }
+                Ok(_) => {
+                    export_shutdown.store(true, Ordering::Release);
+                    break;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => {
+                    export_shutdown.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        }
+    })
+}
+
+#[cfg(feature = "block-volume")]
+fn block_attach_request_args(
+    args: &LivePoolAdminArgs,
+) -> Result<(&str, u16, u16, u64), LivePoolAdminError> {
+    validate_request_arg_names(
+        args,
+        &[
+            "volume",
+            "nr_hw_queues",
+            "queue_depth",
+            "drain_deadline_secs",
+        ],
+    )?;
+    let volume = request_arg_str(args, "volume")?
+        .ok_or_else(|| LivePoolAdminError::malformed("block attach requires volume"))?;
+    let nr_hw_queues = request_arg_u16(args, "nr_hw_queues")?.unwrap_or(1);
+    let queue_depth = request_arg_u16(args, "queue_depth")?.unwrap_or(64);
+    let drain_deadline_secs = request_arg_u64(args, "drain_deadline_secs")?.unwrap_or(30);
+    Ok((volume, nr_hw_queues, queue_depth, drain_deadline_secs))
 }
 
 fn validate_request_pool_identity(
@@ -492,6 +785,7 @@ fn pool_mount_request_args(
 fn pool_export(
     request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
+    #[cfg(feature = "block-volume")] block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
     shutdown: &Arc<AtomicBool>,
 ) -> LivePoolAdminResponse {
     if let Err(err) = validate_pool_export_request_args(&request.args) {
@@ -499,6 +793,8 @@ fn pool_export(
     }
 
     shutdown.store(true, Ordering::Release);
+    #[cfg(feature = "block-volume")]
+    stop_active_block_export(block_export);
     let value = json!({
         "pool_name": manifest.pool_name,
         "pool_uuid": manifest.pool_uuid,
@@ -704,6 +1000,36 @@ fn request_arg_str<'a>(
     }
 }
 
+#[cfg(feature = "block-volume")]
+fn request_arg_u64(
+    args: &LivePoolAdminArgs,
+    name: &str,
+) -> Result<Option<u64>, LivePoolAdminError> {
+    match args.0.get(name) {
+        None | Some(LivePoolAdminArg::Null) => Ok(None),
+        Some(LivePoolAdminArg::U64(value)) => Ok(Some(*value)),
+        Some(_) => Err(LivePoolAdminError::malformed(format!(
+            "live-owner request argument '{name}' must be an unsigned integer"
+        ))),
+    }
+}
+
+#[cfg(feature = "block-volume")]
+fn request_arg_u16(
+    args: &LivePoolAdminArgs,
+    name: &str,
+) -> Result<Option<u16>, LivePoolAdminError> {
+    request_arg_u64(args, name)?
+        .map(|value| {
+            u16::try_from(value).map_err(|_| {
+                LivePoolAdminError::malformed(format!(
+                    "live-owner request argument '{name}' exceeds u16"
+                ))
+            })
+        })
+        .transpose()
+}
+
 fn request_arg_string_array(
     args: &LivePoolAdminArgs,
     name: &str,
@@ -744,6 +1070,7 @@ mod tests {
             backing_dir: "/var/lib/tidefs/tank".to_string(),
             mountpoint: "/mnt/tank".to_string(),
             socket_path: "/run/tidefs/pools/tank/owner.sock".to_string(),
+            read_only: false,
         }
     }
 
@@ -755,6 +1082,72 @@ mod tests {
             validate_requested_pool_uuid(Some("0123456789ABCDEFFEDCBA9876543210"), &manifest)
                 .is_ok()
         );
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
+    fn block_attach_args_require_named_volume_and_decode_geometry() {
+        let args = LivePoolAdminArgs(
+            [
+                (
+                    "volume".to_string(),
+                    LivePoolAdminArg::String("vol".to_string()),
+                ),
+                ("nr_hw_queues".to_string(), LivePoolAdminArg::U64(2)),
+                ("queue_depth".to_string(), LivePoolAdminArg::U64(128)),
+                ("drain_deadline_secs".to_string(), LivePoolAdminArg::U64(45)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        assert_eq!(
+            block_attach_request_args(&args).expect("decode block attach arguments"),
+            ("vol", 2, 128, 45)
+        );
+        assert!(block_attach_request_args(&LivePoolAdminArgs::default()).is_err());
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
+    fn stopping_active_block_export_sets_its_shutdown_flag() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(Mutex::new(Some(ActiveBlockExport {
+            volume: "vol".to_string(),
+            shutdown: Arc::clone(&shutdown),
+        })));
+
+        stop_active_block_export(&active);
+
+        assert!(shutdown.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
+    fn block_export_reservation_refuses_owner_shutdown() {
+        let owner_shutdown = Arc::new(AtomicBool::new(true));
+        let export_shutdown = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(Mutex::new(None));
+
+        let error = reserve_block_export(&active, &owner_shutdown, "tank", "vol", &export_shutdown)
+            .unwrap_err();
+
+        assert_eq!(error, "live owner is shutting down");
+        assert!(active.lock().unwrap().is_none());
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
+    fn client_disconnect_stops_block_export() {
+        let (server, client) = UnixStream::pair().expect("create client socket pair");
+        let stop = Arc::new(AtomicBool::new(false));
+        let export_shutdown = Arc::new(AtomicBool::new(false));
+        let monitor = monitor_client_disconnect(server, stop, Arc::clone(&export_shutdown));
+
+        drop(client);
+        monitor.join().expect("join disconnect monitor");
+
+        assert!(export_shutdown.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1101,13 +1494,21 @@ mod tests {
     fn pool_export_malformed_args_fail_before_shutdown() {
         let manifest = manifest();
         let shutdown = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "block-volume")]
+        let block_export = Arc::new(Mutex::new(None));
         let mut valid = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolExport, "tank");
         valid
             .args
             .0
             .insert("force".to_string(), LivePoolAdminArg::Bool(true));
 
-        let response = pool_export(&valid, &manifest, &shutdown);
+        let response = pool_export(
+            &valid,
+            &manifest,
+            #[cfg(feature = "block-volume")]
+            &block_export,
+            &shutdown,
+        );
 
         assert_eq!(response.exit_code, 0);
         assert!(shutdown.load(Ordering::Acquire));
@@ -1125,10 +1526,18 @@ mod tests {
             ),
         ] {
             let shutdown = Arc::new(AtomicBool::new(false));
+            #[cfg(feature = "block-volume")]
+            let block_export = Arc::new(Mutex::new(None));
             let mut request = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolExport, "tank");
             request.args.0.insert(name.to_string(), value);
 
-            let message = assert_typed_malformed(pool_export(&request, &manifest, &shutdown));
+            let message = assert_typed_malformed(pool_export(
+                &request,
+                &manifest,
+                #[cfg(feature = "block-volume")]
+                &block_export,
+                &shutdown,
+            ));
 
             assert!(message.contains(detail));
             assert!(!shutdown.load(Ordering::Acquire));

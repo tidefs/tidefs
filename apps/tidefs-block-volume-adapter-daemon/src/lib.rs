@@ -14,16 +14,7 @@
 use std::error::Error;
 use std::fmt;
 
-use tidefs_block_volume_adapter_core::{
-    BlockVolumeGeometryRecord, BlockVolumeId, BlockVolumeQueuePolicyRecord,
-    BlockVolumeQueueRuntime, BlockVolumeQueueSetRecord,
-};
 use tidefs_types_package_profile_catalog::BLOCK_VOLUME_ADAPTER_DAEMON_SURFACE;
-use tidefs_ublk_abi::{
-    params_size, UblkParamBasic, UblkParamDiscard, UblkParamSegment, UblkParams,
-    UBLK_ABI_GATE_OW_301I, UBLK_ATTR_FUA, UBLK_MAX_NR_QUEUES, UBLK_MAX_QUEUE_DEPTH,
-    UBLK_MIN_SEGMENT_SIZE, UBLK_PARAM_TYPE_BASIC, UBLK_PARAM_TYPE_DISCARD, UBLK_PARAM_TYPE_SEGMENT,
-};
 pub mod kernel_check;
 pub mod signal_shutdown;
 
@@ -36,12 +27,18 @@ pub mod ublk_control_open;
 pub mod ublk_io;
 pub mod ublk_io_handler;
 pub mod ublk_io_uring;
+mod ublk_parameter_spec;
 
 // Re-export key integration-test types that are defined in private
 // sub-modules of ublk_control_open.
 pub use ublk_control_open::data_queue_worker::{
     DataQueueWorker, DataQueueWorkerError, DataQueueWorkerReport, DataQueueWorkerResultEntry,
 };
+pub(crate) use ublk_parameter_spec::{
+    build_ublk_parameter_spec_report, build_ublk_parameter_spec_report_with_geometry,
+};
+#[cfg(test)]
+pub(crate) use ublk_parameter_spec::{build_ublk_parameters, UblkParameterSpecError};
 
 // ── Crate-level constants ─────────────────────────────────────────────
 
@@ -122,8 +119,7 @@ impl BarrierAuditLog {
     /// Record a barrier event with an optional committed-root anchor.
     ///
     /// `committed_root_opt` encodes the txg committed-root pointer as a hex
-    /// string when the backend exposes it (e.g. `BlockVolumeObjectStoreBackend`).
-    /// File-image backends produce `None`.
+    /// string when the backend exposes it. File-image backends produce `None`.
     pub fn record_with_root(
         &mut self,
         barrier_type: BarrierType,
@@ -238,263 +234,4 @@ pub(crate) fn print_plan_step(step: tidefs_ublk_abi::UblkControlPlanStep) {
         step.ordinal,
         step.mutates_control_state()
     );
-}
-
-pub(crate) fn build_ublk_parameter_spec_report() -> Result<UblkParameterSpecReport, AppError> {
-    let geometry = BlockVolumeGeometryRecord::new(BlockVolumeId::new(301_091), 4096, 1024, 1);
-    build_ublk_parameter_spec_report_with_geometry(geometry, 4, 64)
-}
-
-pub(crate) fn build_ublk_parameter_spec_report_with_geometry(
-    geometry: BlockVolumeGeometryRecord,
-    nr_hw_queues: u16,
-    queue_depth: u16,
-) -> Result<UblkParameterSpecReport, AppError> {
-    let max_inflight_bytes = 1024 * 1024;
-    let shard_count = nr_hw_queues as usize;
-    let max_inflight_requests = queue_depth as usize;
-    let runtime = BlockVolumeQueueRuntime::open(
-        geometry,
-        shard_count,
-        max_inflight_requests,
-        max_inflight_bytes,
-    )
-    .ok_or_else(|| AppError::new("build demo block-volume queue runtime"))?;
-    build_ublk_parameters(geometry, &runtime.queue_policy, &runtime.queue_set)
-        .map_err(|err| AppError::new(format!("project ublk parameters: {}", err.as_str())))
-}
-
-fn build_ublk_parameters(
-    geometry: BlockVolumeGeometryRecord,
-    queue_policy: &BlockVolumeQueuePolicyRecord,
-    queue_set: &BlockVolumeQueueSetRecord,
-) -> Result<UblkParameterSpecReport, UblkParameterSpecError> {
-    if geometry.block_size_bytes == 0 {
-        return Err(UblkParameterSpecError::ZeroBlockSize);
-    }
-    if geometry.block_count == 0 {
-        return Err(UblkParameterSpecError::ZeroBlockCount);
-    }
-    if !geometry.block_size_bytes.is_power_of_two() {
-        return Err(UblkParameterSpecError::NonPowerOfTwoBlockSize);
-    }
-    if geometry.block_size_bytes < LINUX_SECTOR_SIZE_BYTES {
-        return Err(UblkParameterSpecError::BlockSizeBelowLinuxSector);
-    }
-    let capacity_bytes = geometry
-        .capacity_bytes()
-        .ok_or(UblkParameterSpecError::CapacityOverflow)?;
-    if capacity_bytes % LINUX_SECTOR_SIZE_BYTES != 0 {
-        return Err(UblkParameterSpecError::CapacityNotSectorAligned);
-    }
-    if queue_policy.shard_count != queue_set.shard_count {
-        return Err(UblkParameterSpecError::QueuePolicyMismatch);
-    }
-    if queue_set.block_count != geometry.block_count {
-        return Err(UblkParameterSpecError::QueueSetGeometryMismatch);
-    }
-    if queue_set.shard_count == 0 {
-        return Err(UblkParameterSpecError::ZeroQueues);
-    }
-    if queue_set.shard_count > usize::from(UBLK_MAX_NR_QUEUES) {
-        return Err(UblkParameterSpecError::TooManyQueues);
-    }
-    if queue_policy.max_inflight_requests == 0 {
-        return Err(UblkParameterSpecError::ZeroQueueDepth);
-    }
-    if queue_policy.max_inflight_requests > usize::from(UBLK_MAX_QUEUE_DEPTH) {
-        return Err(UblkParameterSpecError::QueueDepthTooLarge);
-    }
-    if queue_policy.max_inflight_bytes < geometry.block_size_bytes {
-        return Err(UblkParameterSpecError::MaxInflightBytesBelowBlockSize);
-    }
-    if queue_policy.max_inflight_bytes % LINUX_SECTOR_SIZE_BYTES != 0 {
-        return Err(UblkParameterSpecError::MaxInflightBytesNotSectorAligned);
-    }
-    if queue_policy.max_inflight_bytes < UBLK_MIN_SEGMENT_SIZE as usize {
-        return Err(UblkParameterSpecError::MaxInflightBytesBelowUblkSegmentMinimum);
-    }
-
-    let queue_count =
-        u16::try_from(queue_set.shard_count).map_err(|_| UblkParameterSpecError::TooManyQueues)?;
-    let queue_depth = u16::try_from(queue_policy.max_inflight_requests)
-        .map_err(|_| UblkParameterSpecError::QueueDepthTooLarge)?;
-    let dev_sectors = u64::try_from(capacity_bytes / LINUX_SECTOR_SIZE_BYTES)
-        .map_err(|_| UblkParameterSpecError::CapacityOverflow)?;
-    let max_sectors = u32::try_from(queue_policy.max_inflight_bytes / LINUX_SECTOR_SIZE_BYTES)
-        .map_err(|_| UblkParameterSpecError::MaxSectorsOverflow)?;
-    let block_sectors = u32::try_from(geometry.block_size_bytes / LINUX_SECTOR_SIZE_BYTES)
-        .map_err(|_| UblkParameterSpecError::BlockSectorsOverflow)?;
-    let (discard_granularity, discard_sectors) = if geometry.admits_discard() {
-        (
-            project_discard_granularity_bytes(geometry)?,
-            project_discard_granularity_sectors(geometry, block_sectors)?,
-        )
-    } else {
-        (
-            u32::try_from(geometry.block_size_bytes)
-                .map_err(|_| UblkParameterSpecError::DiscardGranularityOverflow)?,
-            block_sectors,
-        )
-    };
-    let segment_size = u32::try_from(queue_policy.max_inflight_bytes)
-        .map_err(|_| UblkParameterSpecError::MaxSegmentSizeOverflow)?;
-    let block_shift = geometry.block_size_bytes.trailing_zeros() as u8;
-    let logical_bs_shift = device_topology_shift(geometry.logical_sector_size, block_shift);
-    let physical_bs_shift = device_topology_shift(geometry.physical_sector_size, block_shift);
-    let io_opt_shift = if geometry.optimal_io_size > 0 {
-        device_topology_shift(geometry.optimal_io_size, block_shift)
-    } else {
-        block_shift
-    };
-    let io_min_shift = if geometry.min_io_size > 0 {
-        device_topology_shift(geometry.min_io_size, block_shift)
-    } else {
-        block_shift
-    };
-    let param_types = UBLK_PARAM_TYPE_BASIC | UBLK_PARAM_TYPE_DISCARD | UBLK_PARAM_TYPE_SEGMENT;
-    let params = UblkParams {
-        len: params_size() as u32,
-        types: param_types,
-        basic: UblkParamBasic {
-            attrs: UBLK_ATTR_FUA,
-            logical_bs_shift,
-            physical_bs_shift,
-            io_opt_shift,
-            io_min_shift,
-            max_sectors,
-            chunk_sectors: discard_sectors,
-            dev_sectors,
-            virt_boundary_mask: 0,
-        },
-        discard: UblkParamDiscard {
-            discard_alignment: 0,
-            discard_granularity,
-            max_discard_sectors: if geometry.admits_discard() {
-                max_sectors
-            } else {
-                0
-            },
-            max_write_zeroes_sectors: max_sectors,
-            max_discard_segments: if geometry.admits_discard() { 1 } else { 0 },
-            reserved0: 0,
-        },
-        seg: UblkParamSegment {
-            seg_boundary_mask: u64::from(UBLK_MIN_SEGMENT_SIZE) - 1,
-            max_segment_size: segment_size,
-            max_segments: 1,
-            pad: [0; 2],
-        },
-        ..UblkParams::default()
-    };
-
-    Ok(UblkParameterSpecReport {
-        geometry,
-        queue_count,
-        queue_depth,
-        max_inflight_bytes: queue_policy.max_inflight_bytes,
-        params,
-        params_set_ioctl_issued: false,
-    })
-}
-
-/// Compute a block-shift value (log2) from a device topology size in bytes.
-///
-/// The returned shift must be at least `fallback_shift` (derived from
-/// the volume block size). Values that are not positive powers of two
-/// fall back to `fallback_shift`.
-pub(crate) fn device_topology_shift(size_bytes: u64, fallback_shift: u8) -> u8 {
-    if size_bytes == 0 || !size_bytes.is_power_of_two() {
-        return fallback_shift;
-    }
-    let shift = size_bytes.trailing_zeros() as u8;
-    if shift < fallback_shift {
-        fallback_shift
-    } else {
-        shift
-    }
-}
-
-fn project_discard_granularity_bytes(
-    geometry: BlockVolumeGeometryRecord,
-) -> Result<u32, UblkParameterSpecError> {
-    let Some(bytes) = geometry
-        .discard_granularity_blocks
-        .checked_mul(geometry.block_size_bytes)
-    else {
-        return Err(UblkParameterSpecError::DiscardGranularityOverflow);
-    };
-    u32::try_from(bytes).map_err(|_| UblkParameterSpecError::DiscardGranularityOverflow)
-}
-
-fn project_discard_granularity_sectors(
-    geometry: BlockVolumeGeometryRecord,
-    block_sectors: u32,
-) -> Result<u32, UblkParameterSpecError> {
-    let blocks = u32::try_from(geometry.discard_granularity_blocks)
-        .map_err(|_| UblkParameterSpecError::DiscardGranularityOverflow)?;
-    blocks
-        .checked_mul(block_sectors)
-        .ok_or(UblkParameterSpecError::DiscardGranularityOverflow)
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct UblkParameterSpecReport {
-    geometry: BlockVolumeGeometryRecord,
-    queue_count: u16,
-    queue_depth: u16,
-    max_inflight_bytes: usize,
-    params: UblkParams,
-    params_set_ioctl_issued: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UblkParameterSpecError {
-    ZeroBlockSize,
-    ZeroBlockCount,
-    NonPowerOfTwoBlockSize,
-    BlockSizeBelowLinuxSector,
-    CapacityOverflow,
-    CapacityNotSectorAligned,
-    QueuePolicyMismatch,
-    QueueSetGeometryMismatch,
-    ZeroQueues,
-    TooManyQueues,
-    ZeroQueueDepth,
-    QueueDepthTooLarge,
-    MaxInflightBytesBelowBlockSize,
-    MaxInflightBytesNotSectorAligned,
-    MaxInflightBytesBelowUblkSegmentMinimum,
-    MaxSectorsOverflow,
-    BlockSectorsOverflow,
-    DiscardGranularityOverflow,
-    MaxSegmentSizeOverflow,
-}
-
-impl UblkParameterSpecError {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::ZeroBlockSize => "zero_block_size",
-            Self::ZeroBlockCount => "zero_block_count",
-            Self::NonPowerOfTwoBlockSize => "non_power_of_two_block_size",
-            Self::BlockSizeBelowLinuxSector => "block_size_below_linux_sector",
-            Self::CapacityOverflow => "capacity_overflow",
-            Self::CapacityNotSectorAligned => "capacity_not_sector_aligned",
-            Self::QueuePolicyMismatch => "queue_policy_mismatch",
-            Self::QueueSetGeometryMismatch => "queue_set_geometry_mismatch",
-            Self::ZeroQueues => "zero_queues",
-            Self::TooManyQueues => "too_many_queues",
-            Self::ZeroQueueDepth => "zero_queue_depth",
-            Self::QueueDepthTooLarge => "queue_depth_too_large",
-            Self::MaxInflightBytesBelowBlockSize => "max_inflight_bytes_below_block_size",
-            Self::MaxInflightBytesNotSectorAligned => "max_inflight_bytes_not_sector_aligned",
-            Self::MaxInflightBytesBelowUblkSegmentMinimum => {
-                "max_inflight_bytes_below_ublk_segment_minimum"
-            }
-            Self::MaxSectorsOverflow => "max_sectors_overflow",
-            Self::BlockSectorsOverflow => "block_sectors_overflow",
-            Self::DiscardGranularityOverflow => "discard_granularity_overflow",
-            Self::MaxSegmentSizeOverflow => "max_segment_size_overflow",
-        }
-    }
 }

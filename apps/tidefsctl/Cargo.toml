@@ -18,8 +18,7 @@ block-volume = [
     "dep:tidefs-block-volume-adapter-core",
     "dep:tidefs-block-volume-adapter-daemon",
     "dep:tidefs-block-volume-adapter-ublk-control-runtime",
-    "dep:tidefs-recovery-loop",
-    "dep:tidefs-transport",
+    "tidefs-posix-filesystem-adapter-daemon/block-volume",
 ]
 cluster = [
     "dep:bincode",
@@ -63,6 +62,7 @@ tidefs-auth = { workspace = true }
 tidefs-posix-filesystem-adapter-daemon = { workspace = true }
 tidefs-block-volume-adapter-core = { workspace = true, optional = true }
 tidefs-pool-import = { workspace = true }
+tidefs-pool-runtime = { workspace = true }
 tidefs-pool-scan = { workspace = true }
 tidefs-validation = { workspace = true, optional = true }
 tidefs-recovery-loop = { workspace = true, optional = true }

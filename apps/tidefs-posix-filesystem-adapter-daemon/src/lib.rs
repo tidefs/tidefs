@@ -1118,6 +1118,8 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         }
         (engine, tracker, dataset_id)
     };
+    #[cfg(feature = "block-volume")]
+    let shared_filesystem = base_engine.shared_filesystem();
 
     // When cluster-authorized, wrap the engine in a placement-recording layer.
     #[cfg(feature = "cluster")]
@@ -1279,10 +1281,13 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                     backing_dir: config.backing_dir.clone(),
                     mountpoint: config.mountpoint.clone(),
                     runtime_dir,
+                    read_only: effective_mode.read_only,
                 };
                 let owner = match live_owner::start_fuse_owner(
                     owner_config,
                     Arc::clone(&live_owner_engine),
+                    #[cfg(feature = "block-volume")]
+                    shared_filesystem.clone(),
                     Arc::clone(&shutdown),
                 ) {
                     Ok(owner) => owner,
@@ -1393,6 +1398,9 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
     }
 
     crate::observability::emit_all_summaries();
+    if let Some(live_owner) = live_owner {
+        live_owner.stop();
+    }
     session.join();
     let artifact_result = match config.runtime.queue_depth_artifact.as_deref() {
         Some(path) => write_queue_depth_runtime_artifact(&queue_depth_engine, path),
@@ -1408,9 +1416,6 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
         if let Some(ref pool_name) = config.pool_name {
             eprintln!("tidefsctl: pool exported: {pool_name}");
         }
-    }
-    if let Some(live_owner) = live_owner {
-        live_owner.stop();
     }
     if snapshot_export {
         eprintln!(

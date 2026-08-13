@@ -176,7 +176,7 @@ proptest! {
         fs.flush_write_buffer(inode_id)
             .expect("materialize initial write through Pool authority");
         let record_before = fs.stat("/data.bin").expect("stat before patch");
-        let layout_before = MountedContentReadAuthority::new(&fs.store)
+        let layout_before = MountedContentReadAuthority::new(fs.store.pool())
             .read_layout(inode_id, &record_before)
             .expect("read initial layout through Pool authority");
         let ContentLayout::Chunked(manifest_before) = layout_before else {
@@ -190,7 +190,7 @@ proptest! {
         fs.flush_write_buffer(inode_id)
             .expect("materialize patch through Pool authority");
         let record_after = fs.stat("/data.bin").expect("stat after patch");
-        let layout_after = MountedContentReadAuthority::new(&fs.store)
+        let layout_after = MountedContentReadAuthority::new(fs.store.pool())
             .read_layout(inode_id, &record_after)
             .expect("read patched layout through Pool authority");
         let ContentLayout::Chunked(manifest_after) = layout_after else {
@@ -327,7 +327,7 @@ proptest! {
         fs.flush_write_buffer(inode_id)
             .expect("materialize file through Pool authority");
         let record = fs.stat("/data.bin").expect("stat file");
-        let layout = MountedContentReadAuthority::new(&fs.store)
+        let layout = MountedContentReadAuthority::new(fs.store.pool())
             .read_layout(inode_id, &record)
             .expect("read manifest through Pool authority");
         let ContentLayout::Chunked(manifest) = layout else {
@@ -384,7 +384,7 @@ proptest! {
             fs.sync_all().expect("sync");
 
             let record = fs.stat("/data.bin").expect("stat");
-            let layout = MountedContentReadAuthority::new(&fs.store)
+            let layout = MountedContentReadAuthority::new(fs.store.pool())
                 .read_layout(record.inode_id, &record)
                 .expect("read synced layout through Pool authority");
             let ContentLayout::Chunked(manifest) = layout else {
@@ -395,7 +395,7 @@ proptest! {
         {
             let fs = LocalFileSystem::open_with_options(&root, prop_options()).expect("reopen fs");
             let record = fs.stat("/data.bin").expect("stat after reopen");
-            let layout = MountedContentReadAuthority::new(&fs.store)
+            let layout = MountedContentReadAuthority::new(fs.store.pool())
                 .read_layout(record.inode_id, &record)
                 .expect("read reopened layout through Pool authority");
             let ContentLayout::Chunked(manifest_after) = layout else {

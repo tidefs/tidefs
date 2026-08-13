@@ -205,8 +205,11 @@ impl LocalFileSystem {
         let snapshot = self.snapshot_summary(snapshot_name)?;
         let exported_root = snapshot.source_root.clone();
         let root = root_commit_from_summary(&exported_root);
-        let exported_state =
-            load_state_from_transaction_pool(&self.store, &root, self.root_authentication_key)?;
+        let exported_state = load_state_from_transaction_pool(
+            self.store.pool(),
+            &root,
+            self.root_authentication_key,
+        )?;
         let summary = SnapshotExportSummary {
             snapshot,
             exported_root,

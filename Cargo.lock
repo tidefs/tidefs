@@ -2039,9 +2039,10 @@ dependencies = [
  "tempfile",
  "tidefs-block-volume-adapter-core",
  "tidefs-block-volume-adapter-ublk-control-runtime",
- "tidefs-commit_group",
+ "tidefs-dataset-lifecycle",
+ "tidefs-local-filesystem",
  "tidefs-local-object-store",
- "tidefs-recovery-loop",
+ "tidefs-pool-runtime",
  "tidefs-types-package-profile-catalog",
  "tidefs-ublk-abi",
 ]
@@ -2651,6 +2652,7 @@ dependencies = [
  "tidefs-local-object-store",
  "tidefs-online-defrag",
  "tidefs-orphan-index",
+ "tidefs-pool-runtime",
  "tidefs-pool-scan",
  "tidefs-posix-acl",
  "tidefs-posix-semantics",
@@ -2989,6 +2991,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-pool-runtime"
+version = "0.421.0"
+dependencies = [
+ "blake3",
+ "tempfile",
+ "tidefs-dataset-catalog",
+ "tidefs-dataset-properties",
+ "tidefs-local-object-store",
+ "tidefs-pool-scan",
+]
+
+[[package]]
 name = "tidefs-pool-scan"
 version = "0.421.0"
 dependencies = [
@@ -3023,6 +3037,7 @@ dependencies = [
  "tempfile",
  "tidefs-background-scheduler",
  "tidefs-block-volume-adapter-core",
+ "tidefs-block-volume-adapter-daemon",
  "tidefs-cache-core",
  "tidefs-cluster",
  "tidefs-dataset-catalog",
@@ -3981,6 +3996,7 @@ dependencies = [
  "tidefs-local-object-store",
  "tidefs-membership-epoch",
  "tidefs-pool-import",
+ "tidefs-pool-runtime",
  "tidefs-pool-scan",
  "tidefs-posix-filesystem-adapter-daemon",
  "tidefs-recovery-loop",

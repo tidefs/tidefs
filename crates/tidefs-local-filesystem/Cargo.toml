@@ -29,6 +29,7 @@ tidefs-types-cache-lattice-core = { workspace = true }
 tidefs-types-space-accounting-core = { workspace = true }
 tidefs-space-accounting = { workspace = true }
 tidefs-local-object-store = { workspace = true }
+tidefs-pool-runtime = { workspace = true }
 tidefs-durability-layout = { workspace = true }
 tidefs-types-vfs-core = { workspace = true, features = ["alloc"] }
 tidefs-vfs-engine = { workspace = true }
