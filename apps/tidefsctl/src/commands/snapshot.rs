@@ -1730,7 +1730,13 @@ fn handle_list(args: SnapshotListArgs) {
         "list",
         RecoveryPolicy::ReadOnly,
     );
-    let mut snapshots = fs.list_snapshots_extended();
+    let mut snapshots = fs.list_snapshots_extended_checked().unwrap_or_else(|err| {
+        volume_snapshot_exit(
+            "list",
+            format!("failed to list filesystem snapshots: {err}"),
+            false,
+        )
+    });
     snapshots.sort_by(|a, b| {
         a.created_at_generation
             .cmp(&b.created_at_generation)

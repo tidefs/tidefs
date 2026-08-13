@@ -2544,7 +2544,10 @@ impl VfsLocalFileSystem {
 
     fn live_snapshot_list(&self, wants_json: bool) -> LivePoolAdminResponse {
         let fs = self.fs.borrow();
-        let mut snapshots = fs.list_snapshots();
+        let mut snapshots = match fs.list_snapshots_checked() {
+            Ok(snapshots) => snapshots,
+            Err(err) => return live_admin_error(1, format!("snapshot list: {err}")),
+        };
         let volume_snapshots = match fs.list_volume_snapshot_datasets() {
             Ok(snapshots) => snapshots,
             Err(err) => return live_admin_error(1, format!("snapshot list: {err}")),

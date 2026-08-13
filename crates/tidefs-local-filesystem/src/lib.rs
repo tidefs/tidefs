@@ -769,13 +769,19 @@ pub fn plan_root_retention_with_root_authentication_key(
     policy: RootRetentionPolicy,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RootRetentionPlan> {
-    let mut store = LocalFileSystem::default_development_pool(root.as_ref(), &options, None, None)?;
-    let mut authority = MountedOpenRecoveryAuthority::raw_only(
-        &mut store,
+    let pool = LocalFileSystem::default_development_pool(root.as_ref(), &options, None, None)?;
+    let mut runtime = PoolRuntime::open(pool)?;
+    let (state, current_root) = load_canonical_committed_state(&runtime, root_authentication_key)?;
+    let plan = plan_root_retention_pool(runtime.pool_mut(), policy, root_authentication_key)?;
+    let canonical_pool_keys = runtime.canonical_root_object_keys()?;
+    extend_root_retention_plan_with_canonical_roots(
+        runtime.pool_mut(),
+        plan,
+        &canonical_pool_keys,
+        &current_root.summary(),
+        &state,
         root_authentication_key,
-        RecoveryPolicy::default(),
-    );
-    authority.root_retention_plan(policy)
+    )
 }
 
 pub fn run_crash_recovery_matrix(
@@ -845,6 +851,7 @@ struct MutationDelta {
     old_inodes: BTreeMap<InodeId, InodeRecord>,
     old_directories: BTreeMap<InodeId, BTreeMap<Vec<u8>, NamespaceEntry>>,
     old_snapshots: BTreeMap<Vec<u8>, SnapshotRecord>,
+    old_lifecycle: DatasetLifecycle,
     old_generation: u64,
     old_inode_authority: DatasetInodeAuthority,
     // Side-ledger snapshots for full transaction rollback (#5980).
@@ -4189,14 +4196,25 @@ impl LocalFileSystem {
                     reason: "canonical Pool catalog does not match filesystem snapshot state",
                 });
             }
-            let expected_root = encode_root_commit(&root_commit_from_summary(&record.root));
-            let stored_root = store.load_dataset_root(
-                snapshot::snapshot_record_dataset_id(record),
-                DatasetRootKind::Snapshot,
-            )?;
+            let stored_root =
+                store.load_snapshot_root(snapshot::snapshot_record_dataset_id(record))?;
+            let expected_root = snapshot::snapshot_record_typed_root(record)?;
             if stored_root != expected_root {
                 return Err(FileSystemError::CorruptState {
                     reason: "canonical Pool snapshot root does not match filesystem snapshot state",
+                });
+            }
+            let stored_source = store.load_root_reference(stored_root.source_reference)?;
+            if PoolRuntime::dataset_root_reference(
+                stored_root.source_reference.dataset_id,
+                stored_root.source_reference.kind,
+                stored_root.source_reference.semantic_generation,
+                &stored_source,
+            ) != stored_root.source_reference
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason:
+                        "canonical Pool snapshot source root reference does not match its object",
                 });
             }
             expected_snapshot_catalog_names.insert(catalog_name);
@@ -4831,6 +4849,9 @@ impl LocalFileSystem {
         &mut self,
         policy: RootRetentionPolicy,
     ) -> Result<RootRetentionPlan> {
+        self.ensure_snapshot_authority_consistent()?;
+        let current_root = self.selected_committed_root_summary()?;
+        let canonical_pool_keys = self.store.canonical_root_object_keys()?;
         let root_authentication_key = self.root_authentication_key;
         let recovery_policy = self.recovery_policy;
         let mut authority = MountedOpenRecoveryAuthority::raw_only(
@@ -4838,7 +4859,16 @@ impl LocalFileSystem {
             root_authentication_key,
             recovery_policy,
         );
-        authority.root_retention_plan(policy)
+        let plan = authority.root_retention_plan(policy)?;
+        drop(authority);
+        extend_root_retention_plan_with_canonical_roots(
+            self.store.pool_mut(),
+            plan,
+            &canonical_pool_keys,
+            &current_root,
+            &self.state,
+            root_authentication_key,
+        )
     }
 
     pub fn safe_root_retention_plan(&mut self) -> Result<RootRetentionPlan> {
@@ -5201,9 +5231,12 @@ impl LocalFileSystem {
     /// Uncertainty is terminal for this read-only preflight so background
     /// reclaim leaves the exact local queue entries pending.
     fn collect_reclaim_protected_content_keys(&mut self) -> Result<HashSet<ObjectKey>> {
+        self.ensure_snapshot_authority_consistent()?;
+        let current_root = self.selected_committed_root_summary()?;
         Ok(reclaim_protected_content_keys_pool(
             self.store.pool_mut(),
             self.root_authentication_key,
+            &current_root,
             &self.state,
         )?
         .into_iter()
@@ -5624,10 +5657,17 @@ impl LocalFileSystem {
         let expected_roots = plan.protected_committed_roots.clone();
         let expected_root_slot_locations = plan.protected_root_slot_locations.len();
         let selected_root_before = plan.audit.selected_root.clone();
-        let store_report = self.store.pool_mut().compact_retaining(
-            &plan.protected_object_keys,
-            &plan.protected_root_slot_locations,
-        )?;
+        let mut protected_object_keys = plan.protected_object_keys.clone();
+        protected_object_keys.extend(self.store.canonical_root_object_keys()?);
+        let mut canonical_roots = snapshot_retained_roots(&self.state);
+        let current_root = self.selected_committed_root_summary()?;
+        if !canonical_roots.contains(&current_root) {
+            canonical_roots.push(current_root);
+        }
+        let store_report = self
+            .store
+            .pool_mut()
+            .compact_retaining(&protected_object_keys, &plan.protected_root_slot_locations)?;
         let root_authentication_key = self.root_authentication_key;
         let audit = audit_recovery_pool(self.store.pool_mut(), root_authentication_key)?;
         let recovery_policy = self.recovery_policy;
@@ -5637,14 +5677,19 @@ impl LocalFileSystem {
             recovery_policy,
         );
         for expected in &expected_roots {
-            let locations = authority.root_slot_locations_for_summary(expected)?;
-            if locations.is_empty() {
+            let expected_root = root_commit_from_summary(expected);
+            let _ = authority.load_committed_root_state(&expected_root)?;
+            if canonical_roots.contains(expected) {
+                continue;
+            }
+            if authority
+                .root_slot_locations_for_summary(expected)?
+                .is_empty()
+            {
                 return Err(FileSystemError::CorruptState {
                     reason: "safe reclamation lost a protected root-slot location",
                 });
             }
-            let expected_root = root_commit_from_summary(expected);
-            let _ = authority.load_committed_root_state(&expected_root)?;
         }
         let selected_generation_after = audit.selected_root.as_ref().map(|root| root.generation);
         if audit.selected_root != selected_root_before {
@@ -6679,6 +6724,11 @@ impl LocalFileSystem {
             .collect()
     }
 
+    pub fn list_snapshots_checked(&self) -> Result<Vec<SnapshotSummary>> {
+        self.ensure_snapshot_authority_consistent()?;
+        Ok(self.list_snapshots())
+    }
+
     pub fn snapshot_summary(&self, name: impl AsRef<str>) -> Result<SnapshotSummary> {
         let name = snapshot_name_bytes(name.as_ref())?;
         self.state
@@ -6715,16 +6765,23 @@ impl LocalFileSystem {
         };
         let summary = record.summary();
         self.state.snapshots.insert(name, record.clone());
-        snapshot::reconcile_snapshot_record_catalog_entry(self.dataset_catalog_mut()?, &record)?;
+        let authority_transition = self
+            .dataset_catalog_mut()
+            .and_then(|catalog| snapshot::reconcile_snapshot_record_catalog_entry(catalog, &record))
+            .and_then(|_| {
+                self.lifecycle
+                    .pin_root(traversal_root)
+                    .map_err(|_| FileSystemError::CorruptState {
+                        reason: "snapshot authority lifecycle pin set is full",
+                    })
+            });
+        if let Err(error) = authority_transition {
+            self.rollback_mutation_delta();
+            return Err(error);
+        }
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
-        let result = self.commit_mutation(summary)?;
-        self.lifecycle
-            .pin_root(traversal_root)
-            .map_err(|_| FileSystemError::CorruptState {
-                reason: "snapshot authority lifecycle pin set is full",
-            })?;
-        Ok(result)
+        self.commit_mutation(summary)
     }
 
     pub(crate) fn delete_snapshot_without_deadlist(
@@ -6756,12 +6813,18 @@ impl LocalFileSystem {
         self.begin_mutation("delete snapshot")?; // was: let previous_state = self.state.clone()
         self.bump_generation();
         self.state.snapshots.remove(&name);
-        snapshot::remove_snapshot_record_catalog_entry(self.dataset_catalog_mut()?, &record)?;
+        let authority_transition = self
+            .dataset_catalog_mut()
+            .and_then(|catalog| snapshot::remove_snapshot_record_catalog_entry(catalog, &record));
+        if let Err(error) = authority_transition {
+            self.rollback_mutation_delta();
+            return Err(error);
+        }
+        self.lifecycle
+            .unpin_root(snapshot::snapshot_record_traversal_root(&record)?);
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         let summary = self.commit_mutation(record.summary())?;
-        self.lifecycle
-            .unpin_root(snapshot::snapshot_record_traversal_root(&record)?);
         Ok((summary, record))
     }
 
@@ -13854,6 +13917,7 @@ impl LocalFileSystem {
                 old_inodes: BTreeMap::new(),
                 old_directories: BTreeMap::new(),
                 old_snapshots: self.state.snapshots.clone(),
+                old_lifecycle: self.lifecycle.clone(),
                 old_generation: self.state.generation,
                 old_inode_authority: self.state.inode_authority,
                 old_write_buffers: None,
@@ -13916,6 +13980,7 @@ impl LocalFileSystem {
                 }
             }
             self.state.snapshots = delta.old_snapshots;
+            self.lifecycle = delta.old_lifecycle;
             self.state.generation = delta.old_generation;
             self.state.inode_authority = delta.old_inode_authority;
             self.state.dirty_content.clear();

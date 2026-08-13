@@ -617,6 +617,8 @@ DEVICE="$LIFECYCLE_ROOT/device0.tidefs"
 MNT="$LIFECYCLE_ROOT/mnt"
 POOL=fuse_vm_test_pool
 PAYLOAD=tidefs-canonical-mounted-lifecycle
+OVERWRITE_PAYLOAD=tidefs-post-snapshot-overwrite
+SNAPSHOT=before-overwrite
 mkdir -p "$LIFECYCLE_ROOT" "$MNT"
 truncate -s 268435456 "$DEVICE"
 
@@ -658,6 +660,35 @@ else
     fail "mounted_create_write_fsync_rename_read" "mounted payload mismatch"
 fi
 
+if tidefsctl snapshot create "$POOL" "$SNAPSHOT" >/tmp/snapshot-create.log 2>&1 \
+  && tidefsctl snapshot list "$POOL" >/tmp/snapshot-list.log 2>&1 \
+  && grep -Fq "snapshot entry '$SNAPSHOT'" /tmp/snapshot-list.log; then
+    pass "mounted_snapshot_create_list"
+else
+    cat /tmp/snapshot-create.log 2>/dev/null || true
+    cat /tmp/snapshot-list.log 2>/dev/null || true
+    fail "mounted_snapshot_create_list" "canonical snapshot was not created and listed"
+fi
+
+printf '%s\n' "$OVERWRITE_PAYLOAD" > "$MNT/renamed.txt"
+sync "$MNT/renamed.txt"
+if [ "$(cat "$MNT/renamed.txt")" = "$OVERWRITE_PAYLOAD" ]; then
+    pass "mounted_post_snapshot_overwrite_fsync"
+else
+    fail "mounted_post_snapshot_overwrite_fsync" "post-snapshot overwrite mismatch"
+fi
+
+if tidefsctl snapshot rollback "$POOL" "$SNAPSHOT" >/tmp/snapshot-rollback.log 2>&1 \
+  && [ "$(cat "$MNT/renamed.txt")" = "$PAYLOAD" ] \
+  && tidefsctl snapshot list "$POOL" >/tmp/snapshot-list-after-rollback.log 2>&1 \
+  && grep -Fq "snapshot entry '$SNAPSHOT'" /tmp/snapshot-list-after-rollback.log; then
+    pass "mounted_snapshot_rollback_exact_bytes_retained"
+else
+    cat /tmp/snapshot-rollback.log 2>/dev/null || true
+    cat /tmp/snapshot-list-after-rollback.log 2>/dev/null || true
+    fail "mounted_snapshot_rollback_exact_bytes_retained" "rollback did not restore exact bytes while retaining the snapshot"
+fi
+
 if umount "$MNT" && wait "$MOUNT_PID"; then
     pass "clean_unmount_export"
 else
@@ -677,14 +708,51 @@ for i in $(seq 30); do
     fi
     sleep 1
 done
-if [ "$REMOUNTED" -eq 1 ] && [ "$(cat "$MNT/renamed.txt" 2>/dev/null)" = "$PAYLOAD" ]; then
-    pass "remount_persistence"
+if [ "$REMOUNTED" -eq 1 ] \
+  && [ "$(cat "$MNT/renamed.txt" 2>/dev/null)" = "$PAYLOAD" ] \
+  && tidefsctl snapshot list "$POOL" >/tmp/snapshot-list-after-remount.log 2>&1 \
+  && grep -Fq "snapshot entry '$SNAPSHOT'" /tmp/snapshot-list-after-remount.log; then
+    pass "remount_snapshot_rollback_persistence"
 else
     cat /tmp/pool-remount.log
-    fail "remount_persistence" "fsynced renamed file did not survive remount"
+    cat /tmp/snapshot-list-after-remount.log 2>/dev/null || true
+    fail "remount_snapshot_rollback_persistence" "restored bytes and snapshot did not survive remount"
+fi
+
+if tidefsctl snapshot destroy "$POOL" "$SNAPSHOT" >/tmp/snapshot-destroy.log 2>&1; then
+    pass "mounted_snapshot_logical_destroy"
+else
+    cat /tmp/snapshot-destroy.log
+    fail "mounted_snapshot_logical_destroy" "snapshot destroy failed"
+fi
+
+if ! umount "$MNT" || ! wait "$REMOUNT_PID"; then
+    fail "post_destroy_unmount" "mount owner did not exit cleanly after snapshot destroy"
+fi
+
+tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" >/tmp/pool-final-remount.log 2>&1 &
+FINAL_MOUNT_PID=$!
+FINAL_REMOUNTED=0
+for i in $(seq 30); do
+    if mountpoint -q "$MNT" 2>/dev/null; then
+        FINAL_REMOUNTED=1
+        break
+    fi
+    if ! kill -0 "$FINAL_MOUNT_PID" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+if [ "$FINAL_REMOUNTED" -eq 1 ] \
+  && ! tidefsctl snapshot rollback "$POOL" "$SNAPSHOT" >/tmp/snapshot-rollback-after-destroy.log 2>&1; then
+    pass "destroyed_snapshot_rollback_refused_after_reopen"
+else
+    cat /tmp/pool-final-remount.log 2>/dev/null || true
+    cat /tmp/snapshot-rollback-after-destroy.log 2>/dev/null || true
+    fail "destroyed_snapshot_rollback_refused_after_reopen" "destroyed snapshot remained rollback-reachable after reopen"
 fi
 umount "$MNT" 2>/dev/null || true
-wait "$REMOUNT_PID" 2>/dev/null || true
+wait "$FINAL_MOUNT_PID" 2>/dev/null || true
 
 echo "--- dmesg tail ---"
 dmesg | tail -80 2>/dev/null || true

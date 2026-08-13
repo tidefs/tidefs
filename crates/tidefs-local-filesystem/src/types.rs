@@ -340,7 +340,7 @@ pub const POSIX_SUBSET_ENTRIES: &[PosixSubsetEntry] = &[
         operation: "statfs",
         support: PosixSupport::IncludedAfterCurrentUserspaceImpl,
         errno: "EIO",
-        rule: "Statfs maps to the finite local storage allocator report; free blocks exclude content still protected by committed fallback roots.",
+        rule: "Statfs maps to the finite local storage allocator report; free blocks exclude content retained by the canonical current root or typed snapshots.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::MetadataMutation,
@@ -2001,9 +2001,9 @@ impl MountInvariantReport {
     }
 }
 
-pub const MINIMUM_SAFE_RETAINED_ROOTS: usize = 2;
-pub const DEFAULT_RETAINED_COMMITTED_ROOTS: usize = FILESYSTEM_ROOT_SLOT_COUNT as usize;
-pub const RETENTION_RECLAMATION_IS_NOT_FSCK: &str = "retention planning is validation-only and non-mutating; it must not delete fallback roots, guess repairs, or become production fsck";
+pub const MINIMUM_SAFE_RETAINED_ROOTS: usize = 1;
+pub const DEFAULT_RETAINED_COMMITTED_ROOTS: usize = 1;
+pub const RETENTION_RECLAMATION_IS_NOT_FSCK: &str = "retention planning is validation-only and non-mutating; it must preserve the canonical current root and typed snapshot sources, guess no repairs, and never become production fsck";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RootRetentionPolicy {
@@ -2027,8 +2027,7 @@ impl RootRetentionPolicy {
         if self.protected_committed_roots < MINIMUM_SAFE_RETAINED_ROOTS {
             return Err(FileSystemError::Unsupported {
                 operation: "retention planning",
-                reason:
-                    "policy would protect fewer committed roots than the no-fsck fallback floor",
+                reason: "policy would not protect the canonical current committed root",
             });
         }
         Ok(())

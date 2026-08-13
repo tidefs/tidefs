@@ -27,8 +27,8 @@ const POOL_ROOT_MAGIC: &[u8; 8] = b"TFSPOOL1";
 const POOL_ROOT_VERSION: u16 = 1;
 const VOLUME_ROOT_MAGIC: &[u8; 8] = b"TFSVOL02";
 const VOLUME_ROOT_VERSION: u16 = 2;
-const VOLUME_SNAPSHOT_ROOT_MAGIC: &[u8; 8] = b"TFSSNP01";
-const VOLUME_SNAPSHOT_ROOT_VERSION: u16 = 1;
+const SNAPSHOT_ROOT_MAGIC: &[u8; 8] = b"TFSSNP02";
+const SNAPSHOT_ROOT_VERSION: u16 = 2;
 const VOLUME_MAP_MAGIC: &[u8; 8] = b"TFSVMAP1";
 const VOLUME_MAP_VERSION: u16 = 1;
 const CHECKSUM_LEN: usize = 32;
@@ -225,7 +225,7 @@ impl PoolRuntime {
             pending_metadata: None,
             publication_requires_reopen: false,
         };
-        let _ = runtime.list_volume_snapshots()?;
+        runtime.validate_snapshot_roots()?;
         Ok(runtime)
     }
 
@@ -349,6 +349,62 @@ impl PoolRuntime {
         self.root.dataset_roots.get(&id)
     }
 
+    /// Construct the exact immutable reference used by canonical dataset and
+    /// snapshot roots. This does not write or publish the object.
+    #[must_use]
+    pub fn dataset_root_reference(
+        id: DatasetId,
+        kind: DatasetRootKind,
+        semantic_generation: u64,
+        bytes: &[u8],
+    ) -> DatasetRootRef {
+        make_dataset_root_ref(id, kind, semantic_generation, bytes)
+    }
+
+    /// Write and sync an immutable semantic root before a later snapshot-root
+    /// publication makes it reachable. The caller must publish the returned
+    /// reference only through a canonical Pool-root transition.
+    pub fn prepare_snapshot_source_root(
+        &mut self,
+        id: DatasetId,
+        kind: DatasetRootKind,
+        semantic_generation: u64,
+        bytes: &[u8],
+    ) -> Result<DatasetRootRef> {
+        self.ensure_publishable()?;
+        if kind == DatasetRootKind::Snapshot {
+            return Err(PoolRuntimeError::InvalidSnapshot(
+                "snapshot source root cannot itself be a snapshot",
+            ));
+        }
+        let reference = make_dataset_root_ref(id, kind, semantic_generation, bytes);
+        self.write_semantic_root(reference, bytes)?;
+        Ok(reference)
+    }
+
+    /// Load and checksum-validate one canonical typed snapshot root.
+    pub fn load_snapshot_root(&self, id: DatasetId) -> Result<SnapshotRoot> {
+        let reference = *self
+            .root
+            .dataset_roots
+            .get(&id)
+            .ok_or(PoolRuntimeError::MissingRoot(id))?;
+        if reference.kind != DatasetRootKind::Snapshot {
+            return Err(PoolRuntimeError::WrongRootType {
+                dataset_id: id,
+                expected: DatasetRootKind::Snapshot,
+                actual: reference.kind,
+            });
+        }
+        let root = decode_snapshot_root(&load_immutable_object(&self.pool, reference)?)?;
+        if root.snapshot_generation != reference.semantic_generation {
+            return Err(PoolRuntimeError::InvalidSnapshot(
+                "snapshot generation differs from its typed reference",
+            ));
+        }
+        Ok(root)
+    }
+
     /// Raw Pool access for dataset engines. Canonical catalog and semantic-root
     /// publication remains private to this owner; callers use this only for
     /// engine-owned transaction, content, maintenance, and recovery objects.
@@ -386,6 +442,39 @@ impl PoolRuntime {
             });
         }
         load_immutable_object(&self.pool, *reference)
+    }
+
+    /// Load one exact immutable semantic root by its captured reference.
+    /// Unlike `load_dataset_root`, this is independent of the dataset's newer
+    /// current root in the canonical table.
+    pub fn load_root_reference(&self, reference: DatasetRootRef) -> Result<Vec<u8>> {
+        if reference.kind == DatasetRootKind::Snapshot {
+            return Err(PoolRuntimeError::InvalidSnapshot(
+                "snapshot source root cannot itself be a snapshot",
+            ));
+        }
+        load_immutable_object(&self.pool, reference)
+    }
+
+    /// Immutable object keys that make canonical roots reachable independent
+    /// of the semantic engine's own transaction/content graph.
+    #[must_use]
+    pub fn canonical_root_object_keys(&self) -> Result<Vec<ObjectKey>> {
+        let mut keys = Vec::with_capacity(self.root.dataset_roots.len().saturating_add(1));
+        keys.push(canonical_pool_root_key());
+        for (dataset_id, reference) in &self.root.dataset_roots {
+            keys.push(reference.object_key);
+            if reference.kind == DatasetRootKind::Snapshot {
+                keys.push(
+                    self.load_snapshot_root(*dataset_id)?
+                        .source_reference
+                        .object_key,
+                );
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys)
     }
 
     /// Publish one exact semantic root through the current catalog. The
@@ -683,7 +772,7 @@ impl PoolRuntime {
 
         let snapshot_generation = next_generation(volume.root.snapshot_generation)?;
         let volume_generation = next_generation(volume.root.generation)?;
-        let snapshot_root = VolumeSnapshotRoot {
+        let snapshot_root = SnapshotRoot {
             snapshot_generation,
             source_reference: volume.committed_reference,
         };
@@ -692,7 +781,7 @@ impl PoolRuntime {
             snapshot_generation,
             ..volume.root.clone()
         };
-        let snapshot_bytes = encode_volume_snapshot_root(&snapshot_root);
+        let snapshot_bytes = snapshot_root.encode();
         let volume_bytes = encode_volume_root(&next_volume_root);
         let snapshot_reference = make_dataset_root_ref(
             snapshot_id,
@@ -763,8 +852,10 @@ impl PoolRuntime {
                 .dataset_roots
                 .get(&snapshot_id)
                 .ok_or(PoolRuntimeError::MissingRoot(snapshot_id))?;
-            let snapshot_root =
-                decode_volume_snapshot_root(&load_immutable_object(&self.pool, reference)?)?;
+            let snapshot_root = self.load_snapshot_root(snapshot_id)?;
+            if snapshot_root.source_reference.kind != DatasetRootKind::Volume {
+                continue;
+            }
             let (source_path, source_root) =
                 self.validate_volume_snapshot(&path, reference, &snapshot_root)?;
             snapshots.push(volume_snapshot_summary(
@@ -937,7 +1028,7 @@ impl PoolRuntime {
     fn open_volume_snapshot(
         &self,
         path: &str,
-    ) -> Result<(DatasetId, DatasetRootRef, VolumeSnapshotRoot)> {
+    ) -> Result<(DatasetId, DatasetRootRef, SnapshotRoot)> {
         let snapshot_id = self.root.catalog.snapshot_lookup(path)?;
         let reference = *self
             .root
@@ -951,16 +1042,10 @@ impl PoolRuntime {
                 actual: reference.kind,
             });
         }
-        let bytes = load_immutable_object(&self.pool, reference)?;
-        if !bytes.starts_with(VOLUME_SNAPSHOT_ROOT_MAGIC) {
+        let root = self.load_snapshot_root(snapshot_id)?;
+        if root.source_reference.kind != DatasetRootKind::Volume {
             return Err(PoolRuntimeError::InvalidSnapshot(
                 "snapshot is not a Pool volume snapshot",
-            ));
-        }
-        let root = decode_volume_snapshot_root(&bytes)?;
-        if root.snapshot_generation != reference.semantic_generation {
-            return Err(PoolRuntimeError::InvalidSnapshot(
-                "snapshot generation differs from its typed reference",
             ));
         }
         Ok((snapshot_id, reference, root))
@@ -970,7 +1055,7 @@ impl PoolRuntime {
         &self,
         path: &str,
         snapshot_reference: DatasetRootRef,
-        root: &VolumeSnapshotRoot,
+        root: &SnapshotRoot,
     ) -> Result<(String, VolumeRoot)> {
         if snapshot_reference.kind != DatasetRootKind::Snapshot
             || root.source_reference.kind != DatasetRootKind::Volume
@@ -1056,6 +1141,32 @@ impl PoolRuntime {
             Ok(())
         }
     }
+
+    fn validate_snapshot_roots(&self) -> Result<()> {
+        for (path, snapshot_id, dataset_type, _, _, _) in self.root.catalog.list_all() {
+            if dataset_type != DatasetType::Snapshot {
+                continue;
+            }
+            let snapshot = self.load_snapshot_root(snapshot_id)?;
+            let source_path = snapshot_source_path(&path)?;
+            let source_id = self.root.catalog.lookup(source_path)?;
+            if source_id != snapshot.source_reference.dataset_id {
+                return Err(PoolRuntimeError::InvalidSnapshot(
+                    "snapshot source identity does not match its target path",
+                ));
+            }
+            let (_, _, source_type, _, _, _) = self.root.catalog.get_by_id(&source_id).ok_or(
+                PoolRuntimeError::InvalidSnapshot("snapshot source is missing from the catalog"),
+            )?;
+            if DatasetRootKind::from_dataset_type(source_type) != snapshot.source_reference.kind {
+                return Err(PoolRuntimeError::InvalidSnapshot(
+                    "snapshot source type differs from its exact root reference",
+                ));
+            }
+            let _ = load_immutable_object(&self.pool, snapshot.source_reference)?;
+        }
+        Ok(())
+    }
 }
 
 /// Committed local-volume geometry.
@@ -1135,10 +1246,35 @@ struct VolumeRoot {
     map_root: Option<ImmutableObjectRef>,
 }
 
+/// Canonical cross-mode snapshot object selected by a typed Pool root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct VolumeSnapshotRoot {
-    snapshot_generation: u64,
-    source_reference: DatasetRootRef,
+pub struct SnapshotRoot {
+    pub snapshot_generation: u64,
+    pub source_reference: DatasetRootRef,
+}
+
+impl SnapshotRoot {
+    pub fn new(snapshot_generation: u64, source_reference: DatasetRootRef) -> Result<Self> {
+        if snapshot_generation == 0 || source_reference.semantic_generation == 0 {
+            return Err(PoolRuntimeError::InvalidSnapshot(
+                "snapshot or source generation is zero",
+            ));
+        }
+        if source_reference.kind == DatasetRootKind::Snapshot {
+            return Err(PoolRuntimeError::InvalidSnapshot(
+                "snapshot source root cannot itself be a snapshot",
+            ));
+        }
+        Ok(Self {
+            snapshot_generation,
+            source_reference,
+        })
+    }
+
+    #[must_use]
+    pub fn encode(self) -> Vec<u8> {
+        encode_snapshot_root(&self)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1404,7 +1540,7 @@ fn next_generation(current: u64) -> Result<u64> {
         .ok_or(PoolRuntimeError::CorruptRoot("generation exhausted"))
 }
 
-fn volume_snapshot_source_path(path: &str) -> Result<&str> {
+fn snapshot_source_path(path: &str) -> Result<&str> {
     let Some((source, snapshot)) = path.rsplit_once('@') else {
         return Err(PoolRuntimeError::InvalidSnapshot(
             "target must use <dataset>@<snapshot> form",
@@ -1416,6 +1552,10 @@ fn volume_snapshot_source_path(path: &str) -> Result<&str> {
         ));
     }
     Ok(source)
+}
+
+fn volume_snapshot_source_path(path: &str) -> Result<&str> {
+    snapshot_source_path(path)
 }
 
 fn volume_snapshot_dataset_id(path: &str, source_id: DatasetId) -> DatasetId {
@@ -1432,7 +1572,7 @@ fn volume_snapshot_summary(
     path: &str,
     snapshot_id: DatasetId,
     source_path: &str,
-    snapshot_root: &VolumeSnapshotRoot,
+    snapshot_root: &SnapshotRoot,
     source_root: &VolumeRoot,
 ) -> VolumeSnapshotSummary {
     VolumeSnapshotSummary {
@@ -1924,11 +2064,11 @@ fn decode_volume_root(bytes: &[u8]) -> Result<VolumeRoot> {
     })
 }
 
-fn encode_volume_snapshot_root(root: &VolumeSnapshotRoot) -> Vec<u8> {
+fn encode_snapshot_root(root: &SnapshotRoot) -> Vec<u8> {
     let source = root.source_reference;
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(VOLUME_SNAPSHOT_ROOT_MAGIC);
-    bytes.extend_from_slice(&VOLUME_SNAPSHOT_ROOT_VERSION.to_le_bytes());
+    bytes.extend_from_slice(SNAPSHOT_ROOT_MAGIC);
+    bytes.extend_from_slice(&SNAPSHOT_ROOT_VERSION.to_le_bytes());
     bytes.extend_from_slice(&root.snapshot_generation.to_le_bytes());
     bytes.extend_from_slice(source.dataset_id.as_bytes());
     bytes.push(source.kind as u8);
@@ -1940,22 +2080,22 @@ fn encode_volume_snapshot_root(root: &VolumeSnapshotRoot) -> Vec<u8> {
     bytes
 }
 
-fn decode_volume_snapshot_root(bytes: &[u8]) -> Result<VolumeSnapshotRoot> {
+fn decode_snapshot_root(bytes: &[u8]) -> Result<SnapshotRoot> {
     const PAYLOAD_LEN: usize = 8 + 2 + 8 + 16 + 1 + 8 + 32 + 32;
-    if bytes.len() != PAYLOAD_LEN + CHECKSUM_LEN || &bytes[..8] != VOLUME_SNAPSHOT_ROOT_MAGIC {
+    if bytes.len() != PAYLOAD_LEN + CHECKSUM_LEN || &bytes[..8] != SNAPSHOT_ROOT_MAGIC {
         return Err(PoolRuntimeError::InvalidSnapshot(
-            "bad volume-snapshot-root header",
+            "bad snapshot-root header",
         ));
     }
     if blake3::hash(&bytes[..PAYLOAD_LEN]).as_bytes() != &bytes[PAYLOAD_LEN..] {
         return Err(PoolRuntimeError::InvalidSnapshot(
-            "volume-snapshot-root checksum mismatch",
+            "snapshot-root checksum mismatch",
         ));
     }
     let mut offset = 8;
-    if take_u16(bytes, &mut offset)? != VOLUME_SNAPSHOT_ROOT_VERSION {
+    if take_u16(bytes, &mut offset)? != SNAPSHOT_ROOT_VERSION {
         return Err(PoolRuntimeError::InvalidSnapshot(
-            "unsupported volume-snapshot-root version",
+            "unsupported snapshot-root version",
         ));
     }
     let snapshot_generation = take_u64(bytes, &mut offset)?;
@@ -1964,26 +2104,21 @@ fn decode_volume_snapshot_root(bytes: &[u8]) -> Result<VolumeSnapshotRoot> {
     let semantic_generation = take_u64(bytes, &mut offset)?;
     let object_key = ObjectKey::from_bytes32(take_array::<32>(bytes, &mut offset)?);
     let digest = take_array::<32>(bytes, &mut offset)?;
-    if kind != DatasetRootKind::Volume {
+    if kind == DatasetRootKind::Snapshot {
         return Err(PoolRuntimeError::InvalidSnapshot(
-            "snapshot source root is not a volume",
+            "snapshot source root cannot itself be a snapshot",
         ));
     }
-    if snapshot_generation == 0 || semantic_generation == 0 {
-        return Err(PoolRuntimeError::InvalidSnapshot(
-            "snapshot or source generation is zero",
-        ));
-    }
-    Ok(VolumeSnapshotRoot {
+    SnapshotRoot::new(
         snapshot_generation,
-        source_reference: DatasetRootRef {
+        DatasetRootRef {
             dataset_id,
             kind,
             object_key,
             digest,
             semantic_generation,
         },
-    })
+    )
 }
 
 fn validate_volume_geometry(geometry: VolumeGeometry) -> Result<()> {
@@ -2480,7 +2615,7 @@ mod tests {
 
     #[test]
     fn volume_snapshot_root_checksum_and_source_type_are_validated() {
-        let root = VolumeSnapshotRoot {
+        let root = SnapshotRoot {
             snapshot_generation: 1,
             source_reference: DatasetRootRef {
                 dataset_id: DatasetId::from_bytes([15; 16]),
@@ -2490,25 +2625,189 @@ mod tests {
                 semantic_generation: 2,
             },
         };
-        let mut bytes = encode_volume_snapshot_root(&root);
+        let mut bytes = root.encode();
         bytes[18] ^= 0x80;
         assert!(matches!(
-            decode_volume_snapshot_root(&bytes),
+            decode_snapshot_root(&bytes),
             Err(PoolRuntimeError::InvalidSnapshot(
-                "volume-snapshot-root checksum mismatch"
+                "snapshot-root checksum mismatch"
             ))
         ));
 
-        let mut bytes = encode_volume_snapshot_root(&root);
+        let mut bytes = root.encode();
         let kind_offset = 8 + 2 + 8 + 16;
         bytes[kind_offset] = DatasetRootKind::Snapshot as u8;
         let payload_len = bytes.len() - CHECKSUM_LEN;
         let digest = blake3::hash(&bytes[..payload_len]);
         bytes[payload_len..].copy_from_slice(digest.as_bytes());
         assert!(matches!(
-            decode_volume_snapshot_root(&bytes),
+            decode_snapshot_root(&bytes),
             Err(PoolRuntimeError::InvalidSnapshot(
-                "snapshot source root is not a volume"
+                "snapshot source root cannot itself be a snapshot"
+            ))
+        ));
+    }
+
+    #[test]
+    fn generic_snapshot_root_accepts_filesystem_and_volume_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        let filesystem_id = DatasetId::from_bytes([31; 16]);
+        owner
+            .create_dataset_with_root(
+                "filesystem",
+                filesystem_id,
+                DatasetType::Filesystem,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+                1,
+                b"filesystem-root",
+            )
+            .unwrap();
+        let filesystem_reference = *owner.dataset_root(filesystem_id).unwrap();
+        let filesystem_snapshot_id = DatasetId::from_bytes([32; 16]);
+        let filesystem_snapshot = SnapshotRoot::new(2, filesystem_reference).unwrap();
+        owner
+            .create_dataset_with_root(
+                "filesystem@before",
+                filesystem_snapshot_id,
+                DatasetType::Snapshot,
+                Vec::new(),
+                DatasetFlags::READONLY.union(DatasetFlags::CHECKSUMS),
+                SyncGuarantee::Local,
+                filesystem_snapshot.snapshot_generation,
+                &filesystem_snapshot.encode(),
+            )
+            .unwrap();
+
+        let volume_id = create_volume(&mut owner, "volume", 33);
+        let volume_reference = *owner.dataset_root(volume_id).unwrap();
+        let volume_snapshot_id = DatasetId::from_bytes([34; 16]);
+        let volume_snapshot = SnapshotRoot::new(3, volume_reference).unwrap();
+        owner
+            .create_dataset_with_root(
+                "volume@before",
+                volume_snapshot_id,
+                DatasetType::Snapshot,
+                Vec::new(),
+                DatasetFlags::READONLY.union(DatasetFlags::CHECKSUMS),
+                SyncGuarantee::Local,
+                volume_snapshot.snapshot_generation,
+                &volume_snapshot.encode(),
+            )
+            .unwrap();
+
+        let owner = reopen(owner);
+        assert_eq!(
+            owner.load_snapshot_root(filesystem_snapshot_id).unwrap(),
+            filesystem_snapshot
+        );
+        assert_eq!(
+            owner.load_snapshot_root(volume_snapshot_id).unwrap(),
+            volume_snapshot
+        );
+    }
+
+    #[test]
+    fn generic_snapshot_root_refuses_snapshot_sources() {
+        let source = DatasetRootRef {
+            dataset_id: DatasetId::from_bytes([35; 16]),
+            kind: DatasetRootKind::Snapshot,
+            object_key: ObjectKey::from_bytes32([36; 32]),
+            digest: [37; 32],
+            semantic_generation: 1,
+        };
+        assert!(matches!(
+            SnapshotRoot::new(2, source),
+            Err(PoolRuntimeError::InvalidSnapshot(
+                "snapshot source root cannot itself be a snapshot"
+            ))
+        ));
+    }
+
+    #[test]
+    fn generic_snapshot_reopen_refuses_corruption_and_source_mismatch() {
+        let corrupt_dir = tempfile::tempdir().unwrap();
+        let mut corrupt = runtime(corrupt_dir.path());
+        let corrupt_volume_id = create_volume(&mut corrupt, "volume", 38);
+        corrupt.create_volume_snapshot("volume@before").unwrap();
+        let corrupt_snapshot_id = corrupt.dataset_catalog().lookup("volume@before").unwrap();
+        let corrupt_reference = *corrupt.dataset_root(corrupt_snapshot_id).unwrap();
+        corrupt
+            .pool_mut()
+            .put(
+                DeviceIoClass::Data,
+                corrupt_reference.object_key,
+                b"corrupt snapshot root",
+            )
+            .unwrap();
+        corrupt.pool_mut().sync_all().unwrap();
+        let corrupt_config = corrupt.pool().config().clone();
+        drop(corrupt);
+        let corrupt_pool = Pool::open(
+            corrupt_config,
+            PoolProperties::default(),
+            &StoreOptions::default(),
+        )
+        .unwrap();
+        assert!(PoolRuntime::open(corrupt_pool).is_err());
+
+        let mismatch_dir = tempfile::tempdir().unwrap();
+        let mut mismatch = runtime(mismatch_dir.path());
+        let source_id = DatasetId::from_bytes([39; 16]);
+        mismatch
+            .create_dataset_with_root(
+                "filesystem",
+                source_id,
+                DatasetType::Filesystem,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+                1,
+                b"filesystem-root",
+            )
+            .unwrap();
+        let source_reference = *mismatch.dataset_root(source_id).unwrap();
+        let snapshot_id = DatasetId::from_bytes([40; 16]);
+        let snapshot = SnapshotRoot::new(2, source_reference).unwrap();
+        mismatch
+            .create_dataset_with_root(
+                "filesystem@before",
+                snapshot_id,
+                DatasetType::Snapshot,
+                Vec::new(),
+                DatasetFlags::READONLY.union(DatasetFlags::CHECKSUMS),
+                SyncGuarantee::Local,
+                snapshot.snapshot_generation,
+                &snapshot.encode(),
+            )
+            .unwrap();
+        let mismatched_source = DatasetRootRef {
+            dataset_id: corrupt_volume_id,
+            ..source_reference
+        };
+        let mismatched_snapshot = SnapshotRoot::new(3, mismatched_source).unwrap();
+        mismatch
+            .publish_dataset_root(
+                snapshot_id,
+                DatasetRootKind::Snapshot,
+                mismatched_snapshot.snapshot_generation,
+                &mismatched_snapshot.encode(),
+            )
+            .unwrap();
+        let mismatch_config = mismatch.pool().config().clone();
+        drop(mismatch);
+        let mismatch_pool = Pool::open(
+            mismatch_config,
+            PoolProperties::default(),
+            &StoreOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            PoolRuntime::open(mismatch_pool),
+            Err(PoolRuntimeError::InvalidSnapshot(
+                "snapshot source identity does not match its target path"
             ))
         ));
     }
@@ -2533,7 +2832,7 @@ mod tests {
         assert!(matches!(
             owner.list_volume_snapshots(),
             Err(PoolRuntimeError::InvalidSnapshot(
-                "bad volume-snapshot-root header"
+                "bad snapshot-root header"
             ))
         ));
     }
@@ -2549,10 +2848,9 @@ mod tests {
         let first_id = owner.root.catalog.lookup("first").unwrap();
         let snapshot_id = owner.root.catalog.lookup("first@before").unwrap();
         let snapshot_reference = *owner.root.dataset_roots.get(&snapshot_id).unwrap();
-        let snapshot_root = decode_volume_snapshot_root(
-            &load_immutable_object(&owner.pool, snapshot_reference).unwrap(),
-        )
-        .unwrap();
+        let snapshot_root =
+            decode_snapshot_root(&load_immutable_object(&owner.pool, snapshot_reference).unwrap())
+                .unwrap();
         owner.root.catalog.rename("first", "renamed").unwrap();
         owner
             .root
