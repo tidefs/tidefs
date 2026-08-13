@@ -1539,57 +1539,35 @@ fn handle_rename(args: DatasetRenameArgs) {
         return;
     }
 
-    let devices_ref = args.devices.as_deref();
-    let mut fs = open_filesystem_with_live_args(
-        &args.pool,
-        devices_ref,
-        "rename",
-        RecoveryPolicy::default(),
-        false,
-        super::live_owner::live_admin_args([
-            ("old_name", LivePoolAdminArg::String(args.old_name.clone())),
-            ("new_name", LivePoolAdminArg::String(args.new_name.clone())),
-        ]),
+    let live_args = super::live_owner::live_admin_args([
+        ("old_name", LivePoolAdminArg::String(args.old_name.clone())),
+        ("new_name", LivePoolAdminArg::String(args.new_name.clone())),
+    ]);
+    if let Some(devices) = args
+        .devices
+        .as_deref()
+        .filter(|devices| !devices.is_empty())
+    {
+        with_offline_pool_runtime(
+            &args.pool,
+            devices,
+            "rename",
+            false,
+            &live_args,
+            |runtime| {
+                runtime
+                    .rename_dataset(old_name, new_name)
+                    .map_err(|err| err.to_string())
+            },
+        );
+    } else {
+        super::live_owner::route_with_args("dataset", "rename", &args.pool, live_args);
+    }
+
+    println!(
+        "dataset '{old_name}' renamed to '{new_name}' in pool '{}'",
+        args.pool
     );
-
-    // Verify the old name exists
-    if !fs.dataset_catalog().contains(old_name) {
-        eprintln!("tidefsctl dataset rename: dataset '{old_name}' does not exist in the catalog");
-        process::exit(1);
-    }
-
-    // Verify the new name does not already exist
-    if fs.dataset_catalog().contains(new_name) {
-        eprintln!("tidefsctl dataset rename: dataset '{new_name}' already exists in the catalog");
-        process::exit(1);
-    }
-
-    let catalog = match fs.dataset_catalog_mut() {
-        Ok(catalog) => catalog,
-        Err(err) => {
-            eprintln!("tidefsctl dataset rename: filesystem mutation requires reopen: {err}");
-            process::exit(1);
-        }
-    };
-    match catalog.rename(old_name, new_name) {
-        Ok(()) => {
-            println!(
-                "dataset '{old_name}' renamed to '{new_name}' in pool '{}'",
-                args.pool
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "tidefsctl dataset rename: catalog error renaming '{old_name}' -> '{new_name}': {err}"
-            );
-            process::exit(1);
-        }
-    }
-
-    if let Err(err) = fs.persist_dataset_catalog() {
-        eprintln!("tidefsctl dataset rename: failed to persist catalog: {err}");
-        process::exit(1);
-    }
 }
 fn handle_set_strategy(args: DatasetSetStrategyArgs) {
     let mutates = !args.enable.is_empty() || !args.disable.is_empty();

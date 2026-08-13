@@ -960,8 +960,8 @@ impl DatasetCatalog {
 
     /// Rename a dataset from `old_path` to `new_path`.
     ///
-    /// This operation is atomic at the catalog level: all entries
-    /// (the renamed dataset and its descendants) are updated together.
+    /// This operation is atomic at the catalog level: the renamed dataset,
+    /// its direct snapshots, and its descendants are updated together.
     /// The `DatasetId` values are preserved — open file handles,
     /// leases, and extent references remain valid.
     ///
@@ -978,12 +978,13 @@ impl DatasetCatalog {
         validate_path(old_path)?;
         validate_path(new_path)?;
 
-        let old_path_owned = old_path.to_string();
-
         // Verify old_path exists
-        if !self.contains(old_path) {
-            return Err(CatalogError::NotFound);
-        }
+        let old_path_owned = old_path.to_string();
+        let renamed_entry = self
+            .tree
+            .get(&old_path_owned)
+            .cloned()
+            .ok_or(CatalogError::NotFound)?;
 
         // Verify new_path does not exist
         if self.contains(new_path) {
@@ -1003,18 +1004,39 @@ impl DatasetCatalog {
             return Err(CatalogError::WouldCreateCycle);
         }
 
-        // Collect all entries that need to be moved: the old_path entry
-        // and all descendants (entries whose path starts with old_path/).
+        // Collect all entries that need to be moved: the old_path entry, its
+        // descendants, and snapshots named directly from the renamed source.
+        // A snapshot is keyed as `<source>@<snapshot>`, so it is not a `/`
+        // descendant even though its identity remains attached to the source.
         let old_prefix = format!("{old_path}/");
         let mut affected: Vec<(String, CatalogEntry)> = self
             .tree
             .entries()
             .into_iter()
-            .filter(|(k, _)| *k == old_path_owned || k.starts_with(&old_prefix))
+            .filter(|(k, entry)| {
+                *k == old_path_owned
+                    || k.starts_with(&old_prefix)
+                    || (renamed_entry.dataset_type != DatasetType::Snapshot
+                        && entry.dataset_type == DatasetType::Snapshot
+                        && snapshot_base_path(k) == Some(old_path))
+            })
             .collect();
 
         if affected.is_empty() {
             return Err(CatalogError::NotFound);
+        }
+
+        // Refuse before mutation if any derived destination is already owned
+        // by an entry outside this atomic rename set.
+        for (old_key, _) in &affected {
+            let new_key = replace_prefix(old_key, old_path, new_path);
+            if self.tree.contains_key(&new_key)
+                && !affected
+                    .iter()
+                    .any(|(affected_key, _)| *affected_key == new_key)
+            {
+                return Err(CatalogError::AlreadyExists);
+            }
         }
 
         // Remove old entries from the tree
@@ -1025,10 +1047,13 @@ impl DatasetCatalog {
         // Compute new paths and re-insert
         for (old_key, entry) in &mut affected {
             let new_key = replace_prefix(old_key, old_path, new_path);
+            let direct_snapshot = entry.dataset_type == DatasetType::Snapshot
+                && snapshot_base_path(old_key) == Some(old_path);
 
-            // Update parent reference for the renamed root entry
-            if *old_key == old_path_owned {
-                entry.parent = parent_path(new_path);
+            // Update parent references for the renamed root and any direct
+            // snapshot that follows it across a parent boundary.
+            if *old_key == old_path_owned || direct_snapshot {
+                entry.parent = parent_path(&new_key);
             } else {
                 // For descendants, update their parent path
                 if let Some(ref parent) = entry.parent {
@@ -2803,6 +2828,97 @@ mod tests {
         assert!(cat.contains("pool/newname"));
         // DatasetId remains stable
         assert_eq!(cat.lookup("pool/newname"), Ok(did(42)));
+    }
+
+    #[test]
+    fn rename_moves_direct_snapshots_and_preserves_stable_ids() {
+        let mut cat = DatasetCatalog::new();
+        cat.create(
+            "oldname",
+            did(42),
+            DatasetType::Volume,
+            1,
+            empty_props(),
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+        cat.create(
+            "oldname@before",
+            did(43),
+            DatasetType::Snapshot,
+            2,
+            empty_props(),
+            DatasetFlags::READONLY,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+
+        cat.rename("oldname", "newname").unwrap();
+
+        assert!(!cat.contains("oldname"));
+        assert!(!cat.contains("oldname@before"));
+        assert_eq!(cat.lookup("newname"), Ok(did(42)));
+        assert_eq!(cat.snapshot_lookup("newname@before"), Ok(did(43)));
+    }
+
+    #[test]
+    fn rename_snapshot_collision_preserves_original_catalog() {
+        let mut cat = DatasetCatalog::new();
+        for (path, id, dataset_type) in [
+            ("oldname", 42, DatasetType::Volume),
+            ("oldname@before", 43, DatasetType::Snapshot),
+            ("newname@before", 44, DatasetType::Snapshot),
+        ] {
+            cat.create(
+                path,
+                did(id),
+                dataset_type,
+                1,
+                empty_props(),
+                DatasetFlags::NONE,
+                SyncGuarantee::default(),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            cat.rename("oldname", "newname"),
+            Err(CatalogError::AlreadyExists)
+        );
+        assert_eq!(cat.lookup("oldname"), Ok(did(42)));
+        assert_eq!(cat.snapshot_lookup("oldname@before"), Ok(did(43)));
+        assert_eq!(cat.snapshot_lookup("newname@before"), Ok(did(44)));
+        assert!(!cat.contains("newname"));
+    }
+
+    #[test]
+    fn rename_reparents_direct_snapshot_with_its_source() {
+        let mut cat = DatasetCatalog::new();
+        for (path, id, dataset_type) in [
+            ("left", 40, DatasetType::Filesystem),
+            ("right", 41, DatasetType::Filesystem),
+            ("left/oldname", 42, DatasetType::Volume),
+            ("left/oldname@before", 43, DatasetType::Snapshot),
+        ] {
+            cat.create(
+                path,
+                did(id),
+                dataset_type,
+                1,
+                empty_props(),
+                DatasetFlags::NONE,
+                SyncGuarantee::default(),
+            )
+            .unwrap();
+        }
+
+        cat.rename("left/oldname", "right/newname").unwrap();
+
+        let (_, parent, dataset_type, _, _, _) = cat.get_by_id(&did(43)).unwrap();
+        assert_eq!(parent.as_deref(), Some("right"));
+        assert_eq!(dataset_type, DatasetType::Snapshot);
+        assert_eq!(cat.snapshot_lookup("right/newname@before"), Ok(did(43)));
     }
 
     #[test]

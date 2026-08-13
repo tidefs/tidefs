@@ -1720,40 +1720,10 @@ impl VfsLocalFileSystem {
             return live_admin_error(1, "dataset rename: root dataset cannot be renamed");
         }
 
-        let mut fs = self.fs.borrow_mut();
-        if !fs.dataset_catalog().contains(old_name) {
+        if let Err(err) = self.fs.borrow_mut().rename_pool_dataset(old_name, new_name) {
             return live_admin_error(
                 1,
-                format!("dataset rename: dataset '{old_name}' does not exist in the catalog"),
-            );
-        }
-        if fs.dataset_catalog().contains(new_name) {
-            return live_admin_error(
-                1,
-                format!("dataset rename: dataset '{new_name}' already exists in the catalog"),
-            );
-        }
-        let catalog = match fs.dataset_catalog_mut() {
-            Ok(catalog) => catalog,
-            Err(err) => {
-                return live_admin_error(
-                    1,
-                    format!("dataset rename: mutation requires reopen: {err}"),
-                )
-            }
-        };
-        if let Err(err) = catalog.rename(old_name, new_name) {
-            return live_admin_error(
-                1,
-                format!(
-                    "dataset rename: catalog error renaming '{old_name}' -> '{new_name}': {err}"
-                ),
-            );
-        }
-        if let Err(err) = fs.persist_dataset_catalog() {
-            return live_admin_error(
-                1,
-                format!("dataset rename: failed to persist catalog: {err}"),
+                format!("dataset rename: failed to rename '{old_name}' -> '{new_name}': {err}"),
             );
         }
 
@@ -6797,9 +6767,21 @@ mod tests {
             .as_str()
             .is_some_and(|text| text.contains("volume0@before") && text.contains("created")));
 
+        let renamed = live_dataset_admin(
+            &engine,
+            "rename",
+            json!({"old_name": "volume0", "new_name": "renamed"}),
+        );
+        assert_eq!(renamed["ok"], true, "rename response: {renamed}");
+        let listed = live_snapshot_admin(&engine, "list", json!({}), true);
+        assert_eq!(
+            listed["json"]["volume_snapshots"][0]["path"],
+            "renamed@before"
+        );
+
         {
             let mut fs = engine.fs.borrow_mut();
-            let mut volume = fs.open_volume_dataset("volume0").unwrap();
+            let mut volume = fs.open_volume_dataset("renamed").unwrap();
             fs.write_volume_blocks(&mut volume, 0, &[0x22; 4096])
                 .unwrap();
             fs.flush_volume(&mut volume).unwrap();
@@ -6808,13 +6790,13 @@ mod tests {
         let rollback = live_snapshot_admin(
             &engine,
             "rollback",
-            json!({"target": "volume0@before"}),
+            json!({"target": "renamed@before"}),
             false,
         );
         assert_eq!(rollback["ok"], true, "rollback response: {rollback}");
         let restored_bytes = {
             let fs = engine.fs.borrow();
-            let volume = fs.open_volume_dataset("volume0").unwrap();
+            let volume = fs.open_volume_dataset("renamed").unwrap();
             fs.read_volume_blocks(&volume, 0, 1).unwrap()
         };
         assert_eq!(restored_bytes, vec![0x11; 4096]);
@@ -6823,13 +6805,13 @@ mod tests {
         assert_eq!(listed["ok"], true, "list response: {listed}");
         assert_eq!(
             listed["json"]["volume_snapshots"][0]["path"],
-            "volume0@before"
+            "renamed@before"
         );
 
         let destroyed = live_snapshot_admin(
             &engine,
             "destroy",
-            json!({"target": "volume0@before"}),
+            json!({"target": "renamed@before"}),
             false,
         );
         assert_eq!(destroyed["ok"], true, "destroy response: {destroyed}");
