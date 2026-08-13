@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tidefs_block_volume_adapter_core::{
     BlockRangeRecord, BlockVolumeCompletionClass, BlockVolumeFileImage, BlockVolumeFileImageError,
@@ -292,8 +293,14 @@ impl BlockVolumeStorageBackend for BlockVolumeFileImage {
     }
 }
 
+/// Shared neutral Pool owner used by a standalone block export and its
+/// live-owner control endpoint.
+pub type PoolRuntime = tidefs_pool_runtime::PoolRuntime;
+pub type SharedPoolRuntime = Arc<Mutex<PoolRuntime>>;
+pub type PoolVolumeSnapshotSummary = tidefs_pool_runtime::VolumeSnapshotSummary;
+
 enum PoolVolumeOwner {
-    Standalone(Box<tidefs_pool_runtime::PoolRuntime>),
+    Standalone(SharedPoolRuntime),
     Mounted(tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem),
 }
 
@@ -315,10 +322,25 @@ impl PoolVolumeBackend {
         path: &str,
         read_only: bool,
     ) -> Result<Self, BackendError> {
-        let volume = runtime.open_volume(path).map_err(map_pool_runtime_error)?;
+        Self::open_shared(Arc::new(Mutex::new(runtime)), path, read_only)
+    }
+
+    /// Open a named volume through a shared neutral Pool owner.
+    ///
+    /// The ublk data path locks this owner only for one backend operation, so
+    /// the same runtime can serialize live-owner administration without a
+    /// second Pool open or authority path.
+    pub fn open_shared(
+        runtime: SharedPoolRuntime,
+        path: &str,
+        read_only: bool,
+    ) -> Result<Self, BackendError> {
+        let volume = lock_pool_runtime(&runtime)?
+            .open_volume(path)
+            .map_err(map_pool_runtime_error)?;
         let geometry = BlockDeviceGeometry::from_pool(volume.geometry())?;
         Ok(Self {
-            owner: PoolVolumeOwner::Standalone(Box::new(runtime)),
+            owner: PoolVolumeOwner::Standalone(runtime),
             volume,
             geometry,
             read_only,
@@ -358,9 +380,12 @@ impl PoolVolumeBackend {
         let start_block = u64::try_from(start_block).map_err(|_| BackendError::OutOfBounds)?;
         let block_count = u64::try_from(block_count).map_err(|_| BackendError::OutOfBounds)?;
         match (&mut self.owner, &mut self.volume) {
-            (PoolVolumeOwner::Standalone(runtime), volume) => volume
-                .zero_blocks(runtime, start_block, block_count)
-                .map_err(map_pool_runtime_error),
+            (PoolVolumeOwner::Standalone(runtime), volume) => {
+                let runtime = lock_pool_runtime(runtime)?;
+                volume
+                    .zero_blocks(&runtime, start_block, block_count)
+                    .map_err(map_pool_runtime_error)
+            }
             (PoolVolumeOwner::Mounted(owner), volume) => owner
                 .borrow()
                 .zero_volume_blocks(volume, start_block, block_count)
@@ -382,10 +407,12 @@ impl BlockVolumeStorageBackend for PoolVolumeBackend {
         let start_block = u64::try_from(start_block).map_err(|_| BackendError::OutOfBounds)?;
         let block_count = u64::try_from(block_count).map_err(|_| BackendError::OutOfBounds)?;
         let payload = match &self.owner {
-            PoolVolumeOwner::Standalone(runtime) => self
-                .volume
-                .read_blocks(runtime, start_block, block_count)
-                .map_err(map_pool_runtime_error)?,
+            PoolVolumeOwner::Standalone(runtime) => {
+                let runtime = lock_pool_runtime(runtime)?;
+                self.volume
+                    .read_blocks(&runtime, start_block, block_count)
+                    .map_err(map_pool_runtime_error)?
+            }
             PoolVolumeOwner::Mounted(owner) => owner
                 .borrow()
                 .read_volume_blocks(&self.volume, start_block, block_count)
@@ -413,9 +440,12 @@ impl BlockVolumeStorageBackend for PoolVolumeBackend {
         }
         let start_block = u64::try_from(start_block).map_err(|_| BackendError::OutOfBounds)?;
         match (&mut self.owner, &mut self.volume) {
-            (PoolVolumeOwner::Standalone(runtime), volume) => volume
-                .write_blocks(runtime, start_block, payload)
-                .map_err(map_pool_runtime_error)?,
+            (PoolVolumeOwner::Standalone(runtime), volume) => {
+                let runtime = lock_pool_runtime(runtime)?;
+                volume
+                    .write_blocks(&runtime, start_block, payload)
+                    .map_err(map_pool_runtime_error)?
+            }
             (PoolVolumeOwner::Mounted(owner), volume) => owner
                 .borrow()
                 .write_volume_blocks(volume, start_block, payload)
@@ -432,7 +462,8 @@ impl BlockVolumeStorageBackend for PoolVolumeBackend {
         }
         match (&mut self.owner, &mut self.volume) {
             (PoolVolumeOwner::Standalone(runtime), volume) => {
-                volume.flush(runtime).map_err(map_pool_runtime_error)
+                let mut runtime = lock_pool_runtime(runtime)?;
+                volume.flush(&mut runtime).map_err(map_pool_runtime_error)
             }
             (PoolVolumeOwner::Mounted(owner), volume) => owner
                 .borrow_mut()
@@ -466,6 +497,14 @@ impl BlockVolumeStorageBackend for PoolVolumeBackend {
     fn is_read_only(&self) -> bool {
         self.read_only
     }
+}
+
+fn lock_pool_runtime(
+    runtime: &SharedPoolRuntime,
+) -> Result<MutexGuard<'_, tidefs_pool_runtime::PoolRuntime>, BackendError> {
+    runtime
+        .lock()
+        .map_err(|_| BackendError::Other("shared Pool runtime lock poisoned".into()))
 }
 
 fn map_pool_runtime_error(error: tidefs_pool_runtime::PoolRuntimeError) -> BackendError {

@@ -22,7 +22,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 #[cfg(feature = "block-volume")]
-use tidefs_block_volume_adapter_daemon::storage_backend::PoolVolumeBackend;
+use tidefs_block_volume_adapter_daemon::storage_backend::{
+    PoolVolumeBackend, PoolVolumeSnapshotSummary, SharedPoolRuntime,
+};
 #[cfg(feature = "block-volume")]
 use tidefs_block_volume_adapter_daemon::ublk_control_open::run_ublk_live_device;
 #[cfg(feature = "block-volume")]
@@ -36,6 +38,17 @@ use tidefs_vfs_engine::{
 use tidefs_vfs_engine::{LivePoolAdminErrorKind, LivePoolAdminOutput, LivePoolAdminResponseBody};
 
 pub type LiveOwnerEngine = Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>;
+
+#[derive(Clone)]
+enum LiveOwnerAdmin {
+    Fuse {
+        engine: LiveOwnerEngine,
+        #[cfg(feature = "block-volume")]
+        filesystem: SharedLocalFileSystem,
+    },
+    #[cfg(feature = "block-volume")]
+    StandaloneBlock { runtime: SharedPoolRuntime },
+}
 
 #[derive(Clone, Debug)]
 pub struct LiveOwnerConfig {
@@ -99,6 +112,47 @@ pub fn start_fuse_owner(
     #[cfg(feature = "block-volume")] filesystem: SharedLocalFileSystem,
     shutdown: Arc<AtomicBool>,
 ) -> Result<LiveOwnerHandle, String> {
+    start_owner(
+        config,
+        "fuse",
+        LiveOwnerAdmin::Fuse {
+            engine,
+            #[cfg(feature = "block-volume")]
+            filesystem,
+        },
+        None,
+        shutdown,
+    )
+}
+
+/// Start the existing live-owner protocol for a standalone ublk Pool owner.
+///
+/// The supplied runtime is the same neutral owner used by the block backend;
+/// `active_volume` seeds export admission for the lifetime of the carrier.
+#[cfg(feature = "block-volume")]
+pub fn start_block_owner(
+    config: LiveOwnerConfig,
+    runtime: SharedPoolRuntime,
+    active_volume: String,
+    shutdown: Arc<AtomicBool>,
+) -> Result<LiveOwnerHandle, String> {
+    start_owner(
+        config,
+        "ublk",
+        LiveOwnerAdmin::StandaloneBlock { runtime },
+        Some(active_volume),
+        shutdown,
+    )
+}
+
+fn start_owner(
+    config: LiveOwnerConfig,
+    owner_kind: &str,
+    admin: LiveOwnerAdmin,
+    #[cfg(feature = "block-volume")] active_volume: Option<String>,
+    #[cfg(not(feature = "block-volume"))] _active_volume: Option<String>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<LiveOwnerHandle, String> {
     fs::create_dir_all(&config.runtime_dir).map_err(|err| {
         format!(
             "create live owner runtime dir {}: {err}",
@@ -119,7 +173,7 @@ pub fn start_fuse_owner(
 
     let manifest = LiveOwnerManifest {
         protocol: "tidefs-live-owner-admin-v1".to_string(),
-        owner_kind: "fuse".to_string(),
+        owner_kind: owner_kind.to_string(),
         pool_name: config.pool_name.clone(),
         pool_uuid: hex_uuid(&config.pool_uuid),
         pid: std::process::id(),
@@ -136,7 +190,10 @@ pub fn start_fuse_owner(
     let thread_manifest = manifest.clone();
     let thread_shutdown = Arc::clone(&shutdown);
     #[cfg(feature = "block-volume")]
-    let block_export = Arc::new(Mutex::new(None));
+    let block_export = Arc::new(Mutex::new(active_volume.map(|volume| ActiveBlockExport {
+        volume,
+        shutdown: Arc::clone(&shutdown),
+    })));
     #[cfg(feature = "block-volume")]
     let thread_block_export = Arc::clone(&block_export);
     let join = thread::spawn(move || {
@@ -146,9 +203,7 @@ pub fn start_fuse_owner(
             match listener.accept() {
                 Ok((stream, _addr)) => {
                     let manifest = thread_manifest.clone();
-                    let engine = Arc::clone(&engine);
-                    #[cfg(feature = "block-volume")]
-                    let filesystem = filesystem.clone();
+                    let admin = admin.clone();
                     let shutdown = Arc::clone(&thread_shutdown);
                     #[cfg(feature = "block-volume")]
                     let block_export = Arc::clone(&thread_block_export);
@@ -156,9 +211,7 @@ pub fn start_fuse_owner(
                         handle_client(
                             stream,
                             &manifest,
-                            &engine,
-                            #[cfg(feature = "block-volume")]
-                            &filesystem,
+                            &admin,
                             #[cfg(feature = "block-volume")]
                             &block_export,
                             &shutdown,
@@ -236,8 +289,7 @@ fn cleanup_endpoint(socket_path: &Path, manifest_path: &Path) {
 fn handle_client(
     stream: UnixStream,
     manifest: &LiveOwnerManifest,
-    engine: &LiveOwnerEngine,
-    #[cfg(feature = "block-volume")] filesystem: &SharedLocalFileSystem,
+    admin: &LiveOwnerAdmin,
     #[cfg(feature = "block-volume")] block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
     shutdown: &Arc<AtomicBool>,
 ) {
@@ -252,9 +304,7 @@ fn handle_client(
             Ok(request) => dispatch_request(
                 request,
                 manifest,
-                engine,
-                #[cfg(feature = "block-volume")]
-                filesystem,
+                admin,
                 #[cfg(feature = "block-volume")]
                 block_export,
                 #[cfg(feature = "block-volume")]
@@ -337,8 +387,7 @@ fn parse_wire_command_parts(command: &str) -> Option<(&str, String)> {
 fn dispatch_request(
     request: LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
-    engine: &LiveOwnerEngine,
-    #[cfg(feature = "block-volume")] filesystem: &SharedLocalFileSystem,
+    admin: &LiveOwnerAdmin,
     #[cfg(feature = "block-volume")] block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
     #[cfg(feature = "block-volume")] disconnect_monitor: Option<UnixStream>,
     shutdown: &Arc<AtomicBool>,
@@ -351,7 +400,7 @@ fn dispatch_request(
     }
 
     match request.command {
-        LivePoolAdminCommand::PoolStatus => pool_status(&request, manifest, engine),
+        LivePoolAdminCommand::PoolStatus => pool_status(&request, manifest, admin),
         LivePoolAdminCommand::PoolImport => already_owned(&request, "import", manifest),
         LivePoolAdminCommand::PoolMount => pool_mount_refused(&request, manifest),
         LivePoolAdminCommand::PoolExport => pool_export(
@@ -369,7 +418,7 @@ fn dispatch_request(
         | LivePoolAdminCommand::SnapshotCreate
         | LivePoolAdminCommand::SnapshotDestroy
         | LivePoolAdminCommand::SnapshotRollback => {
-            volume_lifecycle_mutation(&request, engine, block_export)
+            volume_lifecycle_mutation(&request, admin, block_export)
         }
         #[cfg(not(feature = "block-volume"))]
         LivePoolAdminCommand::DatasetResize
@@ -377,7 +426,7 @@ fn dispatch_request(
         | LivePoolAdminCommand::DatasetDestroy
         | LivePoolAdminCommand::SnapshotCreate
         | LivePoolAdminCommand::SnapshotDestroy
-        | LivePoolAdminCommand::SnapshotRollback => delegate_admin_request(&request, engine),
+        | LivePoolAdminCommand::SnapshotRollback => delegate_admin_request(&request, admin),
         LivePoolAdminCommand::PoolGet
         | LivePoolAdminCommand::PoolSet
         | LivePoolAdminCommand::PoolListProps
@@ -396,16 +445,31 @@ fn dispatch_request(
         | LivePoolAdminCommand::SnapshotSend
         | LivePoolAdminCommand::PerformanceAdmissionSnapshot
         | LivePoolAdminCommand::DeviceStatus
-        | LivePoolAdminCommand::DeviceRemove => delegate_admin_request(&request, engine),
+        | LivePoolAdminCommand::DeviceRemove => delegate_admin_request(&request, admin),
         #[cfg(feature = "block-volume")]
-        LivePoolAdminCommand::BlockAttach => block_attach(
-            &request,
-            manifest,
-            filesystem,
-            block_export,
-            disconnect_monitor,
-            shutdown,
-        ),
+        LivePoolAdminCommand::BlockAttach => match admin {
+            LiveOwnerAdmin::Fuse { filesystem, .. } => block_attach(
+                &request,
+                manifest,
+                filesystem,
+                block_export,
+                disconnect_monitor,
+                shutdown,
+            ),
+            LiveOwnerAdmin::StandaloneBlock { .. } => {
+                let volume = request_arg_str(&request.args, "volume")
+                    .ok()
+                    .flatten()
+                    .unwrap_or("<unknown>");
+                LivePoolAdminResponse::error(
+                    1,
+                    format!(
+                        "pool '{}' already has standalone ublk volume '{}' actively exported",
+                        manifest.pool_name, volume
+                    ),
+                )
+            }
+        },
         #[cfg(not(feature = "block-volume"))]
         LivePoolAdminCommand::BlockAttach => unsupported_admin_command_response(&request),
     }
@@ -421,7 +485,7 @@ struct ActiveBlockExport {
 #[cfg(feature = "block-volume")]
 fn volume_lifecycle_mutation(
     request: &LivePoolAdminRequest,
-    engine: &LiveOwnerEngine,
+    admin: &LiveOwnerAdmin,
     block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
 ) -> LivePoolAdminResponse {
     let target = match volume_mutation_target(request) {
@@ -429,10 +493,10 @@ fn volume_lifecycle_mutation(
         Err(error) => return live_admin_typed_error(error),
     };
     let Some(target) = target else {
-        return delegate_admin_request(request, engine);
+        return delegate_admin_request(request, admin);
     };
     match with_volume_mutation_admission(block_export, target, || {
-        delegate_admin_request(request, engine)
+        delegate_admin_request(request, admin)
     }) {
         Ok(response) => response,
         Err(message) => {
@@ -746,15 +810,246 @@ fn validate_requested_pool_uuid(
 
 fn delegate_admin_request(
     request: &LivePoolAdminRequest,
-    engine: &LiveOwnerEngine,
+    admin: &LiveOwnerAdmin,
 ) -> LivePoolAdminResponse {
-    match engine.lock() {
-        Ok(engine) => match engine.live_pool_admin_request(request) {
-            Ok(response) => response,
-            Err(_) => unsupported_admin_command_response(request),
+    match admin {
+        LiveOwnerAdmin::Fuse { engine, .. } => match engine.lock() {
+            Ok(engine) => match engine.live_pool_admin_request(request) {
+                Ok(response) => response,
+                Err(_) => unsupported_admin_command_response(request),
+            },
+            Err(_) => LivePoolAdminResponse::error(1, "live owner engine lock poisoned"),
         },
-        Err(_) => LivePoolAdminResponse::error(1, "live owner engine lock poisoned"),
+        #[cfg(feature = "block-volume")]
+        LiveOwnerAdmin::StandaloneBlock { runtime } => {
+            standalone_block_admin_request(request, runtime)
+        }
     }
+}
+
+#[cfg(feature = "block-volume")]
+fn standalone_block_admin_request(
+    request: &LivePoolAdminRequest,
+    runtime: &SharedPoolRuntime,
+) -> LivePoolAdminResponse {
+    let mut runtime = match runtime.lock() {
+        Ok(runtime) => runtime,
+        Err(_) => return LivePoolAdminResponse::error(1, "shared Pool runtime lock poisoned"),
+    };
+    let wants_json = request.output.wants_json();
+    match request.command {
+        LivePoolAdminCommand::DatasetResize => {
+            let name = match required_request_arg_str(&request.args, "name") {
+                Ok(name) => name,
+                Err(error) => return live_admin_typed_error(error),
+            };
+            let size = match request_arg_u64(&request.args, "size") {
+                Ok(Some(size)) => size,
+                Ok(None) => {
+                    return live_admin_malformed("dataset resize requires size");
+                }
+                Err(error) => return live_admin_typed_error(error),
+            };
+            match runtime.resize_volume(name, size) {
+                Ok(result) if wants_json => LivePoolAdminResponse::ok_machine_json(
+                    json!({
+                        "ok": true,
+                        "operation": "resize",
+                        "pool": request.pool,
+                        "dataset": name,
+                        "size": result.geometry.capacity_bytes,
+                        "block_size": result.geometry.block_size_bytes,
+                        "generation": result.generation,
+                        "resize_generation": result.resize_generation,
+                    })
+                    .to_string(),
+                ),
+                Ok(result) => LivePoolAdminResponse::ok_text(format!(
+                    "dataset '{name}' resized in imported pool '{}': size={} block_size={} generation={} resize_generation={}",
+                    request.pool,
+                    result.geometry.capacity_bytes,
+                    result.geometry.block_size_bytes,
+                    result.generation,
+                    result.resize_generation,
+                )),
+                Err(error) => {
+                    LivePoolAdminResponse::error(1, format!("dataset resize: {error}"))
+                }
+            }
+        }
+        LivePoolAdminCommand::DatasetRename => {
+            let old_name = match required_request_arg_str(&request.args, "old_name") {
+                Ok(name) => name,
+                Err(error) => return live_admin_typed_error(error),
+            };
+            let new_name = match required_request_arg_str(&request.args, "new_name") {
+                Ok(name) => name,
+                Err(error) => return live_admin_typed_error(error),
+            };
+            match runtime.rename_dataset(old_name, new_name) {
+                Ok(_) => LivePoolAdminResponse::ok_text(format!(
+                    "dataset '{old_name}' renamed to '{new_name}' in imported pool '{}'",
+                    request.pool
+                )),
+                Err(error) => LivePoolAdminResponse::error(
+                    1,
+                    format!(
+                        "dataset rename: failed to rename '{old_name}' -> '{new_name}': {error}"
+                    ),
+                ),
+            }
+        }
+        LivePoolAdminCommand::DatasetDestroy => {
+            let name = match required_request_arg_str(&request.args, "name") {
+                Ok(name) => name,
+                Err(error) => return live_admin_typed_error(error),
+            };
+            match runtime.destroy_volume(name) {
+                Ok(_) => LivePoolAdminResponse::ok_text(format!(
+                    "dataset '{name}' logically destroyed; physical reclaim remains pending"
+                )),
+                Err(error) => LivePoolAdminResponse::error(1, format!("dataset destroy: {error}")),
+            }
+        }
+        LivePoolAdminCommand::SnapshotCreate => standalone_volume_snapshot_response(
+            "created",
+            required_request_arg_str(&request.args, "target").and_then(|target| {
+                runtime
+                    .create_volume_snapshot(target)
+                    .map_err(|error| LivePoolAdminError::malformed(error.to_string()))
+            }),
+            wants_json,
+        ),
+        LivePoolAdminCommand::SnapshotDestroy => standalone_volume_snapshot_response(
+            "logically destroyed",
+            required_request_arg_str(&request.args, "target").and_then(|target| {
+                runtime
+                    .destroy_volume_snapshot(target)
+                    .map_err(|error| LivePoolAdminError::malformed(error.to_string()))
+            }),
+            wants_json,
+        ),
+        LivePoolAdminCommand::SnapshotRollback => {
+            let target = match required_request_arg_str(&request.args, "target") {
+                Ok(target) => target,
+                Err(error) => return live_admin_typed_error(error),
+            };
+            match runtime.restore_volume_snapshot(target) {
+                Ok(result) if wants_json => LivePoolAdminResponse::ok_machine_json(
+                    json!({
+                        "ok": true,
+                        "outcome": "restored",
+                        "snapshot": standalone_volume_snapshot_json(&result.snapshot),
+                        "size": result.geometry.capacity_bytes,
+                        "generation": result.generation,
+                        "resize_generation": result.resize_generation,
+                        "snapshot_generation": result.snapshot_generation,
+                    })
+                    .to_string(),
+                ),
+                Ok(result) => LivePoolAdminResponse::ok_text(format!(
+                    "volume snapshot '{}' restored to '{}' (size={} generation={} resize_generation={} snapshot_generation={})",
+                    result.snapshot.path,
+                    result.snapshot.source_path,
+                    result.geometry.capacity_bytes,
+                    result.generation,
+                    result.resize_generation,
+                    result.snapshot_generation,
+                )),
+                Err(error) => {
+                    LivePoolAdminResponse::error(1, format!("snapshot rollback: {error}"))
+                }
+            }
+        }
+        LivePoolAdminCommand::SnapshotList => match runtime.list_volume_snapshots() {
+            Ok(snapshots) if wants_json => LivePoolAdminResponse::ok_machine_json(
+                json!({
+                    "snapshots": [],
+                    "volume_snapshots": snapshots
+                        .iter()
+                        .map(standalone_volume_snapshot_json)
+                        .collect::<Vec<_>>(),
+                })
+                .to_string(),
+            ),
+            Ok(snapshots) if snapshots.is_empty() => LivePoolAdminResponse::ok_text("no snapshots"),
+            Ok(snapshots) => LivePoolAdminResponse::ok_text(
+                snapshots
+                    .iter()
+                    .map(standalone_volume_snapshot_line)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            Err(error) => LivePoolAdminResponse::error(1, format!("snapshot list: {error}")),
+        },
+        _ => unsupported_admin_command_response(request),
+    }
+}
+
+#[cfg(feature = "block-volume")]
+fn required_request_arg_str<'a>(
+    args: &'a LivePoolAdminArgs,
+    name: &str,
+) -> Result<&'a str, LivePoolAdminError> {
+    request_arg_str(args, name)?
+        .ok_or_else(|| LivePoolAdminError::malformed(format!("request requires {name}")))
+}
+
+#[cfg(feature = "block-volume")]
+fn standalone_volume_snapshot_response(
+    outcome: &str,
+    result: Result<PoolVolumeSnapshotSummary, LivePoolAdminError>,
+    wants_json: bool,
+) -> LivePoolAdminResponse {
+    match result {
+        Ok(summary) if wants_json => LivePoolAdminResponse::ok_machine_json(
+            json!({
+                "ok": true,
+                "outcome": outcome,
+                "physical_reclaim": false,
+                "snapshot": standalone_volume_snapshot_json(&summary),
+            })
+            .to_string(),
+        ),
+        Ok(summary) => {
+            let mut text = format!("{} {outcome}", standalone_volume_snapshot_line(&summary));
+            if outcome == "logically destroyed" {
+                text.push_str(
+                    "\nphysical reclaim remains pending; no secure-erasure claim is made",
+                );
+            }
+            LivePoolAdminResponse::ok_text(text)
+        }
+        Err(error) => LivePoolAdminResponse::error(1, error.message),
+    }
+}
+
+#[cfg(feature = "block-volume")]
+fn standalone_volume_snapshot_line(summary: &PoolVolumeSnapshotSummary) -> String {
+    format!(
+        "volume snapshot '{}' source='{}' kind=volume source_generation={} snapshot_generation={} size={} block_size={}",
+        summary.path,
+        summary.source_path,
+        summary.source_generation,
+        summary.snapshot_generation,
+        summary.geometry.capacity_bytes,
+        summary.geometry.block_size_bytes,
+    )
+}
+
+#[cfg(feature = "block-volume")]
+fn standalone_volume_snapshot_json(summary: &PoolVolumeSnapshotSummary) -> serde_json::Value {
+    json!({
+        "path": summary.path,
+        "id": summary.snapshot_id.to_string(),
+        "source": summary.source_path,
+        "source_id": summary.source_dataset_id.to_string(),
+        "source_kind": "volume",
+        "source_generation": summary.source_generation,
+        "snapshot_generation": summary.snapshot_generation,
+        "size": summary.geometry.capacity_bytes,
+        "block_size": summary.geometry.block_size_bytes,
+    })
 }
 
 fn unsupported_admin_command_response(request: &LivePoolAdminRequest) -> LivePoolAdminResponse {
@@ -765,7 +1060,7 @@ fn unsupported_admin_command_response(request: &LivePoolAdminRequest) -> LivePoo
 fn pool_status(
     request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
-    engine: &LiveOwnerEngine,
+    admin: &LiveOwnerAdmin,
 ) -> LivePoolAdminResponse {
     if let Err(err) = validate_request_arg_names(&request.args, &[]) {
         return live_admin_typed_error(err);
@@ -778,17 +1073,41 @@ fn pool_status(
         umask: 0,
         groups: vec![0],
     };
-    let statfs = match engine.lock() {
-        Ok(engine) => match engine.statfs(&ctx) {
-            Ok(statfs) => statfs,
-            Err(errno) => {
-                return LivePoolAdminResponse::error(
-                    1,
-                    format!("live owner statfs failed with {errno:?}"),
+    let statfs = match admin {
+        LiveOwnerAdmin::Fuse { engine, .. } => match engine.lock() {
+            Ok(engine) => match engine.statfs(&ctx) {
+                Ok(statfs) => statfs,
+                Err(errno) => {
+                    return LivePoolAdminResponse::error(
+                        1,
+                        format!("live owner statfs failed with {errno:?}"),
+                    )
+                }
+            },
+            Err(_) => return LivePoolAdminResponse::error(1, "live owner engine lock poisoned"),
+        },
+        #[cfg(feature = "block-volume")]
+        LiveOwnerAdmin::StandaloneBlock { runtime } => match runtime.lock() {
+            Ok(runtime) => {
+                let stats = runtime.pool().pool_stats();
+                let block_size = 4096_u64;
+                let files =
+                    u64::try_from(runtime.dataset_catalog().list_all().len()).unwrap_or(u64::MAX);
+                tidefs_types_vfs_core::StatFs::new(
+                    block_size as u32,
+                    block_size as u32,
+                    stats.total_capacity_bytes / block_size,
+                    stats.available_bytes / block_size,
+                    stats.available_bytes / block_size,
+                    files,
+                    u64::MAX.saturating_sub(files),
+                    255,
+                    0,
+                    0,
                 )
             }
+            Err(_) => return LivePoolAdminResponse::error(1, "shared Pool runtime lock poisoned"),
         },
-        Err(_) => return LivePoolAdminResponse::error(1, "live owner engine lock poisoned"),
     };
 
     let value = json!({
@@ -1174,6 +1493,9 @@ fn hex_uuid(uuid: &[u8; 16]) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "block-volume")]
+    use tidefs_block_volume_adapter_daemon::storage_backend::PoolRuntime;
+
     fn manifest() -> LiveOwnerManifest {
         LiveOwnerManifest {
             protocol: "tidefs-live-owner-admin-v1".to_string(),
@@ -1264,6 +1586,148 @@ mod tests {
         .unwrap();
 
         assert!(active.try_lock().is_ok());
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
+    fn standalone_block_owner_routes_snapshot_to_active_export_admission() {
+        use std::fs::OpenOptions;
+
+        use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, SyncGuarantee};
+        use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("device.img");
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&device)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let mut runtime = PoolRuntime::open_block_devices(
+            &dir.path().join("metadata"),
+            std::slice::from_ref(&device),
+            "tank",
+            PoolRedundancyPolicy::default(),
+            &StoreOptions::default(),
+        )
+        .unwrap();
+        runtime
+            .create_volume(
+                "vol",
+                DatasetId::from_bytes([7; 16]),
+                4 * 1024 * 1024,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+            )
+            .unwrap();
+        let runtime = Arc::new(Mutex::new(runtime));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_dir = dir.path().join("runtime");
+        let owner = start_block_owner(
+            LiveOwnerConfig {
+                pool_name: "tank".to_string(),
+                pool_uuid: [9; 16],
+                backing_dir: dir.path().join("metadata"),
+                mountpoint: PathBuf::from("ublk:vol"),
+                runtime_dir: runtime_dir.clone(),
+                read_only: false,
+            },
+            Arc::clone(&runtime),
+            "vol".to_string(),
+            Arc::clone(&shutdown),
+        )
+        .unwrap();
+
+        let manifest: LiveOwnerManifest =
+            serde_json::from_slice(&fs::read(runtime_dir.join("owner.json")).unwrap()).unwrap();
+        assert_eq!(manifest.owner_kind, "ublk");
+
+        for (command, args) in [
+            (
+                LivePoolAdminCommand::DatasetResize,
+                [
+                    ("name".to_string(), LivePoolAdminArg::String("vol".into())),
+                    ("size".to_string(), LivePoolAdminArg::U64(8 * 1024 * 1024)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            (
+                LivePoolAdminCommand::DatasetRename,
+                [
+                    (
+                        "old_name".to_string(),
+                        LivePoolAdminArg::String("vol".into()),
+                    ),
+                    (
+                        "new_name".to_string(),
+                        LivePoolAdminArg::String("renamed".into()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            (
+                LivePoolAdminCommand::DatasetDestroy,
+                [("name".to_string(), LivePoolAdminArg::String("vol".into()))]
+                    .into_iter()
+                    .collect(),
+            ),
+            (
+                LivePoolAdminCommand::SnapshotCreate,
+                [(
+                    "target".to_string(),
+                    LivePoolAdminArg::String("vol@before".into()),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            (
+                LivePoolAdminCommand::SnapshotRollback,
+                [(
+                    "target".to_string(),
+                    LivePoolAdminArg::String("vol@before".into()),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            (
+                LivePoolAdminCommand::SnapshotDestroy,
+                [(
+                    "target".to_string(),
+                    LivePoolAdminArg::String("vol@before".into()),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        ] {
+            let mut stream = UnixStream::connect(runtime_dir.join("owner.sock")).unwrap();
+            let mut request = LivePoolAdminRequest::new(command, "tank");
+            request.args = LivePoolAdminArgs(args);
+            writeln!(stream, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+            let mut response = String::new();
+            BufReader::new(stream).read_line(&mut response).unwrap();
+            let response: LivePoolAdminResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(response.exit_code, 1);
+            let LivePoolAdminResponseBody::Error { message, .. } = response.body else {
+                panic!("active export should refuse the mutation");
+            };
+            assert!(message.contains("actively exported"), "{message}");
+        }
+        assert!(runtime
+            .lock()
+            .unwrap()
+            .list_volume_snapshots()
+            .unwrap()
+            .is_empty());
+
+        owner.stop();
+        assert!(!runtime_dir.join("owner.json").exists());
+        assert!(!runtime_dir.join("owner.sock").exists());
     }
 
     #[cfg(feature = "block-volume")]
