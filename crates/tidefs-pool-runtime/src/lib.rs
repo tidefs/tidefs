@@ -534,6 +534,23 @@ impl PoolRuntime {
         Ok(geometry)
     }
 
+    /// Atomically rename one cataloged dataset and every direct snapshot path.
+    /// Stable dataset identities and typed semantic roots remain unchanged.
+    pub fn rename_dataset(&mut self, old_path: &str, new_path: &str) -> Result<DatasetId> {
+        self.ensure_publishable()?;
+        if self.pending_metadata.is_some() {
+            return Err(PoolRuntimeError::CorruptRoot(
+                "pending metadata must publish before dataset rename",
+            ));
+        }
+        let dataset_id = self.root.catalog.lookup(old_path)?;
+        let mut next = self.root.clone();
+        next.catalog.rename(old_path, new_path)?;
+        next.generation = next_generation(next.generation)?;
+        self.publish_root(next)?;
+        Ok(dataset_id)
+    }
+
     /// Commit new exact geometry for one named volume.
     ///
     /// Shrink rewrites the sparse map before the new volume root becomes
@@ -2540,7 +2557,7 @@ mod tests {
         owner
             .root
             .catalog
-            .rename("first@before", "second@before")
+            .rename("renamed@before", "second@before")
             .unwrap();
         assert_eq!(owner.root.catalog.lookup("renamed").unwrap(), first_id);
 
@@ -2550,6 +2567,31 @@ mod tests {
                 "snapshot source identity does not match its target path"
             ))
         ));
+    }
+
+    #[test]
+    fn volume_snapshot_follows_atomic_source_rename_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        let volume_id = create_volume(&mut owner, "vol", 21);
+        let snapshot = owner.create_volume_snapshot("vol@before").unwrap();
+
+        assert_eq!(owner.rename_dataset("vol", "renamed").unwrap(), volume_id);
+
+        let owner = reopen(owner);
+        assert_eq!(
+            owner.open_volume("renamed").unwrap().dataset_id(),
+            volume_id
+        );
+        assert!(owner.open_volume("vol").is_err());
+        assert_eq!(
+            owner.list_volume_snapshots().unwrap(),
+            vec![VolumeSnapshotSummary {
+                path: "renamed@before".to_string(),
+                source_path: "renamed".to_string(),
+                ..snapshot
+            }]
+        );
     }
 
     #[test]

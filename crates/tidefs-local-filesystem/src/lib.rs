@@ -2906,6 +2906,19 @@ impl LocalFileSystem {
         result.map_err(FileSystemError::from)
     }
 
+    /// Atomically rename one canonical Pool dataset and its direct snapshots.
+    pub fn rename_pool_dataset(&mut self, old_path: &str, new_path: &str) -> Result<DatasetId> {
+        self.ensure_mutation_allowed("rename Pool dataset")?;
+        let result = self.store.rename_dataset(old_path, new_path);
+        if matches!(
+            &result,
+            Err(tidefs_pool_runtime::PoolRuntimeError::PublicationOutcomeUncertain(_))
+        ) {
+            self.arm_mutation_reopen_fence();
+        }
+        result.map_err(FileSystemError::from)
+    }
+
     /// Atomically publish one canonical snapshot of a committed Pool volume.
     pub fn create_volume_snapshot_dataset(
         &mut self,
