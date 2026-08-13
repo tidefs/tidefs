@@ -2989,6 +2989,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-pool-runtime"
+version = "0.421.0"
+dependencies = [
+ "blake3",
+ "tempfile",
+ "tidefs-dataset-catalog",
+ "tidefs-dataset-properties",
+ "tidefs-local-object-store",
+ "tidefs-pool-scan",
+]
+
+[[package]]
 name = "tidefs-pool-scan"
 version = "0.421.0"
 dependencies = [
