@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 164 |
+| Workspace packages | 165 |
 | Explicitly excluded package roots | 4 |
-| Discovered package manifests | 168 |
-| Classified package roots | 168 |
+| Discovered package manifests | 169 |
+| Classified package roots | 169 |
 
 ## TFR-002 Category Mapping
 
@@ -25,7 +25,7 @@ root.
 
 | TFR-002 category | Current roles | Count | Boundary |
 | --- | --- | ---: | --- |
-| `product` | `product-code`, `adapter-operator` | 144 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
+| `product` | `product-code`, `adapter-operator` | 145 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
 | `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 22 | Repo policy tooling, CI/developer support, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
 | `third-party` | `vendored-third-party` | 1 | Vendored or forked upstream code carried with separate provenance. |
 | `delete` | `scaffold-transitional`, `archive-delete-candidate` | 0 | No current package root is classified for deletion. Both roles are retired and rejected by `check-workspace-policy`; any future dead-scaffolding candidate must reference TFR-002/TFR-013 evidence and an issue-backed delete/archive plan. |
@@ -52,7 +52,7 @@ holding area.
 
 | Role | Count |
 | --- | ---: |
-| `product-code` | 129 |
+| `product-code` | 130 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
 | `proof-harness` | 10 |
@@ -159,6 +159,7 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-placement-runtime` | `tidefs-placement-runtime` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-pool-allocator` | `tidefs-pool-allocator` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-pool-import` | `tidefs-pool-import` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
+| `crates/tidefs-pool-runtime` | `tidefs-pool-runtime` | `workspace-member` | `product-code` | canonical local Pool owner for atomic catalog, property, filesystem-root, and named-volume-root publication; consumed by the local filesystem and block-volume product carriers. |
 | `crates/tidefs-pool-scan` | `tidefs-pool-scan` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-posix-acl` | `tidefs-posix-acl` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-posix-filesystem-adapter-reply` | `tidefs-posix-filesystem-adapter-reply` | `workspace-member` | `adapter-operator` | current adapter-operator authority for FUSE reply commit lanes and directory-entry wire-format serialization: LookupEntryAttr, LookupEntryReply, StatfsReply, StatxReply, DirentWire/DirentPlusWire packers, commit-record builders for small and bulk reply classes, and errno mapping; 61 unit tests validate all public types, wire-size constants, reply encoding, error mapping, lookup entry attributes, dirent packing, and commit-record construction; the crate is no_std with forbid(unsafe_code); consumed by tidefs-fuser for getattr/statfs assembly; mounted FUSE runtime claims remain separately gated. |
