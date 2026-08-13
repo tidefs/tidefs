@@ -1436,9 +1436,45 @@ impl VfsLocalFileSystem {
             Err(err) => return live_admin_error(1, err),
         };
         let mountpoint = live_admin_optional_arg(args, "mountpoint");
+        let capacity = args.get("size").and_then(Value::as_u64);
 
         if name == "root" {
             return live_admin_error(1, "dataset create: 'root' dataset cannot be re-created");
+        }
+
+        if dataset_type != DatasetType::Volume {
+            return live_admin_error(
+                1,
+                match dataset_type {
+                    DatasetType::Filesystem => "dataset create: standalone filesystem creation is not available until a filesystem engine can publish its typed root",
+                    DatasetType::Snapshot => "dataset create: snapshots must be created by the owning filesystem or volume engine",
+                    DatasetType::Volume => unreachable!(),
+                },
+            );
+        }
+        let Some(capacity) = capacity else {
+            return live_admin_error(
+                1,
+                "dataset create: --size <bytes> is required for --type volume",
+            );
+        };
+        if capacity == 0 || capacity % 4096 != 0 {
+            return live_admin_error(
+                1,
+                "dataset create: volume size must be nonzero and aligned to 4096 bytes",
+            );
+        }
+        if mountpoint.is_some() {
+            return live_admin_error(
+                1,
+                "dataset create: --mountpoint is not valid for a block volume",
+            );
+        }
+        if !features.is_empty() {
+            return live_admin_error(
+                1,
+                "dataset create: volume feature flags are not available until the volume engine consumes them",
+            );
         }
 
         let sync_guarantee = match parse_sync_guarantee(sync) {
@@ -1474,35 +1510,17 @@ impl VfsLocalFileSystem {
             );
         }
 
-        let catalog = match fs.dataset_catalog_mut() {
-            Ok(catalog) => catalog,
-            Err(err) => {
-                return live_admin_error(
-                    1,
-                    format!("dataset create: mutation requires reopen: {err}"),
-                )
-            }
-        };
-        if let Err(err) = catalog.create(
+        let geometry = match fs.create_volume_dataset(
             &full_path,
             dataset_id,
-            dataset_type,
-            1,
+            capacity,
             properties.to_key_value_blob(),
             DatasetFlags::default_create(),
             sync_guarantee,
         ) {
-            return live_admin_error(
-                1,
-                format!("dataset create: catalog error creating '{full_path}': {err}"),
-            );
-        }
-        if let Err(err) = fs.persist_dataset_catalog() {
-            return live_admin_error(
-                1,
-                format!("dataset create: failed to persist catalog: {err}"),
-            );
-        }
+            Ok(geometry) => geometry,
+            Err(err) => return live_admin_error(1, format!("dataset create: {err}")),
+        };
 
         let requested_properties = args.get("properties").cloned().unwrap_or_else(|| json!([]));
 
@@ -1514,6 +1532,8 @@ impl VfsLocalFileSystem {
                 "dataset": full_path,
                 "id": dataset_id.to_string(),
                 "type": dataset_type.to_string(),
+                "size": geometry.capacity_bytes,
+                "block_size": geometry.block_size_bytes,
                 "parent": parent,
                 "mountpoint": mountpoint,
                 "properties": requested_properties,
@@ -1522,8 +1542,10 @@ impl VfsLocalFileSystem {
         }
 
         live_admin_ok_text(format!(
-            "dataset '{full_path}' created in imported pool '{pool}'\n  id={}  parent='{parent}'",
-            format_dataset_id(&dataset_id)
+            "dataset '{full_path}' created in imported pool '{pool}'\n  id={}  parent='{parent}'  size={}  block_size={}",
+            format_dataset_id(&dataset_id),
+            geometry.capacity_bytes,
+            geometry.block_size_bytes
         ))
     }
 
@@ -6449,6 +6471,110 @@ mod tests {
     }
 
     #[test]
+    fn live_dataset_create_publishes_named_volume_catalog_and_root_together() {
+        let (engine, _td) = temp_fs();
+
+        let created = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "volume0",
+                "parent": "root",
+                "type": "volume",
+                "size": 8192,
+                "sync": "local",
+            }),
+        );
+        assert_eq!(created["ok"], true, "create response: {created}");
+        assert!(created["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("size=8192") && text.contains("block_size=4096")));
+
+        let fs = engine.fs.borrow();
+        let id = fs
+            .dataset_catalog()
+            .lookup("volume0")
+            .expect("cataloged named volume");
+        let reference = fs.store.dataset_root(id).expect("typed volume root");
+        assert_eq!(reference.dataset_id, id);
+        assert_eq!(reference.kind, tidefs_pool_runtime::DatasetRootKind::Volume);
+        let volume = fs.store.open_volume("volume0").expect("open named volume");
+        assert_eq!(volume.dataset_id(), id);
+        assert_eq!(volume.geometry().capacity_bytes, 8192);
+        assert_eq!(volume.geometry().block_size_bytes, 4096);
+    }
+
+    #[test]
+    fn live_dataset_create_refuses_rootless_or_invalid_objects() {
+        let (engine, _td) = temp_fs();
+
+        for (name, args, expected) in [
+            (
+                "filesystem0",
+                json!({
+                    "name": "filesystem0",
+                    "parent": "root",
+                    "type": "filesystem",
+                    "sync": "local",
+                }),
+                "filesystem engine can publish its typed root",
+            ),
+            (
+                "snapshot0",
+                json!({
+                    "name": "snapshot0",
+                    "parent": "root",
+                    "type": "snapshot",
+                    "sync": "local",
+                }),
+                "owning filesystem or volume engine",
+            ),
+            (
+                "missing-size",
+                json!({
+                    "name": "missing-size",
+                    "parent": "root",
+                    "type": "volume",
+                    "sync": "local",
+                }),
+                "--size <bytes> is required",
+            ),
+            (
+                "zero-size",
+                json!({
+                    "name": "zero-size",
+                    "parent": "root",
+                    "type": "volume",
+                    "size": 0,
+                    "sync": "local",
+                }),
+                "nonzero and aligned to 4096 bytes",
+            ),
+            (
+                "misaligned-size",
+                json!({
+                    "name": "misaligned-size",
+                    "parent": "root",
+                    "type": "volume",
+                    "size": 4097,
+                    "sync": "local",
+                }),
+                "nonzero and aligned to 4096 bytes",
+            ),
+        ] {
+            let refused = live_dataset_admin(&engine, "create", args);
+            assert_eq!(refused["ok"], false, "{name} response: {refused}");
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(expected)),
+                "{name} response did not contain {expected:?}: {refused}",
+            );
+            assert!(!engine.fs.borrow().dataset_catalog().contains(name));
+        }
+    }
+
+    #[test]
     fn live_dataset_properties_use_pool_local_catalog_path() {
         let (engine, _td) = temp_fs();
 
@@ -6458,6 +6584,8 @@ mod tests {
             json!({
                 "name": "demo",
                 "parent": "root",
+                "type": "volume",
+                "size": 4096,
                 "sync": "local",
             }),
         );
@@ -6550,6 +6678,8 @@ mod tests {
             json!({
                 "name": "demo",
                 "parent": "root",
+                "type": "volume",
+                "size": 4096,
                 "sync": "local",
             }),
         );
@@ -6584,6 +6714,8 @@ mod tests {
             json!({
                 "name": "demo",
                 "parent": "root",
+                "type": "volume",
+                "size": 4096,
                 "sync": "local",
             }),
         );
@@ -7133,6 +7265,8 @@ mod tests {
             json!({
                 "name": "demo",
                 "parent": "root",
+                "type": "volume",
+                "size": 4096,
                 "sync": "local",
             }),
         );
@@ -7173,6 +7307,8 @@ mod tests {
             json!({
                 "name": "demo",
                 "parent": "root",
+                "type": "volume",
+                "size": 4096,
                 "sync": "local",
             }),
         );

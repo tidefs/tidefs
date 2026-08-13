@@ -3994,6 +3994,7 @@ dependencies = [
  "tidefs-local-object-store",
  "tidefs-membership-epoch",
  "tidefs-pool-import",
+ "tidefs-pool-runtime",
  "tidefs-pool-scan",
  "tidefs-posix-filesystem-adapter-daemon",
  "tidefs-recovery-loop",

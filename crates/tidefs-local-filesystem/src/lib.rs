@@ -391,7 +391,8 @@ use tidefs_commit_group::{
 };
 use tidefs_dataset_feature_flags::{FeatureFlags, SupportedFeaturesV1};
 use tidefs_dataset_lifecycle::{
-    DatasetCatalog, DatasetFlags, DatasetLifecycle, DatasetType, PoisonNotification, SyncGuarantee,
+    DatasetCatalog, DatasetFlags, DatasetId, DatasetLifecycle, DatasetType, PoisonNotification,
+    SyncGuarantee,
 };
 use tidefs_dataset_properties::PropertySet;
 use tidefs_extent_map::ExtentAllocator;
@@ -2856,6 +2857,36 @@ impl LocalFileSystem {
             self.root_authentication_key,
         )?;
         Ok(())
+    }
+
+    /// Create one named Pool-backed volume without manufacturing filesystem
+    /// state for it. The mounted process remains the sole Pool owner while
+    /// the neutral runtime publishes the catalog entry and typed volume root.
+    pub fn create_volume_dataset(
+        &mut self,
+        path: &str,
+        dataset_id: DatasetId,
+        capacity_bytes: u64,
+        properties: Vec<u8>,
+        flags: DatasetFlags,
+        sync_guarantee: SyncGuarantee,
+    ) -> Result<tidefs_pool_runtime::VolumeGeometry> {
+        self.ensure_mutation_allowed("create Pool volume")?;
+        let result = self.store.create_volume(
+            path,
+            dataset_id,
+            capacity_bytes,
+            properties,
+            flags,
+            sync_guarantee,
+        );
+        if matches!(
+            &result,
+            Err(tidefs_pool_runtime::PoolRuntimeError::PublicationOutcomeUncertain(_))
+        ) {
+            self.arm_mutation_reopen_fence();
+        }
+        result.map_err(FileSystemError::from)
     }
 
     /// Get a shared reference to the durable pool properties.
