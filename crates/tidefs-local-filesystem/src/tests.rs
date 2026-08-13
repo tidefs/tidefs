@@ -293,6 +293,50 @@ fn pool_root_snapshot_catalog_and_typed_root_round_trip_together() {
 }
 
 #[test]
+fn deferred_mounted_snapshot_authority_is_published_before_success() {
+    let root = temp_root("deferred-mounted-snapshot-authority");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.set_auto_commit(false)
+        .expect("enable mounted deferred commits");
+
+    fs.create_snapshot("now")
+        .expect("create snapshot through deferred mount policy");
+    assert_eq!(
+        fs.list_snapshots_checked()
+            .expect("checked list immediately after create")
+            .len(),
+        1,
+    );
+    let snapshot_id = fs
+        .dataset_catalog()
+        .lookup("root@now")
+        .expect("published snapshot catalog entry");
+    assert_eq!(
+        fs.store
+            .dataset_root(snapshot_id)
+            .expect("published typed snapshot root")
+            .kind,
+        DatasetRootKind::Snapshot,
+    );
+
+    fs.delete_snapshot("now")
+        .expect("delete snapshot through deferred mount policy");
+    assert!(fs
+        .list_snapshots_checked()
+        .expect("checked list immediately after destroy")
+        .is_empty());
+    assert!(fs.store.dataset_root(snapshot_id).is_none());
+
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert!(reopened
+        .list_snapshots_checked()
+        .expect("checked list after reopen")
+        .is_empty());
+    cleanup(&root);
+}
+
+#[test]
 fn pool_root_reopen_refuses_catalog_snapshot_state_disagreement() {
     let root = temp_root("pool-root-snapshot-disagreement");
     {
