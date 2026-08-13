@@ -168,8 +168,8 @@ composition; deletion releases the pin inside the same mutation that removes
 catalog and typed-root reachability. List, rollback, destroy, reopen, and root
 retention fail closed on disagreement. Retention preserves the canonical Pool
 root, every live typed dataset root, each snapshot object's exact immutable
-source root, and the complete committed filesystem graphs selected by those
-roots.
+source root, and the complete filesystem transaction/content or volume
+map/chunk graph selected by those roots.
 
 Pool objects owned by a dataset are addressed through a domain-separated
 identity containing the stable `DatasetId`, object kind, logical identity, and
