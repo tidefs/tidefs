@@ -2651,6 +2651,7 @@ dependencies = [
  "tidefs-local-object-store",
  "tidefs-online-defrag",
  "tidefs-orphan-index",
+ "tidefs-pool-runtime",
  "tidefs-pool-scan",
  "tidefs-posix-acl",
  "tidefs-posix-semantics",

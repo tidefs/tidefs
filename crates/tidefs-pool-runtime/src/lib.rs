@@ -51,6 +51,7 @@ pub enum PoolRuntimeError {
     },
     InvalidVolume(&'static str),
     StaleVolumeHandle(DatasetId),
+    PublicationOutcomeUncertain(StoreError),
     PublicationRequiresReopen,
     Bounds,
     Io {
@@ -79,6 +80,10 @@ impl fmt::Display for PoolRuntimeError {
             Self::StaleVolumeHandle(id) => {
                 write!(f, "volume {id} was changed through another open handle")
             }
+            Self::PublicationOutcomeUncertain(error) => write!(
+                f,
+                "canonical Pool publication outcome is uncertain; reopen before mutation: {error}"
+            ),
             Self::PublicationRequiresReopen => f.write_str(
                 "canonical Pool publication outcome is uncertain; reopen before mutation",
             ),
@@ -95,7 +100,7 @@ impl fmt::Display for PoolRuntimeError {
 impl std::error::Error for PoolRuntimeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Store(error) => Some(error),
+            Self::Store(error) | Self::PublicationOutcomeUncertain(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -154,6 +159,15 @@ pub struct DatasetRootRef {
     pub semantic_generation: u64,
 }
 
+/// One immutable semantic root to install with a staged metadata transition.
+#[derive(Clone, Copy, Debug)]
+pub struct DatasetRootUpdate<'a> {
+    pub dataset_id: DatasetId,
+    pub kind: DatasetRootKind,
+    pub semantic_generation: u64,
+    pub bytes: &'a [u8],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ImmutableObjectRef {
     object_key: ObjectKey,
@@ -198,6 +212,9 @@ impl PoolRuntime {
             },
         };
         validate_catalog_root_types(&root.catalog, &root.dataset_roots)?;
+        for reference in root.dataset_roots.values().copied() {
+            let _ = load_immutable_object(&pool, reference)?;
+        }
         Ok(Self {
             pool,
             root,
@@ -261,8 +278,23 @@ impl PoolRuntime {
     }
 
     #[must_use]
+    pub fn is_unpublished(&self) -> bool {
+        self.root.generation == 0
+            && self.root.catalog.entries().is_empty()
+            && self.root.dataset_roots.is_empty()
+    }
+
+    #[must_use]
+    pub fn publication_requires_reopen(&self) -> bool {
+        self.publication_requires_reopen
+    }
+
+    #[must_use]
     pub fn dataset_catalog(&self) -> &DatasetCatalog {
-        &self.root.catalog
+        self.pending_metadata
+            .as_ref()
+            .map(|candidate| &candidate.catalog)
+            .unwrap_or(&self.root.catalog)
     }
 
     /// Stage catalog changes without changing live reopen authority. The
@@ -281,7 +313,10 @@ impl PoolRuntime {
 
     #[must_use]
     pub fn pool_properties(&self) -> &PropertySet {
-        &self.root.pool_properties
+        self.pending_metadata
+            .as_ref()
+            .map(|candidate| &candidate.pool_properties)
+            .unwrap_or(&self.root.pool_properties)
     }
 
     /// Stage pool-property changes without changing live reopen authority.
@@ -295,6 +330,12 @@ impl PoolRuntime {
                 "metadata candidate disappeared",
             ))?
             .pool_properties)
+    }
+
+    /// Abandon the caller's staged catalog/property transaction without
+    /// changing the live canonical Pool composition.
+    pub fn discard_metadata_candidate(&mut self) {
+        self.pending_metadata = None;
     }
 
     #[must_use]
@@ -314,6 +355,12 @@ impl PoolRuntime {
     /// any root that makes those objects reachable through this runtime.
     pub fn pool_mut(&mut self) -> &mut Pool {
         &mut self.pool
+    }
+
+    /// Consume the semantic owner after all front ends are closed.
+    #[must_use]
+    pub fn into_pool(self) -> Pool {
+        self.pool
     }
 
     /// Load and verify the exact immutable semantic root selected by the Pool
@@ -365,6 +412,13 @@ impl PoolRuntime {
     /// complete candidate composition validates. Failed publication leaves
     /// the live in-memory composition unchanged.
     pub fn publish_metadata(&mut self) -> Result<()> {
+        self.publish_metadata_with_roots(&[])
+    }
+
+    /// Publish staged catalog/properties and the supplied semantic roots as
+    /// one canonical composition. All immutable roots are durable before the
+    /// single Pool root makes any of them reachable.
+    pub fn publish_metadata_with_roots(&mut self, updates: &[DatasetRootUpdate<'_>]) -> Result<()> {
         self.ensure_publishable()?;
         let candidate = self
             .pending_metadata
@@ -379,6 +433,26 @@ impl PoolRuntime {
         next.pool_properties = candidate.pool_properties;
         next.dataset_roots
             .retain(|id, _| next.catalog.get_by_id(id).is_some());
+        let mut encoded_updates = Vec::with_capacity(updates.len());
+        for update in updates {
+            validate_catalog_dataset_type(&next.catalog, update.dataset_id, update.kind)?;
+            let reference = make_dataset_root_ref(
+                update.dataset_id,
+                update.kind,
+                update.semantic_generation,
+                update.bytes,
+            );
+            encoded_updates.push((reference, update.bytes));
+            next.dataset_roots.insert(update.dataset_id, reference);
+        }
+        validate_catalog_root_types(&next.catalog, &next.dataset_roots)?;
+        for (reference, bytes) in encoded_updates {
+            self.pool
+                .put(DeviceIoClass::Data, reference.object_key, bytes)?;
+        }
+        if !updates.is_empty() {
+            self.pool.sync_all()?;
+        }
         self.publish_root(next)?;
         self.pending_metadata = None;
         Ok(())
@@ -508,11 +582,11 @@ impl PoolRuntime {
             .put(DeviceIoClass::Data, canonical_pool_root_key(), &bytes)
         {
             self.publication_requires_reopen = true;
-            return Err(error.into());
+            return Err(PoolRuntimeError::PublicationOutcomeUncertain(error));
         }
         if let Err(error) = self.pool.sync_all() {
             self.publication_requires_reopen = true;
-            return Err(error.into());
+            return Err(PoolRuntimeError::PublicationOutcomeUncertain(error));
         }
         self.root = next;
         Ok(())
@@ -1537,6 +1611,14 @@ mod tests {
             ))
         ));
         assert_eq!(owner.generation(), generation);
+        assert!(owner.dataset_catalog().lookup("missing-root").is_ok());
+
+        owner
+            .dataset_catalog_mut()
+            .unwrap()
+            .destroy("missing-root")
+            .unwrap();
+        owner.publish_metadata().unwrap();
         assert!(owner.dataset_catalog().lookup("missing-root").is_err());
     }
 

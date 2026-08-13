@@ -186,7 +186,7 @@ proptest! {
                 "reopened Pool-backed content must preserve accepted bytes"
             );
 
-            let layout = MountedContentReadAuthority::new(&fs.store)
+            let layout = MountedContentReadAuthority::new(fs.store.pool())
                 .read_layout(record.inode_id, &record)
                 .expect("read content layout through mounted Pool authority");
             let ContentLayout::Chunked(manifest) = layout else {
@@ -991,6 +991,7 @@ fn wd_current_content_manifest(fs: &LocalFileSystem, path: &str) -> ContentManif
     let content_key = content_object_key_for_version(record.inode_id, record.data_version);
     let raw = fs
         .store
+        .pool()
         .get(DeviceIoClass::Data, content_key)
         .expect("read content object")
         .expect("content object exists");
@@ -1846,7 +1847,7 @@ fn write_buffer_flush_threshold_setter_changes_autoflush_batch_size() {
         "completed writeback must retire the saved Pool base record"
     );
     let committed = fs.stat("/batched.bin").expect("stat committed file");
-    let bytes = MountedContentReadAuthority::new(&fs.store)
+    let bytes = MountedContentReadAuthority::new(fs.store.pool())
         .read_all(record.inode_id, &committed)
         .expect("read threshold-flushed content through Pool authority");
     assert_eq!(bytes, [data.as_slice(), data.as_slice()].concat());

@@ -64,7 +64,7 @@ impl LocalFileSystem {
     pub fn statvfs(&self) -> crate::Result<Statvfs> {
         // Pool object count for inode statistics (the authority does not
         // own inode accounting; that belongs to the inode table).
-        let pool = self.store.pool_stats();
+        let pool = self.store.pool().pool_stats();
         let inode_total = pool.object_count;
         let inode_cap = self.allocator_policy.inode_capacity;
         let inode_free = if inode_cap > 0 {

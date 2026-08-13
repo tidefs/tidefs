@@ -8,6 +8,7 @@ use tidefs_local_object_store::{
     CrashInjectionPoint, DeviceIoClass, IntegrityDigest64, LocalObjectStore, ObjectKey,
     ObjectLocation, StoreError,
 };
+use tidefs_pool_runtime::{DatasetRootKind, PoolRuntime};
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind, ROOT_INODE_ID};
 
 use crate::allocation_bytes;
@@ -26,7 +27,7 @@ use crate::merge_allocation_entries;
 use crate::object_keys::*;
 use crate::persistence::{
     next_mounted_commit_transaction_id, persist_state_with_pool_at_transaction,
-    root_slot_for_transaction,
+    persist_state_with_runtime_at_transaction, root_slot_for_transaction,
 };
 use crate::read_content_from_store;
 use crate::read_content_layout_from_store;
@@ -408,6 +409,69 @@ pub(crate) fn load_latest_committed_state_pool(
             reason: "root slots exist but no Pool-authorized committed root could be selected",
         }),
     }
+}
+
+/// Load only the authenticated filesystem root selected by the canonical
+/// Pool root. Unreferenced root-slot candidates never participate in mounted
+/// reopen authority.
+pub(crate) fn load_canonical_committed_state(
+    runtime: &PoolRuntime,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<(FileSystemState, RootCommitRecord)> {
+    let bytes = runtime.load_dataset_root(
+        tidefs_pool_runtime::ROOT_DATASET_ID,
+        DatasetRootKind::Filesystem,
+    )?;
+    let root = decode_root_commit(&bytes)?;
+    let state = load_state_from_transaction_pool(runtime.pool(), &root, root_authentication_key)?;
+    Ok((state, root))
+}
+
+pub(crate) fn recover_canonical_committed_state(
+    runtime: &mut PoolRuntime,
+    root_authentication_key: RootAuthenticationKey,
+    policy: RecoveryPolicy,
+) -> Result<(FileSystemState, RootCommitRecord)> {
+    let (mut state, mut root) = load_canonical_committed_state(runtime, root_authentication_key)?;
+    if !policy.allows_replay() {
+        return Ok((state, root));
+    }
+    let committed_base = IntentLogRootAnchor::from_committed_root_summary(&root.summary());
+    let mut log = IntentLog::load(runtime.pool().raw_primary_store())?;
+    if intent_log_requires_commit_after(&log, &committed_base) {
+        check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
+        let count =
+            replay_uncommitted_with_pool(&log, &mut state, runtime.pool_mut(), &committed_base)?;
+        check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
+        if count > 0 {
+            let transaction_id =
+                next_mounted_commit_transaction_id(state.generation, &root.summary())?;
+            root = persist_state_with_runtime_at_transaction(
+                runtime,
+                &state,
+                transaction_id,
+                root_authentication_key,
+            )?;
+            let generation = state.generation;
+            for inode_id in state.dirty_inodes.iter().copied() {
+                state.last_inode_write_tx.insert(inode_id, generation);
+            }
+            for inode_id in state.dirty_dirs.iter().copied() {
+                state.last_dir_write_tx.insert(inode_id, generation);
+            }
+            state.dirty_content.clear();
+            state.dirty_inodes.clear();
+            state.dirty_dirs.clear();
+            eprintln!(
+                "recovery: replayed {count} intent log entries through canonical Pool root after transaction {}",
+                committed_base.transaction_id
+            );
+        }
+    }
+    if !log.is_empty() {
+        log.clear(runtime.pool_mut().raw_primary_store_mut())?;
+    }
+    Ok((state, root))
 }
 
 pub(crate) fn recovery_probe_pool(
@@ -1629,13 +1693,6 @@ pub(crate) fn select_latest_committed_root(
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RootSelection> {
     select_latest_committed_root_from_source(store, root_authentication_key)
-}
-
-pub(crate) fn selected_committed_root_summary_pool(
-    pool: &mut Pool,
-    root_authentication_key: RootAuthenticationKey,
-) -> Result<Option<CommittedRootSummary>> {
-    Ok(select_latest_committed_root_from_source(pool, root_authentication_key)?.selected_root)
 }
 
 fn scan_quorum_root_candidates<S: CommittedRootRecoverySource>(

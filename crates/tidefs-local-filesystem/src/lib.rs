@@ -391,8 +391,7 @@ use tidefs_commit_group::{
 };
 use tidefs_dataset_feature_flags::{FeatureFlags, SupportedFeaturesV1};
 use tidefs_dataset_lifecycle::{
-    DatasetCatalog, DatasetFlags, DatasetId, DatasetLifecycle, DatasetType, PoisonNotification,
-    SyncGuarantee,
+    DatasetCatalog, DatasetFlags, DatasetLifecycle, DatasetType, PoisonNotification, SyncGuarantee,
 };
 use tidefs_dataset_properties::PropertySet;
 use tidefs_extent_map::ExtentAllocator;
@@ -404,6 +403,7 @@ use tidefs_local_object_store::{
     DEFAULT_MAX_SEGMENT_BYTES, FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME, RECORD_OVERHEAD_BYTES,
 };
 use tidefs_orphan_index::OrphanIndex;
+use tidefs_pool_runtime::{DatasetRootKind, PoolRuntime};
 #[cfg(feature = "quorum-write")]
 use tidefs_quorum_write_runtime::{QuorumConfig, QuorumObjectStore};
 #[cfg(feature = "policy-observation")]
@@ -1586,6 +1586,7 @@ mod background_scrubber_tests {
             let manifest_key = content_object_key_for_version(record.inode_id, record.data_version);
             let manifest_receipt = fs
                 .store
+                .pool()
                 .placement_receipt_for_key(DeviceIoClass::Data, manifest_key)
                 .expect("read manifest receipt")
                 .expect("manifest receipt exists");
@@ -1607,6 +1608,7 @@ mod background_scrubber_tests {
             );
             let chunk_receipt = fs
                 .store
+                .pool()
                 .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
                 .expect("read chunk receipt")
                 .expect("chunk receipt exists");
@@ -1621,12 +1623,14 @@ mod background_scrubber_tests {
             {
                 assert!(fs
                     .store
+                    .pool()
                     .raw_primary_store()
                     .get(manifest_key)
                     .expect("inspect raw primary manifest")
                     .is_none());
                 assert!(fs
                     .store
+                    .pool()
                     .raw_primary_store()
                     .get(chunk_key)
                     .expect("inspect raw primary chunk")
@@ -1650,10 +1654,11 @@ mod background_scrubber_tests {
         let fixture = two_device_fixture();
         let mut fs = open_two_device_filesystem(&fixture);
         let payload = commit_off_primary_content(&mut fs);
-        let pool_config = fs.store.config().clone();
-        let pool_properties = fs.store.properties().clone();
+        let pool_config = fs.store.pool().config().clone();
+        let pool_properties = fs.store.pool().properties().clone();
         let receipts_before = fs
             .store
+            .pool()
             .placement_receipts(DeviceIoClass::Data)
             .expect("snapshot placement receipts");
         let devices_before = snapshot_devices(&fixture.devices);
@@ -1681,6 +1686,7 @@ mod background_scrubber_tests {
         assert_eq!(snapshot_devices(&fixture.devices), devices_before);
         assert_eq!(
             fs.store
+                .pool()
                 .placement_receipts(DeviceIoClass::Data)
                 .expect("re-read placement receipts"),
             receipts_before
@@ -1697,12 +1703,12 @@ mod background_scrubber_tests {
             .expect("write topology fixture");
         fs.sync_all().expect("commit topology fixture");
         let devices_before = snapshot_devices(&fixture.devices);
-        let mut incomplete_config = fs.store.config().clone();
+        let mut incomplete_config = fs.store.pool().config().clone();
         incomplete_config.devices.pop();
         let corruption_detected = Arc::new(AtomicBool::new(false));
         let mut scrubber = BackgroundScrubber::new(
             incomplete_config,
-            fs.store.properties().clone(),
+            fs.store.pool().properties().clone(),
             StoreOptions::test_fast(),
             RootAuthenticationKey::demo_key(),
             Duration::ZERO,
@@ -1878,7 +1884,7 @@ pub struct FsyncStatsSnapshot {
 /// [`VfsEngineImpl`](crate::vfs_engine_impl).
 #[derive(Debug)]
 pub struct LocalFileSystem {
-    store: Pool,
+    store: PoolRuntime,
     #[cfg(feature = "quorum-write")]
     quorum_store: Option<QuorumObjectStore>,
     state: FileSystemState,
@@ -1945,13 +1951,6 @@ pub struct LocalFileSystem {
     #[cfg(feature = "data-policy")]
     compression_policy_source: CompressionPolicySource,
     lifecycle: DatasetLifecycle,
-    /// Pool-store-backed dataset catalog mapping hierarchical paths to stable
-    /// [`DatasetId`] values. Mounted open decodes it from the pool store; live
-    /// catalog mutations persist encoded bytes and sync that store.
-    dataset_catalog: DatasetCatalog,
-    /// Durable pool-level property set. Loaded from pool store on mount;
-    /// saved after mutation.
-    pool_properties: PropertySet,
     background_scheduler: Option<BackgroundSchedulerRuntime>,
     /// Populated by `schedule_scrub_repairs()` with receipt-gated repair
     /// admission state. Consumed by `dispatch_scheduled_repairs()` to apply
@@ -2394,6 +2393,7 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
         load_state_from_transaction_pool(&mut *self.store, root, self.root_authentication_key)
     }
 
+    #[cfg(test)]
     fn load_or_initialize_state(&mut self) -> Result<FileSystemState> {
         let root_authentication_key = self.root_authentication_key;
         let recovery_policy = self.recovery_policy;
@@ -2624,10 +2624,10 @@ impl LocalFileSystem {
     #[cfg(test)]
     fn build_quota_parent_map_from_catalog(&self) -> HashMap<[u8; 16], [u8; 16]> {
         let mut map = HashMap::new();
-        let entries = self.dataset_catalog.entries();
+        let entries = self.dataset_catalog().entries();
         for (path, child_id) in &entries {
             if let Some((parent_path, _name)) = path.rsplit_once('/') {
-                if let Ok(parent_id) = self.dataset_catalog.lookup(parent_path) {
+                if let Ok(parent_id) = self.dataset_catalog().lookup(parent_path) {
                     map.insert(*child_id.as_bytes(), *parent_id.as_bytes());
                 }
             }
@@ -2823,7 +2823,7 @@ impl LocalFileSystem {
     /// and [`DatasetCatalog::rename`] for online renames without unmount.
     #[must_use]
     pub fn dataset_catalog(&self) -> &DatasetCatalog {
-        &self.dataset_catalog
+        self.store.dataset_catalog()
     }
 
     /// Get an exclusive reference to the durable dataset catalog for
@@ -2836,53 +2836,51 @@ impl LocalFileSystem {
     /// quiesced or during single-threaded mount/unmount sequences.
     pub fn dataset_catalog_mut(&mut self) -> Result<&mut DatasetCatalog> {
         self.ensure_mutation_allowed("mutate dataset catalog")?;
-        Ok(&mut self.dataset_catalog)
+        Ok(self.store.dataset_catalog_mut()?)
     }
 
-    /// Persist the dataset catalog to the pool store after mutation.
+    /// Publish staged catalog changes through the canonical Pool root.
     ///
     /// Callers that mutate the catalog via [`dataset_catalog_mut`] must
     /// call this before returning to ensure crash recovery can reload
     /// the catalog state.
     pub fn persist_dataset_catalog(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("persist dataset catalog")?;
-        self.store.put(
-            DeviceIoClass::Data,
-            dataset_catalog_object_key(),
-            &self.dataset_catalog.encode(),
+        let current_root = self.selected_committed_root_summary()?;
+        let transaction_id =
+            next_mounted_commit_transaction_id(self.state.generation, &current_root)?;
+        persist_state_with_runtime_at_transaction(
+            &mut self.store,
+            &self.state,
+            transaction_id,
+            self.root_authentication_key,
         )?;
-        self.store.sync_all()?;
         Ok(())
     }
 
     /// Get a shared reference to the durable pool properties.
     #[must_use]
     pub fn pool_properties(&self) -> &PropertySet {
-        &self.pool_properties
+        self.store.pool_properties()
     }
 
     /// Get an exclusive reference to the durable pool properties for mutation.
     pub fn pool_properties_mut(&mut self) -> Result<&mut PropertySet> {
         self.ensure_mutation_allowed("mutate pool properties")?;
-        Ok(&mut self.pool_properties)
+        Ok(self.store.pool_properties_mut()?)
     }
 
     /// Persist the pool properties to the pool store after mutation.
     pub fn persist_pool_properties(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("persist pool properties")?;
         #[cfg(not(feature = "data-policy"))]
-        if properties_select_compression(&self.pool_properties) {
+        if properties_select_compression(self.pool_properties()) {
             return Err(FileSystemError::Unsupported {
                 operation: "persist mounted compression policy",
                 reason: "compression properties require the data-policy feature",
             });
         }
-        self.store.put(
-            DeviceIoClass::Data,
-            pool_properties_object_key(),
-            &self.pool_properties.to_key_value_blob(),
-        )?;
-        self.store.sync_all()?;
+        self.store.publish_metadata()?;
         Ok(())
     }
 
@@ -2902,15 +2900,15 @@ impl LocalFileSystem {
             });
         }
         // Write per-class feature B-trees into the pool store.
-        let roots = self.feature_flags.persist(&mut self.store)?;
+        let roots = self.feature_flags.persist(self.store.pool_mut())?;
         // Write the roots pointer object so remount can locate the B-trees.
         let buf = roots.encode();
-        self.store.put(
+        self.store.pool_mut().put(
             DeviceIoClass::Data,
             crate::object_keys::feature_flags_roots_object_key(),
             &buf,
         )?;
-        self.store.sync_all()?;
+        self.store.pool_mut().sync_all()?;
         Ok(())
     }
 
@@ -2945,7 +2943,7 @@ impl LocalFileSystem {
     ) -> Result<(ContentCompressionPolicy, CompressionPolicySource)> {
         // Check pool properties first (pool-scoped compression override).
         if let Some((policy, source)) =
-            resolve_compression_policy_from_properties(&self.pool_properties)?
+            resolve_compression_policy_from_properties(self.pool_properties())?
         {
             return Ok((policy, source));
         }
@@ -3037,6 +3035,7 @@ impl LocalFileSystem {
     /// the low-watermark threshold.
     pub fn check_write_admission(&self, byte_count: u64) -> std::result::Result<(), StoreError> {
         self.store
+            .pool()
             .check_write_admission(tidefs_local_object_store::DeviceIoClass::Data, byte_count)
     }
 
@@ -3045,7 +3044,7 @@ impl LocalFileSystem {
     /// threshold are refused with `ENOSPC`.  Set to 0 to disable.
     pub(crate) fn set_low_watermark_bytes(&mut self, bytes: u64) -> Result<()> {
         self.ensure_mutation_allowed("set mounted write-admission watermark")?;
-        self.store.set_low_watermark_bytes(bytes);
+        self.store.pool_mut().set_low_watermark_bytes(bytes);
         Ok(())
     }
 
@@ -3817,7 +3816,7 @@ impl LocalFileSystem {
         )?;
         let root_path = root.as_ref().to_path_buf();
         let key_for_struct = encryption.as_ref().map(|c| c.key.clone());
-        let mut store = if let Some(devices) = block_devices {
+        let store = if let Some(devices) = block_devices {
             Self::block_device_pool_with_recovery_policy(
                 &root_path,
                 devices,
@@ -3851,9 +3850,39 @@ impl LocalFileSystem {
         }
         let background_scrub_pool_config = store.config().clone();
         let background_scrub_pool_properties = store.properties().clone();
+        let mut store = PoolRuntime::open(store)?;
         check_crash_hook(CrashInjectionPoint::RecoveryBeforeRootSelect);
-        let mut open_recovery = MountedOpenRecoveryAuthority::raw_only(
-            &mut store,
+        let mut state = if store.is_unpublished() {
+            if !recovery_policy.allows_any_mutation() {
+                return Err(FileSystemError::CorruptState {
+                    reason: "read-only open requires an existing canonical filesystem root",
+                });
+            }
+            let state = initial_state();
+            let signed = prepare_state_with_pool_at_transaction(
+                store.pool_mut(),
+                &state,
+                state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID),
+                root_authentication_key,
+            )?;
+            let root_bytes = encode_root_commit(&signed);
+            store.create_dataset_with_root(
+                "root",
+                tidefs_pool_runtime::ROOT_DATASET_ID,
+                DatasetType::Filesystem,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::default(),
+                signed.generation,
+                &root_bytes,
+            )?;
+            state
+        } else {
+            recover_canonical_committed_state(&mut store, root_authentication_key, recovery_policy)?
+                .0
+        };
+        let open_recovery = MountedOpenRecoveryAuthority::raw_only(
+            store.pool_mut(),
             root_authentication_key,
             recovery_policy,
         );
@@ -3865,8 +3894,6 @@ impl LocalFileSystem {
             open_recovery.transform_ordering_boundary(),
             MOUNTED_RECOVERY_TRANSFORM_ORDERING
         );
-        let mut state = open_recovery.load_or_initialize_state()?;
-
         // Clear any export holds that survived a crash. Export sessions
         // cannot survive pool reopen, so any remaining export-tagged
         // holds are stale and must be released.
@@ -3951,58 +3978,23 @@ impl LocalFileSystem {
             )
         };
         drop(open_recovery);
-        let reclaim_queue_inner = load_filesystem_reclaim_queue(&store)?;
+        let reclaim_queue_inner = load_filesystem_reclaim_queue(store.pool())?;
         // Reconstruct snapshot GC pins from the durable snapshot catalog.
         // Each snapshot root is pinned by full TraversalRoot identity so the GC
         // treats its object graph as reachable. Without this step, snapshot
         // reachability is lost across process restarts because the in-memory
         // GC pin set starts empty.
-        // Load or create the durable dataset catalog from the pool store.
-        // This is the canonical dataset catalog authority for the mounted
-        // filesystem. On first mount the catalog is absent; persisted catalog
-        // bytes that cannot be decoded or loaded are refused instead of
-        // recreated as an implicit migration for retired pre-release input.
-        let mut dataset_catalog = match store.primary_store().get(dataset_catalog_object_key()) {
-            Ok(Some(bytes)) => {
-                DatasetCatalog::decode(&bytes).map_err(|_| FileSystemError::CorruptState {
-                    reason: "dataset catalog decode failed during reopen",
-                })?
-            }
-            Ok(None) => DatasetCatalog::new(),
-            Err(_) => {
-                return Err(FileSystemError::CorruptState {
-                    reason: "dataset catalog load failed during reopen",
-                });
-            }
-        };
-
-        // Load pool properties from the pool store alongside the dataset catalog.
-        let pool_properties = match store.primary_store().get(pool_properties_object_key()) {
-            Ok(Some(bytes)) => PropertySet::from_key_value_blob(&bytes),
-            Ok(None) => PropertySet::new(),
-            Err(e) => {
-                eprintln!("warning: pool properties load failed: {e}; starting empty");
-                PropertySet::new()
-            }
-        };
-        // Ensure the root dataset entry exists.
-        if !dataset_catalog.contains("root") {
-            let root_id = DatasetId::from_bytes(ROOT_DATASET_ID);
-            let _ = dataset_catalog.create(
-                "root",
-                root_id,
-                DatasetType::Filesystem,
-                1,
-                vec![],
-                DatasetFlags::NONE,
-                SyncGuarantee::default(),
-            );
-        } else if let Ok(root_id) = dataset_catalog.lookup("root") {
-            if *root_id.as_bytes() != ROOT_DATASET_ID {
-                return Err(FileSystemError::CorruptState {
-                    reason: "root dataset catalog id differs from mounted root dataset id",
-                });
-            }
+        let root_id =
+            store
+                .dataset_catalog()
+                .lookup("root")
+                .map_err(|_| FileSystemError::CorruptState {
+                    reason: "canonical Pool root has no root filesystem dataset",
+                })?;
+        if root_id != tidefs_pool_runtime::ROOT_DATASET_ID {
+            return Err(FileSystemError::CorruptState {
+                reason: "root dataset catalog id differs from mounted root dataset id",
+            });
         }
 
         let mut lifecycle = DatasetLifecycle::new();
@@ -4016,40 +4008,42 @@ impl LocalFileSystem {
                 .map_err(|_| FileSystemError::CorruptState {
                     reason: "snapshot authority lifecycle pin set is full during reopen",
                 })?;
-            expected_snapshot_catalog_names.insert(snapshot::snapshot_record_catalog_name(record));
-            snapshot::reconcile_snapshot_record_catalog_entry(&mut dataset_catalog, record)?;
+            let catalog_name = snapshot::snapshot_record_catalog_name(record);
+            if !snapshot::snapshot_catalog_entry_matches(store.dataset_catalog(), record) {
+                return Err(FileSystemError::CorruptState {
+                    reason: "canonical Pool catalog does not match filesystem snapshot state",
+                });
+            }
+            let expected_root = encode_root_commit(&root_commit_from_summary(&record.root));
+            let stored_root = store.load_dataset_root(
+                snapshot::snapshot_record_dataset_id(record),
+                DatasetRootKind::Snapshot,
+            )?;
+            if stored_root != expected_root {
+                return Err(FileSystemError::CorruptState {
+                    reason: "canonical Pool snapshot root does not match filesystem snapshot state",
+                });
+            }
+            expected_snapshot_catalog_names.insert(catalog_name);
         }
 
         // Reconcile durable snapshot state into the canonical dataset catalog.
         // Only data-retaining snapshots and clones own dataset catalog entries;
         // bookmarks are lightweight replication anchors and do not pin roots.
-        let catalog_entries =
-            dataset_catalog
-                .list_children("")
-                .map_err(|_| FileSystemError::CorruptState {
-                    reason: "snapshot authority catalog could not be inspected during reopen",
-                })?;
+        let catalog_entries = store.dataset_catalog().list_children("").map_err(|_| {
+            FileSystemError::CorruptState {
+                reason: "snapshot authority catalog could not be inspected during reopen",
+            }
+        })?;
         for (entry_name, _dataset_id) in catalog_entries {
             if entry_name.starts_with("root@")
                 && !expected_snapshot_catalog_names.contains(&entry_name)
             {
-                let _ = dataset_catalog.destroy(&entry_name);
+                return Err(FileSystemError::CorruptState {
+                    reason:
+                        "canonical Pool catalog contains a snapshot absent from filesystem state",
+                });
             }
-        }
-
-        // Persist the canonical dataset catalog to the pool store only for
-        // mutating opens. RecoveryPolicy::ReadOnly is used by inspectors such
-        // as `dataset list` and must not replay or publish side effects while
-        // another process owns the mounted pool.
-        if recovery_policy.allows_any_mutation() {
-            if let Err(e) = store.put(
-                DeviceIoClass::Data,
-                dataset_catalog_object_key(),
-                &dataset_catalog.encode(),
-            ) {
-                eprintln!("warning: dataset catalog persist failed: {e}");
-            }
-            let _ = store.sync_all();
         }
 
         let pool_uuid = pool_uuid_from_path(&root_path);
@@ -4113,8 +4107,6 @@ impl LocalFileSystem {
             auto_compaction_waste_threshold: DEFAULT_AUTO_COMPACTION_WASTE_THRESHOLD,
             orphan_index: Arc::new(Mutex::new(orphan_index_inner)),
             lifecycle,
-            dataset_catalog,
-            pool_properties,
             #[cfg(feature = "data-policy")]
             compression_policy_source: CompressionPolicySource::Default,
             feature_flags: FeatureFlags::new(),
@@ -4290,13 +4282,14 @@ impl LocalFileSystem {
         // unresolved record is corrupt and must not silently disable gates.
         if let Some(bytes) = fs
             .store
+            .pool()
             .primary_store()
             .get(crate::object_keys::feature_flags_roots_object_key())?
         {
             let roots = decode_feature_flags_root_record(&bytes)?;
             if !roots.is_empty() {
                 fs.feature_flags =
-                    tidefs_dataset_feature_flags::FeatureFlags::load(&fs.store, &roots)
+                    tidefs_dataset_feature_flags::FeatureFlags::load(fs.store.pool(), &roots)
                         .map_err(map_feature_flags_load_error)?;
             }
         }
@@ -4325,7 +4318,7 @@ impl LocalFileSystem {
                     reason: "compression and dedup feature flags require the data-policy feature",
                 });
             }
-            if properties_select_compression(&fs.pool_properties) {
+            if properties_select_compression(fs.pool_properties()) {
                 return Err(FileSystemError::Unsupported {
                     operation: "mount filesystem with persisted compression policy",
                     reason: "compression properties require the data-policy feature",
@@ -4369,7 +4362,7 @@ impl LocalFileSystem {
             let cleanup = fs.cleanup_orphans()?;
             if !cleanup.is_idle() {
                 fs.do_commit()?;
-                fs.store.sync_all()?;
+                fs.store.pool_mut().sync_all()?;
             }
         }
 
@@ -4479,7 +4472,7 @@ impl LocalFileSystem {
         let root_authentication_key = self.root_authentication_key;
         let recovery_policy = self.recovery_policy;
         let mut authority = MountedOpenRecoveryAuthority::raw_only(
-            &mut self.store,
+            self.store.pool_mut(),
             root_authentication_key,
             recovery_policy,
         );
@@ -4487,16 +4480,16 @@ impl LocalFileSystem {
     }
 
     pub fn root(&self) -> &Path {
-        self.store.root()
+        self.store.pool().root()
     }
 
     pub fn segments_dir(&self) -> &Path {
-        self.store.segments_dir()
+        self.store.pool().segments_dir()
     }
 
     fn mounted_raw_store_diagnostics(&self) -> MountedRawStoreDiagnostics<'_> {
         MountedRawStoreDiagnostics {
-            store: self.store.raw_primary_store(),
+            store: self.store.pool().raw_primary_store(),
         }
     }
 
@@ -4536,6 +4529,7 @@ impl LocalFileSystem {
         let key = content_object_key_for_version(record.inode_id, record.data_version);
         Ok(self
             .store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, key)?
             .is_some())
     }
@@ -4623,14 +4617,14 @@ impl LocalFileSystem {
     pub(crate) fn mounted_metadata_fallback_authority(
         &self,
     ) -> MountedMetadataFallbackAuthority<'_> {
-        MountedMetadataFallbackAuthority::raw_metadata_only(self.store.raw_primary_store())
+        MountedMetadataFallbackAuthority::raw_metadata_only(self.store.pool().raw_primary_store())
     }
 
     pub fn recovery_audit(&mut self) -> Result<RecoveryAuditReport> {
         let root_authentication_key = self.root_authentication_key;
         let recovery_policy = self.recovery_policy;
         let mut authority = MountedOpenRecoveryAuthority::raw_only(
-            &mut self.store,
+            self.store.pool_mut(),
             root_authentication_key,
             recovery_policy,
         );
@@ -4644,14 +4638,14 @@ impl LocalFileSystem {
     /// intentionally retain their raw repair-store scope until #2377.
     #[cfg(feature = "replication-io")]
     pub(crate) fn recovery_audit_pool_authority(&mut self) -> Result<RecoveryAuditReport> {
-        audit_recovery_pool(&mut self.store, self.root_authentication_key)
+        audit_recovery_pool(self.store.pool_mut(), self.root_authentication_key)
     }
 
     pub fn online_verifier_report(&mut self) -> Result<OnlineVerifierReport> {
         let root_authentication_key = self.root_authentication_key;
         let recovery_policy = self.recovery_policy;
         let mut authority = MountedOpenRecoveryAuthority::raw_only(
-            &mut self.store,
+            self.store.pool_mut(),
             root_authentication_key,
             recovery_policy,
         );
@@ -4665,7 +4659,7 @@ impl LocalFileSystem {
         let root_authentication_key = self.root_authentication_key;
         let recovery_policy = self.recovery_policy;
         let mut authority = MountedOpenRecoveryAuthority::raw_only(
-            &mut self.store,
+            self.store.pool_mut(),
             root_authentication_key,
             recovery_policy,
         );
@@ -4688,6 +4682,7 @@ impl LocalFileSystem {
         let key = filesystem_reclaim_queue_object_key();
         let current = self
             .store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, key)?;
 
         let changed = match current {
@@ -4708,6 +4703,7 @@ impl LocalFileSystem {
                     false
                 } else {
                     self.store
+                        .pool_mut()
                         .put_with_receipt(DeviceIoClass::Data, key, &encoded)?;
                     true
                 }
@@ -4715,13 +4711,14 @@ impl LocalFileSystem {
             None if self.reclaim_queue.lock().unwrap().is_empty() => false,
             None => {
                 self.store
+                    .pool_mut()
                     .put_with_receipt(DeviceIoClass::Data, key, &encoded)?;
                 true
             }
         };
 
         if durability_required {
-            self.store.sync_all()?;
+            self.store.pool_mut().sync_all()?;
         }
         Ok(changed)
     }
@@ -4754,7 +4751,11 @@ impl LocalFileSystem {
             return;
         };
         let include_chunks = record.nlink == 0;
-        let entries = match inode_content_reclaim_entries(&self.store, &record, include_chunks) {
+        let entries = match inode_content_reclaim_entries(
+            self.store.pool(),
+            &record,
+            include_chunks,
+        ) {
             Ok(entries) => entries,
             Err(error) => {
                 eprintln!(
@@ -5026,7 +5027,7 @@ impl LocalFileSystem {
     /// reclaim leaves the exact local queue entries pending.
     fn collect_reclaim_protected_content_keys(&mut self) -> Result<HashSet<ObjectKey>> {
         Ok(reclaim_protected_content_keys_pool(
-            &mut self.store,
+            self.store.pool_mut(),
             self.root_authentication_key,
             &self.state,
         )?
@@ -5100,6 +5101,7 @@ impl LocalFileSystem {
 
             let payload = match self
                 .store
+                .pool()
                 .get_with_current_receipt(DeviceIoClass::Data, local_key)
             {
                 Ok(Some((payload, _receipt))) => payload,
@@ -5120,6 +5122,7 @@ impl LocalFileSystem {
             };
             let canonical_payload = match self
                 .store
+                .pool()
                 .get_with_current_receipt(DeviceIoClass::Data, canonical_key)
             {
                 Ok(Some((payload, _receipt))) => payload,
@@ -5152,7 +5155,10 @@ impl LocalFileSystem {
                     continue;
                 }
 
-                if !matches!(self.store.delete(DeviceIoClass::Data, local_key), Ok(true)) {
+                if !matches!(
+                    self.store.pool_mut().delete(DeviceIoClass::Data, local_key),
+                    Ok(true)
+                ) {
                     continue;
                 }
                 completed_keys.insert(local_key);
@@ -5167,7 +5173,7 @@ impl LocalFileSystem {
                 // reconstruction repairs that fail-safe overcount.
                 let mut canonical_reclaim_key = None;
                 if let StrictReclaimPreflight::DedupRedirect(fingerprint) = preflight {
-                    let store = self.store.raw_primary_store_mut();
+                    let store = self.store.pool_mut().raw_primary_store_mut();
                     let Ok(reclaim_canonical) =
                         crate::dedup_refcount::DedupRefCount::decrement(store, fingerprint)
                     else {
@@ -5245,12 +5251,12 @@ impl LocalFileSystem {
         let mut plan = RewriteTrimPlan::default();
         match old_layout {
             ContentLayout::Chunked(ref old_manifest) => {
-                let content_reader = MountedContentReadAuthority::new(&self.store);
+                let content_reader = MountedContentReadAuthority::new(self.store.pool());
                 let new_layout = content_reader.read_layout(inode_id, new_record)?;
                 if let ContentLayout::Chunked(ref new_manifest) = new_layout {
                     let (trimmable, deferred) =
                         crate::allocation::obsolete_extent_keys_for_full_replace(
-                            &self.store,
+                            self.store.pool(),
                             inode_id,
                             old_manifest,
                             &new_manifest.chunks,
@@ -5263,7 +5269,7 @@ impl LocalFileSystem {
             ContentLayout::Inline(ref old_inline) => {
                 let (trimmable, deferred) =
                     crate::allocation::obsolete_extent_keys_for_inline_replace(
-                        &self.store,
+                        self.store.pool(),
                         inode_id,
                         old_inline.data_version,
                         new_record.data_version,
@@ -5310,7 +5316,7 @@ impl LocalFileSystem {
         let mut remaining = Vec::new();
 
         for (old_key, new_key) in self.deferred_rewrite_trims.drain(..) {
-            if crate::allocation::replacement_key_receipt_is_durable(&self.store, new_key) {
+            if crate::allocation::replacement_key_receipt_is_durable(self.store.pool(), new_key) {
                 promoted.push(old_key);
             } else {
                 remaining.push((old_key, new_key));
@@ -5443,15 +5449,15 @@ impl LocalFileSystem {
         let expected_roots = plan.protected_committed_roots.clone();
         let expected_root_slot_locations = plan.protected_root_slot_locations.len();
         let selected_root_before = plan.audit.selected_root.clone();
-        let store_report = self.store.compact_retaining(
+        let store_report = self.store.pool_mut().compact_retaining(
             &plan.protected_object_keys,
             &plan.protected_root_slot_locations,
         )?;
         let root_authentication_key = self.root_authentication_key;
-        let audit = audit_recovery_pool(&mut self.store, root_authentication_key)?;
+        let audit = audit_recovery_pool(self.store.pool_mut(), root_authentication_key)?;
         let recovery_policy = self.recovery_policy;
         let mut authority = MountedOpenRecoveryAuthority::raw_only(
-            &mut self.store,
+            self.store.pool_mut(),
             root_authentication_key,
             recovery_policy,
         );
@@ -5500,6 +5506,7 @@ impl LocalFileSystem {
         self.ensure_mutation_allowed("compact mounted object store")?;
         if self
             .store
+            .pool()
             .should_compact(self.auto_compaction_waste_threshold)
         {
             return self.safe_reclaim_unprotected_objects().map(Some);
@@ -5571,8 +5578,10 @@ impl LocalFileSystem {
         if !self.recovery_policy.allows_repair_writeback() {
             return Ok(tidefs_scrub::scrub_repair::ScrubRepairLedger::new());
         }
-        let report =
-            crate::scrub::scrub_inodes_content(self.store.raw_primary_store(), &self.state.inodes)?;
+        let report = crate::scrub::scrub_inodes_content(
+            self.store.pool().raw_primary_store(),
+            &self.state.inodes,
+        )?;
 
         // Populate the scheduling bridge with receipt-gated admission state.
         let schedule = crate::scrub_repair_integration::run_scrub_repair_scheduling(&report);
@@ -5594,8 +5603,10 @@ impl LocalFileSystem {
         if !self.recovery_policy.allows_repair_writeback() {
             return Ok(tidefs_scrub::scrub_repair::ScrubRepairLedger::new());
         }
-        let report =
-            crate::scrub::scrub_inodes_content(self.store.raw_primary_store(), &self.state.inodes)?;
+        let report = crate::scrub::scrub_inodes_content(
+            self.store.pool().raw_primary_store(),
+            &self.state.inodes,
+        )?;
         Ok(crate::scrub_repair_integration::run_scrub_repair_pass(
             &report,
         ))
@@ -5657,7 +5668,7 @@ impl LocalFileSystem {
         let applied = crate::scrub_repair_integration::dispatch_repair_from_bridge(
             &mut schedule.bridge,
             &mut self.state,
-            self.store.raw_primary_store_mut(),
+            self.store.pool_mut().raw_primary_store_mut(),
             &mut content_layout_cache,
         );
         check_crash_hook(CrashInjectionPoint::RepairAfterWriteback);
@@ -5675,7 +5686,7 @@ impl LocalFileSystem {
 
         if !re_scrub_inodes.is_empty() {
             match crate::scrub::scrub_inodes_content(
-                self.store.raw_primary_store(),
+                self.store.pool().raw_primary_store(),
                 &re_scrub_inodes,
             ) {
                 Ok(re_report) => {
@@ -5764,7 +5775,7 @@ impl LocalFileSystem {
                 // target_free_segments, activates the cleaner and runs one
                 // round of journal segment cleaning per tick, subject to
                 // the rate limiter so foreground I/O is not starved.
-                self.background_cleaner.tick(&mut self.store);
+                self.background_cleaner.tick(self.store.pool_mut());
             }
         }
         Ok(())
@@ -5795,7 +5806,7 @@ impl LocalFileSystem {
             }
 
             if record.is_file_like() {
-                for entry in inode_content_reclaim_entries(&self.store, &record, true)? {
+                for entry in inode_content_reclaim_entries(self.store.pool(), &record, true)? {
                     prepared.insert(entry.object_key, entry);
                 }
             }
@@ -5870,7 +5881,7 @@ impl LocalFileSystem {
             snapshot_count: self.state.snapshots.len(),
             next_inode_id: self.state.next_inode_id_raw(),
             filesystem_generation: self.state.generation,
-            object_store: self.store.store_stats(),
+            object_store: self.store.pool().store_stats(),
         }
     }
 
@@ -6157,7 +6168,7 @@ impl LocalFileSystem {
         source_record: &InodeRecord,
         dest_record: &InodeRecord,
     ) -> Result<(BTreeMap<ObjectKey, u64>, u64, u64)> {
-        let content_reader = MountedContentReadAuthority::new(&self.store);
+        let content_reader = MountedContentReadAuthority::new(self.store.pool());
         let source_layout = content_reader.read_layout(source_inode_id, source_record)?;
         let planned_entries =
             planned_reflink_allocation_entries_for_source_layout(dest_record, &source_layout)?;
@@ -6171,7 +6182,7 @@ impl LocalFileSystem {
         inode_id: InodeId,
         record: &InodeRecord,
     ) -> Result<()> {
-        let content_reader = MountedContentReadAuthority::new(&self.store);
+        let content_reader = MountedContentReadAuthority::new(self.store.pool());
         let layout = content_reader.read_layout(inode_id, record)?;
         let mut recorded = false;
         match layout {
@@ -6318,7 +6329,7 @@ impl LocalFileSystem {
             Some(state)
         };
         let mut report = allocator_report_for_state_pool(
-            &mut self.store,
+            self.store.pool_mut(),
             pool_readable_state.as_ref().unwrap_or(&self.state),
             self.allocator_policy,
             self.root_authentication_key,
@@ -6418,7 +6429,7 @@ impl LocalFileSystem {
         // Keep store-layer SpaceBook updated for internal tracking
         // (write/delete auto-updates, persistence). The statfs derivation
         // no longer queries SpaceBook; it uses the single capacity authority.
-        self.store.update_space_book_pool_counters(phys);
+        self.store.pool_mut().update_space_book_pool_counters(phys);
         // Refresh the mounted capacity facade from the committed
         // tidefs-space-accounting authority. Statfs must not recompute
         // free space from local capacity counters.
@@ -6479,7 +6490,10 @@ impl LocalFileSystem {
 
     pub fn sync_all(&mut self) -> Result<()> {
         self.commit_if_dirty()?;
-        self.store.sync_all().map_err(FileSystemError::from)
+        self.store
+            .pool_mut()
+            .sync_all()
+            .map_err(FileSystemError::from)
     }
 
     pub fn list_snapshots(&self) -> Vec<SnapshotSummary> {
@@ -6526,6 +6540,7 @@ impl LocalFileSystem {
         };
         let summary = record.summary();
         self.state.snapshots.insert(name, record.clone());
+        snapshot::reconcile_snapshot_record_catalog_entry(self.dataset_catalog_mut()?, &record)?;
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         let result = self.commit_mutation(summary)?;
@@ -6534,9 +6549,6 @@ impl LocalFileSystem {
             .map_err(|_| FileSystemError::CorruptState {
                 reason: "snapshot authority lifecycle pin set is full",
             })?;
-        if snapshot::reconcile_snapshot_record_catalog_entry(&mut self.dataset_catalog, &record)? {
-            self.persist_dataset_catalog()?;
-        }
         Ok(result)
     }
 
@@ -6569,14 +6581,12 @@ impl LocalFileSystem {
         self.begin_mutation("delete snapshot")?; // was: let previous_state = self.state.clone()
         self.bump_generation();
         self.state.snapshots.remove(&name);
+        snapshot::remove_snapshot_record_catalog_entry(self.dataset_catalog_mut()?, &record)?;
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         let summary = self.commit_mutation(record.summary())?;
         self.lifecycle
             .unpin_root(snapshot::snapshot_record_traversal_root(&record)?);
-        if snapshot::remove_snapshot_record_catalog_entry(&mut self.dataset_catalog, &record)? {
-            self.persist_dataset_catalog()?;
-        }
         Ok((summary, record))
     }
 
@@ -6611,7 +6621,7 @@ impl LocalFileSystem {
         let previous_state = self.state.clone();
         let root = root_commit_from_summary(&snapshot.root);
         let mut restored = load_state_from_transaction_incremental(
-            self.store.raw_primary_store_mut(),
+            self.store.pool_mut().raw_primary_store_mut(),
             &root,
             self.root_authentication_key,
             &previous_state,
@@ -6649,7 +6659,7 @@ impl LocalFileSystem {
         self.sync_all()?;
         let current_root = self.selected_current_root_summary()?;
         export_changed_records_from_root(
-            &mut self.store,
+            self.store.pool_mut(),
             &current_root,
             &self.state,
             self.root_authentication_key,
@@ -6673,7 +6683,7 @@ impl LocalFileSystem {
         self.sync_all()?;
         let to_root = self.selected_current_root_summary()?;
         export_incremental_changed_records(
-            &mut self.store,
+            self.store.pool_mut(),
             from_root,
             &to_root,
             &self.state,
@@ -7437,7 +7447,7 @@ impl LocalFileSystem {
         // Zero-copy reflink: store dedup redirects at destination chunk keys.
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
-            let mut pool_store = self.store.pool_store_mut();
+            let mut pool_store = self.store.pool_mut().pool_store_mut();
             reflink_chunked_content(
                 self.dedup_enabled,
                 &mut pool_store,
@@ -8003,7 +8013,7 @@ impl LocalFileSystem {
         )?;
         #[cfg(feature = "policy-observation")]
         let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode_pool(
-            &self.store,
+            self.store.pool(),
             &old_record,
         )?)?;
         #[cfg(feature = "policy-observation")]
@@ -8038,7 +8048,7 @@ impl LocalFileSystem {
         }
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
-            let mut pool_store = self.store.pool_store_mut();
+            let mut pool_store = self.store.pool_mut().pool_store_mut();
             write_chunked_content_with_patch_batch(WriteChunkedContentPatchBatch {
                 dedup_enabled: self.dedup_enabled,
                 store: &mut pool_store,
@@ -9712,7 +9722,7 @@ impl LocalFileSystem {
                 // fsync fast path does not replay pre-truncation writes.
                 self.intent_log.remove_entries_for_inode_from_store(
                     inode_id,
-                    self.store.raw_primary_store_mut(),
+                    self.store.pool_mut().raw_primary_store_mut(),
                 );
             }
         }
@@ -9806,7 +9816,7 @@ impl LocalFileSystem {
         }
         // Zero the content range in the object store via punch_hole_content.
         // This ensures subsequent reads return zeros for the freed range.
-        let mut pool_store = self.store.pool_store_mut();
+        let mut pool_store = self.store.pool_mut().pool_store_mut();
         #[cfg(feature = "quorum-write")]
         let quorum_store = None; // block-device discard is a local operation.
         crate::content::punch_hole_content(PunchHoleContent {
@@ -9948,7 +9958,7 @@ impl LocalFileSystem {
         updated.data_version = tick;
         updated.metadata_version = tick;
         Self::advance_subtree_revision(&mut updated);
-        let mut pool_store = self.store.pool_store_mut();
+        let mut pool_store = self.store.pool_mut().pool_store_mut();
         // Size is preserved (KEEP_SIZE semantics)
         punch_hole_content(PunchHoleContent {
             store: &mut pool_store,
@@ -10270,7 +10280,7 @@ impl LocalFileSystem {
         updated.data_version = tick;
         updated.metadata_version = tick;
         Self::advance_subtree_revision(&mut updated);
-        let mut pool_store = self.store.pool_store_mut();
+        let mut pool_store = self.store.pool_mut().pool_store_mut();
         updated.size = record_size;
         punch_hole_content(PunchHoleContent {
             store: &mut pool_store,
@@ -11802,7 +11812,7 @@ impl LocalFileSystem {
         if size > 0 || kind == NodeKind::Symlink {
             let result = {
                 let mut dedup = self.dedup_index.borrow_mut();
-                let mut pool_store = self.store.pool_store_mut();
+                let mut pool_store = self.store.pool_mut().pool_store_mut();
                 write_chunked_content(
                     self.dedup_enabled,
                     &mut pool_store,
@@ -11908,7 +11918,7 @@ impl LocalFileSystem {
 
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
-            let mut pool_store = self.store.pool_store_mut();
+            let mut pool_store = self.store.pool_mut().pool_store_mut();
             reflink_chunked_content(
                 self.dedup_enabled,
                 &mut pool_store,
@@ -11950,7 +11960,7 @@ impl LocalFileSystem {
         let planned_entries = planned_chunk_allocation_entries_for_full_content(&planned_record)?;
         #[cfg(feature = "policy-observation")]
         let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode_pool(
-            &self.store,
+            self.store.pool(),
             &record,
         )?)?;
         #[cfg(feature = "policy-observation")]
@@ -11973,7 +11983,7 @@ impl LocalFileSystem {
         Self::advance_subtree_revision(&mut record);
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
-            let mut pool_store = self.store.pool_store_mut();
+            let mut pool_store = self.store.pool_mut().pool_store_mut();
             write_chunked_content(
                 self.dedup_enabled,
                 &mut pool_store,
@@ -12047,7 +12057,7 @@ impl LocalFileSystem {
         )?;
         #[cfg(feature = "policy-observation")]
         let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode_pool(
-            &self.store,
+            self.store.pool(),
             &old_record,
         )?)?;
         // Pre-check obligation ledger before allocator (Design rule Rule 3: authority is scarce)
@@ -12085,7 +12095,7 @@ impl LocalFileSystem {
         Self::advance_subtree_revision(&mut record);
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
-            let mut pool_store = self.store.pool_store_mut();
+            let mut pool_store = self.store.pool_mut().pool_store_mut();
             write_chunked_content_with_overlay(WriteChunkedContentOverlay {
                 dedup_enabled: self.dedup_enabled,
                 store: &mut pool_store,
@@ -12451,7 +12461,9 @@ impl LocalFileSystem {
             None => (current_data_version, candidate_target),
         };
         // Sync writes get high throughput allocation to avoid intent-log backpressure.
-        self.store.set_scheduling_class(IoClass::SyncData);
+        self.store
+            .pool_mut()
+            .set_scheduling_class(IoClass::SyncData);
         if !self.commit_group.record_write(length) {
             self.record_unmet_floor_ack_refusal(
                 LocalAckOperation::SyncWrite,
@@ -12469,10 +12481,10 @@ impl LocalFileSystem {
         // Store the write payload durably so that crash replay can
         // recover it even when the content manifest was never committed.
         self.intent_log
-            .write_next_data_payload(&mut self.store, payload)?;
+            .write_next_data_payload(self.store.pool_mut(), payload)?;
 
         let accepted = self.intent_log.append(
-            self.store.raw_primary_store_mut(),
+            self.store.pool_mut().raw_primary_store_mut(),
             IntentLogEntryKind::SyncWriteRange {
                 inode_id,
                 offset,
@@ -12497,7 +12509,8 @@ impl LocalFileSystem {
             return Ok(IntentLogReplyState::Refused);
         }
 
-        self.intent_log.sync(self.store.raw_primary_store_mut())?;
+        self.intent_log
+            .sync(self.store.pool_mut().raw_primary_store_mut())?;
 
         // Keep the committed inode anchored to its current Pool-readable
         // content until replay has produced replacement chunks and receipts.
@@ -12529,7 +12542,7 @@ impl LocalFileSystem {
             .as_nanos() as u64;
         let accepted = MountedMetadataIntentRawStateAuthority::raw_metadata_only(
             &mut self.intent_log,
-            &mut self.store,
+            self.store.pool_mut(),
         )
         .append_create_and_sync(
             NamespaceCreateIntentRecord {
@@ -12561,7 +12574,7 @@ impl LocalFileSystem {
             .as_nanos() as u64;
         let accepted = MountedMetadataIntentRawStateAuthority::raw_metadata_only(
             &mut self.intent_log,
-            &mut self.store,
+            self.store.pool_mut(),
         )
         .append_setattr_and_sync(updated_inode.clone(), root_anchor, timestamp_ns)?;
 
@@ -12582,7 +12595,7 @@ impl LocalFileSystem {
     pub fn flush_intent_log_if_needed(&mut self) -> Result<bool> {
         self.ensure_mutation_allowed("flush mounted intent log")?;
         self.intent_log
-            .flush_if_needed(self.store.raw_primary_store_mut())
+            .flush_if_needed(self.store.pool_mut().raw_primary_store_mut())
     }
 
     /// Return the current pending (unflushed) intent log entry count.
@@ -12731,10 +12744,13 @@ impl LocalFileSystem {
         // root, and clears the covered entries.
         if self.intent_log.has_pending_data_for_inode(attr.inode_id) {
             self.intent_log
-                .flush_and_sync(self.store.raw_primary_store_mut())?;
+                .flush_and_sync(self.store.pool_mut().raw_primary_store_mut())?;
             // Flushed intent-log entries remain replayable until the
             // do_commit() below publishes their replacement root.
-            self.store.sync_all().map_err(FileSystemError::from)?;
+            self.store
+                .pool_mut()
+                .sync_all()
+                .map_err(FileSystemError::from)?;
             self.fsync_stats
                 .fsync_intent_log_fast_path_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -12744,7 +12760,11 @@ impl LocalFileSystem {
             // ReplayEngine::replay_intent_log) provides an additional safety net.
         }
         self.do_commit()?;
-        let result = self.store.sync_all().map_err(FileSystemError::from);
+        let result = self
+            .store
+            .pool_mut()
+            .sync_all()
+            .map_err(FileSystemError::from);
         self.fsync_stats
             .fsync_do_commit_fallback_count
             .fetch_add(1, Ordering::Relaxed);
@@ -12793,7 +12813,11 @@ impl LocalFileSystem {
         self.ensure_mutation_allowed("synchronize mounted filesystem")?;
         let started = Instant::now();
         self.do_commit()?;
-        let result = self.store.sync_all().map_err(FileSystemError::from);
+        let result = self
+            .store
+            .pool_mut()
+            .sync_all()
+            .map_err(FileSystemError::from);
         self.fsync_stats
             .fsync_all_count
             .fetch_add(1, Ordering::Relaxed);
@@ -12899,11 +12923,14 @@ impl LocalFileSystem {
                 .ok_or(FileSystemError::CorruptState {
                     reason: "dirty content inode not found in state",
                 })?;
-            validate_versioned_content_with_pool(&self.store, record)?;
+            validate_versioned_content_with_pool(self.store.pool(), record)?;
         }
         let had_pending_intent = self.intent_log.pending_flush_count() > 0;
         self.do_commit()?;
-        self.store.sync_all().map_err(FileSystemError::from)?;
+        self.store
+            .pool_mut()
+            .sync_all()
+            .map_err(FileSystemError::from)?;
         if !dirty_inodes.is_empty() || had_pending_intent {
             self.record_full_local_placement_ack_receipt(
                 LocalAckOperation::Fdatasync,
@@ -12938,7 +12965,7 @@ impl LocalFileSystem {
         // provides an additional safety net.
         if self.intent_log.has_pending_data_for_inode(inode_id) {
             self.intent_log
-                .flush_and_sync(self.store.raw_primary_store_mut())?;
+                .flush_and_sync(self.store.pool_mut().raw_primary_store_mut())?;
             self.fsync_stats
                 .fsync_intent_log_fast_path_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -12953,7 +12980,11 @@ impl LocalFileSystem {
         // extent maps, and content manifests so that the inode and its
         // data survive a crash consistently.
         self.do_commit()?;
-        let result = self.store.sync_all().map_err(FileSystemError::from);
+        let result = self
+            .store
+            .pool_mut()
+            .sync_all()
+            .map_err(FileSystemError::from);
         self.fsync_stats
             .fsync_do_commit_fallback_count
             .fetch_add(1, Ordering::Relaxed);
@@ -12998,9 +13029,12 @@ impl LocalFileSystem {
                 .ok_or(FileSystemError::CorruptState {
                     reason: "dirty content inode not found in state during sync_all_dirty",
                 })?;
-            validate_versioned_content_with_pool(&self.store, record)?;
+            validate_versioned_content_with_pool(self.store.pool(), record)?;
         }
-        self.store.sync_all().map_err(FileSystemError::from)?;
+        self.store
+            .pool_mut()
+            .sync_all()
+            .map_err(FileSystemError::from)?;
         for inode_id in &dirty_inodes {
             self.mark_content_clean(*inode_id);
         }
@@ -13047,7 +13081,10 @@ impl LocalFileSystem {
         // content-only store flush cannot substitute for that root authority.
         let _ = self.read_committed_content_layout(inode_id, record)?;
         self.do_commit()?;
-        self.store.sync_all().map_err(FileSystemError::from)?;
+        self.store
+            .pool_mut()
+            .sync_all()
+            .map_err(FileSystemError::from)?;
         self.record_full_local_placement_ack_receipt(
             LocalAckOperation::Fdatasync,
             LocalAckReceiptTarget::inode(inode_id.get()),
@@ -13089,7 +13126,7 @@ impl LocalFileSystem {
         // already-applied namespace state and clears the covered entries.
         if self.intent_log.has_pending_namespace_for_dir(attr.inode_id) {
             self.intent_log
-                .flush_and_sync(self.store.raw_primary_store_mut())?;
+                .flush_and_sync(self.store.pool_mut().raw_primary_store_mut())?;
             self.fsync_stats
                 .fsync_intent_log_fast_path_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -13103,7 +13140,10 @@ impl LocalFileSystem {
         // dirty parent entries, and the target inode.  For now, do_commit()
         // syncs all dirty state. Review debt TFR-008 tracks true scoped sync.
         self.do_commit()?;
-        self.store.sync_all().map_err(FileSystemError::from)?;
+        self.store
+            .pool_mut()
+            .sync_all()
+            .map_err(FileSystemError::from)?;
         self.fsync_stats
             .fsync_do_commit_fallback_count
             .fetch_add(1, Ordering::Relaxed);
@@ -13176,7 +13216,7 @@ impl LocalFileSystem {
             replay_live_data_with_pool(
                 &self.intent_log,
                 &mut self.state,
-                &mut self.store,
+                self.store.pool_mut(),
                 &committed_base,
             )?;
         }
@@ -13232,17 +13272,20 @@ impl LocalFileSystem {
             let transaction_id = transaction_id.ok_or(FileSystemError::CorruptState {
                 reason: "mounted commit lost its selected transaction identity",
             })?;
-            if let Err(error) = persist_state_with_pool_at_transaction(
+            let signed_root = match persist_state_with_runtime_at_transaction(
                 &mut self.store,
                 &self.state,
                 transaction_id,
                 self.root_authentication_key,
             ) {
-                if matches!(&error, FileSystemError::PublishOutcomeUncertain { .. }) {
-                    self.arm_mutation_reopen_fence();
+                Ok(root) => root,
+                Err(error) => {
+                    if matches!(&error, FileSystemError::PublishOutcomeUncertain { .. }) {
+                        self.arm_mutation_reopen_fence();
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
+            };
             check_crash_hook(CrashInjectionPoint::CommitGroupAfterAppendData);
             // Re-verify the stored root commit (#870).
             check_crash_hook(CrashInjectionPoint::CommitGroupBeforeCommit);
@@ -13251,34 +13294,18 @@ impl LocalFileSystem {
             // mount and commit, the corruption goes undetected until
             // next mount.  Re-read the root commit we just wrote and
             // run the same validation that mount uses.
-            let slot_key = root_slot_object_key(root_slot_for_transaction(transaction_id));
-            let stored_bytes = match self.store.primary_store().get(slot_key)? {
-                Some(b) => b,
-                None => {
-                    #[cfg(feature = "quorum-write")]
-                    if let Some(ref qs) = self.quorum_store {
-                        let (_, data, _) = qs.quorum_get(slot_key);
-                        if let Some(b) = data {
-                            b
-                        } else {
-                            return Err(FileSystemError::CorruptState {
-                                reason: "root commit written but not found on re-read (primary and replicas)",
-                            });
-                        }
-                    } else {
-                        return Err(FileSystemError::CorruptState {
-                            reason: "root commit written but not found on re-read",
-                        });
-                    }
-                    #[cfg(not(feature = "quorum-write"))]
-                    return Err(FileSystemError::CorruptState {
-                        reason: "root commit written but not found on re-read",
-                    });
-                }
-            };
+            let stored_bytes = self.store.load_dataset_root(
+                tidefs_pool_runtime::ROOT_DATASET_ID,
+                DatasetRootKind::Filesystem,
+            )?;
             let stored_root = decode_root_commit(&stored_bytes)?;
+            if stored_root != signed_root {
+                return Err(FileSystemError::CorruptState {
+                    reason: "canonical Pool root selected a different filesystem commit",
+                });
+            }
             let _ = load_state_from_transaction_pool(
-                &mut self.store,
+                self.store.pool_mut(),
                 &stored_root,
                 self.root_authentication_key,
             )?;
@@ -13291,7 +13318,7 @@ impl LocalFileSystem {
             self.mark_metalogue_committed(transaction_id)?;
         }
         // Persist quota table alongside committed state
-        self.store.put(
+        self.store.pool_mut().put(
             DeviceIoClass::Data,
             quota_table_object_key(),
             &self.state.quota_table.encode(),
@@ -13306,20 +13333,22 @@ impl LocalFileSystem {
         if !self.orphan_index.lock().unwrap().is_empty() {
             let encoded = self.orphan_index.lock().unwrap().encode_log();
             self.store
+                .pool_mut()
                 .put(DeviceIoClass::Data, orphan_index_object_key(), &encoded)?;
         } else {
             // Remove the key when the index is empty to avoid stale reads.
             let _ = self
                 .store
+                .pool_mut()
                 .raw_primary_store_mut()
                 .delete(orphan_index_object_key());
             // Persist feature flags alongside committed state (Phase 3).
             // Every commit snapshots the current feature flag set so that
             // feature enable/disable mutations survive crashes.
-            match self.feature_flags.persist(&mut self.store) {
+            match self.feature_flags.persist(self.store.pool_mut()) {
                 Ok(roots) => {
                     let buf = roots.encode();
-                    if let Err(e) = self.store.put(
+                    if let Err(e) = self.store.pool_mut().put(
                         DeviceIoClass::Data,
                         crate::object_keys::feature_flags_roots_object_key(),
                         &buf,
@@ -13336,12 +13365,13 @@ impl LocalFileSystem {
         // Uncommitted entries survive until the next state commit or
         // replay on remount (#862).
         if had_intent_log_entries {
-            self.intent_log.clear(self.store.raw_primary_store_mut())?;
+            self.intent_log
+                .clear(self.store.pool_mut().raw_primary_store_mut())?;
         }
         // Rotate the current segment if rotation thresholds have been
         // exceeded. This provides flush-boundary rotation (#875).
         check_crash_hook(CrashInjectionPoint::CommitGroupBeforeCheckpoint);
-        self.store.rotate_if_needed()?;
+        self.store.pool_mut().rotate_if_needed()?;
         // Sync quorum replicas after the primary commits successfully.
         #[cfg(feature = "quorum-write")]
         if let Some(qs) = self.quorum_store.as_mut() {
@@ -13373,14 +13403,14 @@ impl LocalFileSystem {
         // will receive ENOSPC; metadata ops (unlink/rmdir) reserve emergency
         // headroom for recovery.
         {
-            let cap = self.store.pool_stats();
+            let cap = self.store.pool().pool_stats();
             self.space_pressure
                 .update(cap.total_capacity_bytes, cap.used_bytes);
             if self.space_pressure.should_sync_clean() {
-                match journal_cleaner::clean_oldest_segment(&mut self.store) {
+                match journal_cleaner::clean_oldest_segment(self.store.pool_mut()) {
                     Ok(report) => {
                         if !report.retired_segments.is_empty() {
-                            let cap_after = self.store.pool_stats();
+                            let cap_after = self.store.pool().pool_stats();
                             self.space_pressure
                                 .update(cap_after.total_capacity_bytes, cap_after.used_bytes);
                             eprintln!(
@@ -13688,6 +13718,7 @@ impl LocalFileSystem {
 
     fn rollback_mutation_delta(&mut self) {
         self.inode_cache.borrow_mut().clear();
+        self.store.discard_metadata_candidate();
         if let Some(delta) = self.mutation_delta.take() {
             // Restore inode/directory/snapshot metadata.
             for (id, inode) in delta.old_inodes {
@@ -13745,7 +13776,9 @@ impl LocalFileSystem {
             self.deferred_rewrite_trims = delta.old_deferred_rewrite_trims;
             // Discard intent-log entries appended during the transaction.
             if self.intent_log.next_entry_id() > delta.intent_log_seq_at_begin {
-                let _ = self.intent_log.clear(self.store.raw_primary_store_mut());
+                let _ = self
+                    .intent_log
+                    .clear(self.store.pool_mut().raw_primary_store_mut());
             }
             // Clear the metadata intent-log buffer if present.
             self.intent_log_buffer = None;
@@ -13753,11 +13786,13 @@ impl LocalFileSystem {
     }
 
     fn selected_committed_root_summary(&mut self) -> Result<CommittedRootSummary> {
-        selected_committed_root_summary_pool(&mut self.store, self.root_authentication_key)?.ok_or(
-            FileSystemError::CorruptState {
-                reason: "operation requires a selected authenticated committed root",
-            },
-        )
+        let bytes = self.store.load_dataset_root(
+            tidefs_pool_runtime::ROOT_DATASET_ID,
+            DatasetRootKind::Filesystem,
+        )?;
+        let root = decode_root_commit(&bytes)?;
+        validate_root_authentication_record(&root, self.root_authentication_key)?;
+        Ok(root.summary())
     }
 
     fn selected_current_root_summary(&mut self) -> Result<CommittedRootSummary> {
@@ -13806,7 +13841,7 @@ impl LocalFileSystem {
                 .get(&live_record.inode_id)
                 .unwrap_or(live_record);
             let inode_entries =
-                content_allocation_entries_for_inode_pool(&self.store, pool_readable_record)?;
+                content_allocation_entries_for_inode_pool(self.store.pool(), pool_readable_record)?;
             // A replacement does not reserve both the old and planned live
             // inode images, but it still must prove every current chunk
             // through strict Pool receipt authority before the old image can
@@ -13825,7 +13860,7 @@ impl LocalFileSystem {
         current_entries: BTreeMap<ObjectKey, u64>,
     ) -> Result<()> {
         let mut reserved_entries = protected_committed_content_entries_pool(
-            &mut self.store,
+            self.store.pool_mut(),
             self.root_authentication_key,
             &self.state,
         )?;
@@ -13907,7 +13942,7 @@ impl LocalFileSystem {
             return Err(FileSystemError::CorruptContent { inode_id });
         }
 
-        let content_reader = MountedContentReadAuthority::new(&self.store);
+        let content_reader = MountedContentReadAuthority::new(self.store.pool());
         content_reader.read_all(inode_id, record)
     }
 
@@ -13951,12 +13986,12 @@ impl LocalFileSystem {
                 requested: clipped_len_u64,
             })?;
         if offset == 0 && length_u64 >= record.size {
-            let content_reader = MountedContentReadAuthority::new(&self.store);
+            let content_reader = MountedContentReadAuthority::new(self.store.pool());
             return content_reader.read_all(inode_id, record);
         }
 
         let layout = self.read_committed_content_layout(inode_id, record)?;
-        let content_reader = MountedContentReadAuthority::new(&self.store);
+        let content_reader = MountedContentReadAuthority::new(self.store.pool());
         let bytes = content_reader.read_range(&layout, offset, clipped_len)?;
         Ok(bytes)
     }
@@ -13972,7 +14007,7 @@ impl LocalFileSystem {
                 kind: record.kind(),
             });
         }
-        let content_reader = MountedContentReadAuthority::new(&self.store);
+        let content_reader = MountedContentReadAuthority::new(self.store.pool());
         content_reader.read_layout(inode_id, record)
     }
 
@@ -14055,16 +14090,20 @@ impl LocalFileSystem {
         let counters = self.state.space_accounting.counters();
         let bytes = encode_space_counters(counters);
         self.store
+            .pool_mut()
             .put(DeviceIoClass::Data, space_counters_object_key(), &bytes)?;
 
         // Bridge to the store-layer SpaceBook so per-dataset usage
         // counters are persisted through the segment write pipeline
         // on the next sync_all() barrier.
-        self.store.raw_primary_store_mut().sync_dataset_counters(
-            self.mounted_dataset_id,
-            counters.logical_used_bytes,
-            counters.reserved_bytes,
-        );
+        self.store
+            .pool_mut()
+            .raw_primary_store_mut()
+            .sync_dataset_counters(
+                self.mounted_dataset_id,
+                counters.logical_used_bytes,
+                counters.reserved_bytes,
+            );
 
         let refreshed_phys = self.derive_pool_physical_counters();
         self.capacity_authority
@@ -14169,13 +14208,11 @@ impl LocalFileSystem {
         }
         // 4. Load from object store on demand.
         let key = inode_object_key(inode_id);
-        let bytes =
-            self.store
-                .raw_primary_store()
-                .get(key)?
-                .ok_or(FileSystemError::CorruptState {
-                    reason: "known inode id references a missing inode object in store",
-                })?;
+        let bytes = self.store.pool().raw_primary_store().get(key)?.ok_or(
+            FileSystemError::CorruptState {
+                reason: "known inode id references a missing inode object in store",
+            },
+        )?;
         let inode = decode_inode(&bytes)?;
         if inode.inode_id != inode_id {
             return Err(FileSystemError::CorruptState {
@@ -14183,18 +14220,17 @@ impl LocalFileSystem {
             });
         }
         // 5. If directory, also load the directory object.
-        let dir =
-            if inode.carries_child_namespace() {
-                let dir_key = directory_object_key(inode_id);
-                let dir_bytes = self.store.primary_store().get(dir_key)?.ok_or(
-                    FileSystemError::CorruptState {
-                        reason: "directory inode is missing its directory object in store",
-                    },
-                )?;
-                Some(decode_directory(&dir_bytes)?)
-            } else {
-                None
-            };
+        let dir = if inode.carries_child_namespace() {
+            let dir_key = directory_object_key(inode_id);
+            let dir_bytes = self.store.pool().primary_store().get(dir_key)?.ok_or(
+                FileSystemError::CorruptState {
+                    reason: "directory inode is missing its directory object in store",
+                },
+            )?;
+            Some(decode_directory(&dir_bytes)?)
+        } else {
+            None
+        };
         // 6. Admit to ARC cache.
         let record = inode.clone();
         self.inode_cache.borrow_mut().insert(
@@ -14585,7 +14621,7 @@ impl LocalFileSystem {
     pub fn trim_blocks(&mut self, ranges: &[TrimRequest]) -> Result<u64> {
         self.ensure_mutation_allowed("discard pool device ranges")?;
         let raw: Vec<(u64, u64)> = ranges.iter().map(|r| (r.offset, r.length)).collect();
-        Ok(self.store.discard_ranges(&raw))
+        Ok(self.store.pool_mut().discard_ranges(&raw))
     }
 }
 impl Drop for LocalFileSystem {
@@ -14622,7 +14658,7 @@ impl Drop for LocalFileSystem {
             }
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Err(e) = self.store.sync_all() {
+            if let Err(e) = self.store.pool_mut().sync_all() {
                 eprintln!("[tidefs-local-filesystem] Drop::store.sync_all failed: {e}");
             }
         }));
@@ -15449,7 +15485,7 @@ mod orphan_index_integration_tests {
         fs.sync_all().expect("commit dedup file");
 
         let record = fs.stat("/dedup.bin").expect("stat dedup file");
-        let layout = MountedContentReadAuthority::new(&fs.store)
+        let layout = MountedContentReadAuthority::new(fs.store.pool())
             .read_layout(record.inode_id, &record)
             .expect("read dedup content layout");
         let ContentLayout::Chunked(manifest) = layout else {
@@ -15467,12 +15503,14 @@ mod orphan_index_integration_tests {
         );
         let (redirect, _receipt) = fs
             .store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
             .expect("strict redirect read")
             .expect("dedup redirect exists");
         let canonical_key = decode_dedup_redirect(&redirect).expect("decode dedup redirect");
         let (canonical_payload, _receipt) = fs
             .store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, canonical_key)
             .expect("strict canonical read")
             .expect("dedup canonical exists");
@@ -15480,9 +15518,11 @@ mod orphan_index_integration_tests {
             decode_content_chunk(&canonical_payload).expect("decode dedup canonical chunk");
         let fingerprint = compute_content_fingerprint(&canonical_chunk.bytes);
         assert_eq!(content_dedup_object_key(&fingerprint), canonical_key);
-        let refcount =
-            crate::dedup_refcount::DedupRefCount::read(fs.store.raw_primary_store(), &fingerprint)
-                .expect("read dedup refcount");
+        let refcount = crate::dedup_refcount::DedupRefCount::read(
+            fs.store.pool().raw_primary_store(),
+            &fingerprint,
+        )
+        .expect("read dedup refcount");
         assert!(refcount > 0, "dedup fixture must have a live refcount");
         assert_eq!(fs.reclaim_queue_depth(), 0);
 
@@ -15537,6 +15577,7 @@ mod orphan_index_integration_tests {
         assert_exact_reclaim_entry_pending(&fs, queued);
         assert!(fs
             .store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, content_key)
             .expect("strict read after refused reclaim")
             .is_some());
@@ -15553,12 +15594,17 @@ mod orphan_index_integration_tests {
         let substituted_redirect =
             encode_dedup_redirect(ObjectKey::from_name(b"substituted-dedup-target"));
         fs.store
+            .pool_mut()
             .raw_primary_store_mut()
             .put(redirect_key, &substituted_redirect)
             .expect("substitute raw redirect without replacing its receipt");
-        fs.store.sync_all().expect("sync substituted redirect");
+        fs.store
+            .pool_mut()
+            .sync_all()
+            .expect("sync substituted redirect");
         assert!(fs
             .store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
             .is_err());
 
@@ -15568,18 +15614,23 @@ mod orphan_index_integration_tests {
 
         assert_exact_reclaim_entry_pending(&fs, queued);
         assert_eq!(
-            crate::dedup_refcount::DedupRefCount::read(fs.store.raw_primary_store(), &fingerprint,)
-                .expect("read retained refcount"),
+            crate::dedup_refcount::DedupRefCount::read(
+                fs.store.pool().raw_primary_store(),
+                &fingerprint,
+            )
+            .expect("read retained refcount"),
             refcount_before,
             "a receipt-mismatched redirect must not decrement canonical lifetime"
         );
         assert!(fs
             .store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, canonical_key)
             .expect("strict canonical read after refusal")
             .is_some());
         assert_eq!(
             fs.store
+                .pool()
                 .raw_primary_store()
                 .get(redirect_key)
                 .expect("read retained raw redirect"),
@@ -15595,21 +15646,28 @@ mod orphan_index_integration_tests {
             dedup_reclaim_fixture("reclaim_receiptless_canonical");
         let canonical_payload = fs
             .store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, canonical_key)
             .expect("strict canonical read")
             .expect("canonical exists")
             .0;
         assert!(fs
             .store
+            .pool_mut()
             .delete(DeviceIoClass::Data, canonical_key)
             .expect("remove canonical receipt and payload"));
         fs.store
+            .pool_mut()
             .raw_primary_store_mut()
             .put(canonical_key, &canonical_payload)
             .expect("stage receiptless canonical bytes");
-        fs.store.sync_all().expect("sync receiptless canonical");
+        fs.store
+            .pool_mut()
+            .sync_all()
+            .expect("sync receiptless canonical");
         assert!(fs
             .store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, canonical_key)
             .is_err());
 
@@ -15619,18 +15677,23 @@ mod orphan_index_integration_tests {
 
         assert_exact_reclaim_entry_pending(&fs, queued);
         assert_eq!(
-            crate::dedup_refcount::DedupRefCount::read(fs.store.raw_primary_store(), &fingerprint,)
-                .expect("read retained refcount"),
+            crate::dedup_refcount::DedupRefCount::read(
+                fs.store.pool().raw_primary_store(),
+                &fingerprint,
+            )
+            .expect("read retained refcount"),
             refcount_before,
             "a receiptless canonical must not decrement canonical lifetime"
         );
         assert!(fs
             .store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
             .expect("strict redirect read after refusal")
             .is_some());
         assert_eq!(
             fs.store
+                .pool()
                 .raw_primary_store()
                 .get(canonical_key)
                 .expect("read retained canonical bytes"),
@@ -15684,14 +15747,18 @@ mod orphan_index_integration_tests {
         );
         assert!(
             fs.store
+                .pool()
                 .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
                 .expect("strict retained redirect read")
                 .is_some(),
             "withholding the exact queue entry must retain the redirect for fault injection"
         );
         assert_eq!(
-            crate::dedup_refcount::DedupRefCount::read(fs.store.raw_primary_store(), &fingerprint,)
-                .expect("read refcount before injected delete"),
+            crate::dedup_refcount::DedupRefCount::read(
+                fs.store.pool().raw_primary_store(),
+                &fingerprint,
+            )
+            .expect("read refcount before injected delete"),
             refcount_before,
             "fixture setup must preserve canonical lifetime"
         );
@@ -15703,21 +15770,29 @@ mod orphan_index_integration_tests {
         let mut failure = tidefs_local_object_store::FaultInjectionConfig::off();
         failure.write_failure_probability = 1.0;
         fs.store
+            .pool_mut()
             .raw_primary_store_mut()
             .enable_fault_injection(failure);
         fs.drain_local_reclaim_queue_into_store()
             .expect("drain local reclaim queue");
-        fs.store.raw_primary_store_mut().disable_fault_injection();
+        fs.store
+            .pool_mut()
+            .raw_primary_store_mut()
+            .disable_fault_injection();
 
         assert_exact_reclaim_entry_pending(&fs, queued);
         assert_eq!(
-            crate::dedup_refcount::DedupRefCount::read(fs.store.raw_primary_store(), &fingerprint,)
-                .expect("read retained refcount after failed delete"),
+            crate::dedup_refcount::DedupRefCount::read(
+                fs.store.pool().raw_primary_store(),
+                &fingerprint,
+            )
+            .expect("read retained refcount after failed delete"),
             refcount_before,
             "a failed redirect delete must not consume canonical lifetime"
         );
         let redirect_was_absent_after_failure = fs
             .store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
             .expect("strict redirect read after failed delete preflight")
             .is_none();
@@ -15730,13 +15805,17 @@ mod orphan_index_integration_tests {
             .expect("drain local reclaim queue");
 
         assert_eq!(
-            crate::dedup_refcount::DedupRefCount::read(fs.store.raw_primary_store(), &fingerprint,)
-                .expect("read refcount after successful retry"),
+            crate::dedup_refcount::DedupRefCount::read(
+                fs.store.pool().raw_primary_store(),
+                &fingerprint,
+            )
+            .expect("read refcount after successful retry"),
             refcount_before.saturating_sub(1),
             "the successful retry must consume the preserved redirect lifetime exactly once"
         );
         assert!(
             fs.store
+                .pool()
                 .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
                 .expect("strict redirect read after successful retry")
                 .is_none(),
@@ -15751,6 +15830,7 @@ mod orphan_index_integration_tests {
             .all(|(key, _entry)| key.0 != *redirect_key.as_bytes()));
         assert!(fs
             .store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, canonical_key)
             .expect("strict canonical read after successful retry")
             .is_some());
@@ -15984,6 +16064,7 @@ mod orphan_index_integration_tests {
         // ---- Phase 4: inspect object-store reclaim queue ----
         let drain_stats = fs
             .store
+            .pool_mut()
             .raw_primary_store_mut()
             .drain_dead_segments(&tidefs_reclaim::ReclaimConsumerConfig::default())
             .expect("drain_dead_segments");
@@ -17510,7 +17591,7 @@ mod orphan_index_integration_tests {
             .get(&inode_id)
             .map(|directory| encode_directory(&inode, directory));
         {
-            let mut store = fs.store.primary_store_mut();
+            let mut store = fs.store.pool_mut().primary_store_mut();
             let raw_store = store.raw_store_mut();
             raw_store
                 .put(inode_object_key(inode_id), &inode_bytes)
@@ -17521,7 +17602,10 @@ mod orphan_index_integration_tests {
                     .expect("write fallback fixture directory");
             }
         }
-        fs.store.sync_all().expect("sync fallback fixture metadata");
+        fs.store
+            .pool_mut()
+            .sync_all()
+            .expect("sync fallback fixture metadata");
     }
 
     #[test]
@@ -17536,6 +17620,7 @@ mod orphan_index_integration_tests {
         seed_metadata_fallback_records(&mut inode_fs, inode_id);
         assert!(inode_fs
             .store
+            .pool_mut()
             .primary_store_mut()
             .raw_store_mut()
             .delete(inode_object_key(inode_id))
@@ -17559,6 +17644,7 @@ mod orphan_index_integration_tests {
         seed_metadata_fallback_records(&mut directory_fs, directory_id);
         assert!(directory_fs
             .store
+            .pool_mut()
             .primary_store_mut()
             .raw_store_mut()
             .delete(directory_object_key(directory_id))
@@ -17585,6 +17671,7 @@ mod orphan_index_integration_tests {
         seed_metadata_fallback_records(&mut inode_fs, inode_id);
         inode_fs
             .store
+            .pool_mut()
             .primary_store_mut()
             .raw_store_mut()
             .put(inode_object_key(inode_id), b"not-an-inode")
@@ -17602,6 +17689,7 @@ mod orphan_index_integration_tests {
         mismatched_inode.inode_id = InodeId::new(inode_id.get() + 1);
         inode_fs
             .store
+            .pool_mut()
             .primary_store_mut()
             .raw_store_mut()
             .put(
@@ -17627,6 +17715,7 @@ mod orphan_index_integration_tests {
         seed_metadata_fallback_records(&mut directory_fs, directory_id);
         directory_fs
             .store
+            .pool_mut()
             .primary_store_mut()
             .raw_store_mut()
             .put(directory_object_key(directory_id), b"not-a-directory")
@@ -17829,7 +17918,7 @@ mod recovery_integration_tests {
         {
             let authority = MountedMetadataIntentRawStateAuthority::raw_metadata_only(
                 &mut fs.intent_log,
-                &mut fs.store,
+                fs.store.pool_mut(),
             );
             assert_eq!(
                 authority.transform_mode(),
@@ -17899,7 +17988,7 @@ mod recovery_integration_tests {
         {
             let authority = MountedMetadataIntentRawStateAuthority::raw_metadata_only(
                 &mut fs.intent_log,
-                &mut fs.store,
+                fs.store.pool_mut(),
             );
             assert_eq!(
                 authority.transform_mode(),

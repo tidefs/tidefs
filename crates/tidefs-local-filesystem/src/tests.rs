@@ -206,6 +206,109 @@ fn default_open_uses_hidden_regular_file_dev_backing() {
 }
 
 #[test]
+fn pool_root_fresh_filesystem_commit_and_reopen_are_canonical() {
+    let root = temp_root("pool-root-fresh-reopen");
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+        assert_eq!(
+            fs.dataset_catalog().lookup("root").expect("root dataset"),
+            tidefs_pool_runtime::ROOT_DATASET_ID
+        );
+        assert_eq!(
+            fs.store
+                .dataset_root(tidefs_pool_runtime::ROOT_DATASET_ID)
+                .expect("typed filesystem root")
+                .kind,
+            DatasetRootKind::Filesystem
+        );
+        fs.create_file("/canonical.txt", DEFAULT_FILE_PERMISSIONS)
+            .expect("create file");
+        fs.write_file("/canonical.txt", 0, b"canonical Pool root")
+            .expect("write file");
+        fs.fsync_file("/canonical.txt").expect("fsync file");
+    }
+
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        reopened
+            .read_file("/canonical.txt")
+            .expect("read canonical file"),
+        b"canonical Pool root"
+    );
+    cleanup(&root);
+}
+
+#[test]
+fn pool_root_snapshot_catalog_and_typed_root_round_trip_together() {
+    let root = temp_root("pool-root-snapshot-round-trip");
+    let snapshot_id;
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+        fs.create_file("/snap.txt", DEFAULT_FILE_PERMISSIONS)
+            .expect("create snapshot file");
+        fs.write_file("/snap.txt", 0, b"snapshot bytes")
+            .expect("write snapshot file");
+        fs.fsync_file("/snap.txt").expect("fsync snapshot file");
+        let summary = fs.create_snapshot("one").expect("create snapshot");
+        snapshot_id = fs
+            .dataset_catalog()
+            .lookup("root@one")
+            .expect("snapshot catalog entry");
+        assert_eq!(
+            fs.store
+                .dataset_root(snapshot_id)
+                .expect("typed snapshot root")
+                .kind,
+            DatasetRootKind::Snapshot
+        );
+        assert_eq!(
+            fs.store
+                .load_dataset_root(snapshot_id, DatasetRootKind::Snapshot)
+                .expect("load typed snapshot root"),
+            encode_root_commit(&root_commit_from_summary(&summary.source_root))
+        );
+    }
+
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        reopened
+            .dataset_catalog()
+            .lookup("root@one")
+            .expect("reopened snapshot catalog entry"),
+        snapshot_id
+    );
+    assert!(reopened.snapshot_summary("one").is_ok());
+    cleanup(&root);
+}
+
+#[test]
+fn pool_root_reopen_refuses_catalog_snapshot_state_disagreement() {
+    let root = temp_root("pool-root-snapshot-disagreement");
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+        fs.create_snapshot("one").expect("create snapshot");
+        fs.store
+            .dataset_catalog_mut()
+            .expect("stage catalog mutation")
+            .destroy("root@one")
+            .expect("remove snapshot catalog entry");
+        fs.store
+            .publish_metadata()
+            .expect("publish deliberately inconsistent test composition");
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    }
+
+    match LocalFileSystem::open_with_options(&root, options()) {
+        Err(FileSystemError::CorruptState { reason }) => {
+            assert!(reason.contains("snapshot"), "unexpected reason: {reason}");
+        }
+        Err(error) => panic!("unexpected reopen error: {error}"),
+        Ok(_) => panic!("canonical snapshot disagreement must fail closed"),
+    }
+    cleanup(&root);
+}
+
+#[test]
 fn open_with_capacity_sizes_hidden_regular_file_dev_backing() {
     let root = temp_root("default-hidden-file-dev-capacity");
     let image = LocalFileSystem::default_development_device_path(&root);
@@ -281,6 +384,7 @@ fn mounted_capacity_projection_consumes_committed_accounting_not_pool_free_claim
 
     let mounted_before = fs.statfs().expect("mounted statfs before poisoning");
     fs.store
+        .pool_mut()
         .update_space_book_pool_counters(PoolPhysicalCountersV1 {
             phys_free_segments: u64::MAX,
             phys_free_bytes: u64::MAX,
@@ -297,6 +401,7 @@ fn mounted_capacity_projection_consumes_committed_accounting_not_pool_free_claim
 
     let store_projection = fs
         .store
+        .pool_mut()
         .statfs_for_dataset(ROOT_DATASET_ID)
         .expect("committed root dataset projection");
     assert_eq!(store_projection.blocks, mounted_after.blocks);
@@ -455,6 +560,7 @@ fn current_content_manifest(fs: &LocalFileSystem, path: &str) -> ContentManifest
     let record = fs.stat(path).expect("stat file");
     let bytes = fs
         .store
+        .pool()
         .get(
             DeviceIoClass::Data,
             content_object_key_for_version(record.inode_id, record.data_version),
@@ -470,22 +576,27 @@ fn current_content_manifest(fs: &LocalFileSystem, path: &str) -> ContentManifest
 fn stage_receiptless_raw_object_substitute(fs: &mut LocalFileSystem, key: ObjectKey) {
     let bytes = fs
         .store
+        .pool()
         .get(DeviceIoClass::Data, key)
         .expect("read receipt-backed object")
         .expect("receipt-backed object exists");
     assert!(fs
         .store
+        .pool_mut()
         .delete(DeviceIoClass::Data, key)
         .expect("delete receipt-backed object"));
     fs.store
+        .pool_mut()
         .raw_primary_store_mut()
         .put(key, &bytes)
         .expect("stage receiptless raw-primary substitute");
     fs.store
+        .pool_mut()
         .sync_all()
         .expect("sync receiptless raw-primary substitute");
     assert!(fs
         .store
+        .pool()
         .placement_receipt_for_key(DeviceIoClass::Data, key)
         .expect("inspect removed placement receipt")
         .is_none());
@@ -557,6 +668,7 @@ fn commit_off_primary_file_version(
         let manifest_key = content_object_key_for_version(record.inode_id, record.data_version);
         let manifest_receipt = fs
             .store
+            .pool()
             .placement_receipt_for_key(DeviceIoClass::Data, manifest_key)
             .expect("read content-manifest placement receipt")
             .expect("committed content manifest has a placement receipt");
@@ -578,6 +690,7 @@ fn commit_off_primary_file_version(
         );
         let chunk_receipt = fs
             .store
+            .pool()
             .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
             .expect("read content-chunk placement receipt")
             .expect("committed content chunk has a placement receipt");
@@ -595,6 +708,7 @@ fn commit_off_primary_file_version(
             for key in [manifest_key, chunk_key] {
                 assert!(
                     fs.store
+                        .pool()
                         .raw_primary_store()
                         .get(key)
                         .expect("inspect raw primary content")
@@ -1898,6 +2012,7 @@ fn fully_buffered_range_read_skips_committed_content_lookup() {
     let committed_key = content_object_key_for_version(committed.inode_id, committed.data_version);
     let committed_bytes = fs
         .store
+        .pool()
         .raw_primary_store()
         .get(committed_key)
         .expect("read committed content")
@@ -1908,11 +2023,13 @@ fn fully_buffered_range_read_skips_committed_content_lookup() {
     assert!(fs.write_buffers.contains_key(&committed.inode_id));
     assert!(fs
         .store
+        .pool_mut()
         .raw_primary_store_mut()
         .delete(committed_key)
         .expect("delete committed content"));
     assert!(fs
         .store
+        .pool()
         .raw_primary_store()
         .get(committed_key)
         .expect("read deleted committed content")
@@ -1924,6 +2041,7 @@ fn fully_buffered_range_read_skips_committed_content_lookup() {
         b"DIRTY".to_vec()
     );
     fs.store
+        .pool_mut()
         .raw_primary_store_mut()
         .put(committed_key, &committed_bytes)
         .expect("restore committed content");
@@ -1990,6 +2108,7 @@ fn mounted_cold_full_reads_reject_receiptless_raw_content_after_open() {
     let content_key = content_object_key_for_version(record.inode_id, record.data_version);
     let content_bytes = fs
         .store
+        .pool()
         .get(DeviceIoClass::Data, content_key)
         .expect("read current versioned content")
         .expect("current versioned content exists");
@@ -1998,10 +2117,12 @@ fn mounted_cold_full_reads_reject_receiptless_raw_content_after_open() {
         record.inode_id.get()
     ));
     fs.store
+        .pool_mut()
         .put(DeviceIoClass::Data, retired_key, &content_bytes)
         .expect("stage Pool-receipted retired unversioned content");
     assert!(fs
         .store
+        .pool()
         .placement_receipt_for_key(DeviceIoClass::Data, retired_key)
         .expect("inspect retired-key receipt")
         .is_some());
@@ -2169,6 +2290,7 @@ fn dedup_canonical_payload_substitution_falls_back_to_older_root() {
         );
         let redirect = fs
             .store
+            .pool()
             .get(DeviceIoClass::Data, redirect_key)
             .expect("read dedup redirect")
             .expect("dedup redirect exists");
@@ -2182,9 +2304,11 @@ fn dedup_canonical_payload_substitution_falls_back_to_older_root() {
         )
         .expect("encode substituted canonical payload");
         fs.store
+            .pool_mut()
             .put(DeviceIoClass::Data, canonical_key, &replacement)
             .expect("publish substituted canonical payload");
         fs.store
+            .pool_mut()
             .sync_all()
             .expect("sync substituted canonical payload");
 
@@ -2254,6 +2378,7 @@ fn mounted_partial_mutation_does_not_launder_receiptless_chunk() {
     for key in [chunk_key, candidate_manifest_key, candidate_chunk_key] {
         assert!(
             fs.store
+                .pool()
                 .placement_receipt_for_key(DeviceIoClass::Data, key)
                 .expect("inspect placement receipt after refused mutation")
                 .is_none(),
@@ -2313,6 +2438,7 @@ fn random_write_updates_only_intersecting_chunk_refs() {
     );
     assert!(!fs
         .store
+        .pool()
         .primary_store()
         .exists(content_chunk_object_key_for_version(
             patched_record.inode_id,
@@ -3319,9 +3445,9 @@ fn unauthenticated_newer_root_candidate_is_skipped() {
     let (staged, candidate_path, inode_id, new_bytes) =
         stage_probe_file_state(&fs, b"unauthenticated.txt", b"unauthenticated bytes");
     let transaction_id = staged.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
-    write_staged_content(&mut fs.store, &staged, inode_id, &new_bytes);
+    write_staged_content(fs.store.pool_mut(), &staged, inode_id, &new_bytes);
     let root_commit = persist_transaction_objects(
-        fs.store.primary_store_mut().raw_store_mut(),
+        fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &staged,
         transaction_id,
     )
@@ -3331,6 +3457,7 @@ fn unauthenticated_newer_root_candidate_is_skipped() {
         ..root_commit
     };
     fs.store
+        .pool_mut()
         .primary_store_mut()
         .raw_store_mut()
         .put(
@@ -3339,6 +3466,7 @@ fn unauthenticated_newer_root_candidate_is_skipped() {
         )
         .expect("publish unauthenticated root candidate");
     fs.store
+        .pool_mut()
         .sync_all()
         .expect("sync unauthenticated root candidate");
     drop(fs);
@@ -3816,13 +3944,17 @@ fn online_verifier_reports_corrupt_candidate_without_changing_live_truth() {
     let bad_transaction_id = committed_generation.saturating_add(1);
     let bad_slot = root_slot_for_transaction(bad_transaction_id);
     fs.store
+        .pool_mut()
         .put(
             DeviceIoClass::Data,
             root_slot_object_key(bad_slot),
             b"not a valid online-verifier root commit",
         )
         .expect("write corrupt root candidate");
-    fs.store.sync_all().expect("sync corrupt candidate");
+    fs.store
+        .pool_mut()
+        .sync_all()
+        .expect("sync corrupt candidate");
 
     let verifier = fs
         .online_verifier_report()
@@ -3875,19 +4007,19 @@ fn missing_manifest_newer_root_is_skipped_without_operator_repair() {
         b"new bytes behind missing manifest",
     );
     let transaction_id = staged.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
-    write_staged_content(&mut fs.store, &staged, inode_id, &new_bytes);
+    write_staged_content(fs.store.pool_mut(), &staged, inode_id, &new_bytes);
     write_transaction_inodes(
-        fs.store.primary_store_mut().raw_store_mut(),
+        fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &staged,
         transaction_id,
     );
     write_transaction_directories(
-        fs.store.primary_store_mut().raw_store_mut(),
+        fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &staged,
         transaction_id,
     );
     let root_without_manifest = write_transaction_superblock(
-        fs.store.primary_store_mut().raw_store_mut(),
+        fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &staged,
         transaction_id,
     );
@@ -3897,12 +4029,13 @@ fn missing_manifest_newer_root_is_skipped_without_operator_repair() {
         ..root_without_manifest
     };
     publish_root_commit(
-        fs.store.primary_store_mut().raw_store_mut(),
+        fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &root_requiring_missing_manifest,
         fs.root_authentication_key,
     )
     .expect("publish root commit that requires a missing manifest");
     fs.store
+        .pool_mut()
         .sync_all()
         .expect("sync missing-manifest root candidate");
     drop(fs);
@@ -4137,14 +4270,17 @@ fn mounted_background_ticks_leave_unbound_physical_queue_pending() {
 
     let key = ObjectKey::from_name(b"unbound-mounted-physical-reclaim");
     fs.store
+        .pool_mut()
         .put_with_receipt(DeviceIoClass::Data, key, b"old physical placement")
         .expect("write old Pool placement");
     fs.store
+        .pool_mut()
         .put_with_receipt(DeviceIoClass::Data, key, b"current physical placement")
         .expect("replace Pool placement");
 
     let pending_before = fs
         .store
+        .pool_mut()
         .drain_receipt_bound_dead_objects_at_stable_generation(DeviceIoClass::Data, 0, 0, 1024)
         .expect("inspect pending physical reclaim");
     assert_eq!(pending_before.objects_examined, 0);
@@ -4163,6 +4299,7 @@ fn mounted_background_ticks_leave_unbound_physical_queue_pending() {
         .expect("run another mounted background tick");
     let pending_after = fs
         .store
+        .pool_mut()
         .drain_receipt_bound_dead_objects_at_stable_generation(DeviceIoClass::Data, 0, 0, 1024)
         .expect("inspect physical reclaim after mounted tick");
     assert_eq!(pending_after.objects_examined, 0);
@@ -4173,6 +4310,7 @@ fn mounted_background_ticks_leave_unbound_physical_queue_pending() {
     );
     assert_eq!(
         fs.store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, key)
             .expect("read current Pool placement")
             .map(|(payload, _receipt)| payload),
@@ -4184,6 +4322,7 @@ fn mounted_background_ticks_leave_unbound_physical_queue_pending() {
     reopened.stop_background_scheduler();
     let pending_after_reopen = reopened
         .store
+        .pool_mut()
         .drain_receipt_bound_dead_objects_at_stable_generation(DeviceIoClass::Data, 0, 0, 1024)
         .expect("inspect physical reclaim after reopen");
     assert_eq!(
@@ -4219,6 +4358,7 @@ fn mounted_reclaim_handoff_preserves_no_snapshot_fallback_root_content() {
         content_object_key_for_version(older_record.inode_id, older_record.data_version);
     let older_stored_payload = fs
         .store
+        .pool()
         .get_with_current_receipt(DeviceIoClass::Data, older_content_key)
         .expect("strictly read older content before reclaim")
         .expect("older content has current receipt")
@@ -4249,6 +4389,7 @@ fn mounted_reclaim_handoff_preserves_no_snapshot_fallback_root_content() {
     );
     assert_eq!(
         fs.store
+            .pool()
             .get_with_current_receipt(DeviceIoClass::Data, older_content_key)
             .expect("strictly read fallback content after reclaim handoff")
             .map(|(payload, _receipt)| payload),
@@ -4288,6 +4429,7 @@ fn invalid_newer_same_slot_root_falls_back_to_previous_version_without_operator_
     let same_slot = root_slot_for_transaction(bad_transaction_id);
     assert_eq!(same_slot, root_slot_for_transaction(committed_generation));
     fs.store
+        .pool_mut()
         .raw_primary_store_mut()
         .put(
             root_slot_object_key(same_slot),
@@ -4295,6 +4437,7 @@ fn invalid_newer_same_slot_root_falls_back_to_previous_version_without_operator_
         )
         .expect("write invalid same-slot root candidate");
     fs.store
+        .pool_mut()
         .raw_primary_store_mut()
         .sync_all()
         .expect("sync invalid same-slot root candidate");
@@ -4398,9 +4541,14 @@ fn uncommitted_transaction_objects_are_ignored_on_reopen() {
         root_inode.metadata_version = tick;
     }
 
-    persist_transaction_objects(fs.store.primary_store_mut().raw_store_mut(), &staged, tick)
-        .expect("write uncommitted transaction objects");
+    persist_transaction_objects(
+        fs.store.pool_mut().primary_store_mut().raw_store_mut(),
+        &staged,
+        tick,
+    )
+    .expect("write uncommitted transaction objects");
     fs.store
+        .pool_mut()
         .sync_all()
         .expect("sync uncommitted transaction objects");
     drop(fs);
@@ -4589,6 +4737,7 @@ fn invalid_newer_root_slot_is_skipped_without_operator_repair() {
     let bad_transaction_id = committed_generation.saturating_add(1);
     let bad_slot = root_slot_for_transaction(bad_transaction_id);
     fs.store
+        .pool_mut()
         .put(
             DeviceIoClass::Data,
             root_slot_object_key(bad_slot),
@@ -4596,6 +4745,7 @@ fn invalid_newer_root_slot_is_skipped_without_operator_repair() {
         )
         .expect("write invalid root slot candidate");
     fs.store
+        .pool_mut()
         .sync_all()
         .expect("sync invalid root slot candidate");
     drop(fs);
@@ -5064,9 +5214,9 @@ fn invalid_transaction_manifest_makes_newer_root_candidate_unselectable() {
 
     let (staged, candidate_path, inode_id, new_bytes) =
         stage_probe_file_state(&fs, b"candidate.txt", b"candidate after bad manifest");
-    write_staged_content(&mut fs.store, &staged, inode_id, &new_bytes);
+    write_staged_content(fs.store.pool_mut(), &staged, inode_id, &new_bytes);
     let root_commit = persist_transaction_objects(
-        fs.store.primary_store_mut().raw_store_mut(),
+        fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &staged,
         staged.generation,
     )
@@ -5074,6 +5224,7 @@ fn invalid_transaction_manifest_makes_newer_root_candidate_unselectable() {
     let corrupt_manifest = b"corrupt manifest bytes";
     let superblock_bytes = fs
         .store
+        .pool()
         .primary_store()
         .raw_store()
         .get(transaction_superblock_object_key(
@@ -5090,6 +5241,7 @@ fn invalid_transaction_manifest_makes_newer_root_candidate_unselectable() {
         ..root_commit
     };
     fs.store
+        .pool_mut()
         .primary_store_mut()
         .raw_store_mut()
         .put(
@@ -5098,12 +5250,13 @@ fn invalid_transaction_manifest_makes_newer_root_candidate_unselectable() {
         )
         .expect("overwrite transaction manifest with corrupt bytes");
     publish_root_commit(
-        fs.store.primary_store_mut().raw_store_mut(),
+        fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &corrupt_root,
         fs.root_authentication_key,
     )
     .expect("publish newer root commit");
     fs.store
+        .pool_mut()
         .sync_all()
         .expect("sync corrupt manifest candidate");
     drop(fs);
@@ -5190,18 +5343,19 @@ fn bad_link_count_committed_root_is_skipped_before_mount_without_fsck() {
     root_inode.nlink = 1;
     root_inode.metadata_version = bad_generation;
     let bad_root = persist_transaction_objects(
-        fs.store.primary_store_mut().raw_store_mut(),
+        fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &bad,
         bad_generation,
     )
     .expect("write structurally invalid transaction root");
     publish_root_commit(
-        fs.store.primary_store_mut().raw_store_mut(),
+        fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &bad_root,
         fs.root_authentication_key,
     )
     .expect("publish invalid committed root candidate");
     fs.store
+        .pool_mut()
         .sync_all()
         .expect("sync invalid committed root candidate");
     drop(fs);
@@ -5262,18 +5416,19 @@ fn unreachable_inode_committed_root_is_skipped_before_mount_without_fsck() {
     );
     Arc::make_mut(&mut bad.directories).insert(orphan_id, BTreeMap::new());
     let bad_root = persist_transaction_objects(
-        fs.store.primary_store_mut().raw_store_mut(),
+        fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &bad,
         bad_generation,
     )
     .expect("write unreachable inode transaction root");
     publish_root_commit(
-        fs.store.primary_store_mut().raw_store_mut(),
+        fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &bad_root,
         fs.root_authentication_key,
     )
     .expect("publish invalid committed root candidate");
     fs.store
+        .pool_mut()
         .sync_all()
         .expect("sync invalid committed root candidate");
     drop(fs);
@@ -5386,6 +5541,7 @@ fn retention_plan_keeps_same_slot_fallback_location_without_repair() {
     let bad_transaction_id = committed_generation.saturating_add(FILESYSTEM_ROOT_SLOT_COUNT);
     let bad_slot = root_slot_for_transaction(bad_transaction_id);
     fs.store
+        .pool_mut()
         .primary_store_mut()
         .raw_store_mut()
         .put(
@@ -5394,6 +5550,7 @@ fn retention_plan_keeps_same_slot_fallback_location_without_repair() {
         )
         .expect("write invalid root slot candidate");
     fs.store
+        .pool_mut()
         .sync_all()
         .expect("sync invalid root slot candidate");
     drop(fs);
@@ -6104,7 +6261,7 @@ fn stage_durable_intent_without_drop(root: &Path, publish_replayed_root: bool) -
     assert_eq!(reply, IntentLogReplyState::IntentDurable);
     assert_eq!(fs.intent_log.len(), 1);
     assert_eq!(
-        IntentLog::load(fs.store.raw_primary_store())
+        IntentLog::load(fs.store.pool().raw_primary_store())
             .expect("reload durable crash fixture intent")
             .len(),
         1
@@ -6116,7 +6273,7 @@ fn stage_durable_intent_without_drop(root: &Path, publish_replayed_root: bool) -
         replay_live_data_with_pool(
             &fs.intent_log,
             &mut fs.state,
-            &mut fs.store,
+            fs.store.pool_mut(),
             &committed_base,
         )
         .expect("fold durable intent into staged root");
@@ -6129,15 +6286,15 @@ fn stage_durable_intent_without_drop(root: &Path, publish_replayed_root: bool) -
         )
         .expect("select crash fixture replay transaction");
         crate::persistence::persist_state_with_pool_at_transaction(
-            &mut fs.store,
+            fs.store.pool_mut(),
             &fs.state,
             transaction_id,
             root_authentication_key,
         )
         .expect("publish replayed root");
-        fs.store.sync_all().expect("sync replayed root");
+        fs.store.pool_mut().sync_all().expect("sync replayed root");
         assert_eq!(
-            IntentLog::load(fs.store.raw_primary_store())
+            IntentLog::load(fs.store.pool().raw_primary_store())
                 .expect("reload uncleared intent after root publication")
                 .len(),
             1,
@@ -6430,7 +6587,7 @@ fn published_replay_root_retries_log_clear_without_republishing() {
         INTENT_REPLAY_CRASH_PAYLOAD
     );
     let current_versions = {
-        let raw_store = fs.store.raw_primary_store();
+        let raw_store = fs.store.pool().raw_primary_store();
         published_versions
             .iter()
             .map(|(key, _)| (*key, raw_store.version_locations_of(*key).len()))
@@ -6562,7 +6719,7 @@ fn pool_intent_replay_rejects_wrong_selected_base_root_or_manifest() {
     let mut log = IntentLog::new();
     append_bound_pool_data_intent(
         &mut log,
-        &mut fs.store,
+        fs.store.pool_mut(),
         inode_id,
         0,
         b"replayed",
@@ -6578,8 +6735,9 @@ fn pool_intent_replay_rejects_wrong_selected_base_root_or_manifest() {
         IntegrityDigest64(wrong_manifest.manifest_checksum.0 ^ 0x8000_0000_0000_0000);
 
     for wrong_base in [&wrong_root, &wrong_manifest] {
-        let error = replay_live_data_with_pool(&log, &mut fs.state, &mut fs.store, wrong_base)
-            .expect_err("replay must reject a different selected committed base");
+        let error =
+            replay_live_data_with_pool(&log, &mut fs.state, fs.store.pool_mut(), wrong_base)
+                .expect_err("replay must reject a different selected committed base");
         assert!(matches!(
             error,
             FileSystemError::CorruptState {
@@ -6613,7 +6771,7 @@ fn pool_intent_replay_rejects_wrong_inode_base_data_version() {
     let mut log = IntentLog::new();
     append_bound_pool_data_intent(
         &mut log,
-        &mut fs.store,
+        fs.store.pool_mut(),
         inode_id,
         0,
         b"replayed",
@@ -6622,8 +6780,9 @@ fn pool_intent_replay_rejects_wrong_inode_base_data_version() {
         &committed_base,
     );
 
-    let error = replay_live_data_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
-        .expect_err("replay must reject a false inode predecessor");
+    let error =
+        replay_live_data_with_pool(&log, &mut fs.state, fs.store.pool_mut(), &committed_base)
+            .expect_err("replay must reject a false inode predecessor");
     assert!(matches!(
         error,
         FileSystemError::CorruptState {
@@ -6656,7 +6815,7 @@ fn pool_intent_replay_applies_sequential_generations_across_unrelated_live_mutat
     let mut log = IntentLog::new();
     append_bound_pool_data_intent(
         &mut log,
-        &mut fs.store,
+        fs.store.pool_mut(),
         inode_id,
         0,
         b"12",
@@ -6676,7 +6835,7 @@ fn pool_intent_replay_applies_sequential_generations_across_unrelated_live_mutat
     let second_data_version = next_generation_after(fs.state.generation.max(first_data_version));
     append_bound_pool_data_intent(
         &mut log,
-        &mut fs.store,
+        fs.store.pool_mut(),
         inode_id,
         4,
         b"XY",
@@ -6685,8 +6844,9 @@ fn pool_intent_replay_applies_sequential_generations_across_unrelated_live_mutat
         &committed_base,
     );
 
-    let replayed = replay_live_data_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
-        .expect("replay sequential generations");
+    let replayed =
+        replay_live_data_with_pool(&log, &mut fs.state, fs.store.pool_mut(), &committed_base)
+            .expect("replay sequential generations");
     assert_eq!(replayed, 2);
     assert_eq!(fs.state.inodes[&inode_id].data_version, second_data_version);
     assert_eq!(fs.state.generation, second_data_version);
@@ -6756,7 +6916,7 @@ fn do_commit_replays_and_clears_intent_log_when_state_clean() {
     // Append an intent log entry directly — no dirty marks from
     // sync_write_intent, simulating a race with a clean commit.
     fs.intent_log
-        .write_next_data_payload(&mut fs.store, b"payload")
+        .write_next_data_payload(fs.store.pool_mut(), b"payload")
         .expect("write intent payload");
     let root_anchor = committed_intent_base(&mut fs);
     let base_data_version = fs.state.inodes[&f_rec.inode_id].data_version;
@@ -6764,7 +6924,7 @@ fn do_commit_replays_and_clears_intent_log_when_state_clean() {
     let accepted = fs
         .intent_log
         .append(
-            fs.store.primary_store_mut().raw_store_mut(),
+            fs.store.pool_mut().primary_store_mut().raw_store_mut(),
             IntentLogEntryKind::SyncWriteRange {
                 inode_id: f_rec.inode_id,
                 offset: 0,
@@ -9623,7 +9783,7 @@ fn fsync_directory_commits_pending_namespace_intent_through_root() {
         let accepted = fs
             .intent_log
             .append(
-                fs.store.primary_store_mut().raw_store_mut(),
+                fs.store.pool_mut().primary_store_mut().raw_store_mut(),
                 IntentLogEntryKind::NamespaceSyncIntent {
                     parent_inode_id: dir_ino,
                     affected_inode_ids: vec![file_ino],
@@ -10483,17 +10643,20 @@ fn block_device_mounted_diagnostics_reject_receiptless_raw_substitute() {
     let snapshots_before = fs.state.snapshots.clone();
     let receipts_before = fs
         .store
+        .pool()
         .placement_receipts(DeviceIoClass::Data)
         .expect("capture receipts after staging substitute");
     let root_locations_before: Vec<_> = (0..FILESYSTEM_ROOT_SLOT_COUNT)
         .map(|slot| {
             fs.store
+                .pool()
                 .raw_primary_store()
                 .version_locations_of(root_slot_object_key(slot))
         })
         .collect();
     let raw_substitute_before = fs
         .store
+        .pool()
         .raw_primary_store()
         .get(committed.key)
         .expect("read staged raw substitute");
@@ -10549,6 +10712,7 @@ fn block_device_mounted_diagnostics_reject_receiptless_raw_substitute() {
     assert_eq!(fs.state.snapshots, snapshots_before);
     assert_eq!(
         fs.store
+            .pool()
             .placement_receipts(DeviceIoClass::Data)
             .expect("inspect receipts after refused diagnostics and growth"),
         receipts_before
@@ -10557,6 +10721,7 @@ fn block_device_mounted_diagnostics_reject_receiptless_raw_substitute() {
         (0..FILESYSTEM_ROOT_SLOT_COUNT)
             .map(|slot| {
                 fs.store
+                    .pool()
                     .raw_primary_store()
                     .version_locations_of(root_slot_object_key(slot))
             })
@@ -10565,6 +10730,7 @@ fn block_device_mounted_diagnostics_reject_receiptless_raw_substitute() {
     );
     assert_eq!(
         fs.store
+            .pool()
             .raw_primary_store()
             .get(committed.key)
             .expect("read raw substitute after refused operations"),
@@ -10662,13 +10828,17 @@ fn root_dataset_catalog_decode_failure_fails_closed() {
         )
         .expect("open fs");
         fs.store
+            .pool_mut()
             .put(
                 DeviceIoClass::Data,
                 dataset_catalog_object_key(),
                 b"retired-pre-release-catalog",
             )
             .expect("persist undecodable dataset catalog fixture");
-        fs.store.sync_all().expect("sync undecodable catalog");
+        fs.store
+            .pool_mut()
+            .sync_all()
+            .expect("sync undecodable catalog");
     }
 
     let result = LocalFileSystem::open_with_root_authentication_key(
@@ -12940,16 +13110,20 @@ fn feature_flag_mount_gate_refuses_data_policy_without_build_feature() {
         // treating the feature as available.
         let roots = fs
             .feature_flags
-            .persist(&mut fs.store)
+            .persist(fs.store.pool_mut())
             .expect("persist test fixture feature tree");
         fs.store
+            .pool_mut()
             .put(
                 DeviceIoClass::Data,
                 feature_flags_roots_object_key(),
                 &roots.encode(),
             )
             .expect("persist test fixture roots");
-        fs.store.sync_all().expect("sync test fixture roots");
+        fs.store
+            .pool_mut()
+            .sync_all()
+            .expect("sync test fixture roots");
         fs.recovery_policy = RecoveryPolicy::ReadOnly;
     }
 

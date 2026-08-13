@@ -5546,7 +5546,7 @@ mod tests {
         )]);
 
         let replayed =
-            replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
+            replay_uncommitted_with_pool(&log, &mut fs.state, fs.store.pool_mut(), &committed_base)
                 .expect("replay metadata-only Pool intent");
         assert_eq!(replayed, 1);
         assert_eq!(fs.state.inodes[&inode_id], updated);
@@ -5579,9 +5579,13 @@ mod tests {
         fs.state = committed_state;
 
         for _ in 0..2 {
-            let replayed =
-                replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
-                    .expect("replay receipted truncate");
+            let replayed = replay_uncommitted_with_pool(
+                &log,
+                &mut fs.state,
+                fs.store.pool_mut(),
+                &committed_base,
+            )
+            .expect("replay receipted truncate");
             assert_eq!(replayed, 1);
             assert_eq!(fs.state.inodes[&inode_id], updated);
             assert_eq!(fs.read_file("/f").expect("read truncated content"), b"abc");
@@ -5608,17 +5612,18 @@ mod tests {
             &committed_base,
         )]);
 
-        replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
+        replay_uncommitted_with_pool(&log, &mut fs.state, fs.store.pool_mut(), &committed_base)
             .expect_err("missing content must not authorize metadata transition");
         assert_eq!(fs.state.inodes[&inode_id], current);
 
         let content_key = content_object_key_for_version(inode_id, updated.data_version);
         let encoded = crate::encoding::encode_content(&updated, b"abc");
         fs.store
+            .pool_mut()
             .raw_primary_store_mut()
             .put(content_key, &encoded)
             .expect("stage receiptless content fixture");
-        replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
+        replay_uncommitted_with_pool(&log, &mut fs.state, fs.store.pool_mut(), &committed_base)
             .expect_err("receiptless content must not authorize metadata transition");
         assert_eq!(fs.state.inodes[&inode_id], current);
 
@@ -5636,6 +5641,7 @@ mod tests {
         );
         let payload = b"XY";
         fs.store
+            .pool_mut()
             .raw_primary_store_mut()
             .put(intent_log_data_object_key(0), payload)
             .expect("stage data replay payload");
@@ -5662,7 +5668,7 @@ mod tests {
         ]);
 
         let replayed =
-            replay_uncommitted_with_pool(&log, &mut fs.state, &mut fs.store, &committed_base)
+            replay_uncommitted_with_pool(&log, &mut fs.state, fs.store.pool_mut(), &committed_base)
                 .expect("replay data before later metadata");
         assert_eq!(replayed, 2);
         let recovered = &fs.state.inodes[&inode_id];

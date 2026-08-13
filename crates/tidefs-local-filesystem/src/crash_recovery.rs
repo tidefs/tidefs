@@ -216,7 +216,7 @@ pub(crate) fn apply_crash_matrix_boundary(
     let transaction_id = staged.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
     let root_authentication_key = fs.root_authentication_key;
     let mut staging =
-        CrashMatrixStagingAuthority::validation_only(&mut fs.store, root_authentication_key);
+        CrashMatrixStagingAuthority::validation_only(fs.store.pool_mut(), root_authentication_key);
     match boundary {
         CrashInjectionBoundary::NoCrash | CrashInjectionBoundary::AfterRootCommitSynced => {
             staging.stage_content(staged, inode_id, bytes)?;

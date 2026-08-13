@@ -2,6 +2,7 @@
 use std::fmt;
 
 use tidefs_local_object_store::StoreError;
+use tidefs_pool_runtime::PoolRuntimeError;
 #[cfg(feature = "replication-io")]
 use tidefs_receive_stream::ReceiverRefusalReason;
 #[cfg(feature = "policy-observation")]
@@ -56,6 +57,7 @@ impl IncrementalReceiveBaseRootIdentity {
 #[derive(Debug)]
 pub enum FileSystemError {
     Store(StoreError),
+    PoolRuntime(PoolRuntimeError),
     MissingRootAuthenticationKey {
         env_var: &'static str,
     },
@@ -313,6 +315,7 @@ impl fmt::Display for FileSystemError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Store(err) => write!(f, "local object-store error: {err}"),
+            Self::PoolRuntime(err) => write!(f, "Pool runtime error: {err}"),
             Self::MissingRootAuthenticationKey { env_var } => write!(
                 f,
                 "missing root authentication key: set {env_var} to a 32-byte hex key or use an explicit root authentication key API"
@@ -504,6 +507,7 @@ impl std::error::Error for FileSystemError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Store(err) | Self::PublishOutcomeUncertain { source: err, .. } => Some(err),
+            Self::PoolRuntime(err) => Some(err),
             _ => None,
         }
     }
@@ -541,6 +545,25 @@ impl FileSystemError {
 impl From<StoreError> for FileSystemError {
     fn from(value: StoreError) -> Self {
         Self::Store(value)
+    }
+}
+
+impl From<PoolRuntimeError> for FileSystemError {
+    fn from(value: PoolRuntimeError) -> Self {
+        match value {
+            PoolRuntimeError::PublicationOutcomeUncertain(source) => {
+                Self::PublishOutcomeUncertain {
+                    completed_boundary: FilesystemCommitBoundary::RootCommitWritten,
+                    recovery_expectation: CrashRecoveryExpectation::OldOrNewCommittedRoot,
+                    live_state_reconciled: true,
+                    source,
+                }
+            }
+            PoolRuntimeError::PublicationRequiresReopen => Self::MutationRequiresReopen {
+                operation: "publish canonical Pool root",
+            },
+            other => Self::PoolRuntime(other),
+        }
     }
 }
 

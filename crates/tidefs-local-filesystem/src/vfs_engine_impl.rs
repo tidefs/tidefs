@@ -2108,7 +2108,7 @@ impl VfsLocalFileSystem {
         };
 
         let mut fs = self.fs.borrow_mut();
-        let mut keystore = BorrowedKeyStore::new(fs.store.raw_primary_store_mut(), salt);
+        let mut keystore = BorrowedKeyStore::new(fs.store.pool_mut().raw_primary_store_mut(), salt);
         if let Err(err) = keystore.store_sealed_dek(&sealed) {
             return live_admin_error(
                 1,
@@ -2163,7 +2163,8 @@ impl VfsLocalFileSystem {
         let new_salt = PoolWrappingKey::generate_salt();
 
         let mut fs = self.fs.borrow_mut();
-        let mut keystore = BorrowedKeyStore::new(fs.store.raw_primary_store_mut(), old_salt);
+        let mut keystore =
+            BorrowedKeyStore::new(fs.store.pool_mut().raw_primary_store_mut(), old_salt);
         let datasets = match keystore.list_datasets() {
             Ok(datasets) => datasets,
             Err(err) => {
@@ -2976,7 +2977,7 @@ impl VfsLocalFileSystem {
         }
 
         let mut fs = self.fs.borrow_mut();
-        let pending = match fs.store.pending_device_removal_result(&device_path) {
+        let pending = match fs.store.pool().pending_device_removal_result(&device_path) {
             Ok(pending) => pending,
             Err(err) => {
                 return live_admin_error(
@@ -3001,7 +3002,7 @@ impl VfsLocalFileSystem {
                 );
             }
 
-            match fs.store.safe_remove_device(&device_path) {
+            match fs.store.pool_mut().safe_remove_device(&device_path) {
                 Ok(result) => result,
                 Err(err) => {
                     return live_admin_error(
@@ -3016,7 +3017,7 @@ impl VfsLocalFileSystem {
         };
 
         if result.topology_commit_pending {
-            let remaining_devices = fs.store.stats().device_count;
+            let remaining_devices = fs.store.pool().stats().device_count;
             let mut machine = json!({
                 "status": "topology_commit_pending",
                 "device_path": device_path.display().to_string(),
@@ -3031,7 +3032,7 @@ impl VfsLocalFileSystem {
                 "action": "reopen with the original pre-removal device configuration to resume; keep the target attached and do not decommission or treat it as removed",
             });
 
-            if let Err(err) = fs.store.sync_all() {
+            if let Err(err) = fs.store.pool_mut().sync_all() {
                 machine["surviving_devices_synced"] = Value::Bool(false);
                 machine["survivor_sync_error"] = Value::String(err.to_string());
                 let message = format!(
@@ -4029,7 +4030,7 @@ impl VfsLocalFileSystem {
             let fs = &mut *fs;
             let dedup_enabled = fs.dedup_enabled;
             let compression_policy = fs.content_compression_policy.clone();
-            let mut pool_store = fs.store.pool_store_mut();
+            let mut pool_store = fs.store.pool_mut().pool_store_mut();
             let mut dedup = fs.dedup_index.borrow_mut();
             reflink_chunked_content(
                 dedup_enabled,
@@ -6626,6 +6627,7 @@ mod tests {
                     format!("mounted-live-owner-device-removal-data-{candidate}").as_bytes(),
                 );
                 fs.store
+                    .pool_mut()
                     .put(
                         tidefs_local_object_store::DeviceIoClass::Data,
                         object_key,
@@ -6634,6 +6636,7 @@ mod tests {
                     .expect("write receipt-backed data through mounted pool owner");
                 let receipt = fs
                     .store
+                    .pool()
                     .placement_receipt_for_key(
                         tidefs_local_object_store::DeviceIoClass::Data,
                         object_key,
@@ -6656,9 +6659,10 @@ mod tests {
                 }
             }
             fs.store
+                .pool_mut()
                 .sync_all()
                 .expect("sync receipt-backed data before removal");
-            assert_eq!(fs.store.stats().device_count, 2);
+            assert_eq!(fs.store.pool().stats().device_count, 2);
             selected.expect("planner must place a bounded candidate on the non-primary device")
         };
         let original_labels: Vec<_> = devices
@@ -6717,15 +6721,17 @@ mod tests {
         assert!(marker_path.exists());
 
         let fs = engine.fs.borrow();
-        assert_eq!(fs.store.stats().device_count, 1);
+        assert_eq!(fs.store.pool().stats().device_count, 1);
         assert_eq!(
             fs.store
+                .pool()
                 .get(tidefs_local_object_store::DeviceIoClass::Data, object_key)
                 .expect("read after live removal"),
             Some(payload.to_vec())
         );
         let survivor_receipt = fs
             .store
+            .pool()
             .placement_receipt_for_key(tidefs_local_object_store::DeviceIoClass::Data, object_key)
             .expect("load survivor receipt after live removal")
             .expect("survivor receipt exists after live removal");
@@ -6754,10 +6760,11 @@ mod tests {
         )
         .expect("reopen original two-device configuration");
         assert!(marker_path.exists());
-        assert_eq!(reopened.store.stats().device_count, 1);
+        assert_eq!(reopened.store.pool().stats().device_count, 1);
         assert_eq!(
             reopened
                 .store
+                .pool()
                 .get(tidefs_local_object_store::DeviceIoClass::Data, object_key)
                 .expect("read before repeated removal status"),
             Some(payload.to_vec())
@@ -6786,12 +6793,14 @@ mod tests {
         assert_eq!(
             reopened
                 .store
+                .pool()
                 .get(tidefs_local_object_store::DeviceIoClass::Data, object_key)
                 .expect("read after reopen"),
             Some(payload.to_vec())
         );
         let reopened_receipt = reopened
             .store
+            .pool()
             .placement_receipt_for_key(tidefs_local_object_store::DeviceIoClass::Data, object_key)
             .expect("load receipt after original-config reopen")
             .expect("receipt exists after original-config reopen");
@@ -7142,7 +7151,8 @@ mod tests {
         let _salt = live_response_salt(&sealed, "salt:");
 
         let mut fs = engine.fs.borrow_mut();
-        let keystore = BorrowedKeyStore::new(fs.store.raw_primary_store_mut(), [0; SALT_LEN]);
+        let keystore =
+            BorrowedKeyStore::new(fs.store.pool_mut().raw_primary_store_mut(), [0; SALT_LEN]);
         let datasets = keystore.list_datasets().expect("list live keystore");
         assert_eq!(datasets, vec!["demo".to_string()]);
         let loaded = keystore
@@ -7193,7 +7203,7 @@ mod tests {
         let new_salt = live_response_salt(&rotated, "new salt:");
 
         let mut fs = engine.fs.borrow_mut();
-        let keystore = BorrowedKeyStore::new(fs.store.raw_primary_store_mut(), new_salt);
+        let keystore = BorrowedKeyStore::new(fs.store.pool_mut().raw_primary_store_mut(), new_salt);
         let loaded = keystore
             .load_sealed_dek("demo")
             .expect("load rotated sealed DEK")
