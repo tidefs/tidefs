@@ -133,9 +133,12 @@ fn handle_attach(
         live_args,
     );
 
-    use tidefs_block_volume_adapter_daemon::storage_backend::PoolVolumeBackend;
+    use tidefs_block_volume_adapter_daemon::storage_backend::{
+        PoolVolumeBackend, SharedPoolRuntime,
+    };
     use tidefs_block_volume_adapter_daemon::ublk_control_open::run_ublk_live_device;
     use tidefs_pool_runtime::PoolRuntime;
+    use tidefs_posix_filesystem_adapter_daemon::live_owner::{start_block_owner, LiveOwnerConfig};
 
     let lock_dir = PathBuf::from("/run/tidefs/import");
     let import_owner = tidefs_pool_import::pool_import_owned(devices, &lock_dir, false, None)
@@ -158,15 +161,18 @@ fn handle_attach(
             ));
         }
     };
-    let mut backend = match PoolVolumeBackend::open_standalone(runtime, &target.dataset, false) {
-        Ok(backend) => backend,
-        Err(error) => {
-            return Err(combine_export_error(
-                format!("open Pool volume '{}': {error}", target.dataset),
-                import_owner.export(),
-            ));
-        }
-    };
+    let runtime = SharedPoolRuntime::new(std::sync::Mutex::new(runtime));
+    let mut backend =
+        match PoolVolumeBackend::open_shared(Arc::clone(&runtime), &target.dataset, false) {
+            Ok(backend) => backend,
+            Err(error) => {
+                drop(runtime);
+                return Err(combine_export_error(
+                    format!("open Pool volume '{}': {error}", target.dataset),
+                    import_owner.export(),
+                ));
+            }
+        };
 
     eprintln!(
         "tidefsctl block attach: launching ublk live device (queues={nr_hw_queues} depth={queue_depth})"
@@ -181,9 +187,36 @@ fn handle_attach(
             Ok(signal_thread) => signal_thread,
             Err(error) => {
                 drop(backend);
+                drop(runtime);
                 return Err(combine_export_error(error, import_owner.export()));
             }
         };
+    let runtime_dir = PathBuf::from("/run/tidefs/pools").join(hex_uuid(&config.pool_uuid));
+    let owner_config = LiveOwnerConfig {
+        pool_name: target.pool.clone(),
+        pool_uuid: config.pool_uuid,
+        backing_dir: metadata_dir,
+        mountpoint: PathBuf::from(format!("ublk:{}", target.dataset)),
+        runtime_dir,
+        read_only: false,
+    };
+    let live_owner = match start_block_owner(
+        owner_config,
+        Arc::clone(&runtime),
+        target.dataset.clone(),
+        Arc::clone(&shutdown),
+    ) {
+        Ok(owner) => owner,
+        Err(error) => {
+            signal_thread.finish();
+            drop(backend);
+            drop(runtime);
+            return Err(combine_export_error(
+                format!("start ublk live owner: {error}"),
+                import_owner.export(),
+            ));
+        }
+    };
     let carrier_result = run_ublk_live_device(
         None,
         &mut backend,
@@ -193,10 +226,12 @@ fn handle_attach(
         queue_depth,
         drain_deadline_secs,
     );
+    live_owner.stop();
     signal_thread.finish();
     let carrier_result =
         carrier_result.map_err(|error| format!("ublk live device failed: {error}"));
     drop(backend);
+    drop(runtime);
     let export_result = import_owner
         .export()
         .map_err(|error| format!("export Pool after block attach: {error}"));
@@ -208,6 +243,13 @@ fn handle_attach(
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Err(error), Err(export_error)) => Err(format!("{error}; additionally {export_error}")),
     }
+}
+
+fn hex_uuid(uuid: &[u8; 16]) -> String {
+    uuid.iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn combine_export_error(
