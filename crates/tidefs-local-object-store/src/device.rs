@@ -1192,6 +1192,14 @@ impl MirrorDevice {
         self.fail_next_read.store(v, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    pub(crate) fn member_store_mut_for_test(
+        &mut self,
+        index: usize,
+    ) -> Option<&mut LocalObjectStore> {
+        self.members.get_mut(index).map(SingleDevice::store_mut)
+    }
+
     fn recompute_state(&mut self) {
         let total = self.members.len();
         // Refresh all error windows before counting
@@ -1296,7 +1304,8 @@ impl MirrorDevice {
     }
 
     fn put_pool_internal(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
-        if key != crate::pool_receipt_generation_high_water_key() {
+        let strict_pool_authority = crate::store::is_strict_pool_authority_key(key);
+        if !strict_pool_authority {
             return self.put_with_pool_authority(key, payload, true);
         }
 
@@ -1315,7 +1324,7 @@ impl MirrorDevice {
             return Err(error);
         }
         let result = last_ok.ok_or(StoreError::InvalidOptions {
-            reason: "placement receipt generation high-water mirror has no legs",
+            reason: "strict pool authority mirror has no legs",
         })?;
         if self
             .members
@@ -1323,14 +1332,39 @@ impl MirrorDevice {
             .any(|member| member.get(key).ok().flatten().as_deref() != Some(payload))
         {
             return Err(StoreError::InvalidOptions {
-                reason:
-                    "placement receipt generation high-water did not converge across mirror legs",
+                reason: "strict pool authority did not converge across mirror legs",
             });
         }
         Ok(result)
     }
 
     fn delete_pool_internal(&mut self, key: ObjectKey) -> Result<bool> {
+        if crate::store::is_strict_pool_authority_key(key) {
+            let mut existed = false;
+            let mut first_error = None;
+            for member in &mut self.members {
+                match member.delete_pool_internal(key) {
+                    Ok(member_existed) => existed |= member_existed,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            self.recompute_state();
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            if self
+                .members
+                .iter()
+                .any(|member| member.get(key).ok().flatten().is_some())
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "strict pool authority deletion did not converge across mirror legs",
+                });
+            }
+            return Ok(existed);
+        }
         self.delete_with_pool_authority(key, true)
     }
 
@@ -1347,20 +1381,19 @@ impl DeviceImpl for MirrorDevice {
     }
 
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
-        if key == crate::pool_receipt_generation_high_water_key() {
+        if crate::store::is_strict_pool_authority_key(key) {
             let mut expected: Option<Option<Vec<u8>>> = None;
             for member in &self.members {
                 let copy = member.get(key)?;
                 if expected.as_ref().is_some_and(|expected| *expected != copy) {
                     return Err(StoreError::InvalidOptions {
-                        reason:
-                            "placement receipt generation high-water conflicts across mirror legs",
+                        reason: "strict pool authority conflicts across mirror legs",
                     });
                 }
                 expected = Some(copy);
             }
             return expected.ok_or(StoreError::InvalidOptions {
-                reason: "placement receipt generation high-water mirror has no legs",
+                reason: "strict pool authority mirror has no legs",
             });
         }
 
@@ -1892,8 +1925,8 @@ impl ParityRaidDevice {
         pool_internal: bool,
     ) -> Result<StoredObject> {
         use crate::parity_raid::ParityRaidLayout;
-        let generation_high_water =
-            pool_internal && crate::is_pool_receipt_generation_high_water_key(key);
+        let strict_pool_authority =
+            pool_internal && crate::store::is_strict_pool_authority_key(key);
         let stripes =
             ParityRaidLayout::stripe_write(payload, self.n_data, self.n_parity).map_err(|_e| {
                 StoreError::InvalidOptions {
@@ -1908,7 +1941,7 @@ impl ParityRaidDevice {
             self.children[0].put(len_key, &len_bytes)
         };
         let mut first_error = None;
-        if generation_high_water {
+        if strict_pool_authority {
             if let Err(error) = len_result {
                 first_error = Some(error);
             }
@@ -1931,7 +1964,7 @@ impl ParityRaidDevice {
                     last_ok = Some(obj);
                 }
                 Err(error) => {
-                    if generation_high_water {
+                    if strict_pool_authority {
                         first_error.get_or_insert(error);
                     }
                     self.health_tracker
@@ -1943,7 +1976,7 @@ impl ParityRaidDevice {
         self.write_ops = self.write_ops.saturating_add(1);
         self.row_sequence = self.row_sequence.saturating_add(1);
         self.evaluate_health();
-        if generation_high_water {
+        if strict_pool_authority {
             if let Some(error) = first_error {
                 return Err(error);
             }
@@ -1960,8 +1993,7 @@ impl ParityRaidDevice {
                 });
             if !len_matches || !stripes_match {
                 return Err(StoreError::InvalidOptions {
-                    reason:
-                        "placement receipt generation high-water did not converge across parity columns",
+                    reason: "strict pool authority did not converge across parity columns",
                 });
             }
         }
@@ -2012,6 +2044,44 @@ impl ParityRaidDevice {
     }
 
     fn delete_pool_internal(&mut self, key: ObjectKey) -> Result<bool> {
+        if crate::store::is_strict_pool_authority_key(key) {
+            let mut existed = false;
+            let mut first_error = None;
+            for (column, child) in self.children.iter_mut().enumerate() {
+                let column_key = Self::column_key(key, column as u8);
+                match child.delete_pool_internal(column_key) {
+                    Ok(column_existed) => existed |= column_existed,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            let length_key = Self::len_key(key);
+            match self.children[0].delete_pool_internal(length_key) {
+                Ok(length_existed) => existed |= length_existed,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+            self.delete_ops = self.delete_ops.saturating_add(1);
+            self.evaluate_health();
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            let retained_column = self.children.iter().enumerate().any(|(column, child)| {
+                child
+                    .get(Self::column_key(key, column as u8))
+                    .ok()
+                    .flatten()
+                    .is_some()
+            });
+            if retained_column || self.children[0].get(length_key)?.is_some() {
+                return Err(StoreError::InvalidOptions {
+                    reason: "strict pool authority deletion did not converge across parity columns",
+                });
+            }
+            return Ok(existed);
+        }
         self.delete_with_pool_authority(key, true)
     }
 
@@ -2030,10 +2100,10 @@ impl DeviceImpl for ParityRaidDevice {
 
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
         use crate::parity_raid::ParityRaidLayout;
-        let generation_high_water = crate::is_pool_receipt_generation_high_water_key(key);
+        let strict_pool_authority = crate::store::is_strict_pool_authority_key(key);
         let len_key = Self::len_key(key);
         let len_data = match self.children[0].get(len_key)? {
-            Some(data) if data.len() == 8 || (!generation_high_water && data.len() > 8) => {
+            Some(data) if data.len() == 8 || (!strict_pool_authority && data.len() > 8) => {
                 let mut bytes = [0u8; 8];
                 bytes.copy_from_slice(&data[..8]);
                 u64::from_le_bytes(bytes) as usize
@@ -2055,9 +2125,9 @@ impl DeviceImpl for ParityRaidDevice {
             }
         }
         self.read_ops.set(self.read_ops.get().saturating_add(1));
-        if generation_high_water && missing_count != 0 {
+        if strict_pool_authority && missing_count != 0 {
             return Err(StoreError::InvalidOptions {
-                reason: "placement receipt generation high-water is missing a parity column",
+                reason: "strict pool authority is missing a parity column",
             });
         }
         if missing_count == 0 {
@@ -2067,7 +2137,7 @@ impl DeviceImpl for ParityRaidDevice {
                 result.extend_from_slice(stripe);
             }
             result.truncate(len_data);
-            if generation_high_water {
+            if strict_pool_authority {
                 let expected = ParityRaidLayout::stripe_write(&result, self.n_data, self.n_parity)
                     .map_err(|_error| StoreError::InvalidOptions {
                         reason: "placement receipt generation high-water parity validation failed",
@@ -2080,8 +2150,7 @@ impl DeviceImpl for ParityRaidDevice {
                     })
                 {
                     return Err(StoreError::InvalidOptions {
-                        reason:
-                            "placement receipt generation high-water conflicts across parity columns",
+                        reason: "strict pool authority conflicts across parity columns",
                     });
                 }
             }
@@ -2752,7 +2821,7 @@ impl CompressedDevice {
     }
 
     fn put_pool_internal(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
-        if key == crate::pool_receipt_generation_high_water_key() {
+        if crate::store::is_strict_pool_authority_key(key) {
             return self.inner.put_pool_internal(key, payload);
         }
 
@@ -2800,7 +2869,7 @@ impl DeviceImpl for CompressedDevice {
     }
 
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
-        if key == crate::pool_receipt_generation_high_water_key() {
+        if crate::store::is_strict_pool_authority_key(key) {
             return self.inner.get(key);
         }
         match self.inner.get(key)? {
@@ -2951,7 +3020,7 @@ impl EncryptedDevice {
     }
 
     fn put_pool_internal(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
-        if key == crate::pool_receipt_generation_high_water_key() {
+        if crate::store::is_strict_pool_authority_key(key) {
             return self.inner.put_pool_internal(key, payload);
         }
         let ciphertext = crate::encrypt::encrypt_object(&self.config.key, payload);
@@ -2976,7 +3045,7 @@ impl DeviceImpl for EncryptedDevice {
     }
 
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
-        if key == crate::pool_receipt_generation_high_water_key() {
+        if crate::store::is_strict_pool_authority_key(key) {
             return self.inner.get(key);
         }
         match self.inner.get(key)? {
@@ -3118,8 +3187,9 @@ fn parity_receipt_sidecar_matches_shard(sidecar: &[u8], shard: &[u8], n_data: u8
 }
 
 #[cfg(any(feature = "distributed-repair", test))]
-fn parity_placement_receipt_candidate_keys(
+fn parity_pool_internal_candidate_keys(
     device: &ParityRaidDevice,
+    is_candidate: fn(ObjectKey) -> bool,
 ) -> Result<BTreeSet<ObjectKey>> {
     validate_parity_receipt_topology(device)?;
 
@@ -3129,7 +3199,7 @@ fn parity_placement_receipt_candidate_keys(
             .store
             .list_keys_including_internal()
             .into_iter()
-            .filter(|key| crate::is_pool_placement_receipt_key(*key))
+            .filter(|key| is_candidate(*key))
         {
             base_keys.insert(ParityRaidDevice::column_key(
                 physical_key,
@@ -3153,7 +3223,7 @@ fn parity_placement_receipt_candidate_keys(
         .store
         .list_keys_including_internal()
         .into_iter()
-        .filter(|key| crate::is_pool_placement_receipt_key(*key))
+        .filter(|key| is_candidate(*key))
         .collect();
     let mut inspected = BTreeSet::new();
     for physical_key in &column_zero_keys {
@@ -3229,13 +3299,14 @@ fn parity_placement_receipt_candidate_keys(
 }
 
 #[cfg(any(feature = "distributed-repair", test))]
-fn parity_placement_receipt_candidates(
+fn parity_pool_internal_candidates(
     device: &ParityRaidDevice,
+    is_candidate: fn(ObjectKey) -> bool,
 ) -> Result<Vec<(ObjectKey, Vec<u8>)>> {
     use crate::parity_raid::ParityRaidLayout;
 
     let mut candidates = Vec::new();
-    for key in parity_placement_receipt_candidate_keys(device)? {
+    for key in parity_pool_internal_candidate_keys(device, is_candidate)? {
         let length_key = ParityRaidDevice::len_key(key);
         let length_slots = device.children[0]
             .store
@@ -3361,12 +3432,15 @@ impl Device {
         }
     }
 
-    pub(crate) fn placement_receipt_candidate_keys(&self) -> Result<BTreeSet<ObjectKey>> {
+    fn pool_internal_candidate_keys(
+        &self,
+        is_candidate: fn(ObjectKey) -> bool,
+    ) -> Result<BTreeSet<ObjectKey>> {
         let store_keys = |store: &LocalObjectStore| {
             store
                 .list_keys_including_internal()
                 .into_iter()
-                .filter(|key| crate::is_pool_placement_receipt_key(*key))
+                .filter(move |key| is_candidate(*key))
         };
         match self {
             Self::Single(device) => Ok(store_keys(&device.store).collect()),
@@ -3375,24 +3449,27 @@ impl Device {
                 .iter()
                 .flat_map(|member| store_keys(&member.store))
                 .collect()),
-            Self::Compressed(device) => device.inner.placement_receipt_candidate_keys(),
-            Self::Encrypted(device) => device.inner.placement_receipt_candidate_keys(),
+            Self::Compressed(device) => device.inner.pool_internal_candidate_keys(is_candidate),
+            Self::Encrypted(device) => device.inner.pool_internal_candidate_keys(is_candidate),
             Self::LogDevice(device) => Ok(store_keys(&device.store).collect()),
             #[cfg(any(feature = "distributed-repair", test))]
             Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
-                parity_placement_receipt_candidate_keys(device)
+                parity_pool_internal_candidate_keys(device, is_candidate)
             }
         }
     }
 
-    pub(crate) fn placement_receipt_candidates(&self) -> Result<Vec<(ObjectKey, Vec<u8>)>> {
+    fn pool_internal_candidates(
+        &self,
+        is_candidate: fn(ObjectKey) -> bool,
+    ) -> Result<Vec<(ObjectKey, Vec<u8>)>> {
         match self {
             Self::Single(device) => {
                 let mut candidates = Vec::new();
-                for key in self.placement_receipt_candidate_keys()? {
+                for key in self.pool_internal_candidate_keys(is_candidate)? {
                     for payload in device
                         .store
-                        .get_pool_placement_receipt_copy_slots(key)?
+                        .get_pool_internal_copy_slots(key)?
                         .into_iter()
                         .flatten()
                     {
@@ -3403,12 +3480,12 @@ impl Device {
             }
             Self::Mirror(device) => {
                 let mut candidates = Vec::new();
-                let keys = self.placement_receipt_candidate_keys()?;
+                let keys = self.pool_internal_candidate_keys(is_candidate)?;
                 for member in &device.members {
                     for key in &keys {
                         for payload in member
                             .store
-                            .get_pool_placement_receipt_copy_slots(*key)?
+                            .get_pool_internal_copy_slots(*key)?
                             .into_iter()
                             .flatten()
                         {
@@ -3420,7 +3497,11 @@ impl Device {
             }
             Self::Compressed(device) => {
                 let mut candidates = Vec::new();
-                for (key, framed) in device.inner.placement_receipt_candidates()? {
+                for (key, framed) in device.inner.pool_internal_candidates(is_candidate)? {
+                    if crate::store::is_strict_pool_authority_key(key) {
+                        candidates.push((key, framed));
+                        continue;
+                    }
                     match crate::compress::decompress_frame(&framed) {
                         Ok(payload) => candidates.push((key, payload)),
                         Err(_)
@@ -3432,7 +3513,7 @@ impl Device {
                         }
                         Err(_) => {
                             return Err(StoreError::InvalidOptions {
-                                reason: "placement receipt candidate decompression failed",
+                                reason: "pool metadata candidate decompression failed",
                             })
                         }
                     }
@@ -3441,10 +3522,14 @@ impl Device {
             }
             Self::Encrypted(device) => {
                 let mut candidates = Vec::new();
-                for (key, ciphertext) in device.inner.placement_receipt_candidates()? {
+                for (key, ciphertext) in device.inner.pool_internal_candidates(is_candidate)? {
+                    if crate::store::is_strict_pool_authority_key(key) {
+                        candidates.push((key, ciphertext));
+                        continue;
+                    }
                     let payload = crate::encrypt::decrypt_object(&device.config.key, &ciphertext)
                         .ok_or(StoreError::InvalidOptions {
-                        reason: "placement receipt candidate decryption failed",
+                        reason: "pool metadata candidate decryption failed",
                     })?;
                     candidates.push((key, payload));
                 }
@@ -3452,10 +3537,10 @@ impl Device {
             }
             Self::LogDevice(device) => {
                 let mut candidates = Vec::new();
-                for key in self.placement_receipt_candidate_keys()? {
+                for key in self.pool_internal_candidate_keys(is_candidate)? {
                     for payload in device
                         .store
-                        .get_pool_placement_receipt_copy_slots(key)?
+                        .get_pool_internal_copy_slots(key)?
                         .into_iter()
                         .flatten()
                     {
@@ -3466,48 +3551,211 @@ impl Device {
             }
             #[cfg(any(feature = "distributed-repair", test))]
             Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
-                parity_placement_receipt_candidates(device)
+                parity_pool_internal_candidates(device, is_candidate)
             }
         }
     }
 
-    pub(crate) fn sync_pool_receipt_generation_high_water(&mut self) -> Result<()> {
+    pub(crate) fn placement_receipt_candidates(&self) -> Result<Vec<(ObjectKey, Vec<u8>)>> {
+        self.pool_internal_candidates(crate::is_pool_placement_receipt_key)
+    }
+
+    pub(crate) fn pending_deletion_candidates(&self) -> Result<Vec<(ObjectKey, Vec<u8>)>> {
+        self.pool_internal_candidates(crate::store::is_pool_pending_deletion_key)
+    }
+
+    pub(crate) fn sync_strict_pool_authority(&mut self) -> Result<()> {
         match self {
-            Self::Single(device) => device.store.sync_pool_receipt_generation_high_water(),
+            Self::Single(device) => device.store.sync_strict_pool_authority(),
             Self::Mirror(device) => {
                 if device.members.is_empty() {
                     return Err(StoreError::InvalidOptions {
-                        reason: "placement receipt generation high-water mirror has no legs",
+                        reason: "strict pool authority mirror has no legs",
                     });
                 }
                 let mut first_error = None;
                 for member in &mut device.members {
-                    if let Err(error) = member.store.sync_pool_receipt_generation_high_water() {
+                    if let Err(error) = member.store.sync_strict_pool_authority() {
                         first_error.get_or_insert(error);
                     }
                 }
                 first_error.map_or(Ok(()), Err)
             }
-            Self::Compressed(device) => device.inner.sync_pool_receipt_generation_high_water(),
-            Self::Encrypted(device) => device.inner.sync_pool_receipt_generation_high_water(),
-            Self::LogDevice(device) => device.store.sync_pool_receipt_generation_high_water(),
+            Self::Compressed(device) => device.inner.sync_strict_pool_authority(),
+            Self::Encrypted(device) => device.inner.sync_strict_pool_authority(),
+            Self::LogDevice(device) => device.store.sync_strict_pool_authority(),
             #[cfg(any(feature = "distributed-repair", test))]
             Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
                 if device.children.is_empty() {
                     return Err(StoreError::InvalidOptions {
-                        reason:
-                            "placement receipt generation high-water parity device has no columns",
+                        reason: "strict pool authority parity device has no columns",
                     });
                 }
                 let mut first_error = None;
                 for child in &mut device.children {
-                    if let Err(error) = child.store.sync_pool_receipt_generation_high_water() {
+                    if let Err(error) = child.store.sync_strict_pool_authority() {
                         first_error.get_or_insert(error);
                     }
                 }
                 first_error.map_or(Ok(()), Err)
             }
         }
+    }
+
+    fn delete_exact_logical_object_with_pool_authority(
+        &mut self,
+        key: ObjectKey,
+        pool_internal: bool,
+    ) -> Result<bool> {
+        match self {
+            Self::Single(device) => {
+                let existed = if pool_internal {
+                    device.delete_pool_internal(key)?
+                } else {
+                    device.delete(key)?
+                };
+                device.store.sync_strict_pool_authority()?;
+                if device.get(key)?.is_some() {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "exact object deletion retained a single-device copy",
+                    });
+                }
+                Ok(existed)
+            }
+            Self::Mirror(device) => {
+                if device.members.is_empty() {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "exact object deletion mirror has no legs",
+                    });
+                }
+                let mut existed = false;
+                let mut first_error = None;
+                for member in &mut device.members {
+                    let result = if pool_internal {
+                        member.delete_pool_internal(key)
+                    } else {
+                        member.delete(key)
+                    };
+                    match result {
+                        Ok(member_existed) => existed |= member_existed,
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                    if let Err(error) = member.store.sync_strict_pool_authority() {
+                        first_error.get_or_insert(error);
+                    }
+                    match member.get(key) {
+                        Ok(None) => {}
+                        Ok(Some(_)) => {
+                            first_error.get_or_insert(StoreError::InvalidOptions {
+                                reason: "exact object deletion retained a mirror-leg copy",
+                            });
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+                device.recompute_state();
+                first_error.map_or(Ok(existed), Err)
+            }
+            Self::Compressed(device) => device
+                .inner
+                .delete_exact_logical_object_with_pool_authority(key, pool_internal),
+            Self::Encrypted(device) => device
+                .inner
+                .delete_exact_logical_object_with_pool_authority(key, pool_internal),
+            Self::LogDevice(device) => {
+                let existed = if pool_internal {
+                    device.delete_pool_internal(key)?
+                } else {
+                    device.delete(key)?
+                };
+                device.store.sync_strict_pool_authority()?;
+                if device.get(key)?.is_some() {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "exact object deletion retained a log-device copy",
+                    });
+                }
+                Ok(existed)
+            }
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                if device.children.is_empty() {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "exact object deletion parity device has no columns",
+                    });
+                }
+                let mut existed = false;
+                let mut first_error = None;
+                for (column, child) in device.children.iter_mut().enumerate() {
+                    let column_key = ParityRaidDevice::column_key(key, column as u8);
+                    let result = if pool_internal {
+                        child.delete_pool_internal(column_key)
+                    } else {
+                        child.delete(column_key)
+                    };
+                    match result {
+                        Ok(column_existed) => existed |= column_existed,
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                    if let Err(error) = child.store.sync_strict_pool_authority() {
+                        first_error.get_or_insert(error);
+                    }
+                    match child.get(column_key) {
+                        Ok(None) => {}
+                        Ok(Some(_)) => {
+                            first_error.get_or_insert(StoreError::InvalidOptions {
+                                reason: "exact object deletion retained a parity-column copy",
+                            });
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+                let length_key = ParityRaidDevice::len_key(key);
+                let length_result = if pool_internal {
+                    device.children[0].delete_pool_internal(length_key)
+                } else {
+                    device.children[0].delete(length_key)
+                };
+                match length_result {
+                    Ok(length_existed) => existed |= length_existed,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                if let Err(error) = device.children[0].store.sync_strict_pool_authority() {
+                    first_error.get_or_insert(error);
+                }
+                match device.children[0].get(length_key) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => {
+                        first_error.get_or_insert(StoreError::InvalidOptions {
+                            reason: "exact object deletion retained a parity-length copy",
+                        });
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                device.delete_ops = device.delete_ops.saturating_add(1);
+                device.evaluate_health();
+                first_error.map_or(Ok(existed), Err)
+            }
+        }
+    }
+
+    pub(crate) fn delete_exact_logical_object(&mut self, key: ObjectKey) -> Result<bool> {
+        self.delete_exact_logical_object_with_pool_authority(key, false)
+    }
+
+    pub(crate) fn delete_exact_pool_internal_object(&mut self, key: ObjectKey) -> Result<bool> {
+        self.delete_exact_logical_object_with_pool_authority(key, true)
     }
 
     pub(crate) fn put_pool_internal(
@@ -5005,7 +5253,9 @@ mod tests {
                 .unwrap());
         }
 
-        let candidate_keys = device.placement_receipt_candidate_keys().unwrap();
+        let candidate_keys = device
+            .pool_internal_candidate_keys(crate::is_pool_placement_receipt_key)
+            .unwrap();
         assert!(candidate_keys.contains(&key));
         assert!(matches!(
             device.placement_receipt_candidates(),
