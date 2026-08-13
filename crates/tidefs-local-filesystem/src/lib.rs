@@ -77,9 +77,11 @@
 //! 1. `record_reclaim_delta()` records entries in the local B+tree queue
 //! 2. `tick_background_services()` Duty 2 drains the queue through
 //!    `Pool::delete()` for each entry
-//! 3. `delete()` feeds the object-store reclaim queues
-//! 4. receipt-bound dead-object drains free segments only after committed
-//!    clearance evidence authorizes the object ids.
+//! 3. `Pool::delete()` durably publishes logical deletion before it removes
+//!    the matching placement authority or exact physical targets
+//! 4. exact removed targets enter receipt-bound object-store reclaim, whose
+//!    drains free segments only after committed clearance evidence authorizes
+//!    the object ids.
 //!
 //! With `distributed-repair`, the scrub-to-repair scheduling chain is:
 //! 1. `BackgroundScrubber` periodically imports the mounted Pool topology
@@ -5037,9 +5039,11 @@ impl LocalFileSystem {
     ///
     /// An entry leaves the local queue only after strict preflight proves that
     /// its object is already absent or `Pool::delete()` completes the logical
-    /// handoff. `Pool::delete()` removes the in-memory object index entry and
-    /// enqueues object-store reclaim entries. Physical segment freeing requires
-    /// receipt-bound dead-object clearance evidence.
+    /// handoff. A committed Pool deletion hides the selected receipt generation
+    /// immediately; exact receipt and physical-target cleanup may remain
+    /// replayable afterward. Removed targets enter the lower receipt-bound
+    /// queue, and physical segment freeing still requires committed clearance
+    /// evidence.
     ///
     /// Budget: at most 1024 entries per call, matching the object-store
     /// reclaim consumer's normal batch size and the background-service
@@ -15637,7 +15641,7 @@ mod orphan_index_integration_tests {
 
     #[test]
     #[cfg(feature = "data-policy")]
-    fn reclaim_ambiguous_delete_does_not_decrement_dedup_refcount() {
+    fn reclaim_preflight_delete_failure_retries_dedup_refcount_once() {
         let (_root, mut fs, redirect_key, canonical_key, fingerprint, refcount_before) =
             dedup_reclaim_fixture("reclaim_delete_failure_refcount");
 
@@ -15715,24 +15719,28 @@ mod orphan_index_integration_tests {
         let redirect_was_absent_after_failure = fs
             .store
             .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
-            .expect("strict redirect read after ambiguous delete")
+            .expect("strict redirect read after failed delete preflight")
             .is_none();
+        assert!(
+            !redirect_was_absent_after_failure,
+            "a refused deletion handoff must preserve the exact redirect authority"
+        );
 
         fs.drain_local_reclaim_queue_into_store()
             .expect("drain local reclaim queue");
 
         assert_eq!(
             crate::dedup_refcount::DedupRefCount::read(fs.store.raw_primary_store(), &fingerprint,)
-                .expect("read refcount after absent-object retry"),
-            refcount_before,
-            "an ambiguous delete may retain canonical lifetime but must never consume it twice"
+                .expect("read refcount after successful retry"),
+            refcount_before.saturating_sub(1),
+            "the successful retry must consume the preserved redirect lifetime exactly once"
         );
-        assert!(fs
-            .store
-            .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
-            .expect("strict redirect read after successful retry")
-            .is_none(),
-            "retry must converge whether the injected failure preceded or followed Pool deletion (absent after failure: {redirect_was_absent_after_failure})"
+        assert!(
+            fs.store
+                .get_with_current_receipt(DeviceIoClass::Data, redirect_key)
+                .expect("strict redirect read after successful retry")
+                .is_none(),
+            "retry must commit the deletion after the refused preflight preserved authority"
         );
         assert!(fs
             .reclaim_queue
