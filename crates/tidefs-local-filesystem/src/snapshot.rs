@@ -624,7 +624,10 @@ impl LocalFileSystem {
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         let summary_snapshot = summary.clone();
-        self.commit_mutation(summary_snapshot)?;
+        // A clone owns a typed snapshot root and catalog entry.  Do not let
+        // deferred mounted commit batching acknowledge that authority before
+        // the canonical Pool composition contains it.
+        self.force_commit(summary_snapshot)?;
         Ok(clone_summary)
     }
 
@@ -678,7 +681,9 @@ impl LocalFileSystem {
         self.unpin_snapshot_record_root(&record)?;
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
-        let summary = self.commit_mutation(record.summary())?;
+        // Publish typed-root and catalog removal before deadlist derivation or
+        // caller-visible success.
+        let summary = self.force_commit(record.summary())?;
         Ok((summary, record))
     }
 
@@ -752,7 +757,10 @@ impl LocalFileSystem {
         reconcile_snapshot_record_catalog_entry(self.dataset_catalog_mut()?, &promoted)?;
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
-        self.commit_mutation(())?;
+        // Promotion changes the typed snapshot object's kind and its catalog
+        // flags.  It is one canonical authority transition and therefore must
+        // not remain deferred behind mounted I/O batching.
+        self.force_commit(())?;
         Ok(PromoteReport {
             name: name.to_string(),
             previous_origin: origin_str,

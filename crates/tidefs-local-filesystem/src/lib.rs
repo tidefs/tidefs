@@ -6781,7 +6781,12 @@ impl LocalFileSystem {
         }
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
-        self.commit_mutation(summary)
+        // Snapshot creation changes the canonical Pool composition, not just
+        // ordinary mounted metadata.  The caller must not observe success
+        // until the filesystem root, catalog entry, lifecycle pin, and typed
+        // snapshot root are durably published together, even when mounted I/O
+        // uses deferred commit batching.
+        self.force_commit(summary)
     }
 
     pub(crate) fn delete_snapshot_without_deadlist(
@@ -6824,7 +6829,11 @@ impl LocalFileSystem {
             .unpin_root(snapshot::snapshot_record_traversal_root(&record)?);
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
-        let summary = self.commit_mutation(record.summary())?;
+        // Logical snapshot removal is an authority transition.  Publish the
+        // removal before deriving deadlist work or acknowledging success so
+        // reclaim never reasons from a newer in-memory generation than the
+        // canonical Pool root.
+        let summary = self.force_commit(record.summary())?;
         Ok((summary, record))
     }
 
