@@ -4,25 +4,20 @@
 //!
 //! # Entrypoint Authority
 //!
-//! `tidefsctl block attach <pool>` is the operator entrypoint for ublk block
-//! device lifecycle. Imported pools route to the live owner. Directory
-//! object-store backing is a hidden retired/offline path, not an
-//! operator block-volume backing mode.
+//! `tidefsctl block attach <pool>/<volume>` is the operator entrypoint for
+//! ublk block-device lifecycle. Imported pools route to the live owner;
+//! explicit devices are imported through the same canonical Pool runtime.
 //!
 //! The block-volume-adapter-daemon binary `ublk-serve` subcommand is a
 //! development/harness tool and must not be used as a production device
 //! lifecycle path.
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use clap::Subcommand;
-use tidefs_local_filesystem::RootAuthenticationKey;
-#[cfg(test)]
-use tidefs_local_filesystem::ROOT_AUTHENTICATION_ENV_VAR;
 use tidefs_vfs_engine::LivePoolAdminArg;
 
 /// Subcommands for the `tidefsctl block` group.
@@ -30,17 +25,12 @@ use tidefs_vfs_engine::LivePoolAdminArg;
 pub enum BlockCommand {
     /// Attach a pool as a ublk block device and serve I/O
     Attach {
-        /// Pool name. Imported pools route to the live owner.
-        pool: String,
+        /// Named volume target in <pool>/<volume> form.
+        target: String,
 
-        /// Retired directory object-store backing mode.
-        #[arg(
-            short = 'b',
-            long = "backing-dir",
-            hide = true,
-            value_parser = crate::commands::reject_directory_pool_media_value
-        )]
-        backing_dir: Option<PathBuf>,
+        /// Offline pool member devices. Omit only for a reachable live owner.
+        #[arg(long, value_name = "DEVICE", num_args = 1..)]
+        devices: Vec<PathBuf>,
 
         /// Number of hardware queues (1..UBLK_MAX_NR_QUEUES)
         #[arg(long, default_value_t = 1)]
@@ -53,10 +43,6 @@ pub enum BlockCommand {
         /// Drain deadline in seconds for graceful shutdown
         #[arg(long, default_value_t = 30)]
         drain_deadline_secs: u64,
-
-        /// Enable io_uring dispatch path
-        #[arg(long)]
-        io_uring: bool,
     },
 
     /// Detach a ublk block device by its numeric device ID
@@ -67,80 +53,24 @@ pub enum BlockCommand {
 
     /// List attached ublk block devices
     List,
-
-    /// Send a block-volume snapshot over the network to a remote storage-node.
-    Send {
-        /// Pool name. Imported pools route to the live owner.
-        pool: String,
-
-        /// Retired directory object-store backing mode.
-        #[arg(
-            short = 'b',
-            long = "backing-dir",
-            hide = true,
-            value_parser = crate::commands::reject_directory_pool_media_value
-        )]
-        backing_dir: Option<PathBuf>,
-
-        /// TCP address of the remote storage-node.
-        #[arg(long = "target-addr")]
-        target_addr: SocketAddr,
-
-        /// Local node id for transport identity.
-        #[arg(long = "node-id", default_value_t = 1)]
-        node_id: u64,
-
-        /// Remote storage-node id for transport routing.
-        #[arg(long = "server-node-id", default_value_t = 2)]
-        server_node_id: u64,
-    },
-
-    /// Receive a block-volume snapshot over the network from a remote storage-node.
-    Receive {
-        /// Pool name. Imported pools route to the live owner.
-        pool: String,
-
-        /// Retired directory object-store backing mode.
-        #[arg(
-            short = 'b',
-            long = "backing-dir",
-            hide = true,
-            value_parser = crate::commands::reject_directory_pool_media_value
-        )]
-        backing_dir: Option<PathBuf>,
-
-        /// TCP address of the remote storage-node.
-        #[arg(long = "source-addr")]
-        source_addr: SocketAddr,
-
-        /// Local node id for transport identity.
-        #[arg(long = "node-id", default_value_t = 1)]
-        node_id: u64,
-
-        /// Remote storage-node id for transport routing.
-        #[arg(long = "server-node-id", default_value_t = 2)]
-        server_node_id: u64,
-    },
 }
 
 /// Route a [`BlockCommand`] to the appropriate handler.
 pub fn handle_block(cmd: BlockCommand) {
     match cmd {
         BlockCommand::Attach {
-            pool,
-            backing_dir,
+            target,
+            devices,
             nr_hw_queues,
             queue_depth,
             drain_deadline_secs,
-            io_uring,
         } => {
             if let Err(err) = handle_attach(
-                &pool,
-                backing_dir.as_deref(),
+                &target,
+                &devices,
                 nr_hw_queues,
                 queue_depth,
                 drain_deadline_secs,
-                io_uring,
             ) {
                 eprintln!("tidefsctl block attach: {err}");
                 process::exit(1);
@@ -155,176 +85,88 @@ pub fn handle_block(cmd: BlockCommand) {
         BlockCommand::List => {
             handle_list();
         }
-        BlockCommand::Send {
-            pool,
-            backing_dir,
-            target_addr,
-            node_id,
-            server_node_id,
-        } => {
-            if let Err(err) = handle_block_send(
-                &pool,
-                backing_dir.as_deref(),
-                target_addr,
-                node_id,
-                server_node_id,
-            ) {
-                eprintln!("tidefsctl block send: {err}");
-                process::exit(1);
-            }
-        }
-        BlockCommand::Receive {
-            pool,
-            backing_dir,
-            source_addr,
-            node_id,
-            server_node_id,
-        } => {
-            if let Err(err) = handle_block_receive(
-                &pool,
-                backing_dir.as_deref(),
-                source_addr,
-                node_id,
-                server_node_id,
-            ) {
-                eprintln!("tidefsctl block receive: {err}");
-                process::exit(1);
-            }
-        }
     }
 }
 
 // ── Attach ────────────────────────────────────────────────────────────
 
 fn handle_attach(
-    pool: &str,
-    backing_dir: Option<&Path>,
+    raw_target: &str,
+    devices: &[PathBuf],
     nr_hw_queues: u16,
     queue_depth: u16,
     drain_deadline_secs: u64,
-    io_uring: bool,
 ) -> Result<(), String> {
     let _guard = super::authz::require_local_only("block attach");
+    let target = crate::parser::parse_dataset_target(raw_target)?;
 
     let live_args = super::live_owner::live_admin_args([
+        ("volume", LivePoolAdminArg::String(target.dataset.clone())),
         ("nr_hw_queues", LivePoolAdminArg::U64(nr_hw_queues.into())),
         ("queue_depth", LivePoolAdminArg::U64(queue_depth.into())),
         (
             "drain_deadline_secs",
             LivePoolAdminArg::U64(drain_deadline_secs),
         ),
-        ("io_uring", LivePoolAdminArg::Bool(io_uring)),
     ]);
 
-    let Some(pool_path) = backing_dir else {
-        super::live_owner::route_with_args("block", "attach", pool, live_args);
-    };
+    if devices.is_empty() {
+        super::live_owner::route_with_args("block", "attach", &target.pool, live_args);
+    }
 
-    super::live_owner::route_if_owner_exists_for_pool_backing_dir_with_args(
+    let entries = tidefs_pool_scan::scan_labels(devices)
+        .map_err(|err| format!("scan Pool devices: {err}"))?;
+    let config = tidefs_pool_scan::PoolAssembler::assemble(&entries, None)
+        .map_err(|err| format!("assemble Pool devices: {err}"))?;
+    if config.pool_name != target.pool {
+        return Err(format!(
+            "devices belong to pool '{}', not requested pool '{}'",
+            config.pool_name, target.pool
+        ));
+    }
+    super::live_owner::route_or_refuse_active_for_uuid_with_args(
         "block",
         "attach",
-        pool,
-        pool_path,
-        live_args.clone(),
-    );
-    super::offline_pool::refuse_runtime_pool_path("block", "attach", pool_path);
-
-    if !pool_path.exists() {
-        return Err(format!(
-            "retired directory object-store backing does not exist: {}",
-            pool_path.display()
-        ));
-    }
-    if !pool_path.is_dir() {
-        return Err(format!(
-            "retired directory object-store backing is not a directory: {}",
-            pool_path.display()
-        ));
-    }
-
-    eprintln!(
-        "tidefsctl block attach: opening retired directory object-store backing for pool '{pool}' at {}",
-        pool_path.display()
+        &target.pool,
+        config.pool_uuid,
+        config.state == tidefs_types_pool_label_core::PoolState::Active,
+        live_args,
     );
 
-    use tidefs_block_volume_adapter_core::{BlockVolumeGeometryRecord, BlockVolumeId};
-    use tidefs_block_volume_adapter_daemon::storage_backend::BlockVolumeObjectStoreBackend;
+    use tidefs_block_volume_adapter_daemon::storage_backend::PoolVolumeBackend;
     use tidefs_block_volume_adapter_daemon::ublk_control_open::run_ublk_live_device;
+    use tidefs_pool_runtime::PoolRuntime;
 
-    // Default geometry: 4 KiB blocks, 1 GiB capacity (262144 blocks), single shard.
-    let geometry = BlockVolumeGeometryRecord::new(BlockVolumeId::new(301_200), 4096, 262_144, 1);
-
-    // ── Crash recovery detection ──────────────────────────────────
-    // Detect whether the previous shutdown was unclean and replay
-    // intent-log segments before opening the backend. Recovery is
-    // best-effort: failures are logged as warnings rather than
-    // preventing pool attach.
-    let mount_state_path = {
-        let mut p = std::path::PathBuf::from(pool_path);
-        p.push(".tidefs_mount_state_ublk");
-        p
+    let lock_dir = PathBuf::from("/run/tidefs/import");
+    let import_owner = tidefs_pool_import::pool_import_owned(devices, &lock_dir, false, None)
+        .map_err(|err| format!("import Pool: {err}"))?;
+    let metadata_dir = super::offline_pool::metadata_dir("block", "attach", &config.pool_uuid);
+    let runtime = match PoolRuntime::open_block_devices(
+        &metadata_dir,
+        devices,
+        &target.pool,
+        tidefs_local_object_store::PoolRedundancyPolicy::from_label_policy(
+            config.redundancy_policy,
+        ),
+        &tidefs_local_object_store::StoreOptions::default(),
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return Err(combine_export_error(
+                format!("open canonical Pool runtime: {error}"),
+                import_owner.export(),
+            ));
+        }
     };
-    {
-        use tidefs_recovery_loop::{CrashRecoveryLoop, CrashRecoveryState, MountState};
-        match CrashRecoveryLoop::detect(&mount_state_path) {
-            Ok(mut recovery) => {
-                recovery.advance();
-                if recovery.state == CrashRecoveryState::Replay {
-                    eprintln!("tidefsctl block attach: unclean shutdown detected — replaying intent log...");
-                    match tidefs_local_object_store::LocalObjectStore::open(pool_path) {
-                        Ok(store) => {
-                            if let Err(e) = recovery.run_replay(&store) {
-                                eprintln!("tidefsctl block attach: warning: intent log replay failed: {e}; continuing");
-                            } else {
-                                recovery.reconcile_and_finish();
-                                eprintln!("tidefsctl block attach: crash recovery complete — pool is ready.");
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("tidefsctl block attach: warning: cannot open store for crash recovery: {e}; continuing");
-                        }
-                    }
-                }
-                // Mark dirty for this session
-                if let Err(e) = MountState::Dirty.write_to_path(&mount_state_path) {
-                    eprintln!("tidefsctl block attach: warning: cannot write mount-state: {e}; continuing");
-                }
-            }
-            Err(e) => {
-                eprintln!("tidefsctl block attach: warning: crash recovery detection failed: {e}; continuing");
-            }
+    let mut backend = match PoolVolumeBackend::open_standalone(runtime, &target.dataset, false) {
+        Ok(backend) => backend,
+        Err(error) => {
+            return Err(combine_export_error(
+                format!("open Pool volume '{}': {error}", target.dataset),
+                import_owner.export(),
+            ));
         }
-    }
-
-    // ── Committed-root validation ──────────────────────────────────
-    // Validate the committed root discovered during pool import.
-    {
-        let root_file = std::path::Path::new(pool_path).join("tidefs-committed-root");
-        if let Ok(payload) = std::fs::read(&root_file) {
-            if let Some((root, digest)) =
-                tidefs_local_object_store::txg_manager::CommitGroupManager::decode_root_with_digest(
-                    &payload,
-                )
-            {
-                match tidefs_recovery_loop::recovery_loop::validate_committed_root(root, digest) {
-                    Ok(()) => {
-                        eprintln!(
-                            "tidefsctl block attach: committed root validated: commit_group={} handle={}",
-                            root.commit_group_id.0, root.root_handle,
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "tidefsctl block attach: warning: committed root validation failed: {e}; continuing with unvalidated root"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let mut backend = BlockVolumeObjectStoreBackend::open(pool_path, geometry)
-        .map_err(|e| format!("failed to open block backend: {e}"))?;
+    };
 
     eprintln!(
         "tidefsctl block attach: launching ublk live device (queues={nr_hw_queues} depth={queue_depth})"
@@ -332,33 +174,50 @@ fn handle_attach(
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_thread =
-        tidefs_block_volume_adapter_daemon::signal_shutdown::install_signal_shutdown_thread(
+        match tidefs_block_volume_adapter_daemon::signal_shutdown::install_signal_shutdown_thread(
             "tidefsctl block attach",
             Arc::clone(&shutdown),
-        )?;
-    let report = run_ublk_live_device(
+        ) {
+            Ok(signal_thread) => signal_thread,
+            Err(error) => {
+                drop(backend);
+                return Err(combine_export_error(error, import_owner.export()));
+            }
+        };
+    let carrier_result = run_ublk_live_device(
         None,
         &mut backend,
         Arc::clone(&shutdown),
-        io_uring,
+        false,
         nr_hw_queues,
         queue_depth,
         drain_deadline_secs,
     );
     signal_thread.finish();
-    let report = report.map_err(|e| format!("ublk live device failed: {e}"))?;
-
-    // ── Mark clean on successful shutdown ─────────────────────────
-    {
-        use tidefs_recovery_loop::MountState;
-        if let Err(e) = MountState::Clean.write_to_path(&mount_state_path) {
-            // Non-fatal: pool state was already persisted via sync/flush.
-            eprintln!("tidefsctl block attach: warning: failed to write clean mount-state: {e}");
+    let carrier_result =
+        carrier_result.map_err(|error| format!("ublk live device failed: {error}"));
+    drop(backend);
+    let export_result = import_owner
+        .export()
+        .map_err(|error| format!("export Pool after block attach: {error}"));
+    match (carrier_result, export_result) {
+        (Ok(report), Ok(())) => {
+            report.print();
+            Ok(())
         }
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(export_error)) => Err(format!("{error}; additionally {export_error}")),
     }
+}
 
-    report.print();
-    Ok(())
+fn combine_export_error(
+    error: String,
+    export: Result<(), tidefs_pool_import::ImportError>,
+) -> String {
+    match export {
+        Ok(()) => error,
+        Err(export_error) => format!("{error}; additionally failed to export Pool: {export_error}"),
+    }
 }
 
 // ── Detach ────────────────────────────────────────────────────────────
@@ -436,239 +295,15 @@ fn read_block_device_size(dev_path: &Path) -> Result<u64, ()> {
     Ok(sectors * 512)
 }
 
-// ── Block send/receive over VSNP ─────────────────────────────────────
-
-use crate::commands::snapshot::{
-    build_block_pull_request, build_block_push_message, parse_snap_net_message, transport_request,
-    SnapNetMessage,
-};
-
-fn block_root_auth_key(operation: &str) -> Result<RootAuthenticationKey, String> {
-    super::required_root_authentication_key(operation)
-}
-
-fn handle_block_send(
-    pool: &str,
-    backing_dir: Option<&Path>,
-    target_addr: SocketAddr,
-    node_id: u64,
-    server_node_id: u64,
-) -> Result<(), String> {
-    let _guard = super::authz::require_local_only("block send");
-
-    let live_args = super::live_owner::live_admin_args([
-        (
-            "target_addr",
-            LivePoolAdminArg::String(target_addr.to_string()),
-        ),
-        ("node_id", LivePoolAdminArg::U64(node_id)),
-        ("server_node_id", LivePoolAdminArg::U64(server_node_id)),
-    ]);
-
-    let Some(pool_path) = backing_dir else {
-        super::live_owner::route_with_args("block", "send", pool, live_args);
-    };
-
-    super::live_owner::route_if_owner_exists_for_pool_backing_dir_with_args(
-        "block",
-        "send",
-        pool,
-        pool_path,
-        live_args.clone(),
-    );
-    super::offline_pool::refuse_runtime_pool_path("block", "send", pool_path);
-
-    if !pool_path.exists() {
-        return Err(format!(
-            "retired directory object-store backing does not exist: {}",
-            pool_path.display()
-        ));
-    }
-
-    // Read raw block data from the pool's block-volume storage.
-    let block_data = read_pool_block_data(pool_path)?;
-    let device_name = "block-volume";
-    let auth_key = block_root_auth_key("block send")?;
-    let req = build_block_push_message(&block_data, device_name, &auth_key.as_bytes32());
-
-    eprintln!(
-        "block send: pushing {} bytes to {target_addr}",
-        block_data.len()
-    );
-
-    let response = transport_request(node_id, server_node_id, target_addr, req)
-        .map_err(|e| format!("transport: {e}"))?;
-
-    match parse_snap_net_message(&response) {
-        Ok(SnapNetMessage::Ack { message }) => {
-            println!("block send: {message}");
-        }
-        Ok(SnapNetMessage::Error { message }) => {
-            return Err(format!("remote error: {message}"));
-        }
-        _ => {
-            return Err("bad response from server".into());
-        }
-    }
-
-    Ok(())
-}
-
-fn handle_block_receive(
-    pool: &str,
-    backing_dir: Option<&Path>,
-    source_addr: SocketAddr,
-    node_id: u64,
-    server_node_id: u64,
-) -> Result<(), String> {
-    let _guard = super::authz::require_local_only("block receive");
-
-    let live_args = super::live_owner::live_admin_args([
-        (
-            "source_addr",
-            LivePoolAdminArg::String(source_addr.to_string()),
-        ),
-        ("node_id", LivePoolAdminArg::U64(node_id)),
-        ("server_node_id", LivePoolAdminArg::U64(server_node_id)),
-    ]);
-
-    let Some(pool_path) = backing_dir else {
-        super::live_owner::route_with_args("block", "receive", pool, live_args);
-    };
-
-    super::live_owner::route_if_owner_exists_for_pool_backing_dir_with_args(
-        "block",
-        "receive",
-        pool,
-        pool_path,
-        live_args.clone(),
-    );
-    super::offline_pool::refuse_runtime_pool_path("block", "receive", pool_path);
-
-    if pool_path.exists() {
-        return Err(format!(
-            "destination retired directory object-store backing already exists: {} (receive requires an empty target)",
-            pool_path.display()
-        ));
-    }
-
-    let auth_key = block_root_auth_key("block receive")?;
-    let req = build_block_pull_request("block-volume", &auth_key.as_bytes32());
-
-    eprintln!("block receive: pulling from {source_addr}");
-
-    let response = transport_request(node_id, server_node_id, source_addr, req)
-        .map_err(|e| format!("transport: {e}"))?;
-
-    let block_data = match parse_snap_net_message(&response) {
-        Ok(SnapNetMessage::PullResponse { export }) => export,
-        Ok(SnapNetMessage::Error { message }) => {
-            return Err(format!("remote error: {message}"));
-        }
-        _ => {
-            return Err("bad response from server".into());
-        }
-    };
-
-    write_pool_block_data(pool_path, &block_data)?;
-
-    println!(
-        "block receive: wrote {} bytes to {}",
-        block_data.len(),
-        pool_path.display()
-    );
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::commands::with_root_auth_env;
-
-    #[test]
-    fn block_root_auth_key_rejects_missing_env() {
-        with_root_auth_env(None, || {
-            let err = block_root_auth_key("block send").unwrap_err();
-            assert!(err.contains(ROOT_AUTHENTICATION_ENV_VAR));
-            assert!(err.contains("missing"));
-        });
-    }
-
-    #[test]
-    fn block_root_auth_key_rejects_malformed_env() {
-        with_root_auth_env(Some("not-hex"), || {
-            let err = block_root_auth_key("block send").unwrap_err();
-            assert!(err.contains(ROOT_AUTHENTICATION_ENV_VAR));
-            assert!(err.contains("invalid"));
-        });
-    }
-}
-
-/// Read the raw block data from a TideFS pool's block-volume storage.
-fn read_pool_block_data(pool_path: &Path) -> Result<Vec<u8>, String> {
-    // Read committed-root metadata to determine block-volume extent.
-    let root_file = pool_path.join("tidefs-committed-root");
-    if !root_file.exists() {
-        return Err("no committed-root found; pool may not be initialized".into());
-    }
-
-    // Collect all objects in the pool directory as raw block data.
-    // For a production implementation, this would use the block-volume
-    // adapter's read path. The current approach reads object store files
-    // directly as a simple block-level replication.
-    let mut block_data = Vec::new();
-    let dir_entries = std::fs::read_dir(pool_path).map_err(|e| format!("read pool dir: {e}"))?;
-
-    for entry in dir_entries {
-        let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
-        let path = entry.path();
-        if path.is_file()
-            && path
-                .file_name()
-                .map(|n| n != "tidefs-committed-root")
-                .unwrap_or(true)
-        {
-            let data = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-            block_data.extend_from_slice(&data);
-        }
-    }
-
-    if block_data.is_empty() {
-        return Err("pool contains no block data".into());
-    }
-
-    Ok(block_data)
-}
-
-/// Write raw block data to a TideFS pool.
-fn write_pool_block_data(pool_path: &Path, data: &[u8]) -> Result<(), String> {
-    std::fs::create_dir_all(pool_path).map_err(|e| format!("create pool dir: {e}"))?;
-
-    // Write block data as a single object file in the pool.
-    let data_path = pool_path.join("block-volume-data");
-    std::fs::write(&data_path, data).map_err(|e| format!("write block data: {e}"))?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod block_path_tests {
     use super::*;
 
     #[test]
-    fn block_attach_rejects_nonexistent_path() {
-        let result = handle_attach(
-            "mypool",
-            Some(Path::new("/tmp/tidefs-nonexistent-pool-xyz")),
-            4,
-            64,
-            30,
-            false,
-        );
+    fn block_attach_requires_named_volume_target() {
+        let result = handle_attach("mypool", &[], 4, 64, 30);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("retired directory object-store backing does not exist"),);
+        assert!(result.unwrap_err().contains("<pool>/<name>"));
     }
 
     #[test]

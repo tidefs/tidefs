@@ -633,7 +633,7 @@ impl VolumeGeometry {
         Ok(Self {
             capacity_bytes,
             block_size_bytes: DEFAULT_VOLUME_BLOCK_SIZE,
-            logical_sector_size: 512,
+            logical_sector_size: DEFAULT_VOLUME_BLOCK_SIZE,
             physical_sector_size: DEFAULT_VOLUME_BLOCK_SIZE,
             optimal_io_size: 128 * 1024,
             discard_granularity_bytes: DEFAULT_VOLUME_BLOCK_SIZE,
@@ -1340,7 +1340,7 @@ fn validate_volume_geometry(geometry: VolumeGeometry) -> Result<()> {
     if geometry.capacity_bytes == 0
         || geometry.block_size_bytes != DEFAULT_VOLUME_BLOCK_SIZE
         || geometry.capacity_bytes % u64::from(geometry.block_size_bytes) != 0
-        || geometry.logical_sector_size == 0
+        || geometry.logical_sector_size != geometry.block_size_bytes
         || geometry.physical_sector_size < geometry.logical_sector_size
         || geometry.discard_granularity_bytes == 0
     {

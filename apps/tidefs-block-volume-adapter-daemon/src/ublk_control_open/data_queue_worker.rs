@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use tidefs_block_volume_adapter_core::{
-    BlockRangeRecord, BlockVolumeCompletionClass, BlockVolumeFileImage, BlockVolumeGeometryRecord,
-    BlockVolumeRequestClass,
+    BlockRangeRecord, BlockVolumeCompletionClass, BlockVolumeFileImage, BlockVolumeRequestClass,
 };
 
-use crate::storage_backend::{BackendError, BlockVolumeStorageBackend};
+use crate::storage_backend::{BackendError, BlockDeviceGeometry, BlockVolumeStorageBackend};
 use tidefs_ublk_abi::{
     UblkSrvIoCmd, UblkSrvIoDesc, UBLK_IO_F_FAILFAST_DEV, UBLK_IO_F_FAILFAST_DRIVER,
     UBLK_IO_F_FAILFAST_TRANSPORT, UBLK_IO_F_FUA, UBLK_IO_F_META, UBLK_IO_F_NEED_REG_BUF,
@@ -77,7 +76,7 @@ pub struct DataQueueWorker {
     pub error_ops: u64,
     pub unsupported_ops: u64,
     pub barrier_audit: BarrierAuditLog,
-    geometry: BlockVolumeGeometryRecord,
+    geometry: BlockDeviceGeometry,
     max_queue_depth: Option<usize>,
 }
 
@@ -119,7 +118,7 @@ impl DataQueueWorker {
         | UBLK_IO_F_SWAP;
 
     #[must_use]
-    pub fn new(queue_id: u16, geometry: BlockVolumeGeometryRecord) -> Self {
+    pub fn new(queue_id: u16, geometry: impl Into<BlockDeviceGeometry>) -> Self {
         Self {
             queue_id,
             bytes_read: 0,
@@ -133,7 +132,7 @@ impl DataQueueWorker {
             error_ops: 0,
             unsupported_ops: 0,
             barrier_audit: BarrierAuditLog::new(),
-            geometry,
+            geometry: geometry.into(),
             max_queue_depth: None,
         }
     }
@@ -592,6 +591,10 @@ impl DataQueueWorker {
                 self.error_ops += 1;
                 Err(DataQueueWorkerError::BackingStoreError(-libc::ENOSPC))
             }
+            Err(BackendError::ReadOnly) => {
+                self.error_ops += 1;
+                Err(DataQueueWorkerError::ReadOnlyVolume)
+            }
             Err(_) => {
                 self.error_ops += 1;
                 Err(DataQueueWorkerError::OutOfRange)
@@ -642,6 +645,7 @@ impl DataQueueWorker {
                     let errno = match error {
                         BackendError::Io(io) => -io.raw_os_error().unwrap_or(libc::EIO),
                         BackendError::NoSpace => -libc::ENOSPC,
+                        BackendError::ReadOnly => -libc::EROFS,
                         _ => -libc::EIO,
                     };
                     Err(DataQueueWorkerError::BackingStoreError(errno))
@@ -692,6 +696,7 @@ impl DataQueueWorker {
                             .record(BarrierType::FuaWrite, BarrierResult::Failed);
                         let errno = match e {
                             BackendError::Io(io) => -io.raw_os_error().unwrap_or(libc::EIO),
+                            BackendError::ReadOnly => -libc::EROFS,
                             _ => -libc::EIO,
                         };
                         return Err(DataQueueWorkerError::BackingStoreError(errno));
@@ -727,6 +732,10 @@ impl DataQueueWorker {
             Err(BackendError::NoSpace) => {
                 self.error_ops += 1;
                 Err(DataQueueWorkerError::BackingStoreError(-libc::ENOSPC))
+            }
+            Err(BackendError::ReadOnly) => {
+                self.error_ops += 1;
+                Err(DataQueueWorkerError::ReadOnlyVolume)
             }
             Err(_) => {
                 self.error_ops += 1;
@@ -787,6 +796,12 @@ impl DataQueueWorker {
                 self.barrier_audit
                     .record(BarrierType::Flush, BarrierResult::Failed);
                 Err(DataQueueWorkerError::BackingStoreError(-libc::ENOSPC))
+            }
+            Err(BackendError::ReadOnly) => {
+                self.error_ops += 1;
+                self.barrier_audit
+                    .record(BarrierType::Flush, BarrierResult::Failed);
+                Err(DataQueueWorkerError::ReadOnlyVolume)
             }
             Err(_) => {
                 self.error_ops += 1;
@@ -915,7 +930,6 @@ impl DataQueueWorker {
         &self,
         desc: &UblkSrvIoDesc,
     ) -> Result<BlockRangeRecord, DataQueueWorkerError> {
-        // Round to block-aligned range, accepting unaligned sector requests.
         let sectors_per_block = self.geometry.block_size_bytes / LINUX_SECTOR_SIZE_BYTES;
         if sectors_per_block == 0 {
             return Err(DataQueueWorkerError::BlockSizeBelowLinuxSector);
@@ -927,9 +941,12 @@ impl DataQueueWorker {
         if sector_count == 0 {
             return Err(DataQueueWorkerError::ZeroLengthDataOperation);
         }
+        if start_sector % sectors_per_block != 0 || sector_count % sectors_per_block != 0 {
+            return Err(DataQueueWorkerError::SectorRangeNotBlockAligned);
+        }
         let start_block = start_sector / sectors_per_block;
         let end_sector = start_sector + sector_count;
-        let end_block = end_sector.div_ceil(sectors_per_block);
+        let end_block = end_sector / sectors_per_block;
         let block_count = end_block
             .checked_sub(start_block)
             .ok_or(DataQueueWorkerError::RangeOverflow)?;
@@ -1155,8 +1172,8 @@ mod tests {
             Err(crate::storage_backend::BackendError::Io(self.raw_error()))
         }
 
-        fn geometry(&self) -> BlockVolumeGeometryRecord {
-            self.geometry
+        fn geometry(&self) -> BlockDeviceGeometry {
+            self.geometry.into()
         }
     }
 
@@ -1211,6 +1228,23 @@ mod tests {
         );
         assert_eq!(worker.unsupported_ops, 1);
         assert_eq!(worker.error_ops, 1);
+    }
+
+    #[test]
+    fn worker_refuses_sub_block_sector_ranges() {
+        let geometry = test_geometry();
+        let (_dir, mut image) = test_image();
+        let mut worker = DataQueueWorker::new(0, geometry);
+        let result = worker.process_one(
+            &mut image,
+            0,
+            &io_desc(UBLK_IO_OP_READ, 0, 1, 1, DEMO_BUFFER_ADDR),
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            DataQueueWorkerError::SectorRangeNotBlockAligned
+        );
     }
 
     #[test]
@@ -1311,27 +1345,21 @@ mod tests {
     }
 
     #[test]
-    fn worker_read_rounds_misaligned_range_to_block_boundary() {
+    fn worker_read_refuses_misaligned_range() {
         let geometry = test_geometry();
         let (_dir, mut image) = test_image();
         let mut worker = DataQueueWorker::new(0, geometry);
-        // Sector 1 count 8 (crosses block boundary): now rounds to block-aligned range.
+        // Sector 1 count 8 crosses a 4 KiB block boundary and cannot be
+        // represented as one atomic Pool-volume operation.
         let result = worker.process_one(
             &mut image,
             0,
             &io_desc(UBLK_IO_OP_READ, 0, 1, 8, DEMO_BUFFER_ADDR),
         );
-        assert!(
-            result.is_ok(),
-            "misaligned range rounded to block boundary, got {:?}",
-            result.err()
-        );
-        let entry = result.unwrap();
         assert_eq!(
-            entry.completion_class,
-            BlockVolumeCompletionClass::Completed
+            result.unwrap_err(),
+            DataQueueWorkerError::SectorRangeNotBlockAligned
         );
-        assert!(entry.byte_count > 0);
     }
 
     #[test]

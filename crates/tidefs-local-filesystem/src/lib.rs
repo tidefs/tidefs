@@ -2889,6 +2889,49 @@ impl LocalFileSystem {
         result.map_err(FileSystemError::from)
     }
 
+    /// Open one committed named volume while this filesystem remains the
+    /// neutral owner of the underlying Pool runtime.
+    pub fn open_volume_dataset(&self, path: &str) -> Result<tidefs_pool_runtime::PoolVolume> {
+        Ok(self.store.open_volume(path)?)
+    }
+
+    /// Read committed or handle-private blocks through the mounted Pool owner.
+    pub fn read_volume_blocks(
+        &self,
+        volume: &tidefs_pool_runtime::PoolVolume,
+        start_block: u64,
+        block_count: u64,
+    ) -> Result<Vec<u8>> {
+        Ok(volume.read_blocks(&self.store, start_block, block_count)?)
+    }
+
+    /// Stage whole-block writes through the mounted Pool owner.
+    pub fn write_volume_blocks(
+        &self,
+        volume: &mut tidefs_pool_runtime::PoolVolume,
+        start_block: u64,
+        payload: &[u8],
+    ) -> Result<()> {
+        Ok(volume.write_blocks(&self.store, start_block, payload)?)
+    }
+
+    /// Stage discard/write-zeroes through the mounted Pool owner.
+    pub fn zero_volume_blocks(
+        &self,
+        volume: &mut tidefs_pool_runtime::PoolVolume,
+        start_block: u64,
+        block_count: u64,
+    ) -> Result<()> {
+        Ok(volume.zero_blocks(&self.store, start_block, block_count)?)
+    }
+
+    /// Publish a volume's dirty copy-on-write map through the same canonical
+    /// Pool root used by mounted filesystem durability.
+    pub fn flush_volume(&mut self, volume: &mut tidefs_pool_runtime::PoolVolume) -> Result<()> {
+        self.ensure_mutation_allowed("flush Pool volume")?;
+        Ok(volume.flush(&mut self.store)?)
+    }
+
     /// Get a shared reference to the durable pool properties.
     #[must_use]
     pub fn pool_properties(&self) -> &PropertySet {

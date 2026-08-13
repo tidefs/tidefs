@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! VfsEngine trait implementation wrapping LocalFileSystem.
 //!
-//! Wraps `LocalFileSystem` in a `RefCell` to provide interior mutability,
-//! matching the VfsEngine `&self` contract. Most namespace operations map to
+//! Wraps `LocalFileSystem` in a shared mutex to provide interior mutability,
+//! matching the VfsEngine `&self` contract while allowing other front ends to
+//! take the same Pool owner for bounded operations. Most namespace operations map to
 //! existing LocalFileSystem path-based methods using a lazy inode-to-path
 //! resolution layer; hot inode-native operations such as xattrs avoid that
 //! path reconstruction.
@@ -10,7 +11,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{json, Value};
 #[cfg(feature = "replication-io")]
@@ -150,8 +151,39 @@ fn map_errno(err: &FileSystemError) -> Errno {
 /// Maintains a lazy inode→path cache that bridges the VfsEngine inode
 /// space to LocalFileSystem path space.  The cache is populated by a
 /// single tree walk from root on first miss and invalidated as needed.
+#[derive(Clone)]
+pub struct SharedLocalFileSystem(Arc<Mutex<LocalFileSystem>>);
+
+impl SharedLocalFileSystem {
+    #[must_use]
+    pub fn new(fs: LocalFileSystem) -> Self {
+        Self(Arc::new(Mutex::new(fs)))
+    }
+
+    #[must_use]
+    pub fn borrow(&self) -> MutexGuard<'_, LocalFileSystem> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[must_use]
+    pub fn borrow_mut(&self) -> MutexGuard<'_, LocalFileSystem> {
+        self.borrow()
+    }
+
+    pub fn into_inner(self) -> LocalFileSystem {
+        match Arc::try_unwrap(self.0) {
+            Ok(filesystem) => filesystem
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Err(_) => panic!("VFS filesystem owner still shared"),
+        }
+    }
+}
+
 pub struct VfsLocalFileSystem {
-    fs: RefCell<LocalFileSystem>,
+    fs: SharedLocalFileSystem,
     read_only: bool,
     path_cache: RefCell<BTreeMap<InodeId, String>>,
     file_handle_table: RefCell<FileHandleTable>,
@@ -178,7 +210,7 @@ impl VfsLocalFileSystem {
         let mut path_cache = BTreeMap::new();
         path_cache.insert(ROOT_INODE_ID, "/".to_string());
         Self {
-            fs: RefCell::new(fs),
+            fs: SharedLocalFileSystem::new(fs),
             read_only: false,
             path_cache: RefCell::new(path_cache),
             file_handle_table: RefCell::new(FileHandleTable::new()),
@@ -259,6 +291,13 @@ impl VfsLocalFileSystem {
     /// Consume the adapter and return the inner `LocalFileSystem`.
     pub fn into_inner(self) -> LocalFileSystem {
         self.fs.into_inner()
+    }
+
+    /// Share the one mounted Pool/filesystem owner with another in-process
+    /// front end. Callers must hold the mutex only for one bounded operation.
+    #[must_use]
+    pub fn shared_filesystem(&self) -> SharedLocalFileSystem {
+        self.fs.clone()
     }
 
     /// Set the mount-level atime policy for automatic timestamp updates.
@@ -1299,8 +1338,7 @@ impl VfsLocalFileSystem {
             | LivePoolAdminCommand::SnapshotSend
             | LivePoolAdminCommand::PerformanceAdmissionSnapshot
             | LivePoolAdminCommand::DeviceRemove
-            | LivePoolAdminCommand::BlockAttach
-            | LivePoolAdminCommand::BlockReceive => true,
+            | LivePoolAdminCommand::BlockAttach => true,
             LivePoolAdminCommand::DatasetSetStrategy => !matches!(
                 request.args.0.get("list"),
                 Some(LivePoolAdminArg::Bool(true))
@@ -1313,8 +1351,7 @@ impl VfsLocalFileSystem {
             | LivePoolAdminCommand::DatasetGet
             | LivePoolAdminCommand::DatasetListProps
             | LivePoolAdminCommand::SnapshotList
-            | LivePoolAdminCommand::DeviceStatus
-            | LivePoolAdminCommand::BlockSend => false,
+            | LivePoolAdminCommand::DeviceStatus => false,
         }
     }
 

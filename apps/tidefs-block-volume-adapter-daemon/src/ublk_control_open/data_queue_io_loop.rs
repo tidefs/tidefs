@@ -286,6 +286,7 @@ fn run_ublk_data_queue_io_loop_impl(
                             geometry,
                             nr_hw_queues,
                             queue_depth,
+                            backend.is_read_only(),
                         ) {
                             set_params_block_size_bytes =
                                 u64::try_from(geometry.block_size_bytes).ok();
@@ -992,14 +993,18 @@ fn run_ublk_data_queue_io_loop_impl(
                                                         eprintln!("tidefs ublk-serve: shutdown phase: drain complete ({drain_iterations} iterations, {drain_cqes_processed} CQEs processed, in-flight counter verified zero)");
                                                     }
 
-                                                    eprintln!("tidefs ublk-serve: shutdown phase: issuing final backend flush");
-                                                    match backend.flush() {
-                                                        Ok(()) => {
-                                                            final_flush_completed = true;
-                                                            eprintln!("tidefs ublk-serve: shutdown phase: backend flush complete");
-                                                        }
-                                                        Err(e) => {
-                                                            eprintln!("tidefs ublk-serve: shutdown phase: final flush failed ({e})");
+                                                    if backend.is_read_only() {
+                                                        eprintln!("tidefs ublk-serve: shutdown phase: read-only backend has no dirty data to flush");
+                                                    } else {
+                                                        eprintln!("tidefs ublk-serve: shutdown phase: issuing final backend flush");
+                                                        match backend.flush() {
+                                                            Ok(()) => {
+                                                                final_flush_completed = true;
+                                                                eprintln!("tidefs ublk-serve: shutdown phase: backend flush complete");
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("tidefs ublk-serve: shutdown phase: final flush failed ({e})");
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1334,6 +1339,18 @@ mod tests {
         // On hosts without /dev/ublk-control this returns Err; on real
         // ublk hosts it returns Ok. Either is acceptable.
         let _ = dir.close();
+    }
+
+    #[test]
+    fn read_only_backend_sets_kernel_device_attribute() {
+        let geometry = test_geometry();
+        let report = build_ublk_parameter_spec_report_with_geometry(geometry, 1, 16, true)
+            .expect("build read-only ublk parameters");
+
+        assert_ne!(
+            report.params.basic.attrs & tidefs_ublk_abi::UBLK_ATTR_READ_ONLY,
+            0
+        );
     }
 
     /// Verify that a non-shutdown I/O loop (bounded iteration) correctly

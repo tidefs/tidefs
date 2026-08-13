@@ -1,10 +1,76 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-use std::{collections::BTreeSet, fmt};
+use std::fmt;
 
 use tidefs_block_volume_adapter_core::{
     BlockRangeRecord, BlockVolumeCompletionClass, BlockVolumeFileImage, BlockVolumeFileImageError,
     BlockVolumeGeometryRecord,
 };
+
+/// Geometry consumed by the Linux block carrier.
+///
+/// Dataset identity deliberately does not cross this boundary. The durable
+/// Pool engine owns the canonical 128-bit `DatasetId`; ublk needs only the
+/// exact committed capacity and topology used to project a block device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockDeviceGeometry {
+    pub block_size_bytes: usize,
+    pub block_count: usize,
+    pub discard_granularity_blocks: usize,
+    pub logical_sector_size: u64,
+    pub physical_sector_size: u64,
+    pub optimal_io_size: u64,
+    pub alignment_offset: u64,
+    pub min_io_size: u64,
+}
+
+impl BlockDeviceGeometry {
+    #[must_use]
+    pub const fn capacity_bytes(self) -> Option<usize> {
+        self.block_size_bytes.checked_mul(self.block_count)
+    }
+
+    #[must_use]
+    pub const fn admits_discard(self) -> bool {
+        self.discard_granularity_blocks > 0
+    }
+
+    pub fn from_pool(geometry: tidefs_pool_runtime::VolumeGeometry) -> Result<Self, BackendError> {
+        let block_size_bytes = usize::try_from(geometry.block_size_bytes)
+            .map_err(|_| BackendError::Other("volume block size exceeds host usize".into()))?;
+        let block_count = usize::try_from(geometry.block_count())
+            .map_err(|_| BackendError::Other("volume block count exceeds host usize".into()))?;
+        let discard_granularity_blocks =
+            usize::try_from(geometry.discard_granularity_bytes / geometry.block_size_bytes)
+                .map_err(|_| {
+                    BackendError::Other("discard granularity exceeds host usize".into())
+                })?;
+        Ok(Self {
+            block_size_bytes,
+            block_count,
+            discard_granularity_blocks,
+            logical_sector_size: u64::from(geometry.logical_sector_size),
+            physical_sector_size: u64::from(geometry.physical_sector_size),
+            optimal_io_size: u64::from(geometry.optimal_io_size),
+            alignment_offset: 0,
+            min_io_size: u64::from(geometry.block_size_bytes),
+        })
+    }
+}
+
+impl From<BlockVolumeGeometryRecord> for BlockDeviceGeometry {
+    fn from(geometry: BlockVolumeGeometryRecord) -> Self {
+        Self {
+            block_size_bytes: geometry.block_size_bytes,
+            block_count: geometry.block_count,
+            discard_granularity_blocks: geometry.discard_granularity_blocks,
+            logical_sector_size: geometry.logical_sector_size,
+            physical_sector_size: geometry.physical_sector_size,
+            optimal_io_size: geometry.optimal_io_size,
+            alignment_offset: geometry.alignment_offset,
+            min_io_size: geometry.min_io_size,
+        }
+    }
+}
 
 /// Result of a backend read operation.
 #[derive(Debug)]
@@ -29,6 +95,7 @@ pub enum BackendError {
     BackingStoreUnavailable,
     PayloadTooShort,
     NoSpace,
+    ReadOnly,
     Other(String),
 }
 
@@ -41,6 +108,7 @@ impl fmt::Display for BackendError {
             Self::BackingStoreUnavailable => write!(f, "backing store unavailable"),
             Self::PayloadTooShort => write!(f, "payload too short"),
             Self::NoSpace => write!(f, "no space left on device"),
+            Self::ReadOnly => write!(f, "read-only block volume"),
             Self::Other(msg) => write!(f, "{msg}"),
         }
     }
@@ -93,7 +161,7 @@ pub trait BlockVolumeStorageBackend {
     ) -> Result<(), BackendError>;
 
     /// Return the block volume geometry.
-    fn geometry(&self) -> tidefs_block_volume_adapter_core::BlockVolumeGeometryRecord;
+    fn geometry(&self) -> BlockDeviceGeometry;
 
     /// Whether this backend is read-only (default: false).
     /// When true, write/flush/discard/write-zeroes are rejected with EROFS.
@@ -121,7 +189,7 @@ pub trait BlockVolumeStorageBackend {
     }
 
     /// Return the txg committed-root pointer from the last barrier flush,
-    /// if the backend tracks it (object-store backends).
+    /// if the backend tracks it.
     ///
     /// Returns `None` for file-image backends or before any flush.
     fn last_committed_root(&self) -> Option<u64> {
@@ -203,8 +271,8 @@ impl BlockVolumeStorageBackend for BlockVolumeFileImage {
         Ok(())
     }
 
-    fn geometry(&self) -> tidefs_block_volume_adapter_core::BlockVolumeGeometryRecord {
-        self.geometry
+    fn geometry(&self) -> BlockDeviceGeometry {
+        self.geometry.into()
     }
 
     fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
@@ -224,352 +292,105 @@ impl BlockVolumeStorageBackend for BlockVolumeFileImage {
     }
 }
 
-// ── LocalObjectStore backend ──────────────────────────────────────────
-
-use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreError};
-
-/// A block-volume storage backend backed by a `LocalObjectStore`.
-///
-/// Each block range is stored as a named object with a key derived
-/// from the block offset, e.g. `b:0000000000000042` for block 42.
-pub struct BlockVolumeObjectStoreBackend {
-    store: LocalObjectStore,
-    geometry: tidefs_block_volume_adapter_core::BlockVolumeGeometryRecord,
-    written_blocks: BTreeSet<usize>,
-    written_index_dirty: bool,
-    /// Committed root of the snapshot backing this read-only export,
-    /// set when opened via `open_snapshot_read_only`.
-    pub snapshot_committed_root: Option<tidefs_commit_group::RootPointer>,
+enum PoolVolumeOwner {
+    Standalone(tidefs_pool_runtime::PoolRuntime),
+    Mounted(tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem),
 }
 
-impl BlockVolumeObjectStoreBackend {
-    const WRITTEN_BLOCK_INDEX_NAME: &'static [u8] = b"__tidefs_block_volume_written_blocks_v1";
-    const WRITTEN_BLOCK_INDEX_MAGIC: &'static [u8; 8] = b"VBBI0001";
+/// Real named-volume backend over the canonical Pool runtime.
+///
+/// Standalone exports own the runtime directly. A mounted export shares the
+/// already-open filesystem/Pool owner and locks it only for one backend call;
+/// the ublk service loop never holds the FUSE engine mutex for its lifetime.
+pub struct PoolVolumeBackend {
+    owner: PoolVolumeOwner,
+    volume: tidefs_pool_runtime::PoolVolume,
+    geometry: BlockDeviceGeometry,
+    read_only: bool,
+}
 
-    /// Open a `LocalObjectStore` at `root` and wrap it as a block backend.
-    pub fn open(
-        root: impl AsRef<std::path::Path>,
-        geometry: tidefs_block_volume_adapter_core::BlockVolumeGeometryRecord,
+impl PoolVolumeBackend {
+    pub fn open_standalone(
+        runtime: tidefs_pool_runtime::PoolRuntime,
+        path: &str,
+        read_only: bool,
     ) -> Result<Self, BackendError> {
-        let store = LocalObjectStore::open(root)
-            .map_err(|e| BackendError::Other(format!("open object store: {e}")))?;
-        let (written_blocks, written_index_dirty) =
-            Self::load_written_block_index(&store, geometry)?;
+        let volume = runtime.open_volume(path).map_err(map_pool_runtime_error)?;
+        let geometry = BlockDeviceGeometry::from_pool(volume.geometry())?;
         Ok(Self {
-            store,
+            owner: PoolVolumeOwner::Standalone(runtime),
+            volume,
             geometry,
-            written_blocks,
-            written_index_dirty,
-            snapshot_committed_root: None,
+            read_only,
         })
     }
 
-    /// Open a read-only `LocalObjectStore` at `root` for snapshot-backed ublk export.
-    pub fn open_read_only(
-        root: impl AsRef<std::path::Path>,
-        geometry: tidefs_block_volume_adapter_core::BlockVolumeGeometryRecord,
+    pub fn open_mounted(
+        owner: tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem,
+        path: &str,
+        read_only: bool,
     ) -> Result<Self, BackendError> {
-        let store = LocalObjectStore::open_read_only_with_options(
-            root,
-            tidefs_local_object_store::StoreOptions::default(),
-        )
-        .map_err(|e| BackendError::Other(format!("open object store read-only: {e}")))?
-        .ok_or_else(|| BackendError::Other("object store does not exist".into()))?;
-        let (written_blocks, _written_index_dirty) =
-            Self::load_written_block_index(&store, geometry)?;
+        let volume = owner
+            .borrow()
+            .open_volume_dataset(path)
+            .map_err(map_filesystem_error)?;
+        let geometry = BlockDeviceGeometry::from_pool(volume.geometry())?;
         Ok(Self {
-            store,
+            owner: PoolVolumeOwner::Mounted(owner),
+            volume,
             geometry,
-            written_blocks,
-            written_index_dirty: false,
-            snapshot_committed_root: None,
+            read_only,
         })
     }
 
-    /// Open a read-only object store anchored to a named snapshot.
-    ///
-    /// Validates that `snapshot_name` exists in the store's snapshot catalog
-    /// and captures its committed root for traceability. Reads are served from
-    /// the store's in-memory index (stable because the store is read-only).
-    /// True per-object anchored reading requires per-object commit_group
-    /// tracking in the LocalObjectStore index (future work).
-    pub fn open_snapshot_read_only(
-        root: impl AsRef<std::path::Path>,
-        geometry: tidefs_block_volume_adapter_core::BlockVolumeGeometryRecord,
-        snapshot_name: &str,
-    ) -> Result<Self, BackendError> {
-        let store = LocalObjectStore::open_read_only_with_options(
-            root.as_ref(),
-            tidefs_local_object_store::StoreOptions::default(),
-        )
-        .map_err(|e| BackendError::Other(format!("open object store read-only: {e}")))?
-        .ok_or_else(|| BackendError::Other("object store does not exist".into()))?;
-
-        // Validate snapshot exists and capture its committed root
-        let snapshots = store.list_snapshots("default");
-        let snapshot = snapshots
-            .iter()
-            .find(|s| s.name == snapshot_name)
-            .ok_or_else(|| {
-                BackendError::Other(format!(
-                    "snapshot '{}' not found in store catalog ({} snapshots available)",
-                    snapshot_name,
-                    snapshots.len()
-                ))
-            })?;
-
-        let committed_root = snapshot.committed_root;
-        let (written_blocks, _written_index_dirty) =
-            Self::load_written_block_index(&store, geometry)?;
-        Ok(Self {
-            store,
-            geometry,
-            written_blocks,
-            written_index_dirty: false,
-            snapshot_committed_root: Some(committed_root),
-        })
-    }
-
-    /// Return the block key name for a given block number.
-    fn block_key(block: usize) -> [u8; 18] {
-        let mut key = [0u8; 18];
-        key[0] = b'b';
-        key[1] = b':';
-        // 16 hex digits for the block number
-        let hex = format!("{block:016x}");
-        key[2..].copy_from_slice(hex.as_bytes());
-        key
-    }
-
-    fn load_written_block_index(
-        store: &LocalObjectStore,
-        geometry: tidefs_block_volume_adapter_core::BlockVolumeGeometryRecord,
-    ) -> Result<(BTreeSet<usize>, bool), BackendError> {
-        match store
-            .get_named(Self::WRITTEN_BLOCK_INDEX_NAME)
-            .map_err(|e| BackendError::Other(format!("read block-volume written index: {e}")))?
-        {
-            Some(payload) => {
-                Self::decode_written_block_index(&payload, geometry).map(|blocks| (blocks, false))
-            }
-            None => {
-                let block_payloads = Self::scan_block_payload_keys(store, geometry);
-                if !block_payloads.is_empty() {
-                    return Err(BackendError::Other(format!(
-                        "block-volume object store is missing current written index but contains {} block payload object(s); refusing pre-index block data",
-                        block_payloads.len()
-                    )));
-                }
-                Ok((BTreeSet::new(), !store.is_read_only()))
-            }
-        }
-    }
-
-    fn scan_block_payload_keys(
-        store: &LocalObjectStore,
-        geometry: tidefs_block_volume_adapter_core::BlockVolumeGeometryRecord,
-    ) -> BTreeSet<usize> {
-        let live_keys: BTreeSet<ObjectKey> = store.list_keys().into_iter().collect();
-        let mut written_blocks = BTreeSet::new();
-        for block in 0..geometry.block_count {
-            if live_keys.contains(&ObjectKey::from_name(Self::block_key(block))) {
-                written_blocks.insert(block);
-            }
-        }
-        written_blocks
-    }
-
-    fn decode_written_block_index(
-        payload: &[u8],
-        geometry: tidefs_block_volume_adapter_core::BlockVolumeGeometryRecord,
-    ) -> Result<BTreeSet<usize>, BackendError> {
-        let header_len = Self::WRITTEN_BLOCK_INDEX_MAGIC.len() + 8 + 8 + 8;
-        if payload.len() < header_len {
-            return Err(BackendError::Other(
-                "block-volume written index is truncated".into(),
-            ));
-        }
-        if &payload[..Self::WRITTEN_BLOCK_INDEX_MAGIC.len()] != Self::WRITTEN_BLOCK_INDEX_MAGIC {
-            return Err(BackendError::Other(
-                "block-volume written index has bad magic".into(),
-            ));
-        }
-
-        let mut cursor = Self::WRITTEN_BLOCK_INDEX_MAGIC.len();
-        let stored_block_size = read_le_u64(payload, &mut cursor)?;
-        let stored_block_count = read_le_u64(payload, &mut cursor)?;
-        let entry_count = read_le_u64(payload, &mut cursor)? as usize;
-        let expected_len = header_len
-            .checked_add(entry_count.checked_mul(8).ok_or_else(|| {
-                BackendError::Other("block-volume written index entry count overflows".into())
-            })?)
-            .ok_or_else(|| {
-                BackendError::Other("block-volume written index length overflows".into())
-            })?;
-        if payload.len() != expected_len {
-            return Err(BackendError::Other(
-                "block-volume written index length does not match entry count".into(),
-            ));
-        }
-        if stored_block_size != geometry.block_size_bytes as u64 {
-            return Err(BackendError::Other(format!(
-                "block-volume written index block size mismatch: stored {stored_block_size}, geometry {}",
-                geometry.block_size_bytes
-            )));
-        }
-        if stored_block_count != geometry.block_count as u64 {
-            return Err(BackendError::Other(format!(
-                "block-volume written index block count mismatch: stored {stored_block_count}, geometry {}",
-                geometry.block_count
-            )));
-        }
-
-        let mut written_blocks = BTreeSet::new();
-        for _ in 0..entry_count {
-            let block = read_le_u64(payload, &mut cursor)?;
-            if block >= geometry.block_count as u64 {
-                return Err(BackendError::Other(format!(
-                    "block-volume written index contains out-of-range block {block}"
-                )));
-            }
-            let block = usize::try_from(block).map_err(|_| {
-                BackendError::Other("block-volume written index block does not fit usize".into())
-            })?;
-            written_blocks.insert(block);
-        }
-        Ok(written_blocks)
-    }
-
-    fn encode_written_block_index(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(
-            Self::WRITTEN_BLOCK_INDEX_MAGIC.len() + 24 + self.written_blocks.len() * 8,
-        );
-        payload.extend_from_slice(Self::WRITTEN_BLOCK_INDEX_MAGIC);
-        payload.extend_from_slice(&(self.geometry.block_size_bytes as u64).to_le_bytes());
-        payload.extend_from_slice(&(self.geometry.block_count as u64).to_le_bytes());
-        payload.extend_from_slice(&(self.written_blocks.len() as u64).to_le_bytes());
-        for block in &self.written_blocks {
-            payload.extend_from_slice(&(*block as u64).to_le_bytes());
-        }
-        payload
-    }
-
-    fn persist_written_block_index_if_dirty(&mut self) -> Result<(), BackendError> {
-        if !self.written_index_dirty {
-            return Ok(());
-        }
-        let payload = self.encode_written_block_index();
-        self.store
-            .put_named(Self::WRITTEN_BLOCK_INDEX_NAME, &payload)
-            .map_err(|e| match e {
-                StoreError::NoSpace => BackendError::NoSpace,
-                other => {
-                    BackendError::Other(format!("persist block-volume written index: {other}"))
-                }
-            })?;
-        self.written_index_dirty = false;
-        Ok(())
-    }
-
-    fn written_blocks_in_range(
-        &self,
-        start_block: usize,
-        block_count: usize,
-    ) -> Result<Vec<usize>, BackendError> {
-        let end_block = start_block
-            .checked_add(block_count)
-            .ok_or(BackendError::OutOfBounds)?;
-        Ok(self
-            .written_blocks
-            .range(start_block..end_block)
-            .copied()
-            .collect())
-    }
-
-    fn delete_written_blocks_in_range(
+    fn zero_blocks(
         &mut self,
         start_block: usize,
         block_count: usize,
+        block_size_bytes: usize,
     ) -> Result<(), BackendError> {
-        let blocks = self.written_blocks_in_range(start_block, block_count)?;
-        for block in &blocks {
-            let key = Self::block_key(*block);
-            self.store.delete_named(key).map_err(|e| {
-                BackendError::Other(format!("delete zero-visible block {block}: {e}"))
-            })?;
-            self.written_blocks.remove(block);
+        if self.read_only {
+            return Err(BackendError::ReadOnly);
         }
-        if !blocks.is_empty() {
-            self.written_index_dirty = true;
+        if block_size_bytes != self.geometry.block_size_bytes {
+            return Err(BackendError::MisalignedRange);
         }
-        Ok(())
+        let start_block = u64::try_from(start_block).map_err(|_| BackendError::OutOfBounds)?;
+        let block_count = u64::try_from(block_count).map_err(|_| BackendError::OutOfBounds)?;
+        match (&mut self.owner, &mut self.volume) {
+            (PoolVolumeOwner::Standalone(runtime), volume) => volume
+                .zero_blocks(runtime, start_block, block_count)
+                .map_err(map_pool_runtime_error),
+            (PoolVolumeOwner::Mounted(owner), volume) => owner
+                .borrow()
+                .zero_volume_blocks(volume, start_block, block_count)
+                .map_err(map_filesystem_error),
+        }
     }
 }
 
-fn read_le_u64(payload: &[u8], cursor: &mut usize) -> Result<u64, BackendError> {
-    let end = cursor
-        .checked_add(8)
-        .ok_or_else(|| BackendError::Other("block-volume index cursor overflow".into()))?;
-    let bytes = payload
-        .get(*cursor..end)
-        .ok_or_else(|| BackendError::Other("block-volume written index is truncated".into()))?;
-    *cursor = end;
-    Ok(u64::from_le_bytes(
-        bytes.try_into().expect("u64 slice length"),
-    ))
-}
-
-impl BlockVolumeStorageBackend for BlockVolumeObjectStoreBackend {
-    fn geometry(&self) -> tidefs_block_volume_adapter_core::BlockVolumeGeometryRecord {
-        self.geometry
-    }
-
-    fn is_read_only(&self) -> bool {
-        self.store.is_read_only()
-    }
-
+impl BlockVolumeStorageBackend for PoolVolumeBackend {
     fn read_blocks(
         &self,
         start_block: usize,
         block_count: usize,
         block_size_bytes: usize,
     ) -> Result<BackendReadResult, BackendError> {
-        if block_count == 0 {
-            return Ok(BackendReadResult {
-                completion_class: BlockVolumeCompletionClass::Completed,
-                payload: Some(Vec::new()),
-            });
+        if block_size_bytes != self.geometry.block_size_bytes {
+            return Err(BackendError::MisalignedRange);
         }
-        let mut payload = Vec::with_capacity(block_count * block_size_bytes);
-        for i in 0..block_count {
-            let key = Self::block_key(start_block + i);
-            let read_result = if let Some(root) = self.snapshot_committed_root {
-                self.store
-                    .get_at_commit_group(tidefs_local_object_store::ObjectKey::from_name(key), root)
-                    .map_err(|e| {
-                        BackendError::Other(format!("read block at root {start_block}+{i}: {e}"))
-                    })?
-            } else {
-                self.store.get_named(key).map_err(|e| {
-                    BackendError::Other(format!("read block {start_block}+{i}: {e}"))
-                })?
-            };
-            match read_result {
-                Some(data) => {
-                    if data.len() != block_size_bytes {
-                        return Ok(BackendReadResult {
-                            completion_class: BlockVolumeCompletionClass::RefusedMisalignedRange,
-                            payload: None,
-                        });
-                    }
-                    payload.extend_from_slice(&data);
-                }
-                None => {
-                    // Unwritten blocks read as zeroes
-                    payload.extend(std::iter::repeat_n(0u8, block_size_bytes));
-                }
-            }
-        }
+        let start_block = u64::try_from(start_block).map_err(|_| BackendError::OutOfBounds)?;
+        let block_count = u64::try_from(block_count).map_err(|_| BackendError::OutOfBounds)?;
+        let payload = match &self.owner {
+            PoolVolumeOwner::Standalone(runtime) => self
+                .volume
+                .read_blocks(runtime, start_block, block_count)
+                .map_err(map_pool_runtime_error)?,
+            PoolVolumeOwner::Mounted(owner) => owner
+                .borrow()
+                .read_volume_blocks(&self.volume, start_block, block_count)
+                .map_err(map_filesystem_error)?,
+        };
         Ok(BackendReadResult {
             completion_class: BlockVolumeCompletionClass::Completed,
             payload: Some(payload),
@@ -582,22 +403,23 @@ impl BlockVolumeStorageBackend for BlockVolumeObjectStoreBackend {
         payload: &[u8],
         block_size_bytes: usize,
     ) -> Result<BackendWriteResult, BackendError> {
-        if payload.len() % block_size_bytes != 0 {
-            return Ok(BackendWriteResult {
-                completion_class: BlockVolumeCompletionClass::RefusedMisalignedRange,
-            });
+        if self.read_only {
+            return Err(BackendError::ReadOnly);
         }
-        let block_count = payload.len() / block_size_bytes;
-        for i in 0..block_count {
-            let key = Self::block_key(start_block + i);
-            let chunk = &payload[i * block_size_bytes..(i + 1) * block_size_bytes];
-            self.store.put_named(key, chunk).map_err(|e| match e {
-                StoreError::NoSpace => BackendError::NoSpace,
-                other => BackendError::Other(format!("write block {start_block}+{i}: {other}")),
-            })?;
-            if self.written_blocks.insert(start_block + i) {
-                self.written_index_dirty = true;
-            }
+        if block_size_bytes != self.geometry.block_size_bytes
+            || payload.len() % block_size_bytes != 0
+        {
+            return Err(BackendError::MisalignedRange);
+        }
+        let start_block = u64::try_from(start_block).map_err(|_| BackendError::OutOfBounds)?;
+        match (&mut self.owner, &mut self.volume) {
+            (PoolVolumeOwner::Standalone(runtime), volume) => volume
+                .write_blocks(runtime, start_block, payload)
+                .map_err(map_pool_runtime_error)?,
+            (PoolVolumeOwner::Mounted(owner), volume) => owner
+                .borrow()
+                .write_volume_blocks(volume, start_block, payload)
+                .map_err(map_filesystem_error)?,
         }
         Ok(BackendWriteResult {
             completion_class: BlockVolumeCompletionClass::Completed,
@@ -605,46 +427,64 @@ impl BlockVolumeStorageBackend for BlockVolumeObjectStoreBackend {
     }
 
     fn flush(&mut self) -> Result<(), BackendError> {
-        // Issue a durability barrier through the local-object-store's
-        // sync path, which flushes the segment file, writes a spacemap
-        // checkpoint, drains the intent-log to durable storage, commits
-        // the current commit_group, and persists the committed root.
-        self.persist_written_block_index_if_dirty()?;
-        self.store
-            .sync()
-            .map_err(|e| BackendError::Other(format!("object store sync failed: {e}")))
-    }
-
-    fn last_committed_root(&self) -> Option<u64> {
-        self.store.committed_root_u64()
+        if self.read_only {
+            return Err(BackendError::ReadOnly);
+        }
+        match (&mut self.owner, &mut self.volume) {
+            (PoolVolumeOwner::Standalone(runtime), volume) => {
+                volume.flush(runtime).map_err(map_pool_runtime_error)
+            }
+            (PoolVolumeOwner::Mounted(owner), volume) => owner
+                .borrow_mut()
+                .flush_volume(volume)
+                .map_err(map_filesystem_error),
+        }
     }
 
     fn discard_blocks(
         &mut self,
         start_block: usize,
         block_count: usize,
-        _block_size_bytes: usize,
+        block_size_bytes: usize,
     ) -> Result<(), BackendError> {
-        self.delete_written_blocks_in_range(start_block, block_count)
+        self.zero_blocks(start_block, block_count, block_size_bytes)
     }
 
     fn write_zeroes(
         &mut self,
         start_block: usize,
         block_count: usize,
-        _block_size_bytes: usize,
+        block_size_bytes: usize,
     ) -> Result<(), BackendError> {
-        self.delete_written_blocks_in_range(start_block, block_count)
+        self.zero_blocks(start_block, block_count, block_size_bytes)
     }
 
-    fn resize_to(&mut self, new_block_count: usize) -> Result<(), BackendError> {
-        // Only grow is supported; refuse shrink
-        if new_block_count <= self.geometry.block_count {
-            return Err(BackendError::Other("online shrink is not supported".into()));
+    fn geometry(&self) -> BlockDeviceGeometry {
+        self.geometry
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+}
+
+fn map_pool_runtime_error(error: tidefs_pool_runtime::PoolRuntimeError) -> BackendError {
+    match error {
+        tidefs_pool_runtime::PoolRuntimeError::Bounds => BackendError::OutOfBounds,
+        tidefs_pool_runtime::PoolRuntimeError::Store(
+            tidefs_local_object_store::StoreError::NoSpace,
+        ) => BackendError::NoSpace,
+        other => BackendError::Other(other.to_string()),
+    }
+}
+
+fn map_filesystem_error(error: tidefs_local_filesystem::FileSystemError) -> BackendError {
+    match error {
+        tidefs_local_filesystem::FileSystemError::NoSpace { .. } => BackendError::NoSpace,
+        tidefs_local_filesystem::FileSystemError::PoolRuntime(error) => {
+            map_pool_runtime_error(error)
         }
-        self.geometry.block_count = new_block_count;
-        self.written_index_dirty = true;
-        Ok(())
+        other => BackendError::Other(other.to_string()),
     }
 }
 
@@ -807,101 +647,6 @@ mod ublk_io_backend_tests {
         let image =
             BlockVolumeFileImage::create_zeroed(&path, geometry).expect("create test image");
         (dir, UblkIoFileImageBackend::new(image))
-    }
-
-    fn object_store_backend(
-        block_count: usize,
-    ) -> (tempfile::TempDir, BlockVolumeObjectStoreBackend) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let geometry =
-            BlockVolumeGeometryRecord::new(BlockVolumeId::new(401_200), 4096, block_count, 1);
-        let backend =
-            BlockVolumeObjectStoreBackend::open(dir.path(), geometry).expect("open object backend");
-        (dir, backend)
-    }
-
-    #[test]
-    fn object_store_full_range_discard_only_touches_written_blocks() {
-        let (_dir, mut backend) = object_store_backend(1_000_000);
-        backend
-            .write_blocks(2, &[0xAAu8; 4096], 4096)
-            .expect("write low block");
-        backend
-            .write_blocks(900_000, &[0xBBu8; 4096], 4096)
-            .expect("write high block");
-        assert_eq!(backend.written_blocks.len(), 2);
-
-        backend
-            .discard_blocks(0, 1_000_000, 4096)
-            .expect("full range discard");
-
-        assert!(backend.written_blocks.is_empty());
-        let read = backend
-            .read_blocks(900_000, 1, 4096)
-            .expect("read discarded block");
-        assert_eq!(read.payload.expect("payload"), vec![0u8; 4096]);
-    }
-
-    #[test]
-    fn object_store_write_zeroes_sparse_deletes_live_blocks() {
-        let (_dir, mut backend) = object_store_backend(128);
-        backend
-            .write_blocks(5, &[0xE5u8; 4096], 4096)
-            .expect("write block");
-        backend
-            .write_zeroes(0, 128, 4096)
-            .expect("write zeroes full range");
-
-        assert!(backend.written_blocks.is_empty());
-        let read = backend.read_blocks(5, 1, 4096).expect("read zeroed block");
-        assert_eq!(read.payload.expect("payload"), vec![0u8; 4096]);
-    }
-
-    #[test]
-    fn object_store_written_index_persists_across_reopen() {
-        let (dir, mut backend) = object_store_backend(256);
-        backend
-            .write_blocks(42, &[0x42u8; 4096], 4096)
-            .expect("write block");
-        backend.flush().expect("flush written index");
-        drop(backend);
-
-        let geometry = BlockVolumeGeometryRecord::new(BlockVolumeId::new(401_200), 4096, 256, 1);
-        let mut reopened =
-            BlockVolumeObjectStoreBackend::open(dir.path(), geometry).expect("reopen backend");
-        assert!(reopened.written_blocks.contains(&42));
-
-        reopened
-            .discard_blocks(0, 256, 4096)
-            .expect("discard after reopen");
-        let read = reopened
-            .read_blocks(42, 1, 4096)
-            .expect("read discarded after reopen");
-        assert_eq!(read.payload.expect("payload"), vec![0u8; 4096]);
-    }
-
-    #[test]
-    fn object_store_missing_written_index_with_block_payloads_is_rejected() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let geometry = BlockVolumeGeometryRecord::new(BlockVolumeId::new(401_201), 4096, 128, 1);
-        {
-            let mut store = LocalObjectStore::open(dir.path()).expect("open raw store");
-            store
-                .put_named(
-                    BlockVolumeObjectStoreBackend::block_key(77),
-                    &[0x77u8; 4096],
-                )
-                .expect("pre-index block payload write");
-            store.sync().expect("sync raw store");
-        }
-
-        let err = match BlockVolumeObjectStoreBackend::open(dir.path(), geometry) {
-            Ok(_) => panic!("accepted pre-index block payloads without written index"),
-            Err(err) => err,
-        };
-        let message = err.to_string();
-        assert!(message.contains("missing current written index"));
-        assert!(message.contains("refusing pre-index block data"));
     }
 
     fn make_io_desc(op: u8, start_sector: u64, sector_count: u32) -> UblkIoDescriptor {

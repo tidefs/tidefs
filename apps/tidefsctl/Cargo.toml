@@ -18,8 +18,7 @@ block-volume = [
     "dep:tidefs-block-volume-adapter-core",
     "dep:tidefs-block-volume-adapter-daemon",
     "dep:tidefs-block-volume-adapter-ublk-control-runtime",
-    "dep:tidefs-recovery-loop",
-    "dep:tidefs-transport",
+    "tidefs-posix-filesystem-adapter-daemon/block-volume",
 ]
 cluster = [
     "dep:bincode",

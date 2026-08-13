@@ -7,7 +7,7 @@
 
 #[cfg(feature = "replication-io")]
 use std::fs;
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process;
@@ -21,7 +21,7 @@ use tidefs_local_filesystem::{
     SnapshotRetentionReport, SnapshotSummary,
 };
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
@@ -29,24 +29,18 @@ use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 // Snapshot network transfer protocol (simple VFSSEND1 push/pull via VSNP)
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 const SNAP_NET_MAGIC: &[u8; 4] = b"VSNP";
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 const SNAP_KIND_ERROR: u8 = 0;
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 const SNAP_KIND_PUSH: u8 = 1;
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 const SNAP_KIND_PULL_REQUEST: u8 = 2;
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 const SNAP_KIND_PULL_RESPONSE: u8 = 3;
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 pub(crate) const SNAP_KIND_ACK: u8 = 4;
-#[cfg(feature = "block-volume")]
-pub(crate) const SNAP_KIND_BLOCK_PUSH: u8 = 5;
-#[cfg(feature = "block-volume")]
-pub(crate) const SNAP_KIND_BLOCK_PULL_REQUEST: u8 = 6;
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
-pub(crate) const SNAP_KIND_BLOCK_PULL_RESPONSE: u8 = 7;
 
 #[cfg(feature = "remote-snapshot")]
 pub(crate) fn build_push_message(export: &[u8], auth_key: &[u8; 32]) -> Vec<u8> {
@@ -61,7 +55,7 @@ pub(crate) fn build_push_message(export: &[u8], auth_key: &[u8; 32]) -> Vec<u8> 
 }
 
 #[allow(dead_code)]
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 pub(crate) fn build_ack(message: &str) -> Vec<u8> {
     let b = message.as_bytes();
     let mut msg = Vec::with_capacity(4 + 1 + 4 + b.len());
@@ -73,51 +67,7 @@ pub(crate) fn build_ack(message: &str) -> Vec<u8> {
 }
 
 #[allow(dead_code)]
-#[cfg(feature = "block-volume")]
-pub(crate) fn build_block_push_message(
-    block_data: &[u8],
-    device_name: &str,
-    auth_key: &[u8; 32],
-) -> Vec<u8> {
-    let name_bytes = device_name.as_bytes();
-    let mut msg = Vec::with_capacity(4 + 1 + 4 + 32 + 4 + name_bytes.len() + 4 + block_data.len());
-    msg.extend_from_slice(SNAP_NET_MAGIC);
-    msg.push(SNAP_KIND_BLOCK_PUSH);
-    msg.extend_from_slice(&32u32.to_le_bytes());
-    msg.extend_from_slice(auth_key);
-    msg.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-    msg.extend_from_slice(name_bytes);
-    msg.extend_from_slice(&(block_data.len() as u32).to_le_bytes());
-    msg.extend_from_slice(block_data);
-    msg
-}
-
-#[cfg(feature = "block-volume")]
-pub(crate) fn build_block_pull_request(device_name: &str, auth_key: &[u8; 32]) -> Vec<u8> {
-    let name_bytes = device_name.as_bytes();
-    let mut msg = Vec::with_capacity(4 + 1 + 4 + 32 + 4 + name_bytes.len());
-    msg.extend_from_slice(SNAP_NET_MAGIC);
-    msg.push(SNAP_KIND_BLOCK_PULL_REQUEST);
-    msg.extend_from_slice(&32u32.to_le_bytes());
-    msg.extend_from_slice(auth_key);
-    msg.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-    msg.extend_from_slice(name_bytes);
-    msg
-}
-
-#[allow(dead_code)]
-#[cfg(feature = "block-volume")]
-pub(crate) fn build_block_pull_response(block_data: &[u8]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(4 + 1 + 4 + block_data.len());
-    msg.extend_from_slice(SNAP_NET_MAGIC);
-    msg.push(SNAP_KIND_BLOCK_PULL_RESPONSE);
-    msg.extend_from_slice(&(block_data.len() as u32).to_le_bytes());
-    msg.extend_from_slice(block_data);
-    msg
-}
-
-#[allow(dead_code)]
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 pub(crate) fn build_error(message: &str) -> Vec<u8> {
     let b = message.as_bytes();
     let mut msg = Vec::with_capacity(4 + 1 + 4 + b.len());
@@ -129,7 +79,7 @@ pub(crate) fn build_error(message: &str) -> Vec<u8> {
 }
 
 #[allow(dead_code)]
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 pub(crate) enum SnapNetMessage {
     Push { auth_key: [u8; 32], export: Vec<u8> },
     PullRequest { auth_key: [u8; 32] },
@@ -138,7 +88,7 @@ pub(crate) enum SnapNetMessage {
     Error { message: String },
 }
 
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 pub(crate) fn parse_snap_net_message(data: &[u8]) -> Result<SnapNetMessage, String> {
     if data.len() < 9 {
         return Err("message too short for VSNP header".into());
@@ -203,22 +153,6 @@ pub(crate) fn parse_snap_net_message(data: &[u8]) -> Result<SnapNetMessage, Stri
                 export: data[start..start + export_len].to_vec(),
             })
         }
-        SNAP_KIND_BLOCK_PULL_RESPONSE => {
-            if data.len() < 9 + 4 {
-                return Err("block_pull_response too short".into());
-            }
-            let data_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
-            let start = 9;
-            if data.len() < start + data_len {
-                return Err(format!(
-                    "block_pull_response: need {} bytes",
-                    start + data_len
-                ));
-            }
-            Ok(SnapNetMessage::PullResponse {
-                export: data[start..start + data_len].to_vec(),
-            })
-        }
         _ => {
             if data.len() < 9 + 4 {
                 return Err("response too short".into());
@@ -238,7 +172,7 @@ pub(crate) fn parse_snap_net_message(data: &[u8]) -> Result<SnapNetMessage, Stri
     }
 }
 
-#[cfg(any(feature = "block-volume", feature = "remote-snapshot"))]
+#[cfg(feature = "remote-snapshot")]
 pub(crate) fn transport_request(
     local_node_id: u64,
     remote_node_id: u64,

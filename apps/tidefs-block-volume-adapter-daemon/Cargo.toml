@@ -19,9 +19,9 @@ io-uring = "0.7.12"
 tidefs-block-volume-adapter-core = { workspace = true }
 tidefs-block-volume-adapter-ublk-control-runtime = { workspace = true }
 tidefs-ublk-abi = { workspace = true }
+tidefs-pool-runtime = { workspace = true }
+tidefs-local-filesystem = { workspace = true }
 tidefs-local-object-store = { workspace = true }
-tidefs-recovery-loop = { workspace = true }
-tidefs-commit_group = { workspace = true }
 tidefs-types-package-profile-catalog = { workspace = true }
 
 [features]
@@ -34,6 +34,7 @@ path = "src/main.rs"
 [dev-dependencies]
 blake3 = { version = "1", default-features = false }
 tidefs-block-volume-adapter-core = { workspace = true }
+tidefs-dataset-lifecycle = { workspace = true }
 
 [lints.clippy]
 unsafe_code = "allow"

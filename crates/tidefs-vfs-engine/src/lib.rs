@@ -1936,8 +1936,6 @@ pub enum LivePoolAdminCommand {
     DeviceStatus,
     DeviceRemove,
     BlockAttach,
-    BlockSend,
-    BlockReceive,
 }
 
 const LIVE_POOL_ADMIN_COMMAND_ROUTES: &[(LivePoolAdminCommand, &str, &str)] = &[
@@ -1995,8 +1993,6 @@ const LIVE_POOL_ADMIN_COMMAND_ROUTES: &[(LivePoolAdminCommand, &str, &str)] = &[
     (LivePoolAdminCommand::DeviceStatus, "device", "status"),
     (LivePoolAdminCommand::DeviceRemove, "device", "remove"),
     (LivePoolAdminCommand::BlockAttach, "block", "attach"),
-    (LivePoolAdminCommand::BlockSend, "block", "send"),
-    (LivePoolAdminCommand::BlockReceive, "block", "receive"),
 ];
 
 impl LivePoolAdminCommand {
