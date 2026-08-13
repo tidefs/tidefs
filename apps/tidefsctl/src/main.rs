@@ -1495,6 +1495,26 @@ mod tests {
     }
 
     #[test]
+    fn cli_parse_dataset_resize_target_size_and_devices() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "dataset",
+            "resize",
+            "tank/vol",
+            "--size",
+            "1048576",
+            "--devices",
+            "/dev/vdb",
+            "--json",
+        ]);
+        assert!(
+            args.is_ok(),
+            "dataset resize with target, exact size, devices, and json should parse"
+        );
+    }
+
+    #[test]
     fn cli_parse_dataset_set_strategy_positional_pool() {
         use clap::Parser;
         let args = Cli::try_parse_from([

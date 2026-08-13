@@ -536,6 +536,12 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         summary: "list catalog-backed datasets through owner authority or explicit devices",
     },
     CommandSurface {
+        path: "dataset resize",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "resize Pool-backed volumes through owner authority or explicit devices",
+    },
+    CommandSurface {
         path: "dataset destroy",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
@@ -905,6 +911,7 @@ mod tests {
             "pool set",
             "pool list-props",
             "dataset create",
+            "dataset resize",
             "snapshot create",
             "snapshot clone create",
             "snapshot bookmark create",

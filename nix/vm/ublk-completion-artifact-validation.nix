@@ -191,7 +191,7 @@ USAGE
     copy_binary_to_bin "$BUSYBOX" busybox
     for applet in sh ls cat echo mount grep insmod dmesg sleep poweroff \
                     mknod mkdir rm touch find sync expr head tail cut kill ps \
-                    test seq blockdev sed awk uname date true false; do
+                    test seq blockdev sed awk uname date true false dd cmp tr; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
     copy_binary_to_bin "$FIO" fio
@@ -275,8 +275,15 @@ POOL_NAME=ublk_completion_pool
 VOLUME_NAME=completion
 ERROR_VOLUME_NAME=completion_error
 VOLUME_SIZE_BYTES=$((BLOCK_COUNT * 4096))
+SHRUNK_VOLUME_SIZE_BYTES=$((VOLUME_SIZE_BYTES / 2))
+RETAINED_OFFSET=0
+DISCARD_OFFSET=65536
+WRITE_ZEROES_OFFSET=69632
+REMOVED_TAIL_OFFSET=$((VOLUME_SIZE_BYTES - 4096))
 ATTACH_LOG=/tmp/tidefs-ublk-attach.log
 ERROR_ATTACH_LOG=/tmp/tidefs-ublk-attach-error.log
+LIFECYCLE_ARTIFACT=/tmp/validation/ublk/lifecycle-completion.json
+LIFECYCLE_STARTED_ARTIFACT=/tmp/validation/ublk/lifecycle-started-export.json
 
 create_pool_volumes() {
     for _ in $(seq 1 30); do
@@ -319,6 +326,7 @@ start_attach() {
     attach_log="$4"
     artifact_scenario="$5"
     inject_op="$6"
+    expected_size="$7"
 
     rm -f "$artifact" "$started_artifact" "$attach_log"
 
@@ -373,12 +381,59 @@ start_attach() {
 
     echo "PASS: ublkb0 appeared"
     observed_size=$(blockdev --getsize64 /dev/ublkb0 2>/dev/null || echo 0)
-    if [ "$observed_size" -ne "$VOLUME_SIZE_BYTES" ]; then
-        echo "FAIL: ublkb0 size $observed_size does not match committed named-volume size $VOLUME_SIZE_BYTES"
+    if [ "$observed_size" -ne "$expected_size" ]; then
+        echo "FAIL: ublkb0 size $observed_size does not match committed named-volume size $expected_size"
         cat "$attach_log" 2>&1 || true
         poweroff -f
     fi
     echo "PASS: ublkb0 committed geometry size=$observed_size"
+}
+
+wait_ublk_gone() {
+    for _ in $(seq 1 30); do
+        [ ! -b /dev/ublkb0 ] && return
+        sleep 1
+    done
+    echo "FAIL: ublkb0 remained after block export teardown"
+    poweroff -f
+}
+
+make_pattern_file() {
+    path="$1"
+    pattern="$2"
+    head -c 4096 /dev/zero | tr '\000' "$pattern" > "$path"
+}
+
+make_zero_file() {
+    head -c 4096 /dev/zero > "$1"
+}
+
+write_expected_block() {
+    expected="$1"
+    offset="$2"
+    label="$3"
+    if ! dd if="$expected" of=/dev/ublkb0 bs=4096 seek=$((offset / 4096)) count=1 conv=fsync >/tmp/dd-write.log 2>&1; then
+        echo "FAIL: $label write"
+        cat /tmp/dd-write.log 2>&1 || true
+        poweroff -f
+    fi
+}
+
+verify_expected_block() {
+    expected="$1"
+    offset="$2"
+    label="$3"
+    if ! dd if=/dev/ublkb0 of=/tmp/actual-block bs=4096 skip=$((offset / 4096)) count=1 >/tmp/dd-read.log 2>&1; then
+        echo "FAIL: $label read"
+        cat /tmp/dd-read.log 2>&1 || true
+        poweroff -f
+    fi
+    if ! cmp "$expected" /tmp/actual-block >/tmp/cmp.log 2>&1; then
+        echo "FAIL: $label contents"
+        cat /tmp/cmp.log 2>&1 || true
+        poweroff -f
+    fi
+    echo "PASS: $label"
 }
 
     run_fio_or_fail() {
@@ -397,7 +452,7 @@ start_attach() {
 
 echo "--- Drive real ublk I/O ---"
 create_pool_volumes
-start_attach "$COMPLETION_ARTIFACT" "$STARTED_EXPORT_ARTIFACT" "$VOLUME_NAME" "$ATTACH_LOG" "$SCENARIO" none
+start_attach "$COMPLETION_ARTIFACT" "$STARTED_EXPORT_ARTIFACT" "$VOLUME_NAME" "$ATTACH_LOG" "$SCENARIO" none "$VOLUME_SIZE_BYTES"
 if [ "$SCENARIO" = "qemu-ublk-qid-tag-runtime" ]; then
     run_fio_or_fail "fio randrw multi-queue" /tmp/fio-randrw.err "$ATTACH_LOG" \
         fio --name=completion-randrw --rw=randrw --rwmixread=50 --size=1M \
@@ -446,6 +501,53 @@ else
 fi
 echo "PASS: fio workloads"
 
+make_pattern_file /tmp/retained-pattern R
+make_pattern_file /tmp/discard-pattern D
+make_pattern_file /tmp/write-zeroes-pattern Z
+make_pattern_file /tmp/removed-tail-pattern T
+make_zero_file /tmp/zero-pattern
+
+write_expected_block /tmp/retained-pattern "$RETAINED_OFFSET" "retained-prefix pattern"
+write_expected_block /tmp/discard-pattern "$DISCARD_OFFSET" "discard-range pattern"
+write_expected_block /tmp/write-zeroes-pattern "$WRITE_ZEROES_OFFSET" "write-zeroes-range pattern"
+write_expected_block /tmp/removed-tail-pattern "$REMOVED_TAIL_OFFSET" "removed-tail pattern"
+if ! blockdev --flushbufs /dev/ublkb0 2>/tmp/lifecycle-pattern-flush.err; then
+    echo "FAIL: flush lifecycle patterns"
+    cat /tmp/lifecycle-pattern-flush.err 2>&1 || true
+    poweroff -f
+fi
+if ! blkdiscard -f --offset "$DISCARD_OFFSET" --length 4096 /dev/ublkb0 2>/tmp/lifecycle-discard.err; then
+    echo "FAIL: discard lifecycle range"
+    cat /tmp/lifecycle-discard.err 2>&1 || true
+    poweroff -f
+fi
+if ! blkdiscard -z -f --offset "$WRITE_ZEROES_OFFSET" --length 4096 /dev/ublkb0 2>/tmp/lifecycle-write-zeroes.err; then
+    echo "FAIL: write zeroes lifecycle range"
+    cat /tmp/lifecycle-write-zeroes.err 2>&1 || true
+    poweroff -f
+fi
+if ! blockdev --flushbufs /dev/ublkb0 2>/tmp/lifecycle-zero-flush.err; then
+    echo "FAIL: flush discard and write zeroes"
+    cat /tmp/lifecycle-zero-flush.err 2>&1 || true
+    poweroff -f
+fi
+verify_expected_block /tmp/retained-pattern "$RETAINED_OFFSET" "retained prefix before reopen"
+verify_expected_block /tmp/zero-pattern "$DISCARD_OFFSET" "discard is zero before reopen"
+verify_expected_block /tmp/zero-pattern "$WRITE_ZEROES_OFFSET" "write zeroes is zero before reopen"
+verify_expected_block /tmp/removed-tail-pattern "$REMOVED_TAIL_OFFSET" "tail pattern before shrink"
+
+set +e
+tidefsctl dataset resize "$POOL_NAME/$VOLUME_NAME" --size "$SHRUNK_VOLUME_SIZE_BYTES" \
+    --devices "$POOL_DEVICE" >/tmp/active-resize.log 2>&1
+ACTIVE_RESIZE_RC=$?
+set -e
+if [ "$ACTIVE_RESIZE_RC" -eq 0 ]; then
+    echo "FAIL: resize succeeded while the volume export was active"
+    cat /tmp/active-resize.log 2>&1 || true
+    poweroff -f
+fi
+echo "PASS: active volume export refused concurrent resize"
+
 stop_attach() {
     attach_log="$1"
     echo "--- Stop tidefsctl block attach ---"
@@ -467,21 +569,87 @@ stop_attach() {
 }
 
 stop_attach "$ATTACH_LOG"
+wait_ublk_gone
+
+echo "--- Reopen committed volume data ---"
+start_attach "$LIFECYCLE_ARTIFACT" "$LIFECYCLE_STARTED_ARTIFACT" "$VOLUME_NAME" \
+    "$ATTACH_LOG" "$SCENARIO" none "$VOLUME_SIZE_BYTES"
+verify_expected_block /tmp/retained-pattern "$RETAINED_OFFSET" "retained prefix after reopen"
+verify_expected_block /tmp/zero-pattern "$DISCARD_OFFSET" "discard stays zero after reopen"
+verify_expected_block /tmp/zero-pattern "$WRITE_ZEROES_OFFSET" "write zeroes stays zero after reopen"
+verify_expected_block /tmp/removed-tail-pattern "$REMOVED_TAIL_OFFSET" "tail persists before shrink"
+stop_attach "$ATTACH_LOG"
+wait_ublk_gone
+
+echo "--- Shrink committed volume geometry ---"
+if ! tidefsctl dataset resize "$POOL_NAME/$VOLUME_NAME" --size "$SHRUNK_VOLUME_SIZE_BYTES" \
+    --devices "$POOL_DEVICE" >/tmp/shrink-volume.log 2>&1; then
+    echo "FAIL: shrink named volume"
+    cat /tmp/shrink-volume.log 2>&1 || true
+    poweroff -f
+fi
+start_attach "$LIFECYCLE_ARTIFACT" "$LIFECYCLE_STARTED_ARTIFACT" "$VOLUME_NAME" \
+    "$ATTACH_LOG" "$SCENARIO" none "$SHRUNK_VOLUME_SIZE_BYTES"
+verify_expected_block /tmp/retained-pattern "$RETAINED_OFFSET" "retained prefix after shrink"
+verify_expected_block /tmp/zero-pattern "$DISCARD_OFFSET" "discard stays zero after shrink"
+verify_expected_block /tmp/zero-pattern "$WRITE_ZEROES_OFFSET" "write zeroes stays zero after shrink"
+stop_attach "$ATTACH_LOG"
+wait_ublk_gone
+
+echo "--- Regrow committed volume geometry ---"
+if ! tidefsctl dataset resize "$POOL_NAME/$VOLUME_NAME" --size "$VOLUME_SIZE_BYTES" \
+    --devices "$POOL_DEVICE" >/tmp/regrow-volume.log 2>&1; then
+    echo "FAIL: regrow named volume"
+    cat /tmp/regrow-volume.log 2>&1 || true
+    poweroff -f
+fi
+start_attach "$LIFECYCLE_ARTIFACT" "$LIFECYCLE_STARTED_ARTIFACT" "$VOLUME_NAME" \
+    "$ATTACH_LOG" "$SCENARIO" none "$VOLUME_SIZE_BYTES"
+verify_expected_block /tmp/retained-pattern "$RETAINED_OFFSET" "retained prefix after regrow"
+verify_expected_block /tmp/zero-pattern "$DISCARD_OFFSET" "discard stays zero after regrow"
+verify_expected_block /tmp/zero-pattern "$WRITE_ZEROES_OFFSET" "write zeroes stays zero after regrow"
+verify_expected_block /tmp/zero-pattern "$REMOVED_TAIL_OFFSET" "removed tail stays zero after regrow"
+
+set +e
+tidefsctl dataset destroy "$POOL_NAME/$VOLUME_NAME" --devices "$POOL_DEVICE" \
+    >/tmp/active-destroy.log 2>&1
+ACTIVE_DESTROY_RC=$?
+set -e
+if [ "$ACTIVE_DESTROY_RC" -eq 0 ]; then
+    echo "FAIL: destroy succeeded while the volume export was active"
+    cat /tmp/active-destroy.log 2>&1 || true
+    poweroff -f
+fi
+echo "PASS: active volume export refused concurrent destroy"
+stop_attach "$ATTACH_LOG"
+wait_ublk_gone
+
+echo "--- Destroy committed volume and refuse later attach ---"
+if ! tidefsctl dataset destroy "$POOL_NAME/$VOLUME_NAME" --devices "$POOL_DEVICE" \
+    >/tmp/destroy-volume.log 2>&1; then
+    echo "FAIL: destroy named volume"
+    cat /tmp/destroy-volume.log 2>&1 || true
+    poweroff -f
+fi
+set +e
+tidefsctl block attach "$POOL_NAME/$VOLUME_NAME" --devices "$POOL_DEVICE" \
+    >/tmp/destroyed-attach.log 2>&1
+DESTROYED_ATTACH_RC=$?
+set -e
+if [ "$DESTROYED_ATTACH_RC" -eq 0 ]; then
+    echo "FAIL: destroyed volume attached successfully"
+    cat /tmp/destroyed-attach.log 2>&1 || true
+    poweroff -f
+fi
+if [ -b /dev/ublkb0 ]; then
+    echo "FAIL: destroyed volume created /dev/ublkb0"
+    cat /tmp/destroyed-attach.log 2>&1 || true
+    poweroff -f
+fi
+echo "PASS: destroyed volume refuses later attach"
 
 if [ "$RUN_ERROR_INJECTION" -eq 1 ]; then
-    for _ in $(seq 1 30); do
-        if [ ! -b /dev/ublkb0 ]; then
-            break
-        fi
-        sleep 1
-    done
-    if [ -b /dev/ublkb0 ]; then
-        echo "FAIL: ublkb0 remained after success-cycle teardown"
-        cat "$ATTACH_LOG" 2>&1 || true
-        poweroff -f
-    fi
-
-    start_attach "$ERROR_COMPLETION_ARTIFACT" "$ERROR_STARTED_EXPORT_ARTIFACT" "$ERROR_VOLUME_NAME" "$ERROR_ATTACH_LOG" "qemu-ublk-qid-tag-runtime-error-injection" write
+    start_attach "$ERROR_COMPLETION_ARTIFACT" "$ERROR_STARTED_EXPORT_ARTIFACT" "$ERROR_VOLUME_NAME" "$ERROR_ATTACH_LOG" "qemu-ublk-qid-tag-runtime-error-injection" write "$VOLUME_SIZE_BYTES"
     run_fio_or_fail "fio error-injection pre-read" /tmp/fio-error-read.err "$ERROR_ATTACH_LOG" \
         fio --name=completion-error-preread --rw=read --size=4k --offset=0 \
         --direct=1 --bs=4k --iodepth=1 --filename=/dev/ublkb0 \

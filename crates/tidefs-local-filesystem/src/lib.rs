@@ -2889,6 +2889,37 @@ impl LocalFileSystem {
         result.map_err(FileSystemError::from)
     }
 
+    /// Commit exact geometry for one named Pool-backed volume.
+    pub fn resize_volume_dataset(
+        &mut self,
+        path: &str,
+        capacity_bytes: u64,
+    ) -> Result<tidefs_pool_runtime::VolumeResizeResult> {
+        self.ensure_mutation_allowed("resize Pool volume")?;
+        let result = self.store.resize_volume(path, capacity_bytes);
+        if matches!(
+            &result,
+            Err(tidefs_pool_runtime::PoolRuntimeError::PublicationOutcomeUncertain(_))
+        ) {
+            self.arm_mutation_reopen_fence();
+        }
+        result.map_err(FileSystemError::from)
+    }
+
+    /// Atomically remove one named Pool-backed volume's catalog entry and
+    /// typed root. Physical reclaim remains separate.
+    pub fn destroy_volume_dataset(&mut self, path: &str) -> Result<DatasetId> {
+        self.ensure_mutation_allowed("destroy Pool volume")?;
+        let result = self.store.destroy_volume(path);
+        if matches!(
+            &result,
+            Err(tidefs_pool_runtime::PoolRuntimeError::PublicationOutcomeUncertain(_))
+        ) {
+            self.arm_mutation_reopen_fence();
+        }
+        result.map_err(FileSystemError::from)
+    }
+
     /// Open one committed named volume while this filesystem remains the
     /// neutral owner of the underlying Pool runtime.
     pub fn open_volume_dataset(&self, path: &str) -> Result<tidefs_pool_runtime::PoolVolume> {
