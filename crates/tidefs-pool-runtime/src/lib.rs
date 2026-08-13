@@ -456,20 +456,31 @@ impl PoolRuntime {
         load_immutable_object(&self.pool, reference)
     }
 
-    /// Immutable object keys that make canonical roots reachable independent
-    /// of the semantic engine's own transaction/content graph.
-    #[must_use]
+    /// Immutable object keys reachable through canonical Pool-owned roots.
+    ///
+    /// Filesystem transaction/content descendants remain owned by the
+    /// filesystem retention walker. Volume maps and chunks are Pool-runtime
+    /// objects, so this method validates and includes their complete immutable
+    /// graphs for both current volume roots and captured volume snapshots.
     pub fn canonical_root_object_keys(&self) -> Result<Vec<ObjectKey>> {
         let mut keys = Vec::with_capacity(self.root.dataset_roots.len().saturating_add(1));
         keys.push(canonical_pool_root_key());
         for (dataset_id, reference) in &self.root.dataset_roots {
             keys.push(reference.object_key);
-            if reference.kind == DatasetRootKind::Snapshot {
-                keys.push(
-                    self.load_snapshot_root(*dataset_id)?
-                        .source_reference
-                        .object_key,
-                );
+            match reference.kind {
+                DatasetRootKind::Filesystem => {}
+                DatasetRootKind::Volume => {
+                    let root = decode_volume_root(&load_immutable_object(&self.pool, *reference)?)?;
+                    collect_volume_root_object_keys(&self.pool, &root, &mut keys)?;
+                }
+                DatasetRootKind::Snapshot => {
+                    let source = self.load_snapshot_root(*dataset_id)?.source_reference;
+                    keys.push(source.object_key);
+                    if source.kind == DatasetRootKind::Volume {
+                        let root = decode_volume_root(&load_immutable_object(&self.pool, source)?)?;
+                        collect_volume_root_object_keys(&self.pool, &root, &mut keys)?;
+                    }
+                }
             }
         }
         keys.sort_unstable();
@@ -1686,6 +1697,46 @@ fn load_volume_chunk(
     Ok(Some(bytes))
 }
 
+fn collect_volume_root_object_keys(
+    pool: &Pool,
+    root: &VolumeRoot,
+    keys: &mut Vec<ObjectKey>,
+) -> Result<()> {
+    let Some(reference) = root.map_root else {
+        return Ok(());
+    };
+    collect_volume_map_object_keys(pool, reference, VOLUME_MAP_ROOT_LEVEL, keys)
+}
+
+fn collect_volume_map_object_keys(
+    pool: &Pool,
+    reference: ImmutableObjectRef,
+    expected_level: u8,
+    keys: &mut Vec<ObjectKey>,
+) -> Result<()> {
+    keys.push(reference.object_key);
+    let node = load_volume_map_node(
+        pool,
+        DatasetId::from_bytes([0_u8; 16]),
+        reference,
+        expected_level,
+    )?;
+    for child in node.children.values().copied() {
+        if expected_level == 0 {
+            let bytes = load_immutable_ref(pool, child)?;
+            if bytes.len() != VOLUME_CHUNK_SIZE {
+                return Err(PoolRuntimeError::InvalidVolume(
+                    "volume chunk has the wrong length",
+                ));
+            }
+            keys.push(child.object_key);
+        } else {
+            collect_volume_map_object_keys(pool, child, expected_level - 1, keys)?;
+        }
+    }
+    Ok(())
+}
+
 fn lookup_volume_map(
     pool: &Pool,
     id: DatasetId,
@@ -2522,6 +2573,44 @@ mod tests {
             owner.restore_volume_snapshot("vol@before"),
             Err(PoolRuntimeError::Catalog(CatalogError::NotFound))
         ));
+    }
+
+    #[test]
+    fn canonical_retention_keeps_current_and_snapshotted_volume_graphs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        create_volume(&mut owner, "vol", 44);
+        let snapshot_bytes = vec![0x44; 4096];
+        let current_bytes = vec![0x55; 4096];
+
+        let mut volume = owner.open_volume("vol").unwrap();
+        volume.write_blocks(&owner, 0, &snapshot_bytes).unwrap();
+        volume.flush(&mut owner).unwrap();
+        owner.create_volume_snapshot("vol@before").unwrap();
+        let mut volume = owner.open_volume("vol").unwrap();
+        volume.write_blocks(&owner, 0, &current_bytes).unwrap();
+        volume.flush(&mut owner).unwrap();
+
+        let protected = owner.canonical_root_object_keys().unwrap();
+        owner.pool_mut().compact_retaining(&protected, &[]).unwrap();
+        assert_eq!(
+            owner
+                .open_volume("vol")
+                .unwrap()
+                .read_blocks(&owner, 0, 1)
+                .unwrap(),
+            current_bytes
+        );
+
+        owner.restore_volume_snapshot("vol@before").unwrap();
+        assert_eq!(
+            owner
+                .open_volume("vol")
+                .unwrap()
+                .read_blocks(&owner, 0, 1)
+                .unwrap(),
+            snapshot_bytes
+        );
     }
 
     #[test]
