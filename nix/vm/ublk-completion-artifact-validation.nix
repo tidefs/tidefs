@@ -274,6 +274,7 @@ POOL_DEVICE=/dev/vda
 POOL_NAME=ublk_completion_pool
 VOLUME_NAME=completion
 ERROR_VOLUME_NAME=completion_error
+SNAPSHOT_TARGET="$POOL_NAME/$VOLUME_NAME@before_overwrite"
 VOLUME_SIZE_BYTES=$((BLOCK_COUNT * 4096))
 SHRUNK_VOLUME_SIZE_BYTES=$((VOLUME_SIZE_BYTES / 2))
 RETAINED_OFFSET=0
@@ -505,6 +506,7 @@ make_pattern_file /tmp/retained-pattern R
 make_pattern_file /tmp/discard-pattern D
 make_pattern_file /tmp/write-zeroes-pattern Z
 make_pattern_file /tmp/removed-tail-pattern T
+make_pattern_file /tmp/overwritten-pattern O
 make_zero_file /tmp/zero-pattern
 
 write_expected_block /tmp/retained-pattern "$RETAINED_OFFSET" "retained-prefix pattern"
@@ -548,6 +550,23 @@ if [ "$ACTIVE_RESIZE_RC" -eq 0 ]; then
 fi
 echo "PASS: active volume export refused concurrent resize"
 
+set +e
+tidefsctl snapshot create "$SNAPSHOT_TARGET" --devices "$POOL_DEVICE" \
+    >/tmp/active-snapshot-create.log 2>&1
+ACTIVE_SNAPSHOT_CREATE_RC=$?
+set -e
+if [ "$ACTIVE_SNAPSHOT_CREATE_RC" -eq 0 ]; then
+    echo "FAIL: snapshot create succeeded while the volume export was active"
+    cat /tmp/active-snapshot-create.log 2>&1 || true
+    poweroff -f
+fi
+if ! grep -F "actively exported" /tmp/active-snapshot-create.log >/dev/null; then
+    echo "FAIL: active snapshot create did not report export admission refusal"
+    cat /tmp/active-snapshot-create.log 2>&1 || true
+    poweroff -f
+fi
+echo "PASS: active volume export refused concurrent snapshot create"
+
 stop_attach() {
     attach_log="$1"
     echo "--- Stop tidefsctl block attach ---"
@@ -571,6 +590,21 @@ stop_attach() {
 stop_attach "$ATTACH_LOG"
 wait_ublk_gone
 
+echo "--- Capture committed volume snapshot ---"
+if ! tidefsctl snapshot create "$SNAPSHOT_TARGET" --devices "$POOL_DEVICE" \
+    >/tmp/snapshot-create.log 2>&1; then
+    echo "FAIL: volume snapshot create"
+    cat /tmp/snapshot-create.log 2>&1 || true
+    poweroff -f
+fi
+if ! tidefsctl snapshot list "$POOL_NAME" --devices "$POOL_DEVICE" \
+    >/tmp/snapshot-list.log 2>&1 || ! grep -F "$VOLUME_NAME@before_overwrite" /tmp/snapshot-list.log >/dev/null; then
+    echo "FAIL: created volume snapshot is not listed"
+    cat /tmp/snapshot-list.log 2>&1 || true
+    poweroff -f
+fi
+echo "PASS: committed volume snapshot created and listed"
+
 echo "--- Reopen committed volume data ---"
 start_attach "$LIFECYCLE_ARTIFACT" "$LIFECYCLE_STARTED_ARTIFACT" "$VOLUME_NAME" \
     "$ATTACH_LOG" "$SCENARIO" none "$VOLUME_SIZE_BYTES"
@@ -578,8 +612,89 @@ verify_expected_block /tmp/retained-pattern "$RETAINED_OFFSET" "retained prefix 
 verify_expected_block /tmp/zero-pattern "$DISCARD_OFFSET" "discard stays zero after reopen"
 verify_expected_block /tmp/zero-pattern "$WRITE_ZEROES_OFFSET" "write zeroes stays zero after reopen"
 verify_expected_block /tmp/removed-tail-pattern "$REMOVED_TAIL_OFFSET" "tail persists before shrink"
+
+write_expected_block /tmp/overwritten-pattern "$RETAINED_OFFSET" "post-snapshot overwrite"
+if ! blockdev --flushbufs /dev/ublkb0 2>/tmp/snapshot-overwrite-flush.err; then
+    echo "FAIL: flush post-snapshot overwrite"
+    cat /tmp/snapshot-overwrite-flush.err 2>&1 || true
+    poweroff -f
+fi
+
+for snapshot_operation in rollback destroy; do
+    set +e
+    tidefsctl snapshot "$snapshot_operation" "$SNAPSHOT_TARGET" --devices "$POOL_DEVICE" \
+        >"/tmp/active-snapshot-$snapshot_operation.log" 2>&1
+    ACTIVE_SNAPSHOT_RC=$?
+    set -e
+    if [ "$ACTIVE_SNAPSHOT_RC" -eq 0 ]; then
+        echo "FAIL: snapshot $snapshot_operation succeeded while the volume export was active"
+        cat "/tmp/active-snapshot-$snapshot_operation.log" 2>&1 || true
+        poweroff -f
+    fi
+    if ! grep -F "actively exported" "/tmp/active-snapshot-$snapshot_operation.log" >/dev/null; then
+        echo "FAIL: active snapshot $snapshot_operation did not report export admission refusal"
+        cat "/tmp/active-snapshot-$snapshot_operation.log" 2>&1 || true
+        poweroff -f
+    fi
+done
+echo "PASS: active volume export refused concurrent snapshot rollback and destroy"
 stop_attach "$ATTACH_LOG"
 wait_ublk_gone
+
+echo "--- Restore exact snapshot bytes and geometry ---"
+if ! tidefsctl dataset resize "$POOL_NAME/$VOLUME_NAME" --size "$SHRUNK_VOLUME_SIZE_BYTES" \
+    --devices "$POOL_DEVICE" >/tmp/snapshot-pre-restore-shrink.log 2>&1; then
+    echo "FAIL: pre-restore volume shrink"
+    cat /tmp/snapshot-pre-restore-shrink.log 2>&1 || true
+    poweroff -f
+fi
+if ! tidefsctl snapshot rollback "$SNAPSHOT_TARGET" --devices "$POOL_DEVICE" \
+    >/tmp/snapshot-rollback.log 2>&1; then
+    echo "FAIL: volume snapshot rollback"
+    cat /tmp/snapshot-rollback.log 2>&1 || true
+    poweroff -f
+fi
+start_attach "$LIFECYCLE_ARTIFACT" "$LIFECYCLE_STARTED_ARTIFACT" "$VOLUME_NAME" \
+    "$ATTACH_LOG" "$SCENARIO" none "$VOLUME_SIZE_BYTES"
+verify_expected_block /tmp/retained-pattern "$RETAINED_OFFSET" "snapshot restored exact pre-overwrite bytes"
+verify_expected_block /tmp/removed-tail-pattern "$REMOVED_TAIL_OFFSET" "snapshot restored exact pre-shrink geometry and tail"
+stop_attach "$ATTACH_LOG"
+wait_ublk_gone
+
+if ! tidefsctl snapshot list "$POOL_NAME" --devices "$POOL_DEVICE" \
+    >/tmp/snapshot-retained-list.log 2>&1 || ! grep -F "$VOLUME_NAME@before_overwrite" /tmp/snapshot-retained-list.log >/dev/null; then
+    echo "FAIL: rollback did not retain volume snapshot"
+    cat /tmp/snapshot-retained-list.log 2>&1 || true
+    poweroff -f
+fi
+if ! tidefsctl snapshot destroy "$SNAPSHOT_TARGET" --devices "$POOL_DEVICE" \
+    >/tmp/snapshot-destroy.log 2>&1; then
+    echo "FAIL: volume snapshot destroy"
+    cat /tmp/snapshot-destroy.log 2>&1 || true
+    poweroff -f
+fi
+if ! grep -F "physical reclaim remains pending" /tmp/snapshot-destroy.log >/dev/null; then
+    echo "FAIL: volume snapshot destroy omitted logical-only reclaim boundary"
+    cat /tmp/snapshot-destroy.log 2>&1 || true
+    poweroff -f
+fi
+if ! tidefsctl snapshot list "$POOL_NAME" --devices "$POOL_DEVICE" \
+    >/tmp/snapshot-destroyed-list.log 2>&1 || grep -F "$VOLUME_NAME@before_overwrite" /tmp/snapshot-destroyed-list.log >/dev/null; then
+    echo "FAIL: destroyed volume snapshot remained listed"
+    cat /tmp/snapshot-destroyed-list.log 2>&1 || true
+    poweroff -f
+fi
+set +e
+tidefsctl snapshot rollback "$SNAPSHOT_TARGET" --devices "$POOL_DEVICE" \
+    >/tmp/destroyed-snapshot-rollback.log 2>&1
+DESTROYED_SNAPSHOT_ROLLBACK_RC=$?
+set -e
+if [ "$DESTROYED_SNAPSHOT_ROLLBACK_RC" -eq 0 ]; then
+    echo "FAIL: destroyed volume snapshot restored successfully"
+    cat /tmp/destroyed-snapshot-rollback.log 2>&1 || true
+    poweroff -f
+fi
+echo "PASS: volume snapshot retained, logically destroyed, and later restore refused"
 
 echo "--- Shrink committed volume geometry ---"
 if ! tidefsctl dataset resize "$POOL_NAME/$VOLUME_NAME" --size "$SHRUNK_VOLUME_SIZE_BYTES" \

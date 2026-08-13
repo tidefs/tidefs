@@ -1288,7 +1288,9 @@ impl VfsLocalFileSystem {
                     LivePoolAdminCommand::DatasetListProps => {
                         self.live_dataset_list_props(pool, &args)
                     }
-                    LivePoolAdminCommand::SnapshotCreate => self.live_snapshot_create(&args),
+                    LivePoolAdminCommand::SnapshotCreate => {
+                        self.live_snapshot_create(&args, wants_json)
+                    }
                     LivePoolAdminCommand::SnapshotList => self.live_snapshot_list(wants_json),
                     LivePoolAdminCommand::SnapshotDestroy => self.live_snapshot_destroy(&args),
                     LivePoolAdminCommand::SnapshotRollback => self.live_snapshot_rollback(&args),
@@ -2543,7 +2545,17 @@ impl VfsLocalFileSystem {
         live_property_table("dataset list-props", &props, family)
     }
 
-    fn live_snapshot_create(&self, args: &Value) -> LivePoolAdminResponse {
+    fn live_snapshot_create(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
+        if let Some(target) = live_admin_optional_arg(args, "target") {
+            let mut fs = self.fs.borrow_mut();
+            return match fs.create_volume_snapshot_dataset(target) {
+                Ok(summary) => volume_snapshot_response("created", &summary, wants_json),
+                Err(err) => live_admin_error(
+                    1,
+                    format!("snapshot create: failed to create '{target}': {err}"),
+                ),
+            };
+        }
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2563,6 +2575,10 @@ impl VfsLocalFileSystem {
     fn live_snapshot_list(&self, wants_json: bool) -> LivePoolAdminResponse {
         let fs = self.fs.borrow();
         let mut snapshots = fs.list_snapshots();
+        let volume_snapshots = match fs.list_volume_snapshot_datasets() {
+            Ok(snapshots) => snapshots,
+            Err(err) => return live_admin_error(1, format!("snapshot list: {err}")),
+        };
         snapshots.sort_by(|a, b| {
             a.created_at_generation
                 .cmp(&b.created_at_generation)
@@ -2580,22 +2596,39 @@ impl VfsLocalFileSystem {
                     })
                 })
                 .collect();
-            return live_admin_ok_json(json!({ "snapshots": values }));
+            let volume_values = volume_snapshots
+                .iter()
+                .map(volume_snapshot_json)
+                .collect::<Vec<_>>();
+            return live_admin_ok_json(json!({
+                "snapshots": values,
+                "volume_snapshots": volume_values,
+            }));
         }
-        if snapshots.is_empty() {
+        if snapshots.is_empty() && volume_snapshots.is_empty() {
             return live_admin_ok_text("no snapshots");
         }
-        let mut out = String::new();
-        for (idx, summary) in snapshots.iter().enumerate() {
-            if idx > 0 {
-                out.push('\n');
-            }
-            out.push_str(&snapshot_summary_line(summary));
-        }
-        live_admin_ok_text(out)
+        live_admin_ok_text(
+            snapshots
+                .iter()
+                .map(snapshot_summary_line)
+                .chain(volume_snapshots.iter().map(volume_snapshot_line))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 
     fn live_snapshot_destroy(&self, args: &Value) -> LivePoolAdminResponse {
+        if let Some(target) = live_admin_optional_arg(args, "target") {
+            let mut fs = self.fs.borrow_mut();
+            return match fs.destroy_volume_snapshot_dataset(target) {
+                Ok(summary) => volume_snapshot_response("logically destroyed", &summary, false),
+                Err(err) => live_admin_error(
+                    1,
+                    format!("snapshot destroy: failed to destroy '{target}': {err}"),
+                ),
+            };
+        }
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2613,6 +2646,24 @@ impl VfsLocalFileSystem {
     }
 
     fn live_snapshot_rollback(&self, args: &Value) -> LivePoolAdminResponse {
+        if let Some(target) = live_admin_optional_arg(args, "target") {
+            let mut fs = self.fs.borrow_mut();
+            return match fs.restore_volume_snapshot_dataset(target) {
+                Ok(result) => live_admin_ok_text(format!(
+                    "volume snapshot '{}' restored to '{}' (size={} generation={} resize_generation={} snapshot_generation={})",
+                    result.snapshot.path,
+                    result.snapshot.source_path,
+                    result.geometry.capacity_bytes,
+                    result.generation,
+                    result.resize_generation,
+                    result.snapshot_generation,
+                )),
+                Err(err) => live_admin_error(
+                    1,
+                    format!("snapshot rollback: failed to restore '{target}': {err}"),
+                ),
+            };
+        }
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -3953,6 +4004,52 @@ fn snapshot_summary_line(summary: &crate::types::SnapshotSummary) -> String {
         summary.source_generation,
         summary.created_at_generation
     )
+}
+
+fn volume_snapshot_line(summary: &tidefs_pool_runtime::VolumeSnapshotSummary) -> String {
+    format!(
+        "volume snapshot '{}' source='{}' kind=volume source_generation={} snapshot_generation={} size={} block_size={}",
+        summary.path,
+        summary.source_path,
+        summary.source_generation,
+        summary.snapshot_generation,
+        summary.geometry.capacity_bytes,
+        summary.geometry.block_size_bytes,
+    )
+}
+
+fn volume_snapshot_json(summary: &tidefs_pool_runtime::VolumeSnapshotSummary) -> Value {
+    json!({
+        "path": summary.path,
+        "id": summary.snapshot_id.to_string(),
+        "source": summary.source_path,
+        "source_id": summary.source_dataset_id.to_string(),
+        "source_kind": "volume",
+        "source_generation": summary.source_generation,
+        "snapshot_generation": summary.snapshot_generation,
+        "size": summary.geometry.capacity_bytes,
+        "block_size": summary.geometry.block_size_bytes,
+    })
+}
+
+fn volume_snapshot_response(
+    outcome: &str,
+    summary: &tidefs_pool_runtime::VolumeSnapshotSummary,
+    wants_json: bool,
+) -> LivePoolAdminResponse {
+    if wants_json {
+        return live_admin_ok_json(json!({
+            "ok": true,
+            "outcome": outcome,
+            "physical_reclaim": false,
+            "snapshot": volume_snapshot_json(summary),
+        }));
+    }
+    let mut text = format!("{} {outcome}", volume_snapshot_line(summary));
+    if outcome == "logically destroyed" {
+        text.push_str("\nphysical reclaim remains pending; no secure-erasure claim is made");
+    }
+    live_admin_ok_text(text)
 }
 
 fn property_family_from_str(value: &str) -> Option<tidefs_dataset_properties::PropertyFamily> {
@@ -6663,6 +6760,112 @@ mod tests {
             text.contains("logically destroyed") && text.contains("physical reclaim")
         }));
         assert!(engine.fs.borrow().open_volume_dataset("volume0").is_err());
+    }
+
+    #[test]
+    fn live_volume_snapshot_shared_commands_restore_bytes_and_retain_snapshot() {
+        let (engine, _td) = temp_fs();
+        let created = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "volume0",
+                "parent": "root",
+                "type": "volume",
+                "size": 8192,
+                "sync": "local",
+            }),
+        );
+        assert_eq!(created["ok"], true, "create response: {created}");
+
+        {
+            let mut fs = engine.fs.borrow_mut();
+            let mut volume = fs.open_volume_dataset("volume0").unwrap();
+            fs.write_volume_blocks(&mut volume, 0, &[0x11; 4096])
+                .unwrap();
+            fs.flush_volume(&mut volume).unwrap();
+        }
+
+        let snapshot = live_snapshot_admin(
+            &engine,
+            "create",
+            json!({"target": "volume0@before"}),
+            false,
+        );
+        assert_eq!(snapshot["ok"], true, "snapshot response: {snapshot}");
+        assert!(snapshot["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("volume0@before") && text.contains("created")));
+
+        {
+            let mut fs = engine.fs.borrow_mut();
+            let mut volume = fs.open_volume_dataset("volume0").unwrap();
+            fs.write_volume_blocks(&mut volume, 0, &[0x22; 4096])
+                .unwrap();
+            fs.flush_volume(&mut volume).unwrap();
+        }
+
+        let rollback = live_snapshot_admin(
+            &engine,
+            "rollback",
+            json!({"target": "volume0@before"}),
+            false,
+        );
+        assert_eq!(rollback["ok"], true, "rollback response: {rollback}");
+        let restored_bytes = {
+            let fs = engine.fs.borrow();
+            let volume = fs.open_volume_dataset("volume0").unwrap();
+            fs.read_volume_blocks(&volume, 0, 1).unwrap()
+        };
+        assert_eq!(restored_bytes, vec![0x11; 4096]);
+
+        let listed = live_snapshot_admin(&engine, "list", json!({}), true);
+        assert_eq!(listed["ok"], true, "list response: {listed}");
+        assert_eq!(
+            listed["json"]["volume_snapshots"][0]["path"],
+            "volume0@before"
+        );
+
+        let destroyed = live_snapshot_admin(
+            &engine,
+            "destroy",
+            json!({"target": "volume0@before"}),
+            false,
+        );
+        assert_eq!(destroyed["ok"], true, "destroy response: {destroyed}");
+        assert!(destroyed["text"].as_str().is_some_and(|text| {
+            text.contains("physical reclaim remains pending")
+                && text.contains("no secure-erasure claim")
+        }));
+        assert!(engine
+            .fs
+            .borrow()
+            .list_volume_snapshot_datasets()
+            .unwrap()
+            .is_empty());
+
+        let filesystem_snapshot = live_snapshot_admin(
+            &engine,
+            "create",
+            json!({"name": "filesystem-before"}),
+            false,
+        );
+        assert_eq!(
+            filesystem_snapshot["ok"], true,
+            "filesystem snapshot response: {filesystem_snapshot}"
+        );
+        let listed = live_snapshot_admin(&engine, "list", json!({}), true);
+        assert_eq!(listed["json"]["snapshots"][0]["name"], "filesystem-before");
+        let filesystem_destroy = live_snapshot_admin(
+            &engine,
+            "destroy",
+            json!({"name": "filesystem-before"}),
+            false,
+        );
+        assert_eq!(
+            filesystem_destroy["ok"], true,
+            "filesystem snapshot destroy response: {filesystem_destroy}"
+        );
     }
 
     #[test]

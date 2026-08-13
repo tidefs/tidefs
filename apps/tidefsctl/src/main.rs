@@ -926,6 +926,40 @@ mod tests {
     }
 
     #[test]
+    fn cli_parse_volume_snapshot_uses_shared_snapshot_commands() {
+        use clap::Parser;
+
+        for operation in ["create", "destroy", "rollback"] {
+            assert!(Cli::try_parse_from([
+                "tidefsctl",
+                "snapshot",
+                operation,
+                "mypool/vol@before",
+                "--devices",
+                "/dev/sda",
+            ])
+            .is_ok());
+        }
+        assert!(Cli::try_parse_from([
+            "tidefsctl",
+            "snapshot",
+            "list",
+            "mypool",
+            "--devices",
+            "/dev/sda",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "tidefsctl",
+            "snapshot",
+            "volume",
+            "create",
+            "mypool/vol@before",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn cli_parse_snapshot_list_rejects_backing_dir() {
         use clap::Parser;
         let args = Cli::try_parse_from([

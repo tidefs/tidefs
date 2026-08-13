@@ -365,13 +365,19 @@ fn dispatch_request(
         #[cfg(feature = "block-volume")]
         LivePoolAdminCommand::DatasetResize
         | LivePoolAdminCommand::DatasetRename
-        | LivePoolAdminCommand::DatasetDestroy => {
+        | LivePoolAdminCommand::DatasetDestroy
+        | LivePoolAdminCommand::SnapshotCreate
+        | LivePoolAdminCommand::SnapshotDestroy
+        | LivePoolAdminCommand::SnapshotRollback => {
             volume_lifecycle_mutation(&request, engine, block_export)
         }
         #[cfg(not(feature = "block-volume"))]
         LivePoolAdminCommand::DatasetResize
         | LivePoolAdminCommand::DatasetRename
-        | LivePoolAdminCommand::DatasetDestroy => delegate_admin_request(&request, engine),
+        | LivePoolAdminCommand::DatasetDestroy
+        | LivePoolAdminCommand::SnapshotCreate
+        | LivePoolAdminCommand::SnapshotDestroy
+        | LivePoolAdminCommand::SnapshotRollback => delegate_admin_request(&request, engine),
         LivePoolAdminCommand::PoolGet
         | LivePoolAdminCommand::PoolSet
         | LivePoolAdminCommand::PoolListProps
@@ -385,10 +391,7 @@ fn dispatch_request(
         | LivePoolAdminCommand::DatasetListProps
         | LivePoolAdminCommand::DatasetSealKey
         | LivePoolAdminCommand::DatasetRotateKey
-        | LivePoolAdminCommand::SnapshotCreate
         | LivePoolAdminCommand::SnapshotList
-        | LivePoolAdminCommand::SnapshotDestroy
-        | LivePoolAdminCommand::SnapshotRollback
         | LivePoolAdminCommand::SnapshotExtract
         | LivePoolAdminCommand::SnapshotSend
         | LivePoolAdminCommand::PerformanceAdmissionSnapshot
@@ -425,13 +428,16 @@ fn volume_lifecycle_mutation(
         Ok(target) => target,
         Err(error) => return live_admin_typed_error(error),
     };
+    let Some(target) = target else {
+        return delegate_admin_request(request, engine);
+    };
     match with_volume_mutation_admission(block_export, target, || {
         delegate_admin_request(request, engine)
     }) {
         Ok(response) => response,
         Err(message) => {
-            let (_, operation) = request.command.parts();
-            LivePoolAdminResponse::error(1, format!("dataset {operation} refused: {message}"))
+            let (command, operation) = request.command.parts();
+            LivePoolAdminResponse::error(1, format!("{command} {operation} refused: {message}"))
         }
     }
 }
@@ -468,18 +474,51 @@ fn ensure_volume_mutation_allowed(
 }
 
 #[cfg(feature = "block-volume")]
-fn volume_mutation_target(request: &LivePoolAdminRequest) -> Result<&str, LivePoolAdminError> {
+fn volume_mutation_target(
+    request: &LivePoolAdminRequest,
+) -> Result<Option<&str>, LivePoolAdminError> {
     let name = match request.command {
         LivePoolAdminCommand::DatasetResize | LivePoolAdminCommand::DatasetDestroy => "name",
         LivePoolAdminCommand::DatasetRename => "old_name",
+        LivePoolAdminCommand::SnapshotCreate
+        | LivePoolAdminCommand::SnapshotDestroy
+        | LivePoolAdminCommand::SnapshotRollback => "target",
         _ => {
             return Err(LivePoolAdminError::malformed(
                 "live-owner volume mutation has no target",
             ))
         }
     };
-    request_arg_str(&request.args, name)?
-        .ok_or_else(|| LivePoolAdminError::malformed(format!("dataset mutation requires {name}")))
+    let target = request_arg_str(&request.args, name)?;
+    if matches!(
+        request.command,
+        LivePoolAdminCommand::SnapshotCreate
+            | LivePoolAdminCommand::SnapshotDestroy
+            | LivePoolAdminCommand::SnapshotRollback
+    ) && target.is_none()
+    {
+        return Ok(None);
+    }
+    let target = target.ok_or_else(|| {
+        LivePoolAdminError::malformed(format!("dataset mutation requires {name}"))
+    })?;
+    if matches!(
+        request.command,
+        LivePoolAdminCommand::SnapshotCreate
+            | LivePoolAdminCommand::SnapshotDestroy
+            | LivePoolAdminCommand::SnapshotRollback
+    ) {
+        let (source, snapshot) = target.rsplit_once('@').ok_or_else(|| {
+            LivePoolAdminError::malformed("volume snapshot target requires <dataset>@<snapshot>")
+        })?;
+        if source.is_empty() || snapshot.is_empty() || source.contains('@') {
+            return Err(LivePoolAdminError::malformed(
+                "volume snapshot target must name one source and one snapshot",
+            ));
+        }
+        return Ok(Some(source));
+    }
+    Ok(Some(target))
 }
 
 #[cfg(feature = "block-volume")]
@@ -1225,6 +1264,47 @@ mod tests {
         .unwrap();
 
         assert!(active.try_lock().is_ok());
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
+    fn volume_snapshot_mutation_targets_source_and_filesystem_requests_delegate() {
+        for command in [
+            LivePoolAdminCommand::SnapshotCreate,
+            LivePoolAdminCommand::SnapshotDestroy,
+            LivePoolAdminCommand::SnapshotRollback,
+        ] {
+            let mut request = LivePoolAdminRequest::new(command, "tank");
+            request.args = LivePoolAdminArgs(
+                [(
+                    "target".to_string(),
+                    LivePoolAdminArg::String("vol@before".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            );
+            assert_eq!(volume_mutation_target(&request).unwrap(), Some("vol"));
+
+            request.args = LivePoolAdminArgs(
+                [(
+                    "target".to_string(),
+                    LivePoolAdminArg::String("vol@snap@nested".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            );
+            assert!(volume_mutation_target(&request).is_err());
+
+            request.args = LivePoolAdminArgs(
+                [(
+                    "name".to_string(),
+                    LivePoolAdminArg::String("before".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            );
+            assert_eq!(volume_mutation_target(&request).unwrap(), None);
+        }
     }
 
     #[cfg(feature = "block-volume")]

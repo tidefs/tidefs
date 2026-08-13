@@ -21,6 +21,7 @@ use tidefs_local_filesystem::{
     SnapshotRetentionReport, SnapshotSummary,
 };
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
+use tidefs_pool_runtime::{PoolRuntime, VolumeSnapshotSummary};
 #[cfg(feature = "remote-snapshot")]
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
@@ -1034,6 +1035,120 @@ fn scan_device_pool_config(
     config
 }
 
+fn parse_volume_snapshot_target(raw: &str) -> Result<(String, String, String), String> {
+    let (pool, path) = raw
+        .split_once('/')
+        .ok_or_else(|| "expected snapshot target in <pool>/<volume>@<snapshot> form".to_string())?;
+    let pool = crate::parser::parse_pool_name(pool)?;
+    let (source, snapshot) = path
+        .rsplit_once('@')
+        .ok_or_else(|| "expected snapshot target in <pool>/<volume>@<snapshot> form".to_string())?;
+    if source.contains('@') || snapshot.contains('/') {
+        return Err("volume snapshot target must name one source and one snapshot".to_string());
+    }
+    let source = crate::parser::parse_dataset_path(source)?;
+    let snapshot = crate::parser::parse_dataset_path(snapshot)?;
+    Ok((pool, format!("{source}@{snapshot}"), source))
+}
+
+enum NamedSnapshotTarget {
+    Filesystem { pool: Option<String>, name: String },
+    Volume { pool: String, target: String },
+}
+
+fn parse_named_snapshot_target(
+    operation: &str,
+    backing_dir: Option<&PathBuf>,
+    operands: &[String],
+) -> NamedSnapshotTarget {
+    if backing_dir.is_none() {
+        if let [target] = operands {
+            let (pool, target, _) = parse_volume_snapshot_target(target)
+                .unwrap_or_else(|error| volume_snapshot_exit(operation, error, false));
+            return NamedSnapshotTarget::Volume { pool, target };
+        }
+    }
+    let (pool, name) = parse_named_snapshot_operands(operation, backing_dir, operands);
+    NamedSnapshotTarget::Filesystem { pool, name }
+}
+
+fn with_offline_volume_snapshot_runtime<T>(
+    pool: &str,
+    devices: &[PathBuf],
+    operation: &str,
+    json: bool,
+    live_args: &LivePoolAdminArgs,
+    run: impl FnOnce(&mut PoolRuntime) -> Result<T, String>,
+) -> T {
+    let config = scan_device_pool_config(pool, devices, operation);
+    super::live_owner::route_or_refuse_active_for_uuid_with_format_and_args(
+        "snapshot",
+        operation,
+        pool,
+        config.pool_uuid,
+        config.state == tidefs_types_pool_label_core::PoolState::Active,
+        json,
+        live_args.clone(),
+    );
+    let lock_dir = PathBuf::from("/run/tidefs/import");
+    let import_owner = match tidefs_pool_import::pool_import_owned(devices, &lock_dir, false, None)
+    {
+        Ok(owner) => owner,
+        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
+            super::live_owner::route_imported_with_format_and_args(
+                "snapshot",
+                operation,
+                pool,
+                pool_uuid,
+                json,
+                live_args.clone(),
+            )
+        }
+        Err(err) => volume_snapshot_exit(operation, format!("pool import failed: {err}"), json),
+    };
+    let metadata_dir = super::offline_pool::metadata_dir("snapshot", operation, &config.pool_uuid);
+    let result = (|| -> Result<T, String> {
+        let mut runtime = PoolRuntime::open_block_devices(
+            &metadata_dir,
+            devices,
+            pool,
+            PoolRedundancyPolicy::from_label_policy(config.redundancy_policy),
+            &StoreOptions::default(),
+        )
+        .map_err(|err| format!("failed to open canonical Pool runtime: {err}"))?;
+        run(&mut runtime)
+    })();
+    let export_result = import_owner
+        .export()
+        .map_err(|err| format!("failed to export Pool after snapshot {operation}: {err}"));
+    match (result, export_result) {
+        (Ok(value), Ok(())) => value,
+        (Err(error), Ok(())) => volume_snapshot_exit(operation, error, json),
+        (Ok(_), Err(error)) => volume_snapshot_exit(operation, error, json),
+        (Err(error), Err(export_error)) => volume_snapshot_exit(
+            operation,
+            format!("{error}; additionally {export_error}"),
+            json,
+        ),
+    }
+}
+
+fn volume_snapshot_exit(operation: &str, error: String, json: bool) -> ! {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": false,
+                "operation": operation,
+                "error": error,
+            })
+        );
+    } else {
+        eprintln!("tidefsctl snapshot {operation}: {error}");
+    }
+    process::exit(1)
+}
+
 #[cfg(feature = "replication-io")]
 fn root_authentication_key() -> RootAuthenticationKey {
     super::root_authentication_key_or_exit("snapshot send")
@@ -1413,8 +1528,17 @@ fn parse_incremental_from_root(
 fn handle_create(args: SnapshotCreateArgs) {
     let _guard = super::authz::require_local_only("snapshot create");
 
-    let (pool, snapshot_name) =
-        parse_named_snapshot_operands("create", args.backing_dir.as_ref(), &args.operands);
+    let target = parse_named_snapshot_target("create", args.backing_dir.as_ref(), &args.operands);
+    let NamedSnapshotTarget::Filesystem {
+        pool,
+        name: snapshot_name,
+    } = target
+    else {
+        let NamedSnapshotTarget::Volume { pool, target } = target else {
+            unreachable!()
+        };
+        return handle_volume_snapshot_create(&pool, &target, args.devices.as_deref());
+    };
     let mut fs = open_filesystem_with_live_args(
         args.backing_dir.as_ref(),
         pool.as_deref(),
@@ -1440,7 +1564,165 @@ fn handle_create(args: SnapshotCreateArgs) {
     }
 }
 
+fn handle_volume_snapshot_create(pool: &str, target: &str, devices: Option<&[PathBuf]>) {
+    let live_args =
+        super::live_owner::live_admin_args([("target", LivePoolAdminArg::String(target.into()))]);
+    let summary = if let Some(devices) = devices.filter(|devices| !devices.is_empty()) {
+        with_offline_volume_snapshot_runtime(
+            pool,
+            devices,
+            "create",
+            false,
+            &live_args,
+            |runtime| {
+                runtime
+                    .create_volume_snapshot(target)
+                    .map_err(|err| err.to_string())
+            },
+        )
+    } else {
+        super::live_owner::route_with_format_and_args("snapshot", "create", pool, false, live_args)
+    };
+    print_volume_snapshot_outcome("created", &summary, false);
+}
+
+fn handle_volume_snapshot_restore(pool: &str, target: &str, devices: Option<&[PathBuf]>) {
+    let live_args =
+        super::live_owner::live_admin_args([("target", LivePoolAdminArg::String(target.into()))]);
+    let result = if let Some(devices) = devices.filter(|devices| !devices.is_empty()) {
+        with_offline_volume_snapshot_runtime(
+            pool,
+            devices,
+            "rollback",
+            false,
+            &live_args,
+            |runtime| {
+                runtime
+                    .restore_volume_snapshot(target)
+                    .map_err(|err| err.to_string())
+            },
+        )
+    } else {
+        super::live_owner::route_with_format_and_args(
+            "snapshot", "rollback", pool, false, live_args,
+        )
+    };
+    println!(
+        "volume snapshot '{}' restored to '{}' (size={} generation={} resize_generation={} snapshot_generation={})",
+        result.snapshot.path,
+        result.snapshot.source_path,
+        result.geometry.capacity_bytes,
+        result.generation,
+        result.resize_generation,
+        result.snapshot_generation,
+    );
+}
+
+fn handle_volume_snapshot_destroy(pool: &str, target: &str, devices: Option<&[PathBuf]>) {
+    let live_args =
+        super::live_owner::live_admin_args([("target", LivePoolAdminArg::String(target.into()))]);
+    let summary = if let Some(devices) = devices.filter(|devices| !devices.is_empty()) {
+        with_offline_volume_snapshot_runtime(
+            pool,
+            devices,
+            "destroy",
+            false,
+            &live_args,
+            |runtime| {
+                runtime
+                    .destroy_volume_snapshot(target)
+                    .map_err(|err| err.to_string())
+            },
+        )
+    } else {
+        super::live_owner::route_with_format_and_args("snapshot", "destroy", pool, false, live_args)
+    };
+    print_volume_snapshot_outcome("logically destroyed", &summary, false);
+}
+
+fn volume_snapshot_line(summary: &VolumeSnapshotSummary) -> String {
+    format!(
+        "volume snapshot '{}' source='{}' kind=volume source_generation={} snapshot_generation={} size={} block_size={}",
+        summary.path,
+        summary.source_path,
+        summary.source_generation,
+        summary.snapshot_generation,
+        summary.geometry.capacity_bytes,
+        summary.geometry.block_size_bytes,
+    )
+}
+
+fn volume_snapshot_json(summary: &VolumeSnapshotSummary) -> serde_json::Value {
+    serde_json::json!({
+        "path": summary.path,
+        "id": summary.snapshot_id.to_string(),
+        "source": summary.source_path,
+        "source_id": summary.source_dataset_id.to_string(),
+        "source_kind": "volume",
+        "source_generation": summary.source_generation,
+        "snapshot_generation": summary.snapshot_generation,
+        "size": summary.geometry.capacity_bytes,
+        "block_size": summary.geometry.block_size_bytes,
+    })
+}
+
+fn print_volume_snapshot_outcome(outcome: &str, summary: &VolumeSnapshotSummary, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "outcome": outcome,
+                "physical_reclaim": false,
+                "snapshot": volume_snapshot_json(summary),
+            })
+        );
+    } else {
+        println!("{} {outcome}", volume_snapshot_line(summary));
+        if outcome == "logically destroyed" {
+            println!("physical reclaim remains pending; no secure-erasure claim is made");
+        }
+    }
+}
+
 fn handle_list(args: SnapshotListArgs) {
+    if args.backing_dir.is_none() && args.devices.as_deref().is_none_or(<[_]>::is_empty) {
+        let pool = args
+            .pool
+            .as_deref()
+            .unwrap_or_else(|| volume_snapshot_exit("list", "pool is required".into(), false));
+        super::live_owner::route_with_args("snapshot", "list", pool, LivePoolAdminArgs::default());
+    }
+
+    let offline_volume_snapshots =
+        if let (Some(pool), Some(devices)) = (args.pool.as_deref(), args.devices.as_deref()) {
+            let (has_filesystem, volume_snapshots) = with_offline_volume_snapshot_runtime(
+                pool,
+                devices,
+                "list",
+                false,
+                &LivePoolAdminArgs::default(),
+                |runtime| {
+                    let has_filesystem = runtime
+                        .dataset_root(tidefs_pool_runtime::ROOT_DATASET_ID)
+                        .is_some_and(|root| {
+                            root.kind == tidefs_pool_runtime::DatasetRootKind::Filesystem
+                        });
+                    runtime
+                        .list_volume_snapshots()
+                        .map(|snapshots| (has_filesystem, snapshots))
+                        .map_err(|err| err.to_string())
+                },
+            );
+            if !has_filesystem {
+                print_snapshot_list(Vec::new(), volume_snapshots);
+                return;
+            }
+            Some(volume_snapshots)
+        } else {
+            None
+        };
+
     let fs = open_filesystem(
         args.backing_dir.as_ref(),
         args.pool.as_deref(),
@@ -1454,14 +1736,31 @@ fn handle_list(args: SnapshotListArgs) {
             .cmp(&b.created_at_generation)
             .then_with(|| a.name.cmp(&b.name))
     });
+    let volume_snapshots = offline_volume_snapshots.unwrap_or_else(|| {
+        fs.list_volume_snapshot_datasets().unwrap_or_else(|err| {
+            volume_snapshot_exit(
+                "list",
+                format!("failed to list volume snapshots: {err}"),
+                false,
+            )
+        })
+    });
+    print_snapshot_list(snapshots, volume_snapshots);
+}
 
-    if snapshots.is_empty() {
+fn print_snapshot_list(
+    filesystem_snapshots: Vec<SnapshotDescriptor>,
+    volume_snapshots: Vec<VolumeSnapshotSummary>,
+) {
+    if filesystem_snapshots.is_empty() && volume_snapshots.is_empty() {
         println!("no snapshots");
         return;
     }
-
-    for descriptor in snapshots {
+    for descriptor in filesystem_snapshots {
         println!("{}", snapshot_descriptor_line(&descriptor));
+    }
+    for summary in volume_snapshots {
+        println!("{}", volume_snapshot_line(&summary));
     }
 }
 
@@ -1834,8 +2133,17 @@ fn print_scheduled_prune_control(action: &str, pool: &str) {
 fn handle_destroy(args: SnapshotDestroyArgs) {
     let _guard = super::authz::require_local_only("snapshot destroy");
 
-    let (pool, snapshot_name) =
-        parse_named_snapshot_operands("destroy", args.backing_dir.as_ref(), &args.operands);
+    let target = parse_named_snapshot_target("destroy", args.backing_dir.as_ref(), &args.operands);
+    let NamedSnapshotTarget::Filesystem {
+        pool,
+        name: snapshot_name,
+    } = target
+    else {
+        let NamedSnapshotTarget::Volume { pool, target } = target else {
+            unreachable!()
+        };
+        return handle_volume_snapshot_destroy(&pool, &target, args.devices.as_deref());
+    };
     let mut fs = open_filesystem_with_live_args(
         args.backing_dir.as_ref(),
         pool.as_deref(),
@@ -1867,8 +2175,17 @@ fn handle_destroy(args: SnapshotDestroyArgs) {
 fn handle_rollback(args: SnapshotRollbackArgs) {
     let _guard = super::authz::require_local_only("snapshot rollback");
 
-    let (pool, snapshot_name) =
-        parse_named_snapshot_operands("rollback", args.backing_dir.as_ref(), &args.operands);
+    let target = parse_named_snapshot_target("rollback", args.backing_dir.as_ref(), &args.operands);
+    let NamedSnapshotTarget::Filesystem {
+        pool,
+        name: snapshot_name,
+    } = target
+    else {
+        let NamedSnapshotTarget::Volume { pool, target } = target else {
+            unreachable!()
+        };
+        return handle_volume_snapshot_restore(&pool, &target, args.devices.as_deref());
+    };
     let mut fs = open_filesystem_with_live_args(
         args.backing_dir.as_ref(),
         pool.as_deref(),
@@ -2353,6 +2670,27 @@ mod tests {
             args.devices,
             Some(vec![PathBuf::from("/dev/sdb"), PathBuf::from("/dev/sdc")])
         );
+    }
+
+    #[test]
+    fn volume_snapshot_target_uses_canonical_shared_command_shape() {
+        let target = parse_volume_snapshot_target("tank/vol@before").unwrap();
+        assert_eq!(target, ("tank".into(), "vol@before".into(), "vol".into()));
+
+        match parse_named_snapshot_target("create", None, &["tank/vol@before".into()]) {
+            NamedSnapshotTarget::Volume { pool, target } => {
+                assert_eq!(pool, "tank");
+                assert_eq!(target, "vol@before");
+            }
+            NamedSnapshotTarget::Filesystem { .. } => panic!("expected volume snapshot target"),
+        }
+    }
+
+    #[test]
+    fn volume_snapshot_target_refuses_ambiguous_or_nested_snapshot_names() {
+        assert!(parse_volume_snapshot_target("tank/vol").is_err());
+        assert!(parse_volume_snapshot_target("tank/vol@snap/nested").is_err());
+        assert!(parse_volume_snapshot_target("tank/vol@snap@nested").is_err());
     }
 
     #[test]
