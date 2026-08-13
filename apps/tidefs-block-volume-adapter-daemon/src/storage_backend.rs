@@ -293,7 +293,7 @@ impl BlockVolumeStorageBackend for BlockVolumeFileImage {
 }
 
 enum PoolVolumeOwner {
-    Standalone(tidefs_pool_runtime::PoolRuntime),
+    Standalone(Box<tidefs_pool_runtime::PoolRuntime>),
     Mounted(tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem),
 }
 
@@ -318,7 +318,7 @@ impl PoolVolumeBackend {
         let volume = runtime.open_volume(path).map_err(map_pool_runtime_error)?;
         let geometry = BlockDeviceGeometry::from_pool(volume.geometry())?;
         Ok(Self {
-            owner: PoolVolumeOwner::Standalone(runtime),
+            owner: PoolVolumeOwner::Standalone(Box::new(runtime)),
             volume,
             geometry,
             read_only,
