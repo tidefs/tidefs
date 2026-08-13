@@ -1266,6 +1266,9 @@ impl VfsLocalFileSystem {
                     LivePoolAdminCommand::DatasetList => {
                         self.live_dataset_list(pool, &args, wants_json)
                     }
+                    LivePoolAdminCommand::DatasetResize => {
+                        self.live_dataset_resize(pool, &args, wants_json)
+                    }
                     LivePoolAdminCommand::DatasetRename => self.live_dataset_rename(pool, &args),
                     LivePoolAdminCommand::DatasetDestroy => {
                         self.live_dataset_destroy(pool, &args, wants_json)
@@ -1325,6 +1328,7 @@ impl VfsLocalFileSystem {
             | LivePoolAdminCommand::PoolDestroy
             | LivePoolAdminCommand::PoolSet
             | LivePoolAdminCommand::DatasetCreate
+            | LivePoolAdminCommand::DatasetResize
             | LivePoolAdminCommand::DatasetRename
             | LivePoolAdminCommand::DatasetDestroy
             | LivePoolAdminCommand::DatasetUpgrade
@@ -1661,6 +1665,46 @@ impl VfsLocalFileSystem {
         live_admin_ok_text(out)
     }
 
+    fn live_dataset_resize(
+        &self,
+        pool: &str,
+        args: &Value,
+        wants_json: bool,
+    ) -> LivePoolAdminResponse {
+        let name = match live_admin_arg(args, "name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let Some(capacity_bytes) = args.get("size").and_then(Value::as_u64) else {
+            return live_admin_error(2, "dataset resize: --size <bytes> is required");
+        };
+
+        let mut fs = self.fs.borrow_mut();
+        let result = match fs.resize_volume_dataset(name, capacity_bytes) {
+            Ok(result) => result,
+            Err(err) => return live_admin_error(1, format!("dataset resize: {err}")),
+        };
+        if wants_json {
+            return live_admin_ok_json(json!({
+                "ok": true,
+                "operation": "resize",
+                "pool": pool,
+                "dataset": name,
+                "size": result.geometry.capacity_bytes,
+                "block_size": result.geometry.block_size_bytes,
+                "generation": result.generation,
+                "resize_generation": result.resize_generation,
+            }));
+        }
+        live_admin_ok_text(format!(
+            "dataset '{name}' resized in imported pool '{pool}'\n  size={}  block_size={}  generation={}  resize_generation={}",
+            result.geometry.capacity_bytes,
+            result.geometry.block_size_bytes,
+            result.generation,
+            result.resize_generation,
+        ))
+    }
+
     fn live_dataset_rename(&self, pool: &str, args: &Value) -> LivePoolAdminResponse {
         let old_name = match live_admin_arg(args, "old_name") {
             Ok(value) => value,
@@ -1771,6 +1815,41 @@ impl VfsLocalFileSystem {
                     hazards.join(", ")
                 ),
             );
+        }
+
+        if fs
+            .dataset_catalog()
+            .get_by_id(
+                &fs.dataset_catalog()
+                    .lookup(name)
+                    .expect("existing dataset retains identity"),
+            )
+            .is_some_and(|(_, _, dataset_type, _, _, _)| dataset_type == DatasetType::Volume)
+        {
+            match fs.destroy_volume_dataset(name) {
+                Ok(_) => {
+                    if wants_json {
+                        return live_admin_ok_json(json!({
+                            "ok": true,
+                            "operation": "destroy",
+                            "pool": pool,
+                            "dataset": name,
+                            "force": force,
+                            "destroyed_entries": 1,
+                            "child_count": child_count,
+                            "snapshot_count": snapshot_count,
+                            "live_mount": live_mount,
+                            "physical_reclaim": false,
+                        }));
+                    }
+                    return live_admin_ok_text(format!(
+                        "dataset '{name}' logically destroyed; physical reclaim remains pending"
+                    ));
+                }
+                Err(err) => {
+                    return live_admin_error(1, format!("dataset destroy: {err}"));
+                }
+            }
         }
 
         let destroyed_entries = if force {
@@ -6539,6 +6618,51 @@ mod tests {
         assert_eq!(volume.dataset_id(), id);
         assert_eq!(volume.geometry().capacity_bytes, 8192);
         assert_eq!(volume.geometry().block_size_bytes, 4096);
+    }
+
+    #[test]
+    fn live_volume_lifecycle_resizes_then_destroys_canonical_root() {
+        let (engine, _td) = temp_fs();
+        let created = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "volume0",
+                "parent": "root",
+                "type": "volume",
+                "size": 8192,
+                "sync": "local",
+            }),
+        );
+        assert_eq!(created["ok"], true, "create response: {created}");
+
+        let resized =
+            live_dataset_admin(&engine, "resize", json!({"name": "volume0", "size": 16384}));
+        assert_eq!(resized["ok"], true, "resize response: {resized}");
+        assert!(resized["text"].as_str().is_some_and(|text| {
+            text.contains("size=16384") && text.contains("resize_generation=2")
+        }));
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .open_volume_dataset("volume0")
+                .expect("resized volume")
+                .geometry()
+                .capacity_bytes,
+            16384
+        );
+
+        let destroyed = live_dataset_admin(
+            &engine,
+            "destroy",
+            json!({"name": "volume0", "force": false}),
+        );
+        assert_eq!(destroyed["ok"], true, "destroy response: {destroyed}");
+        assert!(destroyed["text"].as_str().is_some_and(|text| {
+            text.contains("logically destroyed") && text.contains("physical reclaim")
+        }));
+        assert!(engine.fs.borrow().open_volume_dataset("volume0").is_err());
     }
 
     #[test]

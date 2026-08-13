@@ -362,14 +362,22 @@ fn dispatch_request(
             shutdown,
         ),
         LivePoolAdminCommand::PoolDestroy => pool_destroy_refused(&request, manifest),
+        #[cfg(feature = "block-volume")]
+        LivePoolAdminCommand::DatasetResize
+        | LivePoolAdminCommand::DatasetRename
+        | LivePoolAdminCommand::DatasetDestroy => {
+            volume_lifecycle_mutation(&request, engine, block_export)
+        }
+        #[cfg(not(feature = "block-volume"))]
+        LivePoolAdminCommand::DatasetResize
+        | LivePoolAdminCommand::DatasetRename
+        | LivePoolAdminCommand::DatasetDestroy => delegate_admin_request(&request, engine),
         LivePoolAdminCommand::PoolGet
         | LivePoolAdminCommand::PoolSet
         | LivePoolAdminCommand::PoolListProps
         | LivePoolAdminCommand::PoolIntegrityCheck
         | LivePoolAdminCommand::DatasetCreate
         | LivePoolAdminCommand::DatasetList
-        | LivePoolAdminCommand::DatasetRename
-        | LivePoolAdminCommand::DatasetDestroy
         | LivePoolAdminCommand::DatasetSetStrategy
         | LivePoolAdminCommand::DatasetUpgrade
         | LivePoolAdminCommand::DatasetGet
@@ -405,6 +413,57 @@ fn dispatch_request(
 struct ActiveBlockExport {
     volume: String,
     shutdown: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "block-volume")]
+fn volume_lifecycle_mutation(
+    request: &LivePoolAdminRequest,
+    engine: &LiveOwnerEngine,
+    block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+) -> LivePoolAdminResponse {
+    let target = match volume_mutation_target(request) {
+        Ok(target) => target,
+        Err(error) => return live_admin_typed_error(error),
+    };
+    if let Err(message) = ensure_volume_mutation_allowed(block_export, target) {
+        let (_, operation) = request.command.parts();
+        return LivePoolAdminResponse::error(1, format!("dataset {operation} refused: {message}"));
+    }
+    delegate_admin_request(request, engine)
+}
+
+#[cfg(feature = "block-volume")]
+fn ensure_volume_mutation_allowed(
+    block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    target: &str,
+) -> Result<(), String> {
+    let active = block_export
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if active
+        .as_ref()
+        .is_some_and(|export| export.volume == target)
+    {
+        return Err(format!(
+            "volume '{target}' is actively exported by this live owner; close the block export before mutation"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "block-volume")]
+fn volume_mutation_target(request: &LivePoolAdminRequest) -> Result<&str, LivePoolAdminError> {
+    let name = match request.command {
+        LivePoolAdminCommand::DatasetResize | LivePoolAdminCommand::DatasetDestroy => "name",
+        LivePoolAdminCommand::DatasetRename => "old_name",
+        _ => {
+            return Err(LivePoolAdminError::malformed(
+                "live-owner volume mutation has no target",
+            ))
+        }
+    };
+    request_arg_str(&request.args, name)?
+        .ok_or_else(|| LivePoolAdminError::malformed(format!("dataset mutation requires {name}")))
 }
 
 #[cfg(feature = "block-volume")]
@@ -1120,6 +1179,19 @@ mod tests {
         stop_active_block_export(&active);
 
         assert!(shutdown.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
+    fn active_export_refuses_resize_rename_and_destroy_of_that_volume() {
+        let active = Arc::new(Mutex::new(Some(ActiveBlockExport {
+            volume: "vol".to_string(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        })));
+        let error = ensure_volume_mutation_allowed(&active, "vol").unwrap_err();
+        assert!(error.contains("actively exported"));
+        assert!(error.contains("close the block export"));
+        assert!(ensure_volume_mutation_allowed(&active, "other").is_ok());
     }
 
     #[cfg(feature = "block-volume")]

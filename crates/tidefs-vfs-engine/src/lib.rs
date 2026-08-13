@@ -1917,6 +1917,7 @@ pub enum LivePoolAdminCommand {
     PoolIntegrityCheck,
     DatasetCreate,
     DatasetList,
+    DatasetResize,
     DatasetRename,
     DatasetDestroy,
     DatasetSetStrategy,
@@ -1954,6 +1955,7 @@ const LIVE_POOL_ADMIN_COMMAND_ROUTES: &[(LivePoolAdminCommand, &str, &str)] = &[
     ),
     (LivePoolAdminCommand::DatasetCreate, "dataset", "create"),
     (LivePoolAdminCommand::DatasetList, "dataset", "list"),
+    (LivePoolAdminCommand::DatasetResize, "dataset", "resize"),
     (LivePoolAdminCommand::DatasetRename, "dataset", "rename"),
     (LivePoolAdminCommand::DatasetDestroy, "dataset", "destroy"),
     (

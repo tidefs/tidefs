@@ -46,6 +46,8 @@ pub enum DatasetCommand {
     Create(DatasetCreateArgs),
     /// List datasets in the pool-wide catalog
     List(DatasetListArgs),
+    /// Resize one Pool-backed block volume
+    Resize(DatasetResizeArgs),
     /// Destroy a dataset, removing its catalog entry
     Destroy(DatasetDestroyArgs),
     /// Rename a dataset, preserving its stable DatasetId
@@ -241,6 +243,24 @@ pub struct DatasetListArgs {
     /// Required when --cluster is set.
     #[arg(long = "cluster-node-id")]
     pub cluster_node_id: Option<u64>,
+}
+/// `dataset resize <pool>/<volume> --size <bytes> [--devices <dev>...]`
+#[derive(Args, Debug)]
+pub struct DatasetResizeArgs {
+    /// Volume target in <pool>/<name> form
+    pub target: String,
+
+    /// New exact committed capacity in bytes
+    #[arg(long = "size", value_name = "BYTES")]
+    pub size: u64,
+
+    /// Block devices for offline/not-yet-imported volume access
+    #[arg(short = 'd', long = "devices", num_args = 1..)]
+    pub devices: Option<Vec<PathBuf>>,
+
+    /// Emit machine-parseable JSON
+    #[arg(long = "json")]
+    pub json: bool,
 }
 /// `dataset rename <pool> <old-name> <new-name> [--devices <dev>...]`
 #[derive(Args, Debug)]
@@ -459,6 +479,7 @@ pub fn handle_dataset(cmd: DatasetCommand) {
     match cmd {
         DatasetCommand::Create(args) => handle_create(args),
         DatasetCommand::List(args) => handle_list(args),
+        DatasetCommand::Resize(args) => handle_resize(args),
         DatasetCommand::Destroy(args) => handle_destroy(args),
         DatasetCommand::Rename(args) => handle_rename(args),
         DatasetCommand::SetStrategy(args) => handle_set_strategy(args),
@@ -1346,6 +1367,59 @@ fn handle_list(args: DatasetListArgs) {
     let rows = dataset_rows_from_catalog(&pool, catalog, args.dataset_type, capacity);
     print_dataset_rows(Some(&pool), &rows, args.json);
 }
+
+fn handle_resize(args: DatasetResizeArgs) {
+    let _guard = super::authz::require_local_only("dataset resize");
+    let target = parse_target_or_exit(&args.target, "resize", args.json);
+    if target.dataset == "root" {
+        exit_dataset_error("resize", "'root' dataset is not a volume", args.json);
+    }
+    if args.size == 0 || args.size % 4096 != 0 {
+        exit_dataset_error(
+            "resize",
+            "--size must be nonzero and aligned to 4096 bytes",
+            args.json,
+        );
+    }
+
+    let mut fs = open_filesystem_with_live_args(
+        &target.pool,
+        args.devices.as_deref(),
+        "resize",
+        RecoveryPolicy::default(),
+        args.json,
+        super::live_owner::live_admin_args([
+            ("name", LivePoolAdminArg::String(target.dataset.clone())),
+            ("size", LivePoolAdminArg::U64(args.size)),
+        ]),
+    );
+    let result = fs
+        .resize_volume_dataset(&target.dataset, args.size)
+        .unwrap_or_else(|err| exit_dataset_error("resize", err.to_string(), args.json));
+    if args.json {
+        print_json_or_exit(serde_json::json!({
+            "ok": true,
+            "operation": "resize",
+            "pool": target.pool,
+            "dataset": target.dataset,
+            "size": result.geometry.capacity_bytes,
+            "block_size": result.geometry.block_size_bytes,
+            "generation": result.generation,
+            "resize_generation": result.resize_generation,
+        }));
+    } else {
+        println!(
+            "dataset '{}' resized in pool '{}'\n  size={}  block_size={}  generation={}  resize_generation={}",
+            target.dataset,
+            target.pool,
+            result.geometry.capacity_bytes,
+            result.geometry.block_size_bytes,
+            result.generation,
+            result.resize_generation,
+        );
+    }
+}
+
 fn handle_rename(args: DatasetRenameArgs) {
     let _guard = super::authz::require_local_only("dataset rename");
 
@@ -2159,6 +2233,38 @@ fn handle_destroy(args: DatasetDestroyArgs) {
     .unwrap_or_else(|err| exit_dataset_error("destroy", err, args.json));
     if let Err(err) = require_destroy_admission(&name, &admission, args.force) {
         exit_dataset_error("destroy", err, args.json);
+    }
+
+    let dataset_id = fs
+        .dataset_catalog()
+        .lookup(&name)
+        .expect("existing dataset retains identity");
+    let is_volume = fs
+        .dataset_catalog()
+        .get_by_id(&dataset_id)
+        .is_some_and(|(_, _, dataset_type, _, _, _)| dataset_type == DatasetType::Volume);
+    if is_volume {
+        fs.destroy_volume_dataset(&name)
+            .unwrap_or_else(|err| exit_dataset_error("destroy", err.to_string(), args.json));
+        if args.json {
+            print_json_or_exit(serde_json::json!({
+                "ok": true,
+                "operation": "destroy",
+                "pool": target.pool,
+                "dataset": name,
+                "force": args.force,
+                "destroyed_entries": 1,
+                "physical_reclaim": false,
+                "admission": {
+                    "children": admission.child_count,
+                    "snapshots": admission.snapshot_count,
+                    "live_mount": admission.live_mount,
+                },
+            }));
+        } else {
+            println!("dataset '{name}' logically destroyed; physical reclaim remains pending");
+        }
+        return;
     }
 
     let catalog = fs.dataset_catalog_mut().unwrap_or_else(|err| {

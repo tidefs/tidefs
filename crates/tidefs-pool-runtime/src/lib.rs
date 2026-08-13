@@ -528,6 +528,129 @@ impl PoolRuntime {
         Ok(geometry)
     }
 
+    /// Commit new exact geometry for one named volume.
+    ///
+    /// Shrink rewrites the sparse map before the new volume root becomes
+    /// reachable. Every chunk beyond the new end is removed, and bytes after
+    /// a partial final chunk are zeroed so a later grow cannot expose the
+    /// discarded tail. Grow changes only committed geometry; newly admitted
+    /// sparse ranges therefore read as zeroes.
+    pub fn resize_volume(&mut self, path: &str, capacity_bytes: u64) -> Result<VolumeResizeResult> {
+        self.ensure_publishable()?;
+        if self.pending_metadata.is_some() {
+            return Err(PoolRuntimeError::CorruptRoot(
+                "pending metadata must publish before volume resize",
+            ));
+        }
+
+        let geometry = VolumeGeometry::new(capacity_bytes)?;
+        let volume = self.open_volume(path)?;
+        if geometry.capacity_bytes == volume.root.geometry.capacity_bytes {
+            return Err(PoolRuntimeError::InvalidVolume(
+                "requested capacity already matches committed capacity",
+            ));
+        }
+
+        let generation = next_generation(volume.root.generation)?;
+        let resize_generation = next_generation(volume.root.resize_generation)?;
+        let mut map_root = volume.root.map_root;
+        if geometry.capacity_bytes < volume.root.geometry.capacity_bytes {
+            let retained_chunk_count = geometry.capacity_bytes.div_ceil(VOLUME_CHUNK_SIZE as u64);
+            map_root = truncate_volume_map(
+                &mut self.pool,
+                volume.dataset_id,
+                map_root,
+                VOLUME_MAP_ROOT_LEVEL,
+                0,
+                retained_chunk_count,
+            )?;
+
+            let tail_bytes = usize::try_from(geometry.capacity_bytes % VOLUME_CHUNK_SIZE as u64)
+                .map_err(|_| PoolRuntimeError::Bounds)?;
+            if tail_bytes != 0 {
+                let final_chunk_index = retained_chunk_count
+                    .checked_sub(1)
+                    .ok_or(PoolRuntimeError::Bounds)?;
+                let truncated_root = VolumeRoot {
+                    map_root,
+                    ..volume.root.clone()
+                };
+                if let Some(mut bytes) = load_volume_chunk(
+                    &self.pool,
+                    volume.dataset_id,
+                    &truncated_root,
+                    final_chunk_index,
+                )? {
+                    bytes[tail_bytes..].fill(0);
+                    let replacement = if bytes.iter().all(|byte| *byte == 0) {
+                        None
+                    } else {
+                        let digest = *blake3::hash(&bytes).as_bytes();
+                        let reference = ImmutableObjectRef {
+                            object_key: volume_chunk_key(
+                                volume.dataset_id,
+                                final_chunk_index,
+                                generation,
+                                digest,
+                            ),
+                            digest,
+                        };
+                        self.pool
+                            .put(DeviceIoClass::Data, reference.object_key, &bytes)?;
+                        Some(reference)
+                    };
+                    map_root = update_volume_map(
+                        &mut self.pool,
+                        volume.dataset_id,
+                        map_root,
+                        VOLUME_MAP_ROOT_LEVEL,
+                        final_chunk_index,
+                        replacement,
+                    )?;
+                }
+            }
+        }
+
+        let next_root = VolumeRoot {
+            geometry,
+            generation,
+            resize_generation,
+            snapshot_generation: volume.root.snapshot_generation,
+            map_root,
+        };
+        self.publish_dataset_root(
+            volume.dataset_id,
+            DatasetRootKind::Volume,
+            next_root.generation,
+            &encode_volume_root(&next_root),
+        )?;
+        Ok(VolumeResizeResult {
+            geometry,
+            generation,
+            resize_generation,
+        })
+    }
+
+    /// Atomically remove one volume's catalog entry and typed root.
+    ///
+    /// Immutable objects made unreachable by this transition are left for
+    /// the separate physical-reclaim authority.
+    pub fn destroy_volume(&mut self, path: &str) -> Result<DatasetId> {
+        self.ensure_publishable()?;
+        if self.pending_metadata.is_some() {
+            return Err(PoolRuntimeError::CorruptRoot(
+                "pending metadata must publish before volume destroy",
+            ));
+        }
+        let volume = self.open_volume(path)?;
+        let mut next = self.root.clone();
+        next.catalog.destroy(path)?;
+        next.dataset_roots.remove(&volume.dataset_id);
+        next.generation = next_generation(next.generation)?;
+        self.publish_root(next)?;
+        Ok(volume.dataset_id)
+    }
+
     /// Open a named volume as a detached dataset handle. The Pool runtime
     /// remains with its owner, so several filesystem and volume handles can be
     /// open while the owner serializes durable publication.
@@ -618,6 +741,14 @@ pub struct VolumeGeometry {
     pub physical_sector_size: u32,
     pub optimal_io_size: u32,
     pub discard_granularity_bytes: u32,
+}
+
+/// Committed result of a named-volume resize.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VolumeResizeResult {
+    pub geometry: VolumeGeometry,
+    pub generation: u64,
+    pub resize_generation: u64,
 }
 
 impl VolumeGeometry {
@@ -1084,6 +1215,65 @@ fn update_volume_map(
             }
         }
     }
+    if node.children.is_empty() {
+        return Ok(None);
+    }
+    let bytes = encode_volume_map_node(&node);
+    let digest = *blake3::hash(&bytes).as_bytes();
+    let reference = ImmutableObjectRef {
+        object_key: volume_map_node_key(id, level, digest),
+        digest,
+    };
+    pool.put(DeviceIoClass::Data, reference.object_key, &bytes)?;
+    Ok(Some(reference))
+}
+
+fn truncate_volume_map(
+    pool: &mut Pool,
+    id: DatasetId,
+    current: Option<ImmutableObjectRef>,
+    level: u8,
+    prefix: u64,
+    retained_chunk_count: u64,
+) -> Result<Option<ImmutableObjectRef>> {
+    let Some(reference) = current else {
+        return Ok(None);
+    };
+    let mut node = load_volume_map_node(pool, id, reference, level)?;
+    let shift = u32::from(level) * 8;
+    let mut retained = BTreeMap::new();
+    for (digit, child) in node.children {
+        let child_prefix = prefix | (u64::from(digit) << shift);
+        if level == 0 {
+            if child_prefix < retained_chunk_count {
+                retained.insert(digit, child);
+            }
+            continue;
+        }
+
+        let subtree_span = 1_u64 << shift;
+        if child_prefix >= retained_chunk_count {
+            continue;
+        }
+        let child_end = child_prefix
+            .checked_add(subtree_span)
+            .ok_or(PoolRuntimeError::Bounds)?;
+        if child_end <= retained_chunk_count {
+            retained.insert(digit, child);
+            continue;
+        }
+        if let Some(rewritten) = truncate_volume_map(
+            pool,
+            id,
+            Some(child),
+            level - 1,
+            child_prefix,
+            retained_chunk_count,
+        )? {
+            retained.insert(digit, rewritten);
+        }
+    }
+    node.children = retained;
     if node.children.is_empty() {
         return Ok(None);
     }
@@ -1568,6 +1758,91 @@ mod tests {
         let owner = reopen(owner);
         let volume = owner.open_volume("vol").unwrap();
         assert_eq!(volume.read_blocks(&owner, 2, 1).unwrap(), vec![0; 4096]);
+    }
+
+    #[test]
+    fn volume_resize_shrink_regrow_preserves_prefix_and_zeroes_removed_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        create_volume(&mut owner, "vol", 8);
+        let mut volume = owner.open_volume("vol").unwrap();
+        let blocks_per_chunk = VOLUME_CHUNK_SIZE / 4096;
+        volume.write_blocks(&owner, 0, &vec![0x11; 4096]).unwrap();
+        volume
+            .write_blocks(&owner, blocks_per_chunk as u64 + 4, &vec![0x22; 4096])
+            .unwrap();
+        volume
+            .write_blocks(&owner, 2 * blocks_per_chunk as u64, &vec![0x33; 4096])
+            .unwrap();
+        volume.flush(&mut owner).unwrap();
+
+        let shrink_bytes = VOLUME_CHUNK_SIZE as u64 + 4096;
+        let result = owner.resize_volume("vol", shrink_bytes).unwrap();
+        assert_eq!(result.geometry.capacity_bytes, shrink_bytes);
+        assert_eq!(result.resize_generation, 2);
+
+        let owner = reopen(owner);
+        let volume = owner.open_volume("vol").unwrap();
+        assert_eq!(volume.geometry().capacity_bytes, shrink_bytes);
+        assert_eq!(volume.read_blocks(&owner, 0, 1).unwrap(), vec![0x11; 4096]);
+        assert!(matches!(
+            volume.read_blocks(&owner, blocks_per_chunk as u64 + 1, 1),
+            Err(PoolRuntimeError::Bounds)
+        ));
+
+        let mut owner = owner;
+        let result = owner.resize_volume("vol", 4 * 1024 * 1024).unwrap();
+        assert_eq!(result.resize_generation, 3);
+        let owner = reopen(owner);
+        let volume = owner.open_volume("vol").unwrap();
+        assert_eq!(volume.read_blocks(&owner, 0, 1).unwrap(), vec![0x11; 4096]);
+        assert_eq!(
+            volume
+                .read_blocks(&owner, blocks_per_chunk as u64 + 4, 1)
+                .unwrap(),
+            vec![0; 4096]
+        );
+        assert_eq!(
+            volume
+                .read_blocks(&owner, 2 * blocks_per_chunk as u64, 1)
+                .unwrap(),
+            vec![0; 4096]
+        );
+    }
+
+    #[test]
+    fn volume_resize_refuses_noop_invalid_and_non_volume_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        create_volume(&mut owner, "vol", 9);
+        assert!(matches!(
+            owner.resize_volume("vol", 4 * 1024 * 1024),
+            Err(PoolRuntimeError::InvalidVolume(
+                "requested capacity already matches committed capacity"
+            ))
+        ));
+        assert!(matches!(
+            owner.resize_volume("vol", 1),
+            Err(PoolRuntimeError::InvalidVolume(
+                "capacity must be aligned to 4096 bytes"
+            ))
+        ));
+    }
+
+    #[test]
+    fn volume_destroy_removes_catalog_and_typed_root_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        let id = create_volume(&mut owner, "vol", 10);
+
+        assert_eq!(owner.destroy_volume("vol").unwrap(), id);
+        assert!(owner.dataset_catalog().lookup("vol").is_err());
+        assert!(owner.dataset_root(id).is_none());
+
+        let owner = reopen(owner);
+        assert!(owner.dataset_catalog().lookup("vol").is_err());
+        assert!(owner.dataset_root(id).is_none());
+        assert!(owner.open_volume("vol").is_err());
     }
 
     #[test]
