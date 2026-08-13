@@ -425,21 +425,37 @@ fn volume_lifecycle_mutation(
         Ok(target) => target,
         Err(error) => return live_admin_typed_error(error),
     };
-    if let Err(message) = ensure_volume_mutation_allowed(block_export, target) {
-        let (_, operation) = request.command.parts();
-        return LivePoolAdminResponse::error(1, format!("dataset {operation} refused: {message}"));
+    match with_volume_mutation_admission(block_export, target, || {
+        delegate_admin_request(request, engine)
+    }) {
+        Ok(response) => response,
+        Err(message) => {
+            let (_, operation) = request.command.parts();
+            LivePoolAdminResponse::error(1, format!("dataset {operation} refused: {message}"))
+        }
     }
-    delegate_admin_request(request, engine)
+}
+
+#[cfg(feature = "block-volume")]
+fn with_volume_mutation_admission<T>(
+    block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    target: &str,
+    mutation: impl FnOnce() -> T,
+) -> Result<T, String> {
+    let export_admission = block_export
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ensure_volume_mutation_allowed(&export_admission, target)?;
+    let result = mutation();
+    drop(export_admission);
+    Ok(result)
 }
 
 #[cfg(feature = "block-volume")]
 fn ensure_volume_mutation_allowed(
-    block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    active: &Option<ActiveBlockExport>,
     target: &str,
 ) -> Result<(), String> {
-    let active = block_export
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if active
         .as_ref()
         .is_some_and(|export| export.volume == target)
@@ -1183,15 +1199,32 @@ mod tests {
 
     #[cfg(feature = "block-volume")]
     #[test]
-    fn active_export_refuses_resize_rename_and_destroy_of_that_volume() {
+    fn volume_mutation_admission_refuses_active_target() {
         let active = Arc::new(Mutex::new(Some(ActiveBlockExport {
             volume: "vol".to_string(),
             shutdown: Arc::new(AtomicBool::new(false)),
         })));
+        let active = active.lock().unwrap();
         let error = ensure_volume_mutation_allowed(&active, "vol").unwrap_err();
         assert!(error.contains("actively exported"));
         assert!(error.contains("close the block export"));
         assert!(ensure_volume_mutation_allowed(&active, "other").is_ok());
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
+    fn volume_mutation_admission_stays_locked_through_delegation() {
+        let active = Arc::new(Mutex::new(None));
+
+        with_volume_mutation_admission(&active, "vol", || {
+            assert!(matches!(
+                active.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+        })
+        .unwrap();
+
+        assert!(active.try_lock().is_ok());
     }
 
     #[cfg(feature = "block-volume")]

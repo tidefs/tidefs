@@ -1827,6 +1827,30 @@ mod tests {
                 "capacity must be aligned to 4096 bytes"
             ))
         ));
+        owner
+            .create_dataset_with_root(
+                "filesystem",
+                DatasetId::from_bytes([10; 16]),
+                DatasetType::Filesystem,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+                1,
+                b"filesystem-root",
+            )
+            .unwrap();
+        let non_volume = owner.resize_volume("filesystem", 8 * 1024 * 1024);
+        assert!(
+            matches!(
+                non_volume,
+                Err(PoolRuntimeError::WrongRootType {
+                    expected: DatasetRootKind::Volume,
+                    actual: DatasetRootKind::Filesystem,
+                    ..
+                })
+            ),
+            "unexpected non-volume resize result: {non_volume:?}"
+        );
     }
 
     #[test]
