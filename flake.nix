@@ -262,14 +262,12 @@
             };
             cargoBuildFlags = [
               "-p" "tidefsctl"
-              "-p" "tidefs-block-volume-adapter-daemon"
               "-p" "tidefs-xtask"
               "--features" "tidefsctl/block-volume"
               "--bins"
             ];
             workspaceBins = [
               "tidefsctl"
-              "tidefs-block-volume-adapter-daemon"
               "tidefs-xtask"
             ];
           };
