@@ -80,18 +80,25 @@ pub(crate) fn persist_state_with_runtime_at_transaction(
         root_authentication_key,
     )?;
     let bytes = encode_root_commit(&signed);
-    let snapshot_roots: Vec<_> = state
+    let mut snapshot_roots = Vec::new();
+    for record in state
         .snapshots
         .values()
         .filter(|record| crate::snapshot::snapshot_record_retains_data(record))
-        .map(|record| {
-            (
-                crate::snapshot::snapshot_record_dataset_id(record),
-                record.root.generation,
-                encode_root_commit(&crate::recovery::root_commit_from_summary(&record.root)),
-            )
-        })
-        .collect();
+    {
+        let dataset_id = crate::snapshot::snapshot_record_dataset_id(record);
+        let root = crate::snapshot::snapshot_record_typed_root(record)?;
+        if runtime.dataset_root(dataset_id).is_some() {
+            let stored = runtime.load_snapshot_root(dataset_id)?;
+            if stored != root {
+                return Err(FileSystemError::CorruptState {
+                    reason: "canonical Pool snapshot root differs from filesystem snapshot state",
+                });
+            }
+        } else {
+            snapshot_roots.push((dataset_id, root.snapshot_generation, root.encode()));
+        }
+    }
     let mut updates = Vec::with_capacity(snapshot_roots.len().saturating_add(1));
     updates.push(DatasetRootUpdate {
         dataset_id: tidefs_pool_runtime::ROOT_DATASET_ID,
@@ -132,7 +139,8 @@ pub(crate) fn prepare_state_with_pool_at_transaction(
         transaction_id,
         &content_entries,
     )?;
-    pool.sync_all()?;
+    sync_pool_after_commit_boundary(pool, FilesystemCommitBoundary::TransactionObjectsWritten)
+        .map_err(FileSystemError::from)?;
     sign_root_commit(&root, root_authentication_key)
 }
 

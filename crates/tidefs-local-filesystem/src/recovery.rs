@@ -1104,6 +1104,48 @@ pub(crate) fn plan_root_retention_pool(
     plan_root_retention_source(pool, policy, root_authentication_key)
 }
 
+pub(crate) fn extend_root_retention_plan_with_canonical_roots(
+    pool: &mut Pool,
+    mut plan: RootRetentionPlan,
+    canonical_pool_keys: &[ObjectKey],
+    current_root: &CommittedRootSummary,
+    state: &FileSystemState,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<RootRetentionPlan> {
+    let mut protected_keys: BTreeSet<ObjectKey> =
+        plan.protected_object_keys.iter().copied().collect();
+    protected_keys.extend(canonical_pool_keys.iter().copied());
+    let mut canonical_roots = vec![current_root.clone()];
+    for summary in snapshot_retained_roots(state) {
+        if !canonical_roots.contains(&summary) {
+            canonical_roots.push(summary);
+        }
+    }
+    for summary in canonical_roots {
+        if !plan.protected_committed_roots.contains(&summary) {
+            plan.protected_committed_roots.push(summary.clone());
+        }
+        protected_keys.extend(object_keys_for_committed_root_summary(
+            pool.raw_primary_store_mut(),
+            &summary,
+            root_authentication_key,
+        )?);
+    }
+    plan.retention_debt.valid_committed_roots_available = plan.protected_committed_roots.len();
+    plan.retention_debt.missing_committed_roots = plan
+        .retention_debt
+        .policy_required_committed_roots
+        .saturating_sub(plan.retention_debt.valid_committed_roots_available);
+    plan.protected_object_keys = protected_keys.iter().copied().collect();
+    plan.reclaimable_live_object_keys = pool
+        .raw_primary_store()
+        .list_keys()
+        .into_iter()
+        .filter(|key| !protected_keys.contains(key))
+        .collect();
+    Ok(plan)
+}
+
 fn plan_root_retention_source<S: CommittedRootRecoverySource>(
     source: &mut S,
     policy: RootRetentionPolicy,
@@ -1381,47 +1423,17 @@ fn object_keys_for_validated_root_candidate<S: CommittedRootRecoverySource>(
 pub(crate) fn reclaim_protected_content_keys_pool(
     pool: &mut Pool,
     root_authentication_key: RootAuthenticationKey,
+    current_root: &CommittedRootSummary,
     state: &FileSystemState,
 ) -> Result<BTreeSet<ObjectKey>> {
     let RecoveryAuditDetails {
-        validated_roots: mut protected_roots,
-        quorum_candidates,
+        validated_roots: protected_roots,
         ..
     } = audit_recovery_source_details(pool, root_authentication_key)?;
 
-    // Protect every current root-ring fallback, not only roots named by a
-    // snapshot. A later valid candidate in the same physical slot replaces
-    // its older overwritten location in this fallback floor; retention
-    // compaction handles physical cleanup of those stale locations separately.
-    for summary in snapshot_retained_roots(state) {
-        if protected_roots
-            .iter()
-            .any(|validated: &ValidatedCommittedRoot| validated.candidate.root.summary() == summary)
-        {
-            continue;
-        }
-        if !quorum_candidates
-            .iter()
-            .any(|candidate| candidate.root.summary() == summary)
-        {
-            return Err(FileSystemError::CorruptState {
-                reason: "live snapshot references a root outside current recovery authority",
-            });
-        }
-        protected_roots.push(validated_root_for_summary(
-            pool,
-            &quorum_candidates,
-            &summary,
-            root_authentication_key,
-        )?);
-    }
-    expand_data_retaining_snapshot_roots(
-        pool,
-        &quorum_candidates,
-        &mut protected_roots,
-        root_authentication_key,
-    )?;
-
+    // Protect every current root-ring fallback. Snapshot sources are
+    // independently reachable through canonical typed snapshot roots and do
+    // not need to remain the newest physical version of their old slot.
     let mut protected_keys = BTreeSet::new();
     for validated in protected_roots {
         protected_keys.extend(object_keys_for_validated_root_candidate(
@@ -1431,7 +1443,37 @@ pub(crate) fn reclaim_protected_content_keys_pool(
             true,
         )?);
     }
+    protected_keys.extend(object_keys_for_committed_root_summary(
+        pool.raw_primary_store_mut(),
+        current_root,
+        root_authentication_key,
+    )?);
+    protected_keys.extend(snapshot_protected_content_keys_pool(
+        pool,
+        root_authentication_key,
+        state,
+    )?);
     Ok(protected_keys)
+}
+
+/// Collect objects reachable from live snapshot roots without requiring the
+/// captured root to remain the newest physical version in its two-slot ring.
+/// Canonical typed snapshot roots keep the exact immutable source reference;
+/// the filesystem transaction graph remains validated from that summary.
+fn snapshot_protected_content_keys_pool(
+    pool: &mut Pool,
+    root_authentication_key: RootAuthenticationKey,
+    state: &FileSystemState,
+) -> Result<BTreeSet<ObjectKey>> {
+    let mut keys = BTreeSet::new();
+    for summary in snapshot_retained_roots(state) {
+        keys.extend(object_keys_for_committed_root_summary(
+            pool.raw_primary_store_mut(),
+            &summary,
+            root_authentication_key,
+        )?);
+    }
+    Ok(keys)
 }
 
 pub(crate) fn object_keys_for_committed_root_summary(

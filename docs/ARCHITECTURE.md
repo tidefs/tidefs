@@ -148,7 +148,9 @@ Each typed dataset root then points to exactly one semantic engine root:
 
 - filesystem: inode/directory/extent/snapshot state;
 - volume: capacity/geometry/block-extent/snapshot state; or
-- snapshot: a read-only reference to a committed filesystem or volume root.
+- snapshot: one versioned, checksum-protected cross-mode object containing its
+  snapshot generation and the exact immutable `DatasetRootRef` of a committed
+  filesystem or volume root. A snapshot root cannot source another snapshot.
 
 Publishing the catalog without its referenced typed roots, or publishing a
 typed root without the catalog transition that makes it reachable, is
@@ -156,6 +158,18 @@ forbidden. A crash selects the newest complete pool root and either exposes the
 entire transition or the prior state. Filesystem `fsync`/`syncfs` and block
 flush/FUA converge on this publication machinery while retaining their
 surface-specific dirty-range semantics.
+
+Filesystem snapshot policy and lineage remain in `SnapshotRecord`, but that
+record is not another snapshot format. For each data-retaining filesystem
+snapshot or clone, its state record, `root@<name>` catalog entry, lifecycle pin,
+typed Pool snapshot object, and exact captured filesystem root must agree.
+Creation pins the captured graph before publishing the complete Pool
+composition; deletion releases the pin inside the same mutation that removes
+catalog and typed-root reachability. List, rollback, destroy, reopen, and root
+retention fail closed on disagreement. Retention preserves the canonical Pool
+root, every live typed dataset root, each snapshot object's exact immutable
+source root, and the complete committed filesystem graphs selected by those
+roots.
 
 Pool objects owned by a dataset are addressed through a domain-separated
 identity containing the stable `DatasetId`, object kind, logical identity, and

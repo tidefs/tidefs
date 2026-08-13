@@ -10,8 +10,9 @@
 
 ### 1.1 Storage representation
 
-Every snapshot, clone, and bookmark is a `SnapshotRecord` held in the in-memory
-snapshot state map (`FileSystemState::snapshots`). The record carries:
+Every filesystem snapshot, clone, and bookmark has a `SnapshotRecord` in the
+filesystem state map (`FileSystemState::snapshots`). The record carries policy
+and lineage metadata:
 
 - `name`: validated UTF-8 snapshot name as raw bytes.
 - `root`: the `CommittedRootSummary` at the moment of creation.
@@ -22,14 +23,27 @@ snapshot state map (`FileSystemState::snapshots`). The record carries:
 
 Source: `crates/tidefs-local-filesystem/src/records.rs` (SnapshotRecord, SnapshotKind).
 
+Every data-retaining filesystem snapshot or clone also has one canonical
+cross-mode Pool snapshot object. The versioned, checksum-protected object
+contains its snapshot generation and the exact immutable `DatasetRootRef` of
+the captured filesystem root. The same object format admits volume sources;
+snapshot-of-snapshot is refused. `SnapshotRecord` must agree with this Pool
+object and does not define a second snapshot-root format. Bookmarks remain
+non-retaining metadata and do not create typed snapshot objects.
+
+Source: `crates/tidefs-pool-runtime/src/lib.rs` (`SnapshotRoot`) and
+`crates/tidefs-local-filesystem/src/snapshot.rs` (`snapshot_record_typed_root`).
+
 ### 1.2 Create
 
 `create_snapshot(name)`:
 - Validates the name (ASCII alphanumeric + `._-:@`, 1–255 bytes).
 - Ensures no existing entry has the same name.
-- Commits a mutation that bumps the generation, inserts the record with
-  `SnapshotKind::Snapshot`, persists the snapshot state, and reconciles
-  the catalog entry and lifecycle pin.
+- Commits one mutation that bumps the generation, inserts the record with
+  `SnapshotKind::Snapshot`, adds its catalog entry and lifecycle pin, and
+  atomically publishes the filesystem root plus typed snapshot root through
+  one canonical Pool-root successor. The pin exists before commit-time
+  background work can observe the new snapshot.
 
 Source: `crates/tidefs-local-filesystem/src/snapshot.rs` create_snapshot.
 
@@ -38,8 +52,10 @@ Source: `crates/tidefs-local-filesystem/src/snapshot.rs` create_snapshot.
 `delete_snapshot(name)`:
 - Requires `hold_count == 0`.
 - Ensures snapshot authority consistency before deletion.
-- Removes the record from the state map, unpins the lifecycle root, and
-  removes the catalog entry.
+- Removes the record, catalog entry, and lifecycle pin inside one mutation;
+  canonical Pool publication removes typed-root reachability at the same
+  boundary. A definite pre-publication failure restores all three live
+  authorities, while uncertain publication requires reopen.
 
 Source: `crates/tidefs-local-filesystem/src/snapshot.rs` delete_snapshot.
 
@@ -72,10 +88,12 @@ A snapshot or clone is protected while:
 1. its `SnapshotRecord` exists in the snapshot state map,
 2. a matching catalog entry exists in `DatasetCatalog` with path `root@<name>`
    and `DatasetType::Snapshot` (plus `DatasetFlags::CLONE` for clones), and
-3. its traversal root is pinned in the lifecycle `GcPinSet` with a pin count
+3. a matching typed Pool snapshot object names the exact immutable filesystem
+   root captured by the record, and
+4. its traversal root is pinned in the lifecycle `GcPinSet` with a pin count
    at least equal to the number of snapshot records sharing that root.
 
-The three-part authority is verified by `ensure_snapshot_authority_consistent`
+The four-part authority is verified by `ensure_snapshot_authority_consistent`
 and per-record by `ensure_snapshot_record_authority`.
 
 Source: `crates/tidefs-local-filesystem/src/snapshot.rs` ensure_snapshot_authority_consistent,
@@ -480,8 +498,11 @@ compute_export_identity, receive_changed_records_into_staging_with_skip.
 
 1. **Snapshot authority invariant**: For every data-retaining snapshot or clone
    record in `FileSystemState::snapshots`, there must be a matching catalog
-   entry and a lifecycle pin. For every catalog entry with path `root@<name>`,
-   there must be a matching snapshot record. Pin counts must match.
+   entry, typed Pool snapshot object with the exact captured filesystem-root
+   reference, and lifecycle pin. For every catalog entry with path
+   `root@<name>`, there must be a matching snapshot record and typed root. Pin
+   counts must match. Checked list, rollback, destroy, recovery, and retention
+   refuse any disagreement.
 
 2. **Clone shared-root invariant**: A clone shares its traversal root with its
    origin. The lifecycle pin count for that root must be at least (1 for the
@@ -509,8 +530,8 @@ compute_export_identity, receive_changed_records_into_staging_with_skip.
 
 ### 7.3 What the authority model requires of future changes
 
-- Any new snapshot or clone lifecycle operation must go through the three-part
-  authority (state map, catalog, lifecycle pins) and call
+- Any new snapshot or clone lifecycle operation must go through the four-part
+  authority (state map, catalog, typed Pool root, lifecycle pins) and call
   `ensure_snapshot_authority_consistent` before mutating.
 - Any deadlist implementation must follow the section 4 decision: entries are
   derived from released roots after subtracting the current root and pinned

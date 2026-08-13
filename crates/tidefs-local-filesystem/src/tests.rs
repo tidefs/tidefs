@@ -261,11 +261,22 @@ fn pool_root_snapshot_catalog_and_typed_root_round_trip_together() {
                 .kind,
             DatasetRootKind::Snapshot
         );
+        let typed_root = fs
+            .store
+            .load_snapshot_root(snapshot_id)
+            .expect("load typed snapshot root");
         assert_eq!(
-            fs.store
-                .load_dataset_root(snapshot_id, DatasetRootKind::Snapshot)
-                .expect("load typed snapshot root"),
-            encode_root_commit(&root_commit_from_summary(&summary.source_root))
+            typed_root.source_reference,
+            PoolRuntime::dataset_root_reference(
+                tidefs_pool_runtime::ROOT_DATASET_ID,
+                DatasetRootKind::Filesystem,
+                summary.source_generation,
+                &encode_root_commit(&root_commit_from_summary(&summary.source_root)),
+            )
+        );
+        assert_eq!(
+            typed_root.snapshot_generation,
+            summary.created_at_generation
         );
     }
 
@@ -305,6 +316,57 @@ fn pool_root_reopen_refuses_catalog_snapshot_state_disagreement() {
         Err(error) => panic!("unexpected reopen error: {error}"),
         Ok(_) => panic!("canonical snapshot disagreement must fail closed"),
     }
+    cleanup(&root);
+}
+
+#[test]
+fn live_snapshot_operations_refuse_typed_root_disagreement() {
+    let root = temp_root("pool-root-live-snapshot-disagreement");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.create_snapshot("one").expect("create snapshot");
+    let snapshot_id = fs
+        .dataset_catalog()
+        .lookup("root@one")
+        .expect("snapshot catalog entry");
+    let stored = fs
+        .store
+        .load_snapshot_root(snapshot_id)
+        .expect("load typed snapshot root");
+    let mismatched = tidefs_pool_runtime::SnapshotRoot::new(
+        stored.snapshot_generation + 1,
+        stored.source_reference,
+    )
+    .expect("construct mismatched typed snapshot root");
+    fs.store
+        .publish_dataset_root(
+            snapshot_id,
+            DatasetRootKind::Snapshot,
+            mismatched.snapshot_generation,
+            &mismatched.encode(),
+        )
+        .expect("publish deliberately mismatched typed snapshot root");
+
+    assert!(matches!(
+        fs.list_snapshots_checked(),
+        Err(FileSystemError::CorruptState {
+            reason: "snapshot authority typed root does not match snapshot record"
+        })
+    ));
+    assert!(matches!(
+        fs.rollback_to_snapshot("one"),
+        Err(FileSystemError::CorruptState {
+            reason: "snapshot authority typed root does not match snapshot record"
+        })
+    ));
+    assert!(matches!(
+        fs.delete_snapshot("one"),
+        Err(FileSystemError::CorruptState {
+            reason: "snapshot authority typed root does not match snapshot record"
+        })
+    ));
+
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
     cleanup(&root);
 }
 
@@ -2698,10 +2760,6 @@ fn allocator_counts_snapshot_roots_hidden_behind_newer_slots() {
     }
 
     let audit = fs.recovery_audit().expect("audit recovery roots");
-    assert_eq!(
-        audit.valid_committed_roots.len(),
-        FILESYSTEM_ROOT_SLOT_COUNT as usize
-    );
     assert!(
         !audit.valid_committed_roots.contains(&snapshot.source_root),
         "snapshot source should be hidden behind newer root-slot versions"
@@ -3608,6 +3666,27 @@ fn safe_reclamation_preserves_snapshot_roots_for_later_rollback() {
         .protected_committed_roots
         .iter()
         .any(|root| root == &snapshot.source_root));
+    let snapshot_record = fs
+        .state
+        .snapshots
+        .get(b"snap0".as_slice())
+        .expect("snapshot record");
+    let snapshot_id = crate::snapshot::snapshot_record_dataset_id(snapshot_record);
+    let snapshot_reference = fs
+        .store
+        .dataset_root(snapshot_id)
+        .copied()
+        .expect("typed snapshot reference");
+    let typed_snapshot = fs
+        .store
+        .load_snapshot_root(snapshot_id)
+        .expect("typed snapshot object");
+    assert!(plan
+        .protected_object_keys
+        .contains(&snapshot_reference.object_key));
+    assert!(plan
+        .protected_object_keys
+        .contains(&typed_snapshot.source_reference.object_key));
 
     fs.safe_reclaim_unprotected_objects()
         .expect("safe reclaim with snapshot root protected");
@@ -4334,15 +4413,15 @@ fn mounted_background_ticks_leave_unbound_physical_queue_pending() {
 }
 
 #[test]
-fn mounted_reclaim_handoff_preserves_no_snapshot_fallback_root_content() {
-    let root = temp_root("mounted-reclaim-preserves-ordinary-fallback-root");
-    let older_payload = b"older ordinary fallback root bytes".to_vec();
+fn mounted_reclaim_without_snapshot_preserves_only_canonical_root_content() {
+    let root = temp_root("mounted-reclaim-preserves-canonical-root");
+    let older_payload = b"older unretained root bytes".to_vec();
     let newer_payload = b"newer selected root bytes".to_vec();
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.stop_background_scheduler();
     assert!(
         fs.list_snapshots().is_empty(),
-        "ordinary root-ring fallback must be protected without a snapshot"
+        "the test must not manufacture typed snapshot retention"
     );
 
     fs.create_file("/stable.txt", 0o644)
@@ -4356,14 +4435,6 @@ fn mounted_reclaim_handoff_preserves_no_snapshot_fallback_root_content() {
         .expect("select older committed root");
     let older_content_key =
         content_object_key_for_version(older_record.inode_id, older_record.data_version);
-    let older_stored_payload = fs
-        .store
-        .pool()
-        .get_with_current_receipt(DeviceIoClass::Data, older_content_key)
-        .expect("strictly read older content before reclaim")
-        .expect("older content has current receipt")
-        .0;
-
     let newer_record = fs
         .replace_file("/stable.txt", &newer_payload)
         .expect("publish newer file version");
@@ -4376,42 +4447,23 @@ fn mounted_reclaim_handoff_preserves_no_snapshot_fallback_root_content() {
     assert!(newer_root.generation > older_root.generation);
     assert_ne!(newer_content_key, older_content_key);
     assert!(fs.list_snapshots().is_empty());
-    assert!(
-        fs.reclaim_queue_depth() > 0,
-        "newer publication must leave the replaced content queued for logical reclaim"
-    );
 
     fs.tick_background_services()
         .expect("run mounted logical reclaim handoff");
-    assert!(
-        fs.reclaim_queue_depth() > 0,
-        "content protected by the ordinary fallback root must remain pending after handoff"
-    );
     assert_eq!(
-        fs.store
-            .pool()
-            .get_with_current_receipt(DeviceIoClass::Data, older_content_key)
-            .expect("strictly read fallback content after reclaim handoff")
-            .map(|(payload, _receipt)| payload),
-        Some(older_stored_payload),
-        "mounted reclaim must preserve content reachable from an ordinary fallback root"
+        fs.read_file("/stable.txt")
+            .expect("read canonical content after reclaim handoff"),
+        newer_payload,
+        "mounted reclaim must preserve the content selected by the canonical Pool root"
     );
 
     stage_receiptless_raw_object_substitute(&mut fs, newer_content_key);
     fs.recovery_policy = RecoveryPolicy::ReadOnly;
     drop(fs);
 
-    let mut reopened = LocalFileSystem::open_with_options(&root, options())
-        .expect("reopen through preserved ordinary fallback root");
-    assert_eq!(reopened.generation(), older_root.generation);
-    assert_eq!(
-        reopened
-            .read_file("/stable.txt")
-            .expect("read preserved fallback bytes"),
-        older_payload
+    LocalFileSystem::open_with_options(&root, options()).expect_err(
+        "reopen must refuse corrupt canonical content instead of selecting an old root",
     );
-    reopened.recovery_policy = RecoveryPolicy::ReadOnly;
-    drop(reopened);
     cleanup(&root);
 }
 
@@ -5469,7 +5521,6 @@ fn retention_plan_protects_committed_roots_without_mutation_or_fsck() {
     assert_eq!(plan.policy, RootRetentionPolicy::safe_default());
     assert!(!plan.protected_committed_roots.is_empty());
     assert!(!plan.protected_object_keys.is_empty());
-    assert!(!plan.protected_root_slot_locations.is_empty());
     assert!(plan.protects_fallback_roots_without_operator_repair());
     assert!(!plan.production_recovery_requires_operator_repair());
     assert!(!plan.mutates_storage());
@@ -5480,7 +5531,6 @@ fn retention_plan_protects_committed_roots_without_mutation_or_fsck() {
     assert_eq!(path_plan.policy, RootRetentionPolicy::safe_default());
     assert!(!path_plan.protected_committed_roots.is_empty());
     assert!(!path_plan.protected_object_keys.is_empty());
-    assert!(!path_plan.protected_root_slot_locations.is_empty());
     assert!(path_plan.protects_fallback_roots_without_operator_repair());
     assert!(!path_plan.production_recovery_requires_operator_repair());
     assert!(!path_plan.mutates_storage());
@@ -5499,14 +5549,14 @@ fn retention_plan_reports_debt_when_policy_needs_more_roots_than_exist() {
     );
     assert_eq!(
         plan.retention_debt.valid_committed_roots_available,
-        plan.audit.valid_committed_roots.len()
+        plan.protected_committed_roots.len()
     );
     assert_eq!(
         plan.retention_debt.missing_committed_roots,
-        DEFAULT_RETAINED_COMMITTED_ROOTS.saturating_sub(plan.audit.valid_committed_roots.len())
+        DEFAULT_RETAINED_COMMITTED_ROOTS.saturating_sub(plan.protected_committed_roots.len())
     );
-    assert!(plan.has_retention_debt());
-    assert!(!plan.retention_policy_satisfied());
+    assert!(!plan.has_retention_debt());
+    assert!(plan.retention_policy_satisfied());
     assert!(!plan.production_recovery_requires_operator_repair());
     assert!(!plan.mutates_storage());
     cleanup(&root);
@@ -5517,19 +5567,19 @@ fn retention_policy_rejects_below_no_fsck_fallback_floor() {
     let root = temp_root("retention-policy-floor");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     let err = fs
-        .root_retention_plan(RootRetentionPolicy::protect_at_least(1))
+        .root_retention_plan(RootRetentionPolicy::protect_at_least(0))
         .expect_err("unsafe retention policy should be rejected");
     assert!(matches!(
         err,
         FileSystemError::Unsupported { operation, reason }
             if operation == "retention planning"
-                && reason == "policy would protect fewer committed roots than the no-fsck fallback floor"
+                && reason == "policy would not protect the canonical current committed root"
     ));
     cleanup(&root);
 }
 
 #[test]
-fn retention_plan_keeps_same_slot_fallback_location_without_repair() {
+fn retention_plan_uses_canonical_root_despite_invalid_raw_slot() {
     let root = temp_root("retention-same-slot-fallback");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/stable.txt", 0o644)
@@ -5538,6 +5588,9 @@ fn retention_plan_keeps_same_slot_fallback_location_without_repair() {
         .expect("write stable file");
     fs.sync_all().expect("sync stable state");
     let committed_generation = fs.stats().filesystem_generation;
+    let canonical_root = fs
+        .selected_committed_root_summary()
+        .expect("capture canonical root");
     let bad_transaction_id = committed_generation.saturating_add(FILESYSTEM_ROOT_SLOT_COUNT);
     let bad_slot = root_slot_for_transaction(bad_transaction_id);
     fs.store
@@ -5561,16 +5614,9 @@ fn retention_plan_keeps_same_slot_fallback_location_without_repair() {
     let plan = reopened
         .safe_root_retention_plan()
         .expect("plan retention over fallback root");
-    assert_eq!(
-        plan.audit.outcome,
-        RecoveryAuditOutcome::SelectedCommittedRoot
-    );
     assert!(plan.audit.invalid_root_candidates >= 1);
-    assert!(plan
-        .protected_root_slot_locations
-        .iter()
-        .any(|location| location.key
-            == root_slot_object_key(root_slot_for_transaction(committed_generation))));
+    assert!(plan.protected_committed_roots.contains(&canonical_root));
+    assert!(plan.retention_policy_satisfied());
     assert!(!plan.production_recovery_requires_operator_repair());
     assert!(!plan.mutates_storage());
     drop(reopened);

@@ -195,11 +195,36 @@ pub(crate) fn snapshot_record_dataset_id(record: &SnapshotRecord) -> DatasetId {
     DatasetId::from_bytes(id_bytes)
 }
 
+pub(crate) fn snapshot_record_source_reference(
+    record: &SnapshotRecord,
+) -> tidefs_pool_runtime::DatasetRootRef {
+    let bytes = crate::encoding::encode_root_commit(&crate::recovery::root_commit_from_summary(
+        &record.root,
+    ));
+    tidefs_pool_runtime::PoolRuntime::dataset_root_reference(
+        tidefs_pool_runtime::ROOT_DATASET_ID,
+        tidefs_pool_runtime::DatasetRootKind::Filesystem,
+        record.root.generation,
+        &bytes,
+    )
+}
+
+pub(crate) fn snapshot_record_typed_root(
+    record: &SnapshotRecord,
+) -> Result<tidefs_pool_runtime::SnapshotRoot> {
+    tidefs_pool_runtime::SnapshotRoot::new(
+        record.created_at_generation,
+        snapshot_record_source_reference(record),
+    )
+    .map_err(FileSystemError::from)
+}
+
 pub(crate) fn snapshot_record_catalog_flags(record: &SnapshotRecord) -> DatasetFlags {
+    let flags = DatasetFlags::READONLY.union(DatasetFlags::CHECKSUMS);
     if record.kind == SnapshotKind::Clone {
-        DatasetFlags::NONE.union(DatasetFlags::CLONE)
+        flags.union(DatasetFlags::CLONE)
     } else {
-        DatasetFlags::NONE
+        flags
     }
 }
 
@@ -247,6 +272,8 @@ pub(crate) fn snapshot_catalog_entry_matches(
         && creation_txg == record.root.generation
         && flags.contains(DatasetFlags::CLONE)
             == snapshot_record_catalog_flags(record).contains(DatasetFlags::CLONE)
+        && flags.contains(DatasetFlags::READONLY)
+        && flags.contains(DatasetFlags::CHECKSUMS)
 }
 
 pub(crate) fn reconcile_snapshot_record_catalog_entry(
@@ -328,6 +355,7 @@ impl LocalFileSystem {
                     reason: "snapshot authority catalog entry does not match snapshot state",
                 });
             }
+            self.ensure_snapshot_record_typed_root(record)?;
 
             expected_catalog_names.push(snapshot_record_catalog_name(record));
             let root = snapshot_record_traversal_root(record)?;
@@ -395,6 +423,7 @@ impl LocalFileSystem {
                 reason: "snapshot authority catalog entry does not match snapshot record",
             });
         }
+        self.ensure_snapshot_record_typed_root(record)?;
         if self
             .lifecycle
             .gc_pin_set()
@@ -403,6 +432,31 @@ impl LocalFileSystem {
         {
             return Err(FileSystemError::CorruptState {
                 reason: "snapshot authority lifecycle pin is missing for snapshot record",
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_snapshot_record_typed_root(&self, record: &SnapshotRecord) -> Result<()> {
+        let expected = snapshot_record_typed_root(record)?;
+        let stored = self
+            .store
+            .load_snapshot_root(snapshot_record_dataset_id(record))?;
+        if stored != expected {
+            return Err(FileSystemError::CorruptState {
+                reason: "snapshot authority typed root does not match snapshot record",
+            });
+        }
+        let source_bytes = self.store.load_root_reference(stored.source_reference)?;
+        if tidefs_pool_runtime::PoolRuntime::dataset_root_reference(
+            stored.source_reference.dataset_id,
+            stored.source_reference.kind,
+            stored.source_reference.semantic_generation,
+            &source_bytes,
+        ) != stored.source_reference
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "snapshot authority source object does not match its exact reference",
             });
         }
         Ok(())
@@ -559,12 +613,18 @@ impl LocalFileSystem {
         self.state
             .snapshots
             .insert(clone_name_bytes, record.clone());
-        reconcile_snapshot_record_catalog_entry(self.dataset_catalog_mut()?, &record)?;
+        let authority_transition = self
+            .dataset_catalog_mut()
+            .and_then(|catalog| reconcile_snapshot_record_catalog_entry(catalog, &record))
+            .and_then(|_| self.pin_snapshot_record_root(&record));
+        if let Err(error) = authority_transition {
+            self.rollback_mutation_delta();
+            return Err(error);
+        }
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         let summary_snapshot = summary.clone();
         self.commit_mutation(summary_snapshot)?;
-        self.pin_snapshot_record_root(&record)?;
         Ok(clone_summary)
     }
 
@@ -608,11 +668,17 @@ impl LocalFileSystem {
         self.begin_mutation("delete clone")?;
         self.bump_generation();
         self.state.snapshots.remove(&name_bytes);
-        remove_snapshot_record_catalog_entry(self.dataset_catalog_mut()?, &record)?;
+        let authority_transition = self
+            .dataset_catalog_mut()
+            .and_then(|catalog| remove_snapshot_record_catalog_entry(catalog, &record));
+        if let Err(error) = authority_transition {
+            self.rollback_mutation_delta();
+            return Err(error);
+        }
+        self.unpin_snapshot_record_root(&record)?;
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         let summary = self.commit_mutation(record.summary())?;
-        self.unpin_snapshot_record_root(&record)?;
         Ok((summary, record))
     }
 
@@ -1181,6 +1247,13 @@ impl LocalFileSystem {
                 created_at_generation: r.created_at_generation,
             })
             .collect()
+    }
+
+    /// List snapshot metadata only after validating its complete Pool,
+    /// catalog, and lifecycle-pin authority.
+    pub fn list_snapshots_extended_checked(&self) -> Result<Vec<SnapshotDescriptor>> {
+        self.ensure_snapshot_authority_consistent()?;
+        Ok(self.list_snapshots_extended())
     }
 
     /// Prune regular snapshots according to a local retention policy.
@@ -1881,7 +1954,7 @@ mod tests {
     }
 
     #[test]
-    fn clone_reopen_reconciles_missing_catalog_entry_and_pins() {
+    fn clone_reopen_refuses_missing_catalog_authority() {
         let dir = temp_dir();
         {
             let mut fs = new_fs(&dir);
@@ -1897,11 +1970,16 @@ mod tests {
             assert!(!fs.dataset_catalog().contains("root@clone1"));
         }
 
-        let fs = reopen_fs(&dir);
-        assert!(fs.dataset_catalog().contains("root@snap1"));
-        assert!(fs.dataset_catalog().contains("root@clone1"));
-        assert!(catalog_clone_flag(&fs, "clone1"));
-        assert_eq!(snapshot_catalog_pin_count(&fs), 2);
+        use tidefs_local_object_store::StoreOptions;
+        setup_auth_env();
+        let err = LocalFileSystem::open_with_options(&dir, StoreOptions::default())
+            .expect_err("reopen must refuse missing canonical snapshot catalog authority");
+        assert!(matches!(
+            err,
+            FileSystemError::CorruptState {
+                reason: "canonical Pool catalog does not match filesystem snapshot state"
+            }
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
