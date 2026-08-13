@@ -146,6 +146,13 @@ const COMPACTION_PUBLISH_MANIFEST_OBJECT_NAME: &str = "tidefs-compaction-publish
 pub const FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME: &str = "tidefs-filesystem-reclaim-queue-v1";
 /// Prefix for hidden target objects staged by verified compaction rewrites.
 const COMPACTION_TARGET_KEY_PREFIX: [u8; 8] = *b"TFSCMPCT";
+/// Hidden Pool-owned records that make logical deletion publication replayable.
+///
+/// The remaining 24 bytes identify one `(I/O class, object key, receipt
+/// generation)` handoff.  The Pool owns the record format; the store only
+/// reserves and preserves the namespace so raw callers, scans, statistics,
+/// and compaction cannot mistake it for user payload.
+pub(crate) const POOL_PENDING_DELETION_KEY_PREFIX: [u8; 8] = *b"TFSPDEL1";
 const COMPACTION_MANIFEST_MAGIC: &[u8; 8] = b"TFSCMPM1";
 const COMPACTION_MANIFEST_VERSION: u32 = 1;
 const COMPACTION_MANIFEST_HEADER_LEN: usize = 8 + 4 + 4;
@@ -660,6 +667,20 @@ fn is_compaction_target_key(key: ObjectKey) -> bool {
     key.as_bytes()[..8] == COMPACTION_TARGET_KEY_PREFIX
 }
 
+pub(crate) fn is_pool_pending_deletion_key(key: ObjectKey) -> bool {
+    key.as_bytes()[..8] == POOL_PENDING_DELETION_KEY_PREFIX
+}
+
+pub(crate) fn is_strict_pool_authority_key(key: ObjectKey) -> bool {
+    crate::is_pool_placement_receipt_key(key)
+        || crate::is_pool_receipt_generation_high_water_key(key)
+        || is_pool_pending_deletion_key(key)
+}
+
+fn is_pool_store_internal_key(key: ObjectKey) -> bool {
+    crate::is_pool_placement_scan_internal_key(key) || is_pool_pending_deletion_key(key)
+}
+
 fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 7] {
     static KEYS: OnceLock<[ObjectKey; 7]> = OnceLock::new();
     KEYS.get_or_init(|| {
@@ -684,6 +705,7 @@ fn is_stats_internal_key(key: ObjectKey) -> bool {
         || is_persistent_reclaim_metadata_key(key)
         || crate::is_pool_placement_receipt_key(key)
         || crate::is_pool_receipt_generation_high_water_key(key)
+        || is_pool_pending_deletion_key(key)
         || is_compaction_target_key(key)
 }
 
@@ -691,6 +713,7 @@ fn is_public_scan_internal_key(key: ObjectKey) -> bool {
     key == committed_root_key()
         || is_persistent_reclaim_metadata_key(key)
         || crate::is_pool_placement_scan_internal_key(key)
+        || is_pool_pending_deletion_key(key)
         || is_compaction_target_key(key)
 }
 
@@ -2009,7 +2032,7 @@ impl LocalObjectStore {
         let fm = SegmentFreeMap::new(2, vec![(0, 1)]).unwrap();
         let free_map = PoolAllocator::new(fm);
 
-        Ok(Self {
+        let mut store = Self {
             root,
             segments_dir,
             options,
@@ -2067,7 +2090,19 @@ impl LocalObjectStore {
             current_dataset_id: None,
             checksums: BTreeMap::new(),
             block_device_mode: true,
-        })
+        };
+
+        // Block/regular-file devices persist reclaim authority as named
+        // objects in the same append-only record stream.  Directory-backed
+        // open already reloads these objects below; doing the same here is
+        // required so a close/reopen cannot forget a deletion handoff or make
+        // one physical generation eligible twice.
+        store.reclaim_queue = load_reclaim_queue_entries(&store);
+        store.dead_object_reclaim_queue = load_dead_object_reclaim_queue(&store);
+        store.reclaim_receipts = load_reclaim_receipts(&store)?;
+        store.snapshot_extent_pin_set = load_snapshot_extent_pin_set(&store)?;
+
+        Ok(store)
     }
 
     fn open_with_mode(
@@ -2487,12 +2522,13 @@ impl LocalObjectStore {
                                     crate::intent_log::record::IntentLogRecord::WritePayload {
                                         object_id,
                                         ..
-                                    } if crate::is_pool_receipt_generation_high_water_key(*object_id)
+                                    } if is_strict_pool_authority_key(*object_id)
                                 )
                             })
                         }) {
                             return Err(StoreError::InvalidOptions {
-                                reason: "object-store intent-log cannot mutate pool receipt-generation authority",
+                                reason:
+                                    "object-store intent-log cannot mutate strict pool authority",
                             });
                         }
 
@@ -3595,13 +3631,6 @@ impl LocalObjectStore {
         self.enqueue_receipt_bound_dead_object_authorized(entry)
     }
 
-    pub(crate) fn enqueue_receipt_bound_dead_object_pool_internal(
-        &mut self,
-        entry: DeadObjectEntry,
-    ) -> Result<bool> {
-        self.enqueue_receipt_bound_dead_object_authorized(entry)
-    }
-
     fn enqueue_receipt_bound_dead_object_authorized(
         &mut self,
         entry: DeadObjectEntry,
@@ -3814,7 +3843,7 @@ impl LocalObjectStore {
             .index
             .iter()
             .filter(|(key, location)| {
-                crate::is_pool_placement_scan_internal_key(**key)
+                is_pool_store_internal_key(**key)
                     && plan.dead_segments.contains(&location.segment_id)
             })
             .map(|(key, location)| Ok((*key, self.read_location(*location)?)))
@@ -4145,9 +4174,10 @@ impl LocalObjectStore {
     }
 
     fn ensure_public_pool_key_mutation_allowed(key: ObjectKey) -> Result<()> {
-        if crate::is_pool_placement_scan_internal_key(key) {
+        if is_pool_store_internal_key(key) {
             return Err(StoreError::InvalidOptions {
-                reason: "pool receipt, shard, and generation metadata require pool authority",
+                reason:
+                    "pool receipt, shard, generation, and deletion metadata require pool authority",
             });
         }
         Ok(())
@@ -4367,13 +4397,20 @@ impl LocalObjectStore {
     }
 
     fn put_authorized(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
-        // Apply fault injection before the write (skipped for internal paths).
+        // Pool-owned generation and deletion publication deliberately uses
+        // this path, so configured write faults exercise those durability
+        // transitions too. Only lower put_inner/put_preencoded_internal
+        // callers bypass fault injection.
         let effective_payload = self.prepare_payload_with_fault_injection(payload)?;
-        let generation_high_water_key = key == crate::pool_receipt_generation_high_water_key();
-        let generation_high_water_family = crate::is_pool_receipt_generation_high_water_key(key);
+        let pool_metadata_family = is_strict_pool_authority_key(key);
+        if pool_metadata_family && self.options.replica_count() != self.replicas.len() {
+            return Err(StoreError::InvalidOptions {
+                reason: "strict pool authority store replica is unavailable",
+            });
+        }
 
         // Transparently compress the payload when compression is configured.
-        let (stored_payload, compression_algorithm) = if generation_high_water_key {
+        let (stored_payload, compression_algorithm) = if pool_metadata_family {
             (effective_payload, 0)
         } else if let Some(ref config) = self.compression_config {
             let mut stats = self.compression_stats;
@@ -4389,17 +4426,16 @@ impl LocalObjectStore {
             key,
             &stored_payload,
             compression_algorithm,
-            !generation_high_water_family,
+            !pool_metadata_family,
         )?;
-        if generation_high_water_family
+        if pool_metadata_family
             && self
                 .last_replicated_write
                 .as_ref()
                 .is_none_or(|outcome| outcome.class != crate::ReplicatedWriteClass::Committed)
         {
             return Err(StoreError::InvalidOptions {
-                reason:
-                    "placement receipt generation high-water did not converge across store replicas",
+                reason: "strict pool authority did not converge across store replicas",
             });
         }
 
@@ -4411,11 +4447,11 @@ impl LocalObjectStore {
             self.checksums.insert(key, digest);
         }
 
-        // The pool high-water marker is its own durable authority. Recording
-        // it in the ordinary payload WAL would let generic intent replay
-        // resurrect an older reservation after marker loss. Pool publication
-        // writes and verifies every copy synchronously instead.
-        if generation_high_water_family {
+        // Pool generation and deletion markers are their own durable
+        // authorities. Recording them in the ordinary payload WAL would let
+        // generic replay resurrect an older reservation or deletion after the
+        // Pool had synchronously replaced or cleared it.
+        if pool_metadata_family {
             return Ok(result);
         }
 
@@ -4600,21 +4636,14 @@ impl LocalObjectStore {
         &self,
         key: ObjectKey,
     ) -> Result<Vec<Option<Vec<u8>>>> {
+        if self.options.replica_count() != self.replicas.len() {
+            return Err(StoreError::InvalidOptions {
+                reason: "strict pool authority store replica is unavailable",
+            });
+        }
         let mut slots = Vec::new();
         self.collect_pool_internal_copy_slots(key, &mut slots)?;
         Ok(slots)
-    }
-
-    pub(crate) fn get_pool_placement_receipt_copy_slots(
-        &self,
-        key: ObjectKey,
-    ) -> Result<Vec<Option<Vec<u8>>>> {
-        if !crate::is_pool_placement_receipt_key(key) {
-            return Err(StoreError::InvalidOptions {
-                reason: "placement receipt copy scan requires a receipt key",
-            });
-        }
-        self.get_pool_internal_copy_slots(key)
     }
 
     /// Retrieve blob bytes for `key`.
@@ -4625,11 +4654,11 @@ impl LocalObjectStore {
     /// Use [`LocalObjectStore::get_verified`] for a one-step read with
     /// content-address verification built in.
     pub fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
-        if crate::is_pool_receipt_generation_high_water_key(key) {
+        if is_strict_pool_authority_key(key) {
             return self.get_pool_internal_replica_consensus(
                 key,
-                "placement receipt generation high-water store replica is unavailable",
-                "placement receipt generation high-water conflicts across store replicas",
+                "strict pool authority store replica is unavailable",
+                "strict pool authority conflicts across store replicas",
             );
         }
 
@@ -4886,9 +4915,14 @@ impl LocalObjectStore {
 
     fn delete_authorized(&mut self, key: ObjectKey) -> Result<bool> {
         self.ensure_writable("delete")?;
-        let generation_high_water_family = crate::is_pool_receipt_generation_high_water_key(key);
+        let pool_metadata_family = is_strict_pool_authority_key(key);
+        if self.options.replica_count() != self.replicas.len() {
+            return Err(StoreError::InvalidOptions {
+                reason: "object deletion store replica is unavailable",
+            });
+        }
         let existed = self.index.contains_key(&key);
-        let sequence = if generation_high_water_family {
+        let sequence = if pool_metadata_family {
             0
         } else {
             self.next_sequence
@@ -4900,7 +4934,7 @@ impl LocalObjectStore {
         // after the index entry is removed.
         if let Some(loc) = self.index.get(&key).copied() {
             self.history.entry(key).or_default().push(loc);
-            if !generation_high_water_family {
+            if !pool_metadata_family {
                 // Record the old segment liveness so the background reclaim
                 // process can track dead space and prioritize cleaning.
                 self.segment_liveness
@@ -4913,7 +4947,7 @@ impl LocalObjectStore {
 
         self.index.remove(&key);
         self.checksums.remove(&key);
-        if !generation_high_water_family {
+        if !pool_metadata_family {
             // Enqueue a reclaim entry so the background drain loop can
             // eventually free the segment when all objects in it are dead.
             self.enqueue_reclaim_entry(key);
@@ -4923,19 +4957,44 @@ impl LocalObjectStore {
 
         // Fan out delete to all replicas so stale data does not
         // resurrect on a replica fallback read.
-        for replica in &mut self.replicas {
-            let result = if crate::is_pool_placement_scan_internal_key(key) {
+        let mut first_replica_error = (self.options.replica_count() != self.replicas.len())
+            .then_some(StoreError::InvalidOptions {
+                reason: "object deletion store replica is unavailable",
+            });
+        for (index, replica) in self.replicas.iter_mut().enumerate() {
+            let result = if is_pool_store_internal_key(key) {
                 replica.delete_pool_internal(key)
             } else {
                 replica.delete(key)
             };
-            let _ = result;
+            match result {
+                Ok(_) if index < self.replica_healthy.len() => self.replica_healthy[index] = true,
+                Ok(_) => {}
+                Err(error) => {
+                    if index < self.replica_healthy.len() {
+                        self.replica_healthy[index] = false;
+                    }
+                    first_replica_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = first_replica_error {
+            return Err(error);
+        }
+        if self
+            .get_pool_internal_copy_slots(key)?
+            .into_iter()
+            .any(|copy| copy.is_some())
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "object deletion did not converge across store replicas",
+            });
         }
 
-        // The generation marker is not part of the generic payload WAL.
-        // Replaying a marker tombstone after a later Pool-authorized repair
-        // could otherwise delete the repaired authority.
-        if generation_high_water_family {
+        // Pool generation and deletion markers are not generic payloads.
+        // Replaying an internal-marker tombstone through the payload WAL could
+        // otherwise erase newer Pool authority or enqueue it for user reclaim.
+        if pool_metadata_family {
             return Ok(existed);
         }
 
@@ -5003,7 +5062,7 @@ impl LocalObjectStore {
             self.index
                 .keys()
                 .copied()
-                .filter(|key| crate::is_pool_placement_scan_internal_key(*key)),
+                .filter(|key| is_pool_store_internal_key(*key)),
         );
         let mut retained_copies = Vec::new();
         for key in retained_keys {
@@ -5018,7 +5077,7 @@ impl LocalObjectStore {
             }
             retained_copies.push((
                 key,
-                crate::is_pool_placement_scan_internal_key(key),
+                is_pool_store_internal_key(key),
                 self.read_location(location)?,
             ));
         }
@@ -5528,29 +5587,25 @@ impl LocalObjectStore {
         Ok(())
     }
 
-    pub(crate) fn sync_pool_receipt_generation_high_water(&mut self) -> Result<()> {
-        self.ensure_writable("sync pool receipt generation high-water")?;
+    pub(crate) fn sync_strict_pool_authority(&mut self) -> Result<()> {
+        self.ensure_writable("sync strict pool authority")?;
         let mut first_error = (self.options.replica_count() != self.replicas.len()).then_some(
             StoreError::InvalidOptions {
-                reason: "placement receipt generation high-water store replica is unavailable",
+                reason: "strict pool authority store replica is unavailable",
             },
         );
         let path = segment_path(&self.segments_dir, self.current_segment_id);
 
         if let Err(source) = self.current_file.sync_all() {
             first_error.get_or_insert_with(|| {
-                io_error(
-                    "sync pool receipt generation high-water segment",
-                    &path,
-                    source,
-                )
+                io_error("sync strict pool authority segment", &path, source)
             });
         }
         if let Err(error) = sync_directory(&self.segments_dir) {
             first_error.get_or_insert(error);
         }
         for (i, replica) in self.replicas.iter_mut().enumerate() {
-            match replica.sync_pool_receipt_generation_high_water() {
+            match replica.sync_strict_pool_authority() {
                 Ok(()) if i < self.replica_healthy.len() => self.replica_healthy[i] = true,
                 Ok(()) => {}
                 Err(error) => {
@@ -5849,8 +5904,7 @@ impl LocalObjectStore {
             compression_algorithm,
         ) {
             Err(StoreError::NoSpace)
-                if self.block_device_mode
-                    && !crate::is_pool_receipt_generation_high_water_key(key) =>
+                if self.block_device_mode && !is_strict_pool_authority_key(key) =>
             {
                 self.compact_block_device_live_records()?;
                 self.append_record_once(
@@ -5887,10 +5941,7 @@ impl LocalObjectStore {
         };
         let record_len =
             checked_record_total_len(record, self.current_segment_id, self.current_offset)?;
-        self.ensure_space(
-            record_len,
-            crate::is_pool_receipt_generation_high_water_key(key),
-        )?;
+        self.ensure_space(record_len, is_strict_pool_authority_key(key))?;
         let record_offset = self.current_offset;
         let record_range = checked_record_range(record, self.current_segment_id, record_offset)?;
         let payload_offset = record_range.payload_offset;
@@ -10080,6 +10131,32 @@ mod reclaim_queue_production_tests {
     }
 
     #[test]
+    fn pool_pending_deletion_metadata_bypasses_payload_reclaim_and_wal() {
+        let (mut store, _dir) = temp_store();
+        let mut key_bytes = *ObjectKey::from_name(b"pool pending deletion metadata").as_bytes();
+        key_bytes[..POOL_PENDING_DELETION_KEY_PREFIX.len()]
+            .copy_from_slice(&POOL_PENDING_DELETION_KEY_PREFIX);
+        let key = ObjectKey::from_bytes32(key_bytes);
+        let tombstones_before = store.tombstone_count;
+        let reclaim_before = store.reclaim_queue.len();
+
+        store
+            .put_pool_internal(key, b"checksummed pool handoff")
+            .expect("publish pending deletion metadata");
+        assert!(!store.intent_log_tx_open);
+        assert_eq!(store.tombstone_count, tombstones_before);
+        assert_eq!(store.reclaim_queue.len(), reclaim_before);
+        assert!(!store.list_keys().contains(&key));
+
+        assert!(store
+            .delete_pool_internal(key)
+            .expect("clear pending deletion metadata"));
+        assert!(!store.intent_log_tx_open);
+        assert_eq!(store.tombstone_count, tombstones_before);
+        assert_eq!(store.reclaim_queue.len(), reclaim_before);
+    }
+
+    #[test]
     fn dead_object_reclaim_queue_sync_persists_across_reopen() {
         let (mut store, dir) = temp_store();
         let mut queue = DeadObjectReclaimQueue::new();
@@ -10158,17 +10235,23 @@ mod reclaim_queue_production_tests {
         assert!(matches!(
             err,
             StoreError::InvalidOptions {
-                reason: "pool receipt, shard, and generation metadata require pool authority"
+                reason:
+                    "pool receipt, shard, generation, and deletion metadata require pool authority"
             }
         ));
-        assert!(store
-            .enqueue_receipt_bound_dead_object_pool_internal(reserved_entry)
-            .expect("pool reclaim authority may enqueue reserved physical placement"));
         let replacement = dead_object_receipt(reserved_key, 2);
+        let mut pending_reserved_entry = reserved_entry;
+        pending_reserved_entry.replacement_receipt = None;
+        assert!(store
+            .enqueue_pending_receipt_bound_dead_object_pool_internal(pending_reserved_entry)
+            .expect("pool reclaim authority may enqueue reserved physical placement"));
         assert!(matches!(
             store.publish_dead_object_replacement_receipt(&reserved_key, replacement),
             Err(StoreError::InvalidOptions { .. })
         ));
+        assert!(store
+            .publish_dead_object_replacement_receipt_pool_internal(&reserved_key, replacement)
+            .expect("pool reclaim authority may publish reserved physical receipt"));
         assert!(matches!(
             store.drain_receipt_bound_dead_objects_at_stable_generation(6, 2, 16),
             Err(ReceiptBoundDeadObjectDrainError::Store(

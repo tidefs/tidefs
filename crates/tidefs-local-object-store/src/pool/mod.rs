@@ -76,6 +76,8 @@ use tidefs_types_reclaim_queue_core::{
 const RECEIPT_GENERATION_HIGH_WATER_MAGIC: [u8; 8] = *b"TFSPGH1\0";
 const RECEIPT_GENERATION_HIGH_WATER_ENCODED_LEN: usize = 64;
 const RECEIPT_GENERATION_RESERVATION_SIZE: u64 = 4096;
+const PENDING_DELETION_MAGIC: [u8; 8] = *b"TFSPDH1\0";
+const PENDING_DELETION_CONTEXT: &str = "TideFS pool pending deletion object key v1";
 
 /// One exact labelled byte-addressable member admitted for fresh Pool bootstrap.
 #[derive(Debug)]
@@ -844,6 +846,150 @@ impl PlacementReceipt {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PendingDeletionPhase {
+    Prepared = 1,
+    Committed = 2,
+}
+
+impl PendingDeletionPhase {
+    const fn from_u8(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Prepared),
+            2 => Some(Self::Committed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PoolPendingDeletion {
+    pool_guid: [u8; 16],
+    class: IoClass,
+    receipt: PlacementReceipt,
+    receipt_carrier_guids: Vec<[u8; 16]>,
+    phase: PendingDeletionPhase,
+}
+
+impl PoolPendingDeletion {
+    fn object_key(&self) -> ObjectKey {
+        pool_pending_deletion_object_key(
+            self.class,
+            self.receipt.object_key,
+            self.receipt.generation,
+        )
+    }
+
+    fn same_identity_and_authority(&self, other: &Self) -> bool {
+        self.pool_guid == other.pool_guid
+            && self.class == other.class
+            && self.receipt == other.receipt
+            && self.receipt_carrier_guids == other.receipt_carrier_guids
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        if self.receipt_carrier_guids.is_empty()
+            || self.receipt_carrier_guids.len() > u16::MAX as usize
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending deletion requires a bounded nonempty receipt-carrier set",
+            });
+        }
+        let distinct_carriers = self
+            .receipt_carrier_guids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if distinct_carriers.len() != self.receipt_carrier_guids.len() {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending deletion receipt-carrier set contains duplicates",
+            });
+        }
+        let receipt = self.receipt.encode()?;
+        let receipt_len = u32::try_from(receipt.len()).map_err(|_| StoreError::InvalidOptions {
+            reason: "pending deletion placement receipt exceeds wire format",
+        })?;
+        let mut out = Vec::with_capacity(
+            8 + 16 + 1 + 1 + 2 + 4 + self.receipt_carrier_guids.len() * 16 + receipt.len() + 32,
+        );
+        out.extend_from_slice(&PENDING_DELETION_MAGIC);
+        out.extend_from_slice(&self.pool_guid);
+        out.push(io_class_as_u8(self.class));
+        out.push(self.phase as u8);
+        out.extend_from_slice(&(self.receipt_carrier_guids.len() as u16).to_le_bytes());
+        out.extend_from_slice(&receipt_len.to_le_bytes());
+        for guid in &self.receipt_carrier_guids {
+            out.extend_from_slice(guid);
+        }
+        out.extend_from_slice(&receipt);
+        let checksum = blake3::hash(&out);
+        out.extend_from_slice(checksum.as_bytes());
+        Ok(out)
+    }
+
+    fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.len() < 8 + 16 + 1 + 1 + 2 + 4 + 32 {
+            return None;
+        }
+        let checksum_offset = raw.len().checked_sub(32)?;
+        if blake3::hash(raw.get(..checksum_offset)?).as_bytes() != raw.get(checksum_offset..)? {
+            return None;
+        }
+        let mut cursor = ReceiptCursor::new(raw.get(..checksum_offset)?);
+        if cursor.take(PENDING_DELETION_MAGIC.len())? != PENDING_DELETION_MAGIC {
+            return None;
+        }
+        let pool_guid = cursor.array()?;
+        let class = io_class_from_u8(cursor.u8()?)?;
+        let phase = PendingDeletionPhase::from_u8(cursor.u8()?)?;
+        let carrier_count = u16::from_le_bytes(cursor.array()?) as usize;
+        let receipt_len = u32::from_le_bytes(cursor.array()?) as usize;
+        if carrier_count == 0 {
+            return None;
+        }
+        let mut receipt_carrier_guids = Vec::with_capacity(carrier_count);
+        let mut distinct_carriers = BTreeSet::new();
+        for _ in 0..carrier_count {
+            let guid = cursor.array()?;
+            if !distinct_carriers.insert(guid) {
+                return None;
+            }
+            receipt_carrier_guids.push(guid);
+        }
+        let receipt = PlacementReceipt::decode(cursor.take(receipt_len)?)?;
+        if !cursor.is_finished() || receipt.generation == 0 || receipt.epoch == 0 {
+            return None;
+        }
+        let pending = Self {
+            pool_guid,
+            class,
+            receipt,
+            receipt_carrier_guids,
+            phase,
+        };
+        Some(pending)
+    }
+}
+
+const fn io_class_as_u8(class: IoClass) -> u8 {
+    match class {
+        IoClass::Data => 0,
+        IoClass::Metadata => 1,
+        IoClass::IntentLog => 2,
+        IoClass::ReadCache => 3,
+    }
+}
+
+const fn io_class_from_u8(raw: u8) -> Option<IoClass> {
+    match raw {
+        0 => Some(IoClass::Data),
+        1 => Some(IoClass::Metadata),
+        2 => Some(IoClass::IntentLog),
+        3 => Some(IoClass::ReadCache),
+        _ => None,
+    }
+}
+
 fn encode_planner_replay_receipt(
     out: &mut Vec<u8>,
     receipt: &PlacementReplayReceipt,
@@ -1213,6 +1359,73 @@ impl<'a> ReceiptCursor<'a> {
     }
 }
 
+fn discover_pending_deletions(
+    devices: &[Device],
+    device_guids: &[[u8; 16]],
+    pool_guid: [u8; 16],
+    reserved_placement_receipt_generation_through: u64,
+) -> Result<BTreeMap<ObjectKey, PoolPendingDeletion>> {
+    if devices.len() != device_guids.len() {
+        return Err(StoreError::InvalidOptions {
+            reason: "pending deletion discovery device identity count mismatch",
+        });
+    }
+    let mut pending: BTreeMap<ObjectKey, PoolPendingDeletion> = BTreeMap::new();
+    for (device, device_guid) in devices.iter().zip(device_guids) {
+        for (handoff_key, raw) in device.pending_deletion_candidates()? {
+            let candidate =
+                PoolPendingDeletion::decode(&raw).ok_or(StoreError::InvalidOptions {
+                    reason: "pending deletion handoff is corrupt or unverifiable",
+                })?;
+            if candidate.pool_guid != pool_guid || candidate.object_key() != handoff_key {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pending deletion handoff identity does not match its pool or key",
+                });
+            }
+            if candidate.class == IoClass::IntentLog {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pending deletion handoff cannot govern receiptless intent-log I/O",
+                });
+            }
+            if !candidate.receipt_carrier_guids.contains(device_guid) {
+                return Err(StoreError::InvalidOptions {
+                    reason:
+                        "pending deletion handoff was found outside its declared receipt carriers",
+                });
+            }
+            if candidate.receipt.generation > reserved_placement_receipt_generation_through {
+                return Err(StoreError::InvalidOptions {
+                    reason:
+                        "pending deletion receipt generation exceeds the durable high-water reservation",
+                });
+            }
+            if candidate.receipt.planner_replay_receipt.is_none()
+                || !planner_replay_receipt_matches_receipt(&candidate.receipt)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pending deletion requires matching placement replay authority",
+                });
+            }
+            validate_strict_receipt_structure(&candidate.receipt)?;
+            match pending.get_mut(&handoff_key) {
+                Some(current) if !current.same_identity_and_authority(&candidate) => {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "pending deletion handoff copies conflict",
+                    });
+                }
+                Some(current) if candidate.phase > current.phase => {
+                    current.phase = candidate.phase;
+                }
+                Some(_) => {}
+                None => {
+                    pending.insert(handoff_key, candidate);
+                }
+            }
+        }
+    }
+    Ok(pending)
+}
+
 // ---------------------------------------------------------------------------
 // IoClass → device index mapping
 // ---------------------------------------------------------------------------
@@ -1374,8 +1587,18 @@ pub struct Pool {
     /// the committed-root chain is valid, but reads and writes are
     /// gated until the encryption key is supplied.
     locked: bool,
+    /// Durable logical deletion publications keyed by the handoff object key.
+    /// Committed entries suppress the matching receipt generation and raw
+    /// fallback until every recorded target and receipt carrier is reconciled.
+    pending_deletions: BTreeMap<ObjectKey, PoolPendingDeletion>,
     #[cfg(test)]
     fail_post_publication_reclaim_attachment_once: bool,
+    #[cfg(test)]
+    fail_pending_deletion_preflight_once: bool,
+    #[cfg(test)]
+    fail_post_deletion_publication_cleanup_once: bool,
+    #[cfg(test)]
+    fail_placement_receipt_verification_once: bool,
 }
 
 /// Versioned, checksummed replacement evidence published before an in-memory
@@ -2117,7 +2340,7 @@ fn verify_receipt_generation_high_water_copy(
 fn sync_receipt_generation_high_water_devices(devices: &mut [Device]) -> Result<()> {
     let mut first_error = None;
     for device in devices {
-        if let Err(error) = device.sync_pool_receipt_generation_high_water() {
+        if let Err(error) = device.sync_strict_pool_authority() {
             first_error.get_or_insert(error);
         }
     }
@@ -2461,7 +2684,7 @@ fn seed_receipt_generation_high_water_on_candidate(
     }
 
     if existing.is_some_and(|marker| marker.reserved_through == reserved_through) {
-        device.sync_pool_receipt_generation_high_water()?;
+        device.sync_strict_pool_authority()?;
         return verify_receipt_generation_high_water_copy(
             device,
             ReceiptGenerationHighWater {
@@ -2478,7 +2701,7 @@ fn seed_receipt_generation_high_water_on_candidate(
     let key = receipt_generation_high_water_key();
     let encoded = encode_receipt_generation_high_water(marker);
     device.put_pool_internal(key, &encoded)?;
-    device.sync_pool_receipt_generation_high_water()?;
+    device.sync_strict_pool_authority()?;
     verify_receipt_generation_high_water_copy(device, marker)
 }
 
@@ -2643,8 +2866,15 @@ impl Pool {
             replacement_evidence: None,
             allocator: None,
             locked: false,
+            pending_deletions: BTreeMap::new(),
             #[cfg(test)]
             fail_post_publication_reclaim_attachment_once: false,
+            #[cfg(test)]
+            fail_pending_deletion_preflight_once: false,
+            #[cfg(test)]
+            fail_post_deletion_publication_cleanup_once: false,
+            #[cfg(test)]
+            fail_placement_receipt_verification_once: false,
         };
 
         pool.persist_active_labels_if_needed()?;
@@ -3161,10 +3391,33 @@ impl Pool {
             replacement_evidence: None,
             allocator: None,
             locked,
+            pending_deletions: BTreeMap::new(),
             #[cfg(test)]
             fail_post_publication_reclaim_attachment_once: false,
+            #[cfg(test)]
+            fail_pending_deletion_preflight_once: false,
+            #[cfg(test)]
+            fail_post_deletion_publication_cleanup_once: false,
+            #[cfg(test)]
+            fail_placement_receipt_verification_once: false,
         };
 
+        // Locked imports cannot decode encrypted placement or deletion
+        // authority. They expose no data I/O or generation allocator, so
+        // defer semantic discovery to the first key-bearing reopen just as we
+        // already do for placement receipts above.
+        if !pool.locked {
+            pool.pending_deletions = discover_pending_deletions(
+                &pool.devices,
+                &pool.device_guids,
+                pool.pool_guid,
+                pool.reserved_placement_receipt_generation_through,
+            )?;
+        }
+
+        if mode == PoolOpenMode::Writable && !pool.locked {
+            pool.reconcile_pending_deletions_on_open();
+        }
         if mode == PoolOpenMode::Writable {
             restore_device_replacement_evidence(&mut pool)?;
             // Resume interrupted device removal if a pending marker exists.
@@ -3864,7 +4117,10 @@ impl Pool {
         if indices.is_empty() {
             return Ok(None);
         }
-        self.load_placement_receipt(&indices, key)
+        let receipt = self.load_placement_receipt(&indices, key)?;
+        Ok(receipt.filter(|receipt| {
+            !self.pending_deletion_hides_generation(class, key, Some(receipt.generation))
+        }))
     }
 
     /// Return the latest persisted placement receipt for every logical object
@@ -3887,6 +4143,13 @@ impl Pool {
         Ok(discover_placement_receipt_inventory(&self.devices)?
             .latest_by_object
             .into_values()
+            .filter(|receipt| {
+                !self.pending_deletion_hides_generation(
+                    class,
+                    receipt.object_key,
+                    Some(receipt.generation),
+                )
+            })
             .collect())
     }
 
@@ -3946,42 +4209,45 @@ impl Pool {
         let mut receipts: BTreeMap<(u64, u64), PlacementReceipt> = BTreeMap::new();
 
         for &idx in indices {
-            let Some(raw) = self.devices[idx].get(receipt_key)? else {
-                continue;
-            };
-            let receipt = PlacementReceipt::decode(&raw).ok_or(StoreError::InvalidOptions {
-                reason: "strict read found a corrupt or unverifiable placement receipt",
-            })?;
-            if receipt.object_key != key
-                || placement_receipt_object_key(receipt.object_key) != receipt_key
-            {
-                return Err(StoreError::InvalidOptions {
-                    reason: "strict read found a placement receipt key mismatch",
-                });
-            }
-            if receipt.epoch == 0 || receipt.generation == 0 {
-                return Err(StoreError::InvalidOptions {
-                    reason: "strict read requires nonzero placement receipt epoch and generation",
-                });
-            }
-            if receipt.planner_replay_receipt.is_none()
-                || !planner_replay_receipt_matches_receipt(&receipt)
-            {
-                return Err(StoreError::InvalidOptions {
-                    reason: "strict read requires matching planner replay authority",
-                });
-            }
-            validate_strict_receipt_structure(&receipt)?;
-
-            let version = (receipt.epoch, receipt.generation);
-            if let Some(canonical) = receipts.get(&version) {
-                if canonical != &receipt {
+            for (candidate_key, raw) in self.devices[idx].placement_receipt_candidates()? {
+                if candidate_key != receipt_key {
+                    continue;
+                }
+                let receipt = PlacementReceipt::decode(&raw).ok_or(StoreError::InvalidOptions {
+                    reason: "strict read found a corrupt or unverifiable placement receipt",
+                })?;
+                if receipt.object_key != key
+                    || placement_receipt_object_key(receipt.object_key) != receipt_key
+                {
                     return Err(StoreError::InvalidOptions {
-                        reason: "conflicting placement receipts share epoch and generation",
+                        reason: "strict read found a placement receipt key mismatch",
                     });
                 }
-            } else {
-                receipts.insert(version, receipt);
+                if receipt.epoch == 0 || receipt.generation == 0 {
+                    return Err(StoreError::InvalidOptions {
+                        reason:
+                            "strict read requires nonzero placement receipt epoch and generation",
+                    });
+                }
+                if receipt.planner_replay_receipt.is_none()
+                    || !planner_replay_receipt_matches_receipt(&receipt)
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "strict read requires matching planner replay authority",
+                    });
+                }
+                validate_strict_receipt_structure(&receipt)?;
+
+                let version = (receipt.epoch, receipt.generation);
+                if let Some(canonical) = receipts.get(&version) {
+                    if canonical != &receipt {
+                        return Err(StoreError::InvalidOptions {
+                            reason: "conflicting placement receipts share epoch and generation",
+                        });
+                    }
+                } else {
+                    receipts.insert(version, receipt);
+                }
             }
         }
 
@@ -3994,13 +4260,18 @@ impl Pool {
         Ok(receipts.into_iter().next().map(|(_, receipt)| receipt))
     }
 
-    fn logical_raw_payload_visible(&self, indices: &[usize], key: ObjectKey) -> Result<bool> {
+    fn logical_raw_payload_visible_for_policy(
+        &self,
+        indices: &[usize],
+        key: ObjectKey,
+        policy: PoolRedundancyPolicy,
+    ) -> Result<bool> {
         let mut visible = false;
         for &idx in indices {
             visible |= self.devices[idx].get(key)?.is_some();
         }
-        if let PoolRedundancyPolicy::Erasure { .. } = self.properties.redundancy_policy {
-            let width = self.properties.redundancy_policy.total_targets()?;
+        if let PoolRedundancyPolicy::Erasure { .. } = policy {
+            let width = policy.total_targets()?;
             for shard_index in 0..width {
                 let shard_index =
                     u16::try_from(shard_index).map_err(|_| StoreError::InvalidOptions {
@@ -4015,10 +4286,15 @@ impl Pool {
         Ok(visible)
     }
 
+    fn logical_raw_payload_visible(&self, indices: &[usize], key: ObjectKey) -> Result<bool> {
+        self.logical_raw_payload_visible_for_policy(indices, key, self.properties.redundancy_policy)
+    }
+
     fn restore_device_objects(&mut self, previous: &[(usize, ObjectKey, Option<Vec<u8>>)]) -> bool {
         let mut restored = true;
         for (idx, key, payload) in previous {
-            let pool_internal = crate::is_pool_placement_scan_internal_key(*key);
+            let pool_internal = crate::is_pool_placement_scan_internal_key(*key)
+                || crate::store::is_pool_pending_deletion_key(*key);
             let result = match (payload, pool_internal) {
                 (Some(payload), true) => self.devices[*idx]
                     .put_pool_internal(*key, payload)
@@ -4038,6 +4314,7 @@ impl Pool {
         receipt: &PlacementReceipt,
     ) -> Result<()> {
         let receipt_key = placement_receipt_object_key(receipt.object_key);
+        let encoded = receipt.encode()?;
         for &idx in indices {
             let raw = self.devices[idx]
                 .get(receipt_key)?
@@ -4052,6 +4329,17 @@ impl Pool {
                 return Err(StoreError::InvalidOptions {
                     reason:
                         "placement receipt publication verification found a non-identical receipt copy",
+                });
+            }
+            let physical = self.devices[idx]
+                .placement_receipt_candidates()?
+                .into_iter()
+                .filter(|(key, _)| *key == receipt_key)
+                .map(|(_, payload)| payload)
+                .collect::<Vec<_>>();
+            if physical.is_empty() || physical.iter().any(|payload| payload != &encoded) {
+                return Err(StoreError::InvalidOptions {
+                    reason: "placement receipt publication did not converge across physical copies",
                 });
             }
         }
@@ -4088,7 +4376,7 @@ impl Pool {
                 // A device write may report an error after the record reached
                 // media. Restore the failing slot as well as every successful
                 // prefix instead of assuming that Err implies no mutation.
-                if !self.restore_device_objects(&previous[..=position]) {
+                if !self.restore_and_sync_device_objects(&previous[..=position]) {
                     return Err(StoreError::InvalidOptions {
                         reason: "placement receipt publication failed and rollback was incomplete",
                     });
@@ -4096,11 +4384,32 @@ impl Pool {
                 return Err(error);
             }
         }
+        for &idx in indices {
+            if let Err(error) = self.devices[idx].sync_strict_pool_authority() {
+                if !self.restore_and_sync_device_objects(&previous) {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "placement receipt sync failed and rollback was incomplete",
+                    });
+                }
+                return Err(error);
+            }
+        }
 
-        match self.verify_placement_receipt_publication(indices, receipt) {
+        #[cfg(test)]
+        let verification = if std::mem::take(&mut self.fail_placement_receipt_verification_once) {
+            Err(StoreError::InvalidOptions {
+                reason: "test fault: placement receipt verification failed",
+            })
+        } else {
+            self.verify_placement_receipt_publication(indices, receipt)
+        };
+        #[cfg(not(test))]
+        let verification = self.verify_placement_receipt_publication(indices, receipt);
+
+        match verification {
             Ok(()) => Ok(()),
             Err(error) => {
-                if !self.restore_device_objects(&previous) {
+                if !self.restore_and_sync_device_objects(&previous) {
                     return Err(StoreError::InvalidOptions {
                         reason: "placement receipt verification failed and rollback was incomplete",
                     });
@@ -4129,9 +4438,11 @@ impl Pool {
         old_receipt_policy: OldReceiptPolicy<'_>,
     ) -> Result<(StoredObject, PlacementReceipt)> {
         self.validate_receipt_generation_high_water()?;
-        if crate::is_pool_placement_scan_internal_key(key) {
+        if crate::is_pool_placement_scan_internal_key(key)
+            || crate::store::is_pool_pending_deletion_key(key)
+        {
             return Err(StoreError::InvalidOptions {
-                reason: "pool receipt, shard, and generation namespaces are reserved",
+                reason: "pool receipt, shard, generation, and deletion namespaces are reserved",
             });
         }
         let old_receipt = match old_receipt_policy {
@@ -4196,6 +4507,30 @@ impl Pool {
             }
         }
 
+        // A new receipt generation is allowed to supersede a logically
+        // deleted generation while its exact old target remains pending (for
+        // example, because that device is temporarily absent). Reconcile what
+        // is now safe, but never turn the committed replacement write into an
+        // ordinary failure if old deletion cleanup still cannot finish.
+        let prior_deletions = self
+            .pending_deletions
+            .values()
+            .filter(|pending| {
+                pending.class == class
+                    && pending.receipt.object_key == key
+                    && pending.receipt.generation < receipt.generation
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for pending in prior_deletions {
+            if let Err(error) = self.reconcile_one_pending_deletion(&pending) {
+                eprintln!(
+                    "tidefs: replacement generation {} is current for {key:?}; prior deletion cleanup remains pending: {error}",
+                    receipt.generation
+                );
+            }
+        }
+
         Ok((stored, receipt))
     }
 
@@ -4232,7 +4567,7 @@ impl Pool {
                     last_object = Some(object);
                 }
                 Err(err) => {
-                    if !self.restore_device_objects(&previous_payloads) {
+                    if !self.restore_and_sync_device_objects(&previous_payloads) {
                         return Err(StoreError::InvalidOptions {
                             reason: "replicated payload write failed and rollback was incomplete",
                         });
@@ -4245,7 +4580,7 @@ impl Pool {
         }
 
         if let Err(error) = self.write_placement_receipt(indices, receipt) {
-            if !self.restore_device_objects(&previous_payloads) {
+            if !self.restore_and_sync_device_objects(&previous_payloads) {
                 return Err(StoreError::InvalidOptions {
                     reason:
                         "replicated receipt publication failed and payload rollback was incomplete",
@@ -4323,7 +4658,7 @@ impl Pool {
                 .iter()
                 .find(|shard| shard.index == shard_index)
             else {
-                let _ = self.restore_device_objects(&previous_shards);
+                let _ = self.restore_and_sync_device_objects(&previous_shards);
                 return Err(StoreError::InvalidOptions {
                     reason: "erasure placement lost a validated encoded shard",
                 });
@@ -4335,7 +4670,7 @@ impl Pool {
                     receipt.targets[target_pos].stored_digest = digest32(&shard.bytes);
                 }
                 Err(err) => {
-                    if !self.restore_device_objects(&previous_shards) {
+                    if !self.restore_and_sync_device_objects(&previous_shards) {
                         return Err(StoreError::InvalidOptions {
                             reason: "erasure payload write failed and rollback was incomplete",
                         });
@@ -4348,7 +4683,7 @@ impl Pool {
         }
 
         if let Err(error) = self.write_placement_receipt(indices, receipt) {
-            if !self.restore_device_objects(&previous_shards) {
+            if !self.restore_and_sync_device_objects(&previous_shards) {
                 return Err(StoreError::InvalidOptions {
                     reason:
                         "erasure receipt publication failed and payload rollback was incomplete",
@@ -4378,6 +4713,371 @@ impl Pool {
         Err(StoreError::InvalidOptions {
             reason: "erasure pool operation requires the distributed-repair feature",
         })
+    }
+
+    fn pending_deletion_hides_generation(
+        &self,
+        class: IoClass,
+        key: ObjectKey,
+        receipt_generation: Option<u64>,
+    ) -> bool {
+        self.pending_deletions.values().any(|pending| {
+            pending.class == class
+                && pending.receipt.object_key == key
+                && pending.phase >= PendingDeletionPhase::Committed
+                && receipt_generation
+                    .map(|generation| pending.receipt.generation >= generation)
+                    .unwrap_or(true)
+        })
+    }
+
+    fn pending_deletion_for_subject(
+        &self,
+        class: IoClass,
+        key: ObjectKey,
+    ) -> Option<PoolPendingDeletion> {
+        self.pending_deletions
+            .values()
+            .filter(|pending| pending.class == class && pending.receipt.object_key == key)
+            .max_by_key(|pending| (pending.receipt.generation, pending.phase))
+            .cloned()
+    }
+
+    fn receipt_carriers(
+        &self,
+        indices: &[usize],
+        receipt: &PlacementReceipt,
+    ) -> Result<Vec<usize>> {
+        let receipt_key = placement_receipt_object_key(receipt.object_key);
+        let mut carriers = Vec::new();
+        for &idx in indices {
+            let mut carries_receipt = false;
+            for (candidate_key, raw) in self.devices[idx].placement_receipt_candidates()? {
+                if candidate_key != receipt_key {
+                    continue;
+                }
+                let persisted =
+                    PlacementReceipt::decode(&raw).ok_or(StoreError::InvalidOptions {
+                        reason: "pending deletion preflight found a corrupt receipt carrier",
+                    })?;
+                if persisted != *receipt {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "pending deletion preflight found conflicting receipt authority",
+                    });
+                }
+                carries_receipt = true;
+            }
+            if carries_receipt {
+                carriers.push(idx);
+            }
+        }
+        if carriers.is_empty() {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending deletion preflight found no current receipt carrier",
+            });
+        }
+        Ok(carriers)
+    }
+
+    fn device_index_for_guid(&self, guid: [u8; 16]) -> Option<usize> {
+        self.device_guids
+            .iter()
+            .position(|candidate| *candidate == guid)
+    }
+
+    fn restore_and_sync_device_objects(
+        &mut self,
+        previous: &[(usize, ObjectKey, Option<Vec<u8>>)],
+    ) -> bool {
+        if !self.restore_device_objects(previous) {
+            return false;
+        }
+        let mut restored = true;
+        for (idx, key, expected) in previous {
+            restored &= self.devices[*idx].sync_strict_pool_authority().is_ok();
+            restored &= self.devices[*idx].get(*key).ok().as_ref() == Some(expected);
+        }
+        restored
+    }
+
+    fn finish_committed_pending_deletion_after_rollback_failure(
+        &mut self,
+        pending: &PoolPendingDeletion,
+        carrier_indices: &[usize],
+        encoded: &[u8],
+    ) -> bool {
+        if pending.phase < PendingDeletionPhase::Committed {
+            return false;
+        }
+
+        // Prepared already carries identical cleanup authority on every
+        // receipt carrier. Once rollback cannot prove that every higher phase
+        // was removed, any independently synced Committed copy is the
+        // irreversible decision: returning an ordinary error would make the
+        // public result depend on which phase copy a crash exposes. Discovery
+        // reads every physical representation, validates identical authority,
+        // and selects the monotonic maximum phase, so reopen/retry can converge
+        // the remaining Prepared copies before exact cleanup is forgotten.
+        let handoff_key = pending.object_key();
+        let mut durable_copy = false;
+        for &idx in carrier_indices {
+            let _ = self.devices[idx].put_pool_internal(handoff_key, encoded);
+            if self.devices[idx].sync_strict_pool_authority().is_err() {
+                continue;
+            }
+            durable_copy |=
+                self.devices[idx]
+                    .pending_deletion_candidates()
+                    .is_ok_and(|candidates| {
+                        candidates.iter().any(|(candidate_key, payload)| {
+                            *candidate_key == handoff_key && payload == encoded
+                        })
+                    });
+        }
+        if durable_copy {
+            self.pending_deletions.insert(handoff_key, pending.clone());
+        }
+        durable_copy
+    }
+
+    fn persist_pending_deletion_phase(&mut self, pending: &PoolPendingDeletion) -> Result<()> {
+        let handoff_key = pending.object_key();
+        let encoded = pending.encode()?;
+        let mut carrier_indices = Vec::with_capacity(pending.receipt_carrier_guids.len());
+        for guid in &pending.receipt_carrier_guids {
+            carrier_indices.push(self.device_index_for_guid(*guid).ok_or(
+                StoreError::InvalidOptions {
+                    reason: "pending deletion receipt carrier is absent from the current topology",
+                },
+            )?);
+        }
+        let mut previous = Vec::with_capacity(carrier_indices.len());
+        for &idx in &carrier_indices {
+            match self.devices[idx].get(handoff_key) {
+                Ok(payload) => previous.push((idx, handoff_key, payload)),
+                Err(error) if pending.phase >= PendingDeletionPhase::Committed => {
+                    if self.finish_committed_pending_deletion_after_rollback_failure(
+                        pending,
+                        &carrier_indices,
+                        &encoded,
+                    ) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        for position in 0..previous.len() {
+            let idx = previous[position].0;
+            if let Err(error) = self.devices[idx].put_pool_internal(handoff_key, &encoded) {
+                if self.restore_and_sync_device_objects(&previous[..=position]) {
+                    return Err(error);
+                }
+                if self.finish_committed_pending_deletion_after_rollback_failure(
+                    pending,
+                    &carrier_indices,
+                    &encoded,
+                ) {
+                    return Ok(());
+                }
+                return Err(StoreError::InvalidOptions {
+                    reason: "pending deletion publication failed and rollback was incomplete",
+                });
+            }
+        }
+        for &idx in &carrier_indices {
+            if self.devices[idx].get(handoff_key)?.as_deref() != Some(encoded.as_slice()) {
+                if self.restore_and_sync_device_objects(&previous) {
+                    return Err(StoreError::InvalidOptions {
+                        reason:
+                            "pending deletion publication did not converge across receipt carriers",
+                    });
+                }
+                if self.finish_committed_pending_deletion_after_rollback_failure(
+                    pending,
+                    &carrier_indices,
+                    &encoded,
+                ) {
+                    return Ok(());
+                }
+                return Err(StoreError::InvalidOptions {
+                    reason: "pending deletion verification failed and rollback was incomplete",
+                });
+            }
+        }
+        for &idx in &carrier_indices {
+            if let Err(error) = self.devices[idx].sync_strict_pool_authority() {
+                if self.restore_and_sync_device_objects(&previous) {
+                    return Err(error);
+                }
+                if self.finish_committed_pending_deletion_after_rollback_failure(
+                    pending,
+                    &carrier_indices,
+                    &encoded,
+                ) {
+                    return Ok(());
+                }
+                return Err(StoreError::InvalidOptions {
+                    reason: "pending deletion sync failed and rollback was incomplete",
+                });
+            }
+        }
+        self.pending_deletions.insert(handoff_key, pending.clone());
+        Ok(())
+    }
+
+    fn clear_pending_deletion_handoff(&mut self, pending: &PoolPendingDeletion) -> Result<bool> {
+        let handoff_key = pending.object_key();
+        let mut resolved = true;
+        for guid in &pending.receipt_carrier_guids {
+            let Some(idx) = self.device_index_for_guid(*guid) else {
+                resolved = false;
+                continue;
+            };
+            self.devices[idx].delete_pool_internal(handoff_key)?;
+            self.devices[idx].sync_strict_pool_authority()?;
+            resolved &= self.devices[idx]
+                .pending_deletion_candidates()?
+                .iter()
+                .all(|(candidate_key, _)| *candidate_key != handoff_key);
+        }
+        if resolved {
+            self.pending_deletions.remove(&handoff_key);
+        }
+        Ok(resolved)
+    }
+
+    fn newer_receipt_superseding_deletion(
+        &self,
+        pending: &PoolPendingDeletion,
+    ) -> Result<Option<PlacementReceipt>> {
+        let current = discover_placement_receipt_inventory(&self.devices)?
+            .latest_by_object
+            .remove(&pending.receipt.object_key);
+        Ok(current.filter(|receipt| receipt.generation > pending.receipt.generation))
+    }
+
+    fn newer_receipt_owns_physical_target(
+        &self,
+        newer: &PlacementReceipt,
+        deleted: &PlacementReceipt,
+        deleted_target: &PlacementReceiptTarget,
+    ) -> bool {
+        newer.targets.iter().any(|target| {
+            target.device_guid == deleted_target.device_guid
+                && match (newer.policy, deleted.policy) {
+                    (
+                        PoolRedundancyPolicy::Replicated { .. },
+                        PoolRedundancyPolicy::Replicated { .. },
+                    ) => true,
+                    (
+                        PoolRedundancyPolicy::Erasure { .. },
+                        PoolRedundancyPolicy::Erasure { .. },
+                    ) => target.shard_index == deleted_target.shard_index,
+                    _ => false,
+                }
+        })
+    }
+
+    fn reconcile_one_pending_deletion(&mut self, pending: &PoolPendingDeletion) -> Result<bool> {
+        if pending.phase == PendingDeletionPhase::Prepared {
+            return self.clear_pending_deletion_handoff(pending);
+        }
+
+        let newer_receipt = self.newer_receipt_superseding_deletion(pending)?;
+        if let Some(newer) = &newer_receipt {
+            let indices = self.class_map.get(pending.class);
+            self.verify_placement_receipt_publication(indices, newer)?;
+        }
+        let clearance_receipt = newer_receipt.as_ref().unwrap_or(&pending.receipt);
+        let mut resolved = true;
+
+        for target in &pending.receipt.targets {
+            let Some(idx) = self.device_index_for_guid(target.device_guid) else {
+                resolved = false;
+                continue;
+            };
+            if newer_receipt.as_ref().is_some_and(|newer| {
+                self.newer_receipt_owns_physical_target(newer, &pending.receipt, target)
+            }) {
+                continue;
+            }
+            let physical_key = match pending.receipt.policy {
+                PoolRedundancyPolicy::Replicated { .. } => pending.receipt.object_key,
+                PoolRedundancyPolicy::Erasure { .. } => {
+                    placement_shard_object_key(pending.receipt.object_key, target.shard_index)
+                }
+            };
+            if self.devices[idx].get(physical_key)?.is_some() {
+                self.enqueue_replaced_physical_object(idx, physical_key, clearance_receipt)?;
+                match pending.receipt.policy {
+                    PoolRedundancyPolicy::Replicated { .. } => {
+                        self.devices[idx].delete_exact_logical_object(physical_key)?;
+                    }
+                    PoolRedundancyPolicy::Erasure { .. } => {
+                        self.devices[idx].delete_exact_pool_internal_object(physical_key)?;
+                    }
+                }
+            }
+            resolved &= self.devices[idx].get(physical_key)?.is_none();
+        }
+
+        let receipt_key = placement_receipt_object_key(pending.receipt.object_key);
+        for guid in &pending.receipt_carrier_guids {
+            let Some(idx) = self.device_index_for_guid(*guid) else {
+                resolved = false;
+                continue;
+            };
+            if let Some(raw) = self.devices[idx].get(receipt_key)? {
+                let receipt = PlacementReceipt::decode(&raw).ok_or(StoreError::InvalidOptions {
+                    reason: "pending deletion cleanup found a corrupt receipt carrier",
+                })?;
+                if receipt.generation > pending.receipt.generation {
+                    continue;
+                }
+                if receipt != pending.receipt {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "pending deletion cleanup found conflicting receipt authority",
+                    });
+                }
+                self.devices[idx].delete_exact_pool_internal_object(receipt_key)?;
+            }
+            if let Some(raw) = self.devices[idx].get(receipt_key)? {
+                let retained =
+                    PlacementReceipt::decode(&raw).ok_or(StoreError::InvalidOptions {
+                        reason: "pending deletion cleanup retained a corrupt receipt carrier",
+                    })?;
+                resolved &= retained.generation > pending.receipt.generation;
+            }
+        }
+
+        if newer_receipt.is_none() {
+            let indices = self.class_map.get(pending.class);
+            resolved &= !self.logical_raw_payload_visible_for_policy(
+                indices,
+                pending.receipt.object_key,
+                pending.receipt.policy,
+            )?;
+        }
+        if !resolved {
+            return Ok(false);
+        }
+
+        self.clear_pending_deletion_handoff(pending)
+    }
+
+    fn reconcile_pending_deletions_on_open(&mut self) {
+        let pending = self.pending_deletions.values().cloned().collect::<Vec<_>>();
+        for handoff in pending {
+            if let Err(error) = self.reconcile_one_pending_deletion(&handoff) {
+                eprintln!(
+                    "tidefs: pending deletion for {:?} remains replayable after reopen: {error}",
+                    handoff.receipt.object_key
+                );
+            }
+        }
     }
 
     fn obsolete_physical_placements(
@@ -4461,26 +5161,6 @@ impl Pool {
         Ok(())
     }
 
-    fn enqueue_committed_deleted_placement(&mut self, receipt: &PlacementReceipt) -> Result<()> {
-        self.enqueue_obsolete_placement_with_clearance(receipt, receipt)
-    }
-
-    fn enqueue_obsolete_placement_with_clearance(
-        &mut self,
-        old_receipt: &PlacementReceipt,
-        replacement_receipt: &PlacementReceipt,
-    ) -> Result<()> {
-        let placements = self.obsolete_physical_placements(old_receipt);
-        for placement in placements {
-            self.enqueue_replaced_physical_object(
-                placement.device_index,
-                placement.object_key,
-                replacement_receipt,
-            )?;
-        }
-        Ok(())
-    }
-
     fn enqueue_replaced_physical_object(
         &mut self,
         device_index: usize,
@@ -4496,11 +5176,11 @@ impl Pool {
             death_txg,
             true,
             death_txg,
-        )
-        .with_replacement_receipt(replacement);
-        self.devices[device_index]
-            .store_mut()
-            .enqueue_receipt_bound_dead_object_pool_internal(entry)?;
+        );
+        let store = self.devices[device_index].store_mut();
+        store.enqueue_pending_receipt_bound_dead_object_pool_internal(entry)?;
+        store
+            .publish_dead_object_replacement_receipt_pool_internal(&entry.object_id, replacement)?;
         Ok(())
     }
 
@@ -4561,9 +5241,11 @@ impl Pool {
                 reason: "pool is locked: encryption key required for I/O",
             });
         }
-        if crate::is_pool_placement_scan_internal_key(key) {
+        if crate::is_pool_placement_scan_internal_key(key)
+            || crate::store::is_pool_pending_deletion_key(key)
+        {
             return Err(StoreError::InvalidOptions {
-                reason: "pool receipt, shard, and generation namespaces are reserved",
+                reason: "pool receipt, shard, generation, and deletion namespaces are reserved",
             });
         }
         let indices: Vec<usize> = self.class_map.get(class).to_vec();
@@ -4796,6 +5478,9 @@ impl Pool {
                 .ok_or(StoreError::InvalidOptions {
                     reason: "erasure read repair requires a placement receipt",
                 })?;
+        if self.pending_deletion_hides_generation(class, key, Some(receipt.generation)) {
+            return Ok(None);
+        }
         if !matches!(receipt.policy, PoolRedundancyPolicy::Erasure { .. }) {
             return Err(StoreError::InvalidOptions {
                 reason: "erasure read repair requires an erasure placement receipt",
@@ -4843,7 +5528,14 @@ impl Pool {
         }
 
         if let Some(receipt) = self.load_placement_receipt(&indices, key)? {
+            if self.pending_deletion_hides_generation(class, key, Some(receipt.generation)) {
+                return Ok(None);
+            }
             return self.get_with_receipt(&receipt);
+        }
+
+        if self.pending_deletion_hides_generation(class, key, None) {
+            return Ok(None);
         }
 
         for idx in self.read_order_for_key(class, key, &indices) {
@@ -4921,6 +5613,9 @@ impl Pool {
             "strict read could not inspect every placement receipt copy",
         )?
         else {
+            if self.pending_deletion_hides_generation(class, key, None) {
+                return Ok(None);
+            }
             if map_strict_read_object_io(
                 self.logical_raw_payload_visible(&indices, key),
                 "strict read could not establish receiptless raw payload absence",
@@ -4931,6 +5626,10 @@ impl Pool {
             }
             return Ok(None);
         };
+
+        if self.pending_deletion_hides_generation(class, key, Some(receipt.generation)) {
+            return Ok(None);
+        }
 
         self.verify_strict_receipt_target_copies(&receipt)?;
         let payload =
@@ -5204,12 +5903,15 @@ impl Pool {
         })
     }
 
-    /// Delete an object from every device that can hold this I/O class.
+    /// Publish logical deletion for one receipted object.
     pub fn delete(&mut self, class: IoClass, key: ObjectKey) -> Result<bool> {
         self.ensure_writable("pool delete")?;
-        if crate::is_pool_placement_scan_internal_key(key) {
+        if crate::is_pool_placement_scan_internal_key(key)
+            || crate::store::is_pool_pending_deletion_key(key)
+        {
             return Err(StoreError::InvalidOptions {
-                reason: "pool receipt, shard, and generation metadata cannot be deleted directly",
+                reason:
+                    "pool receipt, shard, generation, and deletion metadata cannot be deleted directly",
             });
         }
         self.validate_receipt_generation_high_water()?;
@@ -5220,83 +5922,89 @@ impl Pool {
             });
         }
 
-        if let Some(receipt) = self.load_placement_receipt(&indices, key)? {
-            let deleted = self.delete_with_receipt(&receipt, &indices)?;
-            if deleted {
-                self.enqueue_committed_deleted_placement(&receipt)?;
+        if let Some(pending) = self.pending_deletion_for_subject(class, key) {
+            if pending.phase >= PendingDeletionPhase::Committed {
+                if let Err(error) = self.reconcile_one_pending_deletion(&pending) {
+                    eprintln!(
+                        "tidefs: committed deletion retry for {key:?} retained cleanup: {error}"
+                    );
+                }
+                let current = match self.load_current_placement_receipt_strict(&indices, key) {
+                    Ok(current) => current,
+                    Err(error) => {
+                        eprintln!(
+                            "tidefs: committed deletion retry for {key:?} retained unresolved replacement authority: {error}"
+                        );
+                        self.health = compute_health(&self.devices);
+                        self.record_health_transitions();
+                        return Ok(false);
+                    }
+                };
+                if current
+                    .as_ref()
+                    .is_none_or(|receipt| receipt.generation <= pending.receipt.generation)
+                {
+                    self.health = compute_health(&self.devices);
+                    self.record_health_transitions();
+                    return Ok(false);
+                }
+            } else if !self.clear_pending_deletion_handoff(&pending)? {
+                return Err(StoreError::InvalidOptions {
+                    reason:
+                        "prepared deletion handoff cannot be cleared from every receipt carrier",
+                });
+            }
+        }
+
+        if let Some(receipt) = self.load_current_placement_receipt_strict(&indices, key)? {
+            let carriers = self.receipt_carriers(&indices, &receipt)?;
+            let receipt_carrier_guids = carriers
+                .iter()
+                .map(|idx| self.device_guid_for_index(*idx))
+                .collect::<Vec<_>>();
+            let mut pending = PoolPendingDeletion {
+                pool_guid: self.pool_guid,
+                class,
+                receipt,
+                receipt_carrier_guids,
+                phase: PendingDeletionPhase::Prepared,
+            };
+
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_pending_deletion_preflight_once) {
+                return Err(StoreError::InvalidOptions {
+                    reason: "test fault: pending deletion preflight failed",
+                });
+            }
+            self.persist_pending_deletion_phase(&pending)?;
+
+            pending.phase = PendingDeletionPhase::Committed;
+            self.persist_pending_deletion_phase(&pending)?;
+
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_post_deletion_publication_cleanup_once) {
+                self.health = compute_health(&self.devices);
+                self.record_health_transitions();
+                return Ok(true);
+            }
+
+            if let Err(error) = self.reconcile_one_pending_deletion(&pending) {
+                eprintln!(
+                    "tidefs: deletion committed for {key:?}; exact physical cleanup remains pending: {error}"
+                );
             }
             self.health = compute_health(&self.devices);
             self.record_health_transitions();
-            return Ok(deleted);
+            return Ok(true);
         }
 
-        let mut deleted = false;
-        let mut attempted = false;
-        let mut last_err = None;
-
-        for idx in self.usable_candidates(&indices) {
-            attempted = true;
-            match self.devices[idx].delete(key) {
-                Ok(was_present) => deleted |= was_present,
-                Err(err) => last_err = Some(err),
-            }
-        }
-
-        self.health = compute_health(&self.devices);
-        self.record_health_transitions();
-
-        if deleted {
-            Ok(true)
-        } else if attempted {
-            if let Some(err) = last_err {
-                Err(err)
-            } else {
-                Ok(false)
-            }
-        } else {
+        if self.logical_raw_payload_visible(&indices, key)? {
             Err(StoreError::InvalidOptions {
-                reason: "delete: no healthy devices available",
+                reason: "pool delete refuses a receiptless raw payload",
             })
+        } else {
+            Ok(false)
         }
-    }
-
-    fn delete_with_receipt(
-        &mut self,
-        receipt: &PlacementReceipt,
-        indices: &[usize],
-    ) -> Result<bool> {
-        let mut deleted = false;
-        match receipt.policy {
-            PoolRedundancyPolicy::Replicated { .. } => {
-                for idx in self.usable_candidates(indices) {
-                    deleted |= self.devices[idx]
-                        .delete(receipt.object_key)
-                        .unwrap_or(false);
-                }
-            }
-            PoolRedundancyPolicy::Erasure { .. } => {
-                for idx in self.usable_candidates(indices) {
-                    for target in &receipt.targets {
-                        let shard_key =
-                            placement_shard_object_key(receipt.object_key, target.shard_index);
-                        deleted |= self.devices[idx]
-                            .delete_pool_internal(shard_key)
-                            .unwrap_or(false);
-                    }
-                    deleted |= self.devices[idx]
-                        .delete(receipt.object_key)
-                        .unwrap_or(false);
-                }
-            }
-        }
-
-        let receipt_key = placement_receipt_object_key(receipt.object_key);
-        for idx in self.usable_candidates(indices) {
-            deleted |= self.devices[idx]
-                .delete_pool_internal(receipt_key)
-                .unwrap_or(false);
-        }
-        Ok(deleted)
     }
 
     /// Drain receipt-authorized dead objects across the devices for an I/O class
@@ -8112,6 +8820,21 @@ fn placement_shard_object_key(key: ObjectKey, shard_index: u16) -> ObjectKey {
     ObjectKey::from_bytes32(bytes)
 }
 
+fn pool_pending_deletion_object_key(
+    class: IoClass,
+    key: ObjectKey,
+    receipt_generation: u64,
+) -> ObjectKey {
+    let mut hasher = blake3::Hasher::new_derive_key(PENDING_DELETION_CONTEXT);
+    hasher.update(b"pending-deletion");
+    hasher.update(&[io_class_as_u8(class)]);
+    hasher.update(&key.as_bytes32());
+    hasher.update(&receipt_generation.to_le_bytes());
+    let mut bytes = *hasher.finalize().as_bytes();
+    bytes[..8].copy_from_slice(&crate::store::POOL_PENDING_DELETION_KEY_PREFIX);
+    ObjectKey::from_bytes32(bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -8557,6 +9280,46 @@ mod tests {
             "bootstrap followed the pathname instead of the retained member"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn pending_deletion_for_test(
+        pool: &Pool,
+        class: IoClass,
+        receipt: &PlacementReceipt,
+        phase: PendingDeletionPhase,
+    ) -> PoolPendingDeletion {
+        let indices = pool.class_map.get(class);
+        let carriers = pool
+            .receipt_carriers(indices, receipt)
+            .expect("discover receipt carriers");
+        PoolPendingDeletion {
+            pool_guid: pool.pool_guid,
+            class,
+            receipt: receipt.clone(),
+            receipt_carrier_guids: carriers
+                .into_iter()
+                .map(|idx| pool.device_guid_for_index(idx))
+                .collect(),
+            phase,
+        }
+    }
+
+    fn stage_pending_deletion_for_test(
+        pool: &mut Pool,
+        class: IoClass,
+        receipt: &PlacementReceipt,
+        phase: PendingDeletionPhase,
+    ) -> PoolPendingDeletion {
+        let mut pending =
+            pending_deletion_for_test(pool, class, receipt, PendingDeletionPhase::Prepared);
+        pool.persist_pending_deletion_phase(&pending)
+            .expect("persist prepared deletion handoff");
+        if phase >= PendingDeletionPhase::Committed {
+            pending.phase = PendingDeletionPhase::Committed;
+            pool.persist_pending_deletion_phase(&pending)
+                .expect("persist committed deletion handoff");
+        }
+        pending
     }
 
     fn snapshot_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -10446,6 +11209,1041 @@ mod tests {
     }
 
     #[test]
+    fn pool_delete_preflight_failure_preserves_prior_authority() {
+        let root = temp_dir("delete-preflight-preserves-authority");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"delete-preflight-preserves-authority");
+        let payload = b"the prior generation remains authoritative";
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, payload)
+            .expect("publish prior authority");
+        pool.sync_all().expect("sync prior authority");
+
+        pool.fail_pending_deletion_preflight_once = true;
+        assert_invalid_options_reason_contains(
+            pool.delete(IoClass::Data, key),
+            "pending deletion preflight failed",
+        );
+        assert!(pool.pending_deletions.is_empty());
+        assert_eq!(
+            pool.get_with_current_receipt(IoClass::Data, key)
+                .expect("read prior authority after refused delete"),
+            Some((payload.to_vec(), receipt.clone()))
+        );
+        drop(pool);
+
+        let reopened = Pool::open(config, properties, &test_options()).expect("reopen pool");
+        assert!(reopened.pending_deletions.is_empty());
+        assert_eq!(
+            reopened
+                .get_with_current_receipt(IoClass::Data, key)
+                .expect("read prior authority after reopen"),
+            Some((payload.to_vec(), receipt))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_delete_refuses_receiptless_raw_payload_before_mutation() {
+        let root = temp_dir("delete-receiptless-raw-refusal");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let properties = PoolProperties::default();
+        let options = test_options();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options).unwrap();
+        let key = ObjectKey::from_name(b"delete-receiptless-raw-refusal");
+        let payload = b"receiptless bytes must remain available for diagnosis";
+
+        for device in &mut pool.devices {
+            device.put(key, payload).unwrap();
+            device.sync_all().unwrap();
+        }
+
+        assert_invalid_options_reason_contains(
+            pool.delete(IoClass::Data, key),
+            "receiptless raw payload",
+        );
+        for device in &pool.devices {
+            assert_eq!(device.get(key).unwrap(), Some(payload.to_vec()));
+        }
+        drop(pool);
+
+        let reopened = Pool::open(config, properties, &options).unwrap();
+        assert_invalid_options_reason_contains(
+            reopened.get_with_current_receipt(IoClass::Data, key),
+            "receiptless raw payload",
+        );
+        for device in &reopened.devices {
+            assert_eq!(device.get(key).unwrap(), Some(payload.to_vec()));
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_delete_reopen_rejects_unbound_handoff_authority() {
+        let options = test_options();
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+
+        let future_root = temp_dir("delete-future-generation-handoff");
+        let _ = std::fs::remove_dir_all(&future_root);
+        let future_config = multi_data_device_config(&future_root, 2);
+        let mut pool = Pool::create(future_config.clone(), properties.clone(), &options).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let future_key = ObjectKey::from_name(b"delete-future-generation-handoff");
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, future_key, b"current generation")
+            .unwrap();
+        let mut pending = pending_deletion_for_test(
+            &pool,
+            IoClass::Data,
+            &receipt,
+            PendingDeletionPhase::Committed,
+        );
+        pending.receipt.generation = pool
+            .reserved_placement_receipt_generation_through
+            .checked_add(1)
+            .unwrap();
+        let handoff_key = pending.object_key();
+        let encoded = pending.encode().unwrap();
+        pool.devices[0]
+            .put_pool_internal(handoff_key, &encoded)
+            .unwrap();
+        pool.devices[0].sync_strict_pool_authority().unwrap();
+        drop(pool);
+
+        assert_invalid_options_reason_contains(
+            Pool::open(future_config, properties.clone(), &options),
+            "exceeds the durable high-water reservation",
+        );
+        let _ = std::fs::remove_dir_all(&future_root);
+
+        let misplaced_root = temp_dir("delete-misplaced-handoff");
+        let _ = std::fs::remove_dir_all(&misplaced_root);
+        let misplaced_config = multi_data_device_config(&misplaced_root, 2);
+        let mut pool =
+            Pool::create(misplaced_config.clone(), properties.clone(), &options).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let misplaced_key = ObjectKey::from_name(b"delete-misplaced-handoff");
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, misplaced_key, b"current authority")
+            .unwrap();
+        let mut pending = pending_deletion_for_test(
+            &pool,
+            IoClass::Data,
+            &receipt,
+            PendingDeletionPhase::Committed,
+        );
+        pending.receipt_carrier_guids = vec![pool.device_guids[1]];
+        let encoded = pending.encode().unwrap();
+        pool.devices[0]
+            .put_pool_internal(pending.object_key(), &encoded)
+            .unwrap();
+        pool.devices[0].sync_strict_pool_authority().unwrap();
+        drop(pool);
+
+        assert_invalid_options_reason_contains(
+            Pool::open(misplaced_config, properties, &options),
+            "outside its declared receipt carriers",
+        );
+        let _ = std::fs::remove_dir_all(&misplaced_root);
+    }
+
+    #[test]
+    fn pool_delete_crash_reopen() {
+        let options = test_options();
+
+        // Crash after Prepared: old receipt and payload remain authoritative,
+        // and writable reopen removes the non-authoritative handoff.
+        let prepared_root = temp_dir("delete-crash-after-prepared");
+        let _ = std::fs::remove_dir_all(&prepared_root);
+        let prepared_config = single_device_config(&prepared_root);
+        let properties = PoolProperties::default();
+        let mut pool = Pool::create(prepared_config.clone(), properties.clone(), &options).unwrap();
+        let prepared_key = ObjectKey::from_name(b"delete-crash-after-prepared");
+        let prepared_payload = b"prepared authority";
+        let (_, prepared_receipt) = pool
+            .put_with_receipt(IoClass::Data, prepared_key, prepared_payload)
+            .unwrap();
+        stage_pending_deletion_for_test(
+            &mut pool,
+            IoClass::Data,
+            &prepared_receipt,
+            PendingDeletionPhase::Prepared,
+        );
+        drop(pool);
+        let reopened = Pool::open(prepared_config, properties.clone(), &options)
+            .expect("reopen after Prepared");
+        assert!(reopened.pending_deletions.is_empty());
+        assert_eq!(
+            reopened
+                .get_with_current_receipt(IoClass::Data, prepared_key)
+                .unwrap(),
+            Some((prepared_payload.to_vec(), prepared_receipt))
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&prepared_root);
+
+        // Crash after Committed: raw payload and receipt may still exist, but
+        // reopen must hide them first and reconcile them exactly once.
+        let committed_root = temp_dir("delete-crash-after-committed");
+        let _ = std::fs::remove_dir_all(&committed_root);
+        let committed_config = multi_data_device_config(&committed_root, 2);
+        let committed_properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(
+            committed_config.clone(),
+            committed_properties.clone(),
+            &options,
+        )
+        .unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let committed_key = ObjectKey::from_name(b"delete-crash-after-committed");
+        let committed_payload = b"committed authority";
+        let (_, committed_receipt) = pool
+            .put_with_receipt(IoClass::Data, committed_key, committed_payload)
+            .unwrap();
+        pool.sync_all().unwrap();
+        pool.fail_post_deletion_publication_cleanup_once = true;
+        assert!(pool.delete(IoClass::Data, committed_key).unwrap());
+        assert_eq!(pool.get(IoClass::Data, committed_key).unwrap(), None);
+        assert_eq!(pool.pending_deletions.len(), 1);
+        assert!(committed_receipt.targets.iter().all(|target| {
+            let idx = pool.resolve_receipt_target(target).unwrap();
+            pool.devices[idx].get(committed_key).unwrap().as_deref() == Some(committed_payload)
+        }));
+        drop(pool);
+        let mut reopened = Pool::open(committed_config, committed_properties, &options)
+            .expect("reopen after Committed");
+        assert_eq!(reopened.get(IoClass::Data, committed_key).unwrap(), None);
+        assert!(!reopened.delete(IoClass::Data, committed_key).unwrap());
+        assert!(reopened.pending_deletions.is_empty());
+        assert!(committed_receipt.targets.iter().all(|target| {
+            let idx = reopened.resolve_receipt_target(target).unwrap();
+            reopened.devices[idx].get(committed_key).unwrap().is_none()
+        }));
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&committed_root);
+
+        // Crash after payload removal but before receipt removal.
+        let payload_root = temp_dir("delete-crash-after-payload");
+        let _ = std::fs::remove_dir_all(&payload_root);
+        let payload_config = multi_data_device_config(&payload_root, 2);
+        let payload_properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool =
+            Pool::create(payload_config.clone(), payload_properties.clone(), &options).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let payload_key = ObjectKey::from_name(b"delete-crash-after-payload");
+        let (_, payload_receipt) = pool
+            .put_with_receipt(IoClass::Data, payload_key, b"payload removal authority")
+            .unwrap();
+        stage_pending_deletion_for_test(
+            &mut pool,
+            IoClass::Data,
+            &payload_receipt,
+            PendingDeletionPhase::Committed,
+        );
+        for target in &payload_receipt.targets {
+            let idx = pool.resolve_receipt_target(target).unwrap();
+            pool.enqueue_replaced_physical_object(idx, payload_key, &payload_receipt)
+                .unwrap();
+            assert!(pool.devices[idx].delete(payload_key).unwrap());
+            pool.devices[idx].sync_all().unwrap();
+        }
+        drop(pool);
+        let reopened = Pool::open(payload_config, payload_properties, &options)
+            .expect("reopen after payload removal");
+        assert_eq!(reopened.get(IoClass::Data, payload_key).unwrap(), None);
+        assert!(reopened.pending_deletions.is_empty());
+        assert!(reopened
+            .placement_receipt_for_key(IoClass::Data, payload_key)
+            .unwrap()
+            .is_none());
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&payload_root);
+
+        // Crash after payload and receipt removal but before clearing the
+        // handoff. Reopen must finish the tombstone without resurrecting raw
+        // fallback bytes or reporting a second successful delete.
+        let receipt_root = temp_dir("delete-crash-after-receipt");
+        let _ = std::fs::remove_dir_all(&receipt_root);
+        let receipt_config = single_device_config(&receipt_root);
+        let mut pool = Pool::create(receipt_config.clone(), properties.clone(), &options).unwrap();
+        let receipt_key = ObjectKey::from_name(b"delete-crash-after-receipt");
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, receipt_key, b"receipt removal authority")
+            .unwrap();
+        let pending = stage_pending_deletion_for_test(
+            &mut pool,
+            IoClass::Data,
+            &receipt,
+            PendingDeletionPhase::Committed,
+        );
+        let target_idx = pool.resolve_receipt_target(&receipt.targets[0]).unwrap();
+        pool.enqueue_replaced_physical_object(target_idx, receipt_key, &receipt)
+            .unwrap();
+        assert!(pool.devices[target_idx].delete(receipt_key).unwrap());
+        let receipt_object_key = placement_receipt_object_key(receipt_key);
+        for guid in &pending.receipt_carrier_guids {
+            let idx = pool.device_index_for_guid(*guid).unwrap();
+            assert!(pool.devices[idx]
+                .delete_pool_internal(receipt_object_key)
+                .unwrap());
+            pool.devices[idx].sync_all().unwrap();
+        }
+        drop(pool);
+        let mut reopened =
+            Pool::open(receipt_config, properties, &options).expect("reopen after receipt removal");
+        assert_eq!(reopened.get(IoClass::Data, receipt_key).unwrap(), None);
+        assert!(!reopened.delete(IoClass::Data, receipt_key).unwrap());
+        assert!(reopened.pending_deletions.is_empty());
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&receipt_root);
+    }
+
+    #[test]
+    fn pool_delete_reopen_discovers_composite_pending_markers() {
+        let options = test_options();
+        let properties = PoolProperties::default();
+
+        let mirror_root = temp_dir("delete-reopen-secondary-mirror-marker");
+        let _ = std::fs::remove_dir_all(&mirror_root);
+        let mirror_config = two_leg_mirror_device_config(&mirror_root);
+        let mut pool = Pool::create(mirror_config.clone(), properties.clone(), &options).unwrap();
+        let mirror_key = ObjectKey::from_name(b"delete-reopen-secondary-mirror-marker");
+        let (_, mirror_receipt) = pool
+            .put_with_receipt(IoClass::Data, mirror_key, b"mirror authority")
+            .unwrap();
+        let mirror_pending = stage_pending_deletion_for_test(
+            &mut pool,
+            IoClass::Data,
+            &mirror_receipt,
+            PendingDeletionPhase::Committed,
+        );
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        let mut primary_leg = LocalObjectStore::open_with_options(
+            mirror_root.join("mirror-0"),
+            StoreOptions::default(),
+        )
+        .unwrap();
+        assert!(primary_leg
+            .delete_pool_internal(mirror_pending.object_key())
+            .unwrap());
+        primary_leg.sync_all().unwrap();
+        drop(primary_leg);
+
+        let mut reopened = Pool::open(mirror_config, properties.clone(), &options)
+            .expect("discover committed marker retained only on the secondary mirror leg");
+        assert_eq!(reopened.get(IoClass::Data, mirror_key).unwrap(), None);
+        assert!(!reopened.delete(IoClass::Data, mirror_key).unwrap());
+        assert!(reopened.pending_deletions.is_empty());
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&mirror_root);
+
+        let parity_root = temp_dir("delete-reopen-parity-marker");
+        let _ = std::fs::remove_dir_all(&parity_root);
+        let parity_config = parity_raid1_device_config(&parity_root, 2);
+        let mut pool = Pool::create(parity_config.clone(), properties.clone(), &options).unwrap();
+        let parity_key = ObjectKey::from_name(b"delete-reopen-parity-marker");
+        let (_, parity_receipt) = pool
+            .put_with_receipt(IoClass::Data, parity_key, b"parity authority")
+            .unwrap();
+        stage_pending_deletion_for_test(
+            &mut pool,
+            IoClass::Data,
+            &parity_receipt,
+            PendingDeletionPhase::Committed,
+        );
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        let mut reopened = Pool::open(parity_config, properties, &options)
+            .expect("discover and reconstruct committed parity marker");
+        assert_eq!(reopened.get(IoClass::Data, parity_key).unwrap(), None);
+        assert!(!reopened.delete(IoClass::Data, parity_key).unwrap());
+        assert!(reopened.pending_deletions.is_empty());
+
+        let _ = std::fs::remove_dir_all(&parity_root);
+    }
+
+    #[test]
+    fn pool_delete_refuses_degraded_composite_handoff_publication() {
+        let root = temp_dir("delete-degraded-composite-publication");
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties::default();
+        let mut pool = Pool::create(
+            two_leg_mirror_device_config(&root),
+            properties,
+            &test_options(),
+        )
+        .unwrap();
+        let key = ObjectKey::from_name(b"delete-degraded-composite-publication");
+        let payload = b"current authority survives refused tombstone publication";
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, payload)
+            .expect("publish current authority");
+        pool.sync_all().unwrap();
+
+        let Device::Mirror(mirror) = &mut pool.devices[0] else {
+            panic!("expected mirror device");
+        };
+        let mut failure = crate::FaultInjectionConfig::off();
+        failure.write_failure_probability = 1.0;
+        mirror
+            .member_store_mut_for_test(1)
+            .expect("secondary mirror leg")
+            .enable_fault_injection(failure);
+
+        assert!(pool.delete(IoClass::Data, key).is_err());
+        assert!(pool.pending_deletions.is_empty());
+        assert_eq!(
+            pool.get_with_current_receipt(IoClass::Data, key).unwrap(),
+            Some((payload.to_vec(), receipt))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_delete_partial_commit_publication_converges_forward() {
+        let root = temp_dir("delete-partial-commit-publication");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let options = test_options();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"delete-partial-commit-publication");
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"phase convergence authority")
+            .unwrap();
+        let mut pending = stage_pending_deletion_for_test(
+            &mut pool,
+            IoClass::Data,
+            &receipt,
+            PendingDeletionPhase::Prepared,
+        );
+        pending.phase = PendingDeletionPhase::Committed;
+        let committed_copy = pending.encode().unwrap();
+        let committed_idx = pool
+            .device_index_for_guid(pending.receipt_carrier_guids[0])
+            .unwrap();
+        pool.devices[committed_idx]
+            .put_pool_internal(pending.object_key(), &committed_copy)
+            .unwrap();
+        pool.devices[committed_idx].sync_all().unwrap();
+        drop(pool);
+
+        let mut reopened = Pool::open(config, properties, &options)
+            .expect("the monotonic committed copy must win over prepared copies");
+        assert_eq!(reopened.get(IoClass::Data, key).unwrap(), None);
+        assert!(!reopened.delete(IoClass::Data, key).unwrap());
+        assert!(reopened.pending_deletions.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn block_device_reopen_reconciles_pending_reclaim() {
+        let root = temp_dir("block-device-pending-delete-reclaim");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_regular_file_pool_config(&root);
+        let properties = PoolProperties::default();
+        let options = test_options();
+        let mut pool =
+            Pool::create(config.clone(), properties.clone(), &options).expect("create pool");
+        let key = ObjectKey::from_name(b"block-device-pending-delete-reclaim");
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"durable block reclaim")
+            .expect("publish block payload");
+        pool.sync_all().expect("sync block payload");
+
+        pool.fail_post_deletion_publication_cleanup_once = true;
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+        drop(pool);
+
+        let mut reopened = Pool::open(config.clone(), properties.clone(), &options)
+            .expect("reconcile committed block deletion");
+        assert_eq!(reopened.get(IoClass::Data, key).unwrap(), None);
+        assert!(reopened.pending_deletions.is_empty());
+        reopened.sync_all().expect("sync reconciled reclaim queue");
+        drop(reopened);
+
+        let mut reopened =
+            Pool::open(config, properties, &options).expect("reload durable block reclaim queue");
+        let target_indices: BTreeSet<_> = receipt
+            .targets
+            .iter()
+            .map(|target| reopened.resolve_receipt_target(target).unwrap())
+            .collect();
+        let queued: usize = target_indices
+            .into_iter()
+            .map(|idx| {
+                reopened.devices[idx]
+                    .store_mut()
+                    .drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
+                        u64::MAX,
+                        u64::MAX,
+                        16,
+                    )
+                    .expect("drain reloaded block reclaim")
+                    .reclaim_queue_depth
+            })
+            .sum();
+        assert_eq!(queued, receipt.targets.len());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_delete_recreated_key_advances_physical_reclaim_receipt() {
+        let root = temp_dir("delete-recreated-key-reclaim-receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+        let properties = PoolProperties::default();
+        let options = test_options();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options).unwrap();
+        let key = ObjectKey::from_name(b"delete-recreated-key-reclaim-receipt");
+
+        let (_, first_receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"first physical lifetime")
+            .unwrap();
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+
+        let second_payload = b"second physical lifetime";
+        let (_, second_receipt) = pool
+            .put_with_receipt(IoClass::Data, key, second_payload)
+            .unwrap();
+        assert!(second_receipt.generation > first_receipt.generation);
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        let mut reopened = Pool::open(config.clone(), properties.clone(), &options).unwrap();
+        let old_lifetime = reopened
+            .drain_receipt_bound_dead_objects_at_stable_generation(
+                IoClass::Data,
+                u64::MAX,
+                first_receipt.generation,
+                16,
+            )
+            .expect("first lifetime must be reclaimable after key recreation");
+        assert_eq!(old_lifetime.objects_examined, 1);
+        assert_eq!(
+            reopened.get(IoClass::Data, key).unwrap(),
+            Some(second_payload.to_vec()),
+            "old-lifetime reclaim must not select the recreated live location"
+        );
+        assert!(reopened.delete(IoClass::Data, key).unwrap());
+        drop(reopened);
+
+        let mut reopened = Pool::open(config, properties, &options).unwrap();
+        let held = reopened
+            .drain_receipt_bound_dead_objects_at_stable_generation(
+                IoClass::Data,
+                u64::MAX,
+                first_receipt.generation,
+                16,
+            )
+            .expect("stale generation must not authorize repeated-key reclaim");
+        assert_eq!(held.objects_examined, 0);
+        assert_eq!(
+            held.reclaim_queue_depth, 1,
+            "the latest physical lifetime must remain queued at the stale generation"
+        );
+        let eligible = reopened
+            .drain_receipt_bound_dead_objects_at_stable_generation(
+                IoClass::Data,
+                u64::MAX,
+                second_receipt.generation,
+                16,
+            )
+            .expect("latest generation must authorize repeated-key reclaim");
+        assert_eq!(eligible.objects_examined, 1);
+        assert_eq!(
+            eligible.reclaim_queue_depth, 1,
+            "segment release may remain queued until every record is dead"
+        );
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_delete_cleans_exact_replicated_and_erasure_targets() {
+        let options = test_options();
+
+        let replicated_root = temp_dir("delete-exact-replicated-targets");
+        let _ = std::fs::remove_dir_all(&replicated_root);
+        let replicated_config = multi_data_device_config(&replicated_root, 3);
+        let replicated_properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(
+            replicated_config.clone(),
+            replicated_properties.clone(),
+            &options,
+        )
+        .unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"delete-exact-replicated-targets");
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"replicated authority")
+            .unwrap();
+        let target_indices: BTreeSet<_> = receipt
+            .targets
+            .iter()
+            .map(|target| pool.resolve_receipt_target(target).unwrap())
+            .collect();
+        let stray_idx = (0..pool.devices.len())
+            .find(|idx| !target_indices.contains(idx))
+            .expect("non-target device");
+        pool.devices[stray_idx]
+            .put(key, b"unreceipted stray copy")
+            .unwrap();
+
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+        assert!(target_indices
+            .iter()
+            .all(|idx| pool.devices[*idx].get(key).unwrap().is_none()));
+        assert_eq!(
+            pool.devices[stray_idx].get(key).unwrap(),
+            Some(b"unreceipted stray copy".to_vec()),
+            "cleanup must not sweep a target absent from the selected receipt"
+        );
+        assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
+        assert_eq!(pool.pending_deletions.len(), 1);
+        drop(pool);
+
+        let mut reopened = Pool::open(replicated_config, replicated_properties, &options)
+            .expect("reopen with replicated stray");
+        assert_eq!(reopened.get(IoClass::Data, key).unwrap(), None);
+        assert_eq!(reopened.pending_deletions.len(), 1);
+        assert!(reopened.devices[stray_idx].delete(key).unwrap());
+        let pending = reopened
+            .pending_deletion_for_subject(IoClass::Data, key)
+            .expect("retained replicated handoff");
+        assert!(reopened.reconcile_one_pending_deletion(&pending).unwrap());
+        assert!(reopened.pending_deletions.is_empty());
+        assert!(!reopened.delete(IoClass::Data, key).unwrap());
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&replicated_root);
+
+        let erasure_root = temp_dir("delete-exact-erasure-targets");
+        let _ = std::fs::remove_dir_all(&erasure_root);
+        let erasure_config = multi_data_device_config(&erasure_root, 4);
+        let erasure_properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool =
+            Pool::create(erasure_config.clone(), erasure_properties.clone(), &options).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"delete-exact-erasure-targets");
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"erasure deletion authority")
+            .unwrap();
+        let target_indices: BTreeSet<_> = receipt
+            .targets
+            .iter()
+            .map(|target| pool.resolve_receipt_target(target).unwrap())
+            .collect();
+        let stray_idx = (0..pool.devices.len())
+            .find(|idx| !target_indices.contains(idx))
+            .expect("non-target erasure device");
+        let stray_shard = placement_shard_object_key(key, receipt.targets[0].shard_index);
+        pool.devices[stray_idx]
+            .put_pool_internal(stray_shard, b"unreceipted stray shard")
+            .unwrap();
+
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+        for target in &receipt.targets {
+            let idx = pool.resolve_receipt_target(target).unwrap();
+            let shard_key = placement_shard_object_key(key, target.shard_index);
+            assert!(pool.devices[idx].get(shard_key).unwrap().is_none());
+        }
+        assert_eq!(
+            pool.devices[stray_idx].get(stray_shard).unwrap(),
+            Some(b"unreceipted stray shard".to_vec())
+        );
+        assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
+        assert_eq!(pool.pending_deletions.len(), 1);
+        drop(pool);
+
+        let mut reopened =
+            Pool::open(erasure_config, erasure_properties, &options).expect("reopen erasure pool");
+        assert_eq!(reopened.get(IoClass::Data, key).unwrap(), None);
+        assert_eq!(reopened.pending_deletions.len(), 1);
+        assert!(reopened.devices[stray_idx]
+            .delete_pool_internal(stray_shard)
+            .unwrap());
+        let pending = reopened
+            .pending_deletion_for_subject(IoClass::Data, key)
+            .expect("retained erasure handoff");
+        assert!(reopened.reconcile_one_pending_deletion(&pending).unwrap());
+        assert!(reopened.pending_deletions.is_empty());
+
+        let _ = std::fs::remove_dir_all(&erasure_root);
+    }
+
+    #[test]
+    fn pool_delete_retains_handoff_until_mirror_cleanup_converges() {
+        let root = temp_dir("delete-mirror-cleanup-convergence");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = two_leg_mirror_device_config(&root);
+        let properties = PoolProperties::default();
+        let options = test_options();
+        let mut pool = Pool::create(config, properties, &options).unwrap();
+        let key = ObjectKey::from_name(b"delete-mirror-cleanup-convergence");
+        let payload = b"committed deletion hides a retained mirror copy";
+        let (_, receipt) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        let pending = stage_pending_deletion_for_test(
+            &mut pool,
+            IoClass::Data,
+            &receipt,
+            PendingDeletionPhase::Committed,
+        );
+
+        let Device::Mirror(mirror) = &mut pool.devices[0] else {
+            panic!("expected mirror device");
+        };
+        mirror
+            .member_store_mut_for_test(1)
+            .unwrap()
+            .install_pool_raw_mutation_guard(Arc::new(AtomicBool::new(false)));
+
+        assert!(pool.reconcile_one_pending_deletion(&pending).is_err());
+        assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
+        assert_eq!(pool.pending_deletions.len(), 1);
+        let Device::Mirror(mirror) = &mut pool.devices[0] else {
+            unreachable!();
+        };
+        assert_eq!(
+            mirror
+                .member_store_mut_for_test(0)
+                .unwrap()
+                .get(key)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            mirror
+                .member_store_mut_for_test(1)
+                .unwrap()
+                .get(key)
+                .unwrap(),
+            Some(payload.to_vec())
+        );
+        mirror
+            .member_store_mut_for_test(1)
+            .unwrap()
+            .install_pool_raw_mutation_guard(Arc::new(AtomicBool::new(true)));
+
+        assert!(pool.reconcile_one_pending_deletion(&pending).unwrap());
+        assert!(pool.pending_deletions.is_empty());
+        assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
+        let Device::Mirror(mirror) = &mut pool.devices[0] else {
+            unreachable!();
+        };
+        for leg in 0..2 {
+            assert_eq!(
+                mirror
+                    .member_store_mut_for_test(leg)
+                    .unwrap()
+                    .get(key)
+                    .unwrap(),
+                None
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_delete_preserves_newer_receipt_hidden_in_store_replica() {
+        let root = temp_dir("delete-hidden-newer-store-replica");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut config = single_device_config(&root);
+        config.root_path = config.devices[0].path.clone();
+        let properties = PoolProperties::default();
+        let mut options = test_options();
+        options.mirror_path = Some(root.join("store-replica"));
+        let mut pool = Pool::create(config, properties, &options).unwrap();
+        let key = ObjectKey::from_name(b"delete-hidden-newer-store-replica");
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"old generation")
+            .unwrap();
+        let pending = stage_pending_deletion_for_test(
+            &mut pool,
+            IoClass::Data,
+            &receipt,
+            PendingDeletionPhase::Committed,
+        );
+
+        let mut newer = receipt.clone();
+        newer.generation = pool.allocate_placement_receipt_generation().unwrap();
+        let receipt_key = placement_receipt_object_key(key);
+        let replica = &mut pool.raw_primary_store_mut().replicas[0];
+        replica
+            .put_pool_internal(receipt_key, &newer.encode().unwrap())
+            .unwrap();
+        replica.sync_strict_pool_authority().unwrap();
+
+        assert!(pool.reconcile_one_pending_deletion(&pending).is_err());
+        assert_eq!(pool.pending_deletions.len(), 1);
+        let replica = &pool.raw_primary_store_mut().replicas[0];
+        assert_eq!(
+            PlacementReceipt::decode(&replica.get(receipt_key).unwrap().unwrap())
+                .unwrap()
+                .generation,
+            newer.generation
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_delete_retains_mixed_pool_device_receipt_generations() {
+        let root = temp_dir("delete-mixed-pool-device-receipts");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"delete-mixed-pool-device-receipts");
+        let payload = b"old authority remains until replacement publication converges";
+        let (_, receipt) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        let pending = stage_pending_deletion_for_test(
+            &mut pool,
+            IoClass::Data,
+            &receipt,
+            PendingDeletionPhase::Committed,
+        );
+
+        let mut newer = receipt.clone();
+        newer.generation = pool.allocate_placement_receipt_generation().unwrap();
+        let receipt_key = placement_receipt_object_key(key);
+        pool.devices[1]
+            .put_pool_internal(receipt_key, &newer.encode().unwrap())
+            .unwrap();
+        pool.devices[1].sync_strict_pool_authority().unwrap();
+
+        assert_invalid_options_reason_contains(
+            pool.reconcile_one_pending_deletion(&pending),
+            "non-identical receipt copy",
+        );
+        assert!(!pool.delete(IoClass::Data, key).unwrap());
+        assert_eq!(pool.pending_deletions.len(), 1);
+        for (idx, expected) in [(0, &receipt), (1, &newer)] {
+            let persisted =
+                PlacementReceipt::decode(&pool.devices[idx].get(receipt_key).unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(&persisted, expected);
+            assert_eq!(
+                pool.devices[idx].get(key).unwrap().as_deref(),
+                Some(payload.as_slice())
+            );
+            assert!(pool.devices[idx]
+                .pending_deletion_candidates()
+                .unwrap()
+                .iter()
+                .any(|(candidate_key, _)| *candidate_key == pending.object_key()));
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_delete_retains_missing_targets_and_exposes_newer_generation() {
+        let options = test_options();
+        let missing_root = temp_dir("delete-missing-target-retention");
+        let _ = std::fs::remove_dir_all(&missing_root);
+        let missing_config = multi_data_device_config(&missing_root, 2);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(missing_config, properties.clone(), &options).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"delete-missing-target-retention");
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"missing target authority")
+            .unwrap();
+        pool.fail_post_deletion_publication_cleanup_once = true;
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+        let pending = pool
+            .pending_deletion_for_subject(IoClass::Data, key)
+            .expect("committed handoff");
+        let missing_idx = pool.resolve_receipt_target(&receipt.targets[0]).unwrap();
+        let original_guid = pool.device_guids[missing_idx];
+        pool.device_guids[missing_idx] = [0xEE; 16];
+        assert!(!pool.reconcile_one_pending_deletion(&pending).unwrap());
+        assert_eq!(pool.pending_deletions.len(), 1);
+        assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
+        pool.device_guids[missing_idx] = original_guid;
+        assert!(pool.reconcile_one_pending_deletion(&pending).unwrap());
+        assert!(pool.pending_deletions.is_empty());
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&missing_root);
+
+        let replacement_root = temp_dir("delete-newer-generation-visible");
+        let _ = std::fs::remove_dir_all(&replacement_root);
+        let replacement_config = multi_data_device_config(&replacement_root, 2);
+        let mut pool = Pool::create(replacement_config, properties, &options).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"delete-newer-generation-visible");
+        let (_, deleted_receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"deleted generation")
+            .unwrap();
+        pool.fail_post_deletion_publication_cleanup_once = true;
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+        assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
+
+        let replacement_payload = b"newer generation is current";
+        let (_, replacement_receipt) = pool
+            .put_with_receipt(IoClass::Data, key, replacement_payload)
+            .expect("publish replacement after committed deletion");
+        assert!(replacement_receipt.generation > deleted_receipt.generation);
+        assert_eq!(
+            pool.get_with_current_receipt(IoClass::Data, key).unwrap(),
+            Some((replacement_payload.to_vec(), replacement_receipt))
+        );
+        assert!(pool.pending_deletions.is_empty());
+
+        let _ = std::fs::remove_dir_all(&replacement_root);
+    }
+
+    #[test]
+    fn pool_delete_retry_refuses_to_abandon_unreachable_prepared_carrier() {
+        let root = temp_dir("delete-prepared-carrier-unreachable");
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties::default();
+        let mut pool =
+            Pool::create(single_device_config(&root), properties, &test_options()).unwrap();
+        let key = ObjectKey::from_name(b"delete-prepared-carrier-unreachable");
+        let payload = b"prepared authority must remain recoverable";
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, payload)
+            .expect("publish current authority");
+        let pending = stage_pending_deletion_for_test(
+            &mut pool,
+            IoClass::Data,
+            &receipt,
+            PendingDeletionPhase::Prepared,
+        );
+        pool.device_guids[0] = [0xA5; 16];
+
+        assert_invalid_options_reason_contains(
+            pool.delete(IoClass::Data, key),
+            "cannot be cleared from every receipt carrier",
+        );
+        assert_eq!(
+            pool.pending_deletion_for_subject(IoClass::Data, key),
+            Some(pending)
+        );
+        assert_eq!(pool.devices[0].get(key).unwrap(), Some(payload.to_vec()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_delete_retry_deletes_newer_generation_after_old_cleanup() {
+        let root = temp_dir("delete-retry-newer-generation");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"delete-retry-newer-generation");
+        let (_, deleted_receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"deleted generation")
+            .unwrap();
+        pool.fail_post_deletion_publication_cleanup_once = true;
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+
+        let replacement_payload = b"replacement generation";
+        pool.device_guids[0] = [0xA6; 16];
+        let (_, replacement_receipt) = pool
+            .put_with_receipt(IoClass::Data, key, replacement_payload)
+            .expect("publish replacement while old target is unreachable");
+        assert!(replacement_receipt.generation > deleted_receipt.generation);
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(replacement_payload.to_vec())
+        );
+        assert_eq!(pool.pending_deletions.len(), 1);
+
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+        assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
+        assert!(!pool.delete(IoClass::Data, key).unwrap());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_public_mutation_rejects_pending_deletion_namespace() {
+        let root = temp_dir("pending-deletion-namespace-reserved");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut pool = Pool::create(
+            single_device_config(&root),
+            PoolProperties::default(),
+            &test_options(),
+        )
+        .unwrap();
+        let user_key = ObjectKey::from_name(b"pending-deletion-namespace-reserved");
+        let reserved_key = pool_pending_deletion_object_key(IoClass::Data, user_key, 1);
+
+        assert_invalid_options_reason_contains(
+            pool.put(IoClass::Data, reserved_key, b"raw public payload"),
+            "deletion namespaces are reserved",
+        );
+        assert_invalid_options_reason_contains(
+            pool.put_with_receipt(IoClass::Data, reserved_key, b"receipted public payload"),
+            "deletion namespaces are reserved",
+        );
+        assert_invalid_options_reason_contains(
+            pool.ensure_prepublication_data_object_with_receipt(
+                reserved_key,
+                b"prepublication public payload",
+            ),
+            "deletion namespaces are reserved",
+        );
+        assert_invalid_options_reason_contains(
+            pool.delete(IoClass::Data, reserved_key),
+            "cannot be deleted directly",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn placement_receipts_scan_returns_latest_logical_receipts() {
         let root = temp_dir("receipt-snapshot-latest");
         let _ = std::fs::remove_dir_all(&root);
@@ -10857,9 +12655,7 @@ mod tests {
             .store_mut()
             .delete_pool_internal(placement_receipt_object_key(key))
             .unwrap();
-        pool.devices[0]
-            .sync_pool_receipt_generation_high_water()
-            .unwrap();
+        pool.devices[0].sync_strict_pool_authority().unwrap();
         drop(pool);
 
         assert!(matches!(
@@ -10974,7 +12770,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        replica.sync_pool_receipt_generation_high_water().unwrap();
+        replica.sync_strict_pool_authority().unwrap();
         drop(pool);
 
         let before = snapshot_tree_bytes(&root);
@@ -11225,7 +13021,9 @@ mod tests {
         let root = temp_dir("partial-receipt-publication");
         let _ = std::fs::remove_dir_all(&root);
         let config = multi_data_device_config(&root, 2);
-        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let properties = PoolProperties::default();
+        let options = test_options();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options).unwrap();
         let key = ObjectKey::from_name(b"partial-receipt-publication");
         let payload = b"stable payload";
         let (_, prior) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
@@ -11265,6 +13063,31 @@ mod tests {
         );
         assert_eq!(
             pool.get_with_current_receipt(IoClass::Data, key).unwrap(),
+            Some((payload.to_vec(), prior.clone()))
+        );
+
+        pool.fail_placement_receipt_verification_once = true;
+        assert_invalid_options_reason_contains(
+            pool.put_with_receipt(
+                IoClass::Data,
+                key,
+                b"replacement payload rejected after receipt sync",
+            ),
+            "test fault: placement receipt verification failed",
+        );
+        drop(pool);
+
+        let reopened = Pool::open(config, properties, &options).unwrap();
+        assert_eq!(
+            reopened
+                .load_current_placement_receipt_strict(&indices, key)
+                .unwrap(),
+            Some(prior.clone())
+        );
+        assert_eq!(
+            reopened
+                .get_with_current_receipt(IoClass::Data, key)
+                .unwrap(),
             Some((payload.to_vec(), prior))
         );
 
@@ -11820,6 +13643,46 @@ mod tests {
                 .expect("replacement receipt target must exist");
             assert_eq!(digest32(&shard), target.stored_digest);
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn erasure_repairing_read_obeys_committed_deletion() {
+        let root = temp_dir("erasure-repairing-read-deleted");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"erasure-repairing-read-deleted");
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"deleted erasure authority")
+            .unwrap();
+        stage_pending_deletion_for_test(
+            &mut pool,
+            IoClass::Data,
+            &receipt,
+            PendingDeletionPhase::Committed,
+        );
+
+        assert_eq!(
+            pool.get_erasure_with_repair_receipt(IoClass::Data, key)
+                .expect("committed deletion is a readable absence"),
+            None
+        );
+        assert_eq!(
+            pool.load_placement_receipt(pool.class_map.get(IoClass::Data), key)
+                .unwrap()
+                .expect("physical receipt remains pending")
+                .generation,
+            receipt.generation,
+            "repair must not publish a replacement for deleted authority"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16351,6 +18214,58 @@ mod tests {
             reserved_through,
             "locked encrypted+compressed import must validate the raw-only marker"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn locked_pool_defers_pending_deletion_until_keyed_reopen() {
+        let root = temp_dir("locked-pending-deletion");
+        let _ = std::fs::remove_dir_all(&root);
+        let options = test_options();
+        let properties = PoolProperties::default();
+        let (config, _key) = encrypted_device_config(&root);
+
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options)
+            .expect("create encrypted pool");
+        let key = ObjectKey::from_name(b"locked-pending-deletion");
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"encrypted deleted authority")
+            .unwrap();
+        stage_pending_deletion_for_test(
+            &mut pool,
+            IoClass::Data,
+            &receipt,
+            PendingDeletionPhase::Committed,
+        );
+        drop(pool);
+
+        let config_without_key = PoolConfig {
+            devices: vec![DeviceConfig {
+                encryption: None,
+                ..config.devices[0].clone()
+            }],
+            ..config.clone()
+        };
+        let locked = Pool::open(config_without_key, properties.clone(), &options)
+            .expect("locked import defers encrypted deletion discovery");
+        assert!(locked.is_locked());
+        assert!(locked.pending_deletions.is_empty());
+        assert_invalid_options_reason_contains(
+            locked.get(IoClass::Data, key),
+            "encryption key required",
+        );
+        drop(locked);
+
+        let reopened = Pool::open(config, properties, &options)
+            .expect("key-bearing reopen discovers committed deletion");
+        assert!(!reopened.is_locked());
+        assert_eq!(reopened.get(IoClass::Data, key).unwrap(), None);
+        assert!(reopened.pending_deletions.is_empty());
+        assert!(reopened
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }
