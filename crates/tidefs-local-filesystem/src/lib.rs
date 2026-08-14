@@ -2971,7 +2971,7 @@ impl LocalFileSystem {
     pub fn destroy_volume_snapshot_dataset(
         &mut self,
         path: &str,
-    ) -> Result<tidefs_pool_runtime::VolumeSnapshotSummary> {
+    ) -> Result<tidefs_pool_runtime::VolumeSnapshotDestroyResult> {
         self.ensure_mutation_allowed("destroy Pool volume snapshot")?;
         let result = self.store.destroy_volume_snapshot(path);
         if matches!(
@@ -3022,7 +3022,7 @@ impl LocalFileSystem {
     pub fn destroy_volume_clone_dataset(
         &mut self,
         path: &str,
-    ) -> Result<tidefs_pool_runtime::VolumeCloneSummary> {
+    ) -> Result<tidefs_pool_runtime::VolumeCloneDestroyResult> {
         self.ensure_mutation_allowed("destroy Pool volume clone")?;
         let result = self.store.destroy_volume_clone(path);
         if matches!(
@@ -3035,8 +3035,11 @@ impl LocalFileSystem {
     }
 
     /// Atomically remove one named Pool-backed volume's catalog entry and
-    /// typed root. Physical reclaim remains separate.
-    pub fn destroy_volume_dataset(&mut self, path: &str) -> Result<DatasetId> {
+    /// typed root, then hand released immutable objects to Pool deletion.
+    pub fn destroy_volume_dataset(
+        &mut self,
+        path: &str,
+    ) -> Result<tidefs_pool_runtime::VolumeDestroyResult> {
         self.ensure_mutation_allowed("destroy Pool volume")?;
         let result = self.store.destroy_volume(path);
         if matches!(
