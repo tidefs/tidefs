@@ -20,7 +20,9 @@ use tidefs_dataset_lifecycle::{
     DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
 };
 use tidefs_dataset_properties::{self, PropertyKey, PropertySet, PropertyValue};
-use tidefs_local_filesystem::{FileSystemStatfs, LocalFileSystem, RecoveryPolicy};
+#[cfg(test)]
+use tidefs_local_filesystem::FileSystemStatfs;
+use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy};
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 use tidefs_pool_runtime::{PoolRuntime, VolumeReclaimOutcome};
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
@@ -1011,10 +1013,12 @@ fn optional_bytes(value: Option<u64>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+#[cfg(test)]
 fn bytes_from_blocks(blocks: u64, block_size: u32) -> u64 {
     blocks.saturating_mul(u64::from(block_size))
 }
 
+#[cfg(test)]
 fn dataset_capacity_projection_from_statfs(stats: FileSystemStatfs) -> DatasetCapacityProjection {
     let used_blocks = stats.blocks.saturating_sub(stats.bfree);
     DatasetCapacityProjection {
@@ -1458,27 +1462,30 @@ fn handle_list(args: DatasetListArgs) {
         return;
     };
 
-    let devices_ref = args.devices.as_deref();
-    let mut fs = open_filesystem_with_live_args(
-        &pool,
-        devices_ref,
-        "list",
-        RecoveryPolicy::ReadOnly,
-        args.json,
-        super::live_owner::live_admin_args([(
-            "type",
-            super::live_owner::live_admin_optional_string(
-                args.dataset_type
-                    .map(|dataset_type| dataset_type.label().to_string()),
-            ),
-        )]),
-    );
-    let capacity = match fs.statfs() {
-        Ok(stats) => dataset_capacity_projection_from_statfs(stats),
-        Err(_) => DatasetCapacityProjection::default(),
+    let live_args = super::live_owner::live_admin_args([(
+        "type",
+        super::live_owner::live_admin_optional_string(
+            args.dataset_type
+                .map(|dataset_type| dataset_type.label().to_string()),
+        ),
+    )]);
+    let (catalog, capacity) = if let Some(devices) = args
+        .devices
+        .as_deref()
+        .filter(|devices| !devices.is_empty())
+    {
+        with_offline_pool_runtime(&pool, devices, "list", args.json, &live_args, |runtime| {
+            Ok((
+                runtime.dataset_catalog().clone(),
+                DatasetCapacityProjection::default(),
+            ))
+        })
+    } else {
+        super::live_owner::route_with_format_and_args(
+            "dataset", "list", &pool, args.json, live_args,
+        )
     };
-    let catalog = fs.dataset_catalog();
-    let rows = dataset_rows_from_catalog(&pool, catalog, args.dataset_type, capacity);
+    let rows = dataset_rows_from_catalog(&pool, &catalog, args.dataset_type, capacity);
     print_dataset_rows(Some(&pool), &rows, args.json);
 }
 
@@ -2818,6 +2825,22 @@ mod dataset_lifecycle_command_tests {
             .unwrap();
         assert_eq!(runtime.dataset_catalog().len(), 1);
         assert!(!runtime.dataset_catalog().contains("root"));
+        assert_eq!(
+            dataset_rows_from_catalog(
+                "tank",
+                runtime.dataset_catalog(),
+                None,
+                DatasetCapacityProjection::default(),
+            ),
+            vec![DatasetListRow {
+                pool: "tank".to_string(),
+                path: "vol".to_string(),
+                dataset_type: DatasetType::Volume,
+                used_bytes: None,
+                available_bytes: None,
+                mountpoint: None,
+            }]
+        );
         drop(runtime);
 
         let mut runtime = open_offline_pool_runtime(
