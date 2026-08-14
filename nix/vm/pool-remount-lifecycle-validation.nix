@@ -201,7 +201,7 @@ done
 if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
     for op in virtio0_size virtio1_size pool_create startup_failure_unwind \
              startup_retry_mount pool_import mount \
-             write_data fsync_data read_verify lookup_inode rename_entry \
+             live_status write_data fsync_data read_verify lookup_inode rename_entry \
              link_inode_identity unlink_entry readdir_entry unmount pool_export \
              reimport remount persist_verify inode_identity_stable \
              committed_root_advance intent_log_consistency \
@@ -333,6 +333,15 @@ TC="TideFS-Remount-Lifecycle-Validation-$(date +%s 2>/dev/null || echo 0)"
 PRE_REMOUNT_INODE=0
 
 if [ "$MOUNTED" -eq 1 ]; then
+    if tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json \
+        > /tmp/live_status.json 2>/tmp/live_status.err \
+        && grep -q '"state"[[:space:]]*:[[:space:]]*"Active"' /tmp/live_status.json \
+        && grep -q '"source_classification"[[:space:]]*:[[:space:]]*"source:live-owner"' /tmp/live_status.json; then
+        pass "live_status"
+    else
+        fail "live_status" "$(cat /tmp/live_status.err /tmp/live_status.json 2>/dev/null)"
+    fi
+
     echo "$TC" > "$TF" 2>/tmp/werr
     [ -f "$TF" ] && pass "write_data" || fail "write_data" "$(cat /tmp/werr 2>/dev/null)"
 
@@ -390,7 +399,7 @@ if [ "$MOUNTED" -eq 1 ]; then
     fi
     TF="$LINKED_TF"
 else
-    for op in write_data fsync_data read_verify lookup_inode rename_entry \
+    for op in live_status write_data fsync_data read_verify lookup_inode rename_entry \
               link_inode_identity unlink_entry readdir_entry; do
         blocked "$op" "not mounted"
     done
@@ -399,31 +408,30 @@ fi
 echo ""
 echo "--- Phase 7: Unmount ---"
 
+LIVE_EXPORT_RC=1
+DAEMON_RC=1
 if [ "$MOUNTED" -eq 1 ]; then
-    # Record commit-root epoch before unmount via dump of pool status JSON
-    PRE_EPOCH_INFO="/tmp/pre_unmount_epoch.txt"
-    tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json > "$PRE_EPOCH_INFO" 2>/dev/null || true
-
-    kill "$DAEMON_PID" 2>/dev/null || true
-    DAEMON_EXITED=0
-    for _ in $(seq 1 10); do
-        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
-            DAEMON_EXITED=1
-            break
-        fi
-        sleep 1
-    done
-    if [ "$DAEMON_EXITED" -eq 0 ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-        echo "  daemon still running after SIGTERM; sending SIGKILL"
-        kill -KILL "$DAEMON_PID" 2>/dev/null || true
+    if tidefsctl pool export "$POOL_NAME" --devices "$DEV0" "$DEV1" \
+        > /tmp/live_export.out 2>/tmp/live_export.err; then
+        LIVE_EXPORT_RC=0
     else
-        echo "  daemon exited after SIGTERM"
+        LIVE_EXPORT_RC=$?
     fi
-    wait "$DAEMON_PID" 2>/dev/null || true
+    if wait "$DAEMON_PID"; then
+        DAEMON_RC=0
+    else
+        DAEMON_RC=$?
+    fi
     echo "  initial mount daemon log:"
     tail -80 /tmp/startup_retry.log 2>/dev/null || true
-    umount "$MNT" 2>/dev/null || true
-    mountpoint -q "$MNT" 2>/dev/null && fail "unmount" "still mounted" || pass "unmount"
+    echo "  live export output:"
+    cat /tmp/live_export.out /tmp/live_export.err 2>/dev/null || true
+    if [ "$LIVE_EXPORT_RC" -eq 0 ] && [ "$DAEMON_RC" -eq 0 ] \
+        && ! mountpoint -q "$MNT" 2>/dev/null; then
+        pass "unmount"
+    else
+        fail "unmount" "export_rc=$LIVE_EXPORT_RC daemon_rc=$DAEMON_RC mounted=$(mountpoint -q "$MNT" 2>/dev/null && echo yes || echo no)"
+    fi
 else
     blocked "unmount" "not mounted"
 fi
@@ -433,14 +441,18 @@ echo "--- Phase 8: Pool export ---"
 
 EXPORT_OK=0
 if [ "$MOUNTED" -eq 1 ]; then
-    EOUT=$(tidefsctl pool export "$POOL_NAME" --devices "$DEV0" "$DEV1" --force 2>&1); RC=$?
-    echo "  export exit=$RC"
-    echo "  $EOUT"
-    if [ "$RC" -eq 0 ]; then
+    POOL_RUNTIME_DIR="/run/tidefs/pools/$(echo "$POOL_UUID" | sed 's/-//g')"
+    if tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json \
+        > /tmp/post_export_status.json 2>/tmp/post_export_status.err \
+        && grep -q '"state"[[:space:]]*:[[:space:]]*"EXPORTED"' /tmp/post_export_status.json \
+        && [ ! -e "$POOL_RUNTIME_DIR/owner.sock" ] \
+        && [ ! -e "$POOL_RUNTIME_DIR/owner.json" ] \
+        && ! find /run/tidefs/import -type f 2>/dev/null | grep -q . \
+        && grep -q 'pool exported:' /tmp/live_export.out 2>/dev/null; then
         pass "pool_export"
         EXPORT_OK=1
     else
-        fail "pool_export" "$EOUT"
+        fail "pool_export" "live_rc=$LIVE_EXPORT_RC daemon_rc=$DAEMON_RC status=$(cat /tmp/post_export_status.err /tmp/post_export_status.json 2>/dev/null)"
     fi
 else
     blocked "pool_export" "not mounted"
@@ -538,24 +550,20 @@ if [ "$REMOUNTED" -eq 1 ]; then
 
     # Get pool status JSON and extract committed-root epoch info
     POST_STATUS="/tmp/post_remount_status.json"
-    tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json > "$POST_STATUS" 2>/dev/null || true
+    if ! tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json \
+        > "$POST_STATUS" 2>/tmp/post_remount_status.err; then
+        fail "committed_root_advance" "$(cat /tmp/post_remount_status.err 2>/dev/null)"
+    elif grep -q '"state"[[:space:]]*:[[:space:]]*"Active"' "$POST_STATUS" 2>/dev/null; then
+        pass "committed_root_advance"
+    else
+        fail "committed_root_advance" "pool status missing active state"
+    fi
 
     # Verify that the committed root exists (pool was imported successfully)
     # The committed-root advancement is validationd by:
     #   a) pool import succeeded (root selection worked)
     #   b) pool reimport succeeded (root selection across unmount boundary)
     #   c) data persisted across unmount/remount (root state consistent)
-    if [ -s "$POST_STATUS" ]; then
-        # Check for pool state in JSON output as proxy for committed-root presence
-        if grep -q '"state"[[:space:]]*:[[:space:]]*"[^"]*"' "$POST_STATUS" 2>/dev/null; then
-            pass "committed_root_advance"
-        else
-            fail "committed_root_advance" "pool status missing state field"
-        fi
-    else
-        # Fallback: if pool status command failed, use import success as validation
-        pass "committed_root_advance"
-    fi
 else
     blocked "committed_root_advance" "remount failed"
 fi
@@ -746,31 +754,7 @@ fi
 
 
 echo ""
-echo "--- Phase 15: Suspect log persistence validation ---"
-
-# The suspect log is persisted to $store_dir/segments/suspect_log in VSUS format
-# with BLAKE3-256 integrity. Scrub findings are durably written on every tick
-# and survive store close/reopen. This is the REL-STOR-004 operator-visible path.
-# For raw block-device pools, the suspect log lives inside the pool device;
-# for file-backed pools it would be at <store_root>/segments/suspect_log.
-
-if [ "$REMOUNTED" -eq 1 ]; then
-    # Verify pool status after remount as indirect validation of integrity
-    if tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json > /tmp/suspect_status.json 2>/dev/null; then
-        if grep -q '"pool_name"' /tmp/suspect_status.json 2>/dev/null; then
-            pass "suspect_log_persistence"
-        else
-            fail "suspect_log_persistence" "pool status after remount failed"
-        fi
-    else
-        pass "suspect_log_persistence"
-    fi
-else
-    blocked "suspect_log_persistence" "remount failed"
-fi
-
-echo ""
-echo "--- Phase 16: Crash-cycle (SIGKILL without export) ---"
+echo "--- Phase 15: Crash-cycle (SIGKILL without export) ---"
 
 # This phase exercises the storage durability/recovery spine:
 # - Write fsynced data (committed through txg commit boundary)
@@ -789,8 +773,7 @@ if tidefsctl pool export "$POOL_NAME" --devices "$DEV0" "$DEV1" --force > /tmp/c
     CRASH_CYCLE_EXPORT_OK=1
     pass "crash_cycle_export_prep"
 else
-    pass "crash_cycle_export_prep"
-    CRASH_CYCLE_EXPORT_OK=1
+    fail "crash_cycle_export_prep" "$(cat /tmp/crash_export.log 2>/dev/null)"
 fi
 
 CRASH_CYCLE_IMPORT_OK=0
@@ -880,7 +863,7 @@ if [ -n "$CRASH_PID" ] && kill -0 "$CRASH_PID" 2>/dev/null; then
     wait "$CRASH_PID" 2>/dev/null || true
     pass "crash_cycle_sigkill"
 else
-    pass "crash_cycle_sigkill"
+    fail "crash_cycle_sigkill" "live daemon PID was not running"
 fi
 if [ -n "$CRASH_UNCOMMITTED_HOLDER" ] && kill -0 "$CRASH_UNCOMMITTED_HOLDER" 2>/dev/null; then
     kill -KILL "$CRASH_UNCOMMITTED_HOLDER" 2>/dev/null || true
@@ -1040,7 +1023,7 @@ INITSCRIPT
       fuse_support fuse_device \
       virtio0_present virtio1_present virtio0_size virtio1_size \
       pool_create startup_failure_unwind startup_retry_mount \
-      pool_import mount write_data fsync_data read_verify lookup_inode \
+      pool_import mount live_status write_data fsync_data read_verify lookup_inode \
       rename_entry link_inode_identity unlink_entry readdir_entry \
       unmount pool_export reimport remount persist_verify inode_identity_stable \
       committed_root_advance intent_log_consistency \
@@ -1049,7 +1032,6 @@ INITSCRIPT
       readonly_unlink_erofs readonly_rename_erofs readonly_mkdir_erofs \
       readonly_setattr_erofs readonly_content_unchanged \
       readonly_release readonly_bytes_preserved \
-      suspect_log_persistence \
       crash_cycle_export_prep crash_cycle_preimport crash_cycle_premount \
       crash_cycle_write_committed crash_cycle_write_uncommitted \
       crash_cycle_committed_pre_crash_read crash_cycle_sigkill \

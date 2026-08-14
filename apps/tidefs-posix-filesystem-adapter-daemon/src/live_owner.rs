@@ -15,7 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -76,15 +76,46 @@ pub struct LiveOwnerManifest {
 
 pub struct LiveOwnerHandle {
     shutdown: Arc<AtomicBool>,
+    export_completion: PoolExportCompletion,
     #[cfg(feature = "block-volume")]
-    block_export: Arc<Mutex<Option<ActiveBlockExport>>>,
+    block_export: SharedBlockExport,
     join: Option<JoinHandle<()>>,
     socket_path: PathBuf,
     manifest_path: PathBuf,
 }
 
 impl LiveOwnerHandle {
+    /// Stop and join any block export sharing this Pool owner.
+    pub fn drain_carriers(&self) -> Result<(), String> {
+        #[cfg(feature = "block-volume")]
+        {
+            stop_active_block_export(&self.block_export);
+            wait_for_block_export_stop(&self.block_export)?;
+        }
+        Ok(())
+    }
+
+    /// Mark the standalone block carrier as stopped before Pool export.
+    #[cfg(feature = "block-volume")]
+    pub fn standalone_block_carrier_stopped(&self, result: Result<(), String>) {
+        finish_all_block_exports(&self.block_export, result);
+    }
+
+    /// Publish the result of carrier teardown and Pool ownership release.
+    ///
+    /// A live `pool export` request does not receive its response until this
+    /// completion is published.  This keeps request acceptance distinct from
+    /// a completed export.
+    pub fn complete_export(&self, result: Result<(), String>) {
+        let endpoint_result = cleanup_endpoint_result(&self.socket_path, &self.manifest_path);
+        self.export_completion
+            .complete(combine_completion_results(result, endpoint_result));
+    }
+
     pub fn stop(mut self) {
+        self.export_completion.complete(Err(
+            "live owner stopped before Pool export completion was published".to_string(),
+        ));
         self.shutdown.store(true, Ordering::Release);
         #[cfg(feature = "block-volume")]
         stop_active_block_export(&self.block_export);
@@ -97,6 +128,9 @@ impl LiveOwnerHandle {
 
 impl Drop for LiveOwnerHandle {
     fn drop(&mut self) {
+        self.export_completion.complete(Err(
+            "live owner dropped before Pool export completion was published".to_string(),
+        ));
         self.shutdown.store(true, Ordering::Release);
         #[cfg(feature = "block-volume")]
         stop_active_block_export(&self.block_export);
@@ -104,6 +138,53 @@ impl Drop for LiveOwnerHandle {
             let _ = join.join();
         }
         cleanup_endpoint(&self.socket_path, &self.manifest_path);
+    }
+}
+
+#[derive(Clone)]
+struct PoolExportCompletion {
+    state: Arc<PoolExportCompletionState>,
+}
+
+struct PoolExportCompletionState {
+    result: Mutex<Option<Result<(), String>>>,
+    ready: Condvar,
+}
+
+impl PoolExportCompletion {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(PoolExportCompletionState {
+                result: Mutex::new(None),
+                ready: Condvar::new(),
+            }),
+        }
+    }
+
+    fn complete(&self, result: Result<(), String>) {
+        let Ok(mut state) = self.state.result.lock() else {
+            return;
+        };
+        if state.is_none() {
+            *state = Some(result);
+            self.state.ready.notify_all();
+        }
+    }
+
+    fn wait(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .result
+            .lock()
+            .map_err(|_| "Pool export completion lock poisoned".to_string())?;
+        while state.is_none() {
+            state = self
+                .state
+                .ready
+                .wait(state)
+                .map_err(|_| "Pool export completion wait lock poisoned".to_string())?;
+        }
+        state.as_ref().expect("completion checked above").clone()
     }
 }
 
@@ -192,10 +273,14 @@ fn start_owner(
 
     let thread_manifest = manifest.clone();
     let thread_shutdown = Arc::clone(&shutdown);
+    let export_completion = PoolExportCompletion::new();
+    let thread_export_completion = export_completion.clone();
     #[cfg(feature = "block-volume")]
-    let block_export = Arc::new(Mutex::new(active_volume.map(|volume| ActiveBlockExport {
-        volume,
-        shutdown: Arc::clone(&shutdown),
+    let block_export = Arc::new(BlockExportState::new(active_volume.map(|volume| {
+        ActiveBlockExport {
+            volume,
+            shutdown: Arc::clone(&shutdown),
+        }
     })));
     #[cfg(feature = "block-volume")]
     let thread_block_export = Arc::clone(&block_export);
@@ -208,6 +293,7 @@ fn start_owner(
                     let manifest = thread_manifest.clone();
                     let admin = admin.clone();
                     let shutdown = Arc::clone(&thread_shutdown);
+                    let export_completion = thread_export_completion.clone();
                     #[cfg(feature = "block-volume")]
                     let block_export = Arc::clone(&thread_block_export);
                     let client = thread::spawn(move || {
@@ -217,6 +303,7 @@ fn start_owner(
                             &admin,
                             #[cfg(feature = "block-volume")]
                             &block_export,
+                            &export_completion,
                             &shutdown,
                         );
                     });
@@ -240,6 +327,7 @@ fn start_owner(
 
     Ok(LiveOwnerHandle {
         shutdown,
+        export_completion,
         #[cfg(feature = "block-volume")]
         block_export,
         join: Some(join),
@@ -285,15 +373,45 @@ fn write_manifest(path: &Path, manifest: &LiveOwnerManifest) -> Result<(), Strin
 }
 
 fn cleanup_endpoint(socket_path: &Path, manifest_path: &Path) {
-    let _ = fs::remove_file(socket_path);
-    let _ = fs::remove_file(manifest_path);
+    let _ = cleanup_endpoint_result(socket_path, manifest_path);
+}
+
+fn cleanup_endpoint_result(socket_path: &Path, manifest_path: &Path) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (kind, path) in [("socket", socket_path), ("manifest", manifest_path)] {
+        if let Err(error) = fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                errors.push(format!(
+                    "remove live owner {kind} {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; additionally "))
+    }
+}
+
+fn combine_completion_results(
+    operation: Result<(), String>,
+    endpoint: Result<(), String>,
+) -> Result<(), String> {
+    match (operation, endpoint) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(endpoint_error)) => Err(format!("{error}; additionally {endpoint_error}")),
+    }
 }
 
 fn handle_client(
     stream: UnixStream,
     manifest: &LiveOwnerManifest,
     admin: &LiveOwnerAdmin,
-    #[cfg(feature = "block-volume")] block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    #[cfg(feature = "block-volume")] block_export: &SharedBlockExport,
+    export_completion: &PoolExportCompletion,
     shutdown: &Arc<AtomicBool>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -312,6 +430,7 @@ fn handle_client(
                 block_export,
                 #[cfg(feature = "block-volume")]
                 disconnect_monitor,
+                export_completion,
                 shutdown,
             ),
             Err(err) => live_admin_typed_error(err),
@@ -391,8 +510,9 @@ fn dispatch_request(
     request: LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
     admin: &LiveOwnerAdmin,
-    #[cfg(feature = "block-volume")] block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    #[cfg(feature = "block-volume")] block_export: &SharedBlockExport,
     #[cfg(feature = "block-volume")] disconnect_monitor: Option<UnixStream>,
+    export_completion: &PoolExportCompletion,
     shutdown: &Arc<AtomicBool>,
 ) -> LivePoolAdminResponse {
     if let Err(err) = request.validate_version() {
@@ -411,6 +531,7 @@ fn dispatch_request(
             manifest,
             #[cfg(feature = "block-volume")]
             block_export,
+            export_completion,
             shutdown,
         ),
         LivePoolAdminCommand::PoolDestroy => pool_destroy_refused(&request, manifest),
@@ -493,10 +614,38 @@ struct ActiveBlockExport {
 }
 
 #[cfg(feature = "block-volume")]
+type SharedBlockExport = Arc<BlockExportState>;
+
+#[cfg(feature = "block-volume")]
+struct BlockExportState {
+    state: Mutex<BlockExportActivity>,
+    idle: Condvar,
+}
+
+#[cfg(feature = "block-volume")]
+struct BlockExportActivity {
+    active: Option<ActiveBlockExport>,
+    completion: Option<Result<(), String>>,
+}
+
+#[cfg(feature = "block-volume")]
+impl BlockExportState {
+    fn new(active: Option<ActiveBlockExport>) -> Self {
+        Self {
+            state: Mutex::new(BlockExportActivity {
+                active,
+                completion: None,
+            }),
+            idle: Condvar::new(),
+        }
+    }
+}
+
+#[cfg(feature = "block-volume")]
 fn volume_lifecycle_mutation(
     request: &LivePoolAdminRequest,
     admin: &LiveOwnerAdmin,
-    block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    block_export: &SharedBlockExport,
 ) -> LivePoolAdminResponse {
     let targets = match volume_mutation_targets(request) {
         Ok(targets) => targets,
@@ -521,15 +670,16 @@ fn volume_lifecycle_mutation(
 
 #[cfg(feature = "block-volume")]
 fn with_volume_mutation_admission<T>(
-    block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    block_export: &SharedBlockExport,
     targets: &[&str],
     mutation: impl FnOnce() -> T,
 ) -> Result<T, String> {
     let export_admission = block_export
+        .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for target in targets {
-        ensure_volume_mutation_allowed(&export_admission, target)?;
+        ensure_volume_mutation_allowed(&export_admission.active, target)?;
     }
     let result = mutation();
     drop(export_admission);
@@ -618,10 +768,12 @@ fn volume_snapshot_source(target: &str) -> Result<&str, LivePoolAdminError> {
 }
 
 #[cfg(feature = "block-volume")]
-fn stop_active_block_export(block_export: &Arc<Mutex<Option<ActiveBlockExport>>>) {
+fn stop_active_block_export(block_export: &SharedBlockExport) {
     if let Some(active) = block_export
+        .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .active
         .as_ref()
     {
         active.shutdown.store(true, Ordering::Release);
@@ -630,25 +782,27 @@ fn stop_active_block_export(block_export: &Arc<Mutex<Option<ActiveBlockExport>>>
 
 #[cfg(feature = "block-volume")]
 fn reserve_block_export(
-    block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    block_export: &SharedBlockExport,
     owner_shutdown: &Arc<AtomicBool>,
     pool: &str,
     volume: &str,
     export_shutdown: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let mut active = block_export
+    let mut state = block_export
+        .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if owner_shutdown.load(Ordering::Acquire) {
         return Err("live owner is shutting down".to_string());
     }
-    if let Some(existing) = active.as_ref() {
+    if let Some(existing) = state.active.as_ref() {
         return Err(format!(
             "pool '{pool}' already exports volume '{}'; concurrent block exports are refused",
             existing.volume
         ));
     }
-    *active = Some(ActiveBlockExport {
+    state.completion = None;
+    state.active = Some(ActiveBlockExport {
         volume: volume.to_string(),
         shutdown: Arc::clone(export_shutdown),
     });
@@ -657,18 +811,48 @@ fn reserve_block_export(
 
 #[cfg(feature = "block-volume")]
 fn clear_block_export(
-    block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    block_export: &SharedBlockExport,
     volume: &str,
     export_shutdown: &Arc<AtomicBool>,
+    completion: Option<Result<(), String>>,
 ) {
-    let mut active = block_export
+    let mut state = block_export
+        .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if active.as_ref().is_some_and(|current| {
+    if state.active.as_ref().is_some_and(|current| {
         current.volume == volume && Arc::ptr_eq(&current.shutdown, export_shutdown)
     }) {
-        *active = None;
+        state.active = None;
+        state.completion = completion;
+        block_export.idle.notify_all();
     }
+}
+
+#[cfg(feature = "block-volume")]
+fn finish_all_block_exports(block_export: &SharedBlockExport, result: Result<(), String>) {
+    let mut state = block_export
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.active = None;
+    state.completion = Some(result);
+    block_export.idle.notify_all();
+}
+
+#[cfg(feature = "block-volume")]
+fn wait_for_block_export_stop(block_export: &SharedBlockExport) -> Result<(), String> {
+    let mut state = block_export
+        .state
+        .lock()
+        .map_err(|_| "active block export lock poisoned".to_string())?;
+    while state.active.is_some() {
+        state = block_export
+            .idle
+            .wait(state)
+            .map_err(|_| "active block export wait lock poisoned".to_string())?;
+    }
+    state.completion.take().unwrap_or(Ok(()))
 }
 
 #[cfg(feature = "block-volume")]
@@ -676,7 +860,7 @@ fn block_attach(
     request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
     filesystem: &SharedLocalFileSystem,
-    block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    block_export: &SharedBlockExport,
     disconnect_monitor: Option<UnixStream>,
     owner_shutdown: &Arc<AtomicBool>,
 ) -> LivePoolAdminResponse {
@@ -703,7 +887,7 @@ fn block_attach(
         match PoolVolumeBackend::open_mounted(filesystem.clone(), volume, manifest.read_only) {
             Ok(backend) => backend,
             Err(err) => {
-                clear_block_export(block_export, volume, &export_shutdown);
+                clear_block_export(block_export, volume, &export_shutdown, None);
                 return LivePoolAdminResponse::error(
                     1,
                     format!("open Pool volume '{volume}' for block export: {err}"),
@@ -711,7 +895,7 @@ fn block_attach(
             }
         };
     if owner_shutdown.load(Ordering::Acquire) {
-        clear_block_export(block_export, volume, &export_shutdown);
+        clear_block_export(block_export, volume, &export_shutdown, None);
         return LivePoolAdminResponse::error(1, "live owner is shutting down");
     }
 
@@ -737,20 +921,25 @@ fn block_attach(
     if let Some(join) = disconnect_join {
         let _ = join.join();
     }
-    clear_block_export(block_export, volume, &export_shutdown);
+    let completion = result.as_ref().map(|_| ()).map_err(|error| {
+        format!(
+            "block export failed for {}/{}: {error}",
+            manifest.pool_name, volume
+        )
+    });
+    clear_block_export(
+        block_export,
+        volume,
+        &export_shutdown,
+        Some(completion.clone()),
+    );
 
-    match result {
-        Ok(_) => LivePoolAdminResponse::ok_text(format!(
+    match completion {
+        Ok(()) => LivePoolAdminResponse::ok_text(format!(
             "block export stopped: {}/{}",
             manifest.pool_name, volume
         )),
-        Err(err) => LivePoolAdminResponse::error(
-            1,
-            format!(
-                "block export failed for {}/{}: {err}",
-                manifest.pool_name, volume
-            ),
-        ),
+        Err(error) => LivePoolAdminResponse::error(1, error),
     }
 }
 
@@ -1360,7 +1549,8 @@ fn pool_mount_request_args(
 fn pool_export(
     request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
-    #[cfg(feature = "block-volume")] block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
+    #[cfg(feature = "block-volume")] block_export: &SharedBlockExport,
+    export_completion: &PoolExportCompletion,
     shutdown: &Arc<AtomicBool>,
 ) -> LivePoolAdminResponse {
     if let Err(err) = validate_pool_export_request_args(&request.args) {
@@ -1370,22 +1560,29 @@ fn pool_export(
     shutdown.store(true, Ordering::Release);
     #[cfg(feature = "block-volume")]
     stop_active_block_export(block_export);
+    if let Err(error) = export_completion.wait() {
+        return LivePoolAdminResponse::error(
+            1,
+            format!("pool '{}' export failed: {error}", manifest.pool_name),
+        );
+    }
     let value = json!({
         "pool_name": manifest.pool_name,
         "pool_uuid": manifest.pool_uuid,
-        "state": "ExportRequested",
+        "state": "Exported",
         "owner_kind": manifest.owner_kind,
         "pid": manifest.pid,
         "backing_dir": manifest.backing_dir,
         "mountpoint": manifest.mountpoint,
         "operation": "export",
         "shutdown_requested": true,
+        "shutdown_completed": true,
     });
     if request.output.wants_json() {
         LivePoolAdminResponse::ok_machine_json(value.to_string())
     } else {
         LivePoolAdminResponse::ok_text(format!(
-            "pool export requested: {}\n  owner:      {} (pid {})\n  mountpoint: {}\n  action:     live owner shutdown requested",
+            "pool exported: {}\n  owner:      {} (pid {})\n  mountpoint: {}\n  action:     live owner shutdown and Pool export completed",
             manifest.pool_name, manifest.owner_kind, manifest.pid, manifest.mountpoint
         ))
     }
@@ -1690,7 +1887,7 @@ mod tests {
     #[test]
     fn stopping_active_block_export_sets_its_shutdown_flag() {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let active = Arc::new(Mutex::new(Some(ActiveBlockExport {
+        let active = Arc::new(BlockExportState::new(Some(ActiveBlockExport {
             volume: "vol".to_string(),
             shutdown: Arc::clone(&shutdown),
         })));
@@ -1703,31 +1900,31 @@ mod tests {
     #[cfg(feature = "block-volume")]
     #[test]
     fn volume_mutation_admission_refuses_active_target() {
-        let active = Arc::new(Mutex::new(Some(ActiveBlockExport {
+        let active = Arc::new(BlockExportState::new(Some(ActiveBlockExport {
             volume: "vol".to_string(),
             shutdown: Arc::new(AtomicBool::new(false)),
         })));
-        let active = active.lock().unwrap();
-        let error = ensure_volume_mutation_allowed(&active, "vol").unwrap_err();
+        let active = active.state.lock().unwrap();
+        let error = ensure_volume_mutation_allowed(&active.active, "vol").unwrap_err();
         assert!(error.contains("actively exported"));
         assert!(error.contains("close the block export"));
-        assert!(ensure_volume_mutation_allowed(&active, "other").is_ok());
+        assert!(ensure_volume_mutation_allowed(&active.active, "other").is_ok());
     }
 
     #[cfg(feature = "block-volume")]
     #[test]
     fn volume_mutation_admission_stays_locked_through_delegation() {
-        let active = Arc::new(Mutex::new(None));
+        let active = Arc::new(BlockExportState::new(None));
 
         with_volume_mutation_admission(&active, &["vol"], || {
             assert!(matches!(
-                active.try_lock(),
+                active.state.try_lock(),
                 Err(std::sync::TryLockError::WouldBlock)
             ));
         })
         .unwrap();
 
-        assert!(active.try_lock().is_ok());
+        assert!(active.state.try_lock().is_ok());
     }
 
     #[cfg(feature = "block-volume")]
@@ -1966,13 +2163,35 @@ mod tests {
     fn block_export_reservation_refuses_owner_shutdown() {
         let owner_shutdown = Arc::new(AtomicBool::new(true));
         let export_shutdown = Arc::new(AtomicBool::new(false));
-        let active = Arc::new(Mutex::new(None));
+        let active = Arc::new(BlockExportState::new(None));
 
         let error = reserve_block_export(&active, &owner_shutdown, "tank", "vol", &export_shutdown)
             .unwrap_err();
 
         assert_eq!(error, "live owner is shutting down");
-        assert!(active.lock().unwrap().is_none());
+        assert!(active.state.lock().unwrap().active.is_none());
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
+    fn block_export_drain_propagates_carrier_failure() {
+        let export_shutdown = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(BlockExportState::new(Some(ActiveBlockExport {
+            volume: "vol".to_string(),
+            shutdown: Arc::clone(&export_shutdown),
+        })));
+
+        clear_block_export(
+            &active,
+            "vol",
+            &export_shutdown,
+            Some(Err("ublk drain refused".to_string())),
+        );
+
+        assert_eq!(
+            wait_for_block_export_stop(&active),
+            Err("ublk drain refused".to_string())
+        );
     }
 
     #[cfg(feature = "block-volume")]
@@ -2333,8 +2552,10 @@ mod tests {
     fn pool_export_malformed_args_fail_before_shutdown() {
         let manifest = manifest();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let export_completion = PoolExportCompletion::new();
+        export_completion.complete(Ok(()));
         #[cfg(feature = "block-volume")]
-        let block_export = Arc::new(Mutex::new(None));
+        let block_export = Arc::new(BlockExportState::new(None));
         let mut valid = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolExport, "tank");
         valid
             .args
@@ -2346,11 +2567,17 @@ mod tests {
             &manifest,
             #[cfg(feature = "block-volume")]
             &block_export,
+            &export_completion,
             &shutdown,
         );
 
         assert_eq!(response.exit_code, 0);
         assert!(shutdown.load(Ordering::Acquire));
+        let LivePoolAdminResponseBody::Text(text) = response.body else {
+            panic!("completed export should return text");
+        };
+        assert!(text.contains("pool exported: tank"));
+        assert!(text.contains("Pool export completed"));
 
         for (name, value, detail) in [
             (
@@ -2365,8 +2592,9 @@ mod tests {
             ),
         ] {
             let shutdown = Arc::new(AtomicBool::new(false));
+            let export_completion = PoolExportCompletion::new();
             #[cfg(feature = "block-volume")]
-            let block_export = Arc::new(Mutex::new(None));
+            let block_export = Arc::new(BlockExportState::new(None));
             let mut request = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolExport, "tank");
             request.args.0.insert(name.to_string(), value);
 
@@ -2375,12 +2603,70 @@ mod tests {
                 &manifest,
                 #[cfg(feature = "block-volume")]
                 &block_export,
+                &export_completion,
                 &shutdown,
             ));
 
             assert!(message.contains(detail));
             assert!(!shutdown.load(Ordering::Acquire));
         }
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let export_completion = PoolExportCompletion::new();
+        let thread_completion = export_completion.clone();
+        let failure_manifest = manifest.clone();
+        let request = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolExport, "tank");
+        let export = thread::spawn(move || {
+            #[cfg(feature = "block-volume")]
+            let block_export = Arc::new(BlockExportState::new(None));
+            pool_export(
+                &request,
+                &failure_manifest,
+                #[cfg(feature = "block-volume")]
+                &block_export,
+                &thread_completion,
+                &thread_shutdown,
+            )
+        });
+        while !shutdown.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        assert!(
+            !export.is_finished(),
+            "request acceptance must not complete pool export"
+        );
+        export_completion.complete(Err("label export refused".to_string()));
+        let response = export.join().unwrap();
+        assert_eq!(response.exit_code, 1);
+        let LivePoolAdminResponseBody::Error { message, .. } = response.body else {
+            panic!("failed export should return an error");
+        };
+        assert!(message.contains("label export refused"));
+    }
+
+    #[test]
+    fn export_completion_reports_endpoint_removal_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        fs::create_dir(&socket_path).unwrap();
+        let manifest_path = dir.path().join("owner.json");
+
+        let error = cleanup_endpoint_result(&socket_path, &manifest_path).unwrap_err();
+
+        assert!(error.contains("remove live owner socket"));
+        assert!(error.contains(socket_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn export_completion_preserves_operation_and_endpoint_errors() {
+        assert_eq!(
+            combine_completion_results(
+                Err("label export refused".to_string()),
+                Err("remove owner endpoint refused".to_string()),
+            ),
+            Err("label export refused; additionally remove owner endpoint refused".to_string())
+        );
     }
 
     fn destroy_request(wants_json: bool) -> LivePoolAdminRequest {
