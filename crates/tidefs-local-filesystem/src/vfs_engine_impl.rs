@@ -1307,7 +1307,9 @@ impl VfsLocalFileSystem {
                     LivePoolAdminCommand::SnapshotClonePromote => {
                         self.live_snapshot_clone_promote(&args, wants_json)
                     }
-                    LivePoolAdminCommand::SnapshotDestroy => self.live_snapshot_destroy(&args),
+                    LivePoolAdminCommand::SnapshotDestroy => {
+                        self.live_snapshot_destroy(&args, wants_json)
+                    }
                     LivePoolAdminCommand::SnapshotRollback => self.live_snapshot_rollback(&args),
                     LivePoolAdminCommand::SnapshotExtract => {
                         self.live_snapshot_extract(&args, wants_json)
@@ -1817,7 +1819,7 @@ impl VfsLocalFileSystem {
             .is_some_and(|(_, _, dataset_type, _, _, _)| dataset_type == DatasetType::Volume)
         {
             match fs.destroy_volume_dataset(name) {
-                Ok(_) => {
+                Ok(result) => {
                     if wants_json {
                         return live_admin_ok_json(json!({
                             "ok": true,
@@ -1829,11 +1831,12 @@ impl VfsLocalFileSystem {
                             "child_count": child_count,
                             "snapshot_count": snapshot_count,
                             "live_mount": live_mount,
-                            "physical_reclaim": false,
+                            "reclaim": volume_reclaim_json(&result.reclaim),
                         }));
                     }
                     return live_admin_ok_text(format!(
-                        "dataset '{name}' logically destroyed; physical reclaim remains pending"
+                        "dataset '{name}' logically destroyed; {}",
+                        volume_reclaim_line(&result.reclaim),
                     ));
                 }
                 Err(err) => {
@@ -2591,7 +2594,7 @@ impl VfsLocalFileSystem {
         };
         let mut fs = self.fs.borrow_mut();
         match fs.destroy_volume_clone_dataset(clone) {
-            Ok(summary) => volume_clone_response("logically destroyed", &summary, wants_json),
+            Ok(result) => volume_clone_destroy_response(&result, wants_json),
             Err(err) => live_admin_error(
                 1,
                 format!(
@@ -2667,11 +2670,11 @@ impl VfsLocalFileSystem {
         )
     }
 
-    fn live_snapshot_destroy(&self, args: &Value) -> LivePoolAdminResponse {
+    fn live_snapshot_destroy(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
         if let Some(target) = live_admin_optional_arg(args, "target") {
             let mut fs = self.fs.borrow_mut();
             return match fs.destroy_volume_snapshot_dataset(target) {
-                Ok(summary) => volume_snapshot_response("logically destroyed", &summary, false),
+                Ok(result) => volume_snapshot_destroy_response(&result, wants_json),
                 Err(err) => live_admin_error(
                     1,
                     format!("snapshot destroy: failed to destroy '{target}': {err}"),
@@ -4093,15 +4096,29 @@ fn volume_snapshot_response(
         return live_admin_ok_json(json!({
             "ok": true,
             "outcome": outcome,
-            "physical_reclaim": false,
             "snapshot": volume_snapshot_json(summary),
         }));
     }
-    let mut text = format!("{} {outcome}", volume_snapshot_line(summary));
-    if outcome == "logically destroyed" {
-        text.push_str("\nphysical reclaim remains pending; no secure-erasure claim is made");
+    live_admin_ok_text(format!("{} {outcome}", volume_snapshot_line(summary)))
+}
+
+fn volume_snapshot_destroy_response(
+    result: &tidefs_pool_runtime::VolumeSnapshotDestroyResult,
+    wants_json: bool,
+) -> LivePoolAdminResponse {
+    if wants_json {
+        return live_admin_ok_json(json!({
+            "ok": true,
+            "outcome": "logically destroyed",
+            "snapshot": volume_snapshot_json(&result.snapshot),
+            "reclaim": volume_reclaim_json(&result.reclaim),
+        }));
     }
-    live_admin_ok_text(text)
+    live_admin_ok_text(format!(
+        "{} logically destroyed\n{}",
+        volume_snapshot_line(&result.snapshot),
+        volume_reclaim_line(&result.reclaim),
+    ))
 }
 
 fn is_volume_snapshot_clone_source(source: &str) -> bool {
@@ -4157,15 +4174,55 @@ fn volume_clone_response(
         return live_admin_ok_json(json!({
             "ok": true,
             "outcome": outcome,
-            "physical_reclaim": false,
             "clone": volume_clone_json(summary),
         }));
     }
-    let mut text = format!("{} {outcome}", volume_clone_line(summary));
-    if outcome == "logically destroyed" {
-        text.push_str("\nphysical reclaim remains pending; no secure-erasure claim is made");
+    live_admin_ok_text(format!("{} {outcome}", volume_clone_line(summary)))
+}
+
+fn volume_clone_destroy_response(
+    result: &tidefs_pool_runtime::VolumeCloneDestroyResult,
+    wants_json: bool,
+) -> LivePoolAdminResponse {
+    if wants_json {
+        return live_admin_ok_json(json!({
+            "ok": true,
+            "outcome": "logically destroyed",
+            "clone": volume_clone_json(&result.clone),
+            "reclaim": volume_reclaim_json(&result.reclaim),
+        }));
     }
-    live_admin_ok_text(text)
+    live_admin_ok_text(format!(
+        "{} logically destroyed\n{}",
+        volume_clone_line(&result.clone),
+        volume_reclaim_line(&result.reclaim),
+    ))
+}
+
+fn volume_reclaim_json(outcome: &tidefs_pool_runtime::VolumeReclaimOutcome) -> Value {
+    json!({
+        "authority": "pool-delete",
+        "candidate_objects": outcome.candidate_objects,
+        "handed_off_objects": outcome.handed_off_objects,
+        "pending_objects": outcome.pending_objects,
+        "pending_plans": outcome.pending_plans,
+        "handoff_error": outcome.handoff_error,
+        "secure_erasure": false,
+    })
+}
+
+fn volume_reclaim_line(outcome: &tidefs_pool_runtime::VolumeReclaimOutcome) -> String {
+    let mut line = format!(
+        "reclaim authority=pool-delete candidates={} handed_off={} pending_objects={} pending_plans={} secure_erasure=false",
+        outcome.candidate_objects,
+        outcome.handed_off_objects,
+        outcome.pending_objects,
+        outcome.pending_plans,
+    );
+    if let Some(error) = &outcome.handoff_error {
+        line.push_str(&format!(" handoff_error={error}"));
+    }
+    line
 }
 
 fn property_family_from_str(value: &str) -> Option<tidefs_dataset_properties::PropertyFamily> {
@@ -6834,7 +6891,7 @@ mod tests {
     }
 
     #[test]
-    fn live_volume_lifecycle_resizes_then_destroys_canonical_root() {
+    fn live_volume_reclaim_lifecycle_resizes_then_destroys_canonical_root() {
         let (engine, _td) = temp_fs();
         let created = live_dataset_admin(
             &engine,
@@ -6873,13 +6930,16 @@ mod tests {
         );
         assert_eq!(destroyed["ok"], true, "destroy response: {destroyed}");
         assert!(destroyed["text"].as_str().is_some_and(|text| {
-            text.contains("logically destroyed") && text.contains("physical reclaim")
+            text.contains("logically destroyed")
+                && text.contains("reclaim authority=pool-delete")
+                && text.contains("pending_objects=0")
+                && text.contains("secure_erasure=false")
         }));
         assert!(engine.fs.borrow().open_volume_dataset("volume0").is_err());
     }
 
     #[test]
-    fn live_volume_snapshot_shared_commands_restore_bytes_and_retain_snapshot() {
+    fn live_volume_reclaim_snapshot_commands_restore_bytes_and_retain_snapshot() {
         let (engine, _td) = temp_fs();
         let created = live_dataset_admin(
             &engine,
@@ -6958,13 +7018,16 @@ mod tests {
             &engine,
             "destroy",
             json!({"target": "renamed@before"}),
-            false,
+            true,
         );
         assert_eq!(destroyed["ok"], true, "destroy response: {destroyed}");
-        assert!(destroyed["text"].as_str().is_some_and(|text| {
-            text.contains("physical reclaim remains pending")
-                && text.contains("no secure-erasure claim")
-        }));
+        assert_eq!(destroyed["json"]["reclaim"]["authority"], "pool-delete");
+        assert!(destroyed["json"]["reclaim"]["candidate_objects"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
+        assert_eq!(destroyed["json"]["reclaim"]["pending_objects"], 0);
+        assert_eq!(destroyed["json"]["reclaim"]["pending_plans"], 0);
+        assert_eq!(destroyed["json"]["reclaim"]["secure_erasure"], false);
         assert!(engine
             .fs
             .borrow()
@@ -6997,7 +7060,7 @@ mod tests {
     }
 
     #[test]
-    fn live_volume_clone_is_writable_cow_and_filesystem_aliases_are_refused() {
+    fn live_volume_reclaim_clone_is_writable_cow_and_filesystem_aliases_are_refused() {
         let (engine, _td) = temp_fs();
         let created = live_dataset_admin(
             &engine,
@@ -7022,6 +7085,25 @@ mod tests {
         let snapshot =
             live_snapshot_admin(&engine, "create", json!({"target": "source@base"}), false);
         assert_eq!(snapshot["ok"], true, "snapshot response: {snapshot}");
+
+        let disposable = live_snapshot_admin(
+            &engine,
+            "clone-create",
+            json!({"clone": "disposable", "source": "source@base"}),
+            false,
+        );
+        assert_eq!(disposable["ok"], true, "clone response: {disposable}");
+        let deleted = live_snapshot_admin(
+            &engine,
+            "clone-delete",
+            json!({"clone": "disposable"}),
+            true,
+        );
+        assert_eq!(deleted["ok"], true, "clone delete response: {deleted}");
+        assert_eq!(deleted["json"]["reclaim"]["authority"], "pool-delete");
+        assert_eq!(deleted["json"]["reclaim"]["pending_objects"], 0);
+        assert_eq!(deleted["json"]["reclaim"]["pending_plans"], 0);
+        assert_eq!(deleted["json"]["reclaim"]["secure_erasure"], false);
 
         let clone = live_snapshot_admin(
             &engine,

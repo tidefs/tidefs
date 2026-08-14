@@ -813,6 +813,12 @@ if [ "$SCENARIO" = "qemu-ublk-smoke" ]; then
         cat /tmp/delete-clone.log 2>&1 || true
         poweroff -f
     fi
+    if ! grep -E "reclaim authority=pool-delete candidates=[1-9][0-9]* handed_off=[1-9][0-9]* pending_objects=0 pending_plans=0 secure_erasure=false" \
+        /tmp/delete-clone.log >/dev/null; then
+        echo "FAIL: volume clone delete omitted committed reclaim outcome"
+        cat /tmp/delete-clone.log 2>&1 || true
+        poweroff -f
+    fi
     if ! tidefsctl snapshot list "$POOL_NAME" --devices "$POOL_DEVICE" \
         >/tmp/post-clone-delete-list.log 2>&1 || \
         ! grep -F "$VOLUME_NAME@before_overwrite" /tmp/post-clone-delete-list.log >/dev/null; then
@@ -849,8 +855,9 @@ if ! tidefsctl snapshot destroy "$SNAPSHOT_TARGET" --devices "$POOL_DEVICE" \
     cat /tmp/snapshot-destroy.log 2>&1 || true
     poweroff -f
 fi
-if ! grep -F "physical reclaim remains pending" /tmp/snapshot-destroy.log >/dev/null; then
-    echo "FAIL: volume snapshot destroy omitted logical-only reclaim boundary"
+if ! grep -E "reclaim authority=pool-delete candidates=[1-9][0-9]* handed_off=[1-9][0-9]* pending_objects=0 pending_plans=0 secure_erasure=false" \
+    /tmp/snapshot-destroy.log >/dev/null; then
+    echo "FAIL: volume snapshot destroy omitted committed reclaim outcome"
     cat /tmp/snapshot-destroy.log 2>&1 || true
     poweroff -f
 fi
@@ -943,6 +950,12 @@ echo "--- Destroy committed volume and refuse later attach ---"
 if ! tidefsctl dataset destroy "$POOL_NAME/$VOLUME_NAME" --devices "$POOL_DEVICE" \
     >/tmp/destroy-volume.log 2>&1; then
     echo "FAIL: destroy named volume"
+    cat /tmp/destroy-volume.log 2>&1 || true
+    poweroff -f
+fi
+if ! grep -E "reclaim authority=pool-delete candidates=[1-9][0-9]* handed_off=[1-9][0-9]* pending_objects=0 pending_plans=0 secure_erasure=false" \
+    /tmp/destroy-volume.log >/dev/null; then
+    echo "FAIL: volume destroy omitted committed reclaim outcome"
     cat /tmp/destroy-volume.log 2>&1 || true
     poweroff -f
 fi

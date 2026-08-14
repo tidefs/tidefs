@@ -22,7 +22,7 @@ use tidefs_dataset_lifecycle::{
 use tidefs_dataset_properties::{self, PropertyKey, PropertySet, PropertyValue};
 use tidefs_local_filesystem::{FileSystemStatfs, LocalFileSystem, RecoveryPolicy};
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
-use tidefs_pool_runtime::PoolRuntime;
+use tidefs_pool_runtime::{PoolRuntime, VolumeReclaimOutcome};
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
@@ -2288,24 +2288,25 @@ fn handle_destroy(args: DatasetDestroyArgs) {
                     .get_by_id(&dataset_id)
                     .ok_or_else(|| format!("dataset '{name}' lost its catalog identity"))?;
                 if dataset_type != DatasetType::Volume {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 runtime
                     .destroy_volume(&name)
-                    .map_err(|err| err.to_string())?;
-                Ok(true)
+                    .map(Some)
+                    .map_err(|err| err.to_string())
             },
         );
-        if destroyed {
+        if let Some(result) = destroyed {
             if args.json {
                 print_json_or_exit(serde_json::json!({
                     "ok": true,
                     "operation": "destroy",
                     "pool": target.pool,
                     "dataset": name,
+                    "dataset_id": result.dataset_id.to_string(),
                     "force": args.force,
                     "destroyed_entries": 1,
-                    "physical_reclaim": false,
+                    "reclaim": volume_reclaim_json(&result.reclaim),
                     "admission": {
                         "children": 0,
                         "snapshots": 0,
@@ -2313,7 +2314,10 @@ fn handle_destroy(args: DatasetDestroyArgs) {
                     },
                 }));
             } else {
-                println!("dataset '{name}' logically destroyed; physical reclaim remains pending");
+                println!(
+                    "dataset '{name}' logically destroyed; {}",
+                    volume_reclaim_line(&result.reclaim),
+                );
             }
             return;
         }
@@ -2358,7 +2362,8 @@ fn handle_destroy(args: DatasetDestroyArgs) {
         .get_by_id(&dataset_id)
         .is_some_and(|(_, _, dataset_type, _, _, _)| dataset_type == DatasetType::Volume);
     if is_volume {
-        fs.destroy_volume_dataset(&name)
+        let result = fs
+            .destroy_volume_dataset(&name)
             .unwrap_or_else(|err| exit_dataset_error("destroy", err.to_string(), args.json));
         if args.json {
             print_json_or_exit(serde_json::json!({
@@ -2366,9 +2371,10 @@ fn handle_destroy(args: DatasetDestroyArgs) {
                 "operation": "destroy",
                 "pool": target.pool,
                 "dataset": name,
+                "dataset_id": result.dataset_id.to_string(),
                 "force": args.force,
                 "destroyed_entries": 1,
-                "physical_reclaim": false,
+                "reclaim": volume_reclaim_json(&result.reclaim),
                 "admission": {
                     "children": admission.child_count,
                     "snapshots": admission.snapshot_count,
@@ -2376,7 +2382,10 @@ fn handle_destroy(args: DatasetDestroyArgs) {
                 },
             }));
         } else {
-            println!("dataset '{name}' logically destroyed; physical reclaim remains pending");
+            println!(
+                "dataset '{name}' logically destroyed; {}",
+                volume_reclaim_line(&result.reclaim),
+            );
         }
         return;
     }
@@ -2416,6 +2425,32 @@ fn handle_destroy(args: DatasetDestroyArgs) {
     } else {
         println!("dataset '{name}' destroyed");
     }
+}
+
+pub(super) fn volume_reclaim_json(outcome: &VolumeReclaimOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "authority": "pool-delete",
+        "candidate_objects": outcome.candidate_objects,
+        "handed_off_objects": outcome.handed_off_objects,
+        "pending_objects": outcome.pending_objects,
+        "pending_plans": outcome.pending_plans,
+        "handoff_error": outcome.handoff_error,
+        "secure_erasure": false,
+    })
+}
+
+pub(super) fn volume_reclaim_line(outcome: &VolumeReclaimOutcome) -> String {
+    let mut line = format!(
+        "reclaim authority=pool-delete candidates={} handed_off={} pending_objects={} pending_plans={} secure_erasure=false",
+        outcome.candidate_objects,
+        outcome.handed_off_objects,
+        outcome.pending_objects,
+        outcome.pending_plans,
+    );
+    if let Some(error) = &outcome.handoff_error {
+        line.push_str(&format!(" handoff_error={error}"));
+    }
+    line
 }
 
 /// Format a DatasetId for compact CLI display (first 8 hex chars of UUID).
@@ -2669,6 +2704,29 @@ mod dataset_lifecycle_command_tests {
             create_entry(&mut catalog, path, *dataset_type);
         }
         catalog
+    }
+
+    #[test]
+    fn physical_reclaim_output_reports_exact_handoff_debt() {
+        let outcome = VolumeReclaimOutcome {
+            candidate_objects: 17,
+            handed_off_objects: 11,
+            pending_objects: 6,
+            pending_plans: 1,
+            handoff_error: Some("injected handoff failure".to_string()),
+        };
+        assert_eq!(
+            volume_reclaim_line(&outcome),
+            "reclaim authority=pool-delete candidates=17 handed_off=11 pending_objects=6 pending_plans=1 secure_erasure=false handoff_error=injected handoff failure",
+        );
+        let json = volume_reclaim_json(&outcome);
+        assert_eq!(json["authority"], "pool-delete");
+        assert_eq!(json["candidate_objects"], 17);
+        assert_eq!(json["handed_off_objects"], 11);
+        assert_eq!(json["pending_objects"], 6);
+        assert_eq!(json["pending_plans"], 1);
+        assert_eq!(json["handoff_error"], "injected handoff failure");
+        assert_eq!(json["secure_erasure"], false);
     }
 
     #[test]

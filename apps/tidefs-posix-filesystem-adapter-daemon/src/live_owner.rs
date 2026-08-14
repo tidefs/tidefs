@@ -1142,8 +1142,31 @@ fn standalone_block_admin_request(
                 Err(error) => return live_admin_typed_error(error),
             };
             match runtime.destroy_volume(name) {
-                Ok(_) => LivePoolAdminResponse::ok_text(format!(
-                    "dataset '{name}' logically destroyed; physical reclaim remains pending"
+                Ok(result) if wants_json => LivePoolAdminResponse::ok_machine_json(
+                    json!({
+                        "ok": true,
+                        "operation": "destroy",
+                        "dataset": name,
+                        "dataset_id": result.dataset_id.to_string(),
+                        "reclaim": standalone_reclaim_json(
+                            result.reclaim.candidate_objects,
+                            result.reclaim.handed_off_objects,
+                            result.reclaim.pending_objects,
+                            result.reclaim.pending_plans,
+                            result.reclaim.handoff_error.as_deref(),
+                        ),
+                    })
+                    .to_string(),
+                ),
+                Ok(result) => LivePoolAdminResponse::ok_text(format!(
+                    "dataset '{name}' logically destroyed; {}",
+                    standalone_reclaim_line(
+                        result.reclaim.candidate_objects,
+                        result.reclaim.handed_off_objects,
+                        result.reclaim.pending_objects,
+                        result.reclaim.pending_plans,
+                        result.reclaim.handoff_error.as_deref(),
+                    ),
                 )),
                 Err(error) => LivePoolAdminResponse::error(1, format!("dataset destroy: {error}")),
             }
@@ -1191,16 +1214,42 @@ fn standalone_block_admin_request(
                 Ok(clone) => clone,
                 Err(error) => return live_admin_typed_error(error),
             };
-            standalone_volume_clone_response(
-                "logically destroyed",
-                runtime
-                    .destroy_volume_clone(clone)
-                    .map_err(|error| error.to_string()),
-                wants_json,
-                |summary| {
-                    (format!("volume clone '{}' source_snapshot='{}' source_volume='{}' kind=volume promoted={} generation={} size={} block_size={}", summary.path, summary.source_snapshot_path, summary.source_volume_path, summary.promoted, summary.generation, summary.geometry.capacity_bytes, summary.geometry.block_size_bytes), json!({"path": summary.path, "id": summary.clone_id.to_string(), "source_snapshot": summary.source_snapshot_path, "source_snapshot_id": summary.source_snapshot_id.to_string(), "source_volume": summary.source_volume_path, "source_volume_id": summary.source_volume_id.to_string(), "kind": "volume", "promoted": summary.promoted, "generation": summary.generation, "size": summary.geometry.capacity_bytes, "block_size": summary.geometry.block_size_bytes}))
-                },
-            )
+            match runtime.destroy_volume_clone(clone) {
+                Ok(result) => {
+                    let summary = &result.clone;
+                    let line = format!("volume clone '{}' source_snapshot='{}' source_volume='{}' kind=volume promoted={} generation={} size={} block_size={}", summary.path, summary.source_snapshot_path, summary.source_volume_path, summary.promoted, summary.generation, summary.geometry.capacity_bytes, summary.geometry.block_size_bytes);
+                    let value = json!({"path": summary.path, "id": summary.clone_id.to_string(), "source_snapshot": summary.source_snapshot_path, "source_snapshot_id": summary.source_snapshot_id.to_string(), "source_volume": summary.source_volume_path, "source_volume_id": summary.source_volume_id.to_string(), "kind": "volume", "promoted": summary.promoted, "generation": summary.generation, "size": summary.geometry.capacity_bytes, "block_size": summary.geometry.block_size_bytes});
+                    if wants_json {
+                        LivePoolAdminResponse::ok_machine_json(
+                            json!({
+                                "ok": true,
+                                "outcome": "logically destroyed",
+                                "clone": value,
+                                "reclaim": standalone_reclaim_json(
+                                    result.reclaim.candidate_objects,
+                                    result.reclaim.handed_off_objects,
+                                    result.reclaim.pending_objects,
+                                    result.reclaim.pending_plans,
+                                    result.reclaim.handoff_error.as_deref(),
+                                ),
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        LivePoolAdminResponse::ok_text(format!(
+                            "{line} logically destroyed\n{}",
+                            standalone_reclaim_line(
+                                result.reclaim.candidate_objects,
+                                result.reclaim.handed_off_objects,
+                                result.reclaim.pending_objects,
+                                result.reclaim.pending_plans,
+                                result.reclaim.handoff_error.as_deref(),
+                            ),
+                        ))
+                    }
+                }
+                Err(error) => LivePoolAdminResponse::error(1, format!("snapshot clone: {error}")),
+            }
         }
         LivePoolAdminCommand::SnapshotClonePromote => {
             let clone = match required_request_arg_str(&request.args, "clone") {
@@ -1218,15 +1267,41 @@ fn standalone_block_admin_request(
                 },
             )
         }
-        LivePoolAdminCommand::SnapshotDestroy => standalone_volume_snapshot_response(
-            "logically destroyed",
-            required_request_arg_str(&request.args, "target").and_then(|target| {
-                runtime
-                    .destroy_volume_snapshot(target)
-                    .map_err(|error| LivePoolAdminError::malformed(error.to_string()))
-            }),
-            wants_json,
-        ),
+        LivePoolAdminCommand::SnapshotDestroy => {
+            let target = match required_request_arg_str(&request.args, "target") {
+                Ok(target) => target,
+                Err(error) => return live_admin_typed_error(error),
+            };
+            match runtime.destroy_volume_snapshot(target) {
+                Ok(result) if wants_json => LivePoolAdminResponse::ok_machine_json(
+                    json!({
+                        "ok": true,
+                        "outcome": "logically destroyed",
+                        "snapshot": standalone_volume_snapshot_json(&result.snapshot),
+                        "reclaim": standalone_reclaim_json(
+                            result.reclaim.candidate_objects,
+                            result.reclaim.handed_off_objects,
+                            result.reclaim.pending_objects,
+                            result.reclaim.pending_plans,
+                            result.reclaim.handoff_error.as_deref(),
+                        ),
+                    })
+                    .to_string(),
+                ),
+                Ok(result) => LivePoolAdminResponse::ok_text(format!(
+                    "{} logically destroyed\n{}",
+                    standalone_volume_snapshot_line(&result.snapshot),
+                    standalone_reclaim_line(
+                        result.reclaim.candidate_objects,
+                        result.reclaim.handed_off_objects,
+                        result.reclaim.pending_objects,
+                        result.reclaim.pending_plans,
+                        result.reclaim.handoff_error.as_deref(),
+                    ),
+                )),
+                Err(error) => LivePoolAdminResponse::error(1, format!("snapshot destroy: {error}")),
+            }
+        }
         LivePoolAdminCommand::SnapshotRollback => {
             let target = match required_request_arg_str(&request.args, "target") {
                 Ok(target) => target,
@@ -1304,20 +1379,14 @@ fn standalone_volume_snapshot_response(
             json!({
                 "ok": true,
                 "outcome": outcome,
-                "physical_reclaim": false,
                 "snapshot": standalone_volume_snapshot_json(&summary),
             })
             .to_string(),
         ),
-        Ok(summary) => {
-            let mut text = format!("{} {outcome}", standalone_volume_snapshot_line(&summary));
-            if outcome == "logically destroyed" {
-                text.push_str(
-                    "\nphysical reclaim remains pending; no secure-erasure claim is made",
-                );
-            }
-            LivePoolAdminResponse::ok_text(text)
-        }
+        Ok(summary) => LivePoolAdminResponse::ok_text(format!(
+            "{} {outcome}",
+            standalone_volume_snapshot_line(&summary),
+        )),
         Err(error) => LivePoolAdminResponse::error(1, error.message),
     }
 }
@@ -1337,22 +1406,55 @@ fn standalone_volume_clone_response<T>(
                     json!({
                         "ok": true,
                         "outcome": outcome,
-                        "physical_reclaim": false,
                         "clone": value,
                     })
                     .to_string(),
                 );
             }
-            let mut text = format!("{line} {outcome}");
-            if outcome == "logically destroyed" {
-                text.push_str(
-                    "\nphysical reclaim remains pending; no secure-erasure claim is made",
-                );
-            }
-            LivePoolAdminResponse::ok_text(text)
+            LivePoolAdminResponse::ok_text(format!("{line} {outcome}"))
         }
         Err(error) => LivePoolAdminResponse::error(1, format!("snapshot clone: {error}")),
     }
+}
+
+#[cfg(feature = "block-volume")]
+fn standalone_reclaim_json(
+    candidate_objects: u64,
+    handed_off_objects: u64,
+    pending_objects: u64,
+    pending_plans: u64,
+    handoff_error: Option<&str>,
+) -> serde_json::Value {
+    json!({
+        "authority": "pool-delete",
+        "candidate_objects": candidate_objects,
+        "handed_off_objects": handed_off_objects,
+        "pending_objects": pending_objects,
+        "pending_plans": pending_plans,
+        "handoff_error": handoff_error,
+        "secure_erasure": false,
+    })
+}
+
+#[cfg(feature = "block-volume")]
+fn standalone_reclaim_line(
+    candidate_objects: u64,
+    handed_off_objects: u64,
+    pending_objects: u64,
+    pending_plans: u64,
+    handoff_error: Option<&str>,
+) -> String {
+    let mut line = format!(
+        "reclaim authority=pool-delete candidates={} handed_off={} pending_objects={} pending_plans={} secure_erasure=false",
+        candidate_objects,
+        handed_off_objects,
+        pending_objects,
+        pending_plans,
+    );
+    if let Some(error) = handoff_error {
+        line.push_str(&format!(" handoff_error={error}"));
+    }
+    line
 }
 
 #[cfg(feature = "block-volume")]

@@ -9,7 +9,7 @@
 //! reopen selects either the previous complete composition or its complete
 //! successor.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +24,8 @@ use tidefs_local_object_store::{
 };
 
 const POOL_ROOT_MAGIC: &[u8; 8] = b"TFSPOOL1";
-const POOL_ROOT_VERSION: u16 = 1;
+const POOL_ROOT_VERSION: u16 = 2;
+const POOL_ROOT_VERSION_V1: u16 = 1;
 const VOLUME_ROOT_MAGIC: &[u8; 8] = b"TFSVOL02";
 const VOLUME_ROOT_VERSION: u16 = 2;
 const SNAPSHOT_ROOT_MAGIC: &[u8; 8] = b"TFSSNP02";
@@ -35,6 +36,11 @@ const CHECKSUM_LEN: usize = 32;
 const DEFAULT_VOLUME_BLOCK_SIZE: u32 = 4096;
 const VOLUME_CHUNK_SIZE: usize = 1024 * 1024;
 const VOLUME_MAP_ROOT_LEVEL: u8 = 7;
+const VOLUME_RECLAIM_PLAN_MAGIC: &[u8; 8] = b"TFSVRCL1";
+const VOLUME_RECLAIM_PLAN_VERSION: u16 = 1;
+const VOLUME_RECLAIM_HANDOFF_LIMIT: usize = 1024;
+const MAX_VOLUME_RECLAIM_PLAN_KEYS: usize = 1_000_000;
+const MAX_PENDING_VOLUME_RECLAIM_PLANS: usize = 4096;
 
 /// Stable root-filesystem identity shared by all product compositions.
 pub const ROOT_DATASET_ID: DatasetId = DatasetId::from_bytes([0_u8; 16]);
@@ -185,6 +191,14 @@ struct CanonicalPoolRoot {
     catalog: DatasetCatalog,
     pool_properties: PropertySet,
     dataset_roots: BTreeMap<DatasetId, DatasetRootRef>,
+    volume_reclaim_cursors: Vec<VolumeReclaimCursor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VolumeReclaimCursor {
+    plan: ImmutableObjectRef,
+    candidate_count: u64,
+    next_index: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -200,6 +214,7 @@ pub struct PoolRuntime {
     root: CanonicalPoolRoot,
     pending_metadata: Option<PoolMetadataCandidate>,
     publication_requires_reopen: bool,
+    last_volume_reclaim: VolumeReclaimOutcome,
 }
 
 impl PoolRuntime {
@@ -213,21 +228,24 @@ impl PoolRuntime {
                 catalog: DatasetCatalog::new(),
                 pool_properties: PropertySet::new(),
                 dataset_roots: BTreeMap::new(),
+                volume_reclaim_cursors: Vec::new(),
             },
         };
         validate_catalog_root_types(&root.catalog, &root.dataset_roots)?;
         for reference in root.dataset_roots.values().copied() {
             let _ = load_immutable_object(&pool, reference)?;
         }
-        let runtime = Self {
+        let mut runtime = Self {
             pool,
             root,
             pending_metadata: None,
             publication_requires_reopen: false,
+            last_volume_reclaim: VolumeReclaimOutcome::default(),
         };
         runtime.root.catalog.validate_published_lineage()?;
         runtime.validate_snapshot_roots()?;
         runtime.validate_volume_clones()?;
+        runtime.last_volume_reclaim = runtime.resume_volume_reclaim(VOLUME_RECLAIM_HANDOFF_LIMIT);
         Ok(runtime)
     }
 
@@ -465,29 +483,7 @@ impl PoolRuntime {
     /// objects, so this method validates and includes their complete immutable
     /// graphs for both current volume roots and captured volume snapshots.
     pub fn canonical_root_object_keys(&self) -> Result<Vec<ObjectKey>> {
-        let mut keys = Vec::with_capacity(self.root.dataset_roots.len().saturating_add(1));
-        keys.push(canonical_pool_root_key());
-        for (dataset_id, reference) in &self.root.dataset_roots {
-            keys.push(reference.object_key);
-            match reference.kind {
-                DatasetRootKind::Filesystem => {}
-                DatasetRootKind::Volume => {
-                    let root = decode_volume_root(&load_immutable_object(&self.pool, *reference)?)?;
-                    collect_volume_root_object_keys(&self.pool, &root, &mut keys)?;
-                }
-                DatasetRootKind::Snapshot => {
-                    let source = self.load_snapshot_root(*dataset_id)?.source_reference;
-                    keys.push(source.object_key);
-                    if source.kind == DatasetRootKind::Volume {
-                        let root = decode_volume_root(&load_immutable_object(&self.pool, source)?)?;
-                        collect_volume_root_object_keys(&self.pool, &root, &mut keys)?;
-                    }
-                }
-            }
-        }
-        keys.sort_unstable();
-        keys.dedup();
-        Ok(keys)
+        canonical_root_object_keys_for(&self.pool, &self.root)
     }
 
     /// Publish one exact semantic root through the current catalog. The
@@ -945,9 +941,9 @@ impl PoolRuntime {
         })
     }
 
-    /// Atomically remove a volume snapshot's catalog entry and typed root.
-    /// Unreachable immutable objects remain pending separate physical reclaim.
-    pub fn destroy_volume_snapshot(&mut self, path: &str) -> Result<VolumeSnapshotSummary> {
+    /// Atomically remove a volume snapshot's catalog entry and typed root,
+    /// then hand its unreachable immutable graph to Pool deletion.
+    pub fn destroy_volume_snapshot(&mut self, path: &str) -> Result<VolumeSnapshotDestroyResult> {
         self.ensure_publishable()?;
         if self.pending_metadata.is_some() {
             return Err(PoolRuntimeError::CorruptRoot(
@@ -969,8 +965,13 @@ impl PoolRuntime {
         next.catalog.destroy(path)?;
         next.dataset_roots.remove(&snapshot_id);
         next.generation = next_generation(next.generation)?;
+        let candidate_objects = self.stage_volume_reclaim(snapshot_reference, &mut next)?;
         self.publish_root(next)?;
-        Ok(summary)
+        let reclaim = self.finish_volume_reclaim(candidate_objects);
+        Ok(VolumeSnapshotDestroyResult {
+            snapshot: summary,
+            reclaim,
+        })
     }
 
     /// Atomically create one writable volume clone from a canonical snapshot.
@@ -1083,7 +1084,7 @@ impl PoolRuntime {
     }
 
     /// Atomically remove one unpromoted volume clone's catalog and root.
-    pub fn destroy_volume_clone(&mut self, path: &str) -> Result<VolumeCloneSummary> {
+    pub fn destroy_volume_clone(&mut self, path: &str) -> Result<VolumeCloneDestroyResult> {
         self.ensure_publishable()?;
         if self.pending_metadata.is_some() {
             return Err(PoolRuntimeError::CorruptRoot(
@@ -1091,19 +1092,27 @@ impl PoolRuntime {
             ));
         }
         let summary = self.open_volume_clone(path)?;
+        let released_reference = *self
+            .root
+            .dataset_roots
+            .get(&summary.clone_id)
+            .ok_or(PoolRuntimeError::MissingRoot(summary.clone_id))?;
         let mut next = self.root.clone();
         next.catalog.destroy(path)?;
         next.dataset_roots.remove(&summary.clone_id);
         next.generation = next_generation(next.generation)?;
+        let candidate_objects = self.stage_volume_reclaim(released_reference, &mut next)?;
         self.publish_root(next)?;
-        Ok(summary)
+        let reclaim = self.finish_volume_reclaim(candidate_objects);
+        Ok(VolumeCloneDestroyResult {
+            clone: summary,
+            reclaim,
+        })
     }
 
-    /// Atomically remove one volume's catalog entry and typed root.
-    ///
-    /// Immutable objects made unreachable by this transition are left for
-    /// the separate physical-reclaim authority.
-    pub fn destroy_volume(&mut self, path: &str) -> Result<DatasetId> {
+    /// Atomically remove one volume's catalog entry and typed root, then hand
+    /// its unreachable immutable graph to Pool deletion.
+    pub fn destroy_volume(&mut self, path: &str) -> Result<VolumeDestroyResult> {
         self.ensure_publishable()?;
         if self.pending_metadata.is_some() {
             return Err(PoolRuntimeError::CorruptRoot(
@@ -1120,12 +1129,22 @@ impl PoolRuntime {
                 "volume has snapshots; destroy them before destroying the volume",
             ));
         }
+        let released_reference = *self
+            .root
+            .dataset_roots
+            .get(&volume.dataset_id)
+            .ok_or(PoolRuntimeError::MissingRoot(volume.dataset_id))?;
         let mut next = self.root.clone();
         next.catalog.destroy(path)?;
         next.dataset_roots.remove(&volume.dataset_id);
         next.generation = next_generation(next.generation)?;
+        let candidate_objects = self.stage_volume_reclaim(released_reference, &mut next)?;
         self.publish_root(next)?;
-        Ok(volume.dataset_id)
+        let reclaim = self.finish_volume_reclaim(candidate_objects);
+        Ok(VolumeDestroyResult {
+            dataset_id: volume.dataset_id,
+            reclaim,
+        })
     }
 
     /// Open a named volume as a detached dataset handle. The Pool runtime
@@ -1239,6 +1258,198 @@ impl PoolRuntime {
             ));
         }
         Ok((source_path, source_root))
+    }
+
+    /// Most recent released-volume reclaim attempt, including an automatic
+    /// reopen attempt when durable cursors were present.
+    #[must_use]
+    pub fn last_volume_reclaim_outcome(&self) -> &VolumeReclaimOutcome {
+        &self.last_volume_reclaim
+    }
+
+    /// Durable released-volume candidate debt still awaiting Pool deletion.
+    #[must_use]
+    pub fn pending_volume_reclaim_objects(&self) -> u64 {
+        self.root
+            .volume_reclaim_cursors
+            .iter()
+            .map(|cursor| cursor.candidate_count.saturating_sub(cursor.next_index))
+            .sum()
+    }
+
+    fn stage_volume_reclaim(
+        &mut self,
+        released_reference: DatasetRootRef,
+        next: &mut CanonicalPoolRoot,
+    ) -> Result<u64> {
+        if next.volume_reclaim_cursors.len() >= MAX_PENDING_VOLUME_RECLAIM_PLANS {
+            return Err(PoolRuntimeError::InvalidVolume(
+                "released-volume reclaim plan limit reached",
+            ));
+        }
+        let candidates = volume_reclaim_candidates(&self.pool, released_reference, next)?;
+        if candidates.len() > MAX_VOLUME_RECLAIM_PLAN_KEYS {
+            return Err(PoolRuntimeError::InvalidVolume(
+                "released-volume reclaim plan exceeds the bounded object limit",
+            ));
+        }
+        let candidate_count = u64::try_from(candidates.len()).map_err(|_| {
+            PoolRuntimeError::InvalidVolume("released-volume reclaim candidate count exceeds u64")
+        })?;
+        if !candidates.is_empty() {
+            let bytes = encode_volume_reclaim_plan(&candidates);
+            let digest = *blake3::hash(&bytes).as_bytes();
+            let plan = ImmutableObjectRef {
+                object_key: volume_reclaim_plan_key(released_reference, next.generation, digest),
+                digest,
+            };
+            self.pool
+                .put(DeviceIoClass::Data, plan.object_key, &bytes)?;
+            self.pool.sync_all()?;
+            next.volume_reclaim_cursors.push(VolumeReclaimCursor {
+                plan,
+                candidate_count,
+                next_index: 0,
+            });
+        }
+        Ok(candidate_count)
+    }
+
+    fn finish_volume_reclaim(&mut self, candidate_objects: u64) -> VolumeReclaimOutcome {
+        let mut outcome = self.resume_volume_reclaim(VOLUME_RECLAIM_HANDOFF_LIMIT);
+        outcome.candidate_objects = candidate_objects;
+        self.last_volume_reclaim = outcome.clone();
+        outcome
+    }
+
+    fn resume_volume_reclaim(&mut self, limit: usize) -> VolumeReclaimOutcome {
+        let pending_objects = self.pending_volume_reclaim_objects();
+        let mut outcome = VolumeReclaimOutcome {
+            candidate_objects: pending_objects,
+            pending_objects,
+            pending_plans: self.root.volume_reclaim_cursors.len() as u64,
+            ..VolumeReclaimOutcome::default()
+        };
+        if self.publication_requires_reopen {
+            outcome.handoff_error = Some(PoolRuntimeError::PublicationRequiresReopen.to_string());
+            return outcome;
+        }
+        let protected: BTreeSet<_> = match canonical_root_object_keys_for(&self.pool, &self.root) {
+            Ok(keys) => keys.into_iter().collect(),
+            Err(error) => {
+                outcome.handoff_error = Some(error.to_string());
+                return outcome;
+            }
+        };
+
+        let mut remaining = limit;
+        while let Some(cursor) = self.root.volume_reclaim_cursors.first().copied() {
+            if cursor.next_index < cursor.candidate_count {
+                if remaining == 0 {
+                    break;
+                }
+                let plan = match load_volume_reclaim_plan(&self.pool, cursor.plan) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        outcome.handoff_error = Some(error.to_string());
+                        break;
+                    }
+                };
+                if plan.len() as u64 != cursor.candidate_count {
+                    outcome.handoff_error = Some(
+                        PoolRuntimeError::CorruptRoot(
+                            "volume-reclaim plan count differs from its cursor",
+                        )
+                        .to_string(),
+                    );
+                    break;
+                }
+                let start = match usize::try_from(cursor.next_index) {
+                    Ok(start) if start <= plan.len() => start,
+                    _ => {
+                        outcome.handoff_error = Some(
+                            PoolRuntimeError::CorruptRoot(
+                                "volume-reclaim cursor index is outside its plan",
+                            )
+                            .to_string(),
+                        );
+                        break;
+                    }
+                };
+                let end = start.saturating_add(remaining).min(plan.len());
+                let mut advanced = 0usize;
+                let mut handed_off = 0usize;
+                for key in &plan[start..end] {
+                    if protected.contains(key) {
+                        advanced += 1;
+                        continue;
+                    }
+                    match self.pool.delete(DeviceIoClass::Data, *key) {
+                        Ok(_) => {
+                            advanced += 1;
+                            handed_off += 1;
+                        }
+                        Err(error) => {
+                            outcome.handoff_error = Some(error.to_string());
+                            break;
+                        }
+                    }
+                }
+                if advanced == 0 {
+                    break;
+                }
+                outcome.handed_off_objects =
+                    outcome.handed_off_objects.saturating_add(handed_off as u64);
+                remaining = remaining.saturating_sub(advanced);
+                let mut next = self.root.clone();
+                next.generation = match next_generation(next.generation) {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        outcome.handoff_error = Some(error.to_string());
+                        break;
+                    }
+                };
+                next.volume_reclaim_cursors[0].next_index =
+                    cursor.next_index.saturating_add(advanced as u64);
+                if let Err(error) = self.publish_root(next) {
+                    outcome.handoff_error = Some(error.to_string());
+                    break;
+                }
+                if advanced < end.saturating_sub(start) {
+                    break;
+                }
+                continue;
+            }
+
+            // A completed cursor no longer needs the plan body. Delete the
+            // plan first while retaining the cursor as an idempotent cleanup
+            // marker; a crash before cursor removal retries this delete
+            // without dereferencing the absent plan.
+            if let Err(error) = self
+                .pool
+                .delete(DeviceIoClass::Data, cursor.plan.object_key)
+            {
+                outcome.handoff_error = Some(error.to_string());
+                break;
+            }
+            let mut next = self.root.clone();
+            next.generation = match next_generation(next.generation) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    outcome.handoff_error = Some(error.to_string());
+                    break;
+                }
+            };
+            next.volume_reclaim_cursors.remove(0);
+            if let Err(error) = self.publish_root(next) {
+                outcome.handoff_error = Some(error.to_string());
+                break;
+            }
+        }
+
+        outcome.pending_objects = self.pending_volume_reclaim_objects();
+        outcome.pending_plans = self.root.volume_reclaim_cursors.len() as u64;
+        outcome
     }
 
     fn write_semantic_root(&mut self, reference: DatasetRootRef, bytes: &[u8]) -> Result<()> {
@@ -1396,6 +1607,46 @@ pub struct VolumeResizeResult {
     pub geometry: VolumeGeometry,
     pub generation: u64,
     pub resize_generation: u64,
+}
+
+/// Truthful progress from released-volume object handoff to `Pool::delete`.
+///
+/// `candidate_objects` counts released immutable objects selected by the
+/// canonical root transition. `handed_off_objects` counts objects for which
+/// crash-safe Pool deletion publication completed during this attempt.
+/// Candidates reused by a newer canonical live graph are advanced without a
+/// delete handoff, so they remain live and the two counts may differ even when
+/// no debt remains.
+/// `pending_objects` and `pending_plans` remain durable across reopen. This is
+/// not a secure-erasure or physical-segment-free claim.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VolumeReclaimOutcome {
+    pub candidate_objects: u64,
+    pub handed_off_objects: u64,
+    pub pending_objects: u64,
+    pub pending_plans: u64,
+    pub handoff_error: Option<String>,
+}
+
+/// Committed destruction of one Pool-backed volume.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeDestroyResult {
+    pub dataset_id: DatasetId,
+    pub reclaim: VolumeReclaimOutcome,
+}
+
+/// Committed destruction of one canonical Pool volume snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeSnapshotDestroyResult {
+    pub snapshot: VolumeSnapshotSummary,
+    pub reclaim: VolumeReclaimOutcome,
+}
+
+/// Committed destruction of one unpromoted Pool volume clone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeCloneDestroyResult {
+    pub clone: VolumeCloneSummary,
+    pub reclaim: VolumeReclaimOutcome,
 }
 
 /// Operator-visible identity and captured state of one Pool volume snapshot.
@@ -1880,6 +2131,21 @@ fn volume_map_node_key(id: DatasetId, level: u8, digest: [u8; 32]) -> ObjectKey 
     ObjectKey::from_name(bytes)
 }
 
+fn volume_reclaim_plan_key(
+    released_reference: DatasetRootRef,
+    pool_generation: u64,
+    digest: [u8; 32],
+) -> ObjectKey {
+    let mut bytes = Vec::with_capacity(112);
+    bytes.extend_from_slice(b"tidefs:volume-reclaim-plan:v1\0");
+    bytes.extend_from_slice(released_reference.dataset_id.as_bytes());
+    bytes.push(released_reference.kind as u8);
+    bytes.extend_from_slice(&released_reference.semantic_generation.to_le_bytes());
+    bytes.extend_from_slice(&pool_generation.to_le_bytes());
+    bytes.extend_from_slice(&digest);
+    ObjectKey::from_name(bytes)
+}
+
 fn load_immutable_object(pool: &Pool, reference: DatasetRootRef) -> Result<Vec<u8>> {
     load_immutable_ref(
         pool,
@@ -1958,6 +2224,81 @@ fn collect_volume_map_object_keys(
         }
     }
     Ok(())
+}
+
+fn canonical_root_object_keys_for(pool: &Pool, root: &CanonicalPoolRoot) -> Result<Vec<ObjectKey>> {
+    let mut keys = Vec::with_capacity(
+        root.dataset_roots
+            .len()
+            .saturating_add(root.volume_reclaim_cursors.len())
+            .saturating_add(1),
+    );
+    keys.push(canonical_pool_root_key());
+    keys.extend(
+        root.volume_reclaim_cursors
+            .iter()
+            .map(|cursor| cursor.plan.object_key),
+    );
+    for reference in root.dataset_roots.values().copied() {
+        keys.push(reference.object_key);
+        match reference.kind {
+            DatasetRootKind::Filesystem => {}
+            DatasetRootKind::Volume => {
+                let volume = decode_volume_root(&load_immutable_object(pool, reference)?)?;
+                collect_volume_root_object_keys(pool, &volume, &mut keys)?;
+            }
+            DatasetRootKind::Snapshot => {
+                let snapshot = decode_snapshot_root(&load_immutable_object(pool, reference)?)?;
+                let source = snapshot.source_reference;
+                keys.push(source.object_key);
+                if source.kind == DatasetRootKind::Volume {
+                    let volume = decode_volume_root(&load_immutable_object(pool, source)?)?;
+                    collect_volume_root_object_keys(pool, &volume, &mut keys)?;
+                }
+            }
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    Ok(keys)
+}
+
+fn volume_reclaim_candidates(
+    pool: &Pool,
+    released_reference: DatasetRootRef,
+    next: &CanonicalPoolRoot,
+) -> Result<Vec<ObjectKey>> {
+    let mut released = vec![released_reference.object_key];
+    match released_reference.kind {
+        DatasetRootKind::Filesystem => {
+            return Err(PoolRuntimeError::InvalidVolume(
+                "filesystem roots require their own released-root walker",
+            ));
+        }
+        DatasetRootKind::Volume => {
+            let volume = decode_volume_root(&load_immutable_object(pool, released_reference)?)?;
+            collect_volume_root_object_keys(pool, &volume, &mut released)?;
+        }
+        DatasetRootKind::Snapshot => {
+            let snapshot = decode_snapshot_root(&load_immutable_object(pool, released_reference)?)?;
+            if snapshot.source_reference.kind != DatasetRootKind::Volume {
+                return Err(PoolRuntimeError::InvalidVolume(
+                    "released snapshot is not a volume snapshot",
+                ));
+            }
+            released.push(snapshot.source_reference.object_key);
+            let volume =
+                decode_volume_root(&load_immutable_object(pool, snapshot.source_reference)?)?;
+            collect_volume_root_object_keys(pool, &volume, &mut released)?;
+        }
+    }
+    released.sort_unstable();
+    released.dedup();
+    let protected: BTreeSet<_> = canonical_root_object_keys_for(pool, next)?
+        .into_iter()
+        .collect();
+    released.retain(|key| !protected.contains(key));
+    Ok(released)
 }
 
 fn lookup_volume_map(
@@ -2155,6 +2496,62 @@ fn validate_catalog_root_types(
     Ok(())
 }
 
+fn encode_volume_reclaim_plan(keys: &[ObjectKey]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8 + 2 + 4 + keys.len().saturating_mul(32) + CHECKSUM_LEN);
+    bytes.extend_from_slice(VOLUME_RECLAIM_PLAN_MAGIC);
+    bytes.extend_from_slice(&VOLUME_RECLAIM_PLAN_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for key in keys {
+        bytes.extend_from_slice(key.as_bytes());
+    }
+    let digest = blake3::hash(&bytes);
+    bytes.extend_from_slice(digest.as_bytes());
+    bytes
+}
+
+fn load_volume_reclaim_plan(pool: &Pool, reference: ImmutableObjectRef) -> Result<Vec<ObjectKey>> {
+    let bytes = load_immutable_ref(pool, reference)?;
+    const HEADER: usize = 8 + 2 + 4;
+    if bytes.len() < HEADER + CHECKSUM_LEN || &bytes[..8] != VOLUME_RECLAIM_PLAN_MAGIC {
+        return Err(PoolRuntimeError::CorruptRoot(
+            "bad volume-reclaim plan header",
+        ));
+    }
+    let payload_len = bytes.len() - CHECKSUM_LEN;
+    if blake3::hash(&bytes[..payload_len]).as_bytes() != &bytes[payload_len..] {
+        return Err(PoolRuntimeError::CorruptRoot(
+            "volume-reclaim plan checksum mismatch",
+        ));
+    }
+    let mut offset = 8;
+    if take_u16(&bytes, &mut offset)? != VOLUME_RECLAIM_PLAN_VERSION {
+        return Err(PoolRuntimeError::CorruptRoot(
+            "unsupported volume-reclaim plan version",
+        ));
+    }
+    let count = take_u32(&bytes, &mut offset)? as usize;
+    if count > MAX_VOLUME_RECLAIM_PLAN_KEYS
+        || offset.checked_add(count.saturating_mul(32)) != Some(payload_len)
+    {
+        return Err(PoolRuntimeError::CorruptRoot(
+            "volume-reclaim plan length fields disagree",
+        ));
+    }
+    let mut keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        keys.push(ObjectKey::from_bytes32(take_array::<32>(
+            &bytes,
+            &mut offset,
+        )?));
+    }
+    if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(PoolRuntimeError::CorruptRoot(
+            "volume-reclaim plan keys are not strictly ordered",
+        ));
+    }
+    Ok(keys)
+}
+
 fn encode_pool_root(root: &CanonicalPoolRoot) -> Vec<u8> {
     let catalog = root.catalog.encode();
     let properties = root.pool_properties.to_key_value_blob();
@@ -2165,6 +2562,7 @@ fn encode_pool_root(root: &CanonicalPoolRoot) -> Vec<u8> {
     bytes.extend_from_slice(&(catalog.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&(properties.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&(root.dataset_roots.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(root.volume_reclaim_cursors.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&catalog);
     bytes.extend_from_slice(&properties);
     for reference in root.dataset_roots.values() {
@@ -2174,15 +2572,22 @@ fn encode_pool_root(root: &CanonicalPoolRoot) -> Vec<u8> {
         bytes.extend_from_slice(reference.object_key.as_bytes());
         bytes.extend_from_slice(&reference.digest);
     }
+    for cursor in &root.volume_reclaim_cursors {
+        bytes.extend_from_slice(cursor.plan.object_key.as_bytes());
+        bytes.extend_from_slice(&cursor.plan.digest);
+        bytes.extend_from_slice(&cursor.candidate_count.to_le_bytes());
+        bytes.extend_from_slice(&cursor.next_index.to_le_bytes());
+    }
     let digest = blake3::hash(&bytes);
     bytes.extend_from_slice(digest.as_bytes());
     bytes
 }
 
 fn decode_pool_root(bytes: &[u8]) -> Result<CanonicalPoolRoot> {
-    const HEADER: usize = 8 + 2 + 8 + 4 + 4 + 4;
+    const V1_HEADER: usize = 8 + 2 + 8 + 4 + 4 + 4;
     const ROOT_RECORD: usize = 16 + 1 + 8 + 32 + 32;
-    if bytes.len() < HEADER + CHECKSUM_LEN || &bytes[..8] != POOL_ROOT_MAGIC {
+    const RECLAIM_CURSOR_RECORD: usize = 32 + 32 + 8 + 8;
+    if bytes.len() < V1_HEADER + CHECKSUM_LEN || &bytes[..8] != POOL_ROOT_MAGIC {
         return Err(PoolRuntimeError::CorruptRoot("bad Pool-root header"));
     }
     let payload_len = bytes.len() - CHECKSUM_LEN;
@@ -2190,7 +2595,8 @@ fn decode_pool_root(bytes: &[u8]) -> Result<CanonicalPoolRoot> {
         return Err(PoolRuntimeError::CorruptRoot("Pool-root checksum mismatch"));
     }
     let mut offset = 8;
-    if take_u16(bytes, &mut offset)? != POOL_ROOT_VERSION {
+    let version = take_u16(bytes, &mut offset)?;
+    if version != POOL_ROOT_VERSION_V1 && version != POOL_ROOT_VERSION {
         return Err(PoolRuntimeError::CorruptRoot(
             "unsupported Pool-root version",
         ));
@@ -2199,13 +2605,27 @@ fn decode_pool_root(bytes: &[u8]) -> Result<CanonicalPoolRoot> {
     let catalog_len = take_u32(bytes, &mut offset)? as usize;
     let properties_len = take_u32(bytes, &mut offset)? as usize;
     let root_count = take_u32(bytes, &mut offset)? as usize;
+    let reclaim_cursor_count = if version >= POOL_ROOT_VERSION {
+        take_u32(bytes, &mut offset)? as usize
+    } else {
+        0
+    };
+    if reclaim_cursor_count > MAX_PENDING_VOLUME_RECLAIM_PLANS {
+        return Err(PoolRuntimeError::CorruptRoot(
+            "too many volume-reclaim cursors",
+        ));
+    }
     let roots_len = root_count
         .checked_mul(ROOT_RECORD)
+        .ok_or(PoolRuntimeError::CorruptRoot("Pool-root length overflow"))?;
+    let reclaim_cursors_len = reclaim_cursor_count
+        .checked_mul(RECLAIM_CURSOR_RECORD)
         .ok_or(PoolRuntimeError::CorruptRoot("Pool-root length overflow"))?;
     if offset
         .checked_add(catalog_len)
         .and_then(|value| value.checked_add(properties_len))
         .and_then(|value| value.checked_add(roots_len))
+        .and_then(|value| value.checked_add(reclaim_cursors_len))
         != Some(payload_len)
     {
         return Err(PoolRuntimeError::CorruptRoot(
@@ -2243,11 +2663,36 @@ fn decode_pool_root(bytes: &[u8]) -> Result<CanonicalPoolRoot> {
             ));
         }
     }
+    let mut volume_reclaim_cursors = Vec::with_capacity(reclaim_cursor_count);
+    let mut reclaim_plan_keys = BTreeSet::new();
+    for _ in 0..reclaim_cursor_count {
+        let plan = ImmutableObjectRef {
+            object_key: ObjectKey::from_bytes32(take_array::<32>(bytes, &mut offset)?),
+            digest: take_array::<32>(bytes, &mut offset)?,
+        };
+        let candidate_count = take_u64(bytes, &mut offset)?;
+        let next_index = take_u64(bytes, &mut offset)?;
+        if candidate_count == 0
+            || candidate_count > MAX_VOLUME_RECLAIM_PLAN_KEYS as u64
+            || next_index > candidate_count
+            || !reclaim_plan_keys.insert(plan.object_key)
+        {
+            return Err(PoolRuntimeError::CorruptRoot(
+                "invalid volume-reclaim cursor",
+            ));
+        }
+        volume_reclaim_cursors.push(VolumeReclaimCursor {
+            plan,
+            candidate_count,
+            next_index,
+        });
+    }
     let root = CanonicalPoolRoot {
         generation,
         catalog,
         pool_properties,
         dataset_roots,
+        volume_reclaim_cursors,
     };
     validate_catalog_root_types(&root.catalog, &root.dataset_roots)?;
     Ok(root)
@@ -2550,6 +2995,27 @@ mod tests {
         PoolRuntime::open(pool).unwrap()
     }
 
+    fn publish_volume_destroy_with_pending_reclaim(
+        owner: &mut PoolRuntime,
+        path: &str,
+    ) -> Vec<ObjectKey> {
+        let volume = owner.open_volume(path).unwrap();
+        let released_reference = *owner.root.dataset_roots.get(&volume.dataset_id).unwrap();
+        let mut next = owner.root.clone();
+        next.catalog.destroy(path).unwrap();
+        next.dataset_roots.remove(&volume.dataset_id);
+        next.generation = next_generation(next.generation).unwrap();
+        let candidates = volume_reclaim_candidates(&owner.pool, released_reference, &next).unwrap();
+        assert_eq!(
+            owner
+                .stage_volume_reclaim(released_reference, &mut next)
+                .unwrap(),
+            candidates.len() as u64,
+        );
+        owner.publish_root(next).unwrap();
+        candidates
+    }
+
     #[test]
     fn pool_root_refuses_checksum_corruption() {
         let root = CanonicalPoolRoot {
@@ -2557,6 +3023,7 @@ mod tests {
             catalog: DatasetCatalog::new(),
             pool_properties: PropertySet::new(),
             dataset_roots: BTreeMap::new(),
+            volume_reclaim_cursors: Vec::new(),
         };
         let mut bytes = encode_pool_root(&root);
         bytes[10] ^= 0x80;
@@ -2564,6 +3031,33 @@ mod tests {
             decode_pool_root(&bytes),
             Err(PoolRuntimeError::CorruptRoot("Pool-root checksum mismatch"))
         ));
+    }
+
+    #[test]
+    fn pool_root_v1_decodes_without_reclaim_cursors() {
+        let root = CanonicalPoolRoot {
+            generation: 7,
+            catalog: DatasetCatalog::new(),
+            pool_properties: PropertySet::new(),
+            dataset_roots: BTreeMap::new(),
+            volume_reclaim_cursors: Vec::new(),
+        };
+        let encoded = encode_pool_root(&root);
+        let mut v1_payload = encoded[..encoded.len() - CHECKSUM_LEN].to_vec();
+        v1_payload[8..10].copy_from_slice(&POOL_ROOT_VERSION_V1.to_le_bytes());
+        v1_payload.drain(30..34);
+        let digest = blake3::hash(&v1_payload);
+        v1_payload.extend_from_slice(digest.as_bytes());
+
+        let decoded = decode_pool_root(&v1_payload).unwrap();
+        assert_eq!(decoded.generation, root.generation);
+        assert_eq!(decoded.catalog.encode(), root.catalog.encode());
+        assert_eq!(
+            decoded.pool_properties.to_key_value_blob(),
+            root.pool_properties.to_key_value_blob(),
+        );
+        assert_eq!(decoded.dataset_roots, root.dataset_roots);
+        assert!(decoded.volume_reclaim_cursors.is_empty());
     }
 
     #[test]
@@ -2728,7 +3222,7 @@ mod tests {
         let mut owner = runtime(dir.path());
         let id = create_volume(&mut owner, "vol", 10);
 
-        assert_eq!(owner.destroy_volume("vol").unwrap(), id);
+        assert_eq!(owner.destroy_volume("vol").unwrap().dataset_id, id);
         assert!(owner.dataset_catalog().lookup("vol").is_err());
         assert!(owner.dataset_root(id).is_none());
 
@@ -2736,6 +3230,291 @@ mod tests {
         assert!(owner.dataset_catalog().lookup("vol").is_err());
         assert!(owner.dataset_root(id).is_none());
         assert!(owner.open_volume("vol").is_err());
+    }
+
+    #[test]
+    fn volume_reclaim_protects_shared_snapshot_and_clone_graphs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        create_volume(&mut owner, "source", 40);
+        let mut volume = owner.open_volume("source").unwrap();
+        volume.write_blocks(&owner, 0, &vec![0x5a; 4096]).unwrap();
+        volume.flush(&mut owner).unwrap();
+        owner.create_volume_snapshot("source@base").unwrap();
+        let clone = owner.create_volume_clone("clone", "source@base").unwrap();
+
+        let result = owner.destroy_volume_clone("clone").unwrap();
+        assert_eq!(result.clone, clone);
+        assert_eq!(result.reclaim.candidate_objects, 1);
+        assert_eq!(result.reclaim.handed_off_objects, 1);
+        assert_eq!(result.reclaim.pending_objects, 0);
+        assert_eq!(result.reclaim.pending_plans, 0);
+        assert!(result.reclaim.handoff_error.is_none());
+        assert_eq!(
+            owner
+                .open_volume("source")
+                .unwrap()
+                .read_blocks(&owner, 0, 1)
+                .unwrap(),
+            vec![0x5a; 4096],
+        );
+        assert_eq!(owner.list_volume_snapshots().unwrap().len(), 1);
+
+        let owner = reopen(owner);
+        assert_eq!(
+            owner
+                .open_volume("source")
+                .unwrap()
+                .read_blocks(&owner, 0, 1)
+                .unwrap(),
+            vec![0x5a; 4096],
+        );
+        assert_eq!(owner.list_volume_snapshots().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn volume_reclaim_destroy_removes_graph_and_reuses_accounted_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        let filesystem_id = DatasetId::from_bytes([46; 16]);
+        owner
+            .create_dataset_with_root(
+                "filesystem",
+                filesystem_id,
+                DatasetType::Filesystem,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+                1,
+                b"filesystem-root",
+            )
+            .unwrap();
+        create_volume(&mut owner, "vol", 41);
+        let mut volume = owner.open_volume("vol").unwrap();
+        let blocks_per_chunk = VOLUME_CHUNK_SIZE as u64 / 4096;
+        volume.write_blocks(&owner, 0, &vec![0x11; 4096]).unwrap();
+        volume
+            .write_blocks(&owner, blocks_per_chunk + 1, &vec![0x22; 4096])
+            .unwrap();
+        volume.flush(&mut owner).unwrap();
+
+        let before = owner.pool().pool_stats();
+        let released_reference = *owner.root.dataset_roots.get(&volume.dataset_id).unwrap();
+        let mut next = owner.root.clone();
+        next.catalog.destroy("vol").unwrap();
+        next.dataset_roots.remove(&volume.dataset_id);
+        next.generation = next_generation(next.generation).unwrap();
+        let candidates = volume_reclaim_candidates(&owner.pool, released_reference, &next).unwrap();
+
+        let result = owner.destroy_volume("vol").unwrap();
+        assert_eq!(result.reclaim.candidate_objects, candidates.len() as u64);
+        assert_eq!(result.reclaim.handed_off_objects, candidates.len() as u64);
+        assert_eq!(result.reclaim.pending_objects, 0);
+        assert_eq!(result.reclaim.pending_plans, 0);
+        assert!(result.reclaim.handoff_error.is_none());
+        for key in candidates {
+            assert!(owner
+                .pool()
+                .get(DeviceIoClass::Data, key)
+                .unwrap()
+                .is_none());
+        }
+        let after = owner.pool().pool_stats();
+        assert!(after.used_bytes < before.used_bytes);
+        assert!(after.available_bytes > before.available_bytes);
+        assert!(after.object_count < before.object_count);
+        assert_eq!(
+            owner
+                .load_dataset_root(filesystem_id, DatasetRootKind::Filesystem)
+                .unwrap(),
+            b"filesystem-root",
+        );
+
+        create_volume(&mut owner, "replacement", 42);
+        let mut replacement = owner.open_volume("replacement").unwrap();
+        replacement
+            .write_blocks(&owner, 0, &vec![0xa5; 4096])
+            .unwrap();
+        replacement.flush(&mut owner).unwrap();
+        assert_eq!(
+            owner
+                .open_volume("replacement")
+                .unwrap()
+                .read_blocks(&owner, 0, 1)
+                .unwrap(),
+            vec![0xa5; 4096],
+        );
+    }
+
+    #[test]
+    fn volume_reclaim_reopen_resumes_published_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        create_volume(&mut owner, "vol", 43);
+        let mut volume = owner.open_volume("vol").unwrap();
+        volume.write_blocks(&owner, 0, &vec![0x43; 4096]).unwrap();
+        volume.flush(&mut owner).unwrap();
+
+        let candidates = publish_volume_destroy_with_pending_reclaim(&mut owner, "vol");
+        assert_eq!(
+            owner.pending_volume_reclaim_objects(),
+            candidates.len() as u64,
+        );
+
+        let owner = reopen(owner);
+        assert_eq!(owner.pending_volume_reclaim_objects(), 0);
+        assert_eq!(
+            owner.last_volume_reclaim_outcome().handed_off_objects,
+            candidates.len() as u64,
+        );
+        assert!(owner.last_volume_reclaim_outcome().handoff_error.is_none());
+        for key in candidates {
+            assert!(owner
+                .pool()
+                .get(DeviceIoClass::Data, key)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn volume_reclaim_retry_protects_recreated_object_lifetime() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        let volume_id = create_volume(&mut owner, "vol", 47);
+        let mut volume = owner.open_volume("vol").unwrap();
+        volume.write_blocks(&owner, 0, &vec![0x47; 4096]).unwrap();
+        volume.flush(&mut owner).unwrap();
+        let candidates = publish_volume_destroy_with_pending_reclaim(&mut owner, "vol");
+
+        owner
+            .create_volume(
+                "vol",
+                volume_id,
+                4 * 1024 * 1024,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+            )
+            .unwrap();
+        let mut replacement = owner.open_volume("vol").unwrap();
+        replacement
+            .write_blocks(&owner, 0, &vec![0x47; 4096])
+            .unwrap();
+        replacement.flush(&mut owner).unwrap();
+
+        let live_keys: BTreeSet<_> = owner
+            .canonical_root_object_keys()
+            .unwrap()
+            .into_iter()
+            .collect();
+        let reprotected = candidates
+            .iter()
+            .filter(|key| live_keys.contains(key))
+            .count();
+        assert!(reprotected > 0);
+
+        let outcome = owner.resume_volume_reclaim(VOLUME_RECLAIM_HANDOFF_LIMIT);
+        assert_eq!(
+            outcome.handed_off_objects,
+            (candidates.len() - reprotected) as u64,
+        );
+        assert_eq!(outcome.pending_objects, 0);
+        assert_eq!(outcome.pending_plans, 0);
+        assert!(outcome.handoff_error.is_none());
+        assert_eq!(
+            owner
+                .open_volume("vol")
+                .unwrap()
+                .read_blocks(&owner, 0, 1)
+                .unwrap(),
+            vec![0x47; 4096],
+        );
+
+        let owner = reopen(owner);
+        assert_eq!(
+            owner
+                .open_volume("vol")
+                .unwrap()
+                .read_blocks(&owner, 0, 1)
+                .unwrap(),
+            vec![0x47; 4096],
+        );
+    }
+
+    #[test]
+    fn volume_reclaim_reopen_finishes_completed_cursor_after_plan_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        create_volume(&mut owner, "vol", 45);
+        let mut volume = owner.open_volume("vol").unwrap();
+        volume.write_blocks(&owner, 0, &vec![0x45; 4096]).unwrap();
+        volume.flush(&mut owner).unwrap();
+
+        let candidates = publish_volume_destroy_with_pending_reclaim(&mut owner, "vol");
+        let cursor = owner.root.volume_reclaim_cursors[0];
+        for key in &candidates {
+            owner.pool_mut().delete(DeviceIoClass::Data, *key).unwrap();
+        }
+        let mut next = owner.root.clone();
+        next.generation = next_generation(next.generation).unwrap();
+        next.volume_reclaim_cursors[0].next_index = candidates.len() as u64;
+        owner.publish_root(next).unwrap();
+        owner
+            .pool_mut()
+            .delete(DeviceIoClass::Data, cursor.plan.object_key)
+            .unwrap();
+
+        let owner = reopen(owner);
+        assert_eq!(owner.pending_volume_reclaim_objects(), 0);
+        assert_eq!(owner.last_volume_reclaim_outcome().pending_plans, 0);
+        assert!(owner.last_volume_reclaim_outcome().handoff_error.is_none());
+        assert!(owner
+            .pool()
+            .get(DeviceIoClass::Data, cursor.plan.object_key)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn volume_reclaim_corrupt_plan_fails_closed_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        create_volume(&mut owner, "vol", 44);
+        let mut volume = owner.open_volume("vol").unwrap();
+        volume.write_blocks(&owner, 0, &vec![0x44; 4096]).unwrap();
+        volume.flush(&mut owner).unwrap();
+
+        let candidates = publish_volume_destroy_with_pending_reclaim(&mut owner, "vol");
+        let plan = owner.root.volume_reclaim_cursors[0].plan;
+        owner
+            .pool_mut()
+            .put(
+                DeviceIoClass::Data,
+                plan.object_key,
+                b"corrupt reclaim plan",
+            )
+            .unwrap();
+        owner.pool_mut().sync_all().unwrap();
+
+        let owner = reopen(owner);
+        assert_eq!(
+            owner.pending_volume_reclaim_objects(),
+            candidates.len() as u64,
+        );
+        assert_eq!(owner.last_volume_reclaim_outcome().handed_off_objects, 0);
+        assert!(owner
+            .last_volume_reclaim_outcome()
+            .handoff_error
+            .as_deref()
+            .is_some_and(|error| error.contains("digest differs")));
+        for key in candidates {
+            assert!(owner
+                .pool()
+                .get(DeviceIoClass::Data, key)
+                .unwrap()
+                .is_some());
+        }
     }
 
     #[test]
@@ -2787,7 +3566,10 @@ mod tests {
 
         let mut owner = owner;
         assert_eq!(
-            owner.destroy_volume_snapshot("vol@before").unwrap(),
+            owner
+                .destroy_volume_snapshot("vol@before")
+                .unwrap()
+                .snapshot,
             created
         );
         let mut owner = reopen(owner);
@@ -3070,6 +3852,7 @@ mod tests {
             owner.destroy_volume_snapshot("source@base"),
             Err(PoolRuntimeError::Catalog(CatalogError::LineageInUse))
         ));
+        assert_eq!(owner.pending_volume_reclaim_objects(), 0);
 
         let mut owner = reopen(owner);
         assert_eq!(
@@ -3109,7 +3892,7 @@ mod tests {
         owner.create_volume_snapshot("source@base").unwrap();
         let clone = owner.create_volume_clone("clone", "source@base").unwrap();
 
-        assert_eq!(owner.destroy_volume_clone("clone").unwrap(), clone);
+        assert_eq!(owner.destroy_volume_clone("clone").unwrap().clone, clone);
         owner.destroy_volume_snapshot("source@base").unwrap();
         let owner = reopen(owner);
         assert!(owner.open_volume("clone").is_err());

@@ -21,7 +21,10 @@ use tidefs_local_filesystem::{
     SnapshotRetentionReport, SnapshotSummary,
 };
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
-use tidefs_pool_runtime::{PoolRuntime, VolumeCloneSummary, VolumeSnapshotSummary};
+use tidefs_pool_runtime::{
+    PoolRuntime, VolumeCloneDestroyResult, VolumeCloneSummary, VolumeSnapshotDestroyResult,
+    VolumeSnapshotSummary,
+};
 #[cfg(feature = "remote-snapshot")]
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
@@ -1676,7 +1679,7 @@ fn handle_volume_snapshot_restore(pool: &str, target: &str, devices: Option<&[Pa
 fn handle_volume_snapshot_destroy(pool: &str, target: &str, devices: Option<&[PathBuf]>) {
     let live_args =
         super::live_owner::live_admin_args([("target", LivePoolAdminArg::String(target.into()))]);
-    let summary = if let Some(devices) = devices.filter(|devices| !devices.is_empty()) {
+    let result = if let Some(devices) = devices.filter(|devices| !devices.is_empty()) {
         with_offline_volume_snapshot_runtime(
             pool,
             devices,
@@ -1692,7 +1695,7 @@ fn handle_volume_snapshot_destroy(pool: &str, target: &str, devices: Option<&[Pa
     } else {
         super::live_owner::route_with_format_and_args("snapshot", "destroy", pool, false, live_args)
     };
-    print_volume_snapshot_outcome("logically destroyed", &summary, false);
+    print_volume_snapshot_destroy(&result, false);
 }
 
 fn volume_snapshot_line(summary: &VolumeSnapshotSummary) -> String {
@@ -1728,15 +1731,31 @@ fn print_volume_snapshot_outcome(outcome: &str, summary: &VolumeSnapshotSummary,
             serde_json::json!({
                 "ok": true,
                 "outcome": outcome,
-                "physical_reclaim": false,
                 "snapshot": volume_snapshot_json(summary),
             })
         );
     } else {
         println!("{} {outcome}", volume_snapshot_line(summary));
-        if outcome == "logically destroyed" {
-            println!("physical reclaim remains pending; no secure-erasure claim is made");
-        }
+    }
+}
+
+fn print_volume_snapshot_destroy(result: &VolumeSnapshotDestroyResult, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "outcome": "logically destroyed",
+                "snapshot": volume_snapshot_json(&result.snapshot),
+                "reclaim": super::dataset::volume_reclaim_json(&result.reclaim),
+            })
+        );
+    } else {
+        println!(
+            "{} logically destroyed",
+            volume_snapshot_line(&result.snapshot),
+        );
+        println!("{}", super::dataset::volume_reclaim_line(&result.reclaim));
     }
 }
 
@@ -1776,15 +1795,28 @@ fn print_volume_clone_outcome(outcome: &str, summary: &VolumeCloneSummary, json:
             serde_json::json!({
                 "ok": true,
                 "outcome": outcome,
-                "physical_reclaim": false,
                 "clone": volume_clone_json(summary),
             })
         );
     } else {
         println!("{} {outcome}", volume_clone_line(summary));
-        if outcome == "logically destroyed" {
-            println!("physical reclaim remains pending; no secure-erasure claim is made");
-        }
+    }
+}
+
+fn print_volume_clone_destroy(result: &VolumeCloneDestroyResult, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "outcome": "logically destroyed",
+                "clone": volume_clone_json(&result.clone),
+                "reclaim": super::dataset::volume_reclaim_json(&result.reclaim),
+            })
+        );
+    } else {
+        println!("{} logically destroyed", volume_clone_line(&result.clone),);
+        println!("{}", super::dataset::volume_reclaim_line(&result.reclaim));
     }
 }
 
@@ -1941,7 +1973,7 @@ fn handle_clone_delete(args: SnapshotCloneDeleteArgs) {
         "clone",
         LivePoolAdminArg::String(clone_name.clone()),
     )]);
-    let summary = if let Some(devices) = devices.as_deref().filter(|devices| !devices.is_empty()) {
+    let result = if let Some(devices) = devices.as_deref().filter(|devices| !devices.is_empty()) {
         with_offline_volume_snapshot_runtime(
             &pool,
             devices,
@@ -1963,7 +1995,7 @@ fn handle_clone_delete(args: SnapshotCloneDeleteArgs) {
             live_args,
         )
     };
-    print_volume_clone_outcome("logically destroyed", &summary, false);
+    print_volume_clone_destroy(&result, false);
 }
 
 fn handle_clone_promote(args: SnapshotClonePromoteArgs) {
