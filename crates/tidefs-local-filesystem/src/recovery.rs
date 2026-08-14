@@ -2,11 +2,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use tidefs_dataset_lifecycle::{DatasetId, DatasetType};
 use tidefs_local_object_store::{
     checksum64,
     pool::{is_strict_read_authority_error, Pool},
     CrashInjectionPoint, DeviceIoClass, IntegrityDigest64, LocalObjectStore, ObjectKey,
-    ObjectLocation, StoreError,
+    ObjectLocation, StoreError, FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME,
 };
 use tidefs_pool_runtime::{DatasetRootKind, PoolRuntime};
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind, ROOT_INODE_ID};
@@ -36,13 +37,17 @@ use crate::types::*;
 use crate::{is_skippable_recovery_error, is_skippable_store_error};
 use crate::{
     transaction_manifest_entries_for_existing_content,
-    transaction_manifest_entries_for_pool_content,
+    transaction_manifest_entries_for_pool_content_in_keyspace,
 };
 use crate::{DatasetInodeAuthority, FileSystemState, QuotaTable, Result, ROOT_DATASET_ID};
 use tidefs_recovery_loop::RecoveryPolicy;
 use tidefs_space_accounting::SpaceAccounting;
 pub(crate) fn initial_state() -> FileSystemState {
-    let inode_authority = DatasetInodeAuthority::fresh_root(ROOT_DATASET_ID);
+    initial_state_for_dataset(tidefs_pool_runtime::ROOT_DATASET_ID)
+}
+
+pub(crate) fn initial_state_for_dataset(dataset_id: DatasetId) -> FileSystemState {
+    let inode_authority = DatasetInodeAuthority::fresh_root(*dataset_id.as_bytes());
     let root_inode_id = inode_authority.root_inode_id();
     let root = InodeRecord {
         rdev: 0,
@@ -418,12 +423,27 @@ pub(crate) fn load_canonical_committed_state(
     runtime: &PoolRuntime,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<(FileSystemState, RootCommitRecord)> {
-    let bytes = runtime.load_dataset_root(
+    load_canonical_committed_state_for_dataset(
+        runtime,
         tidefs_pool_runtime::ROOT_DATASET_ID,
-        DatasetRootKind::Filesystem,
-    )?;
+        root_authentication_key,
+    )
+}
+
+pub(crate) fn load_canonical_committed_state_for_dataset(
+    runtime: &PoolRuntime,
+    dataset_id: DatasetId,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<(FileSystemState, RootCommitRecord)> {
+    let bytes = runtime.load_dataset_root(dataset_id, DatasetRootKind::Filesystem)?;
     let root = decode_root_commit(&bytes)?;
-    let state = load_state_from_transaction_pool(runtime.pool(), &root, root_authentication_key)?;
+    let mut state = load_state_from_transaction_pool_for_dataset(
+        runtime.pool(),
+        dataset_id,
+        &root,
+        root_authentication_key,
+    )?;
+    state.set_inode_authority_dataset_id(*dataset_id.as_bytes());
     Ok((state, root))
 }
 
@@ -432,12 +452,27 @@ pub(crate) fn recover_canonical_committed_state(
     root_authentication_key: RootAuthenticationKey,
     policy: RecoveryPolicy,
 ) -> Result<(FileSystemState, RootCommitRecord)> {
-    let (mut state, mut root) = load_canonical_committed_state(runtime, root_authentication_key)?;
+    recover_canonical_committed_state_for_dataset(
+        runtime,
+        tidefs_pool_runtime::ROOT_DATASET_ID,
+        root_authentication_key,
+        policy,
+    )
+}
+
+pub(crate) fn recover_canonical_committed_state_for_dataset(
+    runtime: &mut PoolRuntime,
+    dataset_id: DatasetId,
+    root_authentication_key: RootAuthenticationKey,
+    policy: RecoveryPolicy,
+) -> Result<(FileSystemState, RootCommitRecord)> {
+    let (mut state, mut root) =
+        load_canonical_committed_state_for_dataset(runtime, dataset_id, root_authentication_key)?;
     if !policy.allows_replay() {
         return Ok((state, root));
     }
     let committed_base = IntentLogRootAnchor::from_committed_root_summary(&root.summary());
-    let mut log = IntentLog::load(runtime.pool().raw_primary_store())?;
+    let mut log = IntentLog::load_for_dataset(runtime.pool().raw_primary_store(), dataset_id)?;
     if intent_log_requires_commit_after(&log, &committed_base) {
         check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
         let count =
@@ -481,6 +516,41 @@ pub(crate) fn recovery_probe_pool(
     recovery_probe_source(pool, root_authentication_key)
 }
 
+/// Validate the one canonical typed root that owns a named filesystem.
+///
+/// Named filesystems are not published through the root filesystem's slot
+/// ring. Treating that ring as their recovery history can return a healthy
+/// root report for the wrong filesystem, so the canonical Pool root is the
+/// only candidate admitted here.
+pub(crate) fn recovery_probe_canonical_dataset(
+    runtime: &mut PoolRuntime,
+    dataset_id: DatasetId,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<RecoveryProbeReport> {
+    let (state, root) =
+        load_canonical_committed_state_for_dataset(runtime, dataset_id, root_authentication_key)?;
+    let mut report = RecoveryProbeReport::empty_with_replay_tail(
+        runtime
+            .pool()
+            .raw_primary_store()
+            .replay_report()
+            .repaired_tail_bytes,
+    );
+    // This report has one canonical publication candidate rather than a slot
+    // ring. Keep the existing counters truthful by reporting only that one
+    // selected candidate.
+    report.root_slot_count = 1;
+    report.root_slot_records_seen = 1;
+    report.root_slot_candidates_seen = 1;
+    report.valid_committed_roots_seen = 1;
+    report.selected_slot = Some(root.slot);
+    report.selected_transaction_id = Some(root.transaction_id);
+    report.selected_generation = Some(root.generation);
+    report.selected_inode_count = Some(state.inodes.len() as u64);
+    report.outcome = RecoveryProbeOutcome::SelectedCommittedRoot;
+    Ok(report)
+}
+
 fn recovery_probe_source<S: CommittedRootRecoverySource>(
     source: &mut S,
     root_authentication_key: RootAuthenticationKey,
@@ -500,6 +570,24 @@ pub(crate) fn audit_recovery_pool(
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RecoveryAuditReport> {
     Ok(audit_recovery_source_details(pool, root_authentication_key)?.report)
+}
+
+pub(crate) fn audit_recovery_canonical_dataset(
+    runtime: &mut PoolRuntime,
+    dataset_id: DatasetId,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<RecoveryAuditReport> {
+    let (_state, root) =
+        load_canonical_committed_state_for_dataset(runtime, dataset_id, root_authentication_key)?;
+    let summary = root.summary();
+    let mut report = RecoveryAuditReport::empty();
+    report.root_slots_seen = 1;
+    report.root_candidates_seen = 1;
+    report.checked_transaction_manifests = u64::from(root.has_manifest());
+    report.valid_committed_roots.push(summary.clone());
+    report.selected_root = Some(summary);
+    report.outcome = RecoveryAuditOutcome::SelectedCommittedRoot;
+    Ok(report)
 }
 
 fn audit_recovery_source_details<S: CommittedRootRecoverySource>(
@@ -581,6 +669,59 @@ pub(crate) fn verify_online_pool(
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<OnlineVerifierReport> {
     verify_online_source(pool, root_authentication_key)
+}
+
+pub(crate) fn verify_online_canonical_dataset(
+    runtime: &mut PoolRuntime,
+    dataset_id: DatasetId,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<OnlineVerifierReport> {
+    let (state, root) =
+        load_canonical_committed_state_for_dataset(runtime, dataset_id, root_authentication_key)?;
+    if !root.has_manifest() {
+        return Err(FileSystemError::CorruptState {
+            reason: "online verifier requires a manifest-backed canonical dataset root",
+        });
+    }
+    if root.root_authentication.is_none() {
+        return Err(FileSystemError::CorruptState {
+            reason: "online verifier requires an authenticated canonical dataset root",
+        });
+    }
+
+    let mount_invariant = mount_invariant_report_from_state(&state)?;
+    let (checked_content_objects, checked_content_chunks) =
+        online_verifier_content_counts_pool_for_dataset(runtime.pool(), &state, dataset_id)?;
+    let verified_snapshot_roots = online_verifier_snapshot_roots_pool_for_dataset(
+        runtime.pool(),
+        &root,
+        &state,
+        dataset_id,
+        root_authentication_key,
+    )?;
+    let root_report = OnlineVerifierRootReport {
+        root: root.summary(),
+        mount_invariant,
+        snapshot_catalog_entries: state.snapshots.len(),
+        verified_snapshot_roots,
+        checked_manifest_entries: root.manifest_entry_count,
+        checked_content_objects,
+        checked_content_chunks,
+    };
+
+    let mut report = OnlineVerifierReport::empty();
+    report.root_slot_count = 1;
+    report.root_slots_seen = 1;
+    report.root_slot_records_seen = 1;
+    report.root_candidates_seen = 1;
+    report.checked_transaction_manifests = 1;
+    report.checked_content_objects = checked_content_objects;
+    report.checked_content_chunks = checked_content_chunks;
+    report.verified_snapshot_roots = verified_snapshot_roots;
+    report.selected_root = Some(root_report.root.clone());
+    report.verified_committed_roots.push(root_report);
+    report.outcome = OnlineVerifierOutcome::Clean;
+    Ok(report)
 }
 
 fn verify_online_source<S: CommittedRootRecoverySource>(
@@ -802,7 +943,19 @@ pub fn online_verifier_content_counts(
 }
 
 fn online_verifier_content_counts_pool(pool: &Pool, state: &FileSystemState) -> Result<(u64, u64)> {
-    let reader = MountedContentReadAuthority::new(pool);
+    online_verifier_content_counts_pool_for_dataset(
+        pool,
+        state,
+        tidefs_pool_runtime::ROOT_DATASET_ID,
+    )
+}
+
+fn online_verifier_content_counts_pool_for_dataset(
+    pool: &Pool,
+    state: &FileSystemState,
+    dataset_id: DatasetId,
+) -> Result<(u64, u64)> {
+    let reader = MountedContentReadAuthority::for_dataset(pool, dataset_id);
     let mut checked_content_objects = 0_u64;
     let mut checked_content_chunks = 0_u64;
     for inode in state.inodes.values() {
@@ -822,6 +975,36 @@ fn online_verifier_content_counts_pool(pool: &Pool, state: &FileSystemState) -> 
         }
     }
     Ok((checked_content_objects, checked_content_chunks))
+}
+
+fn online_verifier_snapshot_roots_pool_for_dataset(
+    pool: &Pool,
+    current_root: &RootCommitRecord,
+    state: &FileSystemState,
+    dataset_id: DatasetId,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<u64> {
+    let mut verified = 0_u64;
+    for snapshot in state.snapshots.values() {
+        if !crate::snapshot::snapshot_record_retains_data(snapshot) {
+            continue;
+        }
+        if snapshot.root.transaction_id >= current_root.transaction_id {
+            return Err(FileSystemError::CorruptState {
+                reason:
+                    "online verifier found a snapshot root at or after the canonical dataset root",
+            });
+        }
+        let root = root_commit_from_summary(&snapshot.root);
+        let _state = load_state_from_transaction_pool_for_dataset(
+            pool,
+            dataset_id,
+            &root,
+            root_authentication_key,
+        )?;
+        verified = verified.saturating_add(1);
+    }
+    Ok(verified)
 }
 
 pub fn inspect_filesystem_content_objects_store(
@@ -1105,31 +1288,48 @@ pub(crate) fn plan_root_retention_pool(
 }
 
 pub(crate) fn extend_root_retention_plan_with_canonical_roots(
-    pool: &mut Pool,
+    runtime: &mut PoolRuntime,
     mut plan: RootRetentionPlan,
-    canonical_pool_keys: &[ObjectKey],
     current_root: &CommittedRootSummary,
     state: &FileSystemState,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RootRetentionPlan> {
     let mut protected_keys: BTreeSet<ObjectKey> =
         plan.protected_object_keys.iter().copied().collect();
-    protected_keys.extend(canonical_pool_keys.iter().copied());
-    let mut canonical_roots = vec![current_root.clone()];
-    for summary in snapshot_retained_roots(state) {
+    protected_keys.extend(runtime.canonical_root_object_keys()?);
+    protected_keys.extend(canonical_filesystem_dataset_object_keys(
+        runtime,
+        root_authentication_key,
+    )?);
+
+    // The unqualified committed-root count describes the canonical root
+    // filesystem. Named filesystems are protected through their typed roots
+    // above, without mixing equal transaction summaries from different
+    // dataset keyspaces into this field. Derive the root count even when a
+    // named filesystem is the caller, so maintenance admission is independent
+    // of which canonical dataset happens to be mounted.
+    let loaded_root_state;
+    let (root_state, root_summary) = if state.dataset_id() == tidefs_pool_runtime::ROOT_DATASET_ID {
+        (state, current_root.clone())
+    } else {
+        let (loaded, root) = load_canonical_committed_state_for_dataset(
+            runtime,
+            tidefs_pool_runtime::ROOT_DATASET_ID,
+            root_authentication_key,
+        )?;
+        loaded_root_state = loaded;
+        (&loaded_root_state, root.summary())
+    };
+    let mut canonical_roots = vec![root_summary];
+    for summary in snapshot_retained_roots(root_state) {
         if !canonical_roots.contains(&summary) {
             canonical_roots.push(summary);
         }
     }
     for summary in canonical_roots {
         if !plan.protected_committed_roots.contains(&summary) {
-            plan.protected_committed_roots.push(summary.clone());
+            plan.protected_committed_roots.push(summary);
         }
-        protected_keys.extend(object_keys_for_committed_root_summary(
-            pool.raw_primary_store_mut(),
-            &summary,
-            root_authentication_key,
-        )?);
     }
     plan.retention_debt.valid_committed_roots_available = plan.protected_committed_roots.len();
     plan.retention_debt.missing_committed_roots = plan
@@ -1137,13 +1337,85 @@ pub(crate) fn extend_root_retention_plan_with_canonical_roots(
         .policy_required_committed_roots
         .saturating_sub(plan.retention_debt.valid_committed_roots_available);
     plan.protected_object_keys = protected_keys.iter().copied().collect();
-    plan.reclaimable_live_object_keys = pool
+    plan.reclaimable_live_object_keys = runtime
+        .pool()
         .raw_primary_store()
         .list_keys()
         .into_iter()
         .filter(|key| !protected_keys.contains(key))
         .collect();
     Ok(plan)
+}
+
+/// Protect the complete object graph and durable maintenance state of every
+/// live filesystem dataset selected by the canonical Pool root.
+pub(crate) fn canonical_filesystem_dataset_object_keys(
+    runtime: &mut PoolRuntime,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<BTreeSet<ObjectKey>> {
+    let filesystem_ids: Vec<DatasetId> = runtime
+        .dataset_catalog()
+        .list_all()
+        .into_iter()
+        .filter_map(
+            |(_path, dataset_id, dataset_type, _txg, _flags, lifecycle_state)| {
+                (dataset_type == DatasetType::Filesystem && lifecycle_state.to_u8() == 0)
+                    .then_some(dataset_id)
+            },
+        )
+        .collect();
+    let mut keys = BTreeSet::new();
+
+    for dataset_id in filesystem_ids {
+        let (state, root) = load_canonical_committed_state_for_dataset(
+            runtime,
+            dataset_id,
+            root_authentication_key,
+        )?;
+        let keyspace = FilesystemObjectKeyspace::new(dataset_id);
+        let mut roots = vec![root.summary()];
+        for summary in snapshot_retained_roots(&state) {
+            if !roots.contains(&summary) {
+                roots.push(summary);
+            }
+        }
+        for summary in roots {
+            keys.extend(object_keys_for_committed_root_summary_in_keyspace(
+                runtime.pool_mut().raw_primary_store_mut(),
+                &summary,
+                root_authentication_key,
+                keyspace,
+            )?);
+        }
+
+        keys.insert(keyspace.scope(ObjectKey::from_name(
+            FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME.as_bytes(),
+        )));
+        keys.insert(keyspace.scope(crate::quota::quota_table_object_key()));
+        keys.insert(keyspace.space_counters());
+        keys.insert(keyspace.orphan_index());
+
+        let feature_roots_key = keyspace.feature_flags_roots();
+        keys.insert(feature_roots_key);
+        if let Some(bytes) = runtime.pool().raw_primary_store().get(feature_roots_key)? {
+            let roots =
+                tidefs_types_dataset_feature_flags_core::DatasetFeatureFlagsV1::decode(&bytes)
+                    .map_err(|_| FileSystemError::CorruptState {
+                        reason: "filesystem feature-root pointer failed retention decode",
+                    })?;
+            for root in [roots.compat_root, roots.ro_compat_root, roots.incompat_root] {
+                if let Some(root) = root.required() {
+                    keys.insert(ObjectKey::from_bytes32(root.as_bytes()));
+                }
+            }
+        }
+
+        let intent_log =
+            IntentLog::load_for_dataset(runtime.pool().raw_primary_store(), dataset_id)?;
+        keys.extend(intent_log.durable_object_keys());
+    }
+
+    Ok(keys)
 }
 
 fn plan_root_retention_source<S: CommittedRootRecoverySource>(
@@ -1426,6 +1698,7 @@ pub(crate) fn reclaim_protected_content_keys_pool(
     current_root: &CommittedRootSummary,
     state: &FileSystemState,
 ) -> Result<BTreeSet<ObjectKey>> {
+    let keyspace = FilesystemObjectKeyspace::new(state.dataset_id());
     let RecoveryAuditDetails {
         validated_roots: protected_roots,
         ..
@@ -1443,10 +1716,11 @@ pub(crate) fn reclaim_protected_content_keys_pool(
             true,
         )?);
     }
-    protected_keys.extend(object_keys_for_committed_root_summary(
+    protected_keys.extend(object_keys_for_committed_root_summary_in_keyspace(
         pool.raw_primary_store_mut(),
         current_root,
         root_authentication_key,
+        keyspace,
     )?);
     protected_keys.extend(snapshot_protected_content_keys_pool(
         pool,
@@ -1465,12 +1739,14 @@ fn snapshot_protected_content_keys_pool(
     root_authentication_key: RootAuthenticationKey,
     state: &FileSystemState,
 ) -> Result<BTreeSet<ObjectKey>> {
+    let keyspace = FilesystemObjectKeyspace::new(state.dataset_id());
     let mut keys = BTreeSet::new();
     for summary in snapshot_retained_roots(state) {
-        keys.extend(object_keys_for_committed_root_summary(
+        keys.extend(object_keys_for_committed_root_summary_in_keyspace(
             pool.raw_primary_store_mut(),
             &summary,
             root_authentication_key,
+            keyspace,
         )?);
     }
     Ok(keys)
@@ -1481,13 +1757,27 @@ pub(crate) fn object_keys_for_committed_root_summary(
     summary: &CommittedRootSummary,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<BTreeSet<ObjectKey>> {
+    object_keys_for_committed_root_summary_in_keyspace(
+        store,
+        summary,
+        root_authentication_key,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+fn object_keys_for_committed_root_summary_in_keyspace(
+    store: &mut LocalObjectStore,
+    summary: &CommittedRootSummary,
+    root_authentication_key: RootAuthenticationKey,
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<BTreeSet<ObjectKey>> {
     let root = root_commit_from_summary(summary);
     let mut keys = BTreeSet::new();
-    keys.insert(root_slot_object_key(root.slot));
-    keys.insert(transaction_superblock_object_key(root.transaction_id));
+    keys.insert(keyspace.root_slot(root.slot));
+    keys.insert(keyspace.transaction_superblock(root.transaction_id));
 
     if root.has_manifest() {
-        let manifest_key = transaction_manifest_object_key(root.transaction_id);
+        let manifest_key = keyspace.transaction_manifest(root.transaction_id);
         keys.insert(manifest_key);
         let manifest_bytes = store
             .get(manifest_key)?
@@ -1523,7 +1813,17 @@ pub(crate) fn object_keys_for_committed_root_summary(
             if let Ok(Some(chunk_bytes)) = store.get(entry.object_key) {
                 if is_dedup_redirect(&chunk_bytes) {
                     if let Ok(canonical_key) = decode_dedup_redirect(&chunk_bytes) {
-                        keys.insert(canonical_key);
+                        let physical_canonical_key = keyspace.scope(canonical_key);
+                        keys.insert(physical_canonical_key);
+                        if let Ok(Some(canonical_bytes)) = store.get(physical_canonical_key) {
+                            if let Ok(canonical_chunk) = decode_content_chunk(&canonical_bytes) {
+                                let fingerprint =
+                                    compute_content_fingerprint(&canonical_chunk.bytes);
+                                if content_dedup_object_key(&fingerprint) == canonical_key {
+                                    keys.insert(keyspace.content_dedup_refcount(&fingerprint));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1531,20 +1831,20 @@ pub(crate) fn object_keys_for_committed_root_summary(
         return Ok(keys);
     }
 
-    let state = load_state_from_transaction(store, &root, root_authentication_key)?;
+    let state = load_state_from_transaction_with_manifest_validation_in_keyspace(
+        store,
+        &root,
+        root_authentication_key,
+        true,
+        keyspace,
+    )?;
     for inode in state.inodes.values() {
-        keys.insert(transaction_inode_object_key(
-            root.transaction_id,
-            inode.inode_id,
-        ));
+        keys.insert(keyspace.transaction_inode(root.transaction_id, inode.inode_id));
         if inode.carries_child_namespace() {
-            keys.insert(transaction_directory_object_key(
-                root.transaction_id,
-                inode.inode_id,
-            ));
+            keys.insert(keyspace.transaction_directory(root.transaction_id, inode.inode_id));
         }
         if inode.is_file_like() {
-            let key = content_object_key_for_version(inode.inode_id, inode.data_version);
+            let key = keyspace.content(inode.inode_id, inode.data_version);
             if inode.size > 0 || store.contains_key(key) {
                 keys.insert(key);
             }
@@ -1629,8 +1929,12 @@ pub(crate) fn allocator_report_for_state_pool(
     let mut protected_entries = BTreeMap::new();
     for summary in &protected_roots {
         let root = root_commit_from_summary(summary);
-        let committed_state =
-            load_state_from_transaction_pool(pool, &root, root_authentication_key)?;
+        let committed_state = load_state_from_transaction_pool_for_dataset(
+            pool,
+            state.dataset_id(),
+            &root,
+            root_authentication_key,
+        )?;
         merge_allocation_entries(
             &mut protected_entries,
             content_allocation_entries_for_state_pool(pool, &committed_state)?,
@@ -1692,8 +1996,12 @@ pub(crate) fn protected_committed_content_entries_pool(
     let mut entries = BTreeMap::new();
     for summary in &protected_roots {
         let root = root_commit_from_summary(summary);
-        let committed_state =
-            load_state_from_transaction_pool(pool, &root, root_authentication_key)?;
+        let committed_state = load_state_from_transaction_pool_for_dataset(
+            pool,
+            state.dataset_id(),
+            &root,
+            root_authentication_key,
+        )?;
         merge_allocation_entries(
             &mut entries,
             content_allocation_entries_for_state_pool(pool, &committed_state)?,
@@ -1960,23 +2268,40 @@ pub(crate) fn load_state_from_transaction_pool(
     root: &RootCommitRecord,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<FileSystemState> {
-    let state = load_state_from_transaction_for_content_inspection(
+    load_state_from_transaction_pool_for_dataset(
+        pool,
+        tidefs_pool_runtime::ROOT_DATASET_ID,
+        root,
+        root_authentication_key,
+    )
+}
+
+pub(crate) fn load_state_from_transaction_pool_for_dataset(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<FileSystemState> {
+    let keyspace = FilesystemObjectKeyspace::new(dataset_id);
+    let mut state = load_state_from_transaction_for_content_inspection_in_keyspace(
         pool.raw_primary_store(),
         root,
         root_authentication_key,
+        keyspace,
     )?;
     let superblock_bytes = pool
         .raw_primary_store()
-        .get(transaction_superblock_object_key(root.transaction_id))?
+        .get(keyspace.transaction_superblock(root.transaction_id))?
         .ok_or(FileSystemError::CorruptState {
             reason: "root commit references a missing transaction superblock",
         })?;
     let root_authentication = validate_root_authentication_record(root, root_authentication_key)?;
-    let manifest = validate_root_transaction_manifest(
+    let manifest = validate_root_transaction_manifest_in_keyspace(
         pool.raw_primary_store(),
         root,
         &superblock_bytes,
         &root_authentication,
+        keyspace,
     )?;
     validate_transaction_manifest_matches_loaded_state_pool(
         pool,
@@ -1985,7 +2310,9 @@ pub(crate) fn load_state_from_transaction_pool(
         &manifest,
         &superblock_bytes,
         None,
+        keyspace,
     )?;
+    state.set_inode_authority_dataset_id(*dataset_id.as_bytes());
     Ok(state)
 }
 
@@ -2159,6 +2486,7 @@ fn load_state_from_transaction_store_candidate(
         true,
         Some(&candidate.manifest.entries),
         Some(&candidate.objects),
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
     )?;
     validate_transaction_manifest_matches_loaded_state_with_content(
         store,
@@ -2168,6 +2496,7 @@ fn load_state_from_transaction_store_candidate(
         &candidate.superblock_bytes,
         Some(&candidate.objects),
         |inode| transaction_manifest_entries_for_existing_content(store, inode),
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
     )?;
     Ok(state)
 }
@@ -2191,6 +2520,7 @@ fn load_state_from_transaction_pool_candidate(
         root.transaction_id,
         &candidate.manifest.entries,
         Some(&candidate.objects),
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
     )?;
     validate_transaction_manifest_matches_loaded_state_pool(
         pool,
@@ -2199,6 +2529,7 @@ fn load_state_from_transaction_pool_candidate(
         &candidate.manifest,
         &candidate.superblock_bytes,
         Some(&candidate.objects),
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
     )?;
     Ok(state)
 }
@@ -2208,11 +2539,26 @@ fn load_state_from_transaction_for_content_inspection(
     root: &RootCommitRecord,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<FileSystemState> {
-    load_state_from_transaction_with_manifest_validation(
+    load_state_from_transaction_for_content_inspection_in_keyspace(
+        store,
+        root,
+        root_authentication_key,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+fn load_state_from_transaction_for_content_inspection_in_keyspace(
+    store: &LocalObjectStore,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<FileSystemState> {
+    load_state_from_transaction_with_manifest_validation_in_keyspace(
         store,
         root,
         root_authentication_key,
         false,
+        keyspace,
     )
 }
 
@@ -2222,8 +2568,24 @@ fn load_state_from_transaction_with_manifest_validation(
     root_authentication_key: RootAuthenticationKey,
     validate_manifest_against_loaded_state: bool,
 ) -> Result<FileSystemState> {
+    load_state_from_transaction_with_manifest_validation_in_keyspace(
+        store,
+        root,
+        root_authentication_key,
+        validate_manifest_against_loaded_state,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+fn load_state_from_transaction_with_manifest_validation_in_keyspace(
+    store: &LocalObjectStore,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    validate_manifest_against_loaded_state: bool,
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<FileSystemState> {
     let superblock_bytes = store
-        .get(transaction_superblock_object_key(root.transaction_id))?
+        .get(keyspace.transaction_superblock(root.transaction_id))?
         .ok_or(FileSystemError::CorruptState {
             reason: "root commit references a missing transaction superblock",
         })?;
@@ -2242,11 +2604,12 @@ fn load_state_from_transaction_with_manifest_validation(
         });
     }
     let manifest = if root.has_manifest() {
-        Some(validate_root_transaction_manifest(
+        Some(validate_root_transaction_manifest_in_keyspace(
             store,
             root,
             &superblock_bytes,
             &root_authentication,
+            keyspace,
         )?)
     } else {
         if !root_authentication.manifest_digest.is_zero() {
@@ -2276,6 +2639,7 @@ fn load_state_from_transaction_with_manifest_validation(
                 .as_ref()
                 .map(|manifest| manifest.entries.as_slice()),
             None,
+            keyspace,
         )?
     } else {
         let manifest = manifest.as_ref().ok_or(FileSystemError::CorruptState {
@@ -2287,16 +2651,18 @@ fn load_state_from_transaction_with_manifest_validation(
             root.transaction_id,
             &manifest.entries,
             None,
+            keyspace,
         )?
     };
     if validate_manifest_against_loaded_state {
         if let Some(manifest) = manifest {
-            validate_transaction_manifest_matches_loaded_state(
+            validate_transaction_manifest_matches_loaded_state_in_keyspace(
                 store,
                 root,
                 &state,
                 &manifest,
                 &superblock_bytes,
+                keyspace,
             )?;
         }
     }
@@ -2309,8 +2675,24 @@ pub(crate) fn validate_root_transaction_manifest(
     _superblock_bytes: &[u8],
     root_authentication: &RootAuthenticationRecord,
 ) -> Result<TransactionManifestRecord> {
+    validate_root_transaction_manifest_in_keyspace(
+        store,
+        root,
+        _superblock_bytes,
+        root_authentication,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+fn validate_root_transaction_manifest_in_keyspace(
+    store: &LocalObjectStore,
+    root: &RootCommitRecord,
+    _superblock_bytes: &[u8],
+    root_authentication: &RootAuthenticationRecord,
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<TransactionManifestRecord> {
     let manifest_bytes = store
-        .get(transaction_manifest_object_key(root.transaction_id))?
+        .get(keyspace.transaction_manifest(root.transaction_id))?
         .ok_or(FileSystemError::CorruptState {
             reason: "root commit references a missing transaction manifest",
         })?;
@@ -2362,6 +2744,24 @@ pub(crate) fn validate_transaction_manifest_matches_loaded_state(
     manifest: &TransactionManifestRecord,
     superblock_bytes: &[u8],
 ) -> Result<()> {
+    validate_transaction_manifest_matches_loaded_state_in_keyspace(
+        store,
+        root,
+        state,
+        manifest,
+        superblock_bytes,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+fn validate_transaction_manifest_matches_loaded_state_in_keyspace(
+    store: &LocalObjectStore,
+    root: &RootCommitRecord,
+    state: &FileSystemState,
+    manifest: &TransactionManifestRecord,
+    superblock_bytes: &[u8],
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<()> {
     validate_transaction_manifest_matches_loaded_state_with_content(
         store,
         root,
@@ -2370,6 +2770,7 @@ pub(crate) fn validate_transaction_manifest_matches_loaded_state(
         superblock_bytes,
         None,
         |inode| transaction_manifest_entries_for_existing_content(store, inode),
+        keyspace,
     )
 }
 
@@ -2380,6 +2781,7 @@ fn validate_transaction_manifest_matches_loaded_state_pool(
     manifest: &TransactionManifestRecord,
     superblock_bytes: &[u8],
     candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<()> {
     validate_transaction_manifest_matches_loaded_state_with_content(
         pool.raw_primary_store(),
@@ -2388,7 +2790,8 @@ fn validate_transaction_manifest_matches_loaded_state_pool(
         manifest,
         superblock_bytes,
         candidate_objects,
-        |inode| transaction_manifest_entries_for_pool_content(pool, inode),
+        |inode| transaction_manifest_entries_for_pool_content_in_keyspace(pool, inode, keyspace),
+        keyspace,
     )
 }
 
@@ -2400,6 +2803,7 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
     superblock_bytes: &[u8],
     candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
     mut content_entries: impl FnMut(&InodeRecord) -> Result<Vec<TransactionManifestEntry>>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<()> {
     let (manifest_inode_keys, manifest_directory_keys) =
         manifest_transaction_object_key_maps(store, &manifest.entries, candidate_objects)?;
@@ -2479,14 +2883,13 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
     }
     expected.push(TransactionManifestEntry {
         role: TransactionManifestObjectRole::TransactionSuperblock,
-        object_key: transaction_superblock_object_key(root.transaction_id),
+        object_key: keyspace.transaction_superblock(root.transaction_id),
         checksum: checksum64(superblock_bytes),
     });
 
     // v3+: snapshot catalog entries
     for snapshot in state.snapshots.values() {
-        let snap_key =
-            transaction_snapshot_catalog_entry_object_key(root.transaction_id, &snapshot.name);
+        let snap_key = keyspace.transaction_snapshot(root.transaction_id, &snapshot.name);
         let snap_bytes = recovery_object_bytes(store, candidate_objects, snap_key)?.ok_or(
             FileSystemError::CorruptState {
                 reason: "transaction manifest validation expected a missing snapshot catalog entry",
@@ -2514,10 +2917,11 @@ fn find_inode_key(
     store: &LocalObjectStore,
     transaction_id: u64,
     inode_id: InodeId,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Option<ObjectKey> {
     let mut tx = transaction_id;
     while tx >= ROOT_COMMIT_MIN_TRANSACTION_ID {
-        let key = transaction_inode_object_key(tx, inode_id);
+        let key = keyspace.transaction_inode(tx, inode_id);
         if store.get(key).ok()?.is_some() {
             return Some(key);
         }
@@ -2535,10 +2939,11 @@ fn find_directory_key(
     store: &LocalObjectStore,
     transaction_id: u64,
     inode_id: InodeId,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Option<ObjectKey> {
     let mut tx = transaction_id;
     while tx >= ROOT_COMMIT_MIN_TRANSACTION_ID {
-        let key = transaction_directory_object_key(tx, inode_id);
+        let key = keyspace.transaction_directory(tx, inode_id);
         if store.get(key).ok()?.is_some() {
             return Some(key);
         }
@@ -2637,6 +3042,7 @@ fn load_state_from_superblock_for_content_inspection(
     transaction_id: u64,
     manifest_entries: &[TransactionManifestEntry],
     candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<FileSystemState> {
     load_state_from_superblock_with_content_validation(
         store,
@@ -2645,6 +3051,7 @@ fn load_state_from_superblock_for_content_inspection(
         false,
         Some(manifest_entries),
         candidate_objects,
+        keyspace,
     )
 }
 
@@ -2655,6 +3062,7 @@ fn load_state_from_superblock_with_content_validation(
     validate_file_content: bool,
     manifest_entries: Option<&[TransactionManifestEntry]>,
     candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<FileSystemState> {
     let (manifest_inode_keys, manifest_directory_keys) = manifest_entries
         .map(|entries| manifest_transaction_object_key_maps(store, entries, candidate_objects))
@@ -2677,9 +3085,9 @@ fn load_state_from_superblock_with_content_validation(
                     reason: "superblock references an inode id not present in the manifest",
                 })?,
                 None => match transaction_id {
-                    Some(tx) => find_inode_key(store, tx, inode_id)
-                        .unwrap_or_else(|| inode_object_key(inode_id)),
-                    None => inode_object_key(inode_id),
+                    Some(tx) => find_inode_key(store, tx, inode_id, keyspace)
+                        .unwrap_or_else(|| keyspace.inode(inode_id)),
+                    None => keyspace.inode(inode_id),
                 },
             };
             let bytes = recovery_object_bytes(store, candidate_objects, inode_key)?.ok_or(
@@ -2699,9 +3107,9 @@ fn load_state_from_superblock_with_content_validation(
                         reason: "directory inode id is not present in the manifest",
                     })?,
                     None => match transaction_id {
-                        Some(tx) => find_directory_key(store, tx, inode_id)
-                            .unwrap_or_else(|| directory_object_key(inode_id)),
-                        None => directory_object_key(inode_id),
+                        Some(tx) => find_directory_key(store, tx, inode_id, keyspace)
+                            .unwrap_or_else(|| keyspace.directory(inode_id)),
+                        None => keyspace.directory(inode_id),
                     },
                 };
                 let dir_bytes = recovery_object_bytes(store, candidate_objects, dir_key)?.ok_or(
@@ -2727,7 +3135,7 @@ fn load_state_from_superblock_with_content_validation(
     if manifest_entries.is_none() {
         if let Some(cg_id) = transaction_id {
             // Load current snapshot records from transaction manifest entries.
-            let manifest_key = transaction_manifest_object_key(cg_id);
+            let manifest_key = keyspace.transaction_manifest(cg_id);
             if let Some(manifest_bytes) = store.get(manifest_key)? {
                 let manifest = decode_transaction_manifest(&manifest_bytes)?;
                 for entry in manifest.entries {
@@ -2986,7 +3394,13 @@ fn load_incremental_inode(request: IncrementalInodeLoad<'_>) -> Result<()> {
             reason: "superblock references an inode id not present in the manifest",
         })?
     } else {
-        find_inode_key(store, transaction_id, inode_id).ok_or(FileSystemError::CorruptState {
+        find_inode_key(
+            store,
+            transaction_id,
+            inode_id,
+            FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+        )
+        .ok_or(FileSystemError::CorruptState {
             reason: "superblock references a missing inode object",
         })?
     };
@@ -3005,11 +3419,15 @@ fn load_incremental_inode(request: IncrementalInodeLoad<'_>) -> Result<()> {
                 reason: "directory inode id is not present in the manifest",
             })?
         } else {
-            find_directory_key(store, transaction_id, inode_id).ok_or(
-                FileSystemError::CorruptState {
-                    reason: "directory inode is missing its directory object",
-                },
-            )?
+            find_directory_key(
+                store,
+                transaction_id,
+                inode_id,
+                FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+            )
+            .ok_or(FileSystemError::CorruptState {
+                reason: "directory inode is missing its directory object",
+            })?
         };
         let dir_bytes = store.get(dir_key)?.ok_or(FileSystemError::CorruptState {
             reason: "directory inode is missing its directory object",

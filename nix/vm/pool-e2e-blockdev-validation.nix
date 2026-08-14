@@ -1,8 +1,8 @@
 # TideFS: pool end-to-end block-device validation (#6102).
 #
 # Boots a Linux 7.0 QEMU guest with two raw virtio-blk disks and exercises:
-# pool create -> import -> status -> dataset -> mount -> file I/O ->
-# unmount -> export -> re-import -> re-mount -> persistence.
+# pool create -> first root mount -> dataset -> owner-creating mount/import ->
+# status -> file I/O -> unmount/export -> owner-creating re-mount/import -> persistence.
 #
 # Validation tier: QEMU guest.
 {
@@ -33,9 +33,9 @@ let
 Usage: tidefs-pool-e2e-blockdev-validation [--timeout SECONDS] [--disk-size-mb MB] [--keep-tmp]
 
 Full operator flow on two virtio-blk disks in a Linux 7.0 QEMU guest:
-  pool create -> import -> status -> dataset create/list ->
-  FUSE mount -> file write/fsync/read/rename/delete ->
-  unmount -> export -> re-import -> re-mount -> persistence.
+  pool create -> first root mount -> dataset create/list ->
+  owner-creating FUSE mount/import -> status -> file write/fsync/read/rename/delete ->
+  unmount/export -> owner-creating re-mount/import -> persistence.
 
 Options:
   --timeout SECONDS  QEMU boot timeout (default: $TIMEOUT_SEC)
@@ -198,10 +198,12 @@ done
 [ -b "$DEV1" ] && pass "virtio1_present" || fail "virtio1_present" "$DEV1 missing"
 
 if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
-    for op in virtio0_size virtio1_size pool_create pool_import pool_status \
+    for op in virtio0_size virtio1_size pool_create root_bootstrap pool_import pool_status \
              dataset_create dataset_list pool_mount file_write file_fsync \
-             file_read file_rename file_delete unmount pool_export reimport \
-             remount file_persist dataset_persist sync_done; do
+             file_read named_file_write named_file_fsync file_rename file_delete \
+             unmount pool_export reimport \
+             root_mount root_isolation root_unmount remount file_persist \
+             dataset_persist sync_done; do
         blocked "$op" "virtio block devices missing"
     done
     echo "PASSED=$PASSED FAILED=$FAILED BLOCKED=$BLOCKED"
@@ -241,76 +243,119 @@ else
 fi
 
 echo ""
-echo "--- Phase 4: Pool import/status ---"
+echo "--- Phase 4: Initialize the default root through its mount carrier ---"
 
-IMPORT_OK=0
-if [ "$POOL_CREATED" -eq 1 ]; then
-    IOUT=$(tidefsctl pool import "$DEV0" "$DEV1" --json 2>&1); RC=$?
-    echo "  import exit=$RC"
-    echo "  $IOUT"
-    if [ "$RC" -eq 0 ]; then
-        pass "pool_import"
-        IMPORT_OK=1
-        rm -f /run/tidefs/import/* 2>/dev/null || true
-        [ -z "$POOL_UUID" ] && POOL_UUID=$(echo "$IOUT" | grep -o '"pool_uuid"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/' || echo "")
+MNT=/mnt/tidefs
+ROOT_BOOTSTRAP_OK=0
+ROOT_BOOTSTRAP_PID=""
+if [ "$POOL_CREATED" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
+    tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV0" "$DEV1" > /tmp/root-bootstrap.log 2>&1 &
+    ROOT_BOOTSTRAP_PID=$!
+    ROOT_BOOTSTRAP_MOUNTED=0
+    for _ in $(seq 1 45); do
+        mountpoint -q "$MNT" 2>/dev/null && { ROOT_BOOTSTRAP_MOUNTED=1; break; }
+        ! kill -0 "$ROOT_BOOTSTRAP_PID" 2>/dev/null && break
+        sleep 1
+    done
+    if [ "$ROOT_BOOTSTRAP_MOUNTED" -eq 1 ]; then
+        kill "$ROOT_BOOTSTRAP_PID" 2>/dev/null || true
+        if wait "$ROOT_BOOTSTRAP_PID"; then
+            ROOT_BOOTSTRAP_RC=0
+        else
+            ROOT_BOOTSTRAP_RC=$?
+        fi
+        umount "$MNT" 2>/dev/null || true
+        if [ "$ROOT_BOOTSTRAP_RC" -eq 0 ] \
+            && ! mountpoint -q "$MNT" 2>/dev/null \
+            && grep -q 'pool ".*" imported' /tmp/root-bootstrap.log; then
+            pass "root_bootstrap"
+            ROOT_BOOTSTRAP_OK=1
+        else
+            fail "root_bootstrap" "owner_exit=$ROOT_BOOTSTRAP_RC mounted=$(mountpoint -q "$MNT" 2>/dev/null && echo yes || echo no): $(tail -20 /tmp/root-bootstrap.log 2>/dev/null)"
+        fi
     else
-        fail "pool_import" "$IOUT"
+        fail "root_bootstrap" "$(tail -20 /tmp/root-bootstrap.log 2>/dev/null)"
+        kill "$ROOT_BOOTSTRAP_PID" 2>/dev/null || true
+        wait "$ROOT_BOOTSTRAP_PID" 2>/dev/null || true
     fi
 else
-    blocked "pool_import" "pool not created"
-fi
-
-if [ "$IMPORT_OK" -eq 1 ]; then
-    SOUT=$(tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" 2>&1); RC=$?
-    echo "  status exit=$RC"
-    [ "$RC" -eq 0 ] && pass "pool_status" || fail "pool_status" "$SOUT"
-else
-    blocked "pool_status" "import not done"
+    blocked "root_bootstrap" "pool or FUSE not ready"
 fi
 
 echo ""
-echo "--- Phase 5: Dataset create/list ---"
+echo "--- Phase 5: Dataset create/list while exported ---"
 
 DS_NAME="e2e_test_ds"
-if [ "$IMPORT_OK" -eq 1 ]; then
-    DCOUT=$(tidefsctl dataset create "$DS_NAME" --pool "$POOL_NAME" --devices "$DEV0" "$DEV1" 2>&1); RC=$?
+DATASET_CREATED=0
+if [ "$ROOT_BOOTSTRAP_OK" -eq 1 ]; then
+    DCOUT=$(tidefsctl dataset create "$POOL_NAME/$DS_NAME" --type filesystem --devices "$DEV0" "$DEV1" 2>&1); RC=$?
     echo "  create exit=$RC"
     echo "  $DCOUT"
-    [ "$RC" -eq 0 ] && pass "dataset_create" || fail "dataset_create" "$DCOUT"
+    if [ "$RC" -eq 0 ]; then
+        pass "dataset_create"
+        DATASET_CREATED=1
+    else
+        fail "dataset_create" "$DCOUT"
+    fi
 
     DLOUT=$(tidefsctl dataset list --pool "$POOL_NAME" --devices "$DEV0" "$DEV1" 2>&1); RC=$?
     echo "  list exit=$RC"
     echo "  $DLOUT"
     [ "$RC" -eq 0 ] && pass "dataset_list" || fail "dataset_list" "$DLOUT"
 else
-    blocked "dataset_create" "import not done"
-    blocked "dataset_list" "import not done"
+    blocked "dataset_create" "root filesystem initialization failed"
+    blocked "dataset_list" "root filesystem initialization failed"
 fi
 
 echo ""
-echo "--- Phase 6: FUSE mount and file operations ---"
+echo "--- Phase 6: Owner-creating import, mount, status, and file operations ---"
 
-MNT=/mnt/tidefs
 MOUNTED=0
+IMPORT_OK=0
 DAEMON_PID=""
 
-if [ "$FUSE_OK" -eq 1 ] && [ "$IMPORT_OK" -eq 1 ]; then
-    tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV0" "$DEV1" > /tmp/mount.log 2>&1 &
+if [ "$FUSE_OK" -eq 1 ] && [ "$DATASET_CREATED" -eq 1 ]; then
+    tidefsctl pool mount "$POOL_NAME" "$MNT" --dataset "$DS_NAME" --devices "$DEV0" "$DEV1" > /tmp/mount.log 2>&1 &
     DAEMON_PID=$!
     echo "  daemon PID=$DAEMON_PID"
 
     for _ in $(seq 1 45); do
         mountpoint -q "$MNT" 2>/dev/null && { MOUNTED=1; break; }
+        ! kill -0 "$DAEMON_PID" 2>/dev/null && break
         sleep 1
     done
 
-    [ "$MOUNTED" -eq 1 ] && pass "pool_mount" || fail "pool_mount" "$(tail -20 /tmp/mount.log 2>/dev/null)"
+    if [ "$MOUNTED" -eq 1 ]; then
+        pass "pool_mount"
+        if grep -q 'pool ".*" imported' /tmp/mount.log; then
+            pass "pool_import"
+            IMPORT_OK=1
+        else
+            fail "pool_import" "mount did not report import ownership: $(tail -20 /tmp/mount.log 2>/dev/null)"
+        fi
+
+        if tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json \
+            > /tmp/live-status.json 2>/tmp/live-status.err \
+            && grep -q '"state"[[:space:]]*:[[:space:]]*"Active"' /tmp/live-status.json \
+            && grep -q '"source_classification"[[:space:]]*:[[:space:]]*"source:live-owner"' /tmp/live-status.json; then
+            pass "pool_status"
+        else
+            fail "pool_status" "$(cat /tmp/live-status.err /tmp/live-status.json 2>/dev/null)"
+        fi
+    else
+        fail "pool_import" "$(tail -20 /tmp/mount.log 2>/dev/null)"
+        fail "pool_mount" "$(tail -20 /tmp/mount.log 2>/dev/null)"
+        blocked "pool_status" "owner-creating mount failed"
+    fi
 else
-    blocked "pool_mount" "FUSE not ready or import not done"
+    blocked "pool_import" "FUSE or filesystem dataset not ready"
+    blocked "pool_mount" "FUSE or filesystem dataset not ready"
+    blocked "pool_status" "owner-creating mount not attempted"
 fi
 
 TF="$MNT/e2e_test.txt"
 TF2="$MNT/e2e_renamed.txt"
+PF="$MNT/named-persist.txt"
 TC="TideFS-E2E-blockdev-pool-validation-$(date +%s 2>/dev/null || echo 0)"
 
 if [ "$MOUNTED" -eq 1 ]; then
@@ -323,13 +368,18 @@ if [ "$MOUNTED" -eq 1 ]; then
     RC=$(cat "$TF" 2>/dev/null || true)
     [ "$RC" = "$TC" ] && pass "file_read" || fail "file_read" "expected '$TC' got '$RC'"
 
+    echo "$TC" > "$PF" 2>/tmp/perr
+    [ -f "$PF" ] && pass "named_file_write" || fail "named_file_write" "$(cat /tmp/perr 2>/dev/null)"
+    sync
+    [ "$(cat "$PF" 2>/dev/null || true)" = "$TC" ] && pass "named_file_fsync" || fail "named_file_fsync" "named persistence file did not sync"
+
     mv "$TF" "$TF2" 2>/tmp/rerr
     [ -f "$TF2" ] && [ ! -f "$TF" ] && pass "file_rename" || fail "file_rename" "$(cat /tmp/rerr 2>/dev/null)"
 
     rm "$TF2" 2>/tmp/derr
     [ ! -f "$TF2" ] && pass "file_delete" || fail "file_delete" "$(cat /tmp/derr 2>/dev/null)"
 else
-    for op in file_write file_fsync file_read file_rename file_delete; do
+    for op in file_write file_fsync file_read named_file_write named_file_fsync file_rename file_delete; do
         blocked "$op" "not mounted"
     done
 fi
@@ -339,67 +389,103 @@ echo "--- Phase 7: Unmount/export/reimport/remount ---"
 
 if [ "$MOUNTED" -eq 1 ]; then
     kill "$DAEMON_PID" 2>/dev/null || true
-    sleep 2
+    wait "$DAEMON_PID" 2>/dev/null || true
     umount "$MNT" 2>/dev/null || true
     mountpoint -q "$MNT" 2>/dev/null && fail "unmount" "still mounted" || pass "unmount"
 else
     blocked "unmount" "not mounted"
 fi
 
-if [ "$IMPORT_OK" -eq 1 ]; then
+ROOT_MOUNTED=0
+if [ "$FUSE_OK" -eq 1 ] && [ "$IMPORT_OK" -eq 1 ]; then
+    tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV0" "$DEV1" > /tmp/root-mount.log 2>&1 &
+    ROOT_PID=$!
+    for _ in $(seq 1 45); do
+        mountpoint -q "$MNT" 2>/dev/null && { ROOT_MOUNTED=1; break; }
+        ! kill -0 "$ROOT_PID" 2>/dev/null && break
+        sleep 1
+    done
+    [ "$ROOT_MOUNTED" -eq 1 ] && pass "root_mount" || fail "root_mount" "$(tail -20 /tmp/root-mount.log 2>/dev/null)"
+    if [ "$ROOT_MOUNTED" -eq 1 ]; then
+        [ ! -e "$PF" ] && pass "root_isolation" || fail "root_isolation" "named dataset file appeared in root filesystem"
+    else
+        blocked "root_isolation" "root mount failed"
+        kill "$ROOT_PID" 2>/dev/null || true
+        wait "$ROOT_PID" 2>/dev/null || true
+    fi
+else
+    blocked "root_mount" "FUSE not ready or import not done"
+    blocked "root_isolation" "root mount not attempted"
+fi
+
+EXPORT_OK=0
+if [ "$ROOT_MOUNTED" -eq 1 ]; then
     EOUT=$(tidefsctl pool export "$POOL_NAME" --devices "$DEV0" "$DEV1" 2>&1); RC=$?
     echo "  export exit=$RC"
-    [ "$RC" -eq 0 ] && pass "pool_export" || fail "pool_export" "$EOUT"
+    if [ "$RC" -eq 0 ]; then
+        EXPORT_OK=1
+    else
+        fail "pool_export" "$EOUT"
+        kill "$ROOT_PID" 2>/dev/null || true
+    fi
+    if wait "$ROOT_PID"; then
+        ROOT_RC=0
+    else
+        ROOT_RC=$?
+    fi
+    umount "$MNT" 2>/dev/null || true
+    if [ "$EXPORT_OK" -eq 1 ] && [ "$ROOT_RC" -eq 0 ] \
+        && ! mountpoint -q "$MNT" 2>/dev/null; then
+        pass "pool_export"
+        pass "root_unmount"
+    else
+        [ "$EXPORT_OK" -eq 1 ] && fail "pool_export" "root owner exit=$ROOT_RC mounted=$(mountpoint -q "$MNT" 2>/dev/null && echo yes || echo no)"
+        fail "root_unmount" "export_ok=$EXPORT_OK owner_exit=$ROOT_RC"
+        EXPORT_OK=0
+    fi
 else
-    blocked "pool_export" "import not done"
+    blocked "pool_export" "root owner not mounted"
+    blocked "root_unmount" "root mount not active"
 fi
 
 REIMPORT_OK=0
-if command -v tidefsctl >/dev/null 2>&1; then
-    RIOUT=$(tidefsctl pool import "$DEV0" "$DEV1" --json 2>&1); RC=$?
-    echo "  reimport exit=$RC"
-    if [ "$RC" -eq 0 ]; then
-        pass "reimport"
-        REIMPORT_OK=1
-        rm -f /run/tidefs/import/* 2>/dev/null || true
-    else
-        fail "reimport" "$RIOUT"
-    fi
-else
-    blocked "reimport" "tidefsctl missing"
-fi
-
-if [ "$REIMPORT_OK" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
-    tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV0" "$DEV1" > /tmp/remount.log 2>&1 &
+if [ "$EXPORT_OK" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
+    tidefsctl pool mount "$POOL_NAME" "$MNT" --dataset "$DS_NAME" --devices "$DEV0" "$DEV1" > /tmp/remount.log 2>&1 &
     RPID=$!
     REMOUNTED=0
     for _ in $(seq 1 45); do
         mountpoint -q "$MNT" 2>/dev/null && { REMOUNTED=1; break; }
+        ! kill -0 "$RPID" 2>/dev/null && break
         sleep 1
     done
 
     if [ "$REMOUNTED" -eq 1 ]; then
+        if grep -q 'pool ".*" imported' /tmp/remount.log; then
+            pass "reimport"
+            REIMPORT_OK=1
+        else
+            fail "reimport" "remount did not report import ownership: $(tail -20 /tmp/remount.log 2>/dev/null)"
+        fi
         pass "remount"
-        PF="$MNT/.e2e_persist"
-        PM="persist-$(date +%s 2>/dev/null || echo 0)"
-        echo "$PM" > "$PF" 2>/dev/null
-        sync
         PB=$(cat "$PF" 2>/dev/null || true)
-        [ "$PB" = "$PM" ] && pass "file_persist" || fail "file_persist" "expected '$PM' got '$PB'"
+        [ "$PB" = "$TC" ] && pass "file_persist" || fail "file_persist" "expected '$TC' got '$PB'"
 
         DLOUT2=$(tidefsctl dataset list --pool "$POOL_NAME" --devices "$DEV0" "$DEV1" 2>&1); RC=$?
         [ "$RC" -eq 0 ] && pass "dataset_persist" || fail "dataset_persist" "$DLOUT2"
 
         kill "$RPID" 2>/dev/null || true
-        sleep 1
+        wait "$RPID" 2>/dev/null || true
         umount "$MNT" 2>/dev/null || true
     else
+        fail "reimport" "$(tail -20 /tmp/remount.log 2>/dev/null)"
         fail "remount" "$(tail -20 /tmp/remount.log 2>/dev/null)"
         blocked "file_persist" "remount failed"
         blocked "dataset_persist" "remount failed"
         kill "$RPID" 2>/dev/null || true
+        wait "$RPID" 2>/dev/null || true
     fi
 else
+    blocked "reimport" "export/FUSE not ready"
     blocked "remount" "reimport/FUSE not ready"
     blocked "file_persist" "remount not done"
     blocked "dataset_persist" "remount not done"
@@ -442,6 +528,7 @@ INITSCRIPT
       -smp 2 \
       -nographic \
       -no-reboot \
+      < /dev/null \
       > "$VAL_LOG" 2>&1 || true
 
     echo "  QEMU exited ($(wc -l < "$VAL_LOG" 2>/dev/null || echo 0) log lines)"
@@ -453,9 +540,11 @@ INITSCRIPT
     for op in \
       fuse_available fuse_device \
       virtio0_present virtio1_present virtio0_size virtio1_size \
-      pool_create pool_import pool_status dataset_create dataset_list \
-      pool_mount file_write file_fsync file_read file_rename file_delete \
-      unmount pool_export reimport remount file_persist dataset_persist \
+      pool_create root_bootstrap pool_import pool_status dataset_create dataset_list \
+      pool_mount file_write file_fsync file_read named_file_write \
+      named_file_fsync file_rename file_delete \
+      unmount root_mount root_isolation root_unmount pool_export reimport \
+      remount file_persist dataset_persist \
       sync_done; do
       if grep -q "PASS: $op" "$VAL_LOG" 2>/dev/null; then
         echo "  PASS: $op"; PASSC=$((PASSC + 1))

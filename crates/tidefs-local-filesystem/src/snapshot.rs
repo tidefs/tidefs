@@ -183,38 +183,70 @@ fn snapshot_root_id_hex(root_id: &Vfssend2Id128) -> String {
     out
 }
 
+const FILESYSTEM_SNAPSHOT_DATASET_ID_DOMAIN: &[u8] =
+    b"tidefs.local-filesystem.snapshot-dataset-id.v1";
+
+#[cfg(feature = "replication-io")]
 pub(crate) fn snapshot_record_catalog_name(record: &SnapshotRecord) -> String {
-    format!("root@{}", snapshot_record_display_name(record))
+    snapshot_record_catalog_name_for_dataset(record, "root")
 }
 
+pub(crate) fn snapshot_record_catalog_name_for_dataset(
+    record: &SnapshotRecord,
+    source_dataset_path: &str,
+) -> String {
+    format!(
+        "{source_dataset_path}@{}",
+        snapshot_record_display_name(record)
+    )
+}
+
+#[cfg(any(feature = "replication-io", test))]
 pub(crate) fn snapshot_record_dataset_id(record: &SnapshotRecord) -> DatasetId {
+    snapshot_record_dataset_id_for_dataset(record, tidefs_pool_runtime::ROOT_DATASET_ID)
+}
+
+pub(crate) fn snapshot_record_dataset_id_for_dataset(
+    record: &SnapshotRecord,
+    source_dataset_id: DatasetId,
+) -> DatasetId {
     let display_name = snapshot_record_display_name(record);
     let mut id_bytes = [0u8; 16];
-    let hash = blake3::hash(display_name.as_bytes());
+    let hash = if source_dataset_id == tidefs_pool_runtime::ROOT_DATASET_ID {
+        blake3::hash(display_name.as_bytes())
+    } else {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(FILESYSTEM_SNAPSHOT_DATASET_ID_DOMAIN);
+        hasher.update(source_dataset_id.as_bytes());
+        hasher.update(display_name.as_bytes());
+        hasher.finalize()
+    };
     id_bytes.copy_from_slice(&hash.as_bytes()[..16]);
     DatasetId::from_bytes(id_bytes)
 }
 
-pub(crate) fn snapshot_record_source_reference(
+pub(crate) fn snapshot_record_source_reference_for_dataset(
     record: &SnapshotRecord,
+    source_dataset_id: DatasetId,
 ) -> tidefs_pool_runtime::DatasetRootRef {
     let bytes = crate::encoding::encode_root_commit(&crate::recovery::root_commit_from_summary(
         &record.root,
     ));
     tidefs_pool_runtime::PoolRuntime::dataset_root_reference(
-        tidefs_pool_runtime::ROOT_DATASET_ID,
+        source_dataset_id,
         tidefs_pool_runtime::DatasetRootKind::Filesystem,
         record.root.generation,
         &bytes,
     )
 }
 
-pub(crate) fn snapshot_record_typed_root(
+pub(crate) fn snapshot_record_typed_root_for_dataset(
     record: &SnapshotRecord,
+    source_dataset_id: DatasetId,
 ) -> Result<tidefs_pool_runtime::SnapshotRoot> {
     tidefs_pool_runtime::SnapshotRoot::new(
         record.created_at_generation,
-        snapshot_record_source_reference(record),
+        snapshot_record_source_reference_for_dataset(record, source_dataset_id),
     )
     .map_err(FileSystemError::from)
 }
@@ -251,12 +283,14 @@ pub(crate) fn snapshot_record_traversal_root(record: &SnapshotRecord) -> Result<
 pub(crate) fn snapshot_catalog_entry_matches(
     catalog: &DatasetCatalog,
     record: &SnapshotRecord,
+    source_dataset_path: &str,
+    source_dataset_id: DatasetId,
 ) -> bool {
     if !snapshot_record_retains_data(record) {
         return true;
     }
 
-    let catalog_name = snapshot_record_catalog_name(record);
+    let catalog_name = snapshot_record_catalog_name_for_dataset(record, source_dataset_path);
     let Ok(dataset_id) = catalog.snapshot_lookup(&catalog_name) else {
         return false;
     };
@@ -266,7 +300,7 @@ pub(crate) fn snapshot_catalog_entry_matches(
         return false;
     };
 
-    dataset_id == snapshot_record_dataset_id(record)
+    dataset_id == snapshot_record_dataset_id_for_dataset(record, source_dataset_id)
         && path == catalog_name
         && dataset_type == DatasetType::Snapshot
         && creation_txg == record.root.generation
@@ -274,20 +308,25 @@ pub(crate) fn snapshot_catalog_entry_matches(
             == snapshot_record_catalog_flags(record).contains(DatasetFlags::CLONE)
         && flags.contains(DatasetFlags::READONLY)
         && flags.contains(DatasetFlags::CHECKSUMS)
+        && catalog.lineage_parent(&path).ok().flatten() == Some(source_dataset_id)
 }
 
 pub(crate) fn reconcile_snapshot_record_catalog_entry(
     catalog: &mut DatasetCatalog,
     record: &SnapshotRecord,
+    source_dataset_path: &str,
+    source_dataset_id: DatasetId,
 ) -> Result<bool> {
     if !snapshot_record_retains_data(record) {
         return Ok(false);
     }
 
-    let catalog_name = snapshot_record_catalog_name(record);
+    let catalog_name = snapshot_record_catalog_name_for_dataset(record, source_dataset_path);
     let mut changed = false;
 
-    if catalog.contains(&catalog_name) && !snapshot_catalog_entry_matches(catalog, record) {
+    if catalog.contains(&catalog_name)
+        && !snapshot_catalog_entry_matches(catalog, record, source_dataset_path, source_dataset_id)
+    {
         catalog
             .destroy(&catalog_name)
             .map_err(|_| FileSystemError::CorruptState {
@@ -300,7 +339,7 @@ pub(crate) fn reconcile_snapshot_record_catalog_entry(
         catalog
             .create(
                 &catalog_name,
-                snapshot_record_dataset_id(record),
+                snapshot_record_dataset_id_for_dataset(record, source_dataset_id),
                 DatasetType::Snapshot,
                 record.root.generation,
                 vec![],
@@ -309,6 +348,11 @@ pub(crate) fn reconcile_snapshot_record_catalog_entry(
             )
             .map_err(|_| FileSystemError::CorruptState {
                 reason: "snapshot authority catalog entry could not be created",
+            })?;
+        catalog
+            .set_lineage_parent(&catalog_name, source_dataset_id)
+            .map_err(|_| FileSystemError::CorruptState {
+                reason: "snapshot authority lineage parent could not be recorded",
             })?;
         changed = true;
     }
@@ -319,12 +363,13 @@ pub(crate) fn reconcile_snapshot_record_catalog_entry(
 pub(crate) fn remove_snapshot_record_catalog_entry(
     catalog: &mut DatasetCatalog,
     record: &SnapshotRecord,
+    source_dataset_path: &str,
 ) -> Result<bool> {
     if !snapshot_record_retains_data(record) {
         return Ok(false);
     }
 
-    let catalog_name = snapshot_record_catalog_name(record);
+    let catalog_name = snapshot_record_catalog_name_for_dataset(record, source_dataset_path);
     if !catalog.contains(&catalog_name) {
         return Ok(false);
     }
@@ -342,6 +387,8 @@ pub(crate) fn remove_snapshot_record_catalog_entry(
 
 impl LocalFileSystem {
     pub(crate) fn ensure_snapshot_authority_consistent(&self) -> Result<()> {
+        let source_dataset_path = self.mounted_dataset_path();
+        let source_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
         let mut expected_catalog_names = Vec::new();
         let mut expected_roots = Vec::<(TraversalRoot, u32)>::new();
 
@@ -350,14 +397,22 @@ impl LocalFileSystem {
                 continue;
             }
 
-            if !snapshot_catalog_entry_matches(self.dataset_catalog(), record) {
+            if !snapshot_catalog_entry_matches(
+                self.dataset_catalog(),
+                record,
+                source_dataset_path,
+                source_dataset_id,
+            ) {
                 return Err(FileSystemError::CorruptState {
                     reason: "snapshot authority catalog entry does not match snapshot state",
                 });
             }
             self.ensure_snapshot_record_typed_root(record)?;
 
-            expected_catalog_names.push(snapshot_record_catalog_name(record));
+            expected_catalog_names.push(snapshot_record_catalog_name_for_dataset(
+                record,
+                source_dataset_path,
+            ));
             let root = snapshot_record_traversal_root(record)?;
             if let Some((_existing, count)) = expected_roots
                 .iter_mut()
@@ -370,13 +425,17 @@ impl LocalFileSystem {
         }
 
         expected_catalog_names.sort();
-        let catalog_entries = self.dataset_catalog().list_children("").map_err(|_| {
-            FileSystemError::CorruptState {
-                reason: "snapshot authority catalog could not be inspected",
-            }
-        })?;
-        for (entry_name, _dataset_id) in catalog_entries {
-            if entry_name.starts_with("root@")
+        for (entry_name, _dataset_id, dataset_type, _txg, _flags, _state) in
+            self.dataset_catalog().list_all()
+        {
+            if dataset_type == DatasetType::Snapshot
+                && self
+                    .dataset_catalog()
+                    .lineage_parent(&entry_name)
+                    .map_err(|_| FileSystemError::CorruptState {
+                        reason: "snapshot authority lineage could not be inspected",
+                    })?
+                    == Some(source_dataset_id)
                 && expected_catalog_names.binary_search(&entry_name).is_err()
             {
                 return Err(FileSystemError::CorruptState {
@@ -418,7 +477,13 @@ impl LocalFileSystem {
                 reason: "snapshot authority record does not retain data",
             });
         }
-        if !snapshot_catalog_entry_matches(self.dataset_catalog(), record) {
+        let source_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        if !snapshot_catalog_entry_matches(
+            self.dataset_catalog(),
+            record,
+            self.mounted_dataset_path(),
+            source_dataset_id,
+        ) {
             return Err(FileSystemError::CorruptState {
                 reason: "snapshot authority catalog entry does not match snapshot record",
             });
@@ -438,10 +503,14 @@ impl LocalFileSystem {
     }
 
     fn ensure_snapshot_record_typed_root(&self, record: &SnapshotRecord) -> Result<()> {
-        let expected = snapshot_record_typed_root(record)?;
+        let source_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        let expected = snapshot_record_typed_root_for_dataset(record, source_dataset_id)?;
         let stored = self
             .store
-            .load_snapshot_root(snapshot_record_dataset_id(record))?;
+            .load_snapshot_root(snapshot_record_dataset_id_for_dataset(
+                record,
+                source_dataset_id,
+            ))?;
         if stored != expected {
             return Err(FileSystemError::CorruptState {
                 reason: "snapshot authority typed root does not match snapshot record",
@@ -613,9 +682,18 @@ impl LocalFileSystem {
         self.state
             .snapshots
             .insert(clone_name_bytes, record.clone());
+        let source_dataset_path = self.mounted_dataset_path().to_string();
+        let source_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
         let authority_transition = self
             .dataset_catalog_mut()
-            .and_then(|catalog| reconcile_snapshot_record_catalog_entry(catalog, &record))
+            .and_then(|catalog| {
+                reconcile_snapshot_record_catalog_entry(
+                    catalog,
+                    &record,
+                    &source_dataset_path,
+                    source_dataset_id,
+                )
+            })
             .and_then(|_| self.pin_snapshot_record_root(&record));
         if let Err(error) = authority_transition {
             self.rollback_mutation_delta();
@@ -671,9 +749,10 @@ impl LocalFileSystem {
         self.begin_mutation("delete clone")?;
         self.bump_generation();
         self.state.snapshots.remove(&name_bytes);
-        let authority_transition = self
-            .dataset_catalog_mut()
-            .and_then(|catalog| remove_snapshot_record_catalog_entry(catalog, &record));
+        let source_dataset_path = self.mounted_dataset_path().to_string();
+        let authority_transition = self.dataset_catalog_mut().and_then(|catalog| {
+            remove_snapshot_record_catalog_entry(catalog, &record, &source_dataset_path)
+        });
         if let Err(error) = authority_transition {
             self.rollback_mutation_delta();
             return Err(error);
@@ -754,7 +833,14 @@ impl LocalFileSystem {
         };
 
         self.state.snapshots.insert(name_bytes, promoted.clone());
-        reconcile_snapshot_record_catalog_entry(self.dataset_catalog_mut()?, &promoted)?;
+        let source_dataset_path = self.mounted_dataset_path().to_string();
+        let source_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        reconcile_snapshot_record_catalog_entry(
+            self.dataset_catalog_mut()?,
+            &promoted,
+            &source_dataset_path,
+            source_dataset_id,
+        )?;
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         // Promotion changes the typed snapshot object's kind and its catalog

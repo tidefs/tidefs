@@ -22,10 +22,11 @@ use tidefs_types_vfs_core::InodeId;
 
 use crate::checksum::{BlockChecksum, FastBlockChecksum};
 use crate::content::{
-    read_mounted_content_scrub_block, validate_content_manifest, MountedContentScrubReadTarget,
+    read_mounted_content_scrub_block_in_keyspace, validate_content_manifest,
+    MountedContentScrubReadTarget,
 };
 use crate::encoding::{decode_content_manifest, split_inline_checksum};
-use crate::object_keys::{content_chunk_object_key_for_version, content_object_key_for_version};
+use crate::object_keys::FilesystemObjectKeyspace;
 use crate::records::ContentChunkRef;
 use crate::types::{
     InodeRecord, MountedContentChecksumEvidence, MountedContentChecksumLayer,
@@ -144,7 +145,23 @@ pub(crate) fn scrub_content_chunk(
     record: &InodeRecord,
     chunk_ref: &ContentChunkRef,
 ) -> ScrubBlockOutcome {
-    scrub_content_chunk_with_pool(store, inode_id, record, chunk_ref, None).outcome
+    scrub_content_chunk_in_keyspace(
+        store,
+        inode_id,
+        record,
+        chunk_ref,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+pub(crate) fn scrub_content_chunk_in_keyspace(
+    store: &LocalObjectStore,
+    inode_id: InodeId,
+    record: &InodeRecord,
+    chunk_ref: &ContentChunkRef,
+    keyspace: FilesystemObjectKeyspace,
+) -> ScrubBlockOutcome {
+    scrub_content_chunk_with_pool(store, inode_id, record, chunk_ref, None, keyspace).outcome
 }
 
 /// Scrub inline content through the mounted scrub/read authority.
@@ -154,7 +171,14 @@ pub(crate) fn scrub_inline_content(
     inode_id: InodeId,
     record: &InodeRecord,
 ) -> ScrubBlockOutcome {
-    scrub_inline_content_with_pool(store, inode_id, record, None).outcome
+    scrub_inline_content_with_pool(
+        store,
+        inode_id,
+        record,
+        None,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+    .outcome
 }
 
 fn scrub_inline_content_with_pool(
@@ -162,8 +186,9 @@ fn scrub_inline_content_with_pool(
     inode_id: InodeId,
     record: &InodeRecord,
     pool: Option<&Pool>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> ScrubbedBlock {
-    let key = content_object_key_for_version(inode_id, record.data_version);
+    let key = keyspace.content(inode_id, record.data_version);
     scrub_mounted_content_target(
         store,
         inode_id,
@@ -172,6 +197,7 @@ fn scrub_inline_content_with_pool(
         record.size,
         Some(key),
         pool,
+        keyspace,
         || inline_checksum_evidence(store, key),
     )
 }
@@ -182,15 +208,12 @@ fn scrub_content_chunk_with_pool(
     record: &InodeRecord,
     chunk_ref: &ContentChunkRef,
     pool: Option<&Pool>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> ScrubbedBlock {
     let key = if chunk_ref.is_hole() {
         None
     } else {
-        Some(content_chunk_object_key_for_version(
-            inode_id,
-            chunk_ref.data_version,
-            chunk_ref.chunk_index,
-        ))
+        Some(keyspace.content_chunk(inode_id, chunk_ref.data_version, chunk_ref.chunk_index))
     };
 
     scrub_mounted_content_target(
@@ -201,6 +224,7 @@ fn scrub_content_chunk_with_pool(
         u64::from(chunk_ref.len),
         key,
         pool,
+        keyspace,
         || chunk_checksum_evidence(store, key, chunk_ref),
     )
 }
@@ -213,12 +237,15 @@ fn scrub_mounted_content_target<F>(
     expected_plaintext_len: u64,
     object_key: Option<ObjectKey>,
     pool: Option<&Pool>,
+    keyspace: FilesystemObjectKeyspace,
     checksum_evidence: F,
 ) -> ScrubbedBlock
 where
     F: FnOnce() -> (Option<MountedContentChecksumEvidence>, Option<String>),
 {
-    match read_mounted_content_scrub_block(store, inode_id, record, target, pool) {
+    match read_mounted_content_scrub_block_in_keyspace(
+        store, inode_id, record, target, pool, keyspace,
+    ) {
         Ok(read) => ScrubbedBlock {
             outcome: ScrubBlockOutcome::Clean,
             evidence: evidence_from_authority_read(read, expected_plaintext_len),
@@ -383,8 +410,9 @@ fn read_content_manifest_for_scrub(
     inode_id: InodeId,
     record: &InodeRecord,
     pool: Option<&Pool>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<Option<ContentManifestObject>> {
-    let key = content_object_key_for_version(inode_id, record.data_version);
+    let key = keyspace.content(inode_id, record.data_version);
     let bytes = match pool {
         Some(pool) => pool
             .get_with_current_receipt(DeviceIoClass::Data, key)?
@@ -410,8 +438,9 @@ fn manifest_error_scrubbed_block(
     record: &InodeRecord,
     pool: Option<&Pool>,
     reason: String,
+    keyspace: FilesystemObjectKeyspace,
 ) -> ScrubbedBlock {
-    let key = content_object_key_for_version(inode_id, record.data_version);
+    let key = keyspace.content(inode_id, record.data_version);
     ScrubbedBlock {
         outcome: ScrubBlockOutcome::Unreadable(reason.clone()),
         evidence: ScrubBlockEvidence {
@@ -554,19 +583,25 @@ fn record_scrubbed_block(report: &mut ScrubReport, scrubbed: ScrubbedBlock) {
     }
 }
 
-#[cfg(any(test, feature = "distributed-repair"))]
-pub(crate) fn scrub_inodes_content(
-    store: &LocalObjectStore,
-    inodes: &BTreeMap<InodeId, InodeRecord>,
-) -> Result<ScrubReport> {
-    scrub_inodes_content_with_pool(store, inodes, None)
-}
-
 #[allow(dead_code)] // INTENT: #651 pool-aware evidence path consumed by follow-up repair gating.
 pub(crate) fn scrub_inodes_content_with_pool(
     store: &LocalObjectStore,
     inodes: &BTreeMap<InodeId, InodeRecord>,
     pool: Option<&Pool>,
+) -> Result<ScrubReport> {
+    scrub_inodes_content_with_pool_in_keyspace(
+        store,
+        inodes,
+        pool,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+pub(crate) fn scrub_inodes_content_with_pool_in_keyspace(
+    store: &LocalObjectStore,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    pool: Option<&Pool>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<ScrubReport> {
     let mut report = ScrubReport::empty();
 
@@ -575,14 +610,15 @@ pub(crate) fn scrub_inodes_content_with_pool(
             continue;
         }
 
-        let inline_scrubbed = scrub_inline_content_with_pool(store, *inode_id, record, pool);
+        let inline_scrubbed =
+            scrub_inline_content_with_pool(store, *inode_id, record, pool, keyspace);
         if matches!(inline_scrubbed.outcome, ScrubBlockOutcome::Clean) {
             report.blocks_scanned += 1;
             record_scrubbed_block(&mut report, inline_scrubbed);
             continue;
         }
 
-        match read_content_manifest_for_scrub(store, *inode_id, record, pool) {
+        match read_content_manifest_for_scrub(store, *inode_id, record, pool, keyspace) {
             Ok(Some(manifest)) => {
                 report.blocks_scanned += 1; // manifest
                 report.blocks_clean += 1; // manifest is clean if parsed successfully
@@ -591,7 +627,9 @@ pub(crate) fn scrub_inodes_content_with_pool(
                     report.blocks_scanned += 1;
                     record_scrubbed_block(
                         &mut report,
-                        scrub_content_chunk_with_pool(store, *inode_id, record, chunk_ref, pool),
+                        scrub_content_chunk_with_pool(
+                            store, *inode_id, record, chunk_ref, pool, keyspace,
+                        ),
                     );
                 }
             }
@@ -603,7 +641,13 @@ pub(crate) fn scrub_inodes_content_with_pool(
                 report.blocks_scanned += 1;
                 record_scrubbed_block(
                     &mut report,
-                    manifest_error_scrubbed_block(*inode_id, record, pool, err.to_string()),
+                    manifest_error_scrubbed_block(
+                        *inode_id,
+                        record,
+                        pool,
+                        err.to_string(),
+                        keyspace,
+                    ),
                 );
             }
         }
@@ -895,6 +939,7 @@ mod tests {
             &record,
             &chunk_ref,
             Some(&pool),
+            FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
         );
 
         assert!(matches!(scrubbed.outcome, ScrubBlockOutcome::Unreadable(_)));
@@ -949,6 +994,7 @@ mod tests {
             &record,
             &chunk_ref,
             Some(&pool),
+            FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
         );
 
         assert!(matches!(scrubbed.outcome, ScrubBlockOutcome::Unreadable(_)));

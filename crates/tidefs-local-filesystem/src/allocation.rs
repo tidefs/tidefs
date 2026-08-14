@@ -22,6 +22,7 @@ use crate::encoding::{
 use crate::error::FileSystemError;
 use crate::object_keys::{
     content_chunk_object_key_for_version, content_dedup_object_key, content_object_key_for_version,
+    FilesystemObjectKeyspace,
 };
 use crate::records::ContentLayout;
 use crate::types::*;
@@ -30,23 +31,25 @@ pub(crate) fn content_allocation_entries_for_state_pool(
     pool: &Pool,
     state: &FileSystemState,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
+    let keyspace = FilesystemObjectKeyspace::new(state.dataset_id());
     let mut entries = BTreeMap::new();
     for inode in state.inodes.values() {
         if inode.is_file_like() {
             merge_allocation_entries(
                 &mut entries,
-                content_allocation_entries_for_inode_pool(pool, inode)?,
+                content_allocation_entries_for_inode_pool_in_keyspace(pool, inode, keyspace)?,
             );
         }
     }
     Ok(entries)
 }
 
-pub(crate) fn content_allocation_entries_for_inode_pool(
+pub(crate) fn content_allocation_entries_for_inode_pool_in_keyspace(
     pool: &Pool,
     inode: &InodeRecord,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
-    let reader = MountedContentReadAuthority::new(pool);
+    let reader = MountedContentReadAuthority::for_dataset(pool, keyspace.dataset_id());
     let layout = reader.read_layout(inode.inode_id, inode)?;
     if let ContentLayout::Chunked(manifest) = &layout {
         for chunk_ref in &manifest.chunks {
@@ -55,7 +58,12 @@ pub(crate) fn content_allocation_entries_for_inode_pool(
             }
         }
     }
-    content_allocation_entries_for_layout(inode.inode_id, &layout)
+    Ok(
+        content_allocation_entries_for_layout(inode.inode_id, &layout)?
+            .into_iter()
+            .map(|(key, grains)| (keyspace.scope(key), grains))
+            .collect(),
+    )
 }
 
 pub(crate) fn content_allocation_entries_for_layout(
@@ -647,11 +655,12 @@ fn dedup_canonical_chunk_is_current(
     pool: &tidefs_local_object_store::pool::Pool,
     canonical_key: ObjectKey,
     expected_len: Option<usize>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> bool {
     use tidefs_local_object_store::DeviceIoClass;
 
     let Ok(Some((canonical_bytes, receipt))) =
-        pool.get_with_current_receipt(DeviceIoClass::Data, canonical_key)
+        pool.get_with_current_receipt(DeviceIoClass::Data, keyspace.scope(canonical_key))
     else {
         return false;
     };
@@ -673,6 +682,7 @@ fn chunk_payload_matches_ref(
     chunk_ref: &crate::records::ContentChunkRef,
     object_key: ObjectKey,
     bytes: &[u8],
+    keyspace: FilesystemObjectKeyspace,
 ) -> bool {
     if chunk_ref.data_version == 0
         || chunk_ref.len == 0
@@ -685,7 +695,12 @@ fn chunk_payload_matches_ref(
         let Ok(canonical_key) = decode_dedup_redirect(bytes) else {
             return false;
         };
-        return dedup_canonical_chunk_is_current(pool, canonical_key, Some(chunk_ref.len as usize));
+        return dedup_canonical_chunk_is_current(
+            pool,
+            canonical_key,
+            Some(chunk_ref.len as usize),
+            keyspace,
+        );
     }
 
     let Ok(chunk) = decode_content_chunk(bytes) else {
@@ -717,6 +732,20 @@ pub(crate) fn chunk_receipt_is_durable(
     chunk_ref: &crate::records::ContentChunkRef,
     object_key: tidefs_local_object_store::ObjectKey,
 ) -> bool {
+    chunk_receipt_is_durable_in_keyspace(
+        pool,
+        chunk_ref,
+        object_key,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+pub(crate) fn chunk_receipt_is_durable_in_keyspace(
+    pool: &tidefs_local_object_store::pool::Pool,
+    chunk_ref: &crate::records::ContentChunkRef,
+    object_key: tidefs_local_object_store::ObjectKey,
+    keyspace: FilesystemObjectKeyspace,
+) -> bool {
     use tidefs_local_object_store::DeviceIoClass;
 
     // Hole chunks never need receipt validation.
@@ -728,20 +757,22 @@ pub(crate) fn chunk_receipt_is_durable(
         return false;
     }
 
-    let Ok(Some((bytes, receipt))) = pool.get_with_current_receipt(DeviceIoClass::Data, object_key)
+    let Ok(Some((bytes, receipt))) =
+        pool.get_with_current_receipt(DeviceIoClass::Data, keyspace.scope(object_key))
     else {
         return false;
     };
 
     receipt.generation == chunk_ref.placement_receipt_generation
         && receipt.generation > 0
-        && chunk_payload_matches_ref(pool, chunk_ref, object_key, &bytes)
+        && chunk_payload_matches_ref(pool, chunk_ref, object_key, &bytes, keyspace)
 }
 
 fn content_manifest_replacement_is_current(
     pool: &tidefs_local_object_store::pool::Pool,
     object_key: ObjectKey,
     bytes: &[u8],
+    keyspace: FilesystemObjectKeyspace,
 ) -> bool {
     let Ok(manifest) = decode_content_manifest(bytes) else {
         return false;
@@ -791,7 +822,7 @@ fn content_manifest_replacement_is_current(
             chunk_ref.data_version,
             chunk_ref.chunk_index,
         );
-        if !chunk_receipt_is_durable(pool, chunk_ref, chunk_key) {
+        if !chunk_receipt_is_durable_in_keyspace(pool, chunk_ref, chunk_key, keyspace) {
             return false;
         }
     }
@@ -802,17 +833,18 @@ fn replacement_payload_matches_key(
     pool: &tidefs_local_object_store::pool::Pool,
     object_key: ObjectKey,
     bytes: &[u8],
+    keyspace: FilesystemObjectKeyspace,
 ) -> bool {
     if is_dedup_redirect(bytes) {
         let Ok(canonical_key) = decode_dedup_redirect(bytes) else {
             return false;
         };
-        return dedup_canonical_chunk_is_current(pool, canonical_key, None);
+        return dedup_canonical_chunk_is_current(pool, canonical_key, None, keyspace);
     }
     if bytes.starts_with(&CONTENT_MANIFEST_MAGIC)
         || bytes.starts_with(&CONTENT_MANIFEST_SPARSE_MAGIC)
     {
-        return content_manifest_replacement_is_current(pool, object_key, bytes);
+        return content_manifest_replacement_is_current(pool, object_key, bytes, keyspace);
     }
     if bytes.starts_with(&CONTENT_CHUNK_MAGIC) {
         let Ok(chunk) = decode_content_chunk(bytes) else {
@@ -845,17 +877,31 @@ fn replacement_payload_matches_key(
 /// receipt and a decodable filesystem content payload whose identity projects
 /// back to the same key. Manifests recursively require exact current receipt
 /// authority for every non-hole chunk they reference.
+#[cfg(test)]
 pub(crate) fn replacement_key_receipt_is_durable(
     pool: &tidefs_local_object_store::pool::Pool,
     object_key: tidefs_local_object_store::ObjectKey,
 ) -> bool {
+    replacement_key_receipt_is_durable_in_keyspace(
+        pool,
+        object_key,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+pub(crate) fn replacement_key_receipt_is_durable_in_keyspace(
+    pool: &tidefs_local_object_store::pool::Pool,
+    object_key: tidefs_local_object_store::ObjectKey,
+    keyspace: FilesystemObjectKeyspace,
+) -> bool {
     use tidefs_local_object_store::DeviceIoClass;
 
-    let Ok(Some((bytes, receipt))) = pool.get_with_current_receipt(DeviceIoClass::Data, object_key)
+    let Ok(Some((bytes, receipt))) =
+        pool.get_with_current_receipt(DeviceIoClass::Data, keyspace.scope(object_key))
     else {
         return false;
     };
-    receipt.generation > 0 && replacement_payload_matches_key(pool, object_key, &bytes)
+    receipt.generation > 0 && replacement_payload_matches_key(pool, object_key, &bytes, keyspace)
 }
 
 /// Classify old extent keys from a chunked rewrite into trimmable and
@@ -877,11 +923,28 @@ pub(crate) fn replacement_key_receipt_is_durable(
 /// can be queued for immediate reclaim and deferred entries carry
 /// `(old_key, replacement_key)` pairs for a future receipt-durability check.
 /// INTENT: wired into rewrite path in lib.rs (issue #377)
+#[cfg(test)]
 pub(crate) fn obsolete_extent_keys_for_chunked_rewrite(
     pool: &tidefs_local_object_store::pool::Pool,
     inode_id: InodeId,
     old_manifest: &crate::records::ContentManifestObject,
     new_chunks: &[crate::records::ContentChunkRef],
+) -> (Vec<ObjectKey>, Vec<(ObjectKey, ObjectKey)>) {
+    obsolete_extent_keys_for_chunked_rewrite_in_keyspace(
+        pool,
+        inode_id,
+        old_manifest,
+        new_chunks,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+pub(crate) fn obsolete_extent_keys_for_chunked_rewrite_in_keyspace(
+    pool: &tidefs_local_object_store::pool::Pool,
+    inode_id: InodeId,
+    old_manifest: &crate::records::ContentManifestObject,
+    new_chunks: &[crate::records::ContentChunkRef],
+    keyspace: FilesystemObjectKeyspace,
 ) -> (Vec<ObjectKey>, Vec<(ObjectKey, ObjectKey)>) {
     let mut trimmable = Vec::new();
     let mut deferred = Vec::new();
@@ -909,7 +972,7 @@ pub(crate) fn obsolete_extent_keys_for_chunked_rewrite(
                     new_chunk.data_version,
                     new_chunk.chunk_index,
                 );
-                if chunk_receipt_is_durable(pool, new_chunk, new_key) {
+                if chunk_receipt_is_durable_in_keyspace(pool, new_chunk, new_key, keyspace) {
                     trimmable.push(old_key);
                 } else {
                     deferred.push((old_key, new_key));
@@ -938,6 +1001,7 @@ pub(crate) fn obsolete_extent_keys_for_chunked_rewrite(
 ///
 /// Also returns the old versioned content-manifest key, similarly gated.
 /// INTENT: wired into replace_content in lib.rs (issue #377)
+#[cfg(test)]
 pub(crate) fn obsolete_extent_keys_for_full_replace(
     pool: &tidefs_local_object_store::pool::Pool,
     inode_id: InodeId,
@@ -945,16 +1009,39 @@ pub(crate) fn obsolete_extent_keys_for_full_replace(
     new_chunks: &[crate::records::ContentChunkRef],
     new_data_version: u64,
 ) -> (Vec<ObjectKey>, Vec<(ObjectKey, ObjectKey)>) {
+    obsolete_extent_keys_for_full_replace_in_keyspace(
+        pool,
+        inode_id,
+        old_manifest,
+        new_chunks,
+        new_data_version,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+pub(crate) fn obsolete_extent_keys_for_full_replace_in_keyspace(
+    pool: &tidefs_local_object_store::pool::Pool,
+    inode_id: InodeId,
+    old_manifest: &crate::records::ContentManifestObject,
+    new_chunks: &[crate::records::ContentChunkRef],
+    new_data_version: u64,
+    keyspace: FilesystemObjectKeyspace,
+) -> (Vec<ObjectKey>, Vec<(ObjectKey, ObjectKey)>) {
     // For a full replace, the old manifest key is always obsolete.
     let old_manifest_key = content_object_key_for_version(inode_id, old_manifest.data_version);
 
     let new_manifest_key = content_object_key_for_version(inode_id, new_data_version);
 
-    let (mut trimmable, mut deferred) =
-        obsolete_extent_keys_for_chunked_rewrite(pool, inode_id, old_manifest, new_chunks);
+    let (mut trimmable, mut deferred) = obsolete_extent_keys_for_chunked_rewrite_in_keyspace(
+        pool,
+        inode_id,
+        old_manifest,
+        new_chunks,
+        keyspace,
+    );
 
     // Gate old manifest key on new manifest receipt durability.
-    if replacement_key_receipt_is_durable(pool, new_manifest_key) {
+    if replacement_key_receipt_is_durable_in_keyspace(pool, new_manifest_key, keyspace) {
         trimmable.push(old_manifest_key);
     } else {
         deferred.push((old_manifest_key, new_manifest_key));
@@ -968,16 +1055,33 @@ pub(crate) fn obsolete_extent_keys_for_full_replace(
 /// The old inline content object is obsolete.  Trimming is gated on
 /// the replacement receipt for the new inline content key.
 /// INTENT: wired into replace_content inline path in lib.rs (issue #377)
+#[cfg(test)]
 pub(crate) fn obsolete_extent_keys_for_inline_replace(
     pool: &tidefs_local_object_store::pool::Pool,
     inode_id: InodeId,
     old_data_version: u64,
     new_data_version: u64,
 ) -> (Vec<ObjectKey>, Vec<(ObjectKey, ObjectKey)>) {
+    obsolete_extent_keys_for_inline_replace_in_keyspace(
+        pool,
+        inode_id,
+        old_data_version,
+        new_data_version,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+pub(crate) fn obsolete_extent_keys_for_inline_replace_in_keyspace(
+    pool: &tidefs_local_object_store::pool::Pool,
+    inode_id: InodeId,
+    old_data_version: u64,
+    new_data_version: u64,
+    keyspace: FilesystemObjectKeyspace,
+) -> (Vec<ObjectKey>, Vec<(ObjectKey, ObjectKey)>) {
     let old_key = content_object_key_for_version(inode_id, old_data_version);
     let new_key = content_object_key_for_version(inode_id, new_data_version);
 
-    if replacement_key_receipt_is_durable(pool, new_key) {
+    if replacement_key_receipt_is_durable_in_keyspace(pool, new_key, keyspace) {
         (vec![old_key], Vec::new())
     } else {
         (Vec::new(), vec![(old_key, new_key)])
