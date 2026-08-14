@@ -1402,9 +1402,9 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
     }
 
     crate::observability::emit_all_summaries();
-    if let Some(live_owner) = live_owner {
-        live_owner.stop();
-    }
+    let carrier_drain_result = live_owner
+        .as_ref()
+        .map_or(Ok(()), live_owner::LiveOwnerHandle::drain_carriers);
     session.join();
     let artifact_result = match config.runtime.queue_depth_artifact.as_deref() {
         Some(path) => write_queue_depth_runtime_artifact(&queue_depth_engine, path),
@@ -1432,14 +1432,24 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
             config.mountpoint.display()
         );
     }
-    match (artifact_result, export_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(artifact_error), Ok(())) => Err(artifact_error),
-        (Ok(()), Err(export_error)) => Err(export_error),
-        (Err(artifact_error), Err(export_error)) => {
-            Err(format!("{artifact_error}; additionally {export_error}"))
+    let mut shutdown_errors = Vec::new();
+    for result in [&carrier_drain_result, &artifact_result, &export_result] {
+        if let Err(error) = result {
+            shutdown_errors.push(error.clone());
         }
     }
+    let shutdown_result = if shutdown_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(shutdown_errors.join("; additionally "))
+    };
+    if let Some(owner) = live_owner.as_ref() {
+        owner.complete_export(shutdown_result.clone());
+    }
+    if let Some(owner) = live_owner {
+        owner.stop();
+    }
+    shutdown_result
 }
 
 fn hex_uuid(uuid: &[u8; 16]) -> String {

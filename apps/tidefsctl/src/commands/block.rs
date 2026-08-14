@@ -226,7 +226,7 @@ fn handle_attach(
         queue_depth,
         drain_deadline_secs,
     );
-    live_owner.stop();
+    live_owner.standalone_block_carrier_stopped();
     signal_thread.finish();
     let carrier_result =
         carrier_result.map_err(|error| format!("ublk live device failed: {error}"));
@@ -235,6 +235,13 @@ fn handle_attach(
     let export_result = import_owner
         .export()
         .map_err(|error| format!("export Pool after block attach: {error}"));
+    let completion = match (&carrier_result, &export_result) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error.clone()),
+        (Err(error), Err(export_error)) => Err(format!("{error}; additionally {export_error}")),
+    };
+    live_owner.complete_export(completion);
+    live_owner.stop();
     match (carrier_result, export_result) {
         (Ok(report), Ok(())) => {
             report.print();
