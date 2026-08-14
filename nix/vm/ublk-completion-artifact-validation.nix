@@ -395,15 +395,6 @@ start_attach() {
     echo "PASS: ublkb0 committed geometry size=$observed_size"
 }
 
-wait_ublk_gone() {
-    for _ in $(seq 1 30); do
-        [ ! -b /dev/ublkb0 ] && return
-        sleep 1
-    done
-    echo "FAIL: ublkb0 remained after block export teardown"
-    poweroff -f
-}
-
 make_pattern_file() {
     path="$1"
     pattern="$2"
@@ -593,10 +584,24 @@ if [ "$SCENARIO" = "qemu-ublk-smoke" ]; then
     echo "PASS: active source volume export refused concurrent clone create"
 fi
 
-stop_attach() {
+export_live_pool() {
     attach_log="$1"
-    echo "--- Stop tidefsctl block attach ---"
-    kill -TERM "$ATTACH_PID" 2>/dev/null || true
+    export_log=/tmp/tidefs-live-pool-export.log
+    echo "--- Export Pool through the live standalone ublk owner ---"
+    if ! tidefsctl pool export "$POOL_NAME" >"$export_log" 2>&1; then
+        echo "FAIL: live Pool export"
+        cat "$export_log" 2>&1 || true
+        cat "$attach_log" 2>&1 || true
+        poweroff -f
+    fi
+
+    if [ -b /dev/ublkb0 ]; then
+        echo "FAIL: live Pool export returned before /dev/ublkb0 disappeared"
+        cat "$export_log" 2>&1 || true
+        cat "$attach_log" 2>&1 || true
+        poweroff -f
+    fi
+
     for _ in $(seq 1 30); do
         if ! kill -0 "$ATTACH_PID" 2>/dev/null; then
             break
@@ -605,16 +610,26 @@ stop_attach() {
     done
 
     if kill -0 "$ATTACH_PID" 2>/dev/null; then
-        echo "FAIL: tidefsctl block attach still running after graceful shutdown"
+        echo "FAIL: live Pool export returned before tidefsctl block attach exited"
+        cat "$export_log" 2>&1 || true
         cat "$attach_log" 2>&1 || true
-        kill -KILL "$ATTACH_PID" 2>/dev/null || true
         poweroff -f
     fi
-    echo "PASS: tidefsctl block attach stopped and Pool exported"
+
+    set +e
+    wait "$ATTACH_PID"
+    ATTACH_RC=$?
+    set -e
+    if [ "$ATTACH_RC" -ne 0 ]; then
+        echo "FAIL: tidefsctl block attach exited with status $ATTACH_RC after live Pool export"
+        cat "$export_log" 2>&1 || true
+        cat "$attach_log" 2>&1 || true
+        poweroff -f
+    fi
+    echo "PASS: live Pool export removed ublkb0 and stopped its standalone owner"
 }
 
-stop_attach "$ATTACH_LOG"
-wait_ublk_gone
+export_live_pool "$ATTACH_LOG"
 
 echo "--- Capture committed volume snapshot ---"
 if ! tidefsctl snapshot create "$SNAPSHOT_TARGET" --devices "$POOL_DEVICE" \
@@ -694,8 +709,7 @@ if [ "$SCENARIO" = "qemu-ublk-smoke" ]; then
         fi
     done
     echo "PASS: active clone export refused concurrent delete and promote"
-    stop_attach "$CLONE_ATTACH_LOG"
-    wait_ublk_gone
+    export_live_pool "$CLONE_ATTACH_LOG"
 fi
 
 echo "--- Reopen committed volume data ---"
@@ -731,8 +745,7 @@ for snapshot_operation in rollback destroy; do
     fi
 done
 echo "PASS: active volume export refused concurrent snapshot rollback and destroy"
-stop_attach "$ATTACH_LOG"
-wait_ublk_gone
+export_live_pool "$ATTACH_LOG"
 
 if [ "$SCENARIO" = "qemu-ublk-smoke" ]; then
     echo "--- Reopen diverged volume clone ---"
@@ -742,8 +755,7 @@ if [ "$SCENARIO" = "qemu-ublk-smoke" ]; then
     verify_expected_block /tmp/zero-pattern "$DISCARD_OFFSET" "clone discard after reopen"
     verify_expected_block /tmp/zero-pattern "$WRITE_ZEROES_OFFSET" "clone write zeroes after reopen"
     verify_expected_block /tmp/removed-tail-pattern "$REMOVED_TAIL_OFFSET" "clone retained captured tail after reopen"
-    stop_attach "$CLONE_ATTACH_LOG"
-    wait_ublk_gone
+    export_live_pool "$CLONE_ATTACH_LOG"
 fi
 
 echo "--- Restore exact snapshot bytes and geometry ---"
@@ -763,8 +775,7 @@ start_attach "$LIFECYCLE_ARTIFACT" "$LIFECYCLE_STARTED_ARTIFACT" "$VOLUME_NAME" 
     "$ATTACH_LOG" "$SCENARIO" none "$VOLUME_SIZE_BYTES"
 verify_expected_block /tmp/retained-pattern "$RETAINED_OFFSET" "snapshot restored exact pre-overwrite bytes"
 verify_expected_block /tmp/removed-tail-pattern "$REMOVED_TAIL_OFFSET" "snapshot restored exact pre-shrink geometry and tail"
-stop_attach "$ATTACH_LOG"
-wait_ublk_gone
+export_live_pool "$ATTACH_LOG"
 
 if ! tidefsctl snapshot list "$POOL_NAME" --devices "$POOL_DEVICE" \
     >/tmp/snapshot-retained-list.log 2>&1 || ! grep -F "$VOLUME_NAME@before_overwrite" /tmp/snapshot-retained-list.log >/dev/null; then
@@ -867,8 +878,7 @@ if [ "$SCENARIO" = "qemu-ublk-smoke" ]; then
         "$CLONE_ATTACH_LOG" "$SCENARIO" none "$VOLUME_SIZE_BYTES"
     verify_expected_block /tmp/clone-pattern "$RETAINED_OFFSET" "promoted clone retained private bytes"
     verify_expected_block /tmp/removed-tail-pattern "$REMOVED_TAIL_OFFSET" "promoted clone retained captured geometry"
-    stop_attach "$CLONE_ATTACH_LOG"
-    wait_ublk_gone
+    export_live_pool "$CLONE_ATTACH_LOG"
     if ! tidefsctl dataset destroy "$POOL_NAME/$CLONE_NAME" --devices "$POOL_DEVICE" \
         >/tmp/promoted-clone-destroy.log 2>&1; then
         echo "FAIL: promoted clone dataset destroy"
@@ -900,8 +910,7 @@ start_attach "$LIFECYCLE_ARTIFACT" "$LIFECYCLE_STARTED_ARTIFACT" "$VOLUME_NAME" 
 verify_expected_block /tmp/retained-pattern "$RETAINED_OFFSET" "retained prefix after shrink"
 verify_expected_block /tmp/zero-pattern "$DISCARD_OFFSET" "discard stays zero after shrink"
 verify_expected_block /tmp/zero-pattern "$WRITE_ZEROES_OFFSET" "write zeroes stays zero after shrink"
-stop_attach "$ATTACH_LOG"
-wait_ublk_gone
+export_live_pool "$ATTACH_LOG"
 
 echo "--- Regrow committed volume geometry ---"
 if ! tidefsctl dataset resize "$POOL_NAME/$VOLUME_NAME" --size "$VOLUME_SIZE_BYTES" \
@@ -928,8 +937,7 @@ if [ "$ACTIVE_DESTROY_RC" -eq 0 ]; then
     poweroff -f
 fi
 echo "PASS: active volume export refused concurrent destroy"
-stop_attach "$ATTACH_LOG"
-wait_ublk_gone
+export_live_pool "$ATTACH_LOG"
 
 echo "--- Destroy committed volume and refuse later attach ---"
 if ! tidefsctl dataset destroy "$POOL_NAME/$VOLUME_NAME" --devices "$POOL_DEVICE" \
@@ -976,7 +984,7 @@ if [ "$RUN_ERROR_INJECTION" -eq 1 ]; then
         poweroff -f
     fi
     echo "PASS: error injection write refused rc=$ERROR_WRITE_RC"
-    stop_attach "$ERROR_ATTACH_LOG"
+    export_live_pool "$ERROR_ATTACH_LOG"
 fi
 
 if [ ! -s "$COMPLETION_ARTIFACT" ]; then
