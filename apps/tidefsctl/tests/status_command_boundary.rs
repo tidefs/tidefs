@@ -161,6 +161,99 @@ fn assert_reimported_volume_graph(
     );
 }
 
+fn open_named_filesystem(
+    metadata_dir: &std::path::Path,
+    devices: &[PathBuf],
+    pool_name: &str,
+    redundancy_policy: PoolRedundancyPolicy,
+    dataset_path: &str,
+) -> LocalFileSystem {
+    LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+        metadata_dir,
+        pool_name,
+        redundancy_policy,
+        dataset_path,
+        tidefs_local_filesystem::LocalFileSystemOpenConfig {
+            options: StoreOptions::default(),
+            allocator_policy: tidefs_local_filesystem::LocalStorageAllocatorPolicy::default(),
+            root_authentication_key: RootAuthenticationKey::demo_key(),
+            encryption: None,
+            compression: None,
+            log_device_device_path: None,
+            recovery_policy: RecoveryPolicy::default(),
+            block_devices: Some(devices),
+        },
+    )
+    .expect("open independently rooted filesystem")
+}
+
+fn prepare_independent_filesystem_lifecycle_graph(
+    mut filesystem: LocalFileSystem,
+    metadata_dir: &std::path::Path,
+    devices: &[PathBuf],
+    pool_name: &str,
+    redundancy_policy: PoolRedundancyPolicy,
+    dataset_id_byte: u8,
+    payload_byte: u8,
+) -> (LocalFileSystem, Vec<u8>) {
+    filesystem
+        .create_filesystem_dataset(
+            "other",
+            DatasetId::from_bytes([dataset_id_byte; 16]),
+            Vec::new(),
+            DatasetFlags::default_create(),
+            SyncGuarantee::Local,
+        )
+        .expect("create independently rooted filesystem");
+    filesystem
+        .sync_all()
+        .expect("commit root catalog before independent filesystem open");
+    drop(filesystem);
+
+    let payload = vec![payload_byte; 8193];
+    let mut independent =
+        open_named_filesystem(metadata_dir, devices, pool_name, redundancy_policy, "other");
+    independent
+        .create_file("/independent.bin", 0o600)
+        .expect("create independent lifecycle file");
+    independent
+        .write_file("/independent.bin", 0, &payload)
+        .expect("write independent lifecycle bytes");
+    independent
+        .sync_all()
+        .expect("commit independent lifecycle bytes");
+    drop(independent);
+
+    let root = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        metadata_dir,
+        devices,
+        pool_name,
+        redundancy_policy,
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::default(),
+    )
+    .expect("reopen root filesystem as sole Pool lifecycle owner");
+    (root, payload)
+}
+
+fn assert_reimported_independent_filesystem(
+    metadata_dir: &std::path::Path,
+    devices: &[PathBuf],
+    pool_name: &str,
+    redundancy_policy: PoolRedundancyPolicy,
+    expected: &[u8],
+) {
+    let independent =
+        open_named_filesystem(metadata_dir, devices, pool_name, redundancy_policy, "other");
+    assert_eq!(
+        independent
+            .read_file("/independent.bin")
+            .expect("read independent filesystem after topology reimport"),
+        expected
+    );
+}
+
 fn run_status(command: &str, json: bool) -> (String, Output) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -474,6 +567,15 @@ fn live_device_remove_cli_commits_survivor_topology() {
     filesystem
         .sync_all()
         .expect("sync mounted files before removal");
+    let (mut filesystem, independent_payload) = prepare_independent_filesystem_lifecycle_graph(
+        filesystem,
+        &metadata_dir,
+        &devices,
+        &pool_name,
+        redundancy_policy,
+        0x81,
+        0x61,
+    );
     let mut active_volume = prepare_volume_lifecycle_graph(&mut filesystem, 0x71, 0x31, 0x41, 0x51);
 
     let scanned = tidefs_pool_scan::scan_labels(&devices).expect("scan created Pool labels");
@@ -579,6 +681,14 @@ fn live_device_remove_cli_commits_survivor_topology() {
         );
     }
     assert_reimported_volume_graph(&mut reopened, 0x31, 0x41, 0x51);
+    drop(reopened);
+    assert_reimported_independent_filesystem(
+        &metadata_dir,
+        &survivor,
+        &pool_name,
+        redundancy_policy,
+        &independent_payload,
+    );
 }
 
 #[test]
@@ -630,6 +740,15 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
     filesystem
         .sync_all()
         .expect("sync mounted files before replacement");
+    let (mut filesystem, independent_payload) = prepare_independent_filesystem_lifecycle_graph(
+        filesystem,
+        &metadata_dir,
+        &devices,
+        &pool_name,
+        redundancy_policy,
+        0x82,
+        0x62,
+    );
     let mut active_volume = prepare_volume_lifecycle_graph(&mut filesystem, 0x72, 0x32, 0x42, 0x52);
 
     let scanned = tidefs_pool_scan::scan_labels(&devices).expect("scan created Pool labels");
@@ -740,4 +859,12 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
         );
     }
     assert_reimported_volume_graph(&mut reopened, 0x32, 0x42, 0x52);
+    drop(reopened);
+    assert_reimported_independent_filesystem(
+        &metadata_dir,
+        &replacement_topology,
+        &pool_name,
+        redundancy_policy,
+        &independent_payload,
+    );
 }

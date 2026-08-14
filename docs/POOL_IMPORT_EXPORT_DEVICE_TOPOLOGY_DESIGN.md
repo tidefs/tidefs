@@ -61,14 +61,17 @@ status only; it does not authorize writable degraded import or rebuild.
 ## Mounted Online Removal Boundary
 
 The bounded local removal path is owned by the reachable mounted filesystem,
-not by an offline CLI helper. It syncs mounted state, validates every canonical
-Pool-runtime volume graph, refuses before evacuation when an independently
-rooted filesystem or filesystem-sourced snapshot/clone needs another owner,
+not by an offline CLI helper. It syncs mounted state, authenticates every active
+current filesystem typed root, validates every canonical Pool-runtime volume
+graph, refuses filesystem snapshots/clones and non-active filesystem roots,
 persists a removal marker, and allocation-fences the target. Pool evacuation
 then rewrites every receipt-backed logical object to surviving members while
-the target stays attached. Volume roots, volume snapshots, and volume clones
-carry immutable keys and digests rather than placement generations, so their
-typed roots remain unchanged while all referenced maps and chunks relocate.
+the target stays attached. For each unmounted independent filesystem, the same
+owner copy-on-writes changed content manifests, durably queues predecessor
+manifests, and publishes its successor typed root before refreshing the mounted
+root ring. Volume roots, volume snapshots, and volume clones carry immutable
+keys and digests rather than placement generations, so their typed roots remain
+unchanged while all referenced maps and chunks relocate.
 
 Chunk relocation advances placement-receipt generations. The mounted owner
 therefore validates survivor payload identity, writes changed content
@@ -92,21 +95,22 @@ member's stale lower-generation label does not restore membership.
 The operator result reports evacuation counts, committed topology generation,
 and remaining members. It explicitly provides no secure-erase,
 media-remanence, sanitization, or decommissioning guarantee. Failed-device
-loss, replacement/rebuild, writable degraded operation, independently mounted
-filesystem atomic removal, and filesystem snapshot/clone root rewriting remain
-separate work.
+loss, replacement/rebuild, writable degraded operation, simultaneous
+multi-mounted filesystem atomic removal, and filesystem snapshot/clone root
+rewriting remain separate work.
 
 ## Mounted Present-Member Replacement Boundary
 
 The bounded replacement path also belongs to the reachable mounted owner. It
 admits only an exact writable two-member `Replicated { copies: 2 }` Pool, one
-mounted filesystem, any number of checksum-validated co-owned Pool-runtime
-volume, volume-snapshot, and volume-clone roots, no independently rooted
-filesystem or filesystem-sourced snapshot/clone, and a distinct blank
-same-backing candidate at least as large as the readable old member. Durable
-versioned checksummed evidence binds the Pool GUID, full old/new device GUIDs
-and paths, member index, next topology generation, subject inventory, verified
-receipt progress, bytes rebuilt, and terminal state.
+mounted filesystem, any number of authenticated active unmounted independent
+filesystem roots, any number of checksum-validated co-owned Pool-runtime
+volume, volume-snapshot, and volume-clone roots, no filesystem-sourced
+snapshot/clone or filesystem clone, and a distinct blank same-backing candidate
+at least as large as the readable old member. Durable versioned checksummed
+evidence binds the Pool GUID, full old/new device GUIDs and paths, member index,
+next topology generation, subject inventory, verified receipt progress, bytes
+rebuilt, and terminal state.
 
 Preparation installs the candidate at the old member's durable index while
 retaining the old member as an attached allocation-fenced predecessor. It
@@ -126,8 +130,8 @@ survivor plus replacement. Operator output reports rebuild counts, exact
 identity, topology generation, completion and detach safety while explicitly
 claiming no secure erase, media remanence, sanitization, or decommissioning.
 Absent or unreadable old members, writable degraded replacement, erasure
-coding, independently mounted filesystem atomicity, and hot-spare policy remain
-separate work.
+coding, filesystem snapshot/clone reconciliation, simultaneous multi-mounted
+filesystem atomicity, and hot-spare policy remain separate work.
 
 ## Authority Limits
 
@@ -141,7 +145,8 @@ where they become publishing-facing claims.
 
 The current guarantee is narrow: TideFS has concrete pool-label,
 pool-scan/import, local import/export, and device-manager code paths in the
-crates named above. Its present-member mounted lifecycle preserves canonical
-Pool-runtime volume roots; this is not general multi-filesystem atomicity.
-Broad operational behavior must be checked against source and validation before
-it is cited.
+crates named above. Its present-member mounted lifecycle preserves active
+current independent filesystem roots and canonical Pool-runtime volume roots
+through one imported owner; this is not simultaneous multi-mounted-filesystem
+atomicity. Broad operational behavior must be checked against source and
+validation before it is cited.

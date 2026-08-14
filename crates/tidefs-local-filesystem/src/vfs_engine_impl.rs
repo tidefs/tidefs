@@ -16,8 +16,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::{json, Value};
 #[cfg(feature = "replication-io")]
 use tidefs_local_object_store::IntegrityDigest64;
-use tidefs_local_object_store::{DeviceIoClass, StoreError};
+use tidefs_local_object_store::{DeviceIoClass, ObjectKey, StoreError};
 use tidefs_types_extent_map_core::ExtentMapOps;
+use tidefs_types_reclaim_queue_core::{
+    ObjectKey as ReclaimObjectKey, QueueFamily as ReclaimQueueFamily, ReclaimQueueEntry,
+};
 use tidefs_types_vfs_core::{
     DirEntry, DirHandleId, EngineDirHandle, EngineFileHandle, Errno, Generation, InodeAttr,
     InodeId, LockSpec, NodeKind, RequestCtx, SetAttr, StatFs, FALLOC_FL_COLLAPSE_RANGE,
@@ -42,6 +45,7 @@ use crate::fuse_setattr;
 use crate::fuse_statfs;
 use crate::helpers::{kind_bits, validate_name};
 use crate::open_dispatch::{self, FileHandleState, FileHandleTable};
+use crate::records::RootCommitRecord;
 use crate::release_dispatch;
 #[cfg(feature = "replication-io")]
 use crate::types::CommittedRootSummary;
@@ -63,7 +67,7 @@ use tidefs_encryption::key_hierarchy::{DatasetDEK, PoolWrappingKey, SALT_LEN};
 use tidefs_encryption::key_manager::{BorrowedKeyStore, KeyManager, KeyRotation};
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 
-use crate::{CopyFileRangeIntent, LocalFileSystem};
+use crate::{CopyFileRangeIntent, FileSystemState, LocalFileSystem};
 
 #[cfg(test)]
 const O_RDONLY: u32 = 0;
@@ -3624,6 +3628,18 @@ impl VfsLocalFileSystem {
     }
 }
 
+struct DeviceLifecycleFilesystemState {
+    state: FileSystemState,
+    root: RootCommitRecord,
+}
+
+struct RelocatedContentReceiptReplacement {
+    record: InodeRecord,
+    manifest: crate::records::ContentManifestObject,
+    sparse: bool,
+    old_manifest_key: ObjectKey,
+}
+
 impl LocalFileSystem {
     /// Complete a mounted device removal without invalidating the exact Pool
     /// receipt generations embedded in content manifests.
@@ -3631,7 +3647,8 @@ impl LocalFileSystem {
         &mut self,
         device_path: &std::path::Path,
     ) -> crate::Result<tidefs_local_object_store::device_removal::EvacuationResult> {
-        self.ensure_device_lifecycle_root_authority("remove device from mounted pool")?;
+        let mut unmounted_filesystems =
+            self.ensure_device_lifecycle_root_authority("remove device from mounted pool")?;
         let preparation = self
             .store
             .pool_mut()
@@ -3644,6 +3661,7 @@ impl LocalFileSystem {
         // Preparation can fail after one or more replacement receipts became
         // current. Always repair every valid manifest reference that can now
         // be advanced before returning the preparation error.
+        self.reconcile_unmounted_filesystem_receipts(&mut unmounted_filesystems)?;
         self.reconcile_relocated_content_receipts()?;
         self.store.pool_mut().sync_all()?;
 
@@ -3690,7 +3708,8 @@ impl LocalFileSystem {
         old_device_path: &std::path::Path,
         new_device_path: &std::path::Path,
     ) -> crate::Result<tidefs_local_object_store::pool::DeviceReplacementResult> {
-        self.ensure_device_lifecycle_root_authority("replace device in mounted pool")?;
+        let mut unmounted_filesystems =
+            self.ensure_device_lifecycle_root_authority("replace device in mounted pool")?;
         let old_config = self
             .store
             .pool()
@@ -3739,6 +3758,7 @@ impl LocalFileSystem {
         // Preparation may have published a prefix of successor receipts.
         // Reconcile every valid content manifest before propagating an error,
         // preserving the same predecessor-root recovery rule as removal.
+        self.reconcile_unmounted_filesystem_receipts(&mut unmounted_filesystems)?;
         self.reconcile_relocated_content_receipts()?;
         self.store.pool_mut().sync_all()?;
         for _ in 0..crate::constants::FILESYSTEM_ROOT_SLOT_COUNT {
@@ -3759,7 +3779,10 @@ impl LocalFileSystem {
         Ok(result)
     }
 
-    fn ensure_device_lifecycle_root_authority(&self, operation: &'static str) -> crate::Result<()> {
+    fn ensure_device_lifecycle_root_authority(
+        &self,
+        operation: &'static str,
+    ) -> crate::Result<Vec<DeviceLifecycleFilesystemState>> {
         if self
             .state
             .snapshots
@@ -3774,17 +3797,38 @@ impl LocalFileSystem {
 
         let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
         let mut has_pool_owned_volume_roots = false;
-        for (_, dataset_id, dataset_type, _, _, _) in self.dataset_catalog().list_all() {
+        let mut unmounted_filesystems = Vec::new();
+        for (_, dataset_id, dataset_type, _, flags, lifecycle_state) in
+            self.dataset_catalog().list_all()
+        {
             if dataset_id == mounted_dataset_id {
                 continue;
             }
             match dataset_type {
                 DatasetType::Volume => has_pool_owned_volume_roots = true,
                 DatasetType::Filesystem => {
-                    return Err(FileSystemError::Unsupported {
-                        operation,
-                        reason: "another dataset in the Pool has filesystem root authority and requires its own mounted owner to join atomic receipt reconciliation",
-                    });
+                    if flags.contains(DatasetFlags::CLONE) || lifecycle_state.to_u8() != 0 {
+                        return Err(FileSystemError::Unsupported {
+                            operation,
+                            reason: "filesystem clones or non-active filesystem datasets require a separate lifecycle authority row",
+                        });
+                    }
+                    let (state, root) = crate::load_canonical_committed_state_for_dataset(
+                        &self.store,
+                        dataset_id,
+                        self.root_authentication_key,
+                    )?;
+                    if state
+                        .snapshots
+                        .values()
+                        .any(crate::snapshot::snapshot_record_retains_data)
+                    {
+                        return Err(FileSystemError::Unsupported {
+                            operation,
+                            reason: "an independently rooted filesystem has data-retaining snapshots or clones that require their own atomic receipt reconciliation row",
+                        });
+                    }
+                    unmounted_filesystems.push(DeviceLifecycleFilesystemState { state, root });
                 }
                 DatasetType::Snapshot => {
                     let snapshot = self.store.load_snapshot_root(dataset_id)?;
@@ -3809,13 +3853,60 @@ impl LocalFileSystem {
             // those exact objects without rewriting their typed roots.
             let _ = self.store.canonical_root_object_keys()?;
         }
-        Ok(())
+        Ok(unmounted_filesystems)
     }
 
-    fn reconcile_relocated_content_receipts(&mut self) -> crate::Result<u64> {
-        let keyspace = self.object_keyspace();
-        let current_inodes = self
-            .state
+    fn reconcile_unmounted_filesystem_receipts(
+        &mut self,
+        filesystems: &mut [DeviceLifecycleFilesystemState],
+    ) -> crate::Result<u64> {
+        let mut total_replacements = 0_u64;
+        for filesystem in filesystems {
+            let (replacement_count, obsolete_manifests) =
+                Self::reconcile_relocated_content_receipts_for_state(
+                    self.store.pool_mut(),
+                    &mut filesystem.state,
+                )?;
+            if replacement_count == 0 {
+                continue;
+            }
+
+            // Queue predecessor manifests before publishing the successor
+            // root. The current canonical root keeps them protected if a
+            // crash occurs here; after publication the durable queue owns the
+            // exact now-unreachable objects. No second filesystem or Pool
+            // owner is opened for this transition.
+            self.persist_device_lifecycle_reclaim_queue(
+                filesystem.state.dataset_id(),
+                &obsolete_manifests,
+            )?;
+            let transaction_id = crate::next_mounted_commit_transaction_id(
+                filesystem.state.generation,
+                &filesystem.root.summary(),
+            )?;
+            filesystem.root = crate::persist_state_with_runtime_at_transaction(
+                &mut self.store,
+                &filesystem.state,
+                transaction_id,
+                self.root_authentication_key,
+            )?;
+            self.store.pool_mut().sync_all()?;
+            let _ = crate::load_canonical_committed_state_for_dataset(
+                &self.store,
+                filesystem.state.dataset_id(),
+                self.root_authentication_key,
+            )?;
+            total_replacements = total_replacements.saturating_add(replacement_count);
+        }
+        Ok(total_replacements)
+    }
+
+    fn plan_relocated_content_receipts(
+        pool: &tidefs_local_object_store::Pool,
+        state: &FileSystemState,
+    ) -> crate::Result<Vec<RelocatedContentReceiptReplacement>> {
+        let keyspace = crate::FilesystemObjectKeyspace::new(state.dataset_id());
+        let current_inodes = state
             .inodes
             .values()
             .filter(|record| {
@@ -3827,13 +3918,11 @@ impl LocalFileSystem {
 
         for record in current_inodes {
             let content_key = keyspace.content(record.inode_id, record.data_version);
-            let Some((bytes, _)) = self
-                .store
-                .pool()
-                .get_with_current_receipt(DeviceIoClass::Data, content_key)?
+            let Some((bytes, _)) =
+                pool.get_with_current_receipt(DeviceIoClass::Data, content_key)?
             else {
                 return Err(FileSystemError::CorruptState {
-                    reason: "device removal lost current content placement authority",
+                    reason: "device lifecycle lost a current filesystem content manifest",
                 });
             };
             let sparse = bytes.starts_with(&CONTENT_MANIFEST_SPARSE_MAGIC);
@@ -3855,13 +3944,11 @@ impl LocalFileSystem {
                     chunk_ref.chunk_index,
                 );
                 let scoped_chunk_key = keyspace.scope(chunk_key);
-                let Some((chunk_bytes, current_chunk_receipt)) = self
-                    .store
-                    .pool()
-                    .get_with_current_receipt(DeviceIoClass::Data, scoped_chunk_key)?
+                let Some((chunk_bytes, current_chunk_receipt)) =
+                    pool.get_with_current_receipt(DeviceIoClass::Data, scoped_chunk_key)?
                 else {
                     return Err(FileSystemError::CorruptState {
-                        reason: "device removal content chunk lost placement authority",
+                        reason: "device lifecycle lost a current filesystem content chunk",
                     });
                 };
                 let mut candidate = chunk_ref.clone();
@@ -3869,7 +3956,7 @@ impl LocalFileSystem {
                 if current_chunk_receipt.generation == 0
                     || current_chunk_receipt.generation < chunk_ref.placement_receipt_generation
                     || !crate::allocation::pending_removal_chunk_payload_matches_ref(
-                        self.store.pool(),
+                        pool,
                         &candidate,
                         chunk_key,
                         &chunk_bytes,
@@ -3877,7 +3964,8 @@ impl LocalFileSystem {
                     )
                 {
                     return Err(FileSystemError::CorruptState {
-                        reason: "device removal replacement receipt does not match content",
+                        reason:
+                            "device lifecycle replacement receipt does not match filesystem content",
                     });
                 }
                 if chunk_ref.placement_receipt_generation != current_chunk_receipt.generation {
@@ -3887,9 +3975,83 @@ impl LocalFileSystem {
             }
 
             if changed {
-                replacements.push((record, manifest, sparse));
+                replacements.push(RelocatedContentReceiptReplacement {
+                    record,
+                    manifest,
+                    sparse,
+                    old_manifest_key: content_key,
+                });
             }
         }
+        Ok(replacements)
+    }
+
+    fn reconcile_relocated_content_receipts_for_state(
+        pool: &mut tidefs_local_object_store::Pool,
+        state: &mut FileSystemState,
+    ) -> crate::Result<(u64, Vec<ObjectKey>)> {
+        let replacements = Self::plan_relocated_content_receipts(pool, state)?;
+        let replacement_count = replacements.len() as u64;
+        if replacements.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+
+        let keyspace = crate::FilesystemObjectKeyspace::new(state.dataset_id());
+        state.generation = state.generation.saturating_add(1).max(1);
+        let tick = state.generation;
+        let mut obsolete_manifests = Vec::with_capacity(replacements.len());
+        for replacement in replacements {
+            let mut updated_record = replacement.record;
+            updated_record.data_version = tick;
+            updated_record.metadata_version = tick;
+            Self::advance_subtree_revision(&mut updated_record);
+            let mut manifest = replacement.manifest;
+            manifest.data_version = tick;
+            let encoded = if replacement.sparse {
+                encode_content_manifest_sparse(&manifest)
+            } else {
+                encode_content_manifest(&manifest)
+            };
+            let replacement_key = keyspace.content(updated_record.inode_id, tick);
+            pool.put_with_receipt(DeviceIoClass::Data, replacement_key, &encoded)?;
+            state.dirty_content.insert(updated_record.inode_id);
+            state.dirty_inodes.insert(updated_record.inode_id);
+            Arc::make_mut(&mut state.inodes).insert(updated_record.inode_id, updated_record);
+            obsolete_manifests.push(replacement.old_manifest_key);
+        }
+        Ok((replacement_count, obsolete_manifests))
+    }
+
+    fn persist_device_lifecycle_reclaim_queue(
+        &mut self,
+        dataset_id: DatasetId,
+        obsolete_manifests: &[ObjectKey],
+    ) -> crate::Result<()> {
+        if obsolete_manifests.is_empty() {
+            return Ok(());
+        }
+        let keyspace = crate::FilesystemObjectKeyspace::new(dataset_id);
+        let mut queue = crate::load_filesystem_reclaim_queue(self.store.pool(), keyspace)?;
+        for key in obsolete_manifests {
+            queue.insert(ReclaimQueueEntry::new(
+                ReclaimObjectKey(*key.as_bytes()),
+                -1,
+                ReclaimQueueFamily::Extent,
+            ));
+        }
+        let key = keyspace.scope(ObjectKey::from_name(
+            tidefs_local_object_store::FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME.as_bytes(),
+        ));
+        self.store
+            .pool_mut()
+            .put_with_receipt(DeviceIoClass::Data, key, &queue.encode())?;
+        self.store.pool_mut().sync_all()?;
+        Ok(())
+    }
+
+    fn reconcile_relocated_content_receipts(&mut self) -> crate::Result<u64> {
+        let keyspace = self.object_keyspace();
+        let replacements = Self::plan_relocated_content_receipts(self.store.pool(), &self.state)?;
 
         let replacement_count = replacements.len() as u64;
         if replacements.is_empty() {
@@ -3900,15 +4062,17 @@ impl LocalFileSystem {
         let reconcile = (|| {
             let tick = self.bump_generation();
             let mut updates = Vec::with_capacity(replacements.len());
-            for (old_record, mut manifest, sparse) in replacements {
-                let old_layout = crate::records::ContentLayout::Chunked(manifest.clone());
-                let mut updated_record = old_record.clone();
+            for replacement in replacements {
+                let old_layout =
+                    crate::records::ContentLayout::Chunked(replacement.manifest.clone());
+                let mut updated_record = replacement.record;
                 updated_record.data_version = tick;
                 updated_record.metadata_version = tick;
                 Self::advance_subtree_revision(&mut updated_record);
 
+                let mut manifest = replacement.manifest;
                 manifest.data_version = tick;
-                let encoded = if sparse {
+                let encoded = if replacement.sparse {
                     encode_content_manifest_sparse(&manifest)
                 } else {
                     encode_content_manifest(&manifest)
@@ -7398,6 +7562,32 @@ mod tests {
         (VfsLocalFileSystem::new(fs), root, devices)
     }
 
+    fn open_named_test_filesystem(
+        metadata: &std::path::Path,
+        devices: &[PathBuf],
+        pool_name: &str,
+        policy: tidefs_local_object_store::pool::PoolRedundancyPolicy,
+        dataset_path: &str,
+    ) -> LocalFileSystem {
+        LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+            metadata,
+            pool_name,
+            policy,
+            dataset_path,
+            crate::LocalFileSystemOpenConfig {
+                options: tidefs_local_object_store::StoreOptions::default(),
+                allocator_policy: crate::LocalStorageAllocatorPolicy::default(),
+                root_authentication_key: RootAuthenticationKey::demo_key(),
+                encryption: None,
+                compression: None,
+                log_device_device_path: None,
+                recovery_policy: crate::RecoveryPolicy::default(),
+                block_devices: Some(devices),
+            },
+        )
+        .expect("open named test filesystem")
+    }
+
     fn fixed_offset_pool_label(path: &std::path::Path) -> Vec<u8> {
         fixed_offset_pool_label_at(path, 0)
     }
@@ -8342,6 +8532,44 @@ mod tests {
             .write_file("/replace.bin", 0, payload)
             .expect("write replacement test file");
         filesystem.sync_all().expect("commit replacement test file");
+        filesystem
+            .create_filesystem_dataset(
+                "other",
+                DatasetId::from_bytes([0xD6; 16]),
+                Vec::new(),
+                DatasetFlags::default_create(),
+                SyncGuarantee::Local,
+            )
+            .expect("create independently rooted replacement filesystem");
+        drop(filesystem);
+        let independent_payload = b"replacement preserves independent filesystem bytes";
+        let mut independent = open_named_test_filesystem(
+            &metadata,
+            &old_devices,
+            "live-device-replace",
+            policy,
+            "other",
+        );
+        independent
+            .create_file("/independent.bin", 0o600)
+            .expect("create independent replacement file");
+        independent
+            .write_file("/independent.bin", 0, independent_payload)
+            .expect("write independent replacement file");
+        independent
+            .sync_all()
+            .expect("commit independent replacement file");
+        drop(independent);
+        let filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &old_devices,
+            "live-device-replace",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("reopen root filesystem for replacement");
         let engine = VfsLocalFileSystem::new(filesystem);
 
         let replaced = live_device_admin(
@@ -8374,7 +8602,7 @@ mod tests {
 
         let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
             &metadata,
-            &[replacement, old_devices[1].clone()],
+            &[replacement.clone(), old_devices[1].clone()],
             "live-device-replace",
             policy,
             tidefs_local_object_store::StoreOptions::default(),
@@ -8387,6 +8615,20 @@ mod tests {
                 .read_file("/replace.bin")
                 .expect("read exact bytes after replacement reimport"),
             payload
+        );
+        drop(reopened);
+        let independent = open_named_test_filesystem(
+            &metadata,
+            &[replacement, old_devices[1].clone()],
+            "live-device-replace",
+            policy,
+            "other",
+        );
+        assert_eq!(
+            independent
+                .read_file("/independent.bin")
+                .expect("read independent bytes after replacement reimport"),
+            independent_payload
         );
     }
 
@@ -8423,6 +8665,44 @@ mod tests {
         filesystem
             .sync_all()
             .expect("commit replacement resume file");
+        filesystem
+            .create_filesystem_dataset(
+                "other",
+                DatasetId::from_bytes([0xD7; 16]),
+                Vec::new(),
+                DatasetFlags::default_create(),
+                SyncGuarantee::Local,
+            )
+            .expect("create independent replacement-resume filesystem");
+        drop(filesystem);
+        let independent_payload = b"replacement resume preserves independent bytes";
+        let mut independent = open_named_test_filesystem(
+            &metadata,
+            &old_devices,
+            "live-device-replace-resume",
+            policy,
+            "other",
+        );
+        independent
+            .create_file("/independent.bin", 0o600)
+            .expect("create independent replacement-resume file");
+        independent
+            .write_file("/independent.bin", 0, independent_payload)
+            .expect("write independent replacement-resume file");
+        independent
+            .sync_all()
+            .expect("commit independent replacement-resume file");
+        drop(independent);
+        let mut filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &old_devices,
+            "live-device-replace-resume",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("reopen root before preparing replacement evidence");
 
         let old_config = filesystem.store.pool().config().devices[0].clone();
         let mut replacement_config = old_config;
@@ -8491,7 +8771,7 @@ mod tests {
 
         let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
             &metadata,
-            &[replacement, old_devices[1].clone()],
+            &[replacement.clone(), old_devices[1].clone()],
             "live-device-replace-resume",
             policy,
             tidefs_local_object_store::StoreOptions::default(),
@@ -8511,12 +8791,66 @@ mod tests {
                 .expect("read post-resume write after replacement reimport"),
             post_resume_payload
         );
+        drop(reopened);
+        let independent = open_named_test_filesystem(
+            &metadata,
+            &[replacement, old_devices[1].clone()],
+            "live-device-replace-resume",
+            policy,
+            "other",
+        );
+        assert_eq!(
+            independent
+                .read_file("/independent.bin")
+                .expect("read independent bytes after replacement resume"),
+            independent_payload
+        );
     }
 
     #[test]
-    fn pending_device_remove_recovers_evacuation_before_cow_root_publication() {
+    fn live_device_remove_pending_evacuation_recovers_before_cow_root_publication() {
         let (engine, td, devices) = temp_fs_with_block_devices(2);
         let marker_path = td.path().join("metadata/.tidefs_device_removal_pending");
+        engine
+            .fs
+            .borrow_mut()
+            .create_filesystem_dataset(
+                "other",
+                DatasetId::from_bytes([0xD8; 16]),
+                Vec::new(),
+                DatasetFlags::default_create(),
+                SyncGuarantee::Local,
+            )
+            .expect("create independent removal-resume filesystem");
+        drop(engine);
+        let independent_payload = b"removal resume preserves independent bytes";
+        let metadata = td.path().join("metadata");
+        let mut independent = open_named_test_filesystem(
+            &metadata,
+            &devices,
+            "tidefs",
+            tidefs_local_object_store::pool::PoolRedundancyPolicy::default(),
+            "other",
+        );
+        independent
+            .create_file("/independent.bin", 0o600)
+            .expect("create independent removal-resume file");
+        independent
+            .write_file("/independent.bin", 0, independent_payload)
+            .expect("write independent removal-resume file");
+        independent
+            .sync_all()
+            .expect("commit independent removal-resume file");
+        drop(independent);
+        let engine = VfsLocalFileSystem::new(
+            LocalFileSystem::open_with_block_devices(
+                &metadata,
+                &devices,
+                tidefs_local_object_store::StoreOptions::default(),
+                RootAuthenticationKey::demo_key(),
+            )
+            .expect("reopen root before preparing removal evidence"),
+        );
         let (selected_path, selected_payload, target_path, _, _) = {
             let mut fs = engine.fs.borrow_mut();
             let mut selected = None;
@@ -8637,10 +8971,29 @@ mod tests {
                 .all(|device| device.path != target_path),
             "recovered topology must exclude the retired target"
         );
+        let survivor = devices
+            .iter()
+            .find(|device| **device != target_path)
+            .expect("one removal-resume survivor")
+            .clone();
+        drop(reopened);
+        let independent = open_named_test_filesystem(
+            &metadata,
+            std::slice::from_ref(&survivor),
+            "tidefs",
+            tidefs_local_object_store::pool::PoolRedundancyPolicy::default(),
+            "other",
+        );
+        assert_eq!(
+            independent
+                .read_file("/independent.bin")
+                .expect("read independent bytes after removal resume"),
+            independent_payload
+        );
     }
 
     #[test]
-    fn live_device_remove_refuses_unowned_roots_before_evacuation() {
+    fn live_device_remove_preserves_independent_filesystem_and_refuses_snapshot_roots() {
         let (snapshot_engine, snapshot_root, snapshot_devices) = temp_fs_with_block_devices(2);
         snapshot_engine
             .fs
@@ -8675,6 +9028,54 @@ mod tests {
             2
         );
 
+        let (corrupt_engine, corrupt_root, corrupt_devices) = temp_fs_with_block_devices(2);
+        let corrupt_dataset_id = DatasetId::from_bytes([0xD4; 16]);
+        {
+            let mut filesystem = corrupt_engine.fs.borrow_mut();
+            filesystem
+                .create_filesystem_dataset(
+                    "other",
+                    corrupt_dataset_id,
+                    Vec::new(),
+                    DatasetFlags::default_create(),
+                    SyncGuarantee::Local,
+                )
+                .expect("create independent corruption preflight filesystem");
+            let root_key = filesystem
+                .store
+                .dataset_root(corrupt_dataset_id)
+                .expect("independent filesystem has a typed root")
+                .object_key;
+            assert!(filesystem
+                .store
+                .pool_mut()
+                .delete(DeviceIoClass::Data, root_key)
+                .expect("remove independent typed root for corruption preflight"));
+            filesystem
+                .store
+                .pool_mut()
+                .sync_all()
+                .expect("sync corrupt independent typed-root fixture");
+        }
+        let corrupt_refusal = live_device_admin(
+            &corrupt_engine,
+            "remove",
+            json!({
+                "device_path": corrupt_devices[1].display().to_string(),
+                "force": false,
+            }),
+            true,
+        );
+        assert_eq!(corrupt_refusal["ok"], false, "{corrupt_refusal}");
+        assert!(!corrupt_root
+            .path()
+            .join("metadata/.tidefs_device_removal_pending")
+            .exists());
+        assert_eq!(
+            corrupt_engine.fs.borrow().store.pool().stats().device_count,
+            2
+        );
+
         let (dataset_engine, dataset_root, dataset_devices) = temp_fs_with_block_devices(2);
         dataset_engine
             .fs
@@ -8687,7 +9088,36 @@ mod tests {
                 SyncGuarantee::Local,
             )
             .expect("create second filesystem dataset");
-        let dataset_refusal = live_device_admin(
+        drop(dataset_engine);
+        let metadata = dataset_root.path().join("metadata");
+        let independent_payload = b"removal preserves independent filesystem bytes";
+        let mut independent = open_named_test_filesystem(
+            &metadata,
+            &dataset_devices,
+            "tidefs",
+            tidefs_local_object_store::pool::PoolRedundancyPolicy::default(),
+            "other",
+        );
+        independent
+            .create_file("/independent.bin", 0o600)
+            .expect("create independent removal file");
+        independent
+            .write_file("/independent.bin", 0, independent_payload)
+            .expect("write independent removal file");
+        independent
+            .sync_all()
+            .expect("commit independent removal file");
+        drop(independent);
+        let dataset_engine = VfsLocalFileSystem::new(
+            LocalFileSystem::open_with_block_devices(
+                &metadata,
+                &dataset_devices,
+                tidefs_local_object_store::StoreOptions::default(),
+                RootAuthenticationKey::demo_key(),
+            )
+            .expect("reopen root filesystem for removal"),
+        );
+        let dataset_removal = live_device_admin(
             &dataset_engine,
             "remove",
             json!({
@@ -8696,20 +9126,31 @@ mod tests {
             }),
             true,
         );
-        assert_eq!(dataset_refusal["ok"], false, "{dataset_refusal}");
-        assert!(dataset_refusal["error"]
-            .as_str()
-            .is_some_and(|message| message.contains("another dataset in the Pool")));
+        assert_eq!(dataset_removal["ok"], true, "{dataset_removal}");
         assert!(!dataset_root
             .path()
             .join("metadata/.tidefs_device_removal_pending")
             .exists());
         assert_eq!(
             dataset_engine.fs.borrow().store.pool().stats().device_count,
-            2
+            1
+        );
+        drop(dataset_engine);
+        let independent = open_named_test_filesystem(
+            &metadata,
+            std::slice::from_ref(&dataset_devices[0]),
+            "tidefs",
+            tidefs_local_object_store::pool::PoolRedundancyPolicy::default(),
+            "other",
+        );
+        assert_eq!(
+            independent
+                .read_file("/independent.bin")
+                .expect("read independent bytes after survivor reopen"),
+            independent_payload
         );
         drop(snapshot_engine);
-        drop(dataset_engine);
+        drop(corrupt_engine);
     }
 
     #[cfg(feature = "replication-io")]
