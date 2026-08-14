@@ -53,9 +53,9 @@ product-grade.
 | `pool list-props` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list pool property definitions and effective values |
 | `snapshot create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create snapshots through the live owner or explicit offline devices |
 | `snapshot list` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list local snapshot catalog entries with kind, origin, hold, and generation metadata |
-| `snapshot clone create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create local snapshot clones through the live owner or explicit offline devices |
-| `snapshot clone delete` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | delete local snapshot clones through the live owner or explicit offline devices |
-| `snapshot clone promote` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | promote local snapshot clones through the live owner or explicit offline devices |
+| `snapshot clone create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create writable local volume datasets from canonical volume snapshots; filesystem snapshot aliases are explicitly unsupported |
+| `snapshot clone delete` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | delete unpromoted writable volume clones through the live owner or explicit offline devices |
+| `snapshot clone promote` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | promote writable volume clones into independent volumes through canonical Pool authority |
 | `snapshot bookmark create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create local snapshot bookmarks through the live owner or explicit offline devices |
 | `snapshot bookmark delete` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | delete local snapshot bookmarks through the live owner or explicit offline devices |
 | `snapshot hold` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | place local deletion-prevention holds on snapshots or clones |
@@ -83,6 +83,7 @@ product-grade.
 | `block list` | `public-operator` | `no-live-pool-state` | `unguarded` | `visible` | list attached ublk devices |
 | `dataset create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create catalog-backed datasets through owner authority or explicit devices |
 | `dataset list` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list catalog-backed datasets through owner authority or explicit devices |
+| `dataset resize` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | resize Pool-backed volumes through owner authority or explicit devices |
 | `dataset destroy` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | destroy catalog entries through owner authority or explicit devices |
 | `dataset rename` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | rename catalog entries through owner authority or explicit devices |
 | `dataset set-strategy` | `public-operator` | `live-owner-or-offline-input` | `local-only-when-mutating` | `visible` | set dataset feature strategy through owner authority or explicit devices |

@@ -114,6 +114,7 @@ const LOCAL_ONLY_COMMANDS: &[&str] = &[
     "block attach",
     "block detach",
     "dataset create",
+    "dataset resize",
     "dataset destroy",
     "dataset rename",
     "dataset seal-key",
@@ -387,6 +388,7 @@ mod tests {
             #[cfg(feature = "block-volume")]
             "block detach",
             "dataset create",
+            "dataset resize",
             "dataset destroy",
             "dataset rename",
             "dataset set-strategy",
