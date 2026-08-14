@@ -351,19 +351,19 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         path: "snapshot clone create",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "create local snapshot clones through the live owner or explicit offline devices",
+        summary: "create writable local volume datasets from canonical volume snapshots; filesystem snapshot aliases are explicitly unsupported",
     },
     CommandSurface {
         path: "snapshot clone delete",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "delete local snapshot clones through the live owner or explicit offline devices",
+        summary: "delete unpromoted writable volume clones through the live owner or explicit offline devices",
     },
     CommandSurface {
         path: "snapshot clone promote",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "promote local snapshot clones through the live owner or explicit offline devices",
+        summary: "promote writable volume clones into independent volumes through canonical Pool authority",
     },
     CommandSurface {
         path: "snapshot bookmark create",

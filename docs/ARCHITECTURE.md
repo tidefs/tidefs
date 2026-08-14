@@ -190,6 +190,28 @@ typed root contains at least:
 - stable `DatasetId` namespace and current root generation; and
 - resize and snapshot generation state.
 
+A writable local volume clone is another complete `DatasetType::Volume`, not
+a catalog alias. `tidefsctl snapshot clone create <pool> <clone>
+<volume@snapshot>` publishes a new stable `DatasetId`, `DatasetFlags::CLONE`,
+an exact lineage edge to the canonical typed snapshot, and a target-namespaced
+volume root initialized from the snapshot's immutable map. Reads may share
+that captured immutable graph; every later map node and chunk created by clone
+writes uses the clone's `DatasetId`, so block writes, discard, write zeroes,
+and flush diverge without changing the source volume or snapshot. Snapshot
+destroy refuses while an unpromoted clone retains that lineage. Promotion
+atomically removes the lineage and clone flag while preserving the writable
+volume; clone delete removes only the unpromoted clone's catalog/root
+authority. Reopen validates the surviving lineage, typed roots, geometry, and
+map graphs before publication.
+
+Clone lifecycle mutations use the same Pool owner as block attach and are
+refused while the affected source or clone volume is actively exported.
+Filesystem `SnapshotRecord::Clone` entries remain shared-root snapshot-table
+metadata, not independently mountable writable datasets. The product clone
+command explicitly refuses filesystem snapshot sources until filesystem roots
+have a dataset-scoped object namespace capable of supporting an independent
+writable filesystem dataset.
+
 The local operator path is:
 
 ```text

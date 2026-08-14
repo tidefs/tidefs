@@ -419,6 +419,9 @@ fn dispatch_request(
         | LivePoolAdminCommand::DatasetRename
         | LivePoolAdminCommand::DatasetDestroy
         | LivePoolAdminCommand::SnapshotCreate
+        | LivePoolAdminCommand::SnapshotCloneCreate
+        | LivePoolAdminCommand::SnapshotCloneDelete
+        | LivePoolAdminCommand::SnapshotClonePromote
         | LivePoolAdminCommand::SnapshotDestroy
         | LivePoolAdminCommand::SnapshotRollback => {
             volume_lifecycle_mutation(&request, admin, block_export)
@@ -428,6 +431,9 @@ fn dispatch_request(
         | LivePoolAdminCommand::DatasetRename
         | LivePoolAdminCommand::DatasetDestroy
         | LivePoolAdminCommand::SnapshotCreate
+        | LivePoolAdminCommand::SnapshotCloneCreate
+        | LivePoolAdminCommand::SnapshotCloneDelete
+        | LivePoolAdminCommand::SnapshotClonePromote
         | LivePoolAdminCommand::SnapshotDestroy => delegate_admin_request(&request, admin),
         #[cfg(not(feature = "block-volume"))]
         LivePoolAdminCommand::SnapshotRollback => rollback_snapshot(&request, admin),
@@ -492,17 +498,17 @@ fn volume_lifecycle_mutation(
     admin: &LiveOwnerAdmin,
     block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
 ) -> LivePoolAdminResponse {
-    let target = match volume_mutation_target(request) {
-        Ok(target) => target,
+    let targets = match volume_mutation_targets(request) {
+        Ok(targets) => targets,
         Err(error) => return live_admin_typed_error(error),
     };
-    let Some(target) = target else {
+    if targets.is_empty() {
         if request.command == LivePoolAdminCommand::SnapshotRollback {
             return rollback_snapshot(request, admin);
         }
         return delegate_admin_request(request, admin);
-    };
-    match with_volume_mutation_admission(block_export, target, || {
+    }
+    match with_volume_mutation_admission(block_export, &targets, || {
         delegate_admin_request(request, admin)
     }) {
         Ok(response) => response,
@@ -516,13 +522,15 @@ fn volume_lifecycle_mutation(
 #[cfg(feature = "block-volume")]
 fn with_volume_mutation_admission<T>(
     block_export: &Arc<Mutex<Option<ActiveBlockExport>>>,
-    target: &str,
+    targets: &[&str],
     mutation: impl FnOnce() -> T,
 ) -> Result<T, String> {
     let export_admission = block_export
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    ensure_volume_mutation_allowed(&export_admission, target)?;
+    for target in targets {
+        ensure_volume_mutation_allowed(&export_admission, target)?;
+    }
     let result = mutation();
     drop(export_admission);
     Ok(result)
@@ -545,9 +553,21 @@ fn ensure_volume_mutation_allowed(
 }
 
 #[cfg(feature = "block-volume")]
-fn volume_mutation_target(
+fn volume_mutation_targets(
     request: &LivePoolAdminRequest,
-) -> Result<Option<&str>, LivePoolAdminError> {
+) -> Result<Vec<&str>, LivePoolAdminError> {
+    if request.command == LivePoolAdminCommand::SnapshotCloneCreate {
+        let clone = required_request_arg_str(&request.args, "clone")?;
+        let source = required_request_arg_str(&request.args, "source")?;
+        let source_volume = volume_snapshot_source(source)?;
+        return Ok(vec![source_volume, clone]);
+    }
+    if matches!(
+        request.command,
+        LivePoolAdminCommand::SnapshotCloneDelete | LivePoolAdminCommand::SnapshotClonePromote
+    ) {
+        return Ok(vec![required_request_arg_str(&request.args, "clone")?]);
+    }
     let name = match request.command {
         LivePoolAdminCommand::DatasetResize | LivePoolAdminCommand::DatasetDestroy => "name",
         LivePoolAdminCommand::DatasetRename => "old_name",
@@ -568,7 +588,7 @@ fn volume_mutation_target(
             | LivePoolAdminCommand::SnapshotRollback
     ) && target.is_none()
     {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let target = target.ok_or_else(|| {
         LivePoolAdminError::malformed(format!("dataset mutation requires {name}"))
@@ -579,17 +599,22 @@ fn volume_mutation_target(
             | LivePoolAdminCommand::SnapshotDestroy
             | LivePoolAdminCommand::SnapshotRollback
     ) {
-        let (source, snapshot) = target.rsplit_once('@').ok_or_else(|| {
-            LivePoolAdminError::malformed("volume snapshot target requires <dataset>@<snapshot>")
-        })?;
-        if source.is_empty() || snapshot.is_empty() || source.contains('@') {
-            return Err(LivePoolAdminError::malformed(
-                "volume snapshot target must name one source and one snapshot",
-            ));
-        }
-        return Ok(Some(source));
+        return Ok(vec![volume_snapshot_source(target)?]);
     }
-    Ok(Some(target))
+    Ok(vec![target])
+}
+
+#[cfg(feature = "block-volume")]
+fn volume_snapshot_source(target: &str) -> Result<&str, LivePoolAdminError> {
+    let (source, snapshot) = target.rsplit_once('@').ok_or_else(|| {
+        LivePoolAdminError::malformed("volume snapshot target requires <dataset>@<snapshot>")
+    })?;
+    if source.is_empty() || snapshot.is_empty() || source.contains('@') {
+        return Err(LivePoolAdminError::malformed(
+            "volume snapshot target must name one source and one snapshot",
+        ));
+    }
+    Ok(source)
 }
 
 #[cfg(feature = "block-volume")]
@@ -943,6 +968,67 @@ fn standalone_block_admin_request(
             }),
             wants_json,
         ),
+        LivePoolAdminCommand::SnapshotCloneCreate => {
+            let clone = match required_request_arg_str(&request.args, "clone") {
+                Ok(clone) => clone,
+                Err(error) => return live_admin_typed_error(error),
+            };
+            let source = match required_request_arg_str(&request.args, "source") {
+                Ok(source) => source,
+                Err(error) => return live_admin_typed_error(error),
+            };
+            if let Err(error) = volume_snapshot_source(source) {
+                return LivePoolAdminResponse::error(
+                    1,
+                    format!(
+                        "snapshot clone create: source '{source}' is not a canonical volume snapshot; filesystem SnapshotRecord clones are metadata aliases, not independently writable datasets, and are unsupported by the product clone command: {}",
+                        error.message
+                    ),
+                );
+            }
+            standalone_volume_clone_response(
+                "created",
+                runtime
+                    .create_volume_clone(clone, source)
+                    .map_err(|error| error.to_string()),
+                wants_json,
+                |summary| {
+                    (format!("volume clone '{}' source_snapshot='{}' source_volume='{}' kind=volume promoted={} generation={} size={} block_size={}", summary.path, summary.source_snapshot_path, summary.source_volume_path, summary.promoted, summary.generation, summary.geometry.capacity_bytes, summary.geometry.block_size_bytes), json!({"path": summary.path, "id": summary.clone_id.to_string(), "source_snapshot": summary.source_snapshot_path, "source_snapshot_id": summary.source_snapshot_id.to_string(), "source_volume": summary.source_volume_path, "source_volume_id": summary.source_volume_id.to_string(), "kind": "volume", "promoted": summary.promoted, "generation": summary.generation, "size": summary.geometry.capacity_bytes, "block_size": summary.geometry.block_size_bytes}))
+                },
+            )
+        }
+        LivePoolAdminCommand::SnapshotCloneDelete => {
+            let clone = match required_request_arg_str(&request.args, "clone") {
+                Ok(clone) => clone,
+                Err(error) => return live_admin_typed_error(error),
+            };
+            standalone_volume_clone_response(
+                "logically destroyed",
+                runtime
+                    .destroy_volume_clone(clone)
+                    .map_err(|error| error.to_string()),
+                wants_json,
+                |summary| {
+                    (format!("volume clone '{}' source_snapshot='{}' source_volume='{}' kind=volume promoted={} generation={} size={} block_size={}", summary.path, summary.source_snapshot_path, summary.source_volume_path, summary.promoted, summary.generation, summary.geometry.capacity_bytes, summary.geometry.block_size_bytes), json!({"path": summary.path, "id": summary.clone_id.to_string(), "source_snapshot": summary.source_snapshot_path, "source_snapshot_id": summary.source_snapshot_id.to_string(), "source_volume": summary.source_volume_path, "source_volume_id": summary.source_volume_id.to_string(), "kind": "volume", "promoted": summary.promoted, "generation": summary.generation, "size": summary.geometry.capacity_bytes, "block_size": summary.geometry.block_size_bytes}))
+                },
+            )
+        }
+        LivePoolAdminCommand::SnapshotClonePromote => {
+            let clone = match required_request_arg_str(&request.args, "clone") {
+                Ok(clone) => clone,
+                Err(error) => return live_admin_typed_error(error),
+            };
+            standalone_volume_clone_response(
+                "promoted",
+                runtime
+                    .promote_volume_clone(clone)
+                    .map_err(|error| error.to_string()),
+                wants_json,
+                |summary| {
+                    (format!("volume clone '{}' source_snapshot='{}' source_volume='{}' kind=volume promoted={} generation={} size={} block_size={}", summary.path, summary.source_snapshot_path, summary.source_volume_path, summary.promoted, summary.generation, summary.geometry.capacity_bytes, summary.geometry.block_size_bytes), json!({"path": summary.path, "id": summary.clone_id.to_string(), "source_snapshot": summary.source_snapshot_path, "source_snapshot_id": summary.source_snapshot_id.to_string(), "source_volume": summary.source_volume_path, "source_volume_id": summary.source_volume_id.to_string(), "kind": "volume", "promoted": summary.promoted, "generation": summary.generation, "size": summary.geometry.capacity_bytes, "block_size": summary.geometry.block_size_bytes}))
+                },
+            )
+        }
         LivePoolAdminCommand::SnapshotDestroy => standalone_volume_snapshot_response(
             "logically destroyed",
             required_request_arg_str(&request.args, "target").and_then(|target| {
@@ -1044,6 +1130,39 @@ fn standalone_volume_snapshot_response(
             LivePoolAdminResponse::ok_text(text)
         }
         Err(error) => LivePoolAdminResponse::error(1, error.message),
+    }
+}
+
+#[cfg(feature = "block-volume")]
+fn standalone_volume_clone_response<T>(
+    outcome: &str,
+    result: Result<T, String>,
+    wants_json: bool,
+    render: impl FnOnce(&T) -> (String, serde_json::Value),
+) -> LivePoolAdminResponse {
+    match result {
+        Ok(summary) => {
+            let (line, value) = render(&summary);
+            if wants_json {
+                return LivePoolAdminResponse::ok_machine_json(
+                    json!({
+                        "ok": true,
+                        "outcome": outcome,
+                        "physical_reclaim": false,
+                        "clone": value,
+                    })
+                    .to_string(),
+                );
+            }
+            let mut text = format!("{line} {outcome}");
+            if outcome == "logically destroyed" {
+                text.push_str(
+                    "\nphysical reclaim remains pending; no secure-erasure claim is made",
+                );
+            }
+            LivePoolAdminResponse::ok_text(text)
+        }
+        Err(error) => LivePoolAdminResponse::error(1, format!("snapshot clone: {error}")),
     }
 }
 
@@ -1600,7 +1719,7 @@ mod tests {
     fn volume_mutation_admission_stays_locked_through_delegation() {
         let active = Arc::new(Mutex::new(None));
 
-        with_volume_mutation_admission(&active, "vol", || {
+        with_volume_mutation_admission(&active, &["vol"], || {
             assert!(matches!(
                 active.try_lock(),
                 Err(std::sync::TryLockError::WouldBlock)
@@ -1613,7 +1732,7 @@ mod tests {
 
     #[cfg(feature = "block-volume")]
     #[test]
-    fn standalone_block_owner_routes_snapshot_to_active_export_admission() {
+    fn standalone_block_owner_routes_volume_clone_and_snapshot_to_active_export_admission() {
         use std::fs::OpenOptions;
 
         use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, SyncGuarantee};
@@ -1710,6 +1829,33 @@ mod tests {
                 .collect(),
             ),
             (
+                LivePoolAdminCommand::SnapshotCloneCreate,
+                [
+                    (
+                        "clone".to_string(),
+                        LivePoolAdminArg::String("clone".into()),
+                    ),
+                    (
+                        "source".to_string(),
+                        LivePoolAdminArg::String("vol@before".into()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            (
+                LivePoolAdminCommand::SnapshotCloneDelete,
+                [("clone".to_string(), LivePoolAdminArg::String("vol".into()))]
+                    .into_iter()
+                    .collect(),
+            ),
+            (
+                LivePoolAdminCommand::SnapshotClonePromote,
+                [("clone".to_string(), LivePoolAdminArg::String("vol".into()))]
+                    .into_iter()
+                    .collect(),
+            ),
+            (
                 LivePoolAdminCommand::SnapshotRollback,
                 [(
                     "target".to_string(),
@@ -1755,7 +1901,7 @@ mod tests {
 
     #[cfg(feature = "block-volume")]
     #[test]
-    fn volume_snapshot_mutation_targets_source_and_filesystem_requests_delegate() {
+    fn volume_clone_and_snapshot_mutation_targets_are_exact() {
         for command in [
             LivePoolAdminCommand::SnapshotCreate,
             LivePoolAdminCommand::SnapshotDestroy,
@@ -1770,7 +1916,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             );
-            assert_eq!(volume_mutation_target(&request).unwrap(), Some("vol"));
+            assert_eq!(volume_mutation_targets(&request).unwrap(), vec!["vol"]);
 
             request.args = LivePoolAdminArgs(
                 [(
@@ -1780,7 +1926,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             );
-            assert!(volume_mutation_target(&request).is_err());
+            assert!(volume_mutation_targets(&request).is_err());
 
             request.args = LivePoolAdminArgs(
                 [(
@@ -1790,8 +1936,29 @@ mod tests {
                 .into_iter()
                 .collect(),
             );
-            assert_eq!(volume_mutation_target(&request).unwrap(), None);
+            assert!(volume_mutation_targets(&request).unwrap().is_empty());
         }
+
+        let mut create =
+            LivePoolAdminRequest::new(LivePoolAdminCommand::SnapshotCloneCreate, "tank");
+        create.args = LivePoolAdminArgs(
+            [
+                (
+                    "clone".to_string(),
+                    LivePoolAdminArg::String("clone".to_string()),
+                ),
+                (
+                    "source".to_string(),
+                    LivePoolAdminArg::String("vol@before".to_string()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            volume_mutation_targets(&create).unwrap(),
+            vec!["vol", "clone"]
+        );
     }
 
     #[cfg(feature = "block-volume")]

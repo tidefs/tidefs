@@ -1298,6 +1298,15 @@ impl VfsLocalFileSystem {
                         self.live_snapshot_create(&args, wants_json)
                     }
                     LivePoolAdminCommand::SnapshotList => self.live_snapshot_list(wants_json),
+                    LivePoolAdminCommand::SnapshotCloneCreate => {
+                        self.live_snapshot_clone_create(&args, wants_json)
+                    }
+                    LivePoolAdminCommand::SnapshotCloneDelete => {
+                        self.live_snapshot_clone_delete(&args, wants_json)
+                    }
+                    LivePoolAdminCommand::SnapshotClonePromote => {
+                        self.live_snapshot_clone_promote(&args, wants_json)
+                    }
                     LivePoolAdminCommand::SnapshotDestroy => self.live_snapshot_destroy(&args),
                     LivePoolAdminCommand::SnapshotRollback => self.live_snapshot_rollback(&args),
                     LivePoolAdminCommand::SnapshotExtract => {
@@ -1344,6 +1353,9 @@ impl VfsLocalFileSystem {
             | LivePoolAdminCommand::DatasetSealKey
             | LivePoolAdminCommand::DatasetRotateKey
             | LivePoolAdminCommand::SnapshotCreate
+            | LivePoolAdminCommand::SnapshotCloneCreate
+            | LivePoolAdminCommand::SnapshotCloneDelete
+            | LivePoolAdminCommand::SnapshotClonePromote
             | LivePoolAdminCommand::SnapshotDestroy
             | LivePoolAdminCommand::SnapshotRollback
             | LivePoolAdminCommand::SnapshotExtract
@@ -2544,6 +2556,64 @@ impl VfsLocalFileSystem {
             Err(err) => live_admin_error(
                 1,
                 format!("snapshot create: failed to create snapshot '{name}': {err}"),
+            ),
+        }
+    }
+
+    fn live_snapshot_clone_create(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
+        let clone = match live_admin_arg(args, "clone") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let source = match live_admin_arg(args, "source") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        if !is_volume_snapshot_clone_source(source) {
+            return filesystem_clone_unsupported("create", source);
+        }
+        let mut fs = self.fs.borrow_mut();
+        match fs.create_volume_clone_dataset(clone, source) {
+            Ok(summary) => volume_clone_response("created", &summary, wants_json),
+            Err(err) => live_admin_error(
+                1,
+                format!(
+                    "snapshot clone create: failed to create volume clone '{clone}' from '{source}': {err}"
+                ),
+            ),
+        }
+    }
+
+    fn live_snapshot_clone_delete(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
+        let clone = match live_admin_arg(args, "clone") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let mut fs = self.fs.borrow_mut();
+        match fs.destroy_volume_clone_dataset(clone) {
+            Ok(summary) => volume_clone_response("logically destroyed", &summary, wants_json),
+            Err(err) => live_admin_error(
+                1,
+                format!(
+                    "snapshot clone delete: '{clone}' is not an unpromoted writable Pool volume clone: {err}"
+                ),
+            ),
+        }
+    }
+
+    fn live_snapshot_clone_promote(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
+        let clone = match live_admin_arg(args, "clone") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let mut fs = self.fs.borrow_mut();
+        match fs.promote_volume_clone_dataset(clone) {
+            Ok(summary) => volume_clone_response("promoted", &summary, wants_json),
+            Err(err) => live_admin_error(
+                1,
+                format!(
+                    "snapshot clone promote: '{clone}' is not an unpromoted writable Pool volume clone: {err}"
+                ),
             ),
         }
     }
@@ -4028,6 +4098,70 @@ fn volume_snapshot_response(
         }));
     }
     let mut text = format!("{} {outcome}", volume_snapshot_line(summary));
+    if outcome == "logically destroyed" {
+        text.push_str("\nphysical reclaim remains pending; no secure-erasure claim is made");
+    }
+    live_admin_ok_text(text)
+}
+
+fn is_volume_snapshot_clone_source(source: &str) -> bool {
+    source.split_once('@').is_some_and(|(volume, snapshot)| {
+        !volume.is_empty() && !snapshot.is_empty() && !snapshot.contains('@')
+    })
+}
+
+fn filesystem_clone_unsupported(operation: &str, source: &str) -> LivePoolAdminResponse {
+    live_admin_error(
+        1,
+        format!(
+            "snapshot clone {operation}: source '{source}' is not a canonical volume snapshot; filesystem SnapshotRecord clones are metadata aliases, not independently writable datasets, and are unsupported by the product clone command"
+        ),
+    )
+}
+
+fn volume_clone_line(summary: &tidefs_pool_runtime::VolumeCloneSummary) -> String {
+    format!(
+        "volume clone '{}' source_snapshot='{}' source_volume='{}' kind=volume promoted={} generation={} size={} block_size={}",
+        summary.path,
+        summary.source_snapshot_path,
+        summary.source_volume_path,
+        summary.promoted,
+        summary.generation,
+        summary.geometry.capacity_bytes,
+        summary.geometry.block_size_bytes,
+    )
+}
+
+fn volume_clone_json(summary: &tidefs_pool_runtime::VolumeCloneSummary) -> Value {
+    json!({
+        "path": summary.path,
+        "id": summary.clone_id.to_string(),
+        "source_snapshot": summary.source_snapshot_path,
+        "source_snapshot_id": summary.source_snapshot_id.to_string(),
+        "source_volume": summary.source_volume_path,
+        "source_volume_id": summary.source_volume_id.to_string(),
+        "kind": "volume",
+        "promoted": summary.promoted,
+        "generation": summary.generation,
+        "size": summary.geometry.capacity_bytes,
+        "block_size": summary.geometry.block_size_bytes,
+    })
+}
+
+fn volume_clone_response(
+    outcome: &str,
+    summary: &tidefs_pool_runtime::VolumeCloneSummary,
+    wants_json: bool,
+) -> LivePoolAdminResponse {
+    if wants_json {
+        return live_admin_ok_json(json!({
+            "ok": true,
+            "outcome": outcome,
+            "physical_reclaim": false,
+            "clone": volume_clone_json(summary),
+        }));
+    }
+    let mut text = format!("{} {outcome}", volume_clone_line(summary));
     if outcome == "logically destroyed" {
         text.push_str("\nphysical reclaim remains pending; no secure-erasure claim is made");
     }
@@ -6860,6 +6994,107 @@ mod tests {
             filesystem_destroy["ok"], true,
             "filesystem snapshot destroy response: {filesystem_destroy}"
         );
+    }
+
+    #[test]
+    fn live_volume_clone_is_writable_cow_and_filesystem_aliases_are_refused() {
+        let (engine, _td) = temp_fs();
+        let created = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "source",
+                "parent": "root",
+                "type": "volume",
+                "size": 8192,
+                "sync": "local",
+            }),
+        );
+        assert_eq!(created["ok"], true, "create response: {created}");
+
+        {
+            let mut fs = engine.fs.borrow_mut();
+            let mut volume = fs.open_volume_dataset("source").unwrap();
+            fs.write_volume_blocks(&mut volume, 0, &[0x11; 4096])
+                .unwrap();
+            fs.flush_volume(&mut volume).unwrap();
+        }
+        let snapshot =
+            live_snapshot_admin(&engine, "create", json!({"target": "source@base"}), false);
+        assert_eq!(snapshot["ok"], true, "snapshot response: {snapshot}");
+
+        let clone = live_snapshot_admin(
+            &engine,
+            "clone-create",
+            json!({"clone": "clone", "source": "source@base"}),
+            true,
+        );
+        assert_eq!(clone["ok"], true, "clone response: {clone}");
+        assert_eq!(clone["json"]["clone"]["path"], "clone");
+        assert_eq!(clone["json"]["clone"]["source_snapshot"], "source@base");
+        assert_eq!(clone["json"]["clone"]["kind"], "volume");
+        assert_eq!(clone["json"]["clone"]["promoted"], false);
+
+        {
+            let mut fs = engine.fs.borrow_mut();
+            let source = fs.open_volume_dataset("source").unwrap();
+            let mut clone = fs.open_volume_dataset("clone").unwrap();
+            assert_eq!(
+                fs.read_volume_blocks(&clone, 0, 1).unwrap(),
+                vec![0x11; 4096]
+            );
+            fs.write_volume_blocks(&mut clone, 0, &[0x22; 4096])
+                .unwrap();
+            fs.flush_volume(&mut clone).unwrap();
+            assert_eq!(
+                fs.read_volume_blocks(&source, 0, 1).unwrap(),
+                vec![0x11; 4096]
+            );
+        }
+
+        let retained =
+            live_snapshot_admin(&engine, "destroy", json!({"target": "source@base"}), false);
+        assert_eq!(retained["ok"], false, "snapshot destroy: {retained}");
+        assert!(retained["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("lineage")));
+
+        let promoted =
+            live_snapshot_admin(&engine, "clone-promote", json!({"clone": "clone"}), true);
+        assert_eq!(promoted["ok"], true, "promote response: {promoted}");
+        assert_eq!(promoted["json"]["clone"]["promoted"], true);
+        assert_eq!(
+            live_snapshot_admin(&engine, "destroy", json!({"target": "source@base"}), false,)["ok"],
+            true
+        );
+        {
+            let fs = engine.fs.borrow();
+            let clone = fs.open_volume_dataset("clone").unwrap();
+            assert_eq!(
+                fs.read_volume_blocks(&clone, 0, 1).unwrap(),
+                vec![0x22; 4096]
+            );
+        }
+
+        assert_eq!(
+            live_snapshot_admin(
+                &engine,
+                "create",
+                json!({"name": "filesystem-before"}),
+                false,
+            )["ok"],
+            true
+        );
+        let unsupported = live_snapshot_admin(
+            &engine,
+            "clone-create",
+            json!({"clone": "not-a-dataset", "source": "filesystem-before"}),
+            false,
+        );
+        assert_eq!(unsupported["ok"], false);
+        assert!(unsupported["error"].as_str().is_some_and(|error| {
+            error.contains("metadata aliases") && error.contains("not independently writable")
+        }));
     }
 
     #[test]
