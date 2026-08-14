@@ -1380,8 +1380,8 @@ pub(crate) fn canonical_filesystem_dataset_object_keys(
             }
         }
         for summary in roots {
-            keys.extend(object_keys_for_committed_root_summary_in_keyspace(
-                runtime.pool_mut().raw_primary_store_mut(),
+            keys.extend(pool_object_keys_for_committed_root_summary_in_keyspace(
+                runtime.pool(),
                 &summary,
                 root_authentication_key,
                 keyspace,
@@ -1415,6 +1415,64 @@ pub(crate) fn canonical_filesystem_dataset_object_keys(
         keys.extend(intent_log.durable_object_keys());
     }
 
+    Ok(keys)
+}
+
+fn pool_object_keys_for_committed_root_summary_in_keyspace(
+    pool: &Pool,
+    summary: &CommittedRootSummary,
+    root_authentication_key: RootAuthenticationKey,
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<BTreeSet<ObjectKey>> {
+    let root = root_commit_from_summary(summary);
+    let candidate =
+        read_pool_transaction_candidate_objects(pool, &root, root_authentication_key, keyspace)?;
+    let mut keys = BTreeSet::new();
+    keys.insert(keyspace.transaction_superblock(root.transaction_id));
+    keys.insert(keyspace.transaction_manifest(root.transaction_id));
+    keys.extend(
+        candidate
+            .manifest
+            .entries
+            .iter()
+            .map(|entry| entry.object_key),
+    );
+
+    for entry in &candidate.manifest.entries {
+        if entry.role != TransactionManifestObjectRole::VersionedContentChunk {
+            continue;
+        }
+        let chunk_bytes = pool
+            .get_with_current_receipt(DeviceIoClass::Data, entry.object_key)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "canonical retention found a missing receipt-backed content chunk",
+            })?
+            .0;
+        if checksum64(&chunk_bytes) != entry.checksum {
+            return Err(FileSystemError::CorruptState {
+                reason: "canonical retention content chunk checksum mismatch",
+            });
+        }
+        if !is_dedup_redirect(&chunk_bytes) {
+            continue;
+        }
+        let canonical_key = keyspace.scope(decode_dedup_redirect(&chunk_bytes)?);
+        keys.insert(canonical_key);
+        let canonical_bytes = pool
+            .get_with_current_receipt(DeviceIoClass::Data, canonical_key)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "canonical retention found a missing receipt-backed dedup object",
+            })?
+            .0;
+        let canonical_chunk = decode_content_chunk(&canonical_bytes)?;
+        let fingerprint = compute_content_fingerprint(&canonical_chunk.bytes);
+        if keyspace.content_dedup(&fingerprint) != canonical_key {
+            return Err(FileSystemError::CorruptState {
+                reason: "canonical retention dedup object identity mismatch",
+            });
+        }
+        keys.insert(keyspace.content_dedup_refcount(&fingerprint));
+    }
     Ok(keys)
 }
 
@@ -2283,37 +2341,128 @@ pub(crate) fn load_state_from_transaction_pool_for_dataset(
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<FileSystemState> {
     let keyspace = FilesystemObjectKeyspace::new(dataset_id);
-    let mut state = load_state_from_transaction_for_content_inspection_in_keyspace(
+    let candidate =
+        read_pool_transaction_candidate_objects(pool, root, root_authentication_key, keyspace)?;
+    let superblock = decode_candidate_superblock(root, &candidate.superblock_bytes)?;
+    let mut state = load_state_from_superblock_for_content_inspection(
         pool.raw_primary_store(),
-        root,
-        root_authentication_key,
-        keyspace,
-    )?;
-    let superblock_bytes = pool
-        .raw_primary_store()
-        .get(keyspace.transaction_superblock(root.transaction_id))?
-        .ok_or(FileSystemError::CorruptState {
-            reason: "root commit references a missing transaction superblock",
-        })?;
-    let root_authentication = validate_root_authentication_record(root, root_authentication_key)?;
-    let manifest = validate_root_transaction_manifest_in_keyspace(
-        pool.raw_primary_store(),
-        root,
-        &superblock_bytes,
-        &root_authentication,
+        &superblock,
+        root.transaction_id,
+        &candidate.manifest.entries,
+        Some(&candidate.objects),
         keyspace,
     )?;
     validate_transaction_manifest_matches_loaded_state_pool(
         pool,
         root,
         &state,
-        &manifest,
-        &superblock_bytes,
-        None,
+        &candidate.manifest,
+        &candidate.superblock_bytes,
+        Some(&candidate.objects),
         keyspace,
     )?;
     state.set_inode_authority_dataset_id(*dataset_id.as_bytes());
     Ok(state)
+}
+
+fn read_pool_transaction_candidate_objects(
+    pool: &Pool,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<TransactionCandidateObjects> {
+    let root_authentication = validate_root_authentication_record(root, root_authentication_key)?;
+    if !root.has_manifest() {
+        return Err(FileSystemError::CorruptState {
+            reason: "canonical Pool recovery requires a manifest-backed filesystem root",
+        });
+    }
+
+    let superblock_key = keyspace.transaction_superblock(root.transaction_id);
+    let superblock_bytes = read_pool_transaction_object(
+        pool,
+        superblock_key,
+        "canonical filesystem root has no receipt-backed transaction superblock",
+    )?;
+    if checksum64(&superblock_bytes) != root.superblock_checksum
+        || root_authentication_digest(ROOT_AUTHENTICATION_SUPERBLOCK_DOMAIN, &superblock_bytes)
+            != root_authentication.superblock_digest
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "canonical transaction superblock does not match its authenticated root",
+        });
+    }
+
+    let manifest_key = keyspace.transaction_manifest(root.transaction_id);
+    let manifest_bytes = read_pool_transaction_object(
+        pool,
+        manifest_key,
+        "canonical filesystem root has no receipt-backed transaction manifest",
+    )?;
+    let manifest =
+        validate_root_transaction_manifest_bytes(root, &root_authentication, &manifest_bytes)?;
+
+    let mut objects = BTreeMap::new();
+    objects.insert(superblock_key, superblock_bytes.clone());
+    for entry in &manifest.entries {
+        match entry.role {
+            TransactionManifestObjectRole::TransactionSuperblock => {
+                if entry.object_key != superblock_key || entry.checksum != root.superblock_checksum
+                {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "canonical manifest superblock entry does not match its root",
+                    });
+                }
+            }
+            TransactionManifestObjectRole::TransactionInode
+            | TransactionManifestObjectRole::TransactionDirectory
+            | TransactionManifestObjectRole::TransactionSnapshotCatalogEntry
+            | TransactionManifestObjectRole::TransactionExtentMap => {
+                let bytes = read_pool_transaction_object(
+                    pool,
+                    entry.object_key,
+                    "canonical manifest metadata object has no Pool placement receipt",
+                )?;
+                if checksum64(&bytes) != entry.checksum {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "canonical manifest metadata object checksum mismatch",
+                    });
+                }
+                if objects.insert(entry.object_key, bytes).is_some() {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "canonical manifest repeats a transaction metadata object key",
+                    });
+                }
+            }
+            TransactionManifestObjectRole::VersionedContent
+            | TransactionManifestObjectRole::VersionedContentChunk => {}
+        }
+    }
+
+    Ok(TransactionCandidateObjects {
+        superblock_bytes,
+        manifest,
+        objects,
+    })
+}
+
+fn read_pool_transaction_object(
+    pool: &Pool,
+    key: ObjectKey,
+    missing_reason: &'static str,
+) -> Result<Vec<u8>> {
+    if pool
+        .placement_receipt_for_key(DeviceIoClass::Metadata, key)?
+        .is_none()
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: missing_reason,
+        });
+    }
+    pool.get(DeviceIoClass::Metadata, key)?
+        .ok_or(FileSystemError::CorruptState {
+            reason: missing_reason,
+        })
 }
 
 fn read_candidate_object_by_checksum(
