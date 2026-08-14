@@ -1543,6 +1543,14 @@ pub struct Pool {
     pool_guid: [u8; 16],
     /// Per-device GUIDs matching device order for label-based topology updates.
     device_guids: Vec<[u8; 16]>,
+    /// Durable member count declared by the imported labels.
+    ///
+    /// Writable opens require this to equal `devices.len()`. A read-only open
+    /// may retain fewer present devices so replicated receipt reads can use a
+    /// surviving member without renumbering the durable topology.
+    expected_device_count: u32,
+    /// Durable label index for each present device, parallel to `devices`.
+    device_label_indices: Vec<u32>,
     /// Monotonic local placement epoch. Receipts bind reads to the epoch that
     /// selected their targets while later topology changes can steer new
     /// allocations elsewhere.
@@ -2837,6 +2845,8 @@ impl Pool {
             })
             .collect();
 
+        let expected_device_count = config.devices.len() as u32;
+        let device_label_indices = (0..expected_device_count).collect();
         let mut pool = Self {
             config,
             properties,
@@ -2853,6 +2863,8 @@ impl Pool {
             log_device,
             pool_guid,
             device_guids,
+            expected_device_count,
+            device_label_indices,
             placement_epoch: 1,
             persisted_label_epoch: None,
             next_placement_receipt_generation,
@@ -2898,12 +2910,13 @@ impl Pool {
         Self::open_with_mode(config, properties, options, PoolOpenMode::Writable)
     }
 
-    /// Open a complete existing Pool topology for side-effect-free inspection.
+    /// Open an existing Pool topology for side-effect-free inspection.
     ///
-    /// This import refuses missing, unlabelled, reordered, or inconsistent
-    /// members and supports only byte-addressable block/regular-file devices.
-    /// It never creates storage, opens an intent-log writer, or resumes device
-    /// lifecycle work.
+    /// This import accepts a nonempty, label-consistent subset of the durable
+    /// member set without renumbering the surviving members. It refuses
+    /// unlabelled or inconsistent configured members and supports only
+    /// byte-addressable block/regular-file devices. It never creates storage,
+    /// opens an intent-log writer, or resumes device lifecycle work.
     pub fn open_read_only_existing(
         config: PoolConfig,
         properties: PoolProperties,
@@ -2961,6 +2974,9 @@ impl Pool {
         let mut read_only_label_features: Option<(u64, u64, u64)> = None;
         let mut read_only_pool_state: Option<PoolState> = None;
         let mut read_only_device_guids = BTreeSet::new();
+        let mut read_only_device_indices = BTreeSet::new();
+        let mut expected_device_count: Option<u32> = None;
+        let mut device_label_indices = Vec::with_capacity(config.devices.len());
 
         // Attempt to read a label from each configured device path.
         for (configured_index, vc) in config.devices.iter().enumerate() {
@@ -3018,19 +3034,46 @@ impl Pool {
                 reason: "pool label corrupt or unreadable",
             })?;
             labeled_device_count += 1;
-            if label.device_count as usize != config.devices.len() {
+            if label.device_count == 0 || label.device_index >= label.device_count {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pool label device index is outside the durable member set",
+                });
+            }
+            match expected_device_count {
+                Some(count) if count != label.device_count => {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "pool topology member count mismatch across labels",
+                    });
+                }
+                None => expected_device_count = Some(label.device_count),
+                Some(_) => {}
+            }
+            if mode == PoolOpenMode::Writable && label.device_count as usize != config.devices.len()
+            {
                 return Err(StoreError::InvalidOptions {
                     reason: "pool topology is missing or has extra configured members",
                 });
             }
-            if label.device_index as usize != configured_index {
+            if mode == PoolOpenMode::Writable && label.device_index as usize != configured_index {
                 return Err(StoreError::InvalidOptions {
                     reason: "pool topology device order does not match labels",
+                });
+            }
+            if mode == PoolOpenMode::ReadOnlyExisting
+                && config.devices.len() > label.device_count as usize
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "read-only pool topology has extra configured members",
                 });
             }
             if !read_only_device_guids.insert(label.device_guid) {
                 return Err(StoreError::InvalidOptions {
                     reason: "pool topology contains duplicate device GUIDs",
+                });
+            }
+            if !read_only_device_indices.insert(label.device_index) {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pool topology contains duplicate device indices",
                 });
             }
             match topology_generation {
@@ -3108,6 +3151,7 @@ impl Pool {
                 Some(_) => {}
             }
             device_guids.push(label.device_guid);
+            device_label_indices.push(label.device_index);
             label_device_layouts.push(device_layout);
             topology_generation = Some(
                 topology_generation
@@ -3142,7 +3186,7 @@ impl Pool {
             // Collect device health state for restoration after import.
             if label.features_compat & features::DEVICE_HEALTH_STATE != 0 {
                 label_health_states.push((
-                    label.device_index as usize,
+                    configured_index,
                     label.device_health,
                     label.device_read_errors,
                     label.device_write_errors,
@@ -3156,6 +3200,8 @@ impl Pool {
                 reason: "pool import requires a label on every configured device",
             });
         }
+
+        let expected_device_count = expected_device_count.unwrap_or(config.devices.len() as u32);
 
         if !label_found {
             if mode == PoolOpenMode::ReadOnlyExisting {
@@ -3353,7 +3399,13 @@ impl Pool {
                 device.restore_health_from_label(health_byte, re, we, ce);
             }
         }
-        let health = compute_health(&devices);
+        let mut health = compute_health(&devices);
+        if mode == PoolOpenMode::ReadOnlyExisting
+            && devices.len() < expected_device_count as usize
+            && health == PoolHealth::Online
+        {
+            health = PoolHealth::Degraded;
+        }
 
         // A read-only inspection import must not create/open a writable log.
         let log_device = if mode == PoolOpenMode::Writable {
@@ -3378,6 +3430,8 @@ impl Pool {
             log_device,
             pool_guid: pg,
             device_guids,
+            expected_device_count,
+            device_label_indices,
             placement_epoch: topology_generation.unwrap_or(1).max(1),
             persisted_label_epoch: Some(topology_generation.unwrap_or(1).max(1)),
             next_placement_receipt_generation,
@@ -3987,6 +4041,37 @@ impl Pool {
         self.device_guids
             .iter()
             .position(|guid| *guid == target.device_guid)
+    }
+
+    fn read_only_missing_member_budget(&self, receipt: &PlacementReceipt) -> Option<usize> {
+        if self.device_label_indices.len() != self.devices.len() {
+            return None;
+        }
+        let missing =
+            (self.expected_device_count as usize).checked_sub(self.device_label_indices.len())?;
+        if !self.read_only
+            || missing == 0
+            || receipt.policy != self.properties.redundancy_policy
+            || !matches!(receipt.policy, PoolRedundancyPolicy::Replicated { copies } if copies > 1)
+        {
+            return None;
+        }
+        Some(missing)
+    }
+
+    fn admit_read_only_missing_receipt_target(
+        &self,
+        receipt: &PlacementReceipt,
+        target: &PlacementReceiptTarget,
+        missing_indices: &mut BTreeSet<u32>,
+    ) -> bool {
+        let Some(budget) = self.read_only_missing_member_budget(receipt) else {
+            return false;
+        };
+        target.device_index < self.expected_device_count
+            && !self.device_label_indices.contains(&target.device_index)
+            && missing_indices.insert(target.device_index)
+            && missing_indices.len() <= budget
     }
 
     fn device_health_capacity_for_index(&self, idx: usize) -> DeviceHealthCapacity {
@@ -5555,12 +5640,22 @@ impl Pool {
 
     fn verify_strict_receipt_target_copies(&self, receipt: &PlacementReceipt) -> Result<()> {
         let receipt_key = placement_receipt_object_key(receipt.object_key);
+        let mut missing_indices = BTreeSet::new();
+        let mut present_targets = 0usize;
         for target in &receipt.targets {
-            let idx = self
-                .resolve_receipt_target(target)
-                .ok_or(StoreError::InvalidOptions {
+            let Some(idx) = self.resolve_receipt_target(target) else {
+                if self.admit_read_only_missing_receipt_target(
+                    receipt,
+                    target,
+                    &mut missing_indices,
+                ) {
+                    continue;
+                }
+                return Err(StoreError::InvalidOptions {
                     reason: "strict read could not resolve every receipt target",
-                })?;
+                });
+            };
+            present_targets = present_targets.saturating_add(1);
             let raw = self.devices[idx]
                 .get(receipt_key)
                 .map_err(|_| StoreError::InvalidOptions {
@@ -5579,6 +5674,11 @@ impl Pool {
                 });
             }
         }
+        if present_targets == 0 {
+            return Err(StoreError::InvalidOptions {
+                reason: "strict read has no present receipt target authority",
+            });
+        }
         Ok(())
     }
 
@@ -5586,11 +5686,14 @@ impl Pool {
     ///
     /// Unlike [`Pool::get`], this entry point rejects receiptless raw payloads
     /// and any malformed, replayless, zero-version, or conflicting receipt.
-    /// Every encoded target must retain the exact receipt copy and exact
-    /// payload or shard named by it; degraded reconstruction remains on the
-    /// explicitly non-strict read and repair paths. The selected receipt is
-    /// scanned again after the exact-receipt read so callers never receive
-    /// bytes under authority that changed in flight.
+    /// Every present encoded target must retain the exact receipt copy and
+    /// exact payload or shard named by it. A read-only import whose labels
+    /// prove a larger replicated member set may omit no more unresolved
+    /// targets than the label-declared missing-member count; at least one
+    /// present replica must still verify. Writable and erasure-coded opens
+    /// keep requiring every target. The selected receipt is scanned again
+    /// after the exact-receipt read so callers never receive bytes under
+    /// authority that changed in flight.
     pub fn get_with_current_receipt(
         &self,
         class: IoClass,
@@ -5687,17 +5790,25 @@ impl Pool {
         receipt: &PlacementReceipt,
     ) -> Result<Option<Vec<u8>>> {
         self.ensure_receipt_replay_authority(receipt)?;
+        let mut missing_indices = BTreeSet::new();
         let expected_len =
             usize::try_from(receipt.payload_len).map_err(|_| StoreError::InvalidOptions {
                 reason: "placement receipt payload length exceeds platform usize",
             })?;
         let mut canonical = None;
         for target in &receipt.targets {
-            let idx = self
-                .resolve_receipt_target(target)
-                .ok_or(StoreError::InvalidOptions {
+            let Some(idx) = self.resolve_receipt_target(target) else {
+                if self.admit_read_only_missing_receipt_target(
+                    receipt,
+                    target,
+                    &mut missing_indices,
+                ) {
+                    continue;
+                }
+                return Err(StoreError::InvalidOptions {
                     reason: "strict read could not resolve every replicated placement target",
-                })?;
+                });
+            };
             let payload = self.devices[idx]
                 .get(receipt.object_key)
                 .map_err(|_| StoreError::InvalidOptions {
@@ -5727,6 +5838,11 @@ impl Pool {
                 });
             }
             canonical.get_or_insert(payload);
+        }
+        if canonical.is_none() {
+            return Err(StoreError::InvalidOptions {
+                reason: "strict read has no present replicated placement target",
+            });
         }
         Ok(canonical)
     }
@@ -9477,24 +9593,19 @@ mod tests {
             ],
         };
         let options = test_options();
-        let properties = PoolProperties::default();
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
         let mut pool = Pool::create(config.clone(), properties.clone(), &options)
             .expect("create two-device pool");
 
-        let (key, payload, receipt) = (0..128_u64)
-            .find_map(|attempt| {
-                let key = ObjectKey::from_name(format!("read-only-object-{attempt}").as_bytes());
-                let payload = format!("read-only payload {attempt}").into_bytes();
-                let (_stored, receipt) = pool
-                    .put_with_receipt(IoClass::Data, key, &payload)
-                    .expect("write receipt-backed object");
-                receipt
-                    .targets
-                    .iter()
-                    .all(|target| target.device_index == 1)
-                    .then_some((key, payload, receipt))
-            })
-            .expect("deterministic placement reaches the secondary device");
+        let key = ObjectKey::from_name(b"read-only-replicated-object");
+        let payload = b"read-only replicated payload".to_vec();
+        let (_stored, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, &payload)
+            .expect("write replicated receipt-backed object");
+        assert_eq!(receipt.targets.len(), 2);
         pool.sync_all().expect("sync two-device pool");
         let pool_guid = pool.pool_guid();
         let first_device_guid = pool.device_guid_for_index(0);
@@ -9546,18 +9657,31 @@ mod tests {
             .expect("remove pending-removal fixture");
 
         let mut incomplete = config.clone();
-        incomplete.devices.pop();
+        incomplete.devices.remove(0);
         assert_invalid_options_reason_contains(
             Pool::open(incomplete.clone(), properties.clone(), &options),
             "missing or has extra",
         );
-        assert_invalid_options_reason_contains(
-            Pool::open_read_only_existing(incomplete, properties.clone(), &options),
-            "missing or has extra",
-        );
+        let mut degraded = Pool::open_read_only_existing(incomplete, properties.clone(), &options)
+            .expect("open surviving nonzero-index member read-only");
+        assert_eq!(degraded.expected_device_count, 2);
+        assert_eq!(degraded.device_label_indices, vec![1]);
+        assert_eq!(degraded.health(), PoolHealth::Degraded);
+        assert_eq!(degraded.device_guid_for_index(0), removal_target_guid);
+        let (degraded_payload, degraded_receipt) = degraded
+            .get_with_current_receipt(IoClass::Data, key)
+            .expect("read current receipt through surviving member")
+            .expect("receipt-backed object survives on member 1");
+        assert_eq!(degraded_payload, payload);
+        assert_eq!(degraded_receipt, receipt);
+        assert!(matches!(
+            degraded.sync_all(),
+            Err(StoreError::ReadOnly { .. })
+        ));
+        drop(degraded);
 
         let mut mismatched_properties = properties;
-        mismatched_properties.redundancy_policy = PoolRedundancyPolicy::replicated(2);
+        mismatched_properties.redundancy_policy = PoolRedundancyPolicy::replicated(1);
         assert_invalid_options_reason_contains(
             Pool::open_read_only_existing(config.clone(), mismatched_properties, &options),
             "redundancy policy does not match",
@@ -9573,7 +9697,7 @@ mod tests {
                 pool_guid,
                 first_device_guid,
             ),
-            "existing valid format header",
+            "initialized format header",
         );
         assert_eq!(
             std::fs::read(&unformatted_path).expect("re-read unformatted"),
@@ -9595,6 +9719,54 @@ mod tests {
             .collect();
         metadata_entries_after.sort();
         assert_eq!(metadata_entries_after, metadata_entries_before);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_pool_open_refuses_receiptless_survivor() {
+        let root = temp_dir("read-only-existing-receiptless-survivor");
+        let metadata_root = root.join("metadata");
+        let config = PoolConfig {
+            name: "read-only-receiptless-survivor".into(),
+            root_path: metadata_root,
+            devices: vec![
+                regular_file_device_config(root.join("device-0.img")),
+                regular_file_device_config(root.join("device-1.img")),
+            ],
+        };
+        let options = test_options();
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options)
+            .expect("create two-device pool");
+        let key = ObjectKey::from_name(b"read-only-receiptless-survivor");
+        let payload = b"payload alone cannot authorize a degraded read";
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, payload)
+            .expect("write replicated receipt-backed object");
+        assert_eq!(receipt.targets.len(), 2);
+
+        let receipt_key = placement_receipt_object_key(key);
+        assert!(pool.devices[1]
+            .delete_pool_internal(receipt_key)
+            .expect("remove surviving member receipt copy"));
+        pool.devices[1]
+            .sync_strict_pool_authority()
+            .expect("sync surviving member receipt loss");
+        drop(pool);
+
+        let mut incomplete = config;
+        incomplete.devices.remove(0);
+        let degraded = Pool::open_read_only_existing(incomplete, properties, &options)
+            .expect("open surviving nonzero-index member read-only");
+        assert_eq!(degraded.health(), PoolHealth::Degraded);
+        assert_invalid_options_reason_contains(
+            degraded.get_with_current_receipt(IoClass::Data, key),
+            "receiptless raw payload",
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
