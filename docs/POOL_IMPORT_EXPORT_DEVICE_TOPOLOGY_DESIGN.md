@@ -25,14 +25,15 @@ The current source-backed pool import/export boundary is:
   replace device label updates.
 - `crates/tidefs-local-object-store/src/device_health.rs`: device health state
   used by topology management.
-- `crates/tidefs-local-object-store/src/pool/mod.rs`: durable removal marker,
-  allocation fence, receipt-backed evacuation, survivor topology publication,
-  and redundant byte-device label writes.
+- `crates/tidefs-local-object-store/src/pool/mod.rs`: durable removal and
+  replacement evidence, allocation fences, receipt-backed evacuation/rebuild,
+  reduced or same-cardinality topology publication, and redundant byte-device
+  label writes.
 - `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` and `recovery.rs`:
   mounted-owner receipt reconciliation, authenticated-root refresh, and
   marker-bound interrupted-removal recovery.
-- `apps/tidefsctl/src/commands/device.rs`: live-owner-only local removal
-  routing and truthful operator projection.
+- `apps/tidefsctl/src/commands/device.rs`: live-owner-only local removal and
+  replacement routing with truthful operator projection.
 
 This document does not supersede source. If source and this summary disagree,
 source plus focused validation wins and this file must be corrected.
@@ -91,13 +92,44 @@ media-remanence, sanitization, or decommissioning guarantee. Failed-device
 loss, replacement/rebuild, writable degraded operation, multi-dataset atomic
 removal, and snapshot/clone root rewriting remain separate work.
 
+## Mounted Present-Member Replacement Boundary
+
+The bounded replacement path also belongs to the reachable mounted owner. It
+admits only an exact writable two-member `Replicated { copies: 2 }` Pool, one
+mounted filesystem, no other dataset or data-retaining snapshot/clone, and a
+distinct blank same-backing candidate at least as large as the readable old
+member. Durable versioned checksummed evidence binds the Pool GUID, full
+old/new device GUIDs and paths, member index, next topology generation, subject
+inventory, verified receipt progress, bytes rebuilt, and terminal state.
+
+Preparation installs the candidate at the old member's durable index while
+retaining the old member as an attached allocation-fenced predecessor. It
+rebuilds every current old-member receipt subject onto the survivor plus
+replacement, verifies newer receipts exclude the old GUID and include the new
+GUID, syncs both successor members, and suppresses ordinary label publication.
+The mounted owner then applies the same copy-on-write content-manifest and
+complete authenticated-root-ring reconciliation used by removal. Only after
+those roots are durable does Pool authority detach the old runtime member,
+write and reread both backup and primary same-cardinality label families, and
+record completed evidence with safe detach.
+
+An interruption before topology publication reopens the old label topology,
+restores the exact evidence, mutation-fences ordinary writes, and resumes with
+the same replacement identity. A completed replacement reimports from only the
+survivor plus replacement. Operator output reports rebuild counts, exact
+identity, topology generation, completion and detach safety while explicitly
+claiming no secure erase, media remanence, sanitization, or decommissioning.
+Absent or unreadable old members, writable degraded replacement, erasure
+coding, multi-dataset/snapshot atomicity, and hot-spare policy remain separate
+work.
+
 ## Authority Limits
 
 This file is not product-readiness evidence for hot spares, general evacuation,
 cluster-aware pool ownership, arbitrary online topology conversion, hardware
 failure survival, availability, operational safety, or incumbent comparison
-claims. The mounted removal section describes only the exact present-member,
-single-filesystem local boundary above.
+claims. The mounted sections describe only the exact present-member,
+single-filesystem local boundaries above.
 Those scopes require current source evidence, runtime validation, and claim IDs
 where they become publishing-facing claims.
 

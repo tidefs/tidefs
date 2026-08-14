@@ -491,6 +491,12 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         summary: "require live-owner authority but refuse dispatch until evacuation receipts and topology/label updates are durable",
     },
     CommandSurface {
+        path: "device replace",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwner,
+        summary: "rebuild a present readable replicated member through the live owner before same-cardinality topology commit",
+    },
+    CommandSurface {
         path: "device status",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwner,
@@ -924,6 +930,7 @@ mod tests {
             "snapshot prune-scheduled refusals",
             "snapshot prune-scheduled results",
             "device remove",
+            "device replace",
             #[cfg(feature = "block-volume")]
             "block attach",
         ] {

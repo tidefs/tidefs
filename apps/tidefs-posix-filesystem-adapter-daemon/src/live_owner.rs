@@ -574,7 +574,8 @@ fn dispatch_request(
         | LivePoolAdminCommand::SnapshotSend
         | LivePoolAdminCommand::PerformanceAdmissionSnapshot
         | LivePoolAdminCommand::DeviceStatus
-        | LivePoolAdminCommand::DeviceRemove => delegate_admin_request(&request, admin),
+        | LivePoolAdminCommand::DeviceRemove
+        | LivePoolAdminCommand::DeviceReplace => delegate_admin_request(&request, admin),
         #[cfg(feature = "block-volume")]
         LivePoolAdminCommand::BlockAttach => match admin {
             LiveOwnerAdmin::Fuse { filesystem, .. } => block_attach(

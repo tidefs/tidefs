@@ -1939,6 +1939,7 @@ pub enum LivePoolAdminCommand {
     PerformanceAdmissionSnapshot,
     DeviceStatus,
     DeviceRemove,
+    DeviceReplace,
     BlockAttach,
 }
 
@@ -2012,6 +2013,7 @@ const LIVE_POOL_ADMIN_COMMAND_ROUTES: &[(LivePoolAdminCommand, &str, &str)] = &[
     ),
     (LivePoolAdminCommand::DeviceStatus, "device", "status"),
     (LivePoolAdminCommand::DeviceRemove, "device", "remove"),
+    (LivePoolAdminCommand::DeviceReplace, "device", "replace"),
     (LivePoolAdminCommand::BlockAttach, "block", "attach"),
 ];
 
@@ -2219,6 +2221,14 @@ mod tests {
                 *command
             );
         }
+    }
+
+    #[test]
+    fn live_pool_admin_device_replace_route_is_typed() {
+        let command = LivePoolAdminCommand::from_parts("device", "replace")
+            .expect("device replace has a typed live-owner route");
+        assert_eq!(command, LivePoolAdminCommand::DeviceReplace);
+        assert_eq!(command.parts(), ("device", "replace"));
     }
 
     #[test]

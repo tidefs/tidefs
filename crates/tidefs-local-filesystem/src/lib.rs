@@ -2720,6 +2720,10 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
         Ok(self.store.pending_device_removal_path()?.is_some())
     }
 
+    fn has_device_replacement_predecessor_resume(&self) -> bool {
+        self.store.has_device_replacement_predecessor_resume()
+    }
+
     fn committed_content_used_bytes(&self, state: &FileSystemState) -> Result<u64> {
         content_allocation_entries_for_state_pool(self.store, state)
             .and_then(|entries| allocation_bytes(&entries))
@@ -4505,6 +4509,10 @@ impl LocalFileSystem {
         // usage. This is the single production source for used/free/reserved/
         // pending byte counters for the lifetime of this filesystem instance.
         let pending_device_removal_recovery = open_recovery.has_pending_device_removal()?;
+        let pending_device_replacement_recovery =
+            open_recovery.has_device_replacement_predecessor_resume();
+        let pending_device_lifecycle_recovery =
+            pending_device_removal_recovery || pending_device_replacement_recovery;
         let capacity_authority = {
             let pool_stats = open_recovery.pool_stats();
             let block_size = StatfsResult::DEFAULT_BLOCK_SIZE as u32;
@@ -4524,7 +4532,7 @@ impl LocalFileSystem {
             // rather than raw object-store usage. The raw pool counter includes
             // metadata/log bytes, while LocalStorageAllocatorPolicy's capacity
             // is the user-content ceiling enforced by fallocate/write paths.
-            let used_bytes = if pending_device_removal_recovery {
+            let used_bytes = if pending_device_lifecycle_recovery {
                 // The authenticated predecessor state can temporarily carry
                 // older embedded receipt generations after Pool evacuation.
                 // Keep admission conservatively closed until mounted recovery
@@ -4537,12 +4545,12 @@ impl LocalFileSystem {
                     .min(total_bytes)
             };
             let mut counters = *state.space_accounting.counters();
-            if !pending_device_removal_recovery && counters.logical_used_bytes < used_bytes {
+            if !pending_device_lifecycle_recovery && counters.logical_used_bytes < used_bytes {
                 counters.logical_used_bytes = used_bytes;
                 state.space_accounting =
                     SpaceAccounting::new(counters, state.space_accounting.domain_id());
             }
-            if pending_device_removal_recovery {
+            if pending_device_lifecycle_recovery {
                 counters.logical_used_bytes = used_bytes;
                 let provisional =
                     SpaceAccounting::new(counters, state.space_accounting.domain_id());
@@ -4778,31 +4786,7 @@ impl LocalFileSystem {
         }
 
         if pending_device_removal_recovery {
-            let pool_stats = fs.store.pool().pool_stats();
-            let total_bytes = if pool_stats.total_capacity_bytes > 0 {
-                pool_stats
-                    .total_capacity_bytes
-                    .min(fs.allocator_policy.content_capacity_bytes)
-            } else {
-                fs.allocator_policy.content_capacity_bytes
-            };
-            let used_bytes = allocation_bytes(&content_allocation_entries_for_state_pool(
-                fs.store.pool(),
-                &fs.state,
-            )?)?
-            .min(total_bytes);
-            let mut counters = *fs.state.space_accounting.counters();
-            if counters.logical_used_bytes < used_bytes {
-                counters.logical_used_bytes = used_bytes;
-                fs.state.space_accounting =
-                    SpaceAccounting::new(counters, fs.state.space_accounting.domain_id());
-            }
-            fs.capacity_authority = CapacityAuthority::from_committed_accounting(
-                total_bytes,
-                &fs.state.space_accounting,
-                StatfsResult::DEFAULT_BLOCK_SIZE as u32,
-                0,
-            );
+            fs.rebuild_capacity_authority_from_committed_content()?;
         }
 
         // Replay BLAKE3-verified namespace intent-log segments recorded by
@@ -14526,6 +14510,37 @@ impl LocalFileSystem {
         if self.mutation_requires_reopen {
             return Err(FileSystemError::MutationRequiresReopen { operation });
         }
+        Ok(())
+    }
+
+    /// Rebuild mounted admission and statfs authority after a device lifecycle
+    /// recovery has reconciled every embedded content receipt generation.
+    fn rebuild_capacity_authority_from_committed_content(&mut self) -> Result<()> {
+        let pool_stats = self.store.pool().pool_stats();
+        let total_bytes = if pool_stats.total_capacity_bytes > 0 {
+            pool_stats
+                .total_capacity_bytes
+                .min(self.allocator_policy.content_capacity_bytes)
+        } else {
+            self.allocator_policy.content_capacity_bytes
+        };
+        let used_bytes = allocation_bytes(&content_allocation_entries_for_state_pool(
+            self.store.pool(),
+            &self.state,
+        )?)?
+        .min(total_bytes);
+        let mut counters = *self.state.space_accounting.counters();
+        if counters.logical_used_bytes < used_bytes {
+            counters.logical_used_bytes = used_bytes;
+            self.state.space_accounting =
+                SpaceAccounting::new(counters, self.state.space_accounting.domain_id());
+        }
+        self.capacity_authority = CapacityAuthority::from_committed_accounting(
+            total_bytes,
+            &self.state.space_accounting,
+            StatfsResult::DEFAULT_BLOCK_SIZE as u32,
+            0,
+        );
         Ok(())
     }
 

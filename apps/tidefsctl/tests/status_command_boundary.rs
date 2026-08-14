@@ -112,6 +112,36 @@ fn no_owner_status_json_is_a_machine_refusal() {
     }
 }
 
+#[test]
+fn no_owner_device_replace_json_refuses_without_touching_paths() {
+    let pool_name = format!(
+        "replace-no-owner-{}-{}",
+        std::process::id(),
+        NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args([
+            "device",
+            "replace",
+            &pool_name,
+            "/definitely/missing/tidefs-old-device",
+            "/definitely/missing/tidefs-new-device",
+            "--json",
+        ])
+        .output()
+        .expect("run no-owner device replace");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let refusal: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse replacement refusal JSON");
+    assert_eq!(refusal["ok"], false);
+    assert_eq!(refusal["command"], "device");
+    assert_eq!(refusal["operation"], "replace");
+    assert_eq!(refusal["pool_name"], pool_name);
+    assert_eq!(refusal["owner_required"], true);
+    assert_eq!(refusal["source:status"], "source:unsupported-or-offline");
+}
+
 fn hex_guid(guid: &[u8; 16]) -> String {
     guid.iter()
         .map(|byte| format!("{byte:02x}"))
@@ -407,6 +437,164 @@ fn live_device_remove_cli_commits_survivor_topology() {
                 .expect("read file after survivor-only reimport"),
             *expected,
             "survivor-only read mismatch for {path}"
+        );
+    }
+}
+
+#[test]
+fn live_device_replace_cli_rebuilds_and_reimports() {
+    let fixture = tempfile::tempdir().expect("create live replacement fixture");
+    let metadata_dir = fixture.path().join("metadata");
+    let devices = [
+        fixture.path().join("member-0.img"),
+        fixture.path().join("member-1.img"),
+    ];
+    let replacement = fixture.path().join("replacement.img");
+    fs::create_dir_all(&metadata_dir).expect("create Pool metadata directory");
+    for device in devices.iter().chain(std::iter::once(&replacement)) {
+        File::create(device)
+            .expect("create regular-file Pool member")
+            .set_len(16 * 1024 * 1024)
+            .expect("size regular-file Pool member");
+    }
+
+    let pool_name = format!(
+        "device-replace-{}-{}",
+        std::process::id(),
+        NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let redundancy_policy = PoolRedundancyPolicy::replicated(2);
+    let mut filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        &devices,
+        &pool_name,
+        redundancy_policy,
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::default(),
+    )
+    .expect("create two-member replicated filesystem");
+
+    let expected_files = [
+        ("/replace-a.bin", vec![0x2a; 8193]),
+        ("/replace-b.bin", (0..=255).cycle().take(12289).collect()),
+    ];
+    for (path, payload) in &expected_files {
+        filesystem
+            .create_file(path, 0o600)
+            .expect("create committed replacement file");
+        filesystem
+            .write_file(path, 0, payload)
+            .expect("write committed replacement bytes");
+    }
+    filesystem
+        .sync_all()
+        .expect("sync mounted files before replacement");
+
+    let scanned = tidefs_pool_scan::scan_labels(&devices).expect("scan created Pool labels");
+    let pool_uuid = scanned[0].pool_guid.expect("created label has a Pool UUID");
+    assert_eq!(scanned[1].pool_guid, Some(pool_uuid));
+
+    let engine = VfsLocalFileSystem::new(filesystem);
+    let shared_filesystem = engine.shared_filesystem();
+    let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create live-owner adapter");
+    let runtime_dir = PathBuf::from("/run/tidefs/pools").join(hex_guid(&pool_uuid));
+    assert!(
+        !runtime_dir.exists(),
+        "unique test Pool runtime directory unexpectedly exists: {}",
+        runtime_dir.display()
+    );
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let owner = start_fuse_owner(
+        LiveOwnerConfig {
+            pool_name: pool_name.clone(),
+            pool_uuid,
+            backing_dir: metadata_dir.clone(),
+            mountpoint: fixture.path().join("not-mounted"),
+            runtime_dir: runtime_dir.clone(),
+            read_only: false,
+        },
+        adapter.engine_handle(),
+        adapter.dataset_replacement_handle(),
+        shared_filesystem.clone(),
+        Arc::clone(&shutdown),
+    )
+    .expect("start live owner for device replacement");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args([
+            "device",
+            "replace",
+            &pool_name,
+            devices[0].to_str().expect("UTF-8 old device path"),
+            replacement.to_str().expect("UTF-8 replacement device path"),
+            "--json",
+        ])
+        .output()
+        .expect("run tidefsctl device replace");
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse replacement result JSON");
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(result["topology_committed"], true, "{result}");
+    assert_eq!(result["objects_failed"], 0, "{result}");
+    assert_eq!(result["old_device_detach_allowed"], true, "{result}");
+    assert_eq!(result["media_privacy_claimed"], false, "{result}");
+    assert_eq!(result["secure_erase_claimed"], false, "{result}");
+    assert_eq!(result["sanitization_claimed"], false, "{result}");
+    assert_eq!(result["decommissioning_claimed"], false, "{result}");
+
+    let status_output = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args(["device", "status", &pool_name, "--json"])
+        .output()
+        .expect("run live device status after replacement");
+    assert!(status_output.status.success(), "{status_output:?}");
+    let status: serde_json::Value = serde_json::from_slice(&status_output.stdout)
+        .expect("parse replacement device status JSON");
+    assert_eq!(status["source_classification"], "source:live-owner");
+    assert_eq!(status["replacement"]["state"], "completed");
+    assert_eq!(status["replacement"]["complete"], true);
+    assert_eq!(status["replacement"]["old_device_detach_allowed"], true);
+
+    {
+        let filesystem = shared_filesystem.borrow();
+        assert_eq!(filesystem.pool_topology_status().members.len(), 2);
+        for (path, expected) in &expected_files {
+            assert_eq!(
+                filesystem
+                    .read_file(path)
+                    .expect("read file through live owner after replacement"),
+                *expected,
+                "live owner read mismatch for {path}"
+            );
+        }
+    }
+
+    owner.stop();
+    drop(shared_filesystem);
+    drop(adapter);
+    fs::remove_dir(&runtime_dir).expect("remove empty test Pool runtime directory");
+
+    let replacement_topology = [replacement.clone(), devices[1].clone()];
+    let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        &replacement_topology,
+        &pool_name,
+        redundancy_policy,
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::default(),
+    )
+    .expect("reimport replacement plus survivor topology");
+    assert_eq!(reopened.pool_topology_status().members.len(), 2);
+    for (path, expected) in &expected_files {
+        assert_eq!(
+            reopened
+                .read_file(path)
+                .expect("read exact bytes after replacement reimport"),
+            *expected,
+            "replacement reimport read mismatch for {path}"
         );
     }
 }
