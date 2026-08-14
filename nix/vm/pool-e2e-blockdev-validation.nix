@@ -247,7 +247,7 @@ echo "--- Phase 4: Pool import/status ---"
 
 IMPORT_OK=0
 if [ "$POOL_CREATED" -eq 1 ]; then
-    IOUT=$(tidefsctl pool import "$DEV0" "$DEV1" --json 2>&1); RC=$?
+    IOUT=$(tidefsctl pool import "$POOL_NAME" --devices "$DEV0" "$DEV1" --json 2>&1); RC=$?
     echo "  import exit=$RC"
     echo "  $IOUT"
     if [ "$RC" -eq 0 ]; then
@@ -390,7 +390,7 @@ fi
 
 REIMPORT_OK=0
 if command -v tidefsctl >/dev/null 2>&1; then
-    RIOUT=$(tidefsctl pool import "$DEV0" "$DEV1" --json 2>&1); RC=$?
+    RIOUT=$(tidefsctl pool import "$POOL_NAME" --devices "$DEV0" "$DEV1" --json 2>&1); RC=$?
     echo "  reimport exit=$RC"
     if [ "$RC" -eq 0 ]; then
         pass "reimport"
