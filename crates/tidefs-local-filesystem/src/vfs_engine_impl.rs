@@ -288,6 +288,12 @@ impl VfsLocalFileSystem {
             .unwrap_or_else(|| "/".to_string())
     }
 
+    fn reset_path_cache(&self) {
+        let mut cache = self.path_cache.borrow_mut();
+        cache.clear();
+        cache.insert(ROOT_INODE_ID, self.root_path());
+    }
+
     /// Consume the adapter and return the inner `LocalFileSystem`.
     pub fn into_inner(self) -> LocalFileSystem {
         self.fs.into_inner()
@@ -2641,16 +2647,19 @@ impl VfsLocalFileSystem {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
         };
-        let mut fs = self.fs.borrow_mut();
-        match fs.rollback_to_snapshot(name) {
-            Ok(report) => live_admin_ok_text(format!(
-                "rolled back to snapshot '{}' (generation {} -> {}, restored source gen {}, {} snapshot entries)",
-                report.snapshot.name,
-                report.generation_before,
-                report.published_generation,
-                report.restored_source_generation,
-                report.snapshot_catalog_entries,
-            )),
+        let rollback = self.fs.borrow_mut().rollback_to_snapshot(name);
+        match rollback {
+            Ok(report) => {
+                self.reset_path_cache();
+                live_admin_ok_text(format!(
+                    "rolled back to snapshot '{}' (generation {} -> {}, restored source gen {}, {} snapshot entries)",
+                    report.snapshot.name,
+                    report.generation_before,
+                    report.published_generation,
+                    report.restored_source_generation,
+                    report.snapshot_catalog_entries,
+                ))
+            }
             Err(err) => live_admin_error(
                 1,
                 format!("snapshot rollback: failed to rollback to snapshot '{name}': {err}"),
@@ -6850,6 +6859,41 @@ mod tests {
         assert_eq!(
             filesystem_destroy["ok"], true,
             "filesystem snapshot destroy response: {filesystem_destroy}"
+        );
+    }
+
+    #[test]
+    fn live_filesystem_rollback_discards_post_snapshot_path_projection() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let snapshot = live_snapshot_admin(
+            &engine,
+            "create",
+            json!({"name": "before-extra-path"}),
+            false,
+        );
+        assert_eq!(snapshot["ok"], true, "snapshot response: {snapshot}");
+
+        let (post_snapshot, _fh) = engine
+            .create(root, b"after-snapshot", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        assert_eq!(
+            cached_path(&engine, post_snapshot.inode_id).as_deref(),
+            Some("/after-snapshot")
+        );
+
+        let rollback = live_snapshot_admin(
+            &engine,
+            "rollback",
+            json!({"name": "before-extra-path"}),
+            false,
+        );
+        assert_eq!(rollback["ok"], true, "rollback response: {rollback}");
+        assert_eq!(cached_path(&engine, ROOT_INODE_ID).as_deref(), Some("/"));
+        assert_eq!(cached_path(&engine, post_snapshot.inode_id), None);
+        assert_eq!(
+            engine.inode_path(post_snapshot.inode_id),
+            Err(Errno::ENOENT)
         );
     }
 

@@ -158,6 +158,20 @@ impl ReadCache {
         }
         self.order.retain(|&i| i != ino);
     }
+
+    /// Remove every derived whole-file entry after a dataset generation
+    /// replacement such as snapshot rollback.
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.order.clear();
+        self.current_bytes = 0;
+    }
+
+    /// Return the inode ids represented by the current derived cache.
+    #[must_use]
+    pub fn inode_ids(&self) -> Vec<u64> {
+        self.data.keys().copied().collect()
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +219,21 @@ mod tests {
         let mut cache = ReadCache::new(4);
         cache.invalidate(99);
         assert_eq!(cache.used_bytes(), 0);
+    }
+
+    #[test]
+    fn clear_removes_every_dataset_generation_entry() {
+        let mut cache = ReadCache::new(4);
+        cache.insert(1, b"old-one".to_vec());
+        cache.insert(2, b"old-two".to_vec());
+        assert_eq!(cache.inode_ids().len(), 2);
+
+        cache.clear();
+
+        assert!(cache.inode_ids().is_empty());
+        assert_eq!(cache.used_bytes(), 0);
+        assert_eq!(cache.get(1), None);
+        assert_eq!(cache.get(2), None);
     }
 
     #[test]

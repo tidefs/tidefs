@@ -333,6 +333,20 @@ impl DirtyPageTracker {
     pub fn dirty_inode_count(&self) -> usize {
         self.ranges.len()
     }
+
+    /// Return true while any dirty range is owned by active writeback or
+    /// retains a writeback error that has not been retried successfully.
+    #[must_use]
+    pub fn dirty_ranges_have_unresolved_writeback(&self) -> bool {
+        self.ranges.values().any(|ranges| {
+            ranges.iter().any(|range| {
+                matches!(
+                    range.lifecycle,
+                    DirtyLifecycleState::WritebackPending | DirtyLifecycleState::ErrorPoisoned
+                )
+            })
+        })
+    }
     #[allow(dead_code)] // INTENT: dirty page tracker types for planned writeback scheduling
     /// Total number of dirty ranges across all inodes.
     pub fn total_dirty_ranges(&self) -> usize {
@@ -597,6 +611,7 @@ mod tests {
 
         assert!(tracker.start_writeback_range(ino, 0, 4096));
         assert!(tracker.is_dirty(ino));
+        assert!(tracker.dirty_ranges_have_unresolved_writeback());
         assert!(tracker.overlaps_lifecycle(ino, 0, 4096, DirtyLifecycleState::WritebackPending));
         assert!(
             tracker.collect_dirty_ranges().is_empty(),
@@ -621,6 +636,7 @@ mod tests {
         );
         assert_eq!(ranges[0].writeback_error(), Some("flush failed"));
         assert!(tracker.is_dirty(ino));
+        assert!(tracker.dirty_ranges_have_unresolved_writeback());
 
         let selected = tracker.collect_dirty_ranges();
         assert_eq!(selected.len(), 1);

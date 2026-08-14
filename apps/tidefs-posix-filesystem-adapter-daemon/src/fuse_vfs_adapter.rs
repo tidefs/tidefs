@@ -7,7 +7,7 @@
 //! `fuser::Filesystem`, mapping every supported FUSE operation to the
 //! corresponding 29-op VfsEngine contract.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,7 +75,10 @@ use tidefs_types_vfs_core::{
     FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE,
     FATTR_UID, F_UNLCK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
 };
-use tidefs_vfs_engine::{LockSpec, LseekDataRange, VfsEngine, VfsEngineStatFs};
+use tidefs_vfs_engine::{
+    LivePoolAdminRequest, LivePoolAdminResponse, LockSpec, LseekDataRange, VfsEngine,
+    VfsEngineStatFs,
+};
 
 use crate::mount_options::TimestampPolicy;
 use tidefs_local_filesystem::PATH_MAX_BYTES;
@@ -603,6 +606,8 @@ struct DentryInvalidationState {
     next_generation: u64,
     invalidated_entries: BTreeMap<DentryKey, u64>,
     invalidated_parent_dirs: BTreeMap<u64, u64>,
+    observed_entries: BTreeSet<DentryKey>,
+    observed_inodes: BTreeSet<u64>,
 }
 
 impl DentryInvalidationState {
@@ -613,6 +618,8 @@ impl DentryInvalidationState {
 
     fn invalidate_child(&mut self, parent_inode: u64, name: &[u8]) -> u64 {
         let generation = self.next_invalidation_generation();
+        self.observed_entries
+            .insert(DentryKey::new(parent_inode, name));
         self.invalidated_entries
             .insert(DentryKey::new(parent_inode, name), generation);
         self.invalidated_parent_dirs
@@ -628,6 +635,10 @@ impl DentryInvalidationState {
         new_name: &[u8],
     ) -> u64 {
         let generation = self.next_invalidation_generation();
+        self.observed_entries
+            .insert(DentryKey::new(old_parent_inode, old_name));
+        self.observed_entries
+            .insert(DentryKey::new(new_parent_inode, new_name));
         self.invalidated_entries
             .insert(DentryKey::new(old_parent_inode, old_name), generation);
         self.invalidated_entries
@@ -637,6 +648,38 @@ impl DentryInvalidationState {
         self.invalidated_parent_dirs
             .insert(new_parent_inode, generation);
         generation
+    }
+
+    fn observe_entry(&mut self, parent_inode: u64, name: &[u8]) {
+        self.observed_entries
+            .insert(DentryKey::new(parent_inode, name));
+    }
+
+    fn observe_inode(&mut self, ino: u64) {
+        self.observed_inodes.insert(ino);
+    }
+
+    fn observe_directory_entries(&mut self, parent_inode: u64, entries: &[DirEntry]) {
+        self.observe_inode(parent_inode);
+        for entry in entries {
+            self.observe_inode(entry.inode_id.get());
+            if entry.name.as_slice() != b"." && entry.name.as_slice() != b".." {
+                self.observe_entry(parent_inode, &entry.name);
+            }
+        }
+    }
+
+    fn observed_entries(&self) -> Vec<DentryKey> {
+        self.observed_entries.iter().cloned().collect()
+    }
+
+    fn observed_inodes(&self) -> Vec<u64> {
+        self.observed_inodes.iter().copied().collect()
+    }
+
+    fn clear_observations(&mut self) {
+        self.observed_entries.clear();
+        self.observed_inodes.clear();
     }
 
     #[cfg(test)]
@@ -667,6 +710,7 @@ struct DataCacheRangeFence {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct DataCacheInvalidationState {
     next_generation: u64,
+    dataset_generation: u64,
     inode_generations: BTreeMap<u64, u64>,
     range_fences: BTreeMap<u64, Vec<DataCacheRangeFence>>,
     read_cache_generations: BTreeMap<u64, u64>,
@@ -685,6 +729,15 @@ impl DataCacheInvalidationState {
         self.inode_generations.insert(ino, generation);
         self.range_fences.remove(&ino);
         self.read_cache_generations.remove(&ino);
+        generation
+    }
+
+    fn invalidate_dataset(&mut self) -> u64 {
+        let generation = self.next_generation();
+        self.dataset_generation = generation;
+        self.inode_generations.clear();
+        self.range_fences.clear();
+        self.read_cache_generations.clear();
         generation
     }
 
@@ -713,7 +766,12 @@ impl DataCacheInvalidationState {
     }
 
     fn current_generation(&self, ino: u64, offset: u64, length: u64) -> u64 {
-        let mut generation = self.inode_generations.get(&ino).copied().unwrap_or(0);
+        let mut generation = self
+            .inode_generations
+            .get(&ino)
+            .copied()
+            .unwrap_or(self.dataset_generation)
+            .max(self.dataset_generation);
         if length == 0 {
             return generation;
         }
@@ -757,6 +815,268 @@ impl DataCacheInvalidationState {
 
     fn forget_read_cache_fill(&mut self, ino: u64) {
         self.read_cache_generations.remove(&ino);
+    }
+}
+
+/// Cloneable live-owner entry point for operations that replace the mounted
+/// dataset generation.  It owns the adapter projections that the engine alone
+/// cannot invalidate after snapshot rollback.
+#[derive(Clone)]
+pub struct DatasetReplacementHandle {
+    engine: Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>,
+    kernel_writeback_cache_enabled: bool,
+    data_cache_invalidations: Arc<Mutex<DataCacheInvalidationState>>,
+    page_cache: Arc<Mutex<ReadCache>>,
+    writeback_page_cache: Option<Arc<PageCache>>,
+    write_page_cache: Arc<PageCache>,
+    dirty_state: Arc<Mutex<BTreeMap<u64, DirtyRanges>>>,
+    writeback_cache: Arc<Mutex<WritebackInodeCache>>,
+    writeback_range_tracker:
+        Option<Arc<Mutex<tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker>>>,
+    worker_dirty_tracker: Arc<Mutex<crate::workers_writeback::DirtyPageTracker>>,
+    getattr_cache: Arc<Mutex<HashMap<u64, (FuseAttrOut, std::time::Instant)>>>,
+    path_lookup_cache: Arc<Mutex<PathLookupCache<InodeAttr>>>,
+    negative_cache: Arc<Mutex<NegativeLookupCache>>,
+    dentry_invalidations: Arc<Mutex<DentryInvalidationState>>,
+    forget_refcounts: Arc<Mutex<BTreeMap<u64, u64>>>,
+    file_handles: Arc<Mutex<AdapterFileHandleTable>>,
+    kernel_cache_invalidator: Arc<Mutex<Option<Arc<dyn KernelCacheInvalidator>>>>,
+}
+
+trait KernelCacheInvalidator: Send + Sync {
+    fn invalidate_inode(&self, ino: u64) -> Result<(), String>;
+    fn invalidate_entry(&self, parent: u64, name: &[u8]) -> Result<(), String>;
+}
+
+impl KernelCacheInvalidator for fuser::Notifier {
+    fn invalidate_inode(&self, ino: u64) -> Result<(), String> {
+        self.inval_inode(ino, 0, -1)
+            .map_err(|error| format!("invalidate kernel inode {ino}: {error}"))
+    }
+
+    fn invalidate_entry(&self, parent: u64, name: &[u8]) -> Result<(), String> {
+        self.inval_entry(parent, OsStr::from_bytes(name))
+            .map_err(|error| {
+                format!(
+                    "invalidate kernel entry {parent}/{}: {error}",
+                    String::from_utf8_lossy(name)
+                )
+            })
+    }
+}
+
+impl DatasetReplacementHandle {
+    pub(crate) fn install_kernel_cache_invalidator(&self, notifier: fuser::Notifier) {
+        *self.kernel_cache_invalidator.lock().unwrap() = Some(Arc::new(notifier));
+    }
+
+    fn tracked_inodes(&self) -> BTreeMap<u64, ()> {
+        let mut inodes = BTreeMap::new();
+        inodes.insert(tidefs_types_vfs_core::ROOT_INODE_ID.get(), ());
+        for ino in self.dentry_invalidations.lock().unwrap().observed_inodes() {
+            inodes.insert(ino, ());
+        }
+        for ino in self.page_cache.lock().unwrap().inode_ids() {
+            inodes.insert(ino, ());
+        }
+        for ino in self.forget_refcounts.lock().unwrap().keys().copied() {
+            inodes.insert(ino, ());
+        }
+        for ino in self.dirty_state.lock().unwrap().keys().copied() {
+            inodes.insert(ino, ());
+        }
+        for page in self.write_page_cache.dirty_pages() {
+            inodes.insert(page.inode, ());
+        }
+        if let Some(ref cache) = self.writeback_page_cache {
+            for page in cache.dirty_pages() {
+                inodes.insert(page.inode, ());
+            }
+        }
+        for handle in self.file_handles.lock().unwrap().handles.values() {
+            inodes.insert(handle.inode, ());
+        }
+        inodes
+    }
+
+    fn unresolved_writeback(&self) -> bool {
+        fn cache_has_unresolved_writeback(cache: &PageCache) -> bool {
+            cache.dirty_pages().into_iter().any(|page| {
+                cache.lookup(page.inode, page.offset).is_some_and(|page| {
+                    matches!(
+                        page.lifecycle_state(),
+                        tidefs_cache_core::page_cache::PageLifecycleState::WritebackPending
+                            | tidefs_cache_core::page_cache::PageLifecycleState::ErrorPoisoned
+                    )
+                })
+            })
+        }
+
+        let local_tracker_has_writeback =
+            self.writeback_range_tracker
+                .as_ref()
+                .is_some_and(|tracker| {
+                    tracker
+                        .lock()
+                        .unwrap()
+                        .dirty_ranges_have_unresolved_writeback()
+                });
+        local_tracker_has_writeback
+            || cache_has_unresolved_writeback(&self.write_page_cache)
+            || self
+                .writeback_page_cache
+                .as_ref()
+                .is_some_and(|cache| cache_has_unresolved_writeback(cache))
+    }
+
+    fn retire_committed_dirty_mirrors(&self, inodes: &BTreeMap<u64, ()>) {
+        self.dirty_state.lock().unwrap().clear();
+        {
+            let mut cache = self.writeback_cache.lock().unwrap();
+            for ino in inodes.keys().copied() {
+                cache.mark_clean(ino);
+            }
+        }
+        if let Some(ref tracker) = self.writeback_range_tracker {
+            let mut tracker = tracker.lock().unwrap();
+            let dirty_inodes: Vec<InodeId> = tracker
+                .collect_dirty_ranges()
+                .into_iter()
+                .map(|(inode, _)| inode)
+                .collect();
+            for inode in dirty_inodes {
+                tracker.flush_inode(inode);
+            }
+        }
+        let mut worker = self.worker_dirty_tracker.lock().unwrap();
+        let boundary = worker.take_boundary();
+        worker.clear_all_until_boundary(boundary);
+        let dirty_write_pages = self.write_page_cache.dirty_pages();
+        for page in dirty_write_pages {
+            self.write_page_cache.clear_dirty(page.inode, page.offset);
+        }
+        if let Some(ref cache) = self.writeback_page_cache {
+            if !Arc::ptr_eq(cache, &self.write_page_cache) {
+                let dirty_pages = cache.dirty_pages();
+                for page in dirty_pages {
+                    cache.clear_dirty(page.inode, page.offset);
+                }
+            }
+        }
+    }
+
+    fn invalidate_kernel_caches(&self, inodes: &BTreeMap<u64, ()>) -> Result<(), String> {
+        let invalidator = self
+            .kernel_cache_invalidator
+            .lock()
+            .map_err(|_| "FUSE kernel cache invalidator lock poisoned".to_string())?;
+        let invalidator = invalidator
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "FUSE kernel cache invalidator is unavailable".to_string())?;
+        let entries = self
+            .dentry_invalidations
+            .lock()
+            .map_err(|_| "FUSE dentry invalidation state lock poisoned".to_string())?
+            .observed_entries();
+        for entry in entries {
+            invalidator.invalidate_entry(entry.parent_inode, &entry.name)?;
+        }
+        for ino in inodes.keys().copied() {
+            invalidator.invalidate_inode(ino)?;
+        }
+        Ok(())
+    }
+
+    fn publish_dataset_fence(&self) {
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .invalidate_dataset();
+        self.page_cache.lock().unwrap().clear();
+        self.write_page_cache.invalidate_all_clean();
+        if let Some(ref cache) = self.writeback_page_cache {
+            cache.invalidate_all_clean();
+        }
+        self.getattr_cache.lock().unwrap().clear();
+        self.path_lookup_cache.lock().unwrap().clear();
+        self.negative_cache.lock().unwrap().clear();
+    }
+
+    /// Execute a live-owner snapshot rollback under the adapter's dataset
+    /// replacement boundary.  Engine sync proves the adapter dirty mirrors
+    /// have durable backing; active writeback remains a refusal and is never
+    /// discarded.
+    pub fn rollback_snapshot(&self, request: &LivePoolAdminRequest) -> LivePoolAdminResponse {
+        if self.kernel_writeback_cache_enabled {
+            return LivePoolAdminResponse::error(
+                1,
+                "snapshot rollback refused: mounted kernel writeback cache may still own dirty pages",
+            );
+        }
+        let engine = match self.engine.lock() {
+            Ok(engine) => engine,
+            Err(_) => return LivePoolAdminResponse::error(1, "live owner engine lock poisoned"),
+        };
+        let ctx = RequestCtx {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            umask: 0,
+            groups: vec![0],
+        };
+        if let Err(errno) = engine.syncfs(&ctx) {
+            return LivePoolAdminResponse::error(
+                1,
+                format!("snapshot rollback: mounted dataset sync failed: {errno:?}"),
+            );
+        }
+        if self.unresolved_writeback() {
+            return LivePoolAdminResponse::error(
+                1,
+                "snapshot rollback refused: mounted dataset still owns unresolved writeback",
+            );
+        }
+        let inodes = self.tracked_inodes();
+        self.retire_committed_dirty_mirrors(&inodes);
+        // Fence daemon cache hits before notifying the kernel.  The engine
+        // lock remains held, so misses cannot refill from the old generation
+        // while the notification and state replacement are in progress.
+        self.publish_dataset_fence();
+        if let Err(error) = self.invalidate_kernel_caches(&inodes) {
+            return LivePoolAdminResponse::error(1, format!("snapshot rollback refused: {error}"));
+        }
+        let response = engine.live_pool_admin_request(request);
+        // Drop clean cache pages again after the attempted state replacement.
+        // This catches a page installed by a fault that raced the
+        // pre-rollback notification while the engine lock kept its daemon
+        // read blocked on the old generation.  Eviction is harmless if the
+        // engine rejects rollback after the adapter fence.
+        self.publish_dataset_fence();
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => {
+                return LivePoolAdminResponse::error(
+                    1,
+                    "snapshot rollback is unsupported by the mounted engine",
+                )
+            }
+        };
+        if response.exit_code == 0 {
+            self.dentry_invalidations
+                .lock()
+                .unwrap()
+                .clear_observations();
+        }
+        response
+    }
+
+    #[cfg(test)]
+    fn dataset_generation(&self) -> u64 {
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .dataset_generation
     }
 }
 
@@ -820,6 +1140,10 @@ impl NegativeLookupCache {
     /// Invalidate all entries for a given parent directory.
     fn invalidate_parent_dir(&mut self, parent_ino: u64) {
         self.entries.retain(|(p, _, _)| *p != parent_ino);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
     }
 
     /// Remove all expired entries.
@@ -2797,7 +3121,7 @@ impl FusePruneNotifySink for UnsupportedFusePruneNotifySink {
 /// FUSE filesystem adapter backed by a `VfsEngine`.
 pub struct FuseVfsAdapter {
     pub(crate) engine: Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>,
-    file_handles: Mutex<AdapterFileHandleTable>,
+    file_handles: Arc<Mutex<AdapterFileHandleTable>>,
     dir_handles: Mutex<AdapterDirHandleTable>,
     dentry_policy: DentryPolicy,
     lock_dispatch: Arc<Mutex<DaemonLockDispatch>>,
@@ -2806,15 +3130,15 @@ pub struct FuseVfsAdapter {
     fuse_admission_hard_policy: FuseAdmissionHardPolicy,
     prune_notify_sink: Arc<dyn FusePruneNotifySink>,
     prune_notify_rate_limit: usize,
-    dentry_invalidations: Mutex<DentryInvalidationState>,
-    data_cache_invalidations: Mutex<DataCacheInvalidationState>,
-    negative_cache: Mutex<NegativeLookupCache>,
+    dentry_invalidations: Arc<Mutex<DentryInvalidationState>>,
+    data_cache_invalidations: Arc<Mutex<DataCacheInvalidationState>>,
+    negative_cache: Arc<Mutex<NegativeLookupCache>>,
     poll_registrations: Mutex<PollRegistrationTable>,
-    pub(crate) dirty_state: Mutex<BTreeMap<u64, DirtyRanges>>,
+    pub(crate) dirty_state: Arc<Mutex<BTreeMap<u64, DirtyRanges>>>,
     /// Adapter-local FUSE kernel lookup references. This projects the dataset
     /// inode authority for kernel cache lifetime only; it does not own durable
     /// inode existence, allocation, or reuse.
-    forget_refcounts: Mutex<BTreeMap<u64, u64>>,
+    forget_refcounts: Arc<Mutex<BTreeMap<u64, u64>>>,
     /// Per-inode lookup frequency counter for reclaim hotness classification.
     /// This is adapter hotness only and must not allocate or preserve inodes.
     lookup_counts: Mutex<BTreeMap<u64, u64>>,
@@ -2825,7 +3149,7 @@ pub struct FuseVfsAdapter {
     block_volume: Mutex<Option<Box<dyn BlockVolumeWriteTarget + Send>>>,
     /// Non-authoritative LRU read cache with byte-size limit.
     /// Checked before VFS engine reads; filled on miss.
-    pub(crate) page_cache: Mutex<ReadCache>,
+    pub(crate) page_cache: Arc<Mutex<ReadCache>>,
     /// Page-cache from tidefs-cache-core for writeback dirty tracking.
     /// When present, flush/fsync iterate dirty pages via this cache.
     writeback_page_cache: Option<Arc<PageCache>>,
@@ -2834,12 +3158,12 @@ pub struct FuseVfsAdapter {
     write_dispatch: Mutex<DaemonWriteDispatch<256>>,
     /// Short-lived getattr result cache: (FuseAttrOut, expiry). Invalidation
     /// on setattr or write to the same inode.
-    getattr_cache: Mutex<HashMap<u64, (FuseAttrOut, std::time::Instant)>>,
-    path_lookup_cache: Mutex<PathLookupCache<InodeAttr>>,
+    getattr_cache: Arc<Mutex<HashMap<u64, (FuseAttrOut, std::time::Instant)>>>,
+    path_lookup_cache: Arc<Mutex<PathLookupCache<InodeAttr>>>,
     base_dentry_policy: DentryPolicy,
     pub(crate) rename_dispatch: FuseRenameDispatch,
     /// WritebackInodeCache for per-inode dirty tracking and reclaim protection.
-    writeback_cache: Mutex<WritebackInodeCache>,
+    writeback_cache: Arc<Mutex<WritebackInodeCache>>,
     /// Background scheduler for deferred maintenance services (writeback, cleaning, compaction).
     background_scheduler: Arc<Mutex<Option<BackgroundScheduler>>>,
 
@@ -2870,6 +3194,9 @@ pub struct FuseVfsAdapter {
     mmap_coherency: Arc<MmapCoherency>,
     /// FUSE kernel cache invalidation notifier, filled after mount.
     notifier: Arc<Mutex<Option<fuser::Notifier>>>,
+    /// Required dataset-replacement invalidation boundary, filled from the
+    /// same mounted notifier after FUSE initialization.
+    kernel_cache_invalidator: Arc<Mutex<Option<Arc<dyn KernelCacheInvalidator>>>>,
     /// Inodes whose lifetime has been exposed to the kernel while FUSE
     /// writeback-cache is active. Linux can issue a late handle-less
     /// timestamp-only setattr for these inodes after the backing engine has
@@ -2911,6 +3238,7 @@ impl FuseVfsAdapter {
         };
         let _root = engine.get_root_inode(&ctx)?;
         let notifier = Arc::new(Mutex::new(None));
+        let kernel_cache_invalidator = Arc::new(Mutex::new(None));
         let mmap_coherency = Arc::new(MmapCoherency::new(Arc::clone(&notifier)));
         let engine = Arc::new(Mutex::new(engine));
         let timestamp_policy = TimestampPolicy::default();
@@ -2918,7 +3246,7 @@ impl FuseVfsAdapter {
         let governor = Governor::new(GovernorConfig::default()).map_err(|_| Errno::EINVAL)?;
         Ok(Self {
             engine: Arc::clone(&engine),
-            file_handles: Mutex::new(AdapterFileHandleTable::default()),
+            file_handles: Arc::new(Mutex::new(AdapterFileHandleTable::default())),
             dir_handles: Mutex::new(AdapterDirHandleTable::default()),
             dentry_policy: base_dentry_policy.for_timestamp_policy(timestamp_policy, false),
             base_dentry_policy,
@@ -2928,26 +3256,29 @@ impl FuseVfsAdapter {
             fuse_admission_hard_policy: FuseAdmissionHardPolicy::default(),
             prune_notify_sink: Arc::new(UnsupportedFusePruneNotifySink),
             prune_notify_rate_limit: MAX_PRUNE_CANDIDATES_PER_TICK,
-            dentry_invalidations: Mutex::new(DentryInvalidationState::default()),
-            data_cache_invalidations: Mutex::new(DataCacheInvalidationState::default()),
-            negative_cache: Mutex::new(NegativeLookupCache::new(256, Duration::from_millis(250))),
+            dentry_invalidations: Arc::new(Mutex::new(DentryInvalidationState::default())),
+            data_cache_invalidations: Arc::new(Mutex::new(DataCacheInvalidationState::default())),
+            negative_cache: Arc::new(Mutex::new(NegativeLookupCache::new(
+                256,
+                Duration::from_millis(250),
+            ))),
             poll_registrations: Mutex::new(PollRegistrationTable::default()),
-            dirty_state: Mutex::new(BTreeMap::new()),
-            forget_refcounts: Mutex::new(BTreeMap::new()),
+            dirty_state: Arc::new(Mutex::new(BTreeMap::new())),
+            forget_refcounts: Arc::new(Mutex::new(BTreeMap::new())),
             lookup_counts: Mutex::new(BTreeMap::new()),
             removed_lookup_attrs: Mutex::new(BTreeMap::new()),
             block_volume: Mutex::new(None),
-            page_cache: Mutex::new(ReadCache::new(256)),
+            page_cache: Arc::new(Mutex::new(ReadCache::new(256))),
             writeback_page_cache: None,
             write_page_cache: Arc::new(PageCache::new(1024, 4096)),
             write_dispatch: Mutex::new(DaemonWriteDispatch::new()),
-            getattr_cache: Mutex::new(HashMap::new()),
-            path_lookup_cache: Mutex::new(PathLookupCache::new(
+            getattr_cache: Arc::new(Mutex::new(HashMap::new())),
+            path_lookup_cache: Arc::new(Mutex::new(PathLookupCache::new(
                 512,
                 std::time::Duration::from_millis(250),
-            )),
+            ))),
             rename_dispatch: FuseRenameDispatch::new(),
-            writeback_cache: Mutex::new(WritebackInodeCache::new(1024)),
+            writeback_cache: Arc::new(Mutex::new(WritebackInodeCache::new(1024))),
             background_scheduler: Arc::new(Mutex::new(None)),
             read_only: false,
             writeback_cache_enabled: false,
@@ -2959,6 +3290,7 @@ impl FuseVfsAdapter {
             timestamp_policy,
             suppress_dir_atime: false,
             notifier: notifier.clone(),
+            kernel_cache_invalidator,
             mmap_coherency,
             writeback_seen_inodes: Mutex::new(HashSet::new()),
             relatime_read_atime_pending: Mutex::new(HashSet::new()),
@@ -2978,6 +3310,30 @@ impl FuseVfsAdapter {
 
     pub fn engine_handle(&self) -> crate::live_owner::LiveOwnerEngine {
         Arc::clone(&self.engine)
+    }
+
+    /// Return the adapter-owned dataset replacement boundary used by the
+    /// mounted live-owner rollback path.
+    pub fn dataset_replacement_handle(&self) -> DatasetReplacementHandle {
+        DatasetReplacementHandle {
+            engine: Arc::clone(&self.engine),
+            kernel_writeback_cache_enabled: self.writeback_cache_enabled,
+            data_cache_invalidations: Arc::clone(&self.data_cache_invalidations),
+            page_cache: Arc::clone(&self.page_cache),
+            writeback_page_cache: self.writeback_page_cache.clone(),
+            write_page_cache: Arc::clone(&self.write_page_cache),
+            dirty_state: Arc::clone(&self.dirty_state),
+            writeback_cache: Arc::clone(&self.writeback_cache),
+            writeback_range_tracker: self.writeback_range_tracker.clone(),
+            worker_dirty_tracker: self.write_dispatch.lock().unwrap().dirty_page_tracker_arc(),
+            getattr_cache: Arc::clone(&self.getattr_cache),
+            path_lookup_cache: Arc::clone(&self.path_lookup_cache),
+            negative_cache: Arc::clone(&self.negative_cache),
+            dentry_invalidations: Arc::clone(&self.dentry_invalidations),
+            forget_refcounts: Arc::clone(&self.forget_refcounts),
+            file_handles: Arc::clone(&self.file_handles),
+            kernel_cache_invalidator: Arc::clone(&self.kernel_cache_invalidator),
+        }
     }
 
     /// Replace the default daemon memory governor used by the FUSE admission boundary.
@@ -3773,6 +4129,10 @@ impl FuseVfsAdapter {
         .next()
         .unwrap()?;
         self.record_dentry_child_mutation(parent, name);
+        self.dentry_invalidations
+            .lock()
+            .unwrap()
+            .observe_inode(attr.inode_id.get());
         self.populate_getattr_cache(attr.inode_id.get(), &attr);
         Ok(attr)
     }
@@ -4225,6 +4585,10 @@ impl FuseVfsAdapter {
         .unwrap()?;
         self.invalidate_inode_metadata_after_engine_write(attr.inode_id.get());
         self.record_dentry_child_mutation(newparent, newname);
+        self.dentry_invalidations
+            .lock()
+            .unwrap()
+            .observe_inode(attr.inode_id.get());
         self.populate_getattr_cache(attr.inode_id.get(), &attr);
         Ok(attr)
     }
@@ -4311,6 +4675,10 @@ impl FuseVfsAdapter {
         .next()
         .unwrap()?;
         self.record_dentry_child_mutation(parent, name);
+        self.dentry_invalidations
+            .lock()
+            .unwrap()
+            .observe_inode(attr.inode_id.get());
         self.populate_getattr_cache(attr.inode_id.get(), &attr);
         Ok(attr)
     }
@@ -4474,6 +4842,10 @@ impl FuseVfsAdapter {
         name: &[u8],
     ) -> Result<InodeAttr, Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_METADATA);
+        self.dentry_invalidations
+            .lock()
+            .unwrap()
+            .observe_entry(parent, name);
 
         // Check daemon-side negative cache before hitting the engine.
         let now_ns = SystemTime::now()
@@ -4498,6 +4870,7 @@ impl FuseVfsAdapter {
         };
         if let Some((ino, attr)) = cache_hit {
             self.record_lookup_count(ino);
+            self.dentry_invalidations.lock().unwrap().observe_inode(ino);
             return Ok(attr);
         }
 
@@ -4510,6 +4883,7 @@ impl FuseVfsAdapter {
         if let Ok(ref attr) = result {
             let ino = attr.inode_id.get();
             self.record_lookup_count(ino);
+            self.dentry_invalidations.lock().unwrap().observe_inode(ino);
             self.cache_path_lookup(parent, name, attr);
         }
 
@@ -5170,6 +5544,10 @@ impl FuseVfsAdapter {
         )?;
         let attr = e.mknod(InodeId::new(parent), name, mode, rdev, ctx)?;
         self.record_dentry_child_mutation(parent, name);
+        self.dentry_invalidations
+            .lock()
+            .unwrap()
+            .observe_inode(attr.inode_id.get());
         self.populate_getattr_cache(attr.inode_id.get(), &attr);
         Ok(attr)
     }
@@ -5235,6 +5613,10 @@ impl FuseVfsAdapter {
         {
             Ok((attr, fh)) => {
                 self.record_dentry_child_mutation(parent, name);
+                self.dentry_invalidations
+                    .lock()
+                    .unwrap()
+                    .observe_inode(attr.inode_id.get());
                 self.populate_getattr_cache(attr.inode_id.get(), &attr);
                 let fuse_open_flags = self.fuse_open_flags_for_request(engine_open_flags);
                 let adapter_fh = {
@@ -7777,6 +8159,10 @@ impl FuseVfsAdapter {
     ) -> Result<(Vec<DirEntry>, bool), Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_METADATA);
         let entries = self.dispatch_readdir_via_engine(ctx, ino, fh, offset)?;
+        self.dentry_invalidations
+            .lock()
+            .unwrap()
+            .observe_directory_entries(ino, &entries.0);
         self.maybe_update_dir_read_atime(ctx, ino);
         Ok(entries)
     }
@@ -10273,6 +10659,9 @@ mod tests {
         FALLOC_FL_INSERT_RANGE, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
         RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFIFO, S_IFLNK, S_IFREG, XATTR_CREATE, XATTR_REPLACE,
     };
+    use tidefs_vfs_engine::{
+        LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminResponseBody,
+    };
 
     #[derive(Debug, Default)]
     struct RecordingPruneNotifySink {
@@ -10292,6 +10681,40 @@ mod tests {
 
         fn notify_prune(&self, ino: u64) -> Result<(), FusePruneUnavailableReason> {
             self.inodes.lock().unwrap().push(ino);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingKernelCacheInvalidator {
+        inodes: Mutex<Vec<u64>>,
+        entries: Mutex<Vec<(u64, Vec<u8>)>>,
+        error: Option<String>,
+    }
+
+    impl RecordingKernelCacheInvalidator {
+        fn failing(message: impl Into<String>) -> Self {
+            Self {
+                error: Some(message.into()),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl KernelCacheInvalidator for RecordingKernelCacheInvalidator {
+        fn invalidate_inode(&self, ino: u64) -> Result<(), String> {
+            if let Some(error) = &self.error {
+                return Err(error.clone());
+            }
+            self.inodes.lock().unwrap().push(ino);
+            Ok(())
+        }
+
+        fn invalidate_entry(&self, parent: u64, name: &[u8]) -> Result<(), String> {
+            if let Some(error) = &self.error {
+                return Err(error.clone());
+            }
+            self.entries.lock().unwrap().push((parent, name.to_vec()));
             Ok(())
         }
     }
@@ -10850,6 +11273,268 @@ mod tests {
                 .unwrap()
                 .allocate(inode.get(), open_flags, engine_fh);
         (inode, adapter_fh, engine_fh)
+    }
+
+    fn snapshot_admin_request(command: LivePoolAdminCommand, name: &str) -> LivePoolAdminRequest {
+        let mut request = LivePoolAdminRequest::new(command, "tank");
+        request.args = LivePoolAdminArgs(
+            [(
+                "name".to_string(),
+                LivePoolAdminArg::String(name.to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        request
+    }
+
+    fn assert_live_admin_ok(response: LivePoolAdminResponse) {
+        assert_eq!(
+            response.exit_code, 0,
+            "live admin request failed: {:?}",
+            response.body
+        );
+    }
+
+    #[test]
+    fn dataset_replacement_rollback_restores_bytes_and_fences_adapter_caches() {
+        let mut fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let created = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"rollback.txt",
+                0o644,
+                libc::O_RDWR as u32,
+            )
+            .expect("create rollback file");
+        let ino = created.attr.inode_id.get();
+        let fh = created.adapter_fh;
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, fh, 0, b"before", 0)
+            .expect("write snapshot bytes");
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, ino, fh)
+            .expect("fsync snapshot bytes");
+
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            assert_live_admin_ok(
+                engine
+                    .live_pool_admin_request(&snapshot_admin_request(
+                        LivePoolAdminCommand::SnapshotCreate,
+                        "before",
+                    ))
+                    .expect("create snapshot through mounted engine"),
+            );
+        }
+
+        let enumerated_ino = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let (attr, handle) = engine
+                .create(root, b"post-snapshot.txt", 0o644, libc::O_RDWR as u32, &ctx)
+                .expect("create post-snapshot file directly in mounted engine");
+            engine.release(&handle).expect("close post-snapshot file");
+            attr.inode_id.get()
+        };
+        let directory = fixture
+            .adapter
+            .dispatch_opendir(&ctx, root.get())
+            .expect("open root for readdirplus");
+        let directory_fh = directory.dh_id.get();
+        let (entries, _) = fixture
+            .adapter
+            .dispatch_readdirplus(&ctx, root.get(), directory_fh, 0)
+            .expect("enumerate post-snapshot file");
+        assert!(entries
+            .iter()
+            .any(|(entry, _)| entry.inode_id.get() == enumerated_ino));
+        fixture
+            .adapter
+            .dispatch_releasedir(directory_fh)
+            .expect("close root directory");
+        assert_eq!(
+            fixture
+                .adapter
+                .file_handles
+                .lock()
+                .unwrap()
+                .open_ref_count(enumerated_ino),
+            0
+        );
+        assert!(!fixture
+            .adapter
+            .forget_refcounts
+            .lock()
+            .unwrap()
+            .contains_key(&enumerated_ino));
+
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, fh, 0, b"after!", 0)
+            .expect("overwrite snapshot bytes");
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, ino, fh)
+            .expect("fsync overwrite");
+        let cached = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, fh, 0, 6, None)
+            .expect("prime derived read cache");
+        assert_eq!(cached, b"after!");
+        assert!(!fixture
+            .adapter
+            .page_cache
+            .lock()
+            .unwrap()
+            .inode_ids()
+            .is_empty());
+        fixture
+            .adapter
+            .dispatch_lookup(&ctx, root.get(), b"rollback.txt")
+            .expect("prime path lookup cache");
+
+        let invalidator = Arc::new(RecordingKernelCacheInvalidator::default());
+        let replacement = fixture.adapter.dataset_replacement_handle();
+        *replacement.kernel_cache_invalidator.lock().unwrap() = Some(invalidator.clone());
+        let generation_before = replacement.dataset_generation();
+        assert_live_admin_ok(replacement.rollback_snapshot(&snapshot_admin_request(
+            LivePoolAdminCommand::SnapshotRollback,
+            "before",
+        )));
+
+        assert!(replacement.dataset_generation() > generation_before);
+        assert!(fixture
+            .adapter
+            .page_cache
+            .lock()
+            .unwrap()
+            .inode_ids()
+            .is_empty());
+        assert!(fixture.adapter.getattr_cache.lock().unwrap().is_empty());
+        assert!(fixture.adapter.path_lookup_cache.lock().unwrap().is_empty());
+        assert_eq!(fixture.adapter.negative_cache.lock().unwrap().len(), 0);
+        assert!(invalidator.inodes.lock().unwrap().contains(&ino));
+        assert!(invalidator.inodes.lock().unwrap().contains(&enumerated_ino));
+        assert!(invalidator
+            .entries
+            .lock()
+            .unwrap()
+            .contains(&(root.get(), b"rollback.txt".to_vec())));
+
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_read(&ctx, ino, fh, 0, 6, None)
+                .expect("read restored snapshot bytes"),
+            b"before"
+        );
+    }
+
+    #[test]
+    fn dataset_replacement_refuses_unresolved_writeback_without_losing_state() {
+        let mut fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode, fh, _) =
+            create_adapter_file_handle(&fixture.adapter, &ctx, b"pending.txt", libc::O_RDWR as u32);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, inode.get(), fh, 0, b"preserve", 0)
+            .expect("write preserved bytes");
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, inode.get(), fh)
+            .expect("fsync preserved bytes");
+
+        let page_cache = Arc::new(PageCache::new(8, 4096));
+        page_cache
+            .insert(inode.get(), 0)
+            .expect("insert writeback page");
+        assert!(page_cache.mark_dirty(inode.get(), 0));
+        assert!(page_cache.start_writeback(inode.get(), 0));
+        fixture.adapter.writeback_page_cache = Some(Arc::clone(&page_cache));
+        let replacement = fixture.adapter.dataset_replacement_handle();
+        *replacement.kernel_cache_invalidator.lock().unwrap() = Some(Arc::new(
+            RecordingKernelCacheInvalidator::failing("must not notify while writeback is active"),
+        ));
+        let generation_before = replacement.dataset_generation();
+
+        let response = replacement.rollback_snapshot(&snapshot_admin_request(
+            LivePoolAdminCommand::SnapshotRollback,
+            "missing",
+        ));
+        assert_ne!(response.exit_code, 0);
+        let LivePoolAdminResponseBody::Error { message, .. } = response.body else {
+            panic!("rollback refusal must be a typed error");
+        };
+        assert!(message.contains("unresolved writeback"));
+        assert_eq!(replacement.dataset_generation(), generation_before);
+        assert_eq!(page_cache.writeback_queue_size(), 1);
+        assert!(page_cache.has_dirty_pages_for_inode(inode.get()));
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_read(&ctx, inode.get(), fh, 0, 8, None)
+                .expect("read state after refused rollback"),
+            b"preserve"
+        );
+    }
+
+    #[test]
+    fn dataset_replacement_refuses_kernel_writeback_cache_before_mutation() {
+        let adapter = fresh_test_adapter().with_writeback_cache_enabled();
+        let replacement = adapter.dataset_replacement_handle();
+        let generation_before = replacement.dataset_generation();
+
+        let response = replacement.rollback_snapshot(&snapshot_admin_request(
+            LivePoolAdminCommand::SnapshotRollback,
+            "missing",
+        ));
+
+        assert_ne!(response.exit_code, 0);
+        let LivePoolAdminResponseBody::Error { message, .. } = response.body else {
+            panic!("rollback refusal must be a typed error");
+        };
+        assert!(message.contains("kernel writeback cache"));
+        assert_eq!(replacement.dataset_generation(), generation_before);
+    }
+
+    #[test]
+    fn dataset_replacement_refuses_error_poisoned_page_without_clearing_it() {
+        let mut fixture = adapter_fixture();
+        let cache = Arc::new(PageCache::new(8, 4096));
+        cache.insert(42, 0).expect("insert error-poisoned page");
+        assert!(cache.mark_dirty(42, 0));
+        assert!(cache.start_writeback(42, 0));
+        assert!(cache.complete_writeback(42, 0, false));
+        fixture.adapter.writeback_page_cache = Some(Arc::clone(&cache));
+        let replacement = fixture.adapter.dataset_replacement_handle();
+        let generation_before = replacement.dataset_generation();
+
+        let response = replacement.rollback_snapshot(&snapshot_admin_request(
+            LivePoolAdminCommand::SnapshotRollback,
+            "missing",
+        ));
+
+        assert_ne!(response.exit_code, 0);
+        let LivePoolAdminResponseBody::Error { message, .. } = response.body else {
+            panic!("rollback refusal must be a typed error");
+        };
+        assert!(message.contains("unresolved writeback"));
+        assert_eq!(replacement.dataset_generation(), generation_before);
+        let page = cache.lookup(42, 0).expect("poisoned page retained");
+        assert_eq!(
+            page.lifecycle_state(),
+            tidefs_cache_core::page_cache::PageLifecycleState::ErrorPoisoned
+        );
     }
 
     fn open_adapter_file_handle(

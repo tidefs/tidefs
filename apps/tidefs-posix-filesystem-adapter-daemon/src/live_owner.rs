@@ -43,6 +43,7 @@ pub type LiveOwnerEngine = Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>;
 enum LiveOwnerAdmin {
     Fuse {
         engine: LiveOwnerEngine,
+        dataset_replacement: crate::fuse_vfs_adapter::DatasetReplacementHandle,
         #[cfg(feature = "block-volume")]
         filesystem: SharedLocalFileSystem,
     },
@@ -109,6 +110,7 @@ impl Drop for LiveOwnerHandle {
 pub fn start_fuse_owner(
     config: LiveOwnerConfig,
     engine: LiveOwnerEngine,
+    dataset_replacement: crate::fuse_vfs_adapter::DatasetReplacementHandle,
     #[cfg(feature = "block-volume")] filesystem: SharedLocalFileSystem,
     shutdown: Arc<AtomicBool>,
 ) -> Result<LiveOwnerHandle, String> {
@@ -117,6 +119,7 @@ pub fn start_fuse_owner(
         "fuse",
         LiveOwnerAdmin::Fuse {
             engine,
+            dataset_replacement,
             #[cfg(feature = "block-volume")]
             filesystem,
         },
@@ -425,8 +428,9 @@ fn dispatch_request(
         | LivePoolAdminCommand::DatasetRename
         | LivePoolAdminCommand::DatasetDestroy
         | LivePoolAdminCommand::SnapshotCreate
-        | LivePoolAdminCommand::SnapshotDestroy
-        | LivePoolAdminCommand::SnapshotRollback => delegate_admin_request(&request, admin),
+        | LivePoolAdminCommand::SnapshotDestroy => delegate_admin_request(&request, admin),
+        #[cfg(not(feature = "block-volume"))]
+        LivePoolAdminCommand::SnapshotRollback => rollback_snapshot(&request, admin),
         LivePoolAdminCommand::PoolGet
         | LivePoolAdminCommand::PoolSet
         | LivePoolAdminCommand::PoolListProps
@@ -493,6 +497,9 @@ fn volume_lifecycle_mutation(
         Err(error) => return live_admin_typed_error(error),
     };
     let Some(target) = target else {
+        if request.command == LivePoolAdminCommand::SnapshotRollback {
+            return rollback_snapshot(request, admin);
+        }
         return delegate_admin_request(request, admin);
     };
     match with_volume_mutation_admission(block_export, target, || {
@@ -820,6 +827,22 @@ fn delegate_admin_request(
             },
             Err(_) => LivePoolAdminResponse::error(1, "live owner engine lock poisoned"),
         },
+        #[cfg(feature = "block-volume")]
+        LiveOwnerAdmin::StandaloneBlock { runtime } => {
+            standalone_block_admin_request(request, runtime)
+        }
+    }
+}
+
+fn rollback_snapshot(
+    request: &LivePoolAdminRequest,
+    admin: &LiveOwnerAdmin,
+) -> LivePoolAdminResponse {
+    match admin {
+        LiveOwnerAdmin::Fuse {
+            dataset_replacement,
+            ..
+        } => dataset_replacement.rollback_snapshot(request),
         #[cfg(feature = "block-volume")]
         LiveOwnerAdmin::StandaloneBlock { runtime } => {
             standalone_block_admin_request(request, runtime)
