@@ -1,8 +1,8 @@
 # TideFS: pool end-to-end block-device validation (#6102).
 #
 # Boots a Linux 7.0 QEMU guest with two raw virtio-blk disks and exercises:
-# pool create -> dataset -> owner-creating mount/import -> status -> file I/O ->
-# unmount/export -> owner-creating re-mount/import -> persistence.
+# pool create -> first root mount -> dataset -> owner-creating mount/import ->
+# status -> file I/O -> unmount/export -> owner-creating re-mount/import -> persistence.
 #
 # Validation tier: QEMU guest.
 {
@@ -33,8 +33,8 @@ let
 Usage: tidefs-pool-e2e-blockdev-validation [--timeout SECONDS] [--disk-size-mb MB] [--keep-tmp]
 
 Full operator flow on two virtio-blk disks in a Linux 7.0 QEMU guest:
-  pool create -> dataset create/list -> owner-creating FUSE mount/import ->
-  status -> file write/fsync/read/rename/delete ->
+  pool create -> first root mount -> dataset create/list ->
+  owner-creating FUSE mount/import -> status -> file write/fsync/read/rename/delete ->
   unmount/export -> owner-creating re-mount/import -> persistence.
 
 Options:
@@ -198,7 +198,7 @@ done
 [ -b "$DEV1" ] && pass "virtio1_present" || fail "virtio1_present" "$DEV1 missing"
 
 if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
-    for op in virtio0_size virtio1_size pool_create pool_import pool_status \
+    for op in virtio0_size virtio1_size pool_create root_bootstrap pool_import pool_status \
              dataset_create dataset_list pool_mount file_write file_fsync \
              file_read named_file_write named_file_fsync file_rename file_delete \
              unmount pool_export reimport \
@@ -243,11 +243,51 @@ else
 fi
 
 echo ""
-echo "--- Phase 4: Dataset create/list while exported ---"
+echo "--- Phase 4: Initialize the default root through its mount carrier ---"
+
+MNT=/mnt/tidefs
+ROOT_BOOTSTRAP_OK=0
+ROOT_BOOTSTRAP_PID=""
+if [ "$POOL_CREATED" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
+    tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV0" "$DEV1" > /tmp/root-bootstrap.log 2>&1 &
+    ROOT_BOOTSTRAP_PID=$!
+    ROOT_BOOTSTRAP_MOUNTED=0
+    for _ in $(seq 1 45); do
+        mountpoint -q "$MNT" 2>/dev/null && { ROOT_BOOTSTRAP_MOUNTED=1; break; }
+        ! kill -0 "$ROOT_BOOTSTRAP_PID" 2>/dev/null && break
+        sleep 1
+    done
+    if [ "$ROOT_BOOTSTRAP_MOUNTED" -eq 1 ]; then
+        kill "$ROOT_BOOTSTRAP_PID" 2>/dev/null || true
+        if wait "$ROOT_BOOTSTRAP_PID"; then
+            ROOT_BOOTSTRAP_RC=0
+        else
+            ROOT_BOOTSTRAP_RC=$?
+        fi
+        umount "$MNT" 2>/dev/null || true
+        if [ "$ROOT_BOOTSTRAP_RC" -eq 0 ] \
+            && ! mountpoint -q "$MNT" 2>/dev/null \
+            && grep -q 'pool ".*" imported' /tmp/root-bootstrap.log; then
+            pass "root_bootstrap"
+            ROOT_BOOTSTRAP_OK=1
+        else
+            fail "root_bootstrap" "owner_exit=$ROOT_BOOTSTRAP_RC mounted=$(mountpoint -q "$MNT" 2>/dev/null && echo yes || echo no): $(tail -20 /tmp/root-bootstrap.log 2>/dev/null)"
+        fi
+    else
+        fail "root_bootstrap" "$(tail -20 /tmp/root-bootstrap.log 2>/dev/null)"
+        kill "$ROOT_BOOTSTRAP_PID" 2>/dev/null || true
+        wait "$ROOT_BOOTSTRAP_PID" 2>/dev/null || true
+    fi
+else
+    blocked "root_bootstrap" "pool or FUSE not ready"
+fi
+
+echo ""
+echo "--- Phase 5: Dataset create/list while exported ---"
 
 DS_NAME="e2e_test_ds"
 DATASET_CREATED=0
-if [ "$POOL_CREATED" -eq 1 ]; then
+if [ "$ROOT_BOOTSTRAP_OK" -eq 1 ]; then
     DCOUT=$(tidefsctl dataset create "$POOL_NAME/$DS_NAME" --type filesystem --devices "$DEV0" "$DEV1" 2>&1); RC=$?
     echo "  create exit=$RC"
     echo "  $DCOUT"
@@ -263,14 +303,13 @@ if [ "$POOL_CREATED" -eq 1 ]; then
     echo "  $DLOUT"
     [ "$RC" -eq 0 ] && pass "dataset_list" || fail "dataset_list" "$DLOUT"
 else
-    blocked "dataset_create" "pool not created"
-    blocked "dataset_list" "pool not created"
+    blocked "dataset_create" "root filesystem initialization failed"
+    blocked "dataset_list" "root filesystem initialization failed"
 fi
 
 echo ""
-echo "--- Phase 5: Owner-creating import, mount, status, and file operations ---"
+echo "--- Phase 6: Owner-creating import, mount, status, and file operations ---"
 
-MNT=/mnt/tidefs
 MOUNTED=0
 IMPORT_OK=0
 DAEMON_PID=""
@@ -346,7 +385,7 @@ else
 fi
 
 echo ""
-echo "--- Phase 6: Unmount/export/reimport/remount ---"
+echo "--- Phase 7: Unmount/export/reimport/remount ---"
 
 if [ "$MOUNTED" -eq 1 ]; then
     kill "$DAEMON_PID" 2>/dev/null || true
@@ -501,7 +540,7 @@ INITSCRIPT
     for op in \
       fuse_available fuse_device \
       virtio0_present virtio1_present virtio0_size virtio1_size \
-      pool_create pool_import pool_status dataset_create dataset_list \
+      pool_create root_bootstrap pool_import pool_status dataset_create dataset_list \
       pool_mount file_write file_fsync file_read named_file_write \
       named_file_fsync file_rename file_delete \
       unmount root_mount root_isolation root_unmount pool_export reimport \
