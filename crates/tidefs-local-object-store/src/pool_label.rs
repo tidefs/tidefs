@@ -10,8 +10,13 @@
 //! `tidefs-types-pool-label-core`.
 
 pub use tidefs_types_pool_label_core::{
-    decode_label, encode_label, features, seal_label, verify_label_checksum,
+    decode_device_layout_v1_bytes, decode_label, decode_topology_roster_v1, encode_label,
+    encode_label_with_device_layout, encode_label_with_extensions, features, seal_label,
+    seal_label_with_device_layout, seal_label_with_extensions, verify_label_checksum,
     DeviceClass as LabelDeviceClass, LabelError, PoolLabelV1, PoolRedundancyPolicy,
-    PoolState as LabelPoolState, POOL_LABEL_MAGIC, POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE,
-    POOL_NAME_MAX,
+    PoolState as LabelPoolState, PoolTopologyRosterV1, POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE,
+    POOL_LABEL_MAGIC, POOL_LABEL_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE,
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE,
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET, POOL_LABEL_V1_WIRE_SIZE,
+    POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE, POOL_NAME_MAX,
 };

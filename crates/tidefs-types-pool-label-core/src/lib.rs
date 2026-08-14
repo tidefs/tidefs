@@ -334,6 +334,10 @@ pub mod features {
     /// A DeviceLayoutV1 record is appended to the pool label header.
     /// Compat bit 10.
     pub const DEVICE_LAYOUT_V1: u64 = 1 << 10;
+    /// A checksummed canonical device-GUID roster is appended after the
+    /// DeviceLayoutV1 record. Durable member indices are the roster offsets.
+    /// Compat bit 11.
+    pub const TOPOLOGY_ROSTER_V1: u64 = 1 << 11;
 }
 
 // ---------------------------------------------------------------------------
@@ -436,7 +440,7 @@ pub type DeviceLayoutV1Bytes = [u8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
 // 407    1   redundancy_policy_reserved
 // 408   32   checksum (BLAKE3-256)
 // 440  124   optional DeviceLayoutV1 record
-// 564  end   (total with DeviceLayoutV1: 564 bytes)
+// 564  var   optional TopologyRosterV1 record
 
 /// Total wire size of a PoolLabelV1 in bytes.
 pub const POOL_LABEL_V1_WIRE_SIZE: usize = 411;
@@ -457,6 +461,67 @@ pub const POOL_LABEL_DEVICE_LAYOUT_V1_OFFSET: usize = POOL_LABEL_V1_EXT_WIRE_SIZ
 /// Extended wire size including the optional DeviceLayoutV1 record.
 pub const POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE: usize =
     POOL_LABEL_DEVICE_LAYOUT_V1_OFFSET + POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE;
+
+/// Offset of the optional TopologyRosterV1 record inside the pool label.
+pub const POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET: usize = POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE;
+
+/// Magic bytes for the canonical device-GUID roster extension.
+pub const POOL_LABEL_TOPOLOGY_ROSTER_V1_MAGIC: [u8; 8] = *b"TDFSROS1";
+
+/// Version of the canonical device-GUID roster extension.
+pub const POOL_LABEL_TOPOLOGY_ROSTER_V1_VERSION: u16 = 1;
+
+/// Fixed header bytes before the indexed GUID array.
+pub const POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE: usize = 28;
+
+/// Bytes occupied by one durable member GUID. Its index in the array is the
+/// durable topology index.
+pub const POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE: usize = 16;
+
+/// BLAKE3-256 checksum bytes after the indexed GUID array.
+pub const POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE: usize = 32;
+
+/// Minimum encoded roster size for a one-member Pool.
+pub const POOL_LABEL_TOPOLOGY_ROSTER_V1_MIN_WIRE_SIZE: usize =
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+        + POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE
+        + POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE;
+
+/// A verified borrowed view of one durable topology roster.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PoolTopologyRosterV1<'a> {
+    topology_generation: u64,
+    member_bytes: &'a [u8],
+}
+
+impl PoolTopologyRosterV1<'_> {
+    /// Topology generation to which this roster belongs.
+    #[must_use]
+    pub const fn topology_generation(&self) -> u64 {
+        self.topology_generation
+    }
+
+    /// Number of durable members in the roster.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.member_bytes.len() / POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE
+    }
+
+    /// Whether the roster contains no members. Valid decoded rosters are
+    /// never empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.member_bytes.is_empty()
+    }
+
+    /// Return the GUID at one durable topology index.
+    #[must_use]
+    pub fn member_guid(&self, index: usize) -> Option<[u8; 16]> {
+        let start = index.checked_mul(POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE)?;
+        let end = start.checked_add(POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE)?;
+        self.member_bytes.get(start..end)?.try_into().ok()
+    }
+}
 
 /// Offset of the checksum field in the wire format.
 /// Original checksum offset for labels without health extension.
@@ -487,6 +552,15 @@ pub enum LabelError {
     NameTooLong,
     /// BLAKE3-256 checksum mismatch (label is corrupt).
     ChecksumMismatch,
+    /// TopologyRosterV1 header, count, reserved bytes, or self-identity is
+    /// invalid.
+    BadTopologyRoster,
+    /// TopologyRosterV1 uses an unsupported version.
+    UnsupportedTopologyRosterVersion(u16),
+    /// TopologyRosterV1 contains duplicate durable member GUIDs.
+    DuplicateTopologyRosterGuid,
+    /// TopologyRosterV1 checksum mismatch.
+    TopologyRosterChecksumMismatch,
     /// Cannot remove the last remaining device from a pool.
     LastDevice,
 }
@@ -509,6 +583,16 @@ impl fmt::Display for LabelError {
             ),
             Self::NameTooLong => f.write_str("pool name too long"),
             Self::ChecksumMismatch => f.write_str("checksum mismatch"),
+            Self::BadTopologyRoster => f.write_str("bad topology roster"),
+            Self::UnsupportedTopologyRosterVersion(version) => {
+                write!(f, "unsupported topology roster version {version}")
+            }
+            Self::DuplicateTopologyRosterGuid => {
+                f.write_str("duplicate topology roster device GUID")
+            }
+            Self::TopologyRosterChecksumMismatch => {
+                f.write_str("topology roster checksum mismatch")
+            }
             Self::LastDevice => f.write_str("cannot remove last device from pool"),
         }
     }
@@ -590,16 +674,67 @@ pub fn encode_label_with_device_layout(
     device_layout_v1: Option<&DeviceLayoutV1Bytes>,
     buf: &mut [u8],
 ) -> Result<(), LabelError> {
+    encode_label_with_extensions(label, device_layout_v1, None, buf)
+}
+
+/// Encode a `PoolLabelV1` plus its optional DeviceLayoutV1 and canonical
+/// topology-roster extensions.
+pub fn encode_label_with_extensions(
+    label: &PoolLabelV1,
+    device_layout_v1: Option<&DeviceLayoutV1Bytes>,
+    topology_roster_v1: Option<&[[u8; 16]]>,
+    buf: &mut [u8],
+) -> Result<(), LabelError> {
     if buf.len() < POOL_LABEL_V1_WIRE_SIZE {
         return Err(LabelError::BufferTooSmall);
     }
     if device_layout_v1.is_some() && buf.len() < POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE {
         return Err(LabelError::BufferTooSmall);
     }
+    let roster_wire_size = topology_roster_v1
+        .map(topology_roster_v1_wire_size)
+        .transpose()?;
+    if let Some(wire_size) = roster_wire_size {
+        if device_layout_v1.is_none()
+            || buf.len()
+                < POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+                    .checked_add(wire_size)
+                    .ok_or(LabelError::BadTopologyRoster)?
+        {
+            return Err(LabelError::BufferTooSmall);
+        }
+    }
     let health_ext = buf.len() >= POOL_LABEL_V1_HEALTH_WIRE_SIZE;
     let policy_ext = buf.len() >= POOL_LABEL_V1_EXT_WIRE_SIZE;
     let layout_ext =
         buf.len() >= POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE && device_layout_v1.is_some();
+    let roster_ext = topology_roster_v1.is_some();
+
+    encode_label_header(label, health_ext, policy_ext, layout_ext, roster_ext, buf)?;
+
+    if layout_ext {
+        buf[POOL_LABEL_DEVICE_LAYOUT_V1_OFFSET..POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE]
+            .copy_from_slice(device_layout_v1.unwrap());
+    }
+
+    if let Some(members) = topology_roster_v1 {
+        encode_topology_roster_v1(label, members, buf)?;
+    }
+
+    Ok(())
+}
+
+fn encode_label_header(
+    label: &PoolLabelV1,
+    health_ext: bool,
+    policy_ext: bool,
+    layout_ext: bool,
+    roster_ext: bool,
+    buf: &mut [u8],
+) -> Result<(), LabelError> {
+    if buf.len() < POOL_LABEL_V1_WIRE_SIZE {
+        return Err(LabelError::BufferTooSmall);
+    }
 
     // Write fixed fields (little-endian).
     buf[0..4].copy_from_slice(&label.magic);
@@ -623,7 +758,8 @@ pub fn encode_label_with_device_layout(
     let mut features_compat_wire = label.features_compat
         & !(features::DEVICE_HEALTH_STATE
             | features::POOL_REDUNDANCY_POLICY
-            | features::DEVICE_LAYOUT_V1);
+            | features::DEVICE_LAYOUT_V1
+            | features::TOPOLOGY_ROSTER_V1);
     if health_ext {
         features_compat_wire |= features::DEVICE_HEALTH_STATE;
     }
@@ -632,6 +768,9 @@ pub fn encode_label_with_device_layout(
     }
     if layout_ext {
         features_compat_wire |= features::DEVICE_LAYOUT_V1;
+    }
+    if roster_ext {
+        features_compat_wire |= features::TOPOLOGY_ROSTER_V1;
     }
     buf[371..379].copy_from_slice(&features_compat_wire.to_le_bytes());
 
@@ -668,11 +807,73 @@ pub fn encode_label_with_device_layout(
     let digest = hasher.finalize();
     buf[cksum_off..cksum_end].copy_from_slice(digest.as_bytes());
 
-    if layout_ext {
-        buf[POOL_LABEL_DEVICE_LAYOUT_V1_OFFSET..POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE]
-            .copy_from_slice(device_layout_v1.unwrap());
-    }
+    Ok(())
+}
 
+fn topology_roster_v1_wire_size(members: &[[u8; 16]]) -> Result<usize, LabelError> {
+    if members.is_empty() || members.len() > u32::MAX as usize {
+        return Err(LabelError::BadTopologyRoster);
+    }
+    let member_bytes = members
+        .len()
+        .checked_mul(POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE)
+        .ok_or(LabelError::BadTopologyRoster)?;
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+        .checked_add(member_bytes)
+        .and_then(|size| size.checked_add(POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE))
+        .filter(|size| {
+            POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+                .checked_add(*size)
+                .is_some_and(|end| end <= POOL_LABEL_SIZE)
+        })
+        .ok_or(LabelError::BadTopologyRoster)
+}
+
+fn encode_topology_roster_v1(
+    label: &PoolLabelV1,
+    members: &[[u8; 16]],
+    buf: &mut [u8],
+) -> Result<(), LabelError> {
+    let wire_size = topology_roster_v1_wire_size(members)?;
+    validate_topology_roster_v1(label, members)?;
+
+    let start = POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET;
+    let end = start
+        .checked_add(wire_size)
+        .ok_or(LabelError::BadTopologyRoster)?;
+    let roster = buf.get_mut(start..end).ok_or(LabelError::BufferTooSmall)?;
+    roster.fill(0);
+    roster[0..8].copy_from_slice(&POOL_LABEL_TOPOLOGY_ROSTER_V1_MAGIC);
+    roster[8..10].copy_from_slice(&POOL_LABEL_TOPOLOGY_ROSTER_V1_VERSION.to_le_bytes());
+    roster[12..20].copy_from_slice(&label.topology_generation.to_le_bytes());
+    roster[20..24].copy_from_slice(&(members.len() as u32).to_le_bytes());
+    let mut offset = POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE;
+    for guid in members {
+        roster[offset..offset + POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE].copy_from_slice(guid);
+        offset += POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE;
+    }
+    let checksum_offset = wire_size - POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE;
+    let digest = blake3::hash(&roster[..checksum_offset]);
+    roster[checksum_offset..].copy_from_slice(digest.as_bytes());
+    Ok(())
+}
+
+fn validate_topology_roster_v1(
+    label: &PoolLabelV1,
+    members: &[[u8; 16]],
+) -> Result<(), LabelError> {
+    topology_roster_v1_wire_size(members)?;
+    if label.device_count as usize != members.len()
+        || label.device_index as usize >= members.len()
+        || members[label.device_index as usize] != label.device_guid
+    {
+        return Err(LabelError::BadTopologyRoster);
+    }
+    for (index, guid) in members.iter().enumerate() {
+        if members[..index].contains(guid) {
+            return Err(LabelError::DuplicateTopologyRosterGuid);
+        }
+    }
     Ok(())
 }
 
@@ -726,6 +927,7 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
     let has_health = features_compat & features::DEVICE_HEALTH_STATE != 0;
     let has_policy = features_compat & features::POOL_REDUNDANCY_POLICY != 0;
     let has_device_layout = features_compat & features::DEVICE_LAYOUT_V1 != 0;
+    let has_topology_roster = features_compat & features::TOPOLOGY_ROSTER_V1 != 0;
     // If health extension bit is set but the buffer is too short for the
     // extended label, reject early before slicing past the buffer.
     if has_health && buf.len() < POOL_LABEL_V1_HEALTH_WIRE_SIZE {
@@ -750,6 +952,9 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
     }
     if has_device_layout && buf.len() < POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE {
         return Err(LabelError::BufferTooSmall);
+    }
+    if has_topology_roster && !has_device_layout {
+        return Err(LabelError::BadTopologyRoster);
     }
     let (device_health, device_read_errors, device_write_errors, device_checksum_errors) =
         if has_health {
@@ -796,6 +1001,15 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
         return Err(LabelError::ChecksumMismatch);
     }
 
+    if let Some(roster) = decode_topology_roster_v1(buf)? {
+        if roster.topology_generation() != topology_generation
+            || roster.len() != device_count as usize
+            || roster.member_guid(device_index as usize) != Some(device_guid)
+        {
+            return Err(LabelError::BadTopologyRoster);
+        }
+    }
+
     Ok(PoolLabelV1 {
         magic,
         version,
@@ -837,17 +1051,46 @@ pub fn seal_label(label: PoolLabelV1) -> Result<PoolLabelV1, LabelError> {
 
 /// Seal a label while optionally committing a DeviceLayoutV1 sidecar record.
 pub fn seal_label_with_device_layout(
-    mut label: PoolLabelV1,
+    label: PoolLabelV1,
     device_layout_v1: Option<&DeviceLayoutV1Bytes>,
 ) -> Result<PoolLabelV1, LabelError> {
-    let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+    seal_label_with_extensions(label, device_layout_v1, None)
+}
+
+/// Seal a label while committing its optional DeviceLayoutV1 and canonical
+/// topology-roster feature bits. Each sidecar keeps its own integrity field;
+/// the label checksum commits their presence.
+pub fn seal_label_with_extensions(
+    mut label: PoolLabelV1,
+    device_layout_v1: Option<&DeviceLayoutV1Bytes>,
+    topology_roster_v1: Option<&[[u8; 16]]>,
+) -> Result<PoolLabelV1, LabelError> {
+    if topology_roster_v1.is_some() && device_layout_v1.is_none() {
+        return Err(LabelError::BadTopologyRoster);
+    }
+    if let Some(members) = topology_roster_v1 {
+        validate_topology_roster_v1(&label, members)?;
+    }
+    let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
     label.checksum = [0u8; 32];
     if device_layout_v1.is_some() {
         label.features_compat |= features::DEVICE_LAYOUT_V1;
     } else {
         label.features_compat &= !features::DEVICE_LAYOUT_V1;
     }
-    encode_label_with_device_layout(&label, device_layout_v1, &mut buf)?;
+    if topology_roster_v1.is_some() {
+        label.features_compat |= features::TOPOLOGY_ROSTER_V1;
+    } else {
+        label.features_compat &= !features::TOPOLOGY_ROSTER_V1;
+    }
+    encode_label_header(
+        &label,
+        true,
+        true,
+        device_layout_v1.is_some(),
+        topology_roster_v1.is_some(),
+        &mut buf,
+    )?;
     label
         .checksum
         .copy_from_slice(&buf[POOL_LABEL_V1_CHECKSUM_OFFSET..POOL_LABEL_V1_EXT_WIRE_SIZE]);
@@ -875,16 +1118,99 @@ pub fn decode_device_layout_v1_bytes(
     ))
 }
 
+/// Return a verified borrowed view of the optional canonical topology roster.
+pub fn decode_topology_roster_v1(
+    buf: &[u8],
+) -> Result<Option<PoolTopologyRosterV1<'_>>, LabelError> {
+    if buf.len() < POOL_LABEL_V1_WIRE_SIZE {
+        return Err(LabelError::BufferTooSmall);
+    }
+    let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
+    if features_compat & features::TOPOLOGY_ROSTER_V1 == 0 {
+        return Ok(None);
+    }
+    if features_compat & features::DEVICE_LAYOUT_V1 == 0
+        || buf.len()
+            < POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET + POOL_LABEL_TOPOLOGY_ROSTER_V1_MIN_WIRE_SIZE
+    {
+        return Err(LabelError::BadTopologyRoster);
+    }
+
+    let roster = &buf[POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET..];
+    if roster[0..8] != POOL_LABEL_TOPOLOGY_ROSTER_V1_MAGIC
+        || roster[10..12] != [0, 0]
+        || roster[24..28] != [0, 0, 0, 0]
+    {
+        return Err(LabelError::BadTopologyRoster);
+    }
+    let version = u16::from_le_bytes(roster[8..10].try_into().unwrap());
+    if version != POOL_LABEL_TOPOLOGY_ROSTER_V1_VERSION {
+        return Err(LabelError::UnsupportedTopologyRosterVersion(version));
+    }
+    let topology_generation = u64::from_le_bytes(roster[12..20].try_into().unwrap());
+    let member_count = u32::from_le_bytes(roster[20..24].try_into().unwrap()) as usize;
+    if member_count == 0 {
+        return Err(LabelError::BadTopologyRoster);
+    }
+    let member_bytes_len = member_count
+        .checked_mul(POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE)
+        .ok_or(LabelError::BadTopologyRoster)?;
+    let checksum_offset = POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+        .checked_add(member_bytes_len)
+        .ok_or(LabelError::BadTopologyRoster)?;
+    let wire_size = checksum_offset
+        .checked_add(POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE)
+        .ok_or(LabelError::BadTopologyRoster)?;
+    if POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+        .checked_add(wire_size)
+        .is_none_or(|end| end > POOL_LABEL_SIZE)
+        || roster.len() < wire_size
+    {
+        return Err(LabelError::BadTopologyRoster);
+    }
+    let expected_checksum = &roster[checksum_offset..wire_size];
+    if blake3::hash(&roster[..checksum_offset]).as_bytes() != expected_checksum {
+        return Err(LabelError::TopologyRosterChecksumMismatch);
+    }
+    let member_bytes = &roster[POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE..checksum_offset];
+    let decoded = PoolTopologyRosterV1 {
+        topology_generation,
+        member_bytes,
+    };
+    for index in 0..decoded.len() {
+        let guid = decoded
+            .member_guid(index)
+            .ok_or(LabelError::BadTopologyRoster)?;
+        for prior in 0..index {
+            if decoded.member_guid(prior) == Some(guid) {
+                return Err(LabelError::DuplicateTopologyRosterGuid);
+            }
+        }
+    }
+    Ok(Some(decoded))
+}
+
 /// Verify a label's checksum in-place (without allocating a separate buffer).
 pub fn verify_label_checksum(label: &PoolLabelV1) -> bool {
-    let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
-    let dummy_layout = [0u8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
-    let device_layout_v1 =
-        (label.features_compat & features::DEVICE_LAYOUT_V1 != 0).then_some(&dummy_layout);
-    if encode_label_with_device_layout(label, device_layout_v1, &mut buf).is_err() {
+    let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
+    let health = label.features_compat & features::DEVICE_HEALTH_STATE != 0;
+    let policy = label.features_compat & features::POOL_REDUNDANCY_POLICY != 0;
+    let layout = label.features_compat & features::DEVICE_LAYOUT_V1 != 0;
+    let roster = label.features_compat & features::TOPOLOGY_ROSTER_V1 != 0;
+    if encode_label_header(label, health, policy, layout, roster, &mut buf).is_err() {
         return false;
     }
-    buf[POOL_LABEL_V1_CHECKSUM_OFFSET..POOL_LABEL_V1_EXT_WIRE_SIZE] == label.checksum
+    let (checksum_offset, checksum_end) = if policy {
+        (POOL_LABEL_V1_CHECKSUM_OFFSET, POOL_LABEL_V1_EXT_WIRE_SIZE)
+    } else if health {
+        (
+            POOL_LABEL_V1_CHECKSUM_HEALTH_OFFSET,
+            POOL_LABEL_V1_HEALTH_WIRE_SIZE,
+        )
+    } else {
+        (POOL_LABEL_V1_CHECKSUM_BASE_OFFSET, POOL_LABEL_V1_WIRE_SIZE)
+    };
+    buf[checksum_offset..checksum_end] == label.checksum
 }
 
 /// Compute the committed label-agreement fingerprint for a valid pool label.
@@ -1194,6 +1520,120 @@ mod tests {
         assert_eq!(decoded.checksum, sealed.checksum);
         assert_eq!(decode_device_layout_v1_bytes(&buf).unwrap(), Some(layout));
         assert!(verify_label_checksum(&decoded));
+    }
+
+    #[test]
+    fn topology_roster_roundtrip_preserves_indexed_member_identity() {
+        let layout = [0x5Au8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        let members = [[0x11; 16], [0x22; 16]];
+        let mut label = PoolLabelV1::new([0xAA; 16], members[1], "roster");
+        label.device_index = 1;
+        label.device_count = 2;
+        label.topology_generation = 9;
+        let sealed = seal_label_with_extensions(label, Some(&layout), Some(&members)).unwrap();
+        let mut buf = [0u8; POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+            + 2 * POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE];
+
+        encode_label_with_extensions(&sealed, Some(&layout), Some(&members), &mut buf).unwrap();
+
+        let decoded = decode_label(&buf).unwrap();
+        assert!(decoded.features_compat & features::TOPOLOGY_ROSTER_V1 != 0);
+        assert!(verify_label_checksum(&decoded));
+        let roster = decode_topology_roster_v1(&buf).unwrap().unwrap();
+        assert_eq!(roster.topology_generation(), 9);
+        assert_eq!(roster.len(), 2);
+        assert_eq!(roster.member_guid(0), Some(members[0]));
+        assert_eq!(roster.member_guid(1), Some(members[1]));
+        assert_eq!(roster.member_guid(2), None);
+    }
+
+    #[test]
+    fn topology_roster_corruption_fails_closed() {
+        let layout = [0x5Au8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        let members = [[0x11; 16], [0x22; 16]];
+        let mut label = PoolLabelV1::new([0xAA; 16], members[0], "roster-corrupt");
+        label.device_count = 2;
+        label.topology_generation = 3;
+        let sealed = seal_label_with_extensions(label, Some(&layout), Some(&members)).unwrap();
+        let mut buf = [0u8; POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+            + 2 * POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE];
+        encode_label_with_extensions(&sealed, Some(&layout), Some(&members), &mut buf).unwrap();
+        buf[POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET + POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE] ^= 1;
+
+        assert_eq!(
+            decode_label(&buf),
+            Err(LabelError::TopologyRosterChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn topology_roster_rejects_duplicate_or_wrong_self_identity() {
+        let layout = [0x5Au8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        let mut label = PoolLabelV1::new([0xAA; 16], [0x22; 16], "roster-invalid");
+        label.device_index = 1;
+        label.device_count = 2;
+        label.topology_generation = 3;
+
+        assert_eq!(
+            seal_label_with_extensions(
+                label.clone(),
+                Some(&layout),
+                Some(&[[0x22; 16], [0x22; 16]])
+            ),
+            Err(LabelError::DuplicateTopologyRosterGuid)
+        );
+        assert_eq!(
+            seal_label_with_extensions(label, Some(&layout), Some(&[[0x11; 16], [0x33; 16]])),
+            Err(LabelError::BadTopologyRoster)
+        );
+    }
+
+    #[test]
+    fn topology_roster_rejects_truncated_stale_or_incomplete_authority() {
+        let layout = [0x5Au8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        let members = [[0x11; 16], [0x22; 16]];
+        let mut label = PoolLabelV1::new([0xAA; 16], members[1], "roster-structural");
+        label.device_index = 1;
+        label.device_count = 2;
+        label.topology_generation = 9;
+        let sealed = seal_label_with_extensions(label, Some(&layout), Some(&members)).unwrap();
+        let mut encoded = [0u8; POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+            + 2 * POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE];
+        encode_label_with_extensions(&sealed, Some(&layout), Some(&members), &mut encoded).unwrap();
+
+        assert_eq!(
+            decode_label(&encoded[..encoded.len() - 1]),
+            Err(LabelError::BadTopologyRoster)
+        );
+
+        let mut stale = encoded;
+        let roster_start = POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET;
+        stale[roster_start + 12..roster_start + 20].copy_from_slice(&8u64.to_le_bytes());
+        let stale_checksum_offset = stale.len() - POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE;
+        let stale_checksum = blake3::hash(&stale[roster_start..stale_checksum_offset]);
+        stale[stale_checksum_offset..].copy_from_slice(stale_checksum.as_bytes());
+        assert_eq!(decode_label(&stale), Err(LabelError::BadTopologyRoster));
+
+        let mut incomplete = encoded;
+        incomplete[roster_start + 20..roster_start + 24].copy_from_slice(&1u32.to_le_bytes());
+        let incomplete_checksum_offset = roster_start
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE;
+        let incomplete_checksum =
+            blake3::hash(&incomplete[roster_start..incomplete_checksum_offset]);
+        incomplete[incomplete_checksum_offset
+            ..incomplete_checksum_offset + POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE]
+            .copy_from_slice(incomplete_checksum.as_bytes());
+        assert_eq!(
+            decode_label(&incomplete),
+            Err(LabelError::BadTopologyRoster)
+        );
     }
 
     #[test]

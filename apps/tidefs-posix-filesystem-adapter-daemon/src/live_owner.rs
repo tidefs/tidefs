@@ -27,8 +27,8 @@ use tidefs_block_volume_adapter_daemon::storage_backend::{
 };
 #[cfg(feature = "block-volume")]
 use tidefs_block_volume_adapter_daemon::ublk_control_open::run_ublk_live_device;
-#[cfg(feature = "block-volume")]
 use tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem;
+use tidefs_local_object_store::pool::{PoolHealth, PoolTopologyStatus};
 use tidefs_types_vfs_core::RequestCtx;
 use tidefs_vfs_engine::{
     LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminError,
@@ -44,7 +44,6 @@ enum LiveOwnerAdmin {
     Fuse {
         engine: LiveOwnerEngine,
         dataset_replacement: crate::fuse_vfs_adapter::DatasetReplacementHandle,
-        #[cfg(feature = "block-volume")]
         filesystem: SharedLocalFileSystem,
     },
     #[cfg(feature = "block-volume")]
@@ -192,7 +191,7 @@ pub fn start_fuse_owner(
     config: LiveOwnerConfig,
     engine: LiveOwnerEngine,
     dataset_replacement: crate::fuse_vfs_adapter::DatasetReplacementHandle,
-    #[cfg(feature = "block-volume")] filesystem: SharedLocalFileSystem,
+    filesystem: SharedLocalFileSystem,
     shutdown: Arc<AtomicBool>,
 ) -> Result<LiveOwnerHandle, String> {
     start_owner(
@@ -201,7 +200,6 @@ pub fn start_fuse_owner(
         LiveOwnerAdmin::Fuse {
             engine,
             dataset_replacement,
-            #[cfg(feature = "block-volume")]
             filesystem,
         },
         None,
@@ -1543,6 +1541,32 @@ fn pool_status(
         },
     };
 
+    let topology = match admin {
+        LiveOwnerAdmin::Fuse { filesystem, .. } => filesystem.borrow().pool_topology_status(),
+        #[cfg(feature = "block-volume")]
+        LiveOwnerAdmin::StandaloneBlock { runtime } => match runtime.lock() {
+            Ok(runtime) => runtime.pool().topology_status(),
+            Err(_) => return LivePoolAdminResponse::error(1, "shared Pool runtime lock poisoned"),
+        },
+    };
+    let health = pool_health_label(topology.health);
+    let access = if topology.read_only {
+        "ReadOnly"
+    } else {
+        "ReadWrite"
+    };
+    let members: Vec<_> = topology
+        .members
+        .iter()
+        .map(|member| {
+            json!({
+                "index": member.device_index,
+                "guid": hex_uuid(&member.device_guid),
+                "presence": if member.present { "Present" } else { "Missing" },
+            })
+        })
+        .collect();
+
     let value = json!({
         "pool_name": manifest.pool_name,
         "pool_uuid": manifest.pool_uuid,
@@ -1552,6 +1576,12 @@ fn pool_status(
         "backing_dir": manifest.backing_dir,
         "mountpoint": manifest.mountpoint,
         "socket_path": manifest.socket_path,
+        "health": health,
+        "access": access,
+        "members_expected": topology.expected_members,
+        "members_present": topology.present_members,
+        "members_missing": topology.missing_members,
+        "members": members,
         "statfs": {
             "block_size": statfs.block_size,
             "fragment_size": statfs.fragment_size,
@@ -1569,20 +1599,55 @@ fn pool_status(
     if request.output.wants_json() {
         LivePoolAdminResponse::ok_machine_json(value.to_string())
     } else {
-        LivePoolAdminResponse::ok_text(format!(
-            "pool: {}\n  pool uuid:   {}\n  state:       Active\n  owner:       {} (pid {})\n  backing dir: {}\n  mountpoint:  {}\n  blocks:      total={} free={} avail={}\n  files:       total={} free={}",
+        LivePoolAdminResponse::ok_text(pool_status_text(manifest, &statfs, &topology))
+    }
+}
+
+fn pool_status_text(
+    manifest: &LiveOwnerManifest,
+    statfs: &tidefs_types_vfs_core::StatFs,
+    topology: &PoolTopologyStatus,
+) -> String {
+    let mut text = format!(
+        "pool: {}\n  pool uuid:   {}\n  state:       Active\n  health:      {}\n  access:      {}\n  owner:       {} (pid {})\n  backing dir: {}\n  mountpoint:  {}\n  members:     expected={} present={} missing={}\n  blocks:      total={} free={} avail={}\n  files:       total={} free={}",
             manifest.pool_name,
             manifest.pool_uuid,
+            pool_health_label(topology.health),
+            if topology.read_only {
+                "ReadOnly"
+            } else {
+                "ReadWrite"
+            },
             manifest.owner_kind,
             manifest.pid,
             manifest.backing_dir,
             manifest.mountpoint,
+            topology.expected_members,
+            topology.present_members,
+            topology.missing_members,
             statfs.total_blocks,
             statfs.free_blocks,
             statfs.avail_blocks,
             statfs.files,
             statfs.files_free
-        ))
+        );
+    for member in &topology.members {
+        text.push_str(&format!(
+            "\n  member {}:   {} {}",
+            member.device_index,
+            hex_uuid(&member.device_guid),
+            if member.present { "Present" } else { "Missing" }
+        ));
+    }
+    text
+}
+
+const fn pool_health_label(health: PoolHealth) -> &'static str {
+    match health {
+        PoolHealth::Online => "Online",
+        PoolHealth::Degraded => "Degraded",
+        PoolHealth::Faulted => "Faulted",
+        PoolHealth::Suspended => "Suspended",
     }
 }
 
@@ -1934,6 +1999,8 @@ fn hex_uuid(uuid: &[u8; 16]) -> String {
 mod tests {
     use super::*;
 
+    use tidefs_local_object_store::pool::PoolMemberStatus;
+
     #[cfg(feature = "block-volume")]
     use tidefs_block_volume_adapter_daemon::storage_backend::PoolRuntime;
 
@@ -1949,6 +2016,39 @@ mod tests {
             socket_path: "/run/tidefs/pools/tank/owner.sock".to_string(),
             read_only: false,
         }
+    }
+
+    #[test]
+    fn live_pool_status_text_reports_exact_degraded_member_identity() {
+        let topology = PoolTopologyStatus {
+            health: PoolHealth::Degraded,
+            read_only: true,
+            expected_members: 2,
+            present_members: 1,
+            missing_members: 1,
+            members: vec![
+                PoolMemberStatus {
+                    device_index: 0,
+                    device_guid: [0x11; 16],
+                    present: false,
+                },
+                PoolMemberStatus {
+                    device_index: 1,
+                    device_guid: [0x22; 16],
+                    present: true,
+                },
+            ],
+        };
+        let statfs =
+            tidefs_types_vfs_core::StatFs::new(4096, 4096, 1024, 768, 768, 10, 9, 255, 0, 0);
+
+        let text = pool_status_text(&manifest(), &statfs, &topology);
+
+        assert!(text.contains("health:      Degraded"));
+        assert!(text.contains("access:      ReadOnly"));
+        assert!(text.contains("members:     expected=2 present=1 missing=1"));
+        assert!(text.contains("member 0:   11111111111111111111111111111111 Missing"));
+        assert!(text.contains("member 1:   22222222222222222222222222222222 Present"));
     }
 
     #[test]

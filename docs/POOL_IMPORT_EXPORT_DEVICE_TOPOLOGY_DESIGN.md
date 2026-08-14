@@ -29,6 +29,26 @@ The current source-backed pool import/export boundary is:
 This document does not supersede source. If source and this summary disagree,
 source plus focused validation wins and this file must be corrected.
 
+## Durable Missing-Member Identity
+
+New local Pool label writes carry `TopologyRosterV1` after `DeviceLayoutV1`
+inside each 256 KiB label copy. The roster is a versioned, BLAKE3-checksummed,
+ordered array of device GUIDs; an array offset is the durable member index.
+Its generation and count must match the enclosing label, and each label's own
+index must resolve to its own device GUID.
+
+Every surviving roster for one import must agree byte-for-byte in member
+order. Corrupt, truncated, duplicate, stale, partial, or conflicting roster
+authority fails closed. A complete rosterless label family can still supply all
+member identities directly, but an incomplete read-only import requires the
+canonical roster so missing GUIDs are never inferred from paths, receipts, or
+cluster membership.
+
+The mounted local Pool projects this authority to live-owner `pool status` as
+health, read-only/read-write access, expected/present/missing counts, and an
+indexed GUID/presence list. This boundary adds truthful read-only degraded
+status only; it does not authorize writable degraded import or rebuild.
+
 ## Authority Limits
 
 This file is not product-readiness evidence for hot spares, evacuation,
