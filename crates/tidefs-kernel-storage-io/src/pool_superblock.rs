@@ -180,6 +180,10 @@ impl From<LabelError> for PoolSuperblockError {
             LabelError::BadPoolState(_)
             | LabelError::BadDeviceClass(_)
             | LabelError::BadRedundancyPolicy { .. }
+            | LabelError::BadTopologyRoster
+            | LabelError::UnsupportedTopologyRosterVersion(_)
+            | LabelError::DuplicateTopologyRosterGuid
+            | LabelError::TopologyRosterChecksumMismatch
             | LabelError::NameTooLong
             | LabelError::LastDevice => Self::Corrupt,
         }
@@ -802,6 +806,21 @@ mod tests {
         );
         let io_err = PoolSuperblockError::Io(Errno::EIO);
         assert!(alloc::format!("{io_err}").contains("I/O error"));
+    }
+
+    #[test]
+    fn topology_roster_label_errors_map_to_corrupt() {
+        for error in [
+            LabelError::BadTopologyRoster,
+            LabelError::UnsupportedTopologyRosterVersion(2),
+            LabelError::DuplicateTopologyRosterGuid,
+            LabelError::TopologyRosterChecksumMismatch,
+        ] {
+            assert_eq!(
+                PoolSuperblockError::from(error),
+                PoolSuperblockError::Corrupt
+            );
+        }
     }
 
     // ── KernelPoolSuperblock field extraction ─────────────────────
