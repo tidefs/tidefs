@@ -226,10 +226,15 @@ fn handle_attach(
         queue_depth,
         drain_deadline_secs,
     );
-    live_owner.standalone_block_carrier_stopped();
     signal_thread.finish();
     let carrier_result =
         carrier_result.map_err(|error| format!("ublk live device failed: {error}"));
+    live_owner.standalone_block_carrier_stopped(
+        carrier_result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| error.clone()),
+    );
     drop(backend);
     drop(runtime);
     let export_result = import_owner
