@@ -48,7 +48,9 @@ use serde::{Deserialize, Serialize};
 
 use tidefs_types_pool_label_core::{
     decode_label, features, DeviceClass, LabelError, PoolLabelV1, PoolRedundancyPolicy, PoolState,
-    POOL_LABEL_MAGIC, POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
+    POOL_LABEL_MAGIC, POOL_LABEL_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE,
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE,
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET, POOL_LABEL_V1_EXT_WIRE_SIZE,
     POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 
@@ -69,6 +71,24 @@ const COMPLETED_EVACUATIONS_EXTENSION_MAGIC: [u8; 8] = *b"TFSEVAC1";
 const COMPLETED_EVACUATIONS_EXTENSION_VERSION: u32 = 1;
 const COMPLETED_EVACUATIONS_EXTENSION_HEADER_SIZE: usize = 48;
 const COMPLETED_EVACUATION_RECORD_SIZE: usize = 64;
+
+fn decoded_label_wire_size(label: &PoolLabelV1) -> Result<usize, String> {
+    if label.features_compat & features::TOPOLOGY_ROSTER_V1 != 0 {
+        return usize::try_from(label.device_count)
+            .ok()
+            .and_then(|count| count.checked_mul(POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE))
+            .and_then(|size| size.checked_add(POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE))
+            .and_then(|size| size.checked_add(POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE))
+            .and_then(|size| POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET.checked_add(size))
+            .filter(|end| *end <= POOL_LABEL_SIZE)
+            .ok_or_else(|| "topology roster extent is outside the label envelope".to_string());
+    }
+    if label.features_compat & features::DEVICE_LAYOUT_V1 != 0 {
+        Ok(POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE)
+    } else {
+        Ok(POOL_LABEL_V1_EXT_WIRE_SIZE)
+    }
+}
 
 pub(crate) fn encode_completed_evacuations_label_extension(
     completed_evacuations: &[CompletedEvacuation],
@@ -864,14 +884,17 @@ impl PoolLabelReader {
 
         let features_compat = u64::from_le_bytes(prefix[371..379].try_into().unwrap());
         let has_device_layout = features_compat & features::DEVICE_LAYOUT_V1 != 0;
-        let wire_size = if has_device_layout {
+        let has_topology_roster = features_compat & features::TOPOLOGY_ROSTER_V1 != 0;
+        let wire_size = if has_topology_roster {
+            POOL_LABEL_SIZE
+        } else if has_device_layout {
             POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE
         } else {
             POOL_LABEL_V1_EXT_WIRE_SIZE
         };
         let mut full = prefix.to_vec();
         full.resize(wire_size, 0);
-        if has_device_layout
+        if wire_size > POOL_LABEL_V1_EXT_WIRE_SIZE
             && file
                 .read_exact(&mut full[POOL_LABEL_V1_EXT_WIRE_SIZE..])
                 .is_err()
@@ -880,14 +903,21 @@ impl PoolLabelReader {
         }
         match decode_label(&full) {
             Ok(label) => {
-                let mut extension = Vec::new();
-                let extension_len = POOL_LABEL_SIZE.saturating_sub(wire_size);
-                file.take(extension_len as u64)
-                    .read_to_end(&mut extension)
-                    .map_err(|e| ScanError::Io {
+                let extension_offset =
+                    decoded_label_wire_size(&label).map_err(|msg| ScanError::LabelEvidence {
                         path: PathBuf::from("<file>"),
-                        msg: format!("read completed evacuation extension: {e}"),
+                        msg,
                     })?;
+                let mut extension = full[extension_offset..].to_vec();
+                if full.len() < POOL_LABEL_SIZE {
+                    let extension_len = POOL_LABEL_SIZE.saturating_sub(full.len());
+                    file.take(extension_len as u64)
+                        .read_to_end(&mut extension)
+                        .map_err(|e| ScanError::Io {
+                            path: PathBuf::from("<file>"),
+                            msg: format!("read completed evacuation extension: {e}"),
+                        })?;
+                }
                 let completed_evacuations =
                     decode_completed_evacuations_label_extension(&extension).map_err(|msg| {
                         ScanError::LabelEvidence {

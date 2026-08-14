@@ -139,13 +139,19 @@ impl std::fmt::Display for LabelErrorKind {
 impl From<&LabelError> for LabelErrorKind {
     fn from(e: &LabelError) -> Self {
         match e {
-            LabelError::ChecksumMismatch => Self::ChecksumMismatch,
+            LabelError::ChecksumMismatch | LabelError::TopologyRosterChecksumMismatch => {
+                Self::ChecksumMismatch
+            }
             LabelError::BadMagic => Self::Other,
             LabelError::BufferTooSmall => Self::Other,
-            LabelError::UnsupportedVersion(_) => Self::UnsupportedVersion,
+            LabelError::UnsupportedVersion(_) | LabelError::UnsupportedTopologyRosterVersion(_) => {
+                Self::UnsupportedVersion
+            }
             LabelError::BadPoolState(_)
             | LabelError::BadDeviceClass(_)
-            | LabelError::BadRedundancyPolicy { .. } => Self::BadField,
+            | LabelError::BadRedundancyPolicy { .. }
+            | LabelError::BadTopologyRoster
+            | LabelError::DuplicateTopologyRosterGuid => Self::BadField,
             LabelError::NameTooLong => Self::BadField,
             LabelError::LastDevice => Self::Other,
         }
@@ -414,9 +420,17 @@ impl LabelReader {
 
         let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
         let has_device_layout = features_compat & features::DEVICE_LAYOUT_V1 != 0;
-        let full = if has_device_layout {
+        let has_topology_roster = features_compat & features::TOPOLOGY_ROSTER_V1 != 0;
+        let full = if has_topology_roster || has_device_layout {
             let mut v = buf.to_vec();
-            v.resize(POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE, 0);
+            v.resize(
+                if has_topology_roster {
+                    POOL_LABEL_SIZE
+                } else {
+                    POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE
+                },
+                0,
+            );
             if file
                 .read_exact(&mut v[POOL_LABEL_V1_EXT_WIRE_SIZE..])
                 .is_err()
@@ -476,27 +490,34 @@ impl LabelReader {
         }
         let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
         let has_device_layout = features_compat & features::DEVICE_LAYOUT_V1 != 0;
-        let wire_size = if has_device_layout {
+        let has_topology_roster = features_compat & features::TOPOLOGY_ROSTER_V1 != 0;
+        let wire_size = if has_topology_roster {
+            POOL_LABEL_SIZE
+        } else if has_device_layout {
             POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE
         } else {
             POOL_LABEL_V1_EXT_WIRE_SIZE
         };
         let mut full = buf.to_vec();
         full.resize(wire_size, 0);
-        if has_device_layout
+        if wire_size > POOL_LABEL_V1_EXT_WIRE_SIZE
             && file
                 .read_exact(&mut full[POOL_LABEL_V1_EXT_WIRE_SIZE..])
                 .is_err()
         {
             return Ok(None);
         }
-        decode_label(&full).map_err(|e| format!("label decode failed: {e}"))?;
-
-        let extension_len = (self.config.label_area_bytes as usize).saturating_sub(wire_size);
-        let mut extension = Vec::new();
-        file.take(extension_len as u64)
-            .read_to_end(&mut extension)
-            .map_err(|e| format!("read completed evacuation extension: {e}"))?;
+        let label = decode_label(&full).map_err(|e| format!("label decode failed: {e}"))?;
+        let extension_offset = crate::decoded_label_wire_size(&label)?;
+        let mut extension = full[extension_offset..].to_vec();
+        let label_area_bytes = usize::try_from(self.config.label_area_bytes)
+            .map_err(|_| "configured label area does not fit in usize".to_string())?;
+        if full.len() < label_area_bytes {
+            let extension_len = label_area_bytes.saturating_sub(full.len());
+            file.take(extension_len as u64)
+                .read_to_end(&mut extension)
+                .map_err(|e| format!("read completed evacuation extension: {e}"))?;
+        }
         decode_completed_evacuations_label_extension(&extension).map(Some)
     }
 }
@@ -737,7 +758,9 @@ mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
     use tidefs_types_pool_label_core::{
-        encode_label, seal_label, DeviceClass, PoolState, POOL_LABEL_V1_CHECKSUM_OFFSET,
+        encode_label, encode_label_with_extensions, seal_label, seal_label_with_extensions,
+        DeviceClass, PoolState, POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE,
+        POOL_LABEL_V1_CHECKSUM_OFFSET,
     };
 
     // -- Helpers --
@@ -895,6 +918,36 @@ mod tests {
         assert_eq!(parsed.pool_guid, [0xABu8; 16]);
         assert_eq!(parsed.device_guid, [0xCDu8; 16]);
         assert_eq!(parsed.pool_name_str(), "validpool");
+    }
+
+    #[test]
+    fn read_valid_topology_roster_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roster-member");
+        let layout = [0x5Au8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        let members = [[0x11; 16], [0x22; 16]];
+        let mut label = PoolLabelV1::new([0xAB; 16], members[1], "roster-pool");
+        label.device_index = 1;
+        label.device_count = 2;
+        label.topology_generation = 7;
+        let label = seal_label_with_extensions(label, Some(&layout), Some(&members)).unwrap();
+        let mut encoded = vec![0u8; POOL_LABEL_SIZE];
+        encode_label_with_extensions(&label, Some(&layout), Some(&members), &mut encoded).unwrap();
+        std::fs::write(&path, encoded).unwrap();
+        let reader = LabelReader::new(PoolScanConfig::new(vec![path.clone()]));
+
+        let outcome = reader.read_label(&path);
+
+        assert!(outcome.is_valid(), "expected roster label, got {outcome:?}");
+        let parsed = outcome.label().unwrap();
+        assert_eq!(parsed.pool_guid, [0xAB; 16]);
+        assert_eq!(parsed.device_guid, members[1]);
+        assert_eq!(parsed.device_index, 1);
+        assert_eq!(parsed.device_count, 2);
+        assert_eq!(
+            reader.read_completed_evacuations(&path).unwrap(),
+            Vec::new()
+        );
     }
 
     // -- LabelReader: no label (missing magic) --

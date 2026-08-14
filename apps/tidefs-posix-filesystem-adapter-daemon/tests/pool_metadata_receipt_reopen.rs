@@ -11,7 +11,9 @@ use tidefs_local_filesystem::{
     transaction_superblock_object_key, vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem,
     RootAuthenticationKey,
 };
-use tidefs_local_object_store::pool::{Pool, PoolConfig, PoolProperties, PoolRedundancyPolicy};
+use tidefs_local_object_store::pool::{
+    Pool, PoolConfig, PoolProperties, PoolRedundancyPolicy, PoolTopologyStatus,
+};
 use tidefs_local_object_store::{
     DeviceBacking, DeviceClass, DeviceConfig, DeviceKind, DeviceMediaClass,
 };
@@ -47,7 +49,7 @@ fn open_fuse_session(
     mountpoint: &Path,
     redundancy_policy: PoolRedundancyPolicy,
     read_only: bool,
-) -> fuser::BackgroundSession {
+) -> (fuser::BackgroundSession, PoolTopologyStatus) {
     let recovery_policy = if read_only {
         RecoveryPolicy::ReadOnly
     } else {
@@ -63,6 +65,7 @@ fn open_fuse_session(
         recovery_policy,
     )
     .expect("open mirrored filesystem for FUSE");
+    let topology = filesystem.pool_topology_status();
     let engine = VfsLocalFileSystem::new(filesystem);
     let engine = if read_only {
         engine.with_read_only()
@@ -75,7 +78,7 @@ fn open_fuse_session(
     } else {
         fuser::MountOption::RW
     };
-    fuser::spawn_mount2(
+    let session = fuser::spawn_mount2(
         adapter,
         mountpoint,
         &[
@@ -86,7 +89,8 @@ fn open_fuse_session(
             fuser::MountOption::Subtype("tidefs".to_string()),
         ],
     )
-    .expect("mount mirrored filesystem through FUSE")
+    .expect("mount mirrored filesystem through FUSE");
+    (session, topology)
 }
 
 #[test]
@@ -111,7 +115,7 @@ fn fuse_remount_survives_primary_transaction_metadata_loss() {
 
     let redundancy_policy = PoolRedundancyPolicy::replicated(2);
     let payload = b"real FUSE bytes recovered through surviving Pool metadata receipts";
-    let session = open_fuse_session(
+    let (session, _) = open_fuse_session(
         &metadata_dir,
         &devices,
         &mountpoint,
@@ -168,7 +172,7 @@ fn fuse_remount_survives_primary_transaction_metadata_loss() {
     pool.sync_all().expect("sync primary member metadata loss");
     drop(pool);
 
-    let session = open_fuse_session(
+    let (session, _) = open_fuse_session(
         &metadata_dir,
         &devices,
         &mountpoint,
@@ -209,7 +213,7 @@ fn fuse_read_only_remount_survives_physically_absent_member() {
 
     let redundancy_policy = PoolRedundancyPolicy::replicated(2);
     let payload = b"committed FUSE bytes recovered while member zero is physically absent";
-    let session = open_fuse_session(
+    let (session, _) = open_fuse_session(
         &metadata_dir,
         &devices,
         &mountpoint,
@@ -238,12 +242,25 @@ fn fuse_read_only_remount_survives_physically_absent_member() {
     fs::rename(&devices[0], &offline_member).expect("make member zero physically absent");
     assert!(!devices[0].exists());
     let surviving_devices = vec![devices[1].clone()];
-    let session = open_fuse_session(
+    let (session, topology) = open_fuse_session(
         &metadata_dir,
         &surviving_devices,
         &mountpoint,
         redundancy_policy,
         true,
+    );
+    assert_eq!(topology.expected_members, 2);
+    assert_eq!(topology.present_members, 1);
+    assert_eq!(topology.missing_members, 1);
+    assert!(topology.read_only);
+    assert_eq!(topology.members.len(), 2);
+    assert_eq!(topology.members[0].device_index, 0);
+    assert!(!topology.members[0].present);
+    assert_eq!(topology.members[1].device_index, 1);
+    assert!(topology.members[1].present);
+    assert_ne!(
+        topology.members[0].device_guid, topology.members[1].device_guid,
+        "the absent member must retain its own durable identity"
     );
     let mut read_back = Vec::new();
     File::open(&mounted_file)

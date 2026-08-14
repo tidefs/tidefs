@@ -350,6 +350,26 @@ pub enum PoolHealth {
     Suspended,
 }
 
+/// One durable Pool member identity and whether its device is present in this
+/// imported runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PoolMemberStatus {
+    pub device_index: u32,
+    pub device_guid: [u8; 16],
+    pub present: bool,
+}
+
+/// Truthful topology projection for operator-visible Pool status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolTopologyStatus {
+    pub health: PoolHealth,
+    pub read_only: bool,
+    pub expected_members: u32,
+    pub present_members: u32,
+    pub missing_members: u32,
+    pub members: Vec<PoolMemberStatus>,
+}
+
 // ---------------------------------------------------------------------------
 // Device replacement
 // ---------------------------------------------------------------------------
@@ -1543,6 +1563,10 @@ pub struct Pool {
     pool_guid: [u8; 16],
     /// Per-device GUIDs matching device order for label-based topology updates.
     device_guids: Vec<[u8; 16]>,
+    /// Complete durable index/GUID authority decoded from surviving labels.
+    /// Unlike `device_guids`, this retains identities for physically absent
+    /// members during a degraded read-only import.
+    durable_device_guids: Vec<[u8; 16]>,
     /// Durable member count declared by the imported labels.
     ///
     /// Writable opens require this to equal `devices.len()`. A read-only open
@@ -2862,6 +2886,7 @@ impl Pool {
             device_layouts,
             log_device,
             pool_guid,
+            durable_device_guids: device_guids.clone(),
             device_guids,
             expected_device_count,
             device_label_indices,
@@ -2977,6 +3002,8 @@ impl Pool {
         let mut read_only_device_indices = BTreeSet::new();
         let mut expected_device_count: Option<u32> = None;
         let mut device_label_indices = Vec::with_capacity(config.devices.len());
+        let mut durable_device_guids: Option<Vec<[u8; 16]>> = None;
+        let mut topology_roster_label_count = 0usize;
 
         // Attempt to read a label from each configured device path.
         for (configured_index, vc) in config.devices.iter().enumerate() {
@@ -3033,6 +3060,30 @@ impl Pool {
             let label = pool_label::decode_label(&buf).map_err(|_| StoreError::InvalidOptions {
                 reason: "pool label corrupt or unreadable",
             })?;
+            let decoded_roster = pool_label::decode_topology_roster_v1(&buf).map_err(|_| {
+                StoreError::InvalidOptions {
+                    reason: "pool label topology roster is corrupt or unreadable",
+                }
+            })?;
+            if let Some(roster) = decoded_roster {
+                topology_roster_label_count += 1;
+                let roster_guids = (0..roster.len())
+                    .map(|index| {
+                        roster.member_guid(index).ok_or(StoreError::InvalidOptions {
+                            reason: "pool label topology roster member is unreadable",
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                match durable_device_guids.as_ref() {
+                    Some(existing) if existing != &roster_guids => {
+                        return Err(StoreError::InvalidOptions {
+                            reason: "pool topology roster mismatch across labels",
+                        });
+                    }
+                    None => durable_device_guids = Some(roster_guids),
+                    Some(_) => {}
+                }
+            }
             labeled_device_count += 1;
             if label.device_count == 0 || label.device_index >= label.device_count {
                 return Err(StoreError::InvalidOptions {
@@ -3200,8 +3251,40 @@ impl Pool {
                 reason: "pool import requires a label on every configured device",
             });
         }
+        if topology_roster_label_count != 0 && topology_roster_label_count != labeled_device_count {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool topology roster presence mismatch across labels",
+            });
+        }
 
         let expected_device_count = expected_device_count.unwrap_or(config.devices.len() as u32);
+
+        let durable_device_guids = match durable_device_guids {
+            Some(roster) if roster.len() == expected_device_count as usize => roster,
+            Some(_) => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pool topology roster member count does not match labels",
+                })
+            }
+            None if config.devices.len() < expected_device_count as usize => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "degraded pool import requires a durable topology roster",
+                })
+            }
+            None => {
+                let mut roster = vec![[0u8; 16]; expected_device_count as usize];
+                for (&index, &guid) in device_label_indices.iter().zip(&device_guids) {
+                    let slot =
+                        roster
+                            .get_mut(index as usize)
+                            .ok_or(StoreError::InvalidOptions {
+                                reason: "pool topology label index is outside the member roster",
+                            })?;
+                    *slot = guid;
+                }
+                roster
+            }
+        };
 
         if !label_found {
             if mode == PoolOpenMode::ReadOnlyExisting {
@@ -3429,6 +3512,7 @@ impl Pool {
             device_layouts,
             log_device,
             pool_guid: pg,
+            durable_device_guids,
             device_guids,
             expected_device_count,
             device_label_indices,
@@ -3505,6 +3589,7 @@ impl Pool {
                 config,
                 label,
                 self.device_layouts.get(i),
+                &self.device_guids,
                 "pool_export_write_label",
             )?;
         }
@@ -3664,7 +3749,9 @@ impl Pool {
                 .device_layouts
                 .get(device_index)
                 .map_or(0, |layout| layout.system_area_len),
-            features_compat: features::DEVICE_HEALTH_STATE | features::DEVICE_LAYOUT_V1,
+            features_compat: features::DEVICE_HEALTH_STATE
+                | features::DEVICE_LAYOUT_V1
+                | features::TOPOLOGY_ROSTER_V1,
             features_incompat: {
                 let mut flags = features::POOL_LABEL_V1;
                 if self.devices.iter().any(|d| d.is_encrypted()) {
@@ -3712,6 +3799,7 @@ impl Pool {
                 config,
                 label,
                 self.device_layouts.get(device_index),
+                &self.device_guids,
                 "pool_active_write_label",
             )?;
         }
@@ -7476,6 +7564,54 @@ impl Pool {
         self.health
     }
 
+    /// Whether this Pool was imported through the side-effect-free read-only
+    /// path.
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Return the durable topology and current presence truth used by
+    /// operator-visible status.
+    #[must_use]
+    pub fn topology_status(&self) -> PoolTopologyStatus {
+        let (roster, present_indices): (&[[u8; 16]], BTreeSet<u32>) = if self.read_only {
+            (
+                &self.durable_device_guids,
+                self.device_label_indices.iter().copied().collect(),
+            )
+        } else {
+            (
+                &self.device_guids,
+                (0..self.device_guids.len())
+                    .filter_map(|index| u32::try_from(index).ok())
+                    .collect(),
+            )
+        };
+        let expected_members = u32::try_from(roster.len()).unwrap_or(u32::MAX);
+        let present_members = u32::try_from(present_indices.len()).unwrap_or(u32::MAX);
+        let members = roster
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &device_guid)| {
+                let device_index = u32::try_from(index).ok()?;
+                Some(PoolMemberStatus {
+                    device_index,
+                    device_guid,
+                    present: present_indices.contains(&device_index),
+                })
+            })
+            .collect();
+        PoolTopologyStatus {
+            health: self.health,
+            read_only: self.read_only,
+            expected_members,
+            present_members,
+            missing_members: expected_members.saturating_sub(present_members),
+            members,
+        }
+    }
+
     /// Number of dedicated intent-log (LOG_DEVICE) devices.
     ///
     /// Counts only devices whose [`DeviceClass`] is [`DeviceClass::IntentLog`],
@@ -8765,6 +8901,7 @@ fn write_pool_label(
     device_config: &DeviceConfig,
     label: PoolLabelV1,
     device_layout: Option<&DeviceLayoutV1>,
+    topology_roster: &[[u8; 16]],
     operation: &'static str,
 ) -> Result<()> {
     let layout_bytes = device_layout.map(|layout| {
@@ -8773,18 +8910,35 @@ fn write_pool_label(
         bytes
     });
     let sealed =
-        pool_label::seal_label_with_device_layout(label, layout_bytes.as_ref()).map_err(|_| {
-            StoreError::InvalidOptions {
+        pool_label::seal_label_with_extensions(label, layout_bytes.as_ref(), Some(topology_roster))
+            .map_err(|_| StoreError::InvalidOptions {
                 reason: "label seal failed",
-            }
-        })?;
+            })?;
 
-    let mut buf = [0u8; pool_label::POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
-    pool_label::encode_label_with_device_layout(&sealed, layout_bytes.as_ref(), &mut buf).map_err(
-        |_| StoreError::InvalidOptions {
-            reason: "label encode failed",
-        },
-    )?;
+    let roster_bytes = topology_roster
+        .len()
+        .checked_mul(pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE)
+        .and_then(|size| size.checked_add(pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE))
+        .and_then(|size| size.checked_add(pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE))
+        .ok_or(StoreError::InvalidOptions {
+            reason: "pool topology roster is too large",
+        })?;
+    let encoded_size = pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+        .checked_add(roster_bytes)
+        .filter(|size| *size <= pool_label::POOL_LABEL_SIZE)
+        .ok_or(StoreError::InvalidOptions {
+            reason: "pool topology roster does not fit the label envelope",
+        })?;
+    let mut buf = vec![0u8; encoded_size];
+    pool_label::encode_label_with_extensions(
+        &sealed,
+        layout_bytes.as_ref(),
+        Some(topology_roster),
+        &mut buf,
+    )
+    .map_err(|_| StoreError::InvalidOptions {
+        reason: "label encode failed",
+    })?;
 
     let device_root = device_root_path(device_config);
     if device_config.backing.uses_fixed_offset_pool_labels() {
@@ -9668,6 +9822,28 @@ mod tests {
         assert_eq!(degraded.device_label_indices, vec![1]);
         assert_eq!(degraded.health(), PoolHealth::Degraded);
         assert_eq!(degraded.device_guid_for_index(0), removal_target_guid);
+        assert_eq!(
+            degraded.topology_status(),
+            PoolTopologyStatus {
+                health: PoolHealth::Degraded,
+                read_only: true,
+                expected_members: 2,
+                present_members: 1,
+                missing_members: 1,
+                members: vec![
+                    PoolMemberStatus {
+                        device_index: 0,
+                        device_guid: first_device_guid,
+                        present: false,
+                    },
+                    PoolMemberStatus {
+                        device_index: 1,
+                        device_guid: removal_target_guid,
+                        present: true,
+                    },
+                ],
+            }
+        );
         let (degraded_payload, degraded_receipt) = degraded
             .get_with_current_receipt(IoClass::Data, key)
             .expect("read current receipt through surviving member")
@@ -9719,6 +9895,110 @@ mod tests {
             .collect();
         metadata_entries_after.sort();
         assert_eq!(metadata_entries_after, metadata_entries_before);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_pool_open_refuses_conflicting_topology_roster() {
+        let root = temp_dir("read-only-conflicting-topology-roster");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = PoolConfig {
+            name: "read-only-conflicting-topology-roster".into(),
+            root_path: root.join("metadata"),
+            devices: vec![
+                regular_file_device_config(root.join("device-0.img")),
+                regular_file_device_config(root.join("device-1.img")),
+            ],
+        };
+        let options = test_options();
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let pool = Pool::create(config.clone(), properties.clone(), &options)
+            .expect("create roster-conflict fixture");
+        let mut conflicting_roster = pool.device_guids.clone();
+        conflicting_roster[0] = [0xEE; 16];
+        assert_ne!(conflicting_roster[0], conflicting_roster[1]);
+        let layout = pool.device_layouts[1];
+        let mut label_bytes = vec![0u8; pool_label::POOL_LABEL_SIZE];
+        let mut label_file = fs::File::open(device_root_path(&config.devices[1])).unwrap();
+        label_file.read_exact(&mut label_bytes).unwrap();
+        let label = pool_label::decode_label(&label_bytes).unwrap();
+        write_pool_label(
+            &config.devices[1],
+            label,
+            Some(&layout),
+            &conflicting_roster,
+            "test_write_conflicting_topology_roster",
+        )
+        .unwrap();
+        drop(pool);
+
+        assert_invalid_options_reason_contains(
+            Pool::open_read_only_existing(config, properties, &options),
+            "topology roster mismatch across labels",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_pool_open_refuses_partial_or_missing_topology_roster() {
+        let root = temp_dir("read-only-partial-topology-roster");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = PoolConfig {
+            name: "read-only-partial-topology-roster".into(),
+            root_path: root.join("metadata"),
+            devices: vec![
+                regular_file_device_config(root.join("device-0.img")),
+                regular_file_device_config(root.join("device-1.img")),
+            ],
+        };
+        let options = test_options();
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let pool = Pool::create(config.clone(), properties.clone(), &options)
+            .expect("create partial-roster fixture");
+        let mut label_bytes = vec![0u8; pool_label::POOL_LABEL_SIZE];
+        let mut label_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(device_root_path(&config.devices[0]))
+            .unwrap();
+        label_file.read_exact(&mut label_bytes).unwrap();
+        let label = pool_label::decode_label(&label_bytes).unwrap();
+        let mut layout_bytes = [0u8; pool_label::POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        encode_device_layout_v1(&pool.device_layouts[0], &mut layout_bytes);
+        let rosterless =
+            pool_label::seal_label_with_device_layout(label, Some(&layout_bytes)).unwrap();
+        let mut rosterless_bytes = [0u8; pool_label::POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+        pool_label::encode_label_with_device_layout(
+            &rosterless,
+            Some(&layout_bytes),
+            &mut rosterless_bytes,
+        )
+        .unwrap();
+        label_file.seek(SeekFrom::Start(0)).unwrap();
+        label_file.write_all(&rosterless_bytes).unwrap();
+        label_file.sync_all().unwrap();
+        drop(label_file);
+        drop(pool);
+
+        assert_invalid_options_reason_contains(
+            Pool::open_read_only_existing(config.clone(), properties.clone(), &options),
+            "feature flags mismatch across devices",
+        );
+
+        let mut degraded_without_roster = config;
+        degraded_without_roster.devices.truncate(1);
+        assert_invalid_options_reason_contains(
+            Pool::open_read_only_existing(degraded_without_roster, properties, &options),
+            "degraded pool import requires a durable topology roster",
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16959,6 +17239,7 @@ mod tests {
             &config.devices[0],
             label,
             Some(&persisted_layout),
+            &pool.device_guids,
             "test_write_directory_layout_capacity_drift_label",
         )
         .unwrap();
@@ -16999,6 +17280,7 @@ mod tests {
             &config.devices[0],
             label,
             Some(&raw_layout),
+            &pool.device_guids,
             "test_write_raw_capacity_creator_layout_label",
         )
         .unwrap();
@@ -17036,6 +17318,7 @@ mod tests {
             &config.devices[0],
             label,
             Some(&mismatched_layout),
+            &pool.device_guids,
             "test_write_byte_layout_capacity_mismatch_label",
         )
         .unwrap();
@@ -17062,6 +17345,7 @@ mod tests {
 
         let pool = Pool::create(config.clone(), properties, &options).unwrap();
         let device_layout = pool.device_layouts()[1];
+        let topology_roster = pool.device_guids.clone();
         pool.export().unwrap();
         drop(pool);
 
@@ -17073,6 +17357,7 @@ mod tests {
             &config.devices[1],
             label,
             Some(&device_layout),
+            &topology_roster,
             "test_write_mismatched_redundancy_label",
         )
         .unwrap();

@@ -3353,6 +3353,13 @@ impl LocalFileSystem {
         self.store.pool_properties()
     }
 
+    /// Return durable Pool-member presence and identity from the mounted Pool
+    /// authority without exposing raw stores or label bytes to a live owner.
+    #[must_use]
+    pub fn pool_topology_status(&self) -> tidefs_local_object_store::pool::PoolTopologyStatus {
+        self.store.pool().topology_status()
+    }
+
     /// Get an exclusive reference to the durable pool properties for mutation.
     pub fn pool_properties_mut(&mut self) -> Result<&mut PropertySet> {
         self.ensure_mutation_allowed("mutate pool properties")?;
@@ -7114,7 +7121,11 @@ impl LocalFileSystem {
         // Keep store-layer SpaceBook updated for internal tracking
         // (write/delete auto-updates, persistence). The statfs derivation
         // no longer queries SpaceBook; it uses the single capacity authority.
-        self.store.pool_mut().update_space_book_pool_counters(phys);
+        // A read-only import projects the same counters in memory below but
+        // must not request a mutable raw-store handle for this unused cache.
+        if !self.store.pool().is_read_only() {
+            self.store.pool_mut().update_space_book_pool_counters(phys);
+        }
         // Refresh the mounted capacity facade from the committed
         // tidefs-space-accounting authority. Statfs must not recompute
         // free space from local capacity counters.

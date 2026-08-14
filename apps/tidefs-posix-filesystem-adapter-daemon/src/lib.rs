@@ -1108,7 +1108,6 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         }
         (engine, tracker, dataset_id)
     };
-    #[cfg(feature = "block-volume")]
     let shared_filesystem = base_engine.shared_filesystem();
 
     // When cluster-authorized, wrap the engine in a placement-recording layer.
@@ -1280,7 +1279,6 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                     owner_config,
                     Arc::clone(&live_owner_engine),
                     dataset_replacement.clone(),
-                    #[cfg(feature = "block-volume")]
                     shared_filesystem.clone(),
                     Arc::clone(&shutdown),
                 ) {
