@@ -659,9 +659,8 @@ fn dedup_canonical_chunk_is_current(
 ) -> bool {
     use tidefs_local_object_store::DeviceIoClass;
 
-    let Ok(Some((canonical_bytes, receipt))) =
-        pool.get_with_current_receipt(DeviceIoClass::Data, keyspace.scope(canonical_key))
-    else {
+    let read = pool.get_with_current_receipt(DeviceIoClass::Data, keyspace.scope(canonical_key));
+    let Ok(Some((canonical_bytes, receipt))) = read else {
         return false;
     };
     if receipt.generation == 0 {
@@ -675,6 +674,68 @@ fn dedup_canonical_chunk_is_current(
     }
     let fingerprint = compute_content_fingerprint(&chunk.bytes);
     content_dedup_object_key(&fingerprint) == canonical_key
+}
+
+pub(crate) fn pending_removal_chunk_payload_matches_ref(
+    pool: &tidefs_local_object_store::pool::Pool,
+    chunk_ref: &crate::records::ContentChunkRef,
+    object_key: ObjectKey,
+    bytes: &[u8],
+    keyspace: FilesystemObjectKeyspace,
+) -> bool {
+    if chunk_ref.data_version == 0
+        || chunk_ref.len == 0
+        || tidefs_local_object_store::checksum64(bytes) != chunk_ref.checksum
+    {
+        return false;
+    }
+
+    if is_dedup_redirect(bytes) {
+        let Ok(canonical_key) = decode_dedup_redirect(bytes) else {
+            return false;
+        };
+        let scoped_key = keyspace.scope(canonical_key);
+        let canonical = match pool.get_with_removal_survivor_receipt(
+            tidefs_local_object_store::DeviceIoClass::Data,
+            scoped_key,
+        ) {
+            Ok(Some(current)) => Some(current),
+            Ok(None) => pool
+                .get_with_removal_predecessor_receipt(
+                    tidefs_local_object_store::DeviceIoClass::Data,
+                    scoped_key,
+                )
+                .ok()
+                .flatten(),
+            Err(_) => None,
+        };
+        let Some((canonical_bytes, receipt)) = canonical else {
+            return false;
+        };
+        if receipt.generation == 0 {
+            return false;
+        }
+        let Ok(chunk) = decode_content_chunk(&canonical_bytes) else {
+            return false;
+        };
+        if chunk.bytes.len() != chunk_ref.len as usize {
+            return false;
+        }
+        let fingerprint = compute_content_fingerprint(&chunk.bytes);
+        return content_dedup_object_key(&fingerprint) == canonical_key;
+    }
+
+    let Ok(chunk) = decode_content_chunk(bytes) else {
+        return false;
+    };
+    chunk.data_version == chunk_ref.data_version
+        && chunk.chunk_index == chunk_ref.chunk_index
+        && chunk.bytes.len() == chunk_ref.len as usize
+        && content_chunk_object_key_for_version(
+            chunk.inode_id,
+            chunk.data_version,
+            chunk.chunk_index,
+        ) == object_key
 }
 
 fn chunk_payload_matches_ref(

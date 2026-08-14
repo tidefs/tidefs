@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::{json, Value};
 #[cfg(feature = "replication-io")]
 use tidefs_local_object_store::IntegrityDigest64;
-use tidefs_local_object_store::StoreError;
+use tidefs_local_object_store::{DeviceIoClass, StoreError};
 use tidefs_types_extent_map_core::ExtentMapOps;
 use tidefs_types_vfs_core::{
     DirEntry, DirHandleId, EngineDirHandle, EngineFileHandle, Errno, Generation, InodeAttr,
@@ -35,6 +35,7 @@ use tidefs_vfs_engine::{
 use tidefs_vfs_engine::{LivePoolAdminOutput, LivePoolAdminResponseBody};
 
 use crate::content::{reflink_chunked_content, FilesystemContentWriteStore};
+use crate::encoding::{encode_content_manifest, encode_content_manifest_sparse};
 use crate::error::FileSystemError;
 use crate::fuse_getattr;
 use crate::fuse_setattr;
@@ -44,6 +45,7 @@ use crate::open_dispatch::{self, FileHandleState, FileHandleTable};
 use crate::release_dispatch;
 #[cfg(feature = "replication-io")]
 use crate::types::CommittedRootSummary;
+use crate::types::CONTENT_MANIFEST_SPARSE_MAGIC;
 use crate::types::{InodeRecord, IntentLogReplyState, NamespaceEntry};
 use crate::xattr_dispatch;
 use tidefs_inode_attributes::timestamp::{TimestampPolicy, TimestampUpdate};
@@ -3261,82 +3263,45 @@ impl VfsLocalFileSystem {
         }
 
         let mut fs = self.fs.borrow_mut();
-        let pending = match fs.store.pool().pending_device_removal_result(&device_path) {
-            Ok(pending) => pending,
+        if let Err(err) = fs.sync_all() {
+            return live_admin_error(
+                1,
+                format!(
+                    "device remove: could not sync mounted filesystem state before evacuating '{}': {err}",
+                    device_path.display()
+                ),
+            );
+        }
+        let result = match fs.complete_mounted_device_removal(&device_path) {
+            Ok(result) => result,
             Err(err) => {
                 return live_admin_error(
                     1,
                     format!(
-                        "device remove: could not inspect pending removal state for '{}': {err}",
+                        "device remove: mounted pool owner could not remove '{}': {err}",
                         device_path.display()
                     ),
                 )
             }
         };
-        let result = if let Some(result) = pending {
-            result
-        } else {
-            if let Err(err) = fs.sync_all() {
-                return live_admin_error(
-                    1,
-                    format!(
-                        "device remove: could not sync mounted filesystem state before evacuating '{}': {err}",
-                        device_path.display()
-                    ),
-                );
-            }
 
-            match fs.store.pool_mut().safe_remove_device(&device_path) {
-                Ok(result) => result,
-                Err(err) => {
-                    return live_admin_error(
-                        1,
-                        format!(
-                            "device remove: mounted pool owner could not remove '{}': {err}",
-                            device_path.display()
-                        ),
-                    )
-                }
-            }
-        };
-
-        if result.topology_commit_pending {
+        if !result.complete || result.objects_failed > 0 {
             let remaining_devices = fs.store.pool().stats().device_count;
-            let mut machine = json!({
-                "status": "topology_commit_pending",
+            let machine = json!({
+                "status": "evacuation_incomplete",
                 "device_path": device_path.display().to_string(),
-                "topology_commit_pending": true,
                 "topology_committed": false,
                 "marker_retained": true,
-                "current_process_detached": true,
+                "target_attached": true,
+                "target_allocation_fenced": true,
                 "objects_evacuated": result.objects_evacuated,
                 "objects_failed": result.objects_failed,
                 "bytes_evacuated": result.bytes_evacuated,
                 "remaining_devices": remaining_devices,
-                "action": "reopen with the original pre-removal device configuration to resume; keep the target attached and do not decommission or treat it as removed",
+                "action": "repair the reported object failures and retry; keep the target attached and do not decommission or treat it as removed",
             });
-
-            if let Err(err) = fs.store.pool_mut().sync_all() {
-                machine["surviving_devices_synced"] = Value::Bool(false);
-                machine["survivor_sync_error"] = Value::String(err.to_string());
-                let message = format!(
-                    "device remove: evacuation of '{}' completed and the current process detached the target, but survivor sync failed while durable topology commit remains pending and the recovery marker is retained: {err}; reopen with the original pre-removal device configuration to resume, keep the target attached, and do not decommission or treat it as removed (objects_evacuated={}, objects_failed={}, bytes_evacuated={}, remaining_devices={})",
-                    device_path.display(),
-                    result.objects_evacuated,
-                    result.objects_failed,
-                    result.bytes_evacuated,
-                    remaining_devices,
-                );
-                return if wants_json {
-                    LivePoolAdminResponse::error_machine_json(1, message, machine.to_string())
-                } else {
-                    live_admin_error(1, message)
-                };
-            }
-
-            machine["surviving_devices_synced"] = Value::Bool(true);
             let message = format!(
-                "device remove: evacuation of '{}' completed, the current process detached the target, and surviving devices were synced, but durable topology commit is unavailable; removal remains pending and the recovery marker is retained; reopen with the original pre-removal device configuration to resume, keep the target attached, and do not decommission or treat it as removed (objects_evacuated={}, objects_failed={}, bytes_evacuated={}, remaining_devices={})",
+                "device remove: evacuation of '{}' did not complete; the target remains attached and allocation-fenced, the recovery marker remains durable, and no reduced topology was committed (objects_evacuated={}, objects_failed={}, bytes_evacuated={}, remaining_devices={})",
                 device_path.display(),
                 result.objects_evacuated,
                 result.objects_failed,
@@ -3350,28 +3315,260 @@ impl VfsLocalFileSystem {
             };
         }
 
-        if !result.complete || result.objects_failed > 0 {
-            return live_admin_error(
-                1,
-                format!(
-                    "device remove: evacuation of '{}' did not complete (objects_evacuated={}, objects_failed={})",
-                    device_path.display(),
-                    result.objects_evacuated,
-                    result.objects_failed,
-                ),
-            );
+        let topology_generation = fs.store.pool().placement_epoch();
+        let remaining_devices = fs.store.pool().stats().device_count;
+        let message = format!(
+            "device remove: removed '{}' after receipt-backed evacuation and durable survivor topology commit (objects_evacuated={}, bytes_evacuated={}, topology_generation={}, remaining_devices={}); this does not establish secure erase, media-remanence, or decommissioning guarantees",
+            device_path.display(),
+            result.objects_evacuated,
+            result.bytes_evacuated,
+            topology_generation,
+            remaining_devices,
+        );
+        if wants_json {
+            LivePoolAdminResponse::ok_machine_json(
+                json!({
+                    "status": "removed",
+                    "device_path": device_path.display().to_string(),
+                    "topology_committed": true,
+                    "topology_generation": topology_generation,
+                    "objects_evacuated": result.objects_evacuated,
+                    "objects_failed": result.objects_failed,
+                    "bytes_evacuated": result.bytes_evacuated,
+                    "remaining_devices": remaining_devices,
+                    "remanence_guarantee": false,
+                    "message": message,
+                })
+                .to_string(),
+            )
+        } else {
+            live_admin_ok_text(message)
+        }
+    }
+}
+
+impl LocalFileSystem {
+    /// Complete a mounted device removal without invalidating the exact Pool
+    /// receipt generations embedded in content manifests.
+    pub(crate) fn complete_mounted_device_removal(
+        &mut self,
+        device_path: &std::path::Path,
+    ) -> crate::Result<tidefs_local_object_store::device_removal::EvacuationResult> {
+        self.ensure_exclusive_device_removal_root_authority()?;
+        let preparation = self
+            .store
+            .pool_mut()
+            .prepare_safe_remove_device(device_path)
+            .map_err(FileSystemError::from);
+        if preparation.is_err() && self.store.pool().pending_device_removal_path()?.is_none() {
+            return preparation;
         }
 
-        live_admin_error(
-            1,
-            format!(
-                "device remove: mounted pool owner reported completion for '{}' without the required topology-pending state; refusing to report the target removed because this path has no durable topology commit (objects_evacuated={}, objects_failed={}, bytes_evacuated={})",
-                device_path.display(),
-                result.objects_evacuated,
-                result.objects_failed,
-                result.bytes_evacuated,
-            ),
-        )
+        // Preparation can fail after one or more replacement receipts became
+        // current. Always repair every valid manifest reference that can now
+        // be advanced before returning the preparation error.
+        self.reconcile_relocated_content_receipts()?;
+        self.store.pool_mut().sync_all()?;
+
+        // Receipt reconciliation copy-on-writes every changed content
+        // manifest under a new inode data version and publishes that state in
+        // one authenticated transaction. Replace every retained fallback root
+        // slot before detach so none can name the predecessor generations.
+        // Always turn the complete ring: a resumed removal may have crashed
+        // after publishing only a prefix.
+        for _ in 0..crate::constants::FILESYSTEM_ROOT_SLOT_COUNT {
+            self.persist_dataset_catalog()?;
+        }
+        self.store.pool_mut().sync_all()?;
+
+        let preparation = preparation?;
+        if preparation.objects_failed > 0 {
+            return Ok(preparation);
+        }
+
+        let result = self
+            .store
+            .pool_mut()
+            .finish_safe_remove_device(device_path)?;
+        self.store.pool_mut().sync_all()?;
+        Ok(result)
+    }
+
+    /// Resume a marker-bound mounted removal before a reopened filesystem is
+    /// exposed to namespace or content I/O.
+    pub(crate) fn resume_pending_mounted_device_removal(
+        &mut self,
+    ) -> crate::Result<Option<tidefs_local_object_store::device_removal::EvacuationResult>> {
+        let Some(device_path) = self.store.pool().pending_device_removal_path()? else {
+            return Ok(None);
+        };
+        self.complete_mounted_device_removal(&device_path).map(Some)
+    }
+
+    fn ensure_exclusive_device_removal_root_authority(&self) -> crate::Result<()> {
+        if self
+            .state
+            .snapshots
+            .values()
+            .any(crate::snapshot::snapshot_record_retains_data)
+        {
+            return Err(FileSystemError::Unsupported {
+                operation: "remove device from mounted pool",
+                reason: "data-retaining snapshots or clones require atomic receipt reconciliation of their immutable roots",
+            });
+        }
+
+        let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        if self
+            .dataset_catalog()
+            .list_all()
+            .iter()
+            .any(|(_, dataset_id, _, _, _, _)| *dataset_id != mounted_dataset_id)
+        {
+            return Err(FileSystemError::Unsupported {
+                operation: "remove device from mounted pool",
+                reason: "another dataset in the Pool requires its own mounted owner to join atomic receipt reconciliation",
+            });
+        }
+        Ok(())
+    }
+
+    fn reconcile_relocated_content_receipts(&mut self) -> crate::Result<u64> {
+        let keyspace = self.object_keyspace();
+        let current_inodes = self
+            .state
+            .inodes
+            .values()
+            .filter(|record| {
+                record.size > 0 && matches!(record.kind(), NodeKind::File | NodeKind::Symlink)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut replacements = Vec::new();
+
+        for record in current_inodes {
+            let content_key = keyspace.content(record.inode_id, record.data_version);
+            let Some((bytes, _)) = self
+                .store
+                .pool()
+                .get_with_current_receipt(DeviceIoClass::Data, content_key)?
+            else {
+                return Err(FileSystemError::CorruptState {
+                    reason: "device removal lost current content placement authority",
+                });
+            };
+            let sparse = bytes.starts_with(&CONTENT_MANIFEST_SPARSE_MAGIC);
+            let layout = crate::content::decode_content_layout(&bytes)?;
+            crate::content::validate_content_layout(record.inode_id, &record, &layout)?;
+            let crate::records::ContentLayout::Chunked(mut manifest) = layout else {
+                continue;
+            };
+
+            let mut changed = false;
+            let manifest_inode_id = manifest.inode_id;
+            for chunk_ref in &mut manifest.chunks {
+                if chunk_ref.is_hole() {
+                    continue;
+                }
+                let chunk_key = crate::object_keys::content_chunk_object_key_for_version(
+                    manifest_inode_id,
+                    chunk_ref.data_version,
+                    chunk_ref.chunk_index,
+                );
+                let scoped_chunk_key = keyspace.scope(chunk_key);
+                let Some((chunk_bytes, current_chunk_receipt)) = self
+                    .store
+                    .pool()
+                    .get_with_current_receipt(DeviceIoClass::Data, scoped_chunk_key)?
+                else {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "device removal content chunk lost placement authority",
+                    });
+                };
+                let mut candidate = chunk_ref.clone();
+                candidate.placement_receipt_generation = current_chunk_receipt.generation;
+                if current_chunk_receipt.generation == 0
+                    || current_chunk_receipt.generation < chunk_ref.placement_receipt_generation
+                    || !crate::allocation::pending_removal_chunk_payload_matches_ref(
+                        self.store.pool(),
+                        &candidate,
+                        chunk_key,
+                        &chunk_bytes,
+                        keyspace,
+                    )
+                {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "device removal replacement receipt does not match content",
+                    });
+                }
+                if chunk_ref.placement_receipt_generation != current_chunk_receipt.generation {
+                    chunk_ref.placement_receipt_generation = current_chunk_receipt.generation;
+                    changed = true;
+                }
+            }
+
+            if changed {
+                replacements.push((record, manifest, sparse));
+            }
+        }
+
+        let replacement_count = replacements.len() as u64;
+        if replacements.is_empty() {
+            return Ok(0);
+        }
+
+        self.begin_mutation("reconcile device-removal placement receipts")?;
+        let reconcile = (|| {
+            let tick = self.bump_generation();
+            let mut updates = Vec::with_capacity(replacements.len());
+            for (old_record, mut manifest, sparse) in replacements {
+                let old_layout = crate::records::ContentLayout::Chunked(manifest.clone());
+                let mut updated_record = old_record.clone();
+                updated_record.data_version = tick;
+                updated_record.metadata_version = tick;
+                Self::advance_subtree_revision(&mut updated_record);
+
+                manifest.data_version = tick;
+                let encoded = if sparse {
+                    encode_content_manifest_sparse(&manifest)
+                } else {
+                    encode_content_manifest(&manifest)
+                };
+                let replacement_key = keyspace.content(updated_record.inode_id, tick);
+                self.store.pool_mut().put_with_receipt(
+                    DeviceIoClass::Data,
+                    replacement_key,
+                    &encoded,
+                )?;
+                let trim_plan = self.rewrite_trim_plan_for_layout(
+                    updated_record.inode_id,
+                    &old_layout,
+                    &updated_record,
+                )?;
+                updates.push((updated_record, trim_plan));
+            }
+
+            for (record, _) in &updates {
+                self.mark_inode_metadata_dirty(record.inode_id);
+                self.mark_inode_content_dirty(record.inode_id);
+                Arc::make_mut(&mut self.state.inodes).insert(record.inode_id, record.clone());
+                self.inode_cache.borrow_mut().invalidate(record.inode_id);
+            }
+            Ok::<_, FileSystemError>(updates)
+        })();
+        let updates = match reconcile {
+            Ok(updates) => updates,
+            Err(error) => {
+                self.rollback_mutation_delta();
+                return Err(error);
+            }
+        };
+
+        self.force_commit(())?;
+        for (_, trim_plan) in updates {
+            self.apply_rewrite_trim_plan(trim_plan);
+        }
+        Ok(replacement_count)
     }
 }
 
@@ -6823,7 +7020,21 @@ mod tests {
     }
 
     fn fixed_offset_pool_label(path: &std::path::Path) -> Vec<u8> {
+        fixed_offset_pool_label_at(path, 0)
+    }
+
+    fn fixed_offset_backup_pool_label(path: &std::path::Path) -> Vec<u8> {
+        let size = std::fs::metadata(path).expect("stat device image").len();
+        fixed_offset_pool_label_at(
+            path,
+            size - tidefs_types_pool_label_core::POOL_LABEL_SIZE as u64,
+        )
+    }
+
+    fn fixed_offset_pool_label_at(path: &std::path::Path, offset: u64) -> Vec<u8> {
         let mut file = std::fs::File::open(path).expect("open device image label");
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
+            .expect("seek fixed-offset pool label");
         let mut label = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
         std::io::Read::read_exact(&mut file, &mut label).expect("read fixed-offset pool label");
         label
@@ -7494,7 +7705,7 @@ mod tests {
     }
 
     #[test]
-    fn live_device_remove_reports_topology_commit_pending() {
+    fn live_device_remove_commits_topology_and_reopens_survivor() {
         let (engine, td, devices) = temp_fs_with_block_devices(2);
         let payload = b"live owner device remove keeps receipt-backed data reachable";
         let (target_path, target_guid, object_key) = {
@@ -7562,17 +7773,9 @@ mod tests {
             true,
         );
 
-        assert_eq!(removed["ok"], false, "remove response: {removed}");
-        assert_eq!(removed["exit_code"], 1);
-        assert_eq!(
-            removed["json"]["status"], "topology_commit_pending",
-            "remove response: {removed}"
-        );
-        assert_eq!(removed["json"]["topology_commit_pending"], true);
-        assert_eq!(removed["json"]["topology_committed"], false);
-        assert_eq!(removed["json"]["marker_retained"], true);
-        assert_eq!(removed["json"]["current_process_detached"], true);
-        assert_eq!(removed["json"]["surviving_devices_synced"], true);
+        assert_eq!(removed["ok"], true, "remove response: {removed}");
+        assert_eq!(removed["json"]["status"], "removed");
+        assert_eq!(removed["json"]["topology_committed"], true);
         assert_eq!(removed["json"]["objects_failed"], 0);
         assert!(
             removed["json"]["objects_evacuated"]
@@ -7587,19 +7790,18 @@ mod tests {
             "evacuated byte count must cover the selected content: {removed}"
         );
         assert_eq!(removed["json"]["remaining_devices"], 1);
-        assert_eq!(
-            removed["json"]["action"],
-            "reopen with the original pre-removal device configuration to resume; keep the target attached and do not decommission or treat it as removed"
-        );
+        assert_eq!(removed["json"]["remanence_guarantee"], false);
         assert!(
-            removed["error"].as_str().is_some_and(|message| {
-                message.contains("durable topology commit is unavailable")
-                    && message.contains("recovery marker is retained")
-                    && message.contains("do not decommission or treat it as removed")
+            removed["json"]["message"].as_str().is_some_and(|message| {
+                message.contains("receipt-backed evacuation")
+                    && message.contains("durable survivor topology commit")
+                    && message.contains("does not establish secure erase")
+                    && message.contains("media-remanence")
+                    && message.contains("decommissioning guarantees")
             }),
-            "pending response must be explicit and actionable: {removed}"
+            "success response must report committed authority and its remanence limit: {removed}"
         );
-        assert!(marker_path.exists());
+        assert!(!marker_path.exists());
 
         let fs = engine.fs.borrow();
         assert_eq!(fs.store.pool().stats().device_count, 1);
@@ -7625,66 +7827,63 @@ mod tests {
         );
         fs.stat("/").expect("mounted namespace remains readable");
         drop(fs);
-        for (path, expected) in devices.iter().zip(&original_labels) {
-            assert!(
-                fixed_offset_pool_label(path).as_slice() == expected.as_slice(),
-                "in-memory detach must not change fixed-offset topology labels"
-            );
+
+        let target_index = devices
+            .iter()
+            .position(|path| path == &target_path)
+            .expect("removed path belongs to configured devices");
+        let survivor_index = (0..devices.len())
+            .find(|index| *index != target_index)
+            .expect("one survivor remains");
+        let survivor_path = devices[survivor_index].clone();
+        assert_eq!(
+            fixed_offset_pool_label(&target_path),
+            original_labels[target_index],
+            "the retired member keeps its stale lower-generation label"
+        );
+
+        let expected_generation = removed["json"]["topology_generation"]
+            .as_u64()
+            .expect("numeric topology generation");
+        let survivor_primary = fixed_offset_pool_label(&survivor_path);
+        let survivor_backup = fixed_offset_backup_pool_label(&survivor_path);
+        for label_bytes in [&survivor_primary, &survivor_backup] {
+            let label = tidefs_types_pool_label_core::decode_label(label_bytes)
+                .expect("decode committed survivor label copy");
+            let roster = tidefs_types_pool_label_core::decode_topology_roster_v1(label_bytes)
+                .expect("decode committed survivor roster")
+                .expect("survivor label has topology roster");
+            assert_eq!(label.device_count, 1);
+            assert_eq!(label.device_index, 0);
+            assert_eq!(label.topology_generation, expected_generation);
+            assert_eq!(roster.len(), 1);
+            assert_ne!(roster.member_guid(0), Some(target_guid));
         }
         drop(engine);
 
         let reopened = LocalFileSystem::open_with_block_devices(
             td.path().join("metadata"),
-            &devices,
+            std::slice::from_ref(&survivor_path),
             tidefs_local_object_store::StoreOptions::default(),
             RootAuthenticationKey::demo_key(),
         )
-        .expect("reopen original two-device configuration");
-        assert!(marker_path.exists());
+        .expect("reopen committed survivor-only topology");
+        assert!(!marker_path.exists());
         assert_eq!(reopened.store.pool().stats().device_count, 1);
         assert_eq!(
             reopened
                 .store
                 .pool()
                 .get(tidefs_local_object_store::DeviceIoClass::Data, object_key)
-                .expect("read before repeated removal status"),
-            Some(payload.to_vec())
-        );
-
-        let reopened_engine = VfsLocalFileSystem::new(reopened);
-        let repeated = live_device_admin(
-            &reopened_engine,
-            "remove",
-            json!({
-                "device_path": target_path.display().to_string(),
-                "force": false,
-            }),
-            true,
-        );
-        assert_eq!(repeated["ok"], false, "repeat response: {repeated}");
-        assert_eq!(repeated["exit_code"], 1);
-        assert_eq!(repeated["json"]["status"], "topology_commit_pending");
-        assert_eq!(repeated["json"]["marker_retained"], true);
-        assert_eq!(repeated["json"]["current_process_detached"], true);
-        assert_eq!(repeated["json"]["objects_failed"], 0);
-        assert_eq!(repeated["json"]["surviving_devices_synced"], true);
-        assert_eq!(repeated["json"]["remaining_devices"], 1);
-
-        let reopened = reopened_engine.fs.borrow();
-        assert_eq!(
-            reopened
-                .store
-                .pool()
-                .get(tidefs_local_object_store::DeviceIoClass::Data, object_key)
-                .expect("read after reopen"),
+                .expect("read after survivor-only reopen"),
             Some(payload.to_vec())
         );
         let reopened_receipt = reopened
             .store
             .pool()
             .placement_receipt_for_key(tidefs_local_object_store::DeviceIoClass::Data, object_key)
-            .expect("load receipt after original-config reopen")
-            .expect("receipt exists after original-config reopen");
+            .expect("load receipt after survivor-only reopen")
+            .expect("receipt exists after survivor-only reopen");
         assert!(
             reopened_receipt
                 .targets
@@ -7695,12 +7894,205 @@ mod tests {
         reopened
             .stat("/")
             .expect("reopened mounted namespace remains readable");
-        for (path, expected) in devices.iter().zip(&original_labels) {
-            assert!(
-                fixed_offset_pool_label(path).as_slice() == expected.as_slice(),
-                "original-config reopen must not change fixed-offset topology labels"
+    }
+
+    #[test]
+    fn pending_device_remove_recovers_evacuation_before_cow_root_publication() {
+        let (engine, td, devices) = temp_fs_with_block_devices(2);
+        let marker_path = td.path().join("metadata/.tidefs_device_removal_pending");
+        let (selected_path, selected_payload, target_path, _, _) = {
+            let mut fs = engine.fs.borrow_mut();
+            let mut selected = None;
+            for candidate in 0..64_u8 {
+                let path = format!("/pending-remove-{candidate:02}.bin");
+                let payload = vec![candidate.wrapping_add(1); 4096 + candidate as usize];
+                fs.create_file(&path, 0o600).expect("create candidate file");
+                fs.write_file(&path, 0, &payload)
+                    .expect("write candidate file");
+                fs.sync_all().expect("commit candidate file");
+
+                let inode = fs.stat(&path).expect("stat candidate file");
+                let content_key = fs
+                    .object_keyspace()
+                    .content(inode.inode_id, inode.data_version);
+                let (content_bytes, _) = fs
+                    .store
+                    .pool()
+                    .get_with_current_receipt(DeviceIoClass::Data, content_key)
+                    .expect("read candidate content manifest")
+                    .expect("candidate content manifest exists");
+                let crate::records::ContentLayout::Chunked(manifest) =
+                    crate::content::decode_content_layout(&content_bytes)
+                        .expect("decode candidate content manifest")
+                else {
+                    continue;
+                };
+                for chunk_ref in manifest.chunks.iter().filter(|chunk| !chunk.is_hole()) {
+                    let chunk_key = fs.object_keyspace().content_chunk(
+                        manifest.inode_id,
+                        chunk_ref.data_version,
+                        chunk_ref.chunk_index,
+                    );
+                    let receipt = fs
+                        .store
+                        .pool()
+                        .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+                        .expect("read candidate chunk receipt")
+                        .expect("candidate chunk receipt exists");
+                    let target = receipt.targets.first().expect("one chunk target");
+                    if target.device_index == 0 {
+                        // Device zero also owns raw filesystem transaction
+                        // metadata. Select the other member so this test
+                        // isolates the authenticated content-manifest crash
+                        // window rather than unrelated raw-metadata refusal.
+                        continue;
+                    }
+                    let target_path = devices
+                        .get(target.device_index as usize)
+                        .expect("receipt target maps to configured member")
+                        .clone();
+                    selected = Some((
+                        path.clone(),
+                        payload.clone(),
+                        target_path,
+                        content_key,
+                        content_bytes.clone(),
+                    ));
+                    break;
+                }
+                if selected.is_some() {
+                    break;
+                }
+            }
+            let selected = selected.expect("find receipt-backed chunk removal target");
+
+            let preparation = fs
+                .store
+                .pool_mut()
+                .prepare_safe_remove_device(&selected.2)
+                .expect("evacuate target without detaching it");
+            assert_eq!(preparation.objects_failed, 0, "{preparation:?}");
+            let (still_authenticated, _) = fs
+                .store
+                .pool()
+                .get_with_current_receipt(DeviceIoClass::Data, selected.3)
+                .expect("read authenticated predecessor manifest after evacuation")
+                .expect("authenticated predecessor manifest remains readable");
+            assert_eq!(
+                still_authenticated, selected.4,
+                "evacuation must not rewrite authenticated predecessor-manifest bytes in place"
             );
-        }
+            fs.store
+                .pool_mut()
+                .sync_all()
+                .expect("sync survivor evacuation before simulated crash");
+            assert!(marker_path.exists());
+            selected
+        };
+
+        // Drop without finish_safe_remove_device(): this simulates the exact
+        // crash window after receipt relocation but before copy-on-write
+        // manifest reconciliation publishes its replacement root.
+        drop(engine);
+
+        let reopened = LocalFileSystem::open_with_block_devices(
+            td.path().join("metadata"),
+            &devices,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("marker-bound recovery republishes roots and finishes removal");
+        assert!(!marker_path.exists());
+        assert_eq!(reopened.store.pool().stats().device_count, 1);
+        assert_eq!(
+            reopened
+                .read_file(&selected_path)
+                .expect("read reconciled file after recovery"),
+            selected_payload
+        );
+        assert!(
+            reopened
+                .store
+                .pool()
+                .config()
+                .devices
+                .iter()
+                .all(|device| device.path != target_path),
+            "recovered topology must exclude the retired target"
+        );
+    }
+
+    #[test]
+    fn live_device_remove_refuses_unowned_roots_before_evacuation() {
+        let (snapshot_engine, snapshot_root, snapshot_devices) = temp_fs_with_block_devices(2);
+        snapshot_engine
+            .fs
+            .borrow_mut()
+            .create_snapshot("retained")
+            .expect("create data-retaining snapshot");
+        let snapshot_refusal = live_device_admin(
+            &snapshot_engine,
+            "remove",
+            json!({
+                "device_path": snapshot_devices[1].display().to_string(),
+                "force": false,
+            }),
+            true,
+        );
+        assert_eq!(snapshot_refusal["ok"], false, "{snapshot_refusal}");
+        assert!(snapshot_refusal["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("data-retaining snapshots or clones")));
+        assert!(!snapshot_root
+            .path()
+            .join("metadata/.tidefs_device_removal_pending")
+            .exists());
+        assert_eq!(
+            snapshot_engine
+                .fs
+                .borrow()
+                .store
+                .pool()
+                .stats()
+                .device_count,
+            2
+        );
+
+        let (dataset_engine, dataset_root, dataset_devices) = temp_fs_with_block_devices(2);
+        dataset_engine
+            .fs
+            .borrow_mut()
+            .create_filesystem_dataset(
+                "other",
+                DatasetId::from_bytes([0xD5; 16]),
+                Vec::new(),
+                DatasetFlags::default_create(),
+                SyncGuarantee::Local,
+            )
+            .expect("create second filesystem dataset");
+        let dataset_refusal = live_device_admin(
+            &dataset_engine,
+            "remove",
+            json!({
+                "device_path": dataset_devices[1].display().to_string(),
+                "force": false,
+            }),
+            true,
+        );
+        assert_eq!(dataset_refusal["ok"], false, "{dataset_refusal}");
+        assert!(dataset_refusal["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("another dataset in the Pool")));
+        assert!(!dataset_root
+            .path()
+            .join("metadata/.tidefs_device_removal_pending")
+            .exists());
+        assert_eq!(
+            dataset_engine.fs.borrow().store.pool().stats().device_count,
+            2
+        );
+        drop(snapshot_engine);
+        drop(dataset_engine);
     }
 
     #[cfg(feature = "replication-io")]

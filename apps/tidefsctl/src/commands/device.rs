@@ -5,11 +5,10 @@
 //! ## Media authority
 //!
 //! Device status routes to the live owner before this module opens any store.
-//! Device removal currently fails closed before live-owner dispatch because the
-//! mounted path cannot yet publish evacuation evidence together with durable,
-//! replayable topology-label updates. Retired directory object-store
-//! evacuation/rebuild arguments also fail closed instead of acting as operator
-//! pool media.
+//! Device removal routes only to the reachable mounted pool owner, which owns
+//! receipt-backed evacuation and durable topology-label publication. Retired
+//! directory object-store evacuation/rebuild arguments fail closed instead of
+//! acting as operator pool media.
 
 use std::path::PathBuf;
 
@@ -20,7 +19,7 @@ use clap::Subcommand;
 pub enum DeviceCommand {
     /// Remove a device from a pool.
     ///
-    /// Refused until the live owner can publish durable detach evidence.
+    /// Routed to the live owner for receipt-backed evacuation and detach.
     Remove {
         /// Pool whose live-owner detach authority is required.
         pool_name: String,
@@ -160,12 +159,26 @@ fn handle_remove(
         .into());
     }
 
+    super::live_owner::route_if_owner_exists_with_format_and_args(
+        "device",
+        "remove",
+        pool_name,
+        false,
+        super::live_owner::live_admin_args([
+            (
+                "device_path",
+                tidefs_vfs_engine::LivePoolAdminArg::String(device_path.display().to_string()),
+            ),
+            ("force", tidefs_vfs_engine::LivePoolAdminArg::Bool(false)),
+        ]),
+    );
+
     Err(online_refusal.into())
 }
 
 fn online_device_removal_refusal(pool_name: &str, device_path: &PathBuf) -> String {
     format!(
-        "online device removal for pool '{pool_name}' device '{}' is refused before contacting a live owner: the mounted removal path cannot yet publish a replayable committed evacuation receipt together with durable topology/label updates. No device state was changed. This refusal is a detach-durability boundary; it does not establish secure erase or media-remanence guarantees.",
+        "online device removal for pool '{pool_name}' device '{}' requires a reachable live owner; none was found, so no device state was changed. Retry while the pool is mounted. Device removal does not establish secure erase, media-remanence, or decommissioning guarantees.",
         device_path.display()
     )
 }
@@ -182,21 +195,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn removal_refuses_before_incomplete_live_owner_mutation() {
+    fn removal_without_live_owner_refuses_without_mutation() {
         let result = handle_remove("testpool", &PathBuf::from("/dev/disk0"), None, &[]);
 
-        assert!(
-            result.is_err(),
-            "online removal must fail closed until detach evidence is durable"
-        );
+        assert!(result.is_err(), "online removal requires a live owner");
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("refused before contacting a live owner")
-                && msg.contains("replayable committed evacuation receipt")
-                && msg.contains("durable topology/label updates")
-                && msg.contains("No device state was changed")
-                && msg.contains("does not establish secure erase or media-remanence guarantees"),
-            "expected durable-detach refusal, got {msg}"
+            msg.contains("requires a reachable live owner")
+                && msg.contains("none was found")
+                && msg.contains("no device state was changed")
+                && msg.contains("Retry while the pool is mounted")
+                && msg.contains("does not establish secure erase")
+                && msg.contains("media-remanence")
+                && msg.contains("decommissioning guarantees"),
+            "expected unavailable-owner refusal, got {msg}"
         );
     }
 
@@ -223,8 +235,8 @@ mod tests {
             "unexpected error: {msg}"
         );
         assert!(
-            msg.contains("refused before contacting a live owner")
-                && msg.contains("No device state was changed"),
+            msg.contains("requires a reachable live owner")
+                && msg.contains("no device state was changed"),
             "retired mode must report the shared no-mutation boundary: {msg}"
         );
     }
@@ -252,8 +264,8 @@ mod tests {
             "unexpected error: {msg}"
         );
         assert!(
-            msg.contains("refused before contacting a live owner")
-                && msg.contains("No device state was changed"),
+            msg.contains("requires a reachable live owner")
+                && msg.contains("no device state was changed"),
             "retired mode must report the shared no-mutation boundary: {msg}"
         );
     }
