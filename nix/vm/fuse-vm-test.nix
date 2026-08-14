@@ -662,7 +662,7 @@ fi
 
 if tidefsctl snapshot create "$POOL" "$SNAPSHOT" >/tmp/snapshot-create.log 2>&1 \
   && tidefsctl snapshot list "$POOL" >/tmp/snapshot-list.log 2>&1 \
-  && grep -Fq "snapshot entry '$SNAPSHOT'" /tmp/snapshot-list.log; then
+  && grep -Fq "snapshot '$SNAPSHOT' (source tx=" /tmp/snapshot-list.log; then
     pass "mounted_snapshot_create_list"
 else
     cat /tmp/snapshot-create.log 2>/dev/null || true
@@ -681,7 +681,7 @@ fi
 if tidefsctl snapshot rollback "$POOL" "$SNAPSHOT" >/tmp/snapshot-rollback.log 2>&1 \
   && [ "$(cat "$MNT/renamed.txt")" = "$PAYLOAD" ] \
   && tidefsctl snapshot list "$POOL" >/tmp/snapshot-list-after-rollback.log 2>&1 \
-  && grep -Fq "snapshot entry '$SNAPSHOT'" /tmp/snapshot-list-after-rollback.log; then
+  && grep -Fq "snapshot '$SNAPSHOT' (source tx=" /tmp/snapshot-list-after-rollback.log; then
     pass "mounted_snapshot_rollback_exact_bytes_retained"
 else
     cat /tmp/snapshot-rollback.log 2>/dev/null || true
@@ -711,7 +711,7 @@ done
 if [ "$REMOUNTED" -eq 1 ] \
   && [ "$(cat "$MNT/renamed.txt" 2>/dev/null)" = "$PAYLOAD" ] \
   && tidefsctl snapshot list "$POOL" >/tmp/snapshot-list-after-remount.log 2>&1 \
-  && grep -Fq "snapshot entry '$SNAPSHOT'" /tmp/snapshot-list-after-remount.log; then
+  && grep -Fq "snapshot '$SNAPSHOT' (source tx=" /tmp/snapshot-list-after-remount.log; then
     pass "remount_snapshot_rollback_persistence"
 else
     cat /tmp/pool-remount.log
