@@ -3631,7 +3631,7 @@ impl LocalFileSystem {
         &mut self,
         device_path: &std::path::Path,
     ) -> crate::Result<tidefs_local_object_store::device_removal::EvacuationResult> {
-        self.ensure_exclusive_device_lifecycle_root_authority("remove device from mounted pool")?;
+        self.ensure_device_lifecycle_root_authority("remove device from mounted pool")?;
         let preparation = self
             .store
             .pool_mut()
@@ -3690,7 +3690,7 @@ impl LocalFileSystem {
         old_device_path: &std::path::Path,
         new_device_path: &std::path::Path,
     ) -> crate::Result<tidefs_local_object_store::pool::DeviceReplacementResult> {
-        self.ensure_exclusive_device_lifecycle_root_authority("replace device in mounted pool")?;
+        self.ensure_device_lifecycle_root_authority("replace device in mounted pool")?;
         let old_config = self
             .store
             .pool()
@@ -3759,10 +3759,7 @@ impl LocalFileSystem {
         Ok(result)
     }
 
-    fn ensure_exclusive_device_lifecycle_root_authority(
-        &self,
-        operation: &'static str,
-    ) -> crate::Result<()> {
+    fn ensure_device_lifecycle_root_authority(&self, operation: &'static str) -> crate::Result<()> {
         if self
             .state
             .snapshots
@@ -3776,16 +3773,41 @@ impl LocalFileSystem {
         }
 
         let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
-        if self
-            .dataset_catalog()
-            .list_all()
-            .iter()
-            .any(|(_, dataset_id, _, _, _, _)| *dataset_id != mounted_dataset_id)
-        {
-            return Err(FileSystemError::Unsupported {
-                operation,
-                reason: "another dataset in the Pool requires its own mounted owner to join atomic receipt reconciliation",
-            });
+        let mut has_pool_owned_volume_roots = false;
+        for (_, dataset_id, dataset_type, _, _, _) in self.dataset_catalog().list_all() {
+            if dataset_id == mounted_dataset_id {
+                continue;
+            }
+            match dataset_type {
+                DatasetType::Volume => has_pool_owned_volume_roots = true,
+                DatasetType::Filesystem => {
+                    return Err(FileSystemError::Unsupported {
+                        operation,
+                        reason: "another dataset in the Pool has filesystem root authority and requires its own mounted owner to join atomic receipt reconciliation",
+                    });
+                }
+                DatasetType::Snapshot => {
+                    let snapshot = self.store.load_snapshot_root(dataset_id)?;
+                    if snapshot.source_reference.kind
+                        != tidefs_pool_runtime::DatasetRootKind::Volume
+                    {
+                        return Err(FileSystemError::Unsupported {
+                            operation,
+                            reason: "another dataset in the Pool has a filesystem-sourced snapshot root and requires its own mounted owner to join atomic receipt reconciliation",
+                        });
+                    }
+                    has_pool_owned_volume_roots = true;
+                }
+            }
+        }
+
+        if has_pool_owned_volume_roots {
+            // Volume roots carry immutable object keys and digests, not Pool
+            // placement-receipt generations. Validate their complete current,
+            // snapshot, clone, map, and chunk graphs before Pool evacuation or
+            // rebuild mutates any receipt authority. Pool lifecycle then moves
+            // those exact objects without rewriting their typed roots.
+            let _ = self.store.canonical_root_object_keys()?;
         }
         Ok(())
     }

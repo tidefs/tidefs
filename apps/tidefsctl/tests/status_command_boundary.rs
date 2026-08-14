@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, SyncGuarantee};
 use tidefs_local_filesystem::{
     human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem,
     RecoveryPolicy, RootAuthenticationKey,
@@ -23,6 +24,142 @@ const STATUS_COMMANDS: &[&str] = &[
     "cluster",
     "device",
 ];
+
+fn prepare_volume_lifecycle_graph(
+    filesystem: &mut LocalFileSystem,
+    dataset_id_byte: u8,
+    committed_byte: u8,
+    clone_byte: u8,
+    staged_byte: u8,
+) -> tidefs_pool_runtime::PoolVolume {
+    filesystem
+        .create_volume_dataset(
+            "volume",
+            DatasetId::from_bytes([dataset_id_byte; 16]),
+            2 * 1024 * 1024,
+            Vec::new(),
+            DatasetFlags::default_create(),
+            SyncGuarantee::Local,
+        )
+        .expect("create Pool-owned volume for device lifecycle");
+    let mut volume = filesystem
+        .open_volume_dataset("volume")
+        .expect("open Pool-owned volume");
+    filesystem
+        .write_volume_blocks(&mut volume, 0, &vec![committed_byte; 4096])
+        .expect("stage committed source volume block");
+    filesystem
+        .flush_volume(&mut volume)
+        .expect("commit source volume block");
+    filesystem
+        .create_volume_snapshot_dataset("volume@before")
+        .expect("create Pool-owned volume snapshot");
+    filesystem
+        .create_volume_clone_dataset("clone", "volume@before")
+        .expect("create Pool-owned volume clone");
+    let mut clone = filesystem
+        .open_volume_dataset("clone")
+        .expect("open Pool-owned volume clone");
+    filesystem
+        .write_volume_blocks(&mut clone, 0, &vec![clone_byte; 4096])
+        .expect("stage clone block");
+    filesystem
+        .flush_volume(&mut clone)
+        .expect("commit clone block");
+
+    let mut active = filesystem
+        .open_volume_dataset("volume")
+        .expect("open active volume handle");
+    filesystem
+        .write_volume_blocks(&mut active, 1, &vec![staged_byte; 4096])
+        .expect("stage private block across topology mutation");
+    active
+}
+
+fn assert_and_flush_live_volume_graph(
+    filesystem: &mut LocalFileSystem,
+    active: &mut tidefs_pool_runtime::PoolVolume,
+    committed_byte: u8,
+    clone_byte: u8,
+    staged_byte: u8,
+) {
+    let mut expected_source = vec![committed_byte; 4096];
+    expected_source.extend(vec![staged_byte; 4096]);
+    assert_eq!(
+        filesystem
+            .read_volume_blocks(active, 0, 2)
+            .expect("read active volume after topology mutation"),
+        expected_source,
+        "active handle must retain committed and private staged blocks"
+    );
+    filesystem
+        .flush_volume(active)
+        .expect("flush staged block through the new topology");
+
+    let clone = filesystem
+        .open_volume_dataset("clone")
+        .expect("open clone after topology mutation");
+    assert_eq!(
+        filesystem
+            .read_volume_blocks(&clone, 0, 1)
+            .expect("read clone after topology mutation"),
+        vec![clone_byte; 4096]
+    );
+    let snapshots = filesystem
+        .list_volume_snapshot_datasets()
+        .expect("validate volume snapshots after topology mutation");
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].path, "volume@before");
+}
+
+fn assert_reimported_volume_graph(
+    filesystem: &mut LocalFileSystem,
+    committed_byte: u8,
+    clone_byte: u8,
+    staged_byte: u8,
+) {
+    let source = filesystem
+        .open_volume_dataset("volume")
+        .expect("open source volume after reimport");
+    let mut expected_source = vec![committed_byte; 4096];
+    expected_source.extend(vec![staged_byte; 4096]);
+    assert_eq!(
+        filesystem
+            .read_volume_blocks(&source, 0, 2)
+            .expect("read source volume after reimport"),
+        expected_source
+    );
+
+    let clone = filesystem
+        .open_volume_dataset("clone")
+        .expect("open clone after reimport");
+    assert_eq!(
+        filesystem
+            .read_volume_blocks(&clone, 0, 1)
+            .expect("read clone after reimport"),
+        vec![clone_byte; 4096]
+    );
+    let snapshots = filesystem
+        .list_volume_snapshot_datasets()
+        .expect("validate volume snapshot after reimport");
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].path, "volume@before");
+
+    filesystem
+        .create_volume_clone_dataset("snapshot-check", "volume@before")
+        .expect("clone retained snapshot after reimport");
+    let snapshot_check = filesystem
+        .open_volume_dataset("snapshot-check")
+        .expect("open verification clone after reimport");
+    let mut expected_snapshot = vec![committed_byte; 4096];
+    expected_snapshot.extend(vec![0; 4096]);
+    assert_eq!(
+        filesystem
+            .read_volume_blocks(&snapshot_check, 0, 2)
+            .expect("read exact retained snapshot bytes after reimport"),
+        expected_snapshot
+    );
+}
 
 fn run_status(command: &str, json: bool) -> (String, Output) {
     let now = SystemTime::now()
@@ -337,6 +474,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
     filesystem
         .sync_all()
         .expect("sync mounted files before removal");
+    let mut active_volume = prepare_volume_lifecycle_graph(&mut filesystem, 0x71, 0x31, 0x41, 0x51);
 
     let scanned = tidefs_pool_scan::scan_labels(&devices).expect("scan created Pool labels");
     let pool_uuid = scanned[0].pool_guid.expect("created label has a Pool UUID");
@@ -400,7 +538,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
     );
 
     {
-        let filesystem = shared_filesystem.borrow();
+        let mut filesystem = shared_filesystem.borrow_mut();
         assert_eq!(filesystem.pool_topology_status().members.len(), 1);
         for (path, expected) in &expected_files {
             assert_eq!(
@@ -411,6 +549,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
                 "live owner read mismatch for {path}"
             );
         }
+        assert_and_flush_live_volume_graph(&mut filesystem, &mut active_volume, 0x31, 0x41, 0x51);
     }
 
     owner.stop();
@@ -419,7 +558,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
     fs::remove_dir(&runtime_dir).expect("remove empty test Pool runtime directory");
 
     let survivor = [devices[0].clone()];
-    let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+    let mut reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
         &metadata_dir,
         &survivor,
         &pool_name,
@@ -439,6 +578,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
             "survivor-only read mismatch for {path}"
         );
     }
+    assert_reimported_volume_graph(&mut reopened, 0x31, 0x41, 0x51);
 }
 
 #[test]
@@ -490,6 +630,7 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
     filesystem
         .sync_all()
         .expect("sync mounted files before replacement");
+    let mut active_volume = prepare_volume_lifecycle_graph(&mut filesystem, 0x72, 0x32, 0x42, 0x52);
 
     let scanned = tidefs_pool_scan::scan_labels(&devices).expect("scan created Pool labels");
     let pool_uuid = scanned[0].pool_guid.expect("created label has a Pool UUID");
@@ -558,7 +699,7 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
     assert_eq!(status["replacement"]["old_device_detach_allowed"], true);
 
     {
-        let filesystem = shared_filesystem.borrow();
+        let mut filesystem = shared_filesystem.borrow_mut();
         assert_eq!(filesystem.pool_topology_status().members.len(), 2);
         for (path, expected) in &expected_files {
             assert_eq!(
@@ -569,6 +710,7 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
                 "live owner read mismatch for {path}"
             );
         }
+        assert_and_flush_live_volume_graph(&mut filesystem, &mut active_volume, 0x32, 0x42, 0x52);
     }
 
     owner.stop();
@@ -577,7 +719,7 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
     fs::remove_dir(&runtime_dir).expect("remove empty test Pool runtime directory");
 
     let replacement_topology = [replacement.clone(), devices[1].clone()];
-    let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+    let mut reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
         &metadata_dir,
         &replacement_topology,
         &pool_name,
@@ -597,4 +739,5 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
             "replacement reimport read mismatch for {path}"
         );
     }
+    assert_reimported_volume_graph(&mut reopened, 0x32, 0x42, 0x52);
 }

@@ -177,16 +177,20 @@ default mount authority.
 
 The current source also implements one bounded pilot lifecycle operation:
 `tidefsctl device remove` can route to the reachable mounted local owner of a
-single-filesystem Pool, evacuate receipt-backed objects, reconcile embedded
-content receipt generations through copy-on-write manifests, refresh the
-authenticated filesystem root ring, and publish a redundant survivor-only
+Pool with one mounted filesystem, evacuate receipt-backed objects, reconcile
+embedded content receipt generations through copy-on-write manifests, refresh
+the authenticated filesystem root ring, and publish a redundant survivor-only
 topology before reporting success. The durable removal marker recovers
 interruption between those phases without overwriting predecessor-manifest
-bytes before their replacement root commits. Removal refuses before evacuation
-when another dataset or a data-retaining snapshot or clone owns roots that the
-mounted filesystem cannot update atomically. This is current implementation
-behavior, not a production-readiness, failed-device, replacement, rebuild,
-secure-erase, media-remanence, sanitization, or decommissioning claim.
+bytes before their replacement root commits. Co-owned Pool-runtime volumes,
+volume snapshots, and volume clones survive because their immutable typed roots
+carry keys and digests while Pool lifecycle relocates their complete
+receipt-backed object graphs. Removal still refuses before evacuation when an
+independently rooted filesystem dataset, filesystem-sourced snapshot/clone, or
+data-retaining mounted snapshot requires another filesystem owner. This is
+current implementation behavior, not a production-readiness, failed-device,
+replacement, rebuild, secure-erase, media-remanence, sanitization, or
+decommissioning claim.
 
 The same carrier implements one bounded present-member replacement row:
 `tidefsctl device replace` routes only to the reachable mounted local owner of
@@ -196,10 +200,12 @@ and allocation-fenced, rewrites current receipt-backed objects onto the
 survivor plus replacement, copy-on-writes mounted content manifests, refreshes
 the authenticated root ring, and only then publishes redundant
 same-cardinality labels. Replacement requires a distinct blank same-backing
-candidate with sufficient capacity and refuses other datasets or data-retaining
-snapshots/clones. This row does not claim failed-member rebuild, writable
-degraded operation, secure erase, media remanence, sanitization,
-decommissioning, or production readiness.
+candidate with sufficient capacity. It preserves co-owned Pool-runtime
+volumes, volume snapshots, and volume clones while refusing independently
+rooted filesystem datasets, filesystem-sourced snapshots/clones, and
+data-retaining mounted snapshots. This row does not claim failed-member
+rebuild, writable degraded operation, secure erase, media remanence,
+sanitization, decommissioning, or production readiness.
 
 ## Current Policy
 
