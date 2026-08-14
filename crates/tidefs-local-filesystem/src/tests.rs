@@ -10578,6 +10578,162 @@ fn block_device_reopen_after_sync_persists_file_data() {
 }
 
 #[test]
+fn block_device_reopen_survives_primary_transaction_metadata_loss() {
+    let (root, devices) = two_device_block_fixture("pool-metadata-receipt-reopen");
+    let redundancy_policy = PoolRedundancyPolicy::replicated(2);
+    let payload = b"receipt-backed filesystem transaction metadata";
+
+    {
+        let mut fs = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+            &root,
+            &devices,
+            "tidefs",
+            redundancy_policy,
+            options(),
+            RootAuthenticationKey::demo_key(),
+            RecoveryPolicy::default(),
+        )
+        .expect("open mirrored block-device filesystem");
+        fs.create_file("/survivor", DEFAULT_FILE_PERMISSIONS)
+            .expect("create survivor file");
+        fs.replace_file("/survivor", payload)
+            .expect("write survivor file");
+        fs.sync_all().expect("commit survivor file");
+
+        let committed = fs
+            .selected_committed_root_summary()
+            .expect("load canonical committed filesystem root");
+        let keyspace = FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID);
+        let manifest_key = keyspace.transaction_manifest(committed.transaction_id);
+        let manifest_bytes = fs
+            .store
+            .pool()
+            .get(DeviceIoClass::Metadata, manifest_key)
+            .expect("read transaction manifest through Pool")
+            .expect("transaction manifest exists");
+        let manifest = decode_transaction_manifest(&manifest_bytes)
+            .expect("decode committed transaction manifest");
+
+        let mut metadata_keys = vec![
+            keyspace.transaction_superblock(committed.transaction_id),
+            manifest_key,
+        ];
+        metadata_keys.extend(manifest.entries.iter().filter_map(|entry| {
+            matches!(
+                entry.role,
+                TransactionManifestObjectRole::TransactionInode
+                    | TransactionManifestObjectRole::TransactionDirectory
+                    | TransactionManifestObjectRole::TransactionSnapshotCatalogEntry
+                    | TransactionManifestObjectRole::TransactionExtentMap
+            )
+            .then_some(entry.object_key)
+        }));
+        metadata_keys.sort_unstable();
+        metadata_keys.dedup();
+
+        for key in &metadata_keys {
+            let receipt = fs
+                .store
+                .pool()
+                .placement_receipt_for_key(DeviceIoClass::Metadata, *key)
+                .expect("inspect transaction metadata receipt")
+                .expect("transaction metadata must have a placement receipt");
+            assert_eq!(receipt.policy, redundancy_policy);
+            assert_eq!(receipt.targets.len(), 2);
+            assert!(
+                fs.store
+                    .pool_mut()
+                    .raw_primary_store_mut()
+                    .delete(*key)
+                    .expect("remove primary transaction metadata copy"),
+                "primary member should contain receipt-backed transaction metadata"
+            );
+        }
+        fs.store
+            .pool_mut()
+            .sync_all()
+            .expect("sync primary metadata loss");
+    }
+
+    let mut reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &root,
+        &devices,
+        "tidefs",
+        redundancy_policy,
+        options(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::default(),
+    )
+    .expect("reopen from surviving transaction metadata replica");
+    reopened
+        .safe_root_retention_plan()
+        .expect("retain the canonical graph through surviving metadata receipts");
+    assert_eq!(
+        reopened
+            .read_file("/survivor")
+            .expect("read file after primary transaction metadata loss"),
+        payload
+    );
+
+    drop(reopened);
+    cleanup_two_device_block_fixture(&root, &devices);
+}
+
+#[test]
+fn block_device_reopen_refuses_missing_transaction_metadata_receipt() {
+    let (root, devices) = two_device_block_fixture("pool-metadata-receipt-missing");
+    let redundancy_policy = PoolRedundancyPolicy::replicated(2);
+
+    {
+        let mut fs = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+            &root,
+            &devices,
+            "tidefs",
+            redundancy_policy,
+            options(),
+            RootAuthenticationKey::demo_key(),
+            RecoveryPolicy::default(),
+        )
+        .expect("open mirrored block-device filesystem");
+        fs.create_file("/must-refuse", DEFAULT_FILE_PERMISSIONS)
+            .expect("create refusal fixture");
+        fs.sync_all().expect("commit refusal fixture");
+        let committed = fs
+            .selected_committed_root_summary()
+            .expect("load canonical committed filesystem root");
+        let manifest_key = transaction_manifest_object_key(committed.transaction_id);
+        assert!(fs
+            .store
+            .pool_mut()
+            .delete(DeviceIoClass::Metadata, manifest_key)
+            .expect("remove transaction manifest and its receipt"));
+        fs.store
+            .pool_mut()
+            .sync_all()
+            .expect("sync missing transaction manifest");
+    }
+
+    let error = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &root,
+        &devices,
+        "tidefs",
+        redundancy_policy,
+        options(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::default(),
+    )
+    .expect_err("canonical reopen must refuse missing transaction metadata authority");
+    assert!(
+        error
+            .to_string()
+            .contains("receipt-backed transaction manifest"),
+        "unexpected reopen refusal: {error}"
+    );
+
+    cleanup_two_device_block_fixture(&root, &devices);
+}
+
+#[test]
 fn block_device_mounted_diagnostics_accept_off_primary_committed_content() {
     let (root, devices) = two_device_block_fixture("pool-diagnostics-off-primary");
     let mut fs =

@@ -2,25 +2,66 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use tidefs_local_object_store::{checksum64, pool::Pool, LocalObjectStore, StoreError};
+use tidefs_local_object_store::{
+    checksum64, pool::Pool, DeviceIoClass, LocalObjectStore, ObjectKey, StoreError,
+};
 use tidefs_pool_runtime::{DatasetRootKind, DatasetRootUpdate, PoolRuntime};
 use tidefs_types_vfs_core::InodeId;
 
 use crate::constants::*;
 use crate::content::MountedContentReadAuthority;
 use crate::decode_content_layout;
+#[cfg(any(test, feature = "replication-io"))]
 use crate::dedup::DedupIndex;
 use crate::encoding::*;
 use crate::error::FileSystemError;
 use crate::object_keys::*;
 use crate::read_content_chunk_from_store;
+#[cfg(any(test, feature = "replication-io"))]
 use crate::read_content_from_store;
 use crate::records::*;
 use crate::types::*;
 use crate::validate_content_layout;
+#[cfg(any(test, feature = "replication-io"))]
 use crate::write_chunked_content;
 use crate::FileSystemState;
 use crate::Result;
+
+trait TransactionMetadataStore {
+    fn get_transaction_metadata(&self, key: ObjectKey) -> Result<Option<Vec<u8>>>;
+
+    fn put_transaction_metadata(&mut self, key: ObjectKey, payload: &[u8]) -> Result<()>;
+}
+
+impl TransactionMetadataStore for LocalObjectStore {
+    fn get_transaction_metadata(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        Ok(self.get(key)?)
+    }
+
+    fn put_transaction_metadata(&mut self, key: ObjectKey, payload: &[u8]) -> Result<()> {
+        self.put(key, payload)?;
+        Ok(())
+    }
+}
+
+impl TransactionMetadataStore for Pool {
+    fn get_transaction_metadata(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        let receipt = self.placement_receipt_for_key(DeviceIoClass::Metadata, key)?;
+        let payload = self.get(DeviceIoClass::Metadata, key)?;
+        match (receipt, payload) {
+            (Some(_), payload) => Ok(payload),
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(FileSystemError::CorruptState {
+                reason: "filesystem transaction metadata is missing Pool placement authority",
+            }),
+        }
+    }
+
+    fn put_transaction_metadata(&mut self, key: ObjectKey, payload: &[u8]) -> Result<()> {
+        self.put_with_receipt(DeviceIoClass::Metadata, key, payload)?;
+        Ok(())
+    }
+}
 #[cfg(test)]
 pub(crate) fn persist_state(
     store: &mut LocalObjectStore,
@@ -138,7 +179,7 @@ pub(crate) fn prepare_state_with_pool_at_transaction(
     let keyspace = FilesystemObjectKeyspace::new(state.dataset_id());
     let content_entries = pool_content_manifest_entries_for_state(pool, state)?;
     let root = persist_transaction_objects_with_precomputed_content(
-        pool.raw_primary_store_mut(),
+        pool,
         state,
         transaction_id,
         &content_entries,
@@ -310,6 +351,7 @@ const fn test_sync_failure_boundary_code(boundary: FilesystemCommitBoundary) -> 
     }
 }
 
+#[cfg(any(test, feature = "replication-io"))]
 pub(crate) fn ensure_versioned_content_object(
     store: &mut LocalObjectStore,
     inode: &InodeRecord,
@@ -507,36 +549,51 @@ pub(crate) fn persist_transaction_objects(
     state: &FileSystemState,
     transaction_id: u64,
 ) -> Result<RootCommitRecord> {
+    let content_entries = raw_content_manifest_entries_for_state(store, state)?;
     persist_transaction_objects_impl(
         store,
         state,
         transaction_id,
-        None,
+        &content_entries,
         FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
     )
 }
 
-fn persist_transaction_objects_with_precomputed_content(
+#[cfg(any(test, feature = "replication-io"))]
+fn raw_content_manifest_entries_for_state(
     store: &mut LocalObjectStore,
+    state: &FileSystemState,
+) -> Result<BTreeMap<InodeId, Vec<TransactionManifestEntry>>> {
+    let mut entries = BTreeMap::new();
+    for inode in state.inodes.values().filter(|inode| inode.is_file_like()) {
+        let needs_inode_write = state.dirty_inodes.contains(&inode.inode_id)
+            || !state.last_inode_write_tx.contains_key(&inode.inode_id);
+        let inode_entries = if needs_inode_write {
+            ensure_versioned_content_object(store, inode, &state.content_compression_policy)?;
+            transaction_manifest_entries_for_content(store, inode, false)?
+        } else {
+            transaction_manifest_entries_for_existing_content(store, inode)?
+        };
+        entries.insert(inode.inode_id, inode_entries);
+    }
+    Ok(entries)
+}
+
+fn persist_transaction_objects_with_precomputed_content<S: TransactionMetadataStore>(
+    store: &mut S,
     state: &FileSystemState,
     transaction_id: u64,
     content_entries: &BTreeMap<InodeId, Vec<TransactionManifestEntry>>,
     keyspace: FilesystemObjectKeyspace,
 ) -> Result<RootCommitRecord> {
-    persist_transaction_objects_impl(
-        store,
-        state,
-        transaction_id,
-        Some(content_entries),
-        keyspace,
-    )
+    persist_transaction_objects_impl(store, state, transaction_id, content_entries, keyspace)
 }
 
-fn persist_transaction_objects_impl(
-    store: &mut LocalObjectStore,
+fn persist_transaction_objects_impl<S: TransactionMetadataStore>(
+    store: &mut S,
     state: &FileSystemState,
     transaction_id: u64,
-    precomputed_content_entries: Option<&BTreeMap<InodeId, Vec<TransactionManifestEntry>>>,
+    content_entries: &BTreeMap<InodeId, Vec<TransactionManifestEntry>>,
     keyspace: FilesystemObjectKeyspace,
 ) -> Result<RootCommitRecord> {
     let mut manifest_entries = Vec::new();
@@ -545,28 +602,20 @@ fn persist_transaction_objects_impl(
         let needs_inode_write =
             is_dirty || !state.last_inode_write_tx.contains_key(&inode.inode_id);
 
-        if inode.is_file_like() && precomputed_content_entries.is_some() {
-            let entries = precomputed_content_entries
-                .and_then(|entries| entries.get(&inode.inode_id))
-                .ok_or(FileSystemError::CorruptState {
-                    reason: "mounted transaction is missing prevalidated content entries",
-                })?;
+        if inode.is_file_like() {
+            let entries =
+                content_entries
+                    .get(&inode.inode_id)
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "mounted transaction is missing prevalidated content entries",
+                    })?;
             manifest_entries.extend(entries.iter().cloned());
-        } else if inode.is_file_like() && needs_inode_write {
-            ensure_versioned_content_object(store, inode, &state.content_compression_policy)?;
-            manifest_entries.extend(transaction_manifest_entries_for_content(
-                store, inode, false,
-            )?);
-        } else if inode.is_file_like() {
-            manifest_entries.extend(transaction_manifest_entries_for_existing_content(
-                store, inode,
-            )?);
         }
 
         if needs_inode_write {
             let inode_key = keyspace.transaction_inode(transaction_id, inode.inode_id);
             let inode_bytes = try_encode_inode(inode)?;
-            store.put(inode_key, &inode_bytes)?;
+            store.put_transaction_metadata(inode_key, &inode_bytes)?;
             manifest_entries.push(TransactionManifestEntry {
                 role: TransactionManifestObjectRole::TransactionInode,
                 object_key: inode_key,
@@ -576,22 +625,15 @@ fn persist_transaction_objects_impl(
             let last_tx = state.last_inode_write_tx[&inode.inode_id];
             let last_key = keyspace.transaction_inode(last_tx, inode.inode_id);
             let current_bytes = try_encode_inode(inode)?;
-            let existing_bytes = store.get(last_key)?.ok_or(FileSystemError::CorruptState {
-                reason: "clean inode reference points to missing object",
-            })?;
+            let existing_bytes =
+                store
+                    .get_transaction_metadata(last_key)?
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "clean inode reference points to missing object",
+                    })?;
             if current_bytes != existing_bytes {
-                if inode.is_file_like() && precomputed_content_entries.is_none() {
-                    ensure_versioned_content_object(
-                        store,
-                        inode,
-                        &state.content_compression_policy,
-                    )?;
-                    manifest_entries.extend(transaction_manifest_entries_for_content(
-                        store, inode, false,
-                    )?);
-                }
                 let inode_key = keyspace.transaction_inode(transaction_id, inode.inode_id);
-                store.put(inode_key, &current_bytes)?;
+                store.put_transaction_metadata(inode_key, &current_bytes)?;
                 manifest_entries.push(TransactionManifestEntry {
                     role: TransactionManifestObjectRole::TransactionInode,
                     object_key: inode_key,
@@ -619,7 +661,7 @@ fn persist_transaction_objects_impl(
                 )?;
                 let directory_key = keyspace.transaction_directory(transaction_id, inode.inode_id);
                 let directory_bytes = encode_directory(inode, directory);
-                store.put(directory_key, &directory_bytes)?;
+                store.put_transaction_metadata(directory_key, &directory_bytes)?;
                 manifest_entries.push(TransactionManifestEntry {
                     role: TransactionManifestObjectRole::TransactionDirectory,
                     object_key: directory_key,
@@ -634,13 +676,15 @@ fn persist_transaction_objects_impl(
                     },
                 )?;
                 let current_bytes = encode_directory(inode, directory);
-                let existing_bytes = store.get(last_key)?.ok_or(FileSystemError::CorruptState {
-                    reason: "clean directory reference points to missing object",
-                })?;
+                let existing_bytes = store.get_transaction_metadata(last_key)?.ok_or(
+                    FileSystemError::CorruptState {
+                        reason: "clean directory reference points to missing object",
+                    },
+                )?;
                 if current_bytes != existing_bytes {
                     let directory_key =
                         keyspace.transaction_directory(transaction_id, inode.inode_id);
-                    store.put(directory_key, &current_bytes)?;
+                    store.put_transaction_metadata(directory_key, &current_bytes)?;
                     manifest_entries.push(TransactionManifestEntry {
                         role: TransactionManifestObjectRole::TransactionDirectory,
                         object_key: directory_key,
@@ -680,7 +724,7 @@ fn persist_transaction_objects_impl(
                 .map_err(|_| FileSystemError::CorruptState {
                     reason: "extent map serialization failed",
                 })?;
-            store.put(ext_key, &ext_bytes)?;
+            store.put_transaction_metadata(ext_key, &ext_bytes)?;
             manifest_entries.push(TransactionManifestEntry {
                 role: TransactionManifestObjectRole::TransactionExtentMap,
                 object_key: ext_key,
@@ -700,7 +744,7 @@ fn persist_transaction_objects_impl(
     let superblock_bytes = encode_superblock(&superblock);
     let superblock_checksum = checksum64(&superblock_bytes);
     let superblock_key = keyspace.transaction_superblock(transaction_id);
-    store.put(superblock_key, &superblock_bytes)?;
+    store.put_transaction_metadata(superblock_key, &superblock_bytes)?;
     manifest_entries.push(TransactionManifestEntry {
         role: TransactionManifestObjectRole::TransactionSuperblock,
         object_key: superblock_key,
@@ -711,7 +755,7 @@ fn persist_transaction_objects_impl(
     for snapshot in state.snapshots.values() {
         let snap_key = keyspace.transaction_snapshot(transaction_id, &snapshot.name);
         let snap_bytes = encode_snapshot_record(snapshot);
-        store.put(snap_key, &snap_bytes)?;
+        store.put_transaction_metadata(snap_key, &snap_bytes)?;
         manifest_entries.push(TransactionManifestEntry {
             role: TransactionManifestObjectRole::TransactionSnapshotCatalogEntry,
             object_key: snap_key,
@@ -727,7 +771,7 @@ fn persist_transaction_objects_impl(
     let manifest_entry_count = manifest.entries.len() as u64;
     let manifest_bytes = encode_transaction_manifest(&manifest);
     let manifest_checksum = checksum64(&manifest_bytes);
-    store.put(
+    store.put_transaction_metadata(
         keyspace.transaction_manifest(transaction_id),
         &manifest_bytes,
     )?;
