@@ -472,6 +472,7 @@ INITSCRIPT
       -smp 2 \
       -nographic \
       -no-reboot \
+      < /dev/null \
       > "$VAL_LOG" 2>&1 || true
 
     echo "  QEMU exited ($(wc -l < "$VAL_LOG" 2>/dev/null || echo 0) log lines)"
