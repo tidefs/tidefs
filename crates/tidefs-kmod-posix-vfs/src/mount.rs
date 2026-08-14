@@ -189,7 +189,11 @@ impl From<LabelError> for PoolImportError {
                     s
                 },
             },
-            LabelError::ChecksumMismatch => Self::ChecksumMismatch,
+            LabelError::ChecksumMismatch
+            | LabelError::BadTopologyRoster
+            | LabelError::UnsupportedTopologyRosterVersion(_)
+            | LabelError::DuplicateTopologyRosterGuid
+            | LabelError::TopologyRosterChecksumMismatch => Self::ChecksumMismatch,
             LabelError::LastDevice => Self::LabelInvalid {
                 detail: {
                     use core::fmt::Write;
@@ -1370,6 +1374,21 @@ mod tests {
         let le = LabelError::BufferTooSmall;
         let pie: PoolImportError = le.into();
         assert!(matches!(pie, PoolImportError::BufferTooSmall { .. }));
+    }
+
+    #[test]
+    fn topology_roster_label_errors_map_to_corrupt() {
+        for error in [
+            LabelError::BadTopologyRoster,
+            LabelError::UnsupportedTopologyRosterVersion(2),
+            LabelError::DuplicateTopologyRosterGuid,
+            LabelError::TopologyRosterChecksumMismatch,
+        ] {
+            assert_eq!(
+                PoolImportError::from(error),
+                PoolImportError::ChecksumMismatch
+            );
+        }
     }
 
     // ── Edge cases ─────────────────────────────────────────────────────
