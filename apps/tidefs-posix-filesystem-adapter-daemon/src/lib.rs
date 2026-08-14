@@ -1182,6 +1182,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     let shutdown = Arc::new(AtomicBool::new(false));
     install_signal_handlers(Arc::clone(&shutdown)).map_err(|e| format!("signal handler: {e}"))?;
     let live_owner_engine = adapter.engine_handle();
+    let dataset_replacement = adapter.dataset_replacement_handle();
     let queue_depth_engine = Arc::clone(&live_owner_engine);
     let notifier_cell = adapter.notifier_cell();
     let mmap_coherency = adapter.mmap_coherency_cell();
@@ -1255,7 +1256,9 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                 .to_string(),
         );
     }
-    *notifier_cell.lock().unwrap() = Some(session.notifier());
+    let notifier = session.notifier();
+    *notifier_cell.lock().unwrap() = Some(notifier.clone());
+    dataset_replacement.install_kernel_cache_invalidator(notifier);
 
     let mode = if effective_mode.read_only { "RO" } else { "RW" };
     eprintln!(
@@ -1286,6 +1289,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                 let owner = match live_owner::start_fuse_owner(
                     owner_config,
                     Arc::clone(&live_owner_engine),
+                    dataset_replacement.clone(),
                     #[cfg(feature = "block-volume")]
                     shared_filesystem.clone(),
                     Arc::clone(&shutdown),
