@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![allow(unsafe_code)]
 
+use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -13,12 +14,12 @@ pub struct SignalShutdownThread {
 
 impl SignalShutdownThread {
     pub fn finish(mut self) {
-        // SAFETY: raise(3) targets the current process with SIGUSR1, which this
-        // module reserves for waking the sigwait thread during orderly join.
-        unsafe {
-            libc::raise(libc::SIGUSR1);
-        }
         if let Some(handle) = self.handle.take() {
+            // SAFETY: the live JoinHandle owns this pthread_t until join, and
+            // SIGUSR1 is blocked by and reserved for its sigwait loop.  Using
+            // pthread_kill is intentional: raise(3) targets the calling thread
+            // on Linux and cannot wake this distinct waiter.
+            let _ = unsafe { libc::pthread_kill(handle.as_pthread_t(), libc::SIGUSR1) };
             let _ = handle.join();
         }
     }
