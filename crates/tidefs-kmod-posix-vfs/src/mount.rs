@@ -189,8 +189,9 @@ impl From<LabelError> for PoolImportError {
                     s
                 },
             },
-            LabelError::ChecksumMismatch
-            | LabelError::BadTopologyRoster
+            LabelError::ChecksumMismatch => Self::ChecksumMismatch,
+            #[cfg(not(CONFIG_RUST))]
+            LabelError::BadTopologyRoster
             | LabelError::UnsupportedTopologyRosterVersion(_)
             | LabelError::DuplicateTopologyRosterGuid
             | LabelError::TopologyRosterChecksumMismatch => Self::ChecksumMismatch,
