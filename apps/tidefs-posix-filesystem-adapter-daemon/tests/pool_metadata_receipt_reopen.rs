@@ -46,7 +46,13 @@ fn open_fuse_session(
     devices: &[PathBuf],
     mountpoint: &Path,
     redundancy_policy: PoolRedundancyPolicy,
+    read_only: bool,
 ) -> fuser::BackgroundSession {
+    let recovery_policy = if read_only {
+        RecoveryPolicy::ReadOnly
+    } else {
+        RecoveryPolicy::default()
+    };
     let filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
         metadata_dir,
         devices,
@@ -54,17 +60,27 @@ fn open_fuse_session(
         redundancy_policy,
         StoreOptions::default(),
         RootAuthenticationKey::demo_key(),
-        RecoveryPolicy::default(),
+        recovery_policy,
     )
     .expect("open mirrored filesystem for FUSE");
     let engine = VfsLocalFileSystem::new(filesystem);
+    let engine = if read_only {
+        engine.with_read_only()
+    } else {
+        engine
+    };
     let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create FUSE VFS adapter");
+    let access = if read_only {
+        fuser::MountOption::RO
+    } else {
+        fuser::MountOption::RW
+    };
     fuser::spawn_mount2(
         adapter,
         mountpoint,
         &[
             fuser::MountOption::FSName("tidefs-pool-metadata-receipt".to_string()),
-            fuser::MountOption::RW,
+            access,
             fuser::MountOption::NoDev,
             fuser::MountOption::NoSuid,
             fuser::MountOption::Subtype("tidefs".to_string()),
@@ -95,7 +111,13 @@ fn fuse_remount_survives_primary_transaction_metadata_loss() {
 
     let redundancy_policy = PoolRedundancyPolicy::replicated(2);
     let payload = b"real FUSE bytes recovered through surviving Pool metadata receipts";
-    let session = open_fuse_session(&metadata_dir, &devices, &mountpoint, redundancy_policy);
+    let session = open_fuse_session(
+        &metadata_dir,
+        &devices,
+        &mountpoint,
+        redundancy_policy,
+        false,
+    );
     let mounted_file = mountpoint.join("survivor");
     {
         let mut file = OpenOptions::new()
@@ -146,7 +168,13 @@ fn fuse_remount_survives_primary_transaction_metadata_loss() {
     pool.sync_all().expect("sync primary member metadata loss");
     drop(pool);
 
-    let session = open_fuse_session(&metadata_dir, &devices, &mountpoint, redundancy_policy);
+    let session = open_fuse_session(
+        &metadata_dir,
+        &devices,
+        &mountpoint,
+        redundancy_policy,
+        false,
+    );
     let mut read_back = Vec::new();
     File::open(&mounted_file)
         .expect("open file after mirrored Pool remount")
@@ -157,4 +185,74 @@ fn fuse_remount_survives_primary_transaction_metadata_loss() {
     drop(session);
     std::thread::sleep(Duration::from_millis(100));
     fs::remove_dir_all(&root).expect("remove completed FUSE test fixture");
+}
+
+#[test]
+fn fuse_read_only_remount_survives_physically_absent_member() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("SKIP: /dev/fuse not available");
+        return;
+    }
+
+    let root = unique_root();
+    let metadata_dir = root.join("metadata");
+    let mountpoint = root.join("mnt");
+    let devices = vec![root.join("member-0.img"), root.join("member-1.img")];
+    fs::create_dir_all(&metadata_dir).expect("create Pool metadata directory");
+    fs::create_dir_all(&mountpoint).expect("create FUSE mountpoint");
+    for device in &devices {
+        File::create(device)
+            .expect("create regular-file Pool member")
+            .set_len(16 * 1024 * 1024)
+            .expect("size regular-file Pool member");
+    }
+
+    let redundancy_policy = PoolRedundancyPolicy::replicated(2);
+    let payload = b"committed FUSE bytes recovered while member zero is physically absent";
+    let session = open_fuse_session(
+        &metadata_dir,
+        &devices,
+        &mountpoint,
+        redundancy_policy,
+        false,
+    );
+    let mounted_file = mountpoint.join("degraded-survivor");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&mounted_file)
+            .expect("create file through replicated FUSE mount");
+        file.write_all(payload)
+            .expect("write file through replicated FUSE mount");
+    }
+    File::open(&mounted_file)
+        .expect("reopen replicated mounted file for fsync")
+        .sync_all()
+        .expect("fsync replicated mounted file");
+    drop(session);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let offline_member = root.join("offline-member-0.img");
+    fs::rename(&devices[0], &offline_member).expect("make member zero physically absent");
+    assert!(!devices[0].exists());
+    let surviving_devices = vec![devices[1].clone()];
+    let session = open_fuse_session(
+        &metadata_dir,
+        &surviving_devices,
+        &mountpoint,
+        redundancy_policy,
+        true,
+    );
+    let mut read_back = Vec::new();
+    File::open(&mounted_file)
+        .expect("open committed file through degraded read-only FUSE mount")
+        .read_to_end(&mut read_back)
+        .expect("read committed file through degraded read-only FUSE mount");
+    assert_eq!(read_back, payload);
+
+    drop(session);
+    std::thread::sleep(Duration::from_millis(100));
+    fs::remove_dir_all(&root).expect("remove completed degraded FUSE test fixture");
 }
