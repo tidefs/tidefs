@@ -34,7 +34,7 @@ use tidefs_vfs_engine::{
 #[cfg(test)]
 use tidefs_vfs_engine::{LivePoolAdminOutput, LivePoolAdminResponseBody};
 
-use crate::content::reflink_chunked_content;
+use crate::content::{reflink_chunked_content, FilesystemContentWriteStore};
 use crate::error::FileSystemError;
 use crate::fuse_getattr;
 use crate::fuse_setattr;
@@ -1505,38 +1505,30 @@ impl VfsLocalFileSystem {
             return live_admin_error(1, "dataset create: 'root' dataset cannot be re-created");
         }
 
-        if dataset_type != DatasetType::Volume {
+        if dataset_type == DatasetType::Snapshot {
             return live_admin_error(
                 1,
-                match dataset_type {
-                    DatasetType::Filesystem => "dataset create: standalone filesystem creation is not available until a filesystem engine can publish its typed root",
-                    DatasetType::Snapshot => "dataset create: snapshots must be created by the owning filesystem or volume engine",
-                    DatasetType::Volume => unreachable!(),
-                },
-            );
-        }
-        let Some(capacity) = capacity else {
-            return live_admin_error(
-                1,
-                "dataset create: --size <bytes> is required for --type volume",
-            );
-        };
-        if capacity == 0 || capacity % 4096 != 0 {
-            return live_admin_error(
-                1,
-                "dataset create: volume size must be nonzero and aligned to 4096 bytes",
+                "dataset create: snapshots must be created by the owning filesystem or volume engine",
             );
         }
         if mountpoint.is_some() {
             return live_admin_error(
                 1,
-                "dataset create: --mountpoint is not valid for a block volume",
+                match dataset_type {
+                    DatasetType::Filesystem => "dataset create: --mountpoint is not available for local filesystem creation; mount the dataset explicitly with 'pool mount --dataset'",
+                    DatasetType::Volume => "dataset create: --mountpoint is not valid for a block volume",
+                    DatasetType::Snapshot => unreachable!(),
+                },
             );
         }
         if !features.is_empty() {
             return live_admin_error(
                 1,
-                "dataset create: volume feature flags are not available until the volume engine consumes them",
+                match dataset_type {
+                    DatasetType::Filesystem => "dataset create: filesystem feature flags are not available until the named filesystem engine consumes them",
+                    DatasetType::Volume => "dataset create: volume feature flags are not available until the volume engine consumes them",
+                    DatasetType::Snapshot => unreachable!(),
+                },
             );
         }
 
@@ -1550,6 +1542,37 @@ impl VfsLocalFileSystem {
                     ),
                 )
             }
+        };
+        if sync_guarantee != SyncGuarantee::Local {
+            return live_admin_error(
+                1,
+                "dataset create: local dataset creation supports only --sync local; clustered guarantees require committed cluster ownership",
+            );
+        }
+        let capacity = match (dataset_type, capacity) {
+            (DatasetType::Filesystem, None) => None,
+            (DatasetType::Filesystem, Some(_)) => {
+                return live_admin_error(
+                    1,
+                    "dataset create: --size is valid only for block volumes",
+                )
+            }
+            (DatasetType::Volume, Some(capacity)) if capacity > 0 && capacity % 4096 == 0 => {
+                Some(capacity)
+            }
+            (DatasetType::Volume, Some(_)) => {
+                return live_admin_error(
+                    1,
+                    "dataset create: volume size must be nonzero and aligned to 4096 bytes",
+                )
+            }
+            (DatasetType::Volume, None) => {
+                return live_admin_error(
+                    1,
+                    "dataset create: --size <bytes> is required for --type volume",
+                )
+            }
+            (DatasetType::Snapshot, _) => unreachable!(),
         };
 
         let full_path = if parent == "root" {
@@ -1573,16 +1596,29 @@ impl VfsLocalFileSystem {
             );
         }
 
-        let geometry = match fs.create_volume_dataset(
-            &full_path,
-            dataset_id,
-            capacity,
-            properties.to_key_value_blob(),
-            DatasetFlags::default_create(),
-            sync_guarantee,
-        ) {
-            Ok(geometry) => geometry,
-            Err(err) => return live_admin_error(1, format!("dataset create: {err}")),
+        let geometry = match dataset_type {
+            DatasetType::Filesystem => match fs.create_filesystem_dataset(
+                &full_path,
+                dataset_id,
+                properties.to_key_value_blob(),
+                DatasetFlags::default_create(),
+                sync_guarantee,
+            ) {
+                Ok(_) => None,
+                Err(err) => return live_admin_error(1, format!("dataset create: {err}")),
+            },
+            DatasetType::Volume => match fs.create_volume_dataset(
+                &full_path,
+                dataset_id,
+                capacity.expect("volume capacity was validated"),
+                properties.to_key_value_blob(),
+                DatasetFlags::default_create(),
+                sync_guarantee,
+            ) {
+                Ok(geometry) => Some(geometry),
+                Err(err) => return live_admin_error(1, format!("dataset create: {err}")),
+            },
+            DatasetType::Snapshot => unreachable!(),
         };
 
         let requested_properties = args.get("properties").cloned().unwrap_or_else(|| json!([]));
@@ -1595,8 +1631,8 @@ impl VfsLocalFileSystem {
                 "dataset": full_path,
                 "id": dataset_id.to_string(),
                 "type": dataset_type.to_string(),
-                "size": geometry.capacity_bytes,
-                "block_size": geometry.block_size_bytes,
+                "size": geometry.as_ref().map(|geometry| geometry.capacity_bytes),
+                "block_size": geometry.as_ref().map(|geometry| geometry.block_size_bytes),
                 "parent": parent,
                 "mountpoint": mountpoint,
                 "properties": requested_properties,
@@ -1604,11 +1640,18 @@ impl VfsLocalFileSystem {
             }));
         }
 
+        let detail = geometry.map_or_else(
+            || "filesystem_root=published".to_string(),
+            |geometry| {
+                format!(
+                    "size={}  block_size={}",
+                    geometry.capacity_bytes, geometry.block_size_bytes
+                )
+            },
+        );
         live_admin_ok_text(format!(
-            "dataset '{full_path}' created in imported pool '{pool}'\n  id={}  parent='{parent}'  size={}  block_size={}",
+            "dataset '{full_path}' created in imported pool '{pool}'\n  id={}  parent='{parent}'  {detail}",
             format_dataset_id(&dataset_id),
-            geometry.capacity_bytes,
-            geometry.block_size_bytes
         ))
     }
 
@@ -1783,7 +1826,10 @@ impl VfsLocalFileSystem {
                 )
             }
         };
-        let snapshot_count = fs.list_snapshots().len();
+        let snapshot_count = match live_dataset_snapshot_count(fs.dataset_catalog(), name) {
+            Ok(count) => count,
+            Err(err) => return live_admin_error(1, err),
+        };
         let live_mount = fs
             .dataset_catalog()
             .lookup(name)
@@ -1809,15 +1855,16 @@ impl VfsLocalFileSystem {
             );
         }
 
-        if fs
+        let dataset_type = fs
             .dataset_catalog()
             .get_by_id(
                 &fs.dataset_catalog()
                     .lookup(name)
                     .expect("existing dataset retains identity"),
             )
-            .is_some_and(|(_, _, dataset_type, _, _, _)| dataset_type == DatasetType::Volume)
-        {
+            .map(|(_, _, dataset_type, _, _, _)| dataset_type)
+            .expect("existing dataset retains catalog type");
+        if dataset_type == DatasetType::Volume {
             match fs.destroy_volume_dataset(name) {
                 Ok(result) => {
                     if wants_json {
@@ -1844,44 +1891,17 @@ impl VfsLocalFileSystem {
                 }
             }
         }
-
-        let destroyed_entries = if force {
-            let catalog = match fs.dataset_catalog_mut() {
-                Ok(catalog) => catalog,
-                Err(err) => {
-                    return live_admin_error(
-                        1,
-                        format!("dataset destroy: mutation requires reopen: {err}"),
-                    )
-                }
-            };
-            match live_destroy_catalog_subtree(catalog, name) {
-                Ok(count) => count,
-                Err(err) => return live_admin_error(1, err),
-            }
-        } else {
-            let catalog = match fs.dataset_catalog_mut() {
-                Ok(catalog) => catalog,
-                Err(err) => {
-                    return live_admin_error(
-                        1,
-                        format!("dataset destroy: mutation requires reopen: {err}"),
-                    )
-                }
-            };
-            if let Err(err) = catalog.destroy(name) {
-                return live_admin_error(
-                    1,
-                    format!("dataset destroy: catalog error destroying '{name}': {err}"),
-                );
-            }
-            1
-        };
-        if let Err(err) = fs.persist_dataset_catalog() {
+        if dataset_type != DatasetType::Filesystem {
+            return live_admin_error(1, "dataset destroy: unsupported dataset type");
+        }
+        if child_count != 0 || snapshot_count != 0 || live_mount {
             return live_admin_error(
                 1,
-                format!("dataset destroy: failed to persist catalog: {err}"),
+                "dataset destroy: recursive or live filesystem destruction is not implemented; destroy snapshots and children and unmount the target first",
             );
+        }
+        if let Err(err) = fs.destroy_filesystem_dataset(name) {
+            return live_admin_error(1, format!("dataset destroy: {err}"));
         }
         if wants_json {
             return live_admin_ok_json(json!({
@@ -1890,7 +1910,7 @@ impl VfsLocalFileSystem {
                 "pool": pool,
                 "dataset": name,
                 "force": force,
-                "destroyed_entries": destroyed_entries,
+                "destroyed_entries": 1,
                 "child_count": child_count,
                 "snapshot_count": snapshot_count,
                 "live_mount": live_mount,
@@ -1920,6 +1940,16 @@ impl VfsLocalFileSystem {
             return live_admin_error(
                 1,
                 format!("dataset set-strategy: dataset '{name}' does not exist in the catalog"),
+            );
+        }
+        let target_id = fs
+            .dataset_catalog()
+            .lookup(name)
+            .expect("existing dataset retains identity");
+        if *target_id.as_bytes() != fs.mounted_dataset_id() {
+            return live_admin_error(
+                1,
+                "dataset set-strategy: named filesystem feature flags require that dataset's mounted owner; refusing to mutate the root filesystem",
             );
         }
 
@@ -2060,6 +2090,16 @@ impl VfsLocalFileSystem {
             return live_admin_error(
                 1,
                 format!("dataset upgrade: dataset '{name}' does not exist in the catalog"),
+            );
+        }
+        let target_id = fs
+            .dataset_catalog()
+            .lookup(name)
+            .expect("existing dataset retains identity");
+        if *target_id.as_bytes() != fs.mounted_dataset_id() {
+            return live_admin_error(
+                1,
+                "dataset upgrade: named filesystem feature flags require that dataset's mounted owner; refusing to mutate the root filesystem",
             );
         }
 
@@ -3475,26 +3515,23 @@ fn live_feature_names_from_request(args: &Value) -> Result<Vec<String>, String> 
     Ok(features)
 }
 
-fn live_destroy_catalog_subtree(catalog: &mut DatasetCatalog, path: &str) -> Result<usize, String> {
-    let prefix = format!("{path}/");
-    let mut descendants: Vec<String> = catalog
-        .list_all()
-        .into_iter()
-        .map(|(entry_path, _, _, _, _, _)| entry_path)
-        .filter(|entry_path| entry_path.starts_with(&prefix))
-        .collect();
-    descendants.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| right.cmp(left)));
-    let mut destroyed = 0;
-    for descendant in descendants {
-        catalog.destroy(&descendant).map_err(|err| {
-            format!("dataset destroy: catalog error destroying '{descendant}': {err}")
-        })?;
-        destroyed += 1;
+fn live_dataset_snapshot_count(catalog: &DatasetCatalog, path: &str) -> Result<usize, String> {
+    let target_id = catalog
+        .lookup(path)
+        .map_err(|err| format!("dataset destroy: catalog error resolving '{path}': {err}"))?;
+    let mut count = 0;
+    for (snapshot_path, _, dataset_type, _, _, _) in catalog.list_all() {
+        if dataset_type != DatasetType::Snapshot {
+            continue;
+        }
+        if catalog.lineage_parent(&snapshot_path).map_err(|err| {
+            format!("dataset destroy: catalog error resolving lineage for '{snapshot_path}': {err}")
+        })? == Some(target_id)
+        {
+            count += 1;
+        }
     }
-    catalog
-        .destroy(path)
-        .map_err(|err| format!("dataset destroy: catalog error destroying '{path}': {err}"))?;
-    Ok(destroyed + 1)
+    Ok(count)
 }
 
 fn live_property_value_json(value: &PropertyValue) -> Value {
@@ -4438,11 +4475,13 @@ impl VfsLocalFileSystem {
             let fs = &mut *fs;
             let dedup_enabled = fs.dedup_enabled;
             let compression_policy = fs.content_compression_policy.clone();
-            let mut pool_store = fs.store.pool_mut().pool_store_mut();
+            let dataset_id = DatasetId::from_bytes(fs.mounted_dataset_id);
+            let pool_store = fs.store.pool_mut().pool_store_mut();
+            let mut content_store = FilesystemContentWriteStore::new(pool_store, dataset_id);
             let mut dedup = fs.dedup_index.borrow_mut();
             reflink_chunked_content(
                 dedup_enabled,
-                &mut pool_store,
+                &mut content_store,
                 source_fh.inode_id,
                 &source_record,
                 &dest_record,

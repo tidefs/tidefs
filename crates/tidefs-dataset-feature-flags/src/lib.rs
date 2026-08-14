@@ -14,6 +14,7 @@ use tidefs_types_dataset_feature_flags_core::{
 use tidefs_types_dataset_lifecycle_core::DatasetOpenResult;
 
 const FEATURE_FLAGS_PREFIX: &[u8] = b"tidefs:feature_flags:";
+const FEATURE_FLAGS_DATASET_PREFIX: &[u8] = b"tidefs:feature_flags:dataset:v1:";
 
 fn feature_flags_object_key(class: FeatureClass) -> ObjectKey {
     let suffix: &[u8] = match class {
@@ -23,6 +24,25 @@ fn feature_flags_object_key(class: FeatureClass) -> ObjectKey {
     };
     let mut name = Vec::with_capacity(FEATURE_FLAGS_PREFIX.len() + suffix.len());
     name.extend_from_slice(FEATURE_FLAGS_PREFIX);
+    name.extend_from_slice(suffix);
+    ObjectKey::from_name(&name)
+}
+
+fn feature_flags_object_key_for_dataset(class: FeatureClass, dataset_id: [u8; 16]) -> ObjectKey {
+    if dataset_id == [0; 16] {
+        return feature_flags_object_key(class);
+    }
+    let suffix: &[u8] = match class {
+        FeatureClass::Compat => b"compat",
+        FeatureClass::RoCompat => b"ro_compat",
+        FeatureClass::Incompat => b"incompat",
+    };
+    let mut name = Vec::with_capacity(
+        FEATURE_FLAGS_DATASET_PREFIX.len() + dataset_id.len() + 1 + suffix.len(),
+    );
+    name.extend_from_slice(FEATURE_FLAGS_DATASET_PREFIX);
+    name.extend_from_slice(&dataset_id);
+    name.push(b':');
     name.extend_from_slice(suffix);
     ObjectKey::from_name(&name)
 }
@@ -44,6 +64,21 @@ fn root_key_for_tree(
         FeatureTreeRootKeyV1::EMPTY
     } else {
         root_key_from_object_key(feature_flags_object_key(class))
+    }
+}
+
+fn root_key_for_tree_in_dataset(
+    class: FeatureClass,
+    tree: &BPlusTree<FeatureName, FeatureFlagValueV1>,
+    dataset_id: [u8; 16],
+) -> FeatureTreeRootKeyV1 {
+    if dataset_id == [0; 16] {
+        return root_key_for_tree(class, tree);
+    }
+    if tree.is_empty() {
+        FeatureTreeRootKeyV1::EMPTY
+    } else {
+        root_key_from_object_key(feature_flags_object_key_for_dataset(class, dataset_id))
     }
 }
 
@@ -302,9 +337,18 @@ impl FeatureFlags {
     }
 
     pub fn persist(&self, store: &mut Pool) -> StoreResult<DatasetFeatureFlagsV1> {
-        let compat_key = feature_flags_object_key(FeatureClass::Compat);
-        let ro_compat_key = feature_flags_object_key(FeatureClass::RoCompat);
-        let incompat_key = feature_flags_object_key(FeatureClass::Incompat);
+        self.persist_for_dataset(store, [0; 16])
+    }
+
+    pub fn persist_for_dataset(
+        &self,
+        store: &mut Pool,
+        dataset_id: [u8; 16],
+    ) -> StoreResult<DatasetFeatureFlagsV1> {
+        let compat_key = feature_flags_object_key_for_dataset(FeatureClass::Compat, dataset_id);
+        let ro_compat_key =
+            feature_flags_object_key_for_dataset(FeatureClass::RoCompat, dataset_id);
+        let incompat_key = feature_flags_object_key_for_dataset(FeatureClass::Incompat, dataset_id);
         let mut roots = DatasetFeatureFlagsV1::default();
         if !self.compat_tree.is_empty() {
             let bytes = serialize_feature_tree(&self.compat_tree);
@@ -555,10 +599,27 @@ impl FeatureFlags {
 
     #[must_use]
     pub fn to_dataset_flags(&self) -> DatasetFeatureFlagsV1 {
+        self.to_dataset_flags_for_dataset([0; 16])
+    }
+
+    #[must_use]
+    pub fn to_dataset_flags_for_dataset(&self, dataset_id: [u8; 16]) -> DatasetFeatureFlagsV1 {
         DatasetFeatureFlagsV1 {
-            compat_root: root_key_for_tree(FeatureClass::Compat, &self.compat_tree),
-            ro_compat_root: root_key_for_tree(FeatureClass::RoCompat, &self.ro_compat_tree),
-            incompat_root: root_key_for_tree(FeatureClass::Incompat, &self.incompat_tree),
+            compat_root: root_key_for_tree_in_dataset(
+                FeatureClass::Compat,
+                &self.compat_tree,
+                dataset_id,
+            ),
+            ro_compat_root: root_key_for_tree_in_dataset(
+                FeatureClass::RoCompat,
+                &self.ro_compat_tree,
+                dataset_id,
+            ),
+            incompat_root: root_key_for_tree_in_dataset(
+                FeatureClass::Incompat,
+                &self.incompat_tree,
+                dataset_id,
+            ),
         }
     }
 
@@ -737,6 +798,46 @@ mod tests {
         );
         let loaded = FeatureFlags::load(&pool, &roots).expect("load persisted feature tree");
         assert!(loaded.is_enabled(&name));
+
+        drop(pool);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persist_separates_named_dataset_roots_and_preserves_root_keys() {
+        let (root, mut pool) = test_pool("dataset-root-keys");
+        let mut flags = FeatureFlags::new();
+        let name = feature(FEATURE_POSIX_ACL);
+        flags
+            .enable_feature(name.clone(), FeatureClass::Compat)
+            .unwrap();
+
+        let root_flags = flags
+            .persist_for_dataset(&mut pool, [0; 16])
+            .expect("persist root-dataset feature tree");
+        let first = flags
+            .persist_for_dataset(&mut pool, [1; 16])
+            .expect("persist first named-dataset feature tree");
+        let second = flags
+            .persist_for_dataset(&mut pool, [2; 16])
+            .expect("persist second named-dataset feature tree");
+
+        assert_eq!(
+            root_flags.compat_root,
+            root_key_from_object_key(feature_flags_object_key(FeatureClass::Compat)),
+            "the root dataset must preserve the unreleased legacy object key",
+        );
+        assert_ne!(root_flags.compat_root, first.compat_root);
+        assert_ne!(first.compat_root, second.compat_root);
+        assert!(FeatureFlags::load(&pool, &root_flags)
+            .expect("load root feature tree")
+            .is_enabled(&name));
+        assert!(FeatureFlags::load(&pool, &first)
+            .expect("load first named feature tree")
+            .is_enabled(&name));
+        assert!(FeatureFlags::load(&pool, &second)
+            .expect("load second named feature tree")
+            .is_enabled(&name));
 
         drop(pool);
         fs::remove_dir_all(root).unwrap();

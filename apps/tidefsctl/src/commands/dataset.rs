@@ -1079,16 +1079,27 @@ fn validate_create_capacity(
 fn destroy_admission_from_catalog(
     catalog: &DatasetCatalog,
     path: &str,
-    snapshot_count: usize,
     mounted_dataset_id: [u8; 16],
 ) -> Result<DestroyAdmission, String> {
+    let target_id = catalog
+        .lookup(path)
+        .map_err(|err| format!("catalog error resolving '{path}': {err}"))?;
     let children = catalog
         .list_children(path)
         .map_err(|err| format!("catalog error listing children of '{path}': {err}"))?;
-    let live_mount = catalog
-        .lookup(path)
-        .map(|dataset_id| *dataset_id.as_bytes() == mounted_dataset_id)
-        .unwrap_or(false);
+    let mut snapshot_count = 0;
+    for (snapshot_path, _, dataset_type, _, _, _) in catalog.list_all() {
+        if dataset_type != DatasetType::Snapshot {
+            continue;
+        }
+        if catalog.lineage_parent(&snapshot_path).map_err(|err| {
+            format!("catalog error resolving lineage for '{snapshot_path}': {err}")
+        })? == Some(target_id)
+        {
+            snapshot_count += 1;
+        }
+    }
+    let live_mount = *target_id.as_bytes() == mounted_dataset_id;
     Ok(DestroyAdmission {
         child_count: children.len(),
         snapshot_count,
@@ -1110,6 +1121,7 @@ fn require_destroy_admission(
     ))
 }
 
+#[cfg(test)]
 fn destroy_catalog_subtree(catalog: &mut DatasetCatalog, path: &str) -> Result<usize, String> {
     let prefix = format!("{path}/");
     let mut descendants: Vec<String> = catalog
@@ -1166,41 +1178,54 @@ fn handle_create(args: DatasetCreateArgs) {
         );
     }
 
-    if args.dataset_type == DatasetTypeArg::Filesystem {
-        exit_dataset_error(
-            "create",
-            "standalone filesystem creation is not available until a filesystem engine can publish its typed root",
-            args.json,
-        );
-    }
-    let capacity = capacity.unwrap_or_else(|| {
-        exit_dataset_error(
-            "create",
-            "--size <bytes> is required for --type volume",
-            args.json,
-        )
-    });
-
-    if mountpoint.is_some() {
-        exit_dataset_error(
-            "create",
-            "--mountpoint is not valid for a block volume",
-            args.json,
-        );
-    }
-    if !features.is_empty() {
-        exit_dataset_error(
-            "create",
-            "volume feature flags are not available until the volume engine consumes them",
-            args.json,
-        );
-    }
-    if sync_guarantee != SyncGuarantee::Local {
-        exit_dataset_error(
-            "create",
-            "local volume creation supports only --sync local; clustered guarantees require committed cluster ownership",
-            args.json,
-        );
+    match args.dataset_type {
+        DatasetTypeArg::Filesystem => {
+            if mountpoint.is_some() {
+                exit_dataset_error(
+                    "create",
+                    "--mountpoint is not available for local filesystem creation; mount the dataset explicitly with 'pool mount --dataset'",
+                    args.json,
+                );
+            }
+            if !features.is_empty() {
+                exit_dataset_error(
+                    "create",
+                    "filesystem feature flags are not available until the named filesystem engine consumes them",
+                    args.json,
+                );
+            }
+            if sync_guarantee != SyncGuarantee::Local {
+                exit_dataset_error(
+                    "create",
+                    "local filesystem creation supports only --sync local; clustered guarantees require committed cluster ownership",
+                    args.json,
+                );
+            }
+        }
+        DatasetTypeArg::Volume => {
+            if mountpoint.is_some() {
+                exit_dataset_error(
+                    "create",
+                    "--mountpoint is not valid for a block volume",
+                    args.json,
+                );
+            }
+            if !features.is_empty() {
+                exit_dataset_error(
+                    "create",
+                    "volume feature flags are not available until the volume engine consumes them",
+                    args.json,
+                );
+            }
+            if sync_guarantee != SyncGuarantee::Local {
+                exit_dataset_error(
+                    "create",
+                    "local volume creation supports only --sync local; clustered guarantees require committed cluster ownership",
+                    args.json,
+                );
+            }
+        }
+        DatasetTypeArg::Snapshot => unreachable!("snapshot create was refused above"),
     }
 
     // ── Cluster-authoritative path ─────────────────────────────────
@@ -1241,10 +1266,7 @@ fn handle_create(args: DatasetCreateArgs) {
                     .collect(),
             ),
         ),
-        (
-            "size",
-            super::live_owner::live_admin_optional_u64(Some(capacity)),
-        ),
+        ("size", super::live_owner::live_admin_optional_u64(capacity)),
         ("sync", LivePoolAdminArg::String(args.sync.clone())),
     ]);
     let dataset_id = dataset_id_from_name(&full_path);
@@ -1281,16 +1303,35 @@ fn handle_create(args: DatasetCreateArgs) {
             )
             .map_err(|err| format!("failed to open canonical Pool runtime: {err}"))?;
             require_create_admission(runtime.dataset_catalog(), &full_path, &parent)?;
-            runtime
-                .create_volume(
-                    &full_path,
-                    dataset_id,
-                    capacity,
-                    property_set.to_key_value_blob(),
-                    DatasetFlags::default_create(),
-                    sync_guarantee,
-                )
-                .map_err(|err| format!("failed to create canonical Pool volume: {err}"))
+            match args.dataset_type {
+                DatasetTypeArg::Filesystem => {
+                    let root_authentication_key =
+                        super::root_authentication_key_or_exit("dataset create");
+                    tidefs_local_filesystem::create_filesystem_dataset_in_pool_runtime(
+                        &mut runtime,
+                        &full_path,
+                        dataset_id,
+                        property_set.to_key_value_blob(),
+                        DatasetFlags::default_create(),
+                        sync_guarantee,
+                        root_authentication_key,
+                    )
+                    .map(|_| None)
+                    .map_err(|err| format!("failed to create canonical Pool filesystem: {err}"))
+                }
+                DatasetTypeArg::Volume => runtime
+                    .create_volume(
+                        &full_path,
+                        dataset_id,
+                        capacity.expect("volume capacity was validated"),
+                        property_set.to_key_value_blob(),
+                        DatasetFlags::default_create(),
+                        sync_guarantee,
+                    )
+                    .map(Some)
+                    .map_err(|err| format!("failed to create canonical Pool volume: {err}")),
+                DatasetTypeArg::Snapshot => unreachable!("snapshot create was refused above"),
+            }
         })();
         let export_result = import_owner
             .export()
@@ -1323,8 +1364,8 @@ fn handle_create(args: DatasetCreateArgs) {
             "dataset": full_path,
             "id": dataset_id.to_string(),
             "type": dataset_type.to_string(),
-            "size": geometry.capacity_bytes,
-            "block_size": geometry.block_size_bytes,
+            "size": geometry.as_ref().map(|geometry| geometry.capacity_bytes),
+            "block_size": geometry.as_ref().map(|geometry| geometry.block_size_bytes),
             "parent": parent,
             "mountpoint": mountpoint,
             "properties": property_assignments_json(&properties),
@@ -1332,12 +1373,19 @@ fn handle_create(args: DatasetCreateArgs) {
         }));
     } else {
         println!("dataset '{full_path}' created in pool '{}'", target.pool);
-        println!(
-            "  id={}  parent='{parent}'  size={}  block_size={}",
-            format_dataset_id(&dataset_id),
-            geometry.capacity_bytes,
-            geometry.block_size_bytes
-        );
+        if let Some(geometry) = geometry {
+            println!(
+                "  id={}  parent='{parent}'  size={}  block_size={}",
+                format_dataset_id(&dataset_id),
+                geometry.capacity_bytes,
+                geometry.block_size_bytes
+            );
+        } else {
+            println!(
+                "  id={}  parent='{parent}'  filesystem_root=published",
+                format_dataset_id(&dataset_id)
+            );
+        }
     }
 }
 fn handle_list(args: DatasetListArgs) {
@@ -1618,6 +1666,16 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
         );
         process::exit(1);
     }
+    let target_id = fs
+        .dataset_catalog()
+        .lookup(&args.name)
+        .expect("existing dataset retains identity");
+    if *target_id.as_bytes() != fs.mounted_dataset_id() {
+        eprintln!(
+            "tidefsctl dataset set-strategy: named filesystem feature flags require that dataset's mounted owner; refusing to mutate the root filesystem"
+        );
+        process::exit(1);
+    }
 
     // Handle --list
     if args.list {
@@ -1815,6 +1873,16 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
         eprintln!(
             "tidefsctl dataset upgrade: dataset '{}' does not exist in the catalog",
             args.name
+        );
+        process::exit(1);
+    }
+    let target_id = fs
+        .dataset_catalog()
+        .lookup(&args.name)
+        .expect("existing dataset retains identity");
+    if *target_id.as_bytes() != fs.mounted_dataset_id() {
+        eprintln!(
+            "tidefsctl dataset upgrade: named filesystem feature flags require that dataset's mounted owner; refusing to mutate the root filesystem"
         );
         process::exit(1);
     }
@@ -2342,13 +2410,9 @@ fn handle_destroy(args: DatasetDestroyArgs) {
         );
     }
 
-    let admission = destroy_admission_from_catalog(
-        fs.dataset_catalog(),
-        &name,
-        fs.list_snapshots().len(),
-        fs.mounted_dataset_id(),
-    )
-    .unwrap_or_else(|err| exit_dataset_error("destroy", err, args.json));
+    let admission =
+        destroy_admission_from_catalog(fs.dataset_catalog(), &name, fs.mounted_dataset_id())
+            .unwrap_or_else(|err| exit_dataset_error("destroy", err, args.json));
     if let Err(err) = require_destroy_admission(&name, &admission, args.force) {
         exit_dataset_error("destroy", err, args.json);
     }
@@ -2390,23 +2454,15 @@ fn handle_destroy(args: DatasetDestroyArgs) {
         return;
     }
 
-    let catalog = fs.dataset_catalog_mut().unwrap_or_else(|err| {
+    if admission.child_count != 0 || admission.snapshot_count != 0 || admission.live_mount {
         exit_dataset_error(
             "destroy",
-            format!("filesystem mutation requires reopen: {err}"),
-            args.json,
-        )
-    });
-    let destroyed_entries = destroy_catalog_subtree(catalog, &name)
-        .unwrap_or_else(|err| exit_dataset_error("destroy", err, args.json));
-
-    if let Err(err) = fs.persist_dataset_catalog() {
-        exit_dataset_error(
-            "destroy",
-            format!("failed to persist catalog: {err}"),
+            "recursive or live filesystem destruction is not implemented; destroy snapshots and children and unmount the target first",
             args.json,
         );
     }
+    fs.destroy_filesystem_dataset(&name)
+        .unwrap_or_else(|err| exit_dataset_error("destroy", err.to_string(), args.json));
 
     if args.json {
         print_json_or_exit(serde_json::json!({
@@ -2415,7 +2471,7 @@ fn handle_destroy(args: DatasetDestroyArgs) {
             "pool": target.pool,
             "dataset": name,
             "force": args.force,
-            "destroyed_entries": destroyed_entries,
+            "destroyed_entries": 1,
             "admission": {
                 "children": admission.child_count,
                 "snapshots": admission.snapshot_count,
@@ -2883,14 +2939,19 @@ mod dataset_lifecycle_command_tests {
 
     #[test]
     fn destroy_admission_requires_force_for_children_snapshots_or_live_mount() {
-        let catalog = catalog_with(&[
+        let mut catalog = catalog_with(&[
             ("data", DatasetType::Filesystem),
             ("data/child", DatasetType::Filesystem),
         ]);
         let mounted_dataset_id = *dataset_id_from_name("data").as_bytes();
+        create_entry(&mut catalog, "data@snap", DatasetType::Snapshot);
+        catalog
+            .set_lineage_parent("data@snap", DatasetId::from_bytes(mounted_dataset_id))
+            .unwrap();
 
         let admission =
-            destroy_admission_from_catalog(&catalog, "data", 1, mounted_dataset_id).unwrap();
+            destroy_admission_from_catalog(&catalog, "data", mounted_dataset_id).unwrap();
+        assert_eq!(admission.snapshot_count, 1);
         assert!(admission.has_hazards());
         let err = require_destroy_admission("data", &admission, false).unwrap_err();
         assert!(err.contains("--force"));

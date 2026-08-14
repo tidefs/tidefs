@@ -156,6 +156,7 @@ impl InodeCache {
     }
 
     /// Update the mounted-dataset budget partition for future admissions.
+    #[cfg(test)]
     pub(crate) fn set_budget_partition(&mut self, partition: BudgetPartitionKey) {
         if self.budget_partition != Some(partition) {
             self.clear();

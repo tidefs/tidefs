@@ -975,11 +975,12 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             },
             ..StoreOptions::default()
         };
-        let mut lfs =
-            LocalFileSystem::open_named_pool_with_allocator_policy_and_root_authentication_key(
+        let selected_dataset_path = config.dataset_path.as_deref().unwrap_or("root");
+        let mut lfs = LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
                 &config.backing_dir,
                 config.pool_name.as_deref().unwrap_or("tidefs"),
                 config.pool_redundancy_policy,
+                selected_dataset_path,
                 LocalFileSystemOpenConfig {
                     options: store_options,
                     allocator_policy: LocalStorageAllocatorPolicy {
@@ -994,7 +995,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                     block_devices: config.block_devices.as_deref(),
                 },
             )
-            .map_err(|e| format!("open store: {e}"))?;
+        .map_err(|e| format!("open store: {e}"))?;
 
         if !effective_mode.read_only && config.runtime.enable_dedup {
             #[cfg(not(feature = "data-policy"))]
@@ -1047,10 +1048,11 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                 ));
             }
         }
-        if !effective_mode.read_only {
-            if let Some(ds_id) = dataset_id {
-                lfs.set_mounted_dataset_id(*ds_id.as_bytes())
-                    .map_err(|e| format!("set mounted dataset identity: {e}"))?;
+        if let Some(ds_id) = dataset_id {
+            if lfs.mounted_dataset_id() != *ds_id.as_bytes() {
+                return Err(format!(
+                    "mounted dataset identity differs from canonical root for {selected_dataset_path}"
+                ));
             }
         }
 
@@ -1081,7 +1083,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             config.runtime.sync_guarantee
         };
 
-        // Build the base VfsLocalFileSystem, optionally scoped to a dataset root.
+        // The LocalFileSystem already owns the exact typed dataset root.
         let mut engine = VfsLocalFileSystem::new(lfs).with_sync_guarantee(sync_guarantee);
         if effective_mode.read_only {
             engine
@@ -1103,18 +1105,6 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             engine
                 .set_timestamp_policy(timestamp_policy)
                 .map_err(|e| format!("set mounted timestamp policy: {e}"))?;
-        }
-        // When mounting a non-root dataset, scope path resolution to the
-        // dataset directory within the pool so the FUSE mount root exposes
-        // only that dataset's contents.
-        if let Some(ref ds_path) = config.dataset_path {
-            if ds_path != "root" {
-                let dataset_fs_path = format!("/{ds_path}");
-                if config.debug {
-                    eprintln!("tidefsctl: dataset mount root: {ds_path} -> {dataset_fs_path}");
-                }
-                engine = engine.with_dataset_root(&dataset_fs_path);
-            }
         }
         (engine, tracker, dataset_id)
     };
@@ -1851,9 +1841,7 @@ mod cluster_mount_authority_tests {
 // release-tier FUSE claims).
 #[cfg(test)]
 mod dataset_mount_lookup_tests {
-    use tidefs_dataset_catalog::{
-        DatasetFlags, DatasetId, DatasetType, LifecycleState, SyncGuarantee,
-    };
+    use tidefs_dataset_catalog::{DatasetFlags, DatasetId, LifecycleState, SyncGuarantee};
     use tidefs_local_filesystem::human::local_filesystem::StoreOptions;
     use tidefs_local_filesystem::{LocalFileSystem, RootAuthenticationKey};
 
@@ -1902,29 +1890,20 @@ mod dataset_mount_lookup_tests {
         let mut fs = open_temp_fs(dir.path());
 
         let ds_id = DatasetId::from_bytes([2u8; 16]);
-        fs.dataset_catalog_mut()
-            .unwrap()
-            .create(
-                "ds1",
-                ds_id,
-                DatasetType::Filesystem,
-                1,
-                vec![],
-                DatasetFlags::NONE,
-                SyncGuarantee::default(),
-            )
-            .unwrap();
-        fs.persist_dataset_catalog().unwrap();
+        fs.create_filesystem_dataset(
+            "ds1",
+            ds_id,
+            vec![],
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
 
         let id_before = fs.dataset_catalog().mount_lookup("ds1").unwrap();
         assert_eq!(id_before, ds_id);
 
         // Rename ds1 -> renamed_ds
-        fs.dataset_catalog_mut()
-            .unwrap()
-            .rename("ds1", "renamed_ds")
-            .unwrap();
-        fs.persist_dataset_catalog().unwrap();
+        fs.rename_pool_dataset("ds1", "renamed_ds").unwrap();
 
         // Old path no longer resolves
         assert!(fs.dataset_catalog().mount_lookup("ds1").is_err());
@@ -1940,23 +1919,17 @@ mod dataset_mount_lookup_tests {
         let mut fs = open_temp_fs(dir.path());
 
         let ds_id = DatasetId::from_bytes([3u8; 16]);
-        fs.dataset_catalog_mut()
-            .unwrap()
-            .create(
-                "ds3",
-                ds_id,
-                DatasetType::Filesystem,
-                1,
-                vec![],
-                DatasetFlags::NONE,
-                SyncGuarantee::default(),
-            )
-            .unwrap();
-        fs.persist_dataset_catalog().unwrap();
+        fs.create_filesystem_dataset(
+            "ds3",
+            ds_id,
+            vec![],
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
 
         // Destroy the dataset
-        fs.dataset_catalog_mut().unwrap().destroy("ds3").unwrap();
-        fs.persist_dataset_catalog().unwrap();
+        fs.destroy_filesystem_dataset("ds3").unwrap();
 
         // Verify dataset entry is removed (lifecycle_state returns NotFound)
         let state_result = fs.dataset_catalog().lifecycle_state("ds3");

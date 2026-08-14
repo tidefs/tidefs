@@ -1,8 +1,161 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+use tidefs_dataset_lifecycle::DatasetId;
 use tidefs_local_object_store::ObjectKey;
 use tidefs_types_vfs_core::InodeId;
 
 use crate::constants::*;
+
+const FILESYSTEM_DATASET_OBJECT_KEY_DOMAIN: &[u8] =
+    b"tidefs.local-filesystem.dataset-object-key.v1";
+
+/// Dataset-scoped key authority for one filesystem engine.
+///
+/// The all-zero root dataset retains the unreleased pre-dataset key layout.
+/// Every named filesystem instead derives an independent key domain from its
+/// stable 128-bit `DatasetId`, so equal inode, transaction, and content
+/// identities in two filesystems cannot alias in the shared Pool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FilesystemObjectKeyspace {
+    dataset_id: DatasetId,
+}
+
+impl FilesystemObjectKeyspace {
+    #[must_use]
+    pub(crate) const fn new(dataset_id: DatasetId) -> Self {
+        Self { dataset_id }
+    }
+
+    #[must_use]
+    pub(crate) const fn dataset_id(self) -> DatasetId {
+        self.dataset_id
+    }
+
+    #[must_use]
+    pub(crate) fn scope(self, key: ObjectKey) -> ObjectKey {
+        if self.dataset_id == tidefs_pool_runtime::ROOT_DATASET_ID {
+            return key;
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(FILESYSTEM_DATASET_OBJECT_KEY_DOMAIN);
+        hasher.update(self.dataset_id.as_bytes());
+        hasher.update(key.as_bytes());
+        ObjectKey::from_bytes32(*hasher.finalize().as_bytes())
+    }
+
+    #[must_use]
+    pub(crate) fn inode(self, inode_id: InodeId) -> ObjectKey {
+        self.scope(inode_object_key(inode_id))
+    }
+
+    #[must_use]
+    pub(crate) fn directory(self, inode_id: InodeId) -> ObjectKey {
+        self.scope(directory_object_key(inode_id))
+    }
+
+    #[must_use]
+    pub(crate) fn content(self, inode_id: InodeId, data_version: u64) -> ObjectKey {
+        self.scope(content_object_key_for_version(inode_id, data_version))
+    }
+
+    #[must_use]
+    pub(crate) fn content_chunk(
+        self,
+        inode_id: InodeId,
+        data_version: u64,
+        chunk_index: u64,
+    ) -> ObjectKey {
+        self.scope(content_chunk_object_key_for_version(
+            inode_id,
+            data_version,
+            chunk_index,
+        ))
+    }
+
+    #[must_use]
+    pub(crate) fn content_dedup(self, fingerprint: &crate::types::ContentFingerprint) -> ObjectKey {
+        self.scope(content_dedup_object_key(fingerprint))
+    }
+
+    #[must_use]
+    pub(crate) fn content_dedup_refcount(
+        self,
+        fingerprint: &crate::types::ContentFingerprint,
+    ) -> ObjectKey {
+        self.scope(content_dedup_refcount_key(fingerprint))
+    }
+
+    #[must_use]
+    pub(crate) fn root_slot(self, slot: u64) -> ObjectKey {
+        self.scope(root_slot_object_key(slot))
+    }
+
+    #[must_use]
+    pub(crate) fn transaction_superblock(self, transaction_id: u64) -> ObjectKey {
+        self.scope(transaction_superblock_object_key(transaction_id))
+    }
+
+    #[must_use]
+    pub(crate) fn transaction_manifest(self, transaction_id: u64) -> ObjectKey {
+        self.scope(transaction_manifest_object_key(transaction_id))
+    }
+
+    #[must_use]
+    pub(crate) fn transaction_inode(self, transaction_id: u64, inode_id: InodeId) -> ObjectKey {
+        self.scope(transaction_inode_object_key(transaction_id, inode_id))
+    }
+
+    #[must_use]
+    pub(crate) fn transaction_directory(self, transaction_id: u64, inode_id: InodeId) -> ObjectKey {
+        self.scope(transaction_directory_object_key(transaction_id, inode_id))
+    }
+
+    #[must_use]
+    pub(crate) fn transaction_extent_map(
+        self,
+        transaction_id: u64,
+        inode_id: InodeId,
+    ) -> ObjectKey {
+        self.scope(transaction_extent_map_object_key(transaction_id, inode_id))
+    }
+
+    #[must_use]
+    pub(crate) fn transaction_snapshot(self, transaction_id: u64, name: &[u8]) -> ObjectKey {
+        self.scope(transaction_snapshot_catalog_entry_object_key(
+            transaction_id,
+            name,
+        ))
+    }
+
+    #[must_use]
+    pub(crate) fn intent_log_entry(self, entry_id: u64) -> ObjectKey {
+        self.scope(intent_log_entry_object_key(entry_id))
+    }
+
+    #[must_use]
+    pub(crate) fn intent_log_data(self, entry_id: u64) -> ObjectKey {
+        self.scope(intent_log_data_object_key(entry_id))
+    }
+
+    #[must_use]
+    pub(crate) fn intent_log_head(self) -> ObjectKey {
+        self.scope(intent_log_head_object_key())
+    }
+
+    #[must_use]
+    pub(crate) fn space_counters(self) -> ObjectKey {
+        self.scope(space_counters_object_key())
+    }
+
+    #[must_use]
+    pub(crate) fn orphan_index(self) -> ObjectKey {
+        self.scope(orphan_index_object_key())
+    }
+
+    #[must_use]
+    pub(crate) fn feature_flags_roots(self) -> ObjectKey {
+        self.scope(feature_flags_roots_object_key())
+    }
+}
 pub(crate) fn retired_v0390_fixed_superblock_object_key() -> ObjectKey {
     ObjectKey::from_name(RETIRED_V0390_FIXED_SUPERBLOCK_OBJECT_NAME)
 }

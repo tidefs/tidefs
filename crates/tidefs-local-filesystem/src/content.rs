@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::vec;
 
+use tidefs_dataset_lifecycle::DatasetId;
 #[cfg(feature = "data-policy")]
 use tidefs_dedup::{decide_inline_dedup, InlineDedupDecision};
 use tidefs_local_object_store::pool::{PlacementReceipt, PoolStoreMut};
@@ -25,6 +26,7 @@ use crate::encoding::{
 use crate::error::FileSystemError;
 use crate::object_keys::{
     content_chunk_object_key_for_version, content_dedup_object_key, content_object_key_for_version,
+    FilesystemObjectKeyspace,
 };
 use crate::types::*;
 use crate::{ContentChunkObject, ContentChunkRef, ContentLayout, ContentManifestObject, Result};
@@ -35,6 +37,14 @@ use crate::{ContentChunkObject, ContentChunkRef, ContentLayout, ContentManifestO
 /// require current placement authority; only explicit raw-store callers retain
 /// receiptless and same-key historical behavior.
 pub(crate) trait ContentWriteStore {
+    fn keyspace(&self) -> FilesystemObjectKeyspace {
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID)
+    }
+
+    fn physical_key(&self, key: ObjectKey) -> ObjectKey {
+        key
+    }
+
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>>;
 
     fn get_with_receipt_generation(
@@ -50,6 +60,64 @@ pub(crate) trait ContentWriteStore {
 
     fn raw_store(&self) -> &LocalObjectStore;
     fn raw_store_mut(&mut self) -> &mut LocalObjectStore;
+}
+
+/// Dataset-scoped view of content I/O.
+///
+/// Content encodings retain logical per-filesystem keys (including dedup
+/// redirect targets), while every object-store operation is translated into
+/// the mounted dataset's physical key domain at this one boundary.
+pub(crate) struct FilesystemContentWriteStore<S> {
+    inner: S,
+    keyspace: FilesystemObjectKeyspace,
+}
+
+impl<S> FilesystemContentWriteStore<S> {
+    pub(crate) fn new(inner: S, dataset_id: DatasetId) -> Self {
+        Self {
+            inner,
+            keyspace: FilesystemObjectKeyspace::new(dataset_id),
+        }
+    }
+}
+
+impl<S: ContentWriteStore> ContentWriteStore for FilesystemContentWriteStore<S> {
+    fn keyspace(&self) -> FilesystemObjectKeyspace {
+        self.keyspace
+    }
+
+    fn physical_key(&self, key: ObjectKey) -> ObjectKey {
+        self.keyspace.scope(key)
+    }
+
+    fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        self.inner.get(self.physical_key(key))
+    }
+
+    fn get_with_receipt_generation(
+        &self,
+        key: ObjectKey,
+    ) -> Result<Option<(Vec<u8>, Option<u64>)>> {
+        self.inner
+            .get_with_receipt_generation(self.physical_key(key))
+    }
+
+    fn put_with_receipt(&mut self, key: ObjectKey, payload: &[u8]) -> Result<PlacementReceipt> {
+        self.inner
+            .put_with_receipt(self.keyspace.scope(key), payload)
+    }
+
+    fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.inner.put(self.keyspace.scope(key), payload)
+    }
+
+    fn raw_store(&self) -> &LocalObjectStore {
+        self.inner.raw_store()
+    }
+
+    fn raw_store_mut(&mut self) -> &mut LocalObjectStore {
+        self.inner.raw_store_mut()
+    }
 }
 
 impl<'a> ContentWriteStore for PoolStoreMut<'a> {
@@ -205,6 +273,24 @@ pub(crate) fn read_mounted_content_scrub_block(
     target: MountedContentScrubReadTarget<'_>,
     pool: Option<&Pool>,
 ) -> Result<MountedContentScrubRead> {
+    read_mounted_content_scrub_block_in_keyspace(
+        store,
+        inode_id,
+        record,
+        target,
+        pool,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+pub(crate) fn read_mounted_content_scrub_block_in_keyspace(
+    store: &LocalObjectStore,
+    inode_id: InodeId,
+    record: &InodeRecord,
+    target: MountedContentScrubReadTarget<'_>,
+    pool: Option<&Pool>,
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<MountedContentScrubRead> {
     if record.inode_id != inode_id {
         return Err(FileSystemError::CorruptState {
             reason: "mounted content scrub authority inode record mismatch",
@@ -213,7 +299,7 @@ pub(crate) fn read_mounted_content_scrub_block(
 
     match target {
         MountedContentScrubReadTarget::Inline => {
-            read_mounted_inline_content_scrub_block(store, inode_id, record, pool)
+            read_mounted_inline_content_scrub_block(store, inode_id, record, pool, keyspace)
         }
         MountedContentScrubReadTarget::ContentChunk(chunk_ref) => {
             if chunk_ref.data_version != record.data_version {
@@ -221,7 +307,7 @@ pub(crate) fn read_mounted_content_scrub_block(
                     reason: "mounted content scrub authority stale chunk data version",
                 });
             }
-            read_mounted_chunk_content_scrub_block(store, inode_id, chunk_ref, pool)
+            read_mounted_chunk_content_scrub_block(store, inode_id, chunk_ref, pool, keyspace)
         }
     }
 }
@@ -231,8 +317,9 @@ fn read_mounted_inline_content_scrub_block(
     inode_id: InodeId,
     record: &InodeRecord,
     pool: Option<&Pool>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<MountedContentScrubRead> {
-    let key = content_object_key_for_version(inode_id, record.data_version);
+    let key = keyspace.content(inode_id, record.data_version);
     let (encoded, receipt) = read_mounted_scrub_object_bytes(
         store,
         pool,
@@ -289,6 +376,7 @@ fn read_mounted_chunk_content_scrub_block(
     inode_id: InodeId,
     chunk_ref: &ContentChunkRef,
     pool: Option<&Pool>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<MountedContentScrubRead> {
     if chunk_ref.is_hole() {
         return Ok(MountedContentScrubRead {
@@ -311,11 +399,7 @@ fn read_mounted_chunk_content_scrub_block(
         });
     }
 
-    let key = content_chunk_object_key_for_version(
-        inode_id,
-        chunk_ref.data_version,
-        chunk_ref.chunk_index,
-    );
+    let key = keyspace.content_chunk(inode_id, chunk_ref.data_version, chunk_ref.chunk_index);
     let expected_generation = chunk_ref.placement_receipt_generation;
     if pool.is_some() && expected_generation == 0 {
         return Err(FileSystemError::ReceiptAuthorityMissing {
@@ -351,13 +435,13 @@ fn read_mounted_chunk_content_scrub_block(
         Some(pool) => {
             try_validate_chunk_bytes_with_get(inode_id, chunk_ref, &encoded, |canonical_key| {
                 Ok(pool
-                    .get_with_current_receipt(DeviceIoClass::Data, canonical_key)?
+                    .get_with_current_receipt(DeviceIoClass::Data, keyspace.scope(canonical_key))?
                     .map(|(canonical, _receipt)| canonical))
             })?
         }
         None => {
             try_validate_chunk_bytes_with_get(inode_id, chunk_ref, &encoded, |canonical_key| {
-                Ok(store.get(canonical_key)?)
+                Ok(store.get(keyspace.scope(canonical_key))?)
             })?
         }
     };
@@ -484,13 +568,38 @@ pub(crate) fn read_content_from_store(
     }
 }
 
+pub(crate) fn read_content_from_write_store<S: ContentWriteStore + ?Sized>(
+    store: &S,
+    inode_id: InodeId,
+    record: &InodeRecord,
+) -> Result<Vec<u8>> {
+    let layout = read_content_layout_from_write_store(store, inode_id, record)?;
+    match &layout {
+        ContentLayout::Inline(content) => Ok(content.bytes.clone()),
+        ContentLayout::Chunked(manifest) => {
+            read_chunked_content_with(manifest, record.size, |chunk_inode_id, chunk_ref| {
+                read_content_chunk_from_write_store(store, chunk_inode_id, chunk_ref)
+            })
+        }
+    }
+}
+
 pub(crate) struct MountedContentReadAuthority<'a> {
     pool: &'a Pool,
+    keyspace: FilesystemObjectKeyspace,
 }
 
 impl<'a> MountedContentReadAuthority<'a> {
+    #[cfg(any(test, feature = "replication-io"))]
     pub(crate) fn new(pool: &'a Pool) -> Self {
-        Self { pool }
+        Self::for_dataset(pool, tidefs_pool_runtime::ROOT_DATASET_ID)
+    }
+
+    pub(crate) fn for_dataset(pool: &'a Pool, dataset_id: DatasetId) -> Self {
+        Self {
+            pool,
+            keyspace: FilesystemObjectKeyspace::new(dataset_id),
+        }
     }
 
     pub(crate) fn read_current_object(
@@ -499,7 +608,7 @@ impl<'a> MountedContentReadAuthority<'a> {
     ) -> Result<Option<(Vec<u8>, PlacementReceipt)>> {
         Ok(self
             .pool
-            .get_with_current_receipt(DeviceIoClass::Data, key)?)
+            .get_with_current_receipt(DeviceIoClass::Data, self.keyspace.scope(key))?)
     }
 
     pub(crate) fn read_layout(
@@ -507,7 +616,7 @@ impl<'a> MountedContentReadAuthority<'a> {
         inode_id: InodeId,
         record: &InodeRecord,
     ) -> Result<ContentLayout> {
-        read_content_layout_from_pool(self.pool, inode_id, record)
+        read_content_layout_from_pool_in_keyspace(self.pool, inode_id, record, self.keyspace)
     }
 
     pub(crate) fn read_all(&self, inode_id: InodeId, record: &InodeRecord) -> Result<Vec<u8>> {
@@ -593,6 +702,16 @@ pub(crate) fn read_content_layout_from_store(
     read_content_layout_with_get(|key| Ok(store.get(key)?), inode_id, record)
 }
 
+#[cfg(feature = "distributed-repair")]
+pub(crate) fn read_content_layout_from_store_in_keyspace(
+    store: &LocalObjectStore,
+    inode_id: InodeId,
+    record: &InodeRecord,
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<ContentLayout> {
+    read_content_layout_with_get(|key| Ok(store.get(keyspace.scope(key))?), inode_id, record)
+}
+
 fn read_content_layout_from_write_store<S: ContentWriteStore + ?Sized>(
     store: &S,
     inode_id: InodeId,
@@ -601,15 +720,16 @@ fn read_content_layout_from_write_store<S: ContentWriteStore + ?Sized>(
     read_content_layout_with_get(|key| store.get(key), inode_id, record)
 }
 
-pub(crate) fn read_content_layout_from_pool(
+fn read_content_layout_from_pool_in_keyspace(
     pool: &Pool,
     inode_id: InodeId,
     record: &InodeRecord,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<ContentLayout> {
     read_content_layout_with_get(
         |key| {
             Ok(pool
-                .get_with_current_receipt(DeviceIoClass::Data, key)?
+                .get_with_current_receipt(DeviceIoClass::Data, keyspace.scope(key))?
                 .map(|(bytes, _receipt)| bytes))
         },
         inode_id,
@@ -909,7 +1029,7 @@ fn try_self_heal_chunk_from_write_store<S: ContentWriteStore + ?Sized>(
 ) -> Result<Option<ContentChunkObject>> {
     for location in store
         .raw_store()
-        .version_locations_of(key)
+        .version_locations_of(store.physical_key(key))
         .into_iter()
         .rev()
     {
@@ -1156,11 +1276,16 @@ fn encode_new_canonical_chunk<S: ContentWriteStore>(
     #[cfg(feature = "quorum-write")]
     if replicate_to_quorum {
         if let Some(qs) = quorum_store.as_deref_mut() {
-            let _ = qs.quorum_put(canonical_key, &encoded);
+            let _ = qs.quorum_put(store.physical_key(canonical_key), &encoded);
         }
     }
     dedup_index.insert(fingerprint, canonical_key);
-    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
+    let keyspace = store.keyspace();
+    crate::dedup_refcount::DedupRefCount::init_in_keyspace(
+        store.raw_store_mut(),
+        &fingerprint,
+        keyspace,
+    )?;
     Ok(crate::encoding::encode_dedup_redirect(canonical_key))
 }
 
@@ -1240,18 +1365,22 @@ fn encode_chunk_with_dedup<S: ContentWriteStore>(
         match decision {
             InlineDedupDecision::SessionHit { canonical } => {
                 _dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                let _ = crate::dedup_refcount::DedupRefCount::increment(
+                let keyspace = _store.keyspace();
+                let _ = crate::dedup_refcount::DedupRefCount::increment_in_keyspace(
                     _store.raw_store_mut(),
                     &fingerprint,
+                    keyspace,
                 );
                 Ok(crate::encoding::encode_dedup_redirect(canonical))
             }
             InlineDedupDecision::CanonicalStoreHit { canonical } => {
                 _dedup_index.insert(fingerprint, canonical);
                 _dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                let _ = crate::dedup_refcount::DedupRefCount::increment(
+                let keyspace = _store.keyspace();
+                let _ = crate::dedup_refcount::DedupRefCount::increment_in_keyspace(
                     _store.raw_store_mut(),
                     &fingerprint,
+                    keyspace,
                 );
                 Ok(crate::encoding::encode_dedup_redirect(canonical))
             }
@@ -1330,7 +1459,7 @@ pub(crate) fn write_chunked_content<S: ContentWriteStore>(
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
         #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
-            let _ = qs.quorum_put(per_inode_key, &encoded);
+            let _ = qs.quorum_put(store.physical_key(per_inode_key), &encoded);
         }
         chunks.push(ContentChunkRef {
             chunk_index,
@@ -1446,7 +1575,7 @@ fn write_same_size_sparse_overlay<S: ContentWriteStore>(
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
         #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
-            let _ = qs.quorum_put(per_inode_key, &encoded);
+            let _ = qs.quorum_put(store.physical_key(per_inode_key), &encoded);
         }
         chunks_by_index.insert(
             chunk_index,
@@ -1472,7 +1601,7 @@ fn write_same_size_sparse_overlay<S: ContentWriteStore>(
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
-        let _ = qs.quorum_put(manifest_key, &manifest_encoded);
+        let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
     Ok(())
 }
@@ -1559,7 +1688,7 @@ fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
         #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
-            let _ = qs.quorum_put(per_inode_key, &encoded);
+            let _ = qs.quorum_put(store.physical_key(per_inode_key), &encoded);
         }
         chunks_by_index.insert(
             old_ref.chunk_index,
@@ -1630,7 +1759,7 @@ fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
         #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
-            let _ = qs.quorum_put(per_inode_key, &encoded);
+            let _ = qs.quorum_put(store.physical_key(per_inode_key), &encoded);
         }
         chunks_by_index.insert(
             chunk_index,
@@ -1656,7 +1785,7 @@ fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
-        let _ = qs.quorum_put(manifest_key, &manifest_encoded);
+        let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
     Ok(())
 }
@@ -1730,7 +1859,7 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
             let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
             #[cfg(feature = "quorum-write")]
             if let Some(ref mut qs) = quorum_store {
-                let _ = qs.quorum_put(per_inode_key, &encoded);
+                let _ = qs.quorum_put(store.physical_key(per_inode_key), &encoded);
             }
             chunks_by_index.insert(
                 chunk_index,
@@ -1771,7 +1900,7 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
-        let _ = qs.quorum_put(manifest_key, &manifest_encoded);
+        let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
     Ok(())
 }
@@ -1830,7 +1959,7 @@ fn write_sparse_size_change<S: ContentWriteStore>(
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
         #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
-            let _ = qs.quorum_put(per_inode_key, &encoded);
+            let _ = qs.quorum_put(store.physical_key(per_inode_key), &encoded);
         }
         chunks.push(ContentChunkRef {
             chunk_index: old_ref.chunk_index,
@@ -1853,7 +1982,7 @@ fn write_sparse_size_change<S: ContentWriteStore>(
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
-        let _ = qs.quorum_put(manifest_key, &manifest_encoded);
+        let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
     Ok(())
 }
@@ -1933,7 +2062,7 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
         #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
-            let _ = qs.quorum_put(per_inode_key, &encoded);
+            let _ = qs.quorum_put(store.physical_key(per_inode_key), &encoded);
         }
         chunks_by_index.insert(
             old_ref.chunk_index,
@@ -1999,7 +2128,7 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
             let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
             #[cfg(feature = "quorum-write")]
             if let Some(ref mut qs) = quorum_store {
-                let _ = qs.quorum_put(per_inode_key, &encoded);
+                let _ = qs.quorum_put(store.physical_key(per_inode_key), &encoded);
             }
             chunks_by_index.insert(
                 chunk_index,
@@ -2026,7 +2155,7 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
-        let _ = qs.quorum_put(manifest_key, &manifest_encoded);
+        let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
     Ok(())
 }
@@ -2189,7 +2318,7 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
         let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
         #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
-            let _ = qs.quorum_put(per_inode_key, &encoded);
+            let _ = qs.quorum_put(store.physical_key(per_inode_key), &encoded);
         }
         chunks.push(ContentChunkRef {
             chunk_index,
@@ -2211,7 +2340,7 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
-        let _ = qs.quorum_put(manifest_key, &manifest_encoded);
+        let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
     Ok(())
 }
@@ -2354,7 +2483,7 @@ pub(crate) fn punch_hole_content<S: ContentWriteStore>(
             let chunk_receipt = store.put_with_receipt(key, &encoded)?;
             #[cfg(feature = "quorum-write")]
             if let Some(ref mut qs) = quorum_store {
-                let _ = qs.quorum_put(key, &encoded);
+                let _ = qs.quorum_put(store.physical_key(key), &encoded);
             }
             chunks.push(ContentChunkRef {
                 chunk_index,
@@ -2382,7 +2511,7 @@ pub(crate) fn punch_hole_content<S: ContentWriteStore>(
     let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
-        let _ = qs.quorum_put(manifest_key, &manifest_encoded);
+        let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
     Ok(())
 }
@@ -2908,9 +3037,11 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
                     None => false,
                 };
                 if canonical_exists {
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(
+                    let keyspace = store.keyspace();
+                    let _ = crate::dedup_refcount::DedupRefCount::increment_in_keyspace(
                         store.raw_store_mut(),
                         &fingerprint,
+                        keyspace,
                     );
                 } else {
                     let canonical_bytes = encode_content_chunk(
@@ -2920,9 +3051,11 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
                         compression_policy,
                     )?;
                     store.put(canonical_key, &canonical_bytes)?;
-                    crate::dedup_refcount::DedupRefCount::init(
+                    let keyspace = store.keyspace();
+                    crate::dedup_refcount::DedupRefCount::init_in_keyspace(
                         store.raw_store_mut(),
                         &fingerprint,
+                        keyspace,
                     )?;
                 }
 

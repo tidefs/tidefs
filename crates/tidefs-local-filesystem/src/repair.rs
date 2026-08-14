@@ -391,7 +391,9 @@ use tidefs_local_object_store::LocalObjectStore;
 use tidefs_types_vfs_core::InodeId;
 
 #[cfg(feature = "distributed-repair")]
-use crate::content::read_content_layout_from_store;
+use crate::content::read_content_layout_from_store_in_keyspace;
+#[cfg(feature = "distributed-repair")]
+use crate::object_keys::FilesystemObjectKeyspace;
 #[cfg(feature = "distributed-repair")]
 use crate::records::ContentLayout;
 #[cfg(feature = "distributed-repair")]
@@ -429,16 +431,24 @@ pub(crate) fn apply_one_repair(
     store: &mut LocalObjectStore,
     content_layout_cache: &mut BTreeMap<InodeId, ContentLayout>,
 ) -> RepairOutcome {
-    apply_one_repair_with_replacement_evidence(entry, state, store, content_layout_cache, None)
+    apply_one_repair_with_replacement_evidence_in_keyspace(
+        entry,
+        state,
+        store,
+        content_layout_cache,
+        None,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
 }
 
 #[cfg(feature = "distributed-repair")]
-pub(crate) fn apply_one_repair_with_replacement_evidence(
+pub(crate) fn apply_one_repair_with_replacement_evidence_in_keyspace(
     entry: &RepairEntry,
     state: &mut FileSystemState,
     store: &mut LocalObjectStore,
     content_layout_cache: &mut BTreeMap<InodeId, ContentLayout>,
     replacement_receipt: Option<RepairReplacementReceiptEvidence>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> RepairOutcome {
     let inode_id = InodeId::new(entry.block_id.inode_id);
 
@@ -449,10 +459,16 @@ pub(crate) fn apply_one_repair_with_replacement_evidence(
             state,
             store,
             replacement_receipt,
+            keyspace,
         ),
-        crate::scrub::RepairStrategy::Truncate => {
-            apply_truncate(inode_id, entry, state, store, content_layout_cache)
-        }
+        crate::scrub::RepairStrategy::Truncate => apply_truncate(
+            inode_id,
+            entry,
+            state,
+            store,
+            content_layout_cache,
+            keyspace,
+        ),
         crate::scrub::RepairStrategy::MarkCorrupt => {
             state.corrupted_inodes.insert(inode_id);
             RepairOutcome::MarkedCorrupt
@@ -467,6 +483,7 @@ fn apply_truncate(
     state: &mut FileSystemState,
     store: &mut LocalObjectStore,
     content_layout_cache: &mut BTreeMap<InodeId, ContentLayout>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> RepairOutcome {
     let corrupt_index = match &entry.block_id.kind {
         crate::scrub::ScrubBlockKind::ContentChunk { chunk_index } => *chunk_index,
@@ -480,7 +497,8 @@ fn apply_truncate(
     };
 
     // Read content layout from store
-    let layout = match read_content_layout_from_store(store, inode_id, &inode) {
+    let layout = match read_content_layout_from_store_in_keyspace(store, inode_id, &inode, keyspace)
+    {
         Ok(layout) => {
             content_layout_cache.insert(inode_id, layout.clone());
             layout
@@ -529,8 +547,9 @@ fn apply_reconstruct(
     state: &mut FileSystemState,
     store: &mut LocalObjectStore,
     replacement_receipt: Option<RepairReplacementReceiptEvidence>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> RepairOutcome {
-    let content_key = crate::object_keys::content_object_key_for_version(inode_id, data_version);
+    let content_key = keyspace.content(inode_id, data_version);
     let raw = match store.get(content_key) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {

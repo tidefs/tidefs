@@ -73,6 +73,7 @@ pub(crate) fn persist_state_with_runtime_at_transaction(
     transaction_id: u64,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RootCommitRecord> {
+    let source_dataset_id = state.dataset_id();
     let signed = prepare_state_with_pool_at_transaction(
         runtime.pool_mut(),
         state,
@@ -86,22 +87,24 @@ pub(crate) fn persist_state_with_runtime_at_transaction(
         .values()
         .filter(|record| crate::snapshot::snapshot_record_retains_data(record))
     {
-        let dataset_id = crate::snapshot::snapshot_record_dataset_id(record);
-        let root = crate::snapshot::snapshot_record_typed_root(record)?;
-        if runtime.dataset_root(dataset_id).is_some() {
-            let stored = runtime.load_snapshot_root(dataset_id)?;
+        let snapshot_dataset_id =
+            crate::snapshot::snapshot_record_dataset_id_for_dataset(record, source_dataset_id);
+        let root =
+            crate::snapshot::snapshot_record_typed_root_for_dataset(record, source_dataset_id)?;
+        if runtime.dataset_root(snapshot_dataset_id).is_some() {
+            let stored = runtime.load_snapshot_root(snapshot_dataset_id)?;
             if stored != root {
                 return Err(FileSystemError::CorruptState {
                     reason: "canonical Pool snapshot root differs from filesystem snapshot state",
                 });
             }
         } else {
-            snapshot_roots.push((dataset_id, root.snapshot_generation, root.encode()));
+            snapshot_roots.push((snapshot_dataset_id, root.snapshot_generation, root.encode()));
         }
     }
     let mut updates = Vec::with_capacity(snapshot_roots.len().saturating_add(1));
     updates.push(DatasetRootUpdate {
-        dataset_id: tidefs_pool_runtime::ROOT_DATASET_ID,
+        dataset_id: source_dataset_id,
         kind: DatasetRootKind::Filesystem,
         semantic_generation: signed.generation,
         bytes: &bytes,
@@ -132,12 +135,14 @@ pub(crate) fn prepare_state_with_pool_at_transaction(
             reason: "mounted transaction id precedes filesystem state generation",
         });
     }
+    let keyspace = FilesystemObjectKeyspace::new(state.dataset_id());
     let content_entries = pool_content_manifest_entries_for_state(pool, state)?;
     let root = persist_transaction_objects_with_precomputed_content(
         pool.raw_primary_store_mut(),
         state,
         transaction_id,
         &content_entries,
+        keyspace,
     )?;
     sync_pool_after_commit_boundary(pool, FilesystemCommitBoundary::TransactionObjectsWritten)
         .map_err(FileSystemError::from)?;
@@ -178,6 +183,7 @@ pub(crate) fn persist_state_with_pool_at_transaction_until_boundary(
         state,
         transaction_id,
         &content_entries,
+        FilesystemObjectKeyspace::new(state.dataset_id()),
     )?;
     if stop_after == Some(FilesystemCommitBoundary::TransactionObjectsWritten) {
         return Ok(FilesystemCommitBoundary::TransactionObjectsWritten);
@@ -335,8 +341,13 @@ pub(crate) fn ensure_versioned_content_object(
 /// Data-only durability paths call this after draining buffered writes. They
 /// must not reconstruct receipt-backed content in the raw primary metadata
 /// store when the Pool already owns the current logical objects.
-pub(crate) fn validate_versioned_content_with_pool(pool: &Pool, inode: &InodeRecord) -> Result<()> {
-    let _ = MountedContentReadAuthority::new(pool).read_all(inode.inode_id, inode)?;
+pub(crate) fn validate_versioned_content_with_pool_in_keyspace(
+    pool: &Pool,
+    inode: &InodeRecord,
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<()> {
+    let _ = MountedContentReadAuthority::for_dataset(pool, keyspace.dataset_id())
+        .read_all(inode.inode_id, inode)?;
     Ok(())
 }
 
@@ -417,17 +428,19 @@ pub(crate) fn transaction_manifest_entries_for_content(
 
 /// Build mounted committed-root entries from strict, current Pool reads.
 /// Receiptless raw-primary bytes cannot satisfy this boundary.
-pub(crate) fn transaction_manifest_entries_for_pool_content(
+pub(crate) fn transaction_manifest_entries_for_pool_content_in_keyspace(
     pool: &Pool,
     inode: &InodeRecord,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<Vec<TransactionManifestEntry>> {
     if inode.size == 0 {
         return Ok(Vec::new());
     }
 
-    let authority = MountedContentReadAuthority::new(pool);
-    let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
-    let (content_bytes, _receipt) = authority.read_current_object(content_key)?.ok_or(
+    let authority = MountedContentReadAuthority::for_dataset(pool, keyspace.dataset_id());
+    let logical_content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+    let content_key = keyspace.scope(logical_content_key);
+    let (content_bytes, _receipt) = authority.read_current_object(logical_content_key)?.ok_or(
         FileSystemError::ReceiptAuthorityMissing {
             object_key: content_key,
             expected_generation: 0,
@@ -449,7 +462,7 @@ pub(crate) fn transaction_manifest_entries_for_pool_content(
             let _ = authority.read_chunk(manifest.inode_id, chunk_ref)?;
             entries.push(TransactionManifestEntry {
                 role: TransactionManifestObjectRole::VersionedContentChunk,
-                object_key: content_chunk_object_key_for_version(
+                object_key: keyspace.content_chunk(
                     manifest.inode_id,
                     chunk_ref.data_version,
                     chunk_ref.chunk_index,
@@ -465,11 +478,12 @@ fn pool_content_manifest_entries_for_state(
     pool: &Pool,
     state: &FileSystemState,
 ) -> Result<BTreeMap<InodeId, Vec<TransactionManifestEntry>>> {
+    let keyspace = FilesystemObjectKeyspace::new(state.dataset_id());
     let mut entries = BTreeMap::new();
     for inode in state.inodes.values().filter(|inode| inode.is_file_like()) {
         entries.insert(
             inode.inode_id,
-            transaction_manifest_entries_for_pool_content(pool, inode)?,
+            transaction_manifest_entries_for_pool_content_in_keyspace(pool, inode, keyspace)?,
         );
     }
     Ok(entries)
@@ -493,7 +507,13 @@ pub(crate) fn persist_transaction_objects(
     state: &FileSystemState,
     transaction_id: u64,
 ) -> Result<RootCommitRecord> {
-    persist_transaction_objects_impl(store, state, transaction_id, None)
+    persist_transaction_objects_impl(
+        store,
+        state,
+        transaction_id,
+        None,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
 }
 
 fn persist_transaction_objects_with_precomputed_content(
@@ -501,8 +521,15 @@ fn persist_transaction_objects_with_precomputed_content(
     state: &FileSystemState,
     transaction_id: u64,
     content_entries: &BTreeMap<InodeId, Vec<TransactionManifestEntry>>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<RootCommitRecord> {
-    persist_transaction_objects_impl(store, state, transaction_id, Some(content_entries))
+    persist_transaction_objects_impl(
+        store,
+        state,
+        transaction_id,
+        Some(content_entries),
+        keyspace,
+    )
 }
 
 fn persist_transaction_objects_impl(
@@ -510,6 +537,7 @@ fn persist_transaction_objects_impl(
     state: &FileSystemState,
     transaction_id: u64,
     precomputed_content_entries: Option<&BTreeMap<InodeId, Vec<TransactionManifestEntry>>>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<RootCommitRecord> {
     let mut manifest_entries = Vec::new();
     for inode in state.inodes.values() {
@@ -536,7 +564,7 @@ fn persist_transaction_objects_impl(
         }
 
         if needs_inode_write {
-            let inode_key = transaction_inode_object_key(transaction_id, inode.inode_id);
+            let inode_key = keyspace.transaction_inode(transaction_id, inode.inode_id);
             let inode_bytes = try_encode_inode(inode)?;
             store.put(inode_key, &inode_bytes)?;
             manifest_entries.push(TransactionManifestEntry {
@@ -546,7 +574,7 @@ fn persist_transaction_objects_impl(
             });
         } else {
             let last_tx = state.last_inode_write_tx[&inode.inode_id];
-            let last_key = transaction_inode_object_key(last_tx, inode.inode_id);
+            let last_key = keyspace.transaction_inode(last_tx, inode.inode_id);
             let current_bytes = try_encode_inode(inode)?;
             let existing_bytes = store.get(last_key)?.ok_or(FileSystemError::CorruptState {
                 reason: "clean inode reference points to missing object",
@@ -562,7 +590,7 @@ fn persist_transaction_objects_impl(
                         store, inode, false,
                     )?);
                 }
-                let inode_key = transaction_inode_object_key(transaction_id, inode.inode_id);
+                let inode_key = keyspace.transaction_inode(transaction_id, inode.inode_id);
                 store.put(inode_key, &current_bytes)?;
                 manifest_entries.push(TransactionManifestEntry {
                     role: TransactionManifestObjectRole::TransactionInode,
@@ -589,8 +617,7 @@ fn persist_transaction_objects_impl(
                         reason: "directory inode has no directory table",
                     },
                 )?;
-                let directory_key =
-                    transaction_directory_object_key(transaction_id, inode.inode_id);
+                let directory_key = keyspace.transaction_directory(transaction_id, inode.inode_id);
                 let directory_bytes = encode_directory(inode, directory);
                 store.put(directory_key, &directory_bytes)?;
                 manifest_entries.push(TransactionManifestEntry {
@@ -600,7 +627,7 @@ fn persist_transaction_objects_impl(
                 });
             } else {
                 let last_tx = state.last_dir_write_tx[&inode.inode_id];
-                let last_key = transaction_directory_object_key(last_tx, inode.inode_id);
+                let last_key = keyspace.transaction_directory(last_tx, inode.inode_id);
                 let directory = state.directories.get(&inode.inode_id).ok_or(
                     FileSystemError::CorruptState {
                         reason: "directory inode has no directory table",
@@ -612,7 +639,7 @@ fn persist_transaction_objects_impl(
                 })?;
                 if current_bytes != existing_bytes {
                     let directory_key =
-                        transaction_directory_object_key(transaction_id, inode.inode_id);
+                        keyspace.transaction_directory(transaction_id, inode.inode_id);
                     store.put(directory_key, &current_bytes)?;
                     manifest_entries.push(TransactionManifestEntry {
                         role: TransactionManifestObjectRole::TransactionDirectory,
@@ -646,7 +673,7 @@ fn persist_transaction_objects_impl(
             continue;
         }
         if let Some(extent_map) = extent_maps.get(inode_id) {
-            let ext_key = transaction_extent_map_object_key(transaction_id, *inode_id);
+            let ext_key = keyspace.transaction_extent_map(transaction_id, *inode_id);
             let mut ext_bytes = Vec::new();
             extent_map
                 .serialize(&mut ext_bytes)
@@ -672,7 +699,7 @@ fn persist_transaction_objects_impl(
     };
     let superblock_bytes = encode_superblock(&superblock);
     let superblock_checksum = checksum64(&superblock_bytes);
-    let superblock_key = transaction_superblock_object_key(transaction_id);
+    let superblock_key = keyspace.transaction_superblock(transaction_id);
     store.put(superblock_key, &superblock_bytes)?;
     manifest_entries.push(TransactionManifestEntry {
         role: TransactionManifestObjectRole::TransactionSuperblock,
@@ -682,8 +709,7 @@ fn persist_transaction_objects_impl(
 
     // Write snapshot catalog entries as separate transaction objects.
     for snapshot in state.snapshots.values() {
-        let snap_key =
-            transaction_snapshot_catalog_entry_object_key(transaction_id, &snapshot.name);
+        let snap_key = keyspace.transaction_snapshot(transaction_id, &snapshot.name);
         let snap_bytes = encode_snapshot_record(snapshot);
         store.put(snap_key, &snap_bytes)?;
         manifest_entries.push(TransactionManifestEntry {
@@ -702,7 +728,7 @@ fn persist_transaction_objects_impl(
     let manifest_bytes = encode_transaction_manifest(&manifest);
     let manifest_checksum = checksum64(&manifest_bytes);
     store.put(
-        transaction_manifest_object_key(transaction_id),
+        keyspace.transaction_manifest(transaction_id),
         &manifest_bytes,
     )?;
 
@@ -729,7 +755,7 @@ pub(crate) fn publish_root_commit(
 ) -> Result<()> {
     let signed = sign_root_commit(root, root_authentication_key)?;
     store.put(
-        root_slot_object_key(signed.slot),
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID).root_slot(signed.slot),
         &encode_root_commit(&signed),
     )?;
     Ok(())

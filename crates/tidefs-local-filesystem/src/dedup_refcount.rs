@@ -70,7 +70,7 @@
 
 use tidefs_local_object_store::LocalObjectStore;
 
-use crate::object_keys;
+use crate::object_keys::FilesystemObjectKeyspace;
 use crate::types::ContentFingerprint;
 
 /// Persistent reference-count authority for canonical dedup objects.
@@ -110,8 +110,21 @@ impl DedupRefCountCapacityEvidence {
 
 impl DedupRefCount {
     /// Read the current refcount. Returns 0 when no refcount entry exists.
+    #[cfg(test)]
     pub fn read(store: &LocalObjectStore, fingerprint: &ContentFingerprint) -> crate::Result<u64> {
-        let key = object_keys::content_dedup_refcount_key(fingerprint);
+        Self::read_in_keyspace(
+            store,
+            fingerprint,
+            FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+        )
+    }
+
+    pub(crate) fn read_in_keyspace(
+        store: &LocalObjectStore,
+        fingerprint: &ContentFingerprint,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> crate::Result<u64> {
+        let key = keyspace.content_dedup_refcount(fingerprint);
         match store.get(key)? {
             Some(bytes) if bytes.len() >= 8 => {
                 let mut buf = [0u8; 8];
@@ -125,11 +138,24 @@ impl DedupRefCount {
 
     /// Initialize a refcount to 1 — called when a brand-new canonical
     /// dedup object is stored.
+    #[cfg(test)]
     pub fn init(
         store: &mut LocalObjectStore,
         fingerprint: &ContentFingerprint,
     ) -> crate::Result<()> {
-        let key = object_keys::content_dedup_refcount_key(fingerprint);
+        Self::init_in_keyspace(
+            store,
+            fingerprint,
+            FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+        )
+    }
+
+    pub(crate) fn init_in_keyspace(
+        store: &mut LocalObjectStore,
+        fingerprint: &ContentFingerprint,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> crate::Result<()> {
+        let key = keyspace.content_dedup_refcount(fingerprint);
         store.put(key, &1u64.to_le_bytes())?;
         Ok(())
     }
@@ -138,13 +164,26 @@ impl DedupRefCount {
     ///
     /// Called when a new dedup redirect is created that points to this
     /// canonical object.
+    #[cfg(test)]
     pub fn increment(
         store: &mut LocalObjectStore,
         fingerprint: &ContentFingerprint,
     ) -> crate::Result<u64> {
-        let current = Self::read(store, fingerprint)?;
+        Self::increment_in_keyspace(
+            store,
+            fingerprint,
+            FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+        )
+    }
+
+    pub(crate) fn increment_in_keyspace(
+        store: &mut LocalObjectStore,
+        fingerprint: &ContentFingerprint,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> crate::Result<u64> {
+        let current = Self::read_in_keyspace(store, fingerprint, keyspace)?;
         let new_count = current.saturating_add(1);
-        let key = object_keys::content_dedup_refcount_key(fingerprint);
+        let key = keyspace.content_dedup_refcount(fingerprint);
         store.put(key, &new_count.to_le_bytes())?;
         Ok(new_count)
     }
@@ -153,16 +192,29 @@ impl DedupRefCount {
     ///
     /// Refcount decrements are canonical-lifetime evidence only. They do not
     /// publish mounted availability deltas by themselves.
+    #[cfg(test)]
     pub fn decrement_with_capacity_evidence(
         store: &mut LocalObjectStore,
         fingerprint: &ContentFingerprint,
     ) -> crate::Result<DedupRefCountCapacityEvidence> {
-        let current = Self::read(store, fingerprint)?;
+        Self::decrement_with_capacity_evidence_in_keyspace(
+            store,
+            fingerprint,
+            FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+        )
+    }
+
+    pub(crate) fn decrement_with_capacity_evidence_in_keyspace(
+        store: &mut LocalObjectStore,
+        fingerprint: &ContentFingerprint,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> crate::Result<DedupRefCountCapacityEvidence> {
+        let current = Self::read_in_keyspace(store, fingerprint, keyspace)?;
         if current == 0 {
             return Ok(DedupRefCountCapacityEvidence::RefusedNoLiveRefcount);
         }
         let new_count = current.saturating_sub(1);
-        let key = object_keys::content_dedup_refcount_key(fingerprint);
+        let key = keyspace.content_dedup_refcount(fingerprint);
         if new_count == 0 {
             let _ = store.delete(key);
             Ok(DedupRefCountCapacityEvidence::Reclaimable)
@@ -180,6 +232,7 @@ impl DedupRefCount {
     /// delete both the canonical data and refcount objects.
     /// Returns `Ok(false)` when the count is still positive or the
     /// refcount entry does not exist (already reclaimed / never created).
+    #[cfg(test)]
     pub fn decrement(
         store: &mut LocalObjectStore,
         fingerprint: &ContentFingerprint,
@@ -190,6 +243,17 @@ impl DedupRefCount {
         Ok(evidence.canonical_reclaimable())
     }
 
+    pub(crate) fn decrement_in_keyspace(
+        store: &mut LocalObjectStore,
+        fingerprint: &ContentFingerprint,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> crate::Result<bool> {
+        let evidence =
+            Self::decrement_with_capacity_evidence_in_keyspace(store, fingerprint, keyspace)?;
+        debug_assert_eq!(evidence.mounted_availability_delta_bytes(), None);
+        Ok(evidence.canonical_reclaimable())
+    }
+
     /// Delete a canonical dedup object and its refcount entry together.
     /// Call when the refcount has reached zero.
     #[allow(dead_code)] // INTENT: available for direct deletion; reclaim drain uses queue
@@ -197,8 +261,20 @@ impl DedupRefCount {
         store: &mut LocalObjectStore,
         fingerprint: &ContentFingerprint,
     ) -> crate::Result<()> {
-        let data_key = object_keys::content_dedup_object_key(fingerprint);
-        let ref_key = object_keys::content_dedup_refcount_key(fingerprint);
+        Self::delete_canonical_in_keyspace(
+            store,
+            fingerprint,
+            FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+        )
+    }
+
+    pub(crate) fn delete_canonical_in_keyspace(
+        store: &mut LocalObjectStore,
+        fingerprint: &ContentFingerprint,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> crate::Result<()> {
+        let data_key = keyspace.content_dedup(fingerprint);
+        let ref_key = keyspace.content_dedup_refcount(fingerprint);
         let _ = store.delete(data_key);
         let _ = store.delete(ref_key);
         Ok(())

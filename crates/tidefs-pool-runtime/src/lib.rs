@@ -57,6 +57,7 @@ pub enum PoolRuntimeError {
         expected: DatasetRootKind,
         actual: DatasetRootKind,
     },
+    InvalidFilesystem(&'static str),
     InvalidVolume(&'static str),
     InvalidSnapshot(&'static str),
     StaleVolumeHandle(DatasetId),
@@ -85,6 +86,7 @@ impl fmt::Display for PoolRuntimeError {
                 f,
                 "dataset {dataset_id} root type is {actual:?}, expected {expected:?}"
             ),
+            Self::InvalidFilesystem(reason) => write!(f, "invalid filesystem: {reason}"),
             Self::InvalidVolume(reason) => write!(f, "invalid volume: {reason}"),
             Self::InvalidSnapshot(reason) => write!(f, "invalid snapshot: {reason}"),
             Self::StaleVolumeHandle(id) => {
@@ -1145,6 +1147,69 @@ impl PoolRuntime {
             dataset_id: volume.dataset_id,
             reclaim,
         })
+    }
+
+    /// Atomically remove one filesystem catalog entry and its typed root.
+    /// Filesystem-owned transaction/content reclamation remains with the
+    /// filesystem retention walker after canonical reachability is removed.
+    pub fn destroy_filesystem(&mut self, path: &str) -> Result<DatasetId> {
+        self.ensure_publishable()?;
+        if self.pending_metadata.is_some() {
+            return Err(PoolRuntimeError::CorruptRoot(
+                "pending metadata must publish before filesystem destroy",
+            ));
+        }
+        let dataset_id = self.root.catalog.lookup(path)?;
+        if dataset_id == ROOT_DATASET_ID {
+            return Err(PoolRuntimeError::CorruptRoot(
+                "root filesystem cannot be destroyed",
+            ));
+        }
+        let (_, _, dataset_type, _, _, lifecycle_state) = self
+            .root
+            .catalog
+            .get_by_id(&dataset_id)
+            .ok_or(PoolRuntimeError::CorruptRoot(
+                "filesystem catalog lookup lost dataset identity",
+            ))?;
+        if dataset_type != DatasetType::Filesystem || lifecycle_state.to_u8() != 0 {
+            return Err(PoolRuntimeError::InvalidFilesystem(
+                "filesystem destroy target is not an active filesystem",
+            ));
+        }
+        if !self.root.catalog.list_children(path)?.is_empty() {
+            return Err(PoolRuntimeError::InvalidFilesystem(
+                "filesystem has child datasets; destroy them first",
+            ));
+        }
+        for (entry_path, _entry_id, entry_type, _, _, _) in self.root.catalog.list_all() {
+            if entry_type == DatasetType::Snapshot
+                && self.root.catalog.lineage_parent(&entry_path)? == Some(dataset_id)
+            {
+                return Err(PoolRuntimeError::InvalidFilesystem(
+                    "filesystem has snapshots; destroy them first",
+                ));
+            }
+        }
+        let reference = self
+            .root
+            .dataset_roots
+            .get(&dataset_id)
+            .ok_or(PoolRuntimeError::MissingRoot(dataset_id))?;
+        if reference.kind != DatasetRootKind::Filesystem {
+            return Err(PoolRuntimeError::WrongRootType {
+                dataset_id,
+                expected: DatasetRootKind::Filesystem,
+                actual: reference.kind,
+            });
+        }
+
+        let mut next = self.root.clone();
+        next.catalog.destroy(path)?;
+        next.dataset_roots.remove(&dataset_id);
+        next.generation = next_generation(next.generation)?;
+        self.publish_root(next)?;
+        Ok(dataset_id)
     }
 
     /// Open a named volume as a detached dataset handle. The Pool runtime
@@ -3058,6 +3123,129 @@ mod tests {
         );
         assert_eq!(decoded.dataset_roots, root.dataset_roots);
         assert!(decoded.volume_reclaim_cursors.is_empty());
+    }
+
+    #[test]
+    fn filesystem_destroy_atomically_removes_catalog_and_typed_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        owner
+            .create_dataset_with_root(
+                "root",
+                ROOT_DATASET_ID,
+                DatasetType::Filesystem,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+                1,
+                b"root-filesystem",
+            )
+            .unwrap();
+        let named_id = DatasetId::from_bytes([0x45; 16]);
+        owner
+            .create_dataset_with_root(
+                "named",
+                named_id,
+                DatasetType::Filesystem,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+                1,
+                b"named-filesystem",
+            )
+            .unwrap();
+
+        assert_eq!(owner.destroy_filesystem("named").unwrap(), named_id);
+        assert!(!owner.dataset_catalog().contains("named"));
+        assert!(owner.dataset_root(named_id).is_none());
+        assert_eq!(
+            owner
+                .load_dataset_root(ROOT_DATASET_ID, DatasetRootKind::Filesystem)
+                .unwrap(),
+            b"root-filesystem",
+        );
+
+        let owner = reopen(owner);
+        assert!(!owner.dataset_catalog().contains("named"));
+        assert!(owner.dataset_root(named_id).is_none());
+        assert_eq!(
+            owner
+                .load_dataset_root(ROOT_DATASET_ID, DatasetRootKind::Filesystem)
+                .unwrap(),
+            b"root-filesystem",
+        );
+    }
+
+    #[test]
+    fn filesystem_destroy_refuses_children_and_snapshot_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        let parent_id = DatasetId::from_bytes([0x51; 16]);
+        let child_id = DatasetId::from_bytes([0x52; 16]);
+        owner
+            .create_dataset_with_root(
+                "parent",
+                parent_id,
+                DatasetType::Filesystem,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+                1,
+                b"parent-filesystem",
+            )
+            .unwrap();
+        owner
+            .create_dataset_with_root(
+                "parent/child",
+                child_id,
+                DatasetType::Filesystem,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+                1,
+                b"child-filesystem",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            owner.destroy_filesystem("parent"),
+            Err(PoolRuntimeError::InvalidFilesystem(
+                "filesystem has child datasets; destroy them first"
+            ))
+        ));
+        assert!(owner.dataset_root(parent_id).is_some());
+        owner.destroy_filesystem("parent/child").unwrap();
+
+        let source_reference = *owner.dataset_root(parent_id).unwrap();
+        let snapshot_id = DatasetId::from_bytes([0x53; 16]);
+        let snapshot = SnapshotRoot::new(2, source_reference).unwrap();
+        owner
+            .create_dataset_with_root(
+                "parent@before",
+                snapshot_id,
+                DatasetType::Snapshot,
+                Vec::new(),
+                DatasetFlags::READONLY.union(DatasetFlags::CHECKSUMS),
+                SyncGuarantee::Local,
+                snapshot.snapshot_generation,
+                &snapshot.encode(),
+            )
+            .unwrap();
+        owner
+            .dataset_catalog_mut()
+            .unwrap()
+            .set_lineage_parent("parent@before", parent_id)
+            .unwrap();
+        owner.publish_metadata().unwrap();
+
+        assert!(matches!(
+            owner.destroy_filesystem("parent"),
+            Err(PoolRuntimeError::InvalidFilesystem(
+                "filesystem has snapshots; destroy them first"
+            ))
+        ));
+        assert!(owner.dataset_root(parent_id).is_some());
+        assert!(owner.dataset_root(snapshot_id).is_some());
     }
 
     #[test]

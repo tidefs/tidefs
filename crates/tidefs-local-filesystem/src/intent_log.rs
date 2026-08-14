@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+use tidefs_dataset_lifecycle::DatasetId;
 use tidefs_local_object_store::pool::PlacementReceipt;
 use tidefs_local_object_store::{
     DeviceIoClass, IntegrityDigest64, LocalObjectStore, ObjectKey, Pool, StoredObject,
@@ -687,8 +688,11 @@ fn maybe_inject_intent_log_clear_failure_before_retire(store: &LocalObjectStore)
 }
 
 impl IntentLogRawStateAuthority {
-    fn read_head_entry_id(store: &LocalObjectStore) -> Result<u64> {
-        match store.get(intent_log_head_object_key())? {
+    fn read_head_entry_id(
+        store: &LocalObjectStore,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> Result<u64> {
+        match store.get(keyspace.intent_log_head())? {
             Some(ref bytes) if bytes.len() == 8 => {
                 Ok(u64::from_le_bytes(bytes[..8].try_into().map_err(|_| {
                     FileSystemError::CorruptState {
@@ -703,50 +707,75 @@ impl IntentLogRawStateAuthority {
         }
     }
 
-    fn read_entry(store: &LocalObjectStore, entry_id: u64) -> Result<Option<IntentLogEntry>> {
+    fn read_entry(
+        store: &LocalObjectStore,
+        entry_id: u64,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> Result<Option<IntentLogEntry>> {
         store
-            .get(intent_log_entry_object_key(entry_id))?
+            .get(keyspace.intent_log_entry(entry_id))?
             .map(|bytes| decode_intent_log_entry(&bytes))
             .transpose()
     }
 
-    fn write_entry(store: &mut LocalObjectStore, entry: &IntentLogEntry) -> Result<()> {
+    fn write_entry(
+        store: &mut LocalObjectStore,
+        entry: &IntentLogEntry,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> Result<()> {
         let bytes = try_encode_intent_log_entry(entry)?;
-        store.put(intent_log_entry_object_key(entry.entry_id), &bytes)?;
+        store.put(keyspace.intent_log_entry(entry.entry_id), &bytes)?;
         Ok(())
     }
 
-    fn write_head_entry_id(store: &mut LocalObjectStore, next_entry_id: u64) -> Result<()> {
+    fn write_head_entry_id(
+        store: &mut LocalObjectStore,
+        next_entry_id: u64,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> Result<()> {
         let bytes = next_entry_id.to_le_bytes();
-        store.put(intent_log_head_object_key(), &bytes)?;
+        store.put(keyspace.intent_log_head(), &bytes)?;
         Ok(())
     }
 
-    fn delete_entry(store: &mut LocalObjectStore, entry_id: u64) -> Result<()> {
-        store.delete(intent_log_entry_object_key(entry_id))?;
+    fn delete_entry(
+        store: &mut LocalObjectStore,
+        entry_id: u64,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> Result<()> {
+        store.delete(keyspace.intent_log_entry(entry_id))?;
         Ok(())
     }
 
-    fn read_data_payload(store: &LocalObjectStore, entry_id: u64) -> Result<Option<Vec<u8>>> {
-        Ok(store.get(intent_log_data_object_key(entry_id))?)
+    fn read_data_payload(
+        store: &LocalObjectStore,
+        entry_id: u64,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(store.get(keyspace.intent_log_data(entry_id))?)
     }
 
     fn write_data_payload(
         store: &mut LocalObjectStore,
         entry_id: u64,
         payload: &[u8],
+        keyspace: FilesystemObjectKeyspace,
     ) -> Result<()> {
-        store.put(intent_log_data_object_key(entry_id), payload)?;
+        store.put(keyspace.intent_log_data(entry_id), payload)?;
         Ok(())
     }
 
-    fn delete_data_payload(store: &mut LocalObjectStore, entry_id: u64) -> Result<()> {
-        store.delete(intent_log_data_object_key(entry_id))?;
+    fn delete_data_payload(
+        store: &mut LocalObjectStore,
+        entry_id: u64,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> Result<()> {
+        store.delete(keyspace.intent_log_data(entry_id))?;
         Ok(())
     }
 
-    fn delete_head(store: &mut LocalObjectStore) -> Result<()> {
-        store.delete(intent_log_head_object_key())?;
+    fn delete_head(store: &mut LocalObjectStore, keyspace: FilesystemObjectKeyspace) -> Result<()> {
+        store.delete(keyspace.intent_log_head())?;
         Ok(())
     }
 
@@ -976,6 +1005,7 @@ fn try_encoded_entry_len(entry: &IntentLogEntry) -> Result<usize> {
 /// append is refused.
 #[derive(Debug)]
 pub struct IntentLog {
+    keyspace: FilesystemObjectKeyspace,
     next_entry_id: u64,
     /// All entries that have been appended (both flushed and unflushed).
     entries: Vec<IntentLogEntry>,
@@ -1006,26 +1036,12 @@ pub struct IntentLog {
 impl IntentLog {
     #[cfg(test)]
     pub fn new() -> Self {
-        Self {
-            next_entry_id: 0,
-            entries: Vec::new(),
-            flushed_entry_count: 0,
-            config: IntentLogConfig::default(),
-            last_flush: None,
-            first_unflushed_at: None,
-            flush_history: [0; FLUSH_HISTORY_LEN],
-            flush_history_pos: 0,
-            flush_history_filled: false,
-            log_device: None,
-            used_bytes: 0,
-            throttle_events: 0,
-            segments_trimmed: 0,
-        }
+        Self::with_config(IntentLogConfig::default())
     }
 
-    #[allow(dead_code)] // INTENT: intent-log types for planned log device fast path and crash recovery
-    pub fn with_config(config: IntentLogConfig) -> Self {
+    fn with_config_for_dataset(config: IntentLogConfig, dataset_id: DatasetId) -> Self {
         Self {
+            keyspace: FilesystemObjectKeyspace::new(dataset_id),
             next_entry_id: 0,
             entries: Vec::new(),
             flushed_entry_count: 0,
@@ -1040,6 +1056,11 @@ impl IntentLog {
             throttle_events: 0,
             segments_trimmed: 0,
         }
+    }
+
+    #[allow(dead_code)] // INTENT: intent-log types for planned log device fast path and crash recovery
+    pub fn with_config(config: IntentLogConfig) -> Self {
+        Self::with_config_for_dataset(config, tidefs_pool_runtime::ROOT_DATASET_ID)
     }
     #[allow(dead_code)] // INTENT: intent-log types for planned log device fast path and crash recovery
     /// Configure a separate fast log device (LOG_DEVICE) for sync write
@@ -1084,14 +1105,30 @@ impl IntentLog {
         Self::load_with_config(store, IntentLogConfig::default())
     }
 
+    pub(crate) fn load_for_dataset(
+        store: &LocalObjectStore,
+        dataset_id: DatasetId,
+    ) -> Result<Self> {
+        Self::load_with_config_for_dataset(store, IntentLogConfig::default(), dataset_id)
+    }
+
     /// Load the intent log from the object store during mount/recovery
     /// with a custom config.
     pub fn load_with_config(store: &LocalObjectStore, config: IntentLogConfig) -> Result<Self> {
-        let head_entry_id = IntentLogRawStateAuthority::read_head_entry_id(store)?;
+        Self::load_with_config_for_dataset(store, config, tidefs_pool_runtime::ROOT_DATASET_ID)
+    }
+
+    fn load_with_config_for_dataset(
+        store: &LocalObjectStore,
+        config: IntentLogConfig,
+        dataset_id: DatasetId,
+    ) -> Result<Self> {
+        let keyspace = FilesystemObjectKeyspace::new(dataset_id);
+        let head_entry_id = IntentLogRawStateAuthority::read_head_entry_id(store, keyspace)?;
 
         let mut entries = Vec::new();
         for entry_id in 0..head_entry_id {
-            match IntentLogRawStateAuthority::read_entry(store, entry_id)? {
+            match IntentLogRawStateAuthority::read_entry(store, entry_id, keyspace)? {
                 Some(entry) => {
                     if entry.entry_id != entry_id {
                         return Err(FileSystemError::CorruptState {
@@ -1109,6 +1146,7 @@ impl IntentLog {
         }
         let entry_count = entries.len();
         Ok(Self {
+            keyspace,
             next_entry_id: entry_count as u64,
             entries,
             flushed_entry_count: entry_count,
@@ -1242,11 +1280,22 @@ impl IntentLog {
         self.next_entry_id
     }
 
+    pub(crate) fn durable_object_keys(&self) -> Vec<ObjectKey> {
+        let mut keys = Vec::new();
+        keys.push(self.keyspace.intent_log_head());
+        for entry_id in 0..self.next_entry_id {
+            keys.push(self.keyspace.intent_log_entry(entry_id));
+            keys.push(self.keyspace.intent_log_data(entry_id));
+        }
+        keys
+    }
+
     pub(crate) fn write_next_data_payload(&self, pool: &mut Pool, payload: &[u8]) -> Result<()> {
         IntentLogRawStateAuthority::write_data_payload(
             pool.raw_primary_store_mut(),
             self.next_entry_id(),
             payload,
+            self.keyspace,
         )
     }
 
@@ -1270,11 +1319,11 @@ impl IntentLog {
         // into the object store for the group commit.
         for idx in flush_from..flush_to {
             let entry = &self.entries[idx];
-            IntentLogRawStateAuthority::write_entry(store, entry)?;
+            IntentLogRawStateAuthority::write_entry(store, entry, self.keyspace)?;
         }
 
         // Single head-pointer update for the entire batch
-        IntentLogRawStateAuthority::write_head_entry_id(store, self.next_entry_id)?;
+        IntentLogRawStateAuthority::write_head_entry_id(store, self.next_entry_id, self.keyspace)?;
 
         // Durable sync — one fsync for the entire batch
         IntentLogRawStateAuthority::sync_all(store)?;
@@ -1473,15 +1522,19 @@ impl IntentLog {
         if let Some(ref mut log_device) = self.log_device {
             log_device.truncate()?;
         }
-        IntentLogRawStateAuthority::delete_head(store)?;
+        IntentLogRawStateAuthority::delete_head(store, self.keyspace)?;
         IntentLogRawStateAuthority::sync_all(store)?;
 
         // Physical cleanup is no longer part of the correctness boundary.
         // Best-effort deletion avoids turning an already-retired, committed
         // intent into a false commit failure.
         for entry in &self.entries {
-            let _ = IntentLogRawStateAuthority::delete_entry(store, entry.entry_id);
-            let _ = IntentLogRawStateAuthority::delete_data_payload(store, entry.entry_id);
+            let _ = IntentLogRawStateAuthority::delete_entry(store, entry.entry_id, self.keyspace);
+            let _ = IntentLogRawStateAuthority::delete_data_payload(
+                store,
+                entry.entry_id,
+                self.keyspace,
+            );
         }
         let _ = IntentLogRawStateAuthority::sync_all(store);
         self.entries.clear();
@@ -1531,8 +1584,9 @@ impl IntentLog {
     ) -> Vec<u64> {
         let removed_ids = self.remove_entries_for_inode(inode_id);
         for entry_id in &removed_ids {
-            let _ = IntentLogRawStateAuthority::delete_entry(store, *entry_id);
-            let _ = IntentLogRawStateAuthority::delete_data_payload(store, *entry_id);
+            let _ = IntentLogRawStateAuthority::delete_entry(store, *entry_id, self.keyspace);
+            let _ =
+                IntentLogRawStateAuthority::delete_data_payload(store, *entry_id, self.keyspace);
         }
         removed_ids
     }
@@ -1838,6 +1892,7 @@ fn replay_metadata_setattr_intent_with_pool(
     state: &mut crate::FileSystemState,
     pool: &Pool,
     preceding_data: Option<&PoolReplayDataTransition>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<()> {
     use std::sync::Arc;
 
@@ -1972,7 +2027,9 @@ fn replay_metadata_setattr_intent_with_pool(
     // versioned layout before recording this post-setattr inode. Adopt that
     // content identity only after the manifest and every materialized chunk
     // are readable through current Pool placement receipts.
-    let _ = crate::allocation::content_allocation_entries_for_inode_pool(pool, updated)?;
+    let _ = crate::allocation::content_allocation_entries_for_inode_pool_in_keyspace(
+        pool, updated, keyspace,
+    )?;
 
     Arc::make_mut(&mut state.inodes).insert(updated.inode_id, updated.clone());
     state.generation = state
@@ -1997,17 +2054,30 @@ fn replay_metadata_setattr_intent_with_pool(
 /// - MetadataSetattrIntent: restore metadata-only fields; content identity
 ///   changes are refused because the intent carries no file bytes.
 /// - FsyncDirtyDrain / PressureFallback / CrashReplayReconcile: no-op.
+#[cfg(test)]
 pub(crate) fn replay_entry(
     entry: &IntentLogEntry,
     state: &mut crate::FileSystemState,
     store: &mut LocalObjectStore,
 ) -> Result<()> {
+    replay_entry_in_keyspace(
+        entry,
+        state,
+        store,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+fn replay_entry_in_keyspace(
+    entry: &IntentLogEntry,
+    state: &mut crate::FileSystemState,
+    store: &mut LocalObjectStore,
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<()> {
     use crate::allocation::next_generation_after;
     use crate::constants::content_chunk_size;
     use crate::content::content_chunk_count;
     use crate::encoding::{encode_content_chunk, encode_content_manifest};
-    use crate::object_keys::content_chunk_object_key_for_version;
-    use crate::object_keys::content_object_key_for_version;
     use crate::records::{ContentChunkRef, ContentManifestObject};
     use std::sync::Arc;
     use tidefs_local_object_store::checksum64;
@@ -2034,15 +2104,18 @@ pub(crate) fn replay_entry(
             length,
             ..
         } => {
-            let payload =
-                match IntentLogRawStateAuthority::read_data_payload(store, entry.entry_id)? {
-                    Some(bytes) => bytes,
-                    None => {
-                        return Err(FileSystemError::CorruptState {
-                            reason: "intent log replay: missing data payload",
-                        });
-                    }
-                };
+            let payload = match IntentLogRawStateAuthority::read_data_payload(
+                store,
+                entry.entry_id,
+                keyspace,
+            )? {
+                Some(bytes) => bytes,
+                None => {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "intent log replay: missing data payload",
+                    });
+                }
+            };
 
             let mut record = match state.inodes.get(inode_id) {
                 Some(rec) => rec.clone(),
@@ -2056,11 +2129,16 @@ pub(crate) fn replay_entry(
             let write_end = offset.saturating_add(*length);
             let new_size = record.size.max(write_end);
 
-            let existing_bytes =
-                match crate::content::read_content_from_store(store, *inode_id, &record, None) {
+            let existing_bytes = {
+                let scoped = crate::content::FilesystemContentWriteStore::new(
+                    &mut *store,
+                    keyspace.dataset_id(),
+                );
+                match crate::content::read_content_from_write_store(&scoped, *inode_id, &record) {
                     Ok(bytes) => bytes,
                     Err(_) => vec![0u8; record.size as usize],
-                };
+                }
+            };
 
             let mut full_content = existing_bytes;
             if new_size as usize > full_content.len() {
@@ -2096,7 +2174,7 @@ pub(crate) fn replay_entry(
                 )?;
                 let checksum = checksum64(&encoded_chunk);
 
-                let chunk_key = content_chunk_object_key_for_version(*inode_id, tick, ci);
+                let chunk_key = keyspace.content_chunk(*inode_id, tick, ci);
                 store.put(chunk_key, &encoded_chunk)?;
 
                 manifest.chunks.push(ContentChunkRef {
@@ -2109,10 +2187,7 @@ pub(crate) fn replay_entry(
             }
 
             let encoded_manifest = encode_content_manifest(&manifest);
-            store.put(
-                content_object_key_for_version(*inode_id, tick),
-                &encoded_manifest,
-            )?;
+            store.put(keyspace.content(*inode_id, tick), &encoded_manifest)?;
 
             record.size = new_size;
             record.metadata_version = tick;
@@ -2188,15 +2263,23 @@ use std::collections::BTreeMap;
 
 struct UncommittedReplayContentStore<'a> {
     pool: &'a mut Pool,
+    keyspace: FilesystemObjectKeyspace,
     inode_id: InodeId,
     data_version: u64,
     file_size: u64,
 }
 
 impl<'a> UncommittedReplayContentStore<'a> {
-    fn new(pool: &'a mut Pool, inode_id: InodeId, data_version: u64, file_size: u64) -> Self {
+    fn new(
+        pool: &'a mut Pool,
+        inode_id: InodeId,
+        data_version: u64,
+        file_size: u64,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> Self {
         Self {
             pool,
+            keyspace,
             inode_id,
             data_version,
             file_size,
@@ -2205,10 +2288,18 @@ impl<'a> UncommittedReplayContentStore<'a> {
 }
 
 impl crate::content::ContentWriteStore for UncommittedReplayContentStore<'_> {
+    fn keyspace(&self) -> FilesystemObjectKeyspace {
+        self.keyspace
+    }
+
+    fn physical_key(&self, key: ObjectKey) -> ObjectKey {
+        self.keyspace.scope(key)
+    }
+
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
         Ok(self
             .pool
-            .get_with_current_receipt(DeviceIoClass::Data, key)?
+            .get_with_current_receipt(DeviceIoClass::Data, self.keyspace.scope(key))?
             .map(|(bytes, _receipt)| bytes))
     }
 
@@ -2218,7 +2309,7 @@ impl crate::content::ContentWriteStore for UncommittedReplayContentStore<'_> {
     ) -> Result<Option<(Vec<u8>, Option<u64>)>> {
         Ok(self
             .pool
-            .get_with_current_receipt(DeviceIoClass::Data, key)?
+            .get_with_current_receipt(DeviceIoClass::Data, self.keyspace.scope(key))?
             .map(|(bytes, receipt)| (bytes, Some(receipt.generation))))
     }
 
@@ -2258,7 +2349,7 @@ impl crate::content::ContentWriteStore for UncommittedReplayContentStore<'_> {
         // an orphan from an interrupted publication can already occupy it.
         Ok(self
             .pool
-            .ensure_prepublication_data_object_with_receipt(key, payload)?)
+            .ensure_prepublication_data_object_with_receipt(self.keyspace.scope(key), payload)?)
     }
 
     fn put(&mut self, _key: ObjectKey, _payload: &[u8]) -> Result<StoredObject> {
@@ -2338,13 +2429,12 @@ impl ReplayBatcher {
         &mut self,
         state: &mut crate::FileSystemState,
         store: &mut LocalObjectStore,
+        keyspace: FilesystemObjectKeyspace,
     ) -> Result<u64> {
         use crate::allocation::next_generation_after;
         use crate::constants::content_chunk_size;
         use crate::content::content_chunk_count;
         use crate::encoding::{encode_content_chunk, encode_content_manifest};
-        use crate::object_keys::content_chunk_object_key_for_version;
-        use crate::object_keys::content_object_key_for_version;
         use crate::records::{ContentChunkRef, ContentManifestObject};
         use std::sync::Arc;
         use tidefs_local_object_store::checksum64;
@@ -2370,11 +2460,16 @@ impl ReplayBatcher {
             };
 
             // 1. Read existing content once.
-            let existing_bytes =
-                match crate::content::read_content_from_store(store, inode_id, &record, None) {
+            let existing_bytes = {
+                let scoped = crate::content::FilesystemContentWriteStore::new(
+                    &mut *store,
+                    keyspace.dataset_id(),
+                );
+                match crate::content::read_content_from_write_store(&scoped, inode_id, &record) {
                     Ok(bytes) => bytes,
                     Err(_) => vec![0u8; record.size as usize],
-                };
+                }
+            };
 
             // 2. Compute the final size: the maximum of the existing size,
             //    the current record size, and the end of every write.
@@ -2421,7 +2516,7 @@ impl ReplayBatcher {
                 )?;
                 let checksum = checksum64(&encoded_chunk);
 
-                let chunk_key = content_chunk_object_key_for_version(inode_id, tick, ci);
+                let chunk_key = keyspace.content_chunk(inode_id, tick, ci);
                 store.put(chunk_key, &encoded_chunk)?;
 
                 manifest.chunks.push(ContentChunkRef {
@@ -2434,10 +2529,7 @@ impl ReplayBatcher {
             }
 
             let encoded_manifest = encode_content_manifest(&manifest);
-            store.put(
-                content_object_key_for_version(inode_id, tick),
-                &encoded_manifest,
-            )?;
+            store.put(keyspace.content(inode_id, tick), &encoded_manifest)?;
 
             record.size = new_size;
             record.metadata_version = tick;
@@ -2466,6 +2558,7 @@ impl ReplayBatcher {
         pool: &mut Pool,
         planned_target_data_version: u64,
         base_data_versions: &BTreeMap<InodeId, u64>,
+        keyspace: FilesystemObjectKeyspace,
     ) -> Result<u64> {
         use std::sync::Arc;
 
@@ -2542,7 +2635,7 @@ impl ReplayBatcher {
             let mut all_keys_absent = true;
             for (&inode_id, &new_size) in &planned_sizes {
                 let manifest_key = content_object_key_for_version(inode_id, target_data_version);
-                if !pool_replay_key_is_mechanically_absent(pool, manifest_key)? {
+                if !pool_replay_key_is_mechanically_absent(pool, keyspace.scope(manifest_key))? {
                     all_keys_absent = false;
                     break;
                 }
@@ -2552,7 +2645,7 @@ impl ReplayBatcher {
                         target_data_version,
                         chunk_index,
                     );
-                    if !pool_replay_key_is_mechanically_absent(pool, chunk_key)? {
+                    if !pool_replay_key_is_mechanically_absent(pool, keyspace.scope(chunk_key))? {
                         all_keys_absent = false;
                         break;
                     }
@@ -2604,8 +2697,13 @@ impl ReplayBatcher {
                 })
                 .collect();
             let mut dedup_index = crate::dedup::DedupIndex::new();
-            let mut store =
-                UncommittedReplayContentStore::new(pool, inode_id, target_data_version, new_size);
+            let mut store = UncommittedReplayContentStore::new(
+                pool,
+                inode_id,
+                target_data_version,
+                new_size,
+                keyspace,
+            );
             crate::content::write_chunked_content_with_patch_batch(
                 crate::content::WriteChunkedContentPatchBatch {
                     dedup_enabled: false,
@@ -2750,6 +2848,7 @@ fn flush_planned_pool_replay_generation(
     generation: &PoolReplayGenerationPlan,
     effective_versions: &mut BTreeMap<(InodeId, u64), u64>,
     data_transitions: &mut BTreeMap<InodeId, PoolReplayDataTransition>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<u64> {
     let mut actual_base_versions = BTreeMap::new();
     for (&inode_id, &planned_base) in &generation.base_data_versions {
@@ -2777,6 +2876,7 @@ fn flush_planned_pool_replay_generation(
         pool,
         generation.target_data_version,
         &actual_base_versions,
+        keyspace,
     )?;
     for (&inode_id, &recorded_base_data_version) in &generation.base_data_versions {
         effective_versions.insert((inode_id, generation.target_data_version), effective_target);
@@ -2992,17 +3092,21 @@ fn validated_pool_replay_payload(
     offset: u64,
     length: u64,
     payload_digest: IntegrityDigest64,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<Vec<u8>> {
     let _end = offset
         .checked_add(length)
         .ok_or(FileSystemError::SizeOverflow {
             requested: u64::MAX,
         })?;
-    let payload =
-        IntentLogRawStateAuthority::read_data_payload(pool.raw_primary_store(), entry.entry_id)?
-            .ok_or(FileSystemError::CorruptState {
-                reason: "Pool intent replay is missing its data payload",
-            })?;
+    let payload = IntentLogRawStateAuthority::read_data_payload(
+        pool.raw_primary_store(),
+        entry.entry_id,
+        keyspace,
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "Pool intent replay is missing its data payload",
+    })?;
     let payload_len = u64::try_from(payload.len()).map_err(|_| FileSystemError::SizeOverflow {
         requested: u64::MAX,
     })?;
@@ -3064,6 +3168,7 @@ fn flush_active_pool_replay_generation(
     data_generation_index: &mut usize,
     effective_versions: &mut BTreeMap<(InodeId, u64), u64>,
     data_transitions: &mut BTreeMap<InodeId, PoolReplayDataTransition>,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<()> {
     let Some(active_data_version) = active_data_version.take() else {
         return Ok(());
@@ -3086,6 +3191,7 @@ fn flush_active_pool_replay_generation(
         generation,
         effective_versions,
         data_transitions,
+        keyspace,
     )?;
     *data_generation_index = data_generation_index.saturating_add(1);
     Ok(())
@@ -3125,6 +3231,7 @@ fn replay_with_pool(
                 &mut data_generation_index,
                 &mut effective_versions,
                 &mut data_transitions,
+                log.keyspace,
             )?;
         }
         match &entry.entry_kind {
@@ -3162,11 +3269,18 @@ fn replay_with_pool(
                         &mut data_generation_index,
                         &mut effective_versions,
                         &mut data_transitions,
+                        log.keyspace,
                     )?;
                     active_data_version = Some(*data_version);
                 }
-                let payload =
-                    validated_pool_replay_payload(pool, entry, *offset, *length, *payload_digest)?;
+                let payload = validated_pool_replay_payload(
+                    pool,
+                    entry,
+                    *offset,
+                    *length,
+                    *payload_digest,
+                    log.keyspace,
+                )?;
                 batcher.push(*inode_id, *offset, *length, payload);
             }
             IntentLogEntryKind::NamespaceCreateIntent(intent) => {
@@ -3179,10 +3293,11 @@ fn replay_with_pool(
                     state,
                     pool,
                     data_transitions.get(&updated.inode_id),
+                    log.keyspace,
                 )?;
             }
             IntentLogEntryKind::NamespaceSyncIntent { .. } => {
-                replay_entry(entry, state, pool.raw_primary_store_mut())?;
+                replay_entry_in_keyspace(entry, state, pool.raw_primary_store_mut(), log.keyspace)?;
             }
             IntentLogEntryKind::FsyncDirtyDrain { .. }
             | IntentLogEntryKind::PressureFallback
@@ -3199,6 +3314,7 @@ fn replay_with_pool(
         &mut data_generation_index,
         &mut effective_versions,
         &mut data_transitions,
+        log.keyspace,
     )?;
     if data_generation_index != replay_plan.data_generations.len() {
         return Err(FileSystemError::CorruptState {
@@ -3258,32 +3374,35 @@ pub(crate) fn batched_replay_uncommitted(
                 length,
                 ..
             } => {
-                let payload =
-                    match IntentLogRawStateAuthority::read_data_payload(store, entry.entry_id)? {
-                        Some(bytes) => bytes,
-                        None => {
-                            return Err(FileSystemError::CorruptState {
-                                reason: "intent log batched replay: missing data payload",
-                            });
-                        }
-                    };
+                let payload = match IntentLogRawStateAuthority::read_data_payload(
+                    store,
+                    entry.entry_id,
+                    log.keyspace,
+                )? {
+                    Some(bytes) => bytes,
+                    None => {
+                        return Err(FileSystemError::CorruptState {
+                            reason: "intent log batched replay: missing data payload",
+                        });
+                    }
+                };
                 batcher.push(*inode_id, *offset, *length, payload);
             }
             // Metadata-only setattr does not carry content authority. Apply it
             // before the queued data patches so it cannot overwrite the
             // replayed size/data version when the batch is materialized.
             IntentLogEntryKind::MetadataSetattrIntent(_) => {
-                replay_entry(entry, state, store)?;
+                replay_entry_in_keyspace(entry, state, store, log.keyspace)?;
                 count += 1;
             }
             _ => {
-                replay_entry(entry, state, store)?;
+                replay_entry_in_keyspace(entry, state, store, log.keyspace)?;
                 count += 1;
             }
         }
     }
 
-    count += batcher.flush(state, store)?;
+    count += batcher.flush(state, store, log.keyspace)?;
     Ok(count)
 }
 

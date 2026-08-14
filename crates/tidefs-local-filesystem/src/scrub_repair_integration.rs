@@ -27,6 +27,7 @@ use tidefs_scrub::repair_scheduling::{
 };
 use tidefs_scrub::ChecksumLayer;
 
+use crate::object_keys::FilesystemObjectKeyspace;
 use crate::repair::RepairAuthorityMismatch;
 use crate::scrub::{
     ScrubBlockEvidence, ScrubBlockId, ScrubBlockKind, ScrubBlockOutcome, ScrubReport,
@@ -401,6 +402,25 @@ pub fn dispatch_repair_from_bridge(
         crate::records::ContentLayout,
     >,
 ) -> crate::repair::RepairLog {
+    dispatch_repair_from_bridge_in_keyspace(
+        bridge,
+        state,
+        store,
+        content_layout_cache,
+        FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+    )
+}
+
+pub(crate) fn dispatch_repair_from_bridge_in_keyspace(
+    bridge: &mut ScrubToRepairBridge,
+    state: &mut crate::FileSystemState,
+    store: &mut tidefs_local_object_store::LocalObjectStore,
+    content_layout_cache: &mut BTreeMap<
+        tidefs_types_vfs_core::InodeId,
+        crate::records::ContentLayout,
+    >,
+    keyspace: FilesystemObjectKeyspace,
+) -> crate::repair::RepairLog {
     let mut applied_log = crate::repair::RepairLog::new();
 
     // Snapshot locator IDs to avoid borrow conflicts during mutation.
@@ -441,9 +461,13 @@ pub fn dispatch_repair_from_bridge(
             outcome: crate::repair::RepairOutcome::Skipped,
         };
 
-        if let Err(reason) =
-            verify_current_repair_authority(&entry.block_id, state, store, content_layout_cache)
-        {
+        if let Err(reason) = verify_current_repair_authority(
+            &entry.block_id,
+            state,
+            store,
+            content_layout_cache,
+            keyspace,
+        ) {
             let outcome = crate::repair::RepairOutcome::AuthorityMismatch { reason };
             applied_log.record(crate::repair::RepairEntry {
                 block_id: entry.block_id,
@@ -460,12 +484,13 @@ pub fn dispatch_repair_from_bridge(
                 None
             }
         };
-        let outcome = crate::repair::apply_one_repair_with_replacement_evidence(
+        let outcome = crate::repair::apply_one_repair_with_replacement_evidence_in_keyspace(
             &entry,
             state,
             store,
             content_layout_cache,
             replacement_receipt,
+            keyspace,
         );
 
         applied_log.record(crate::repair::RepairEntry {
@@ -656,6 +681,7 @@ fn verify_current_repair_authority(
         tidefs_types_vfs_core::InodeId,
         crate::records::ContentLayout,
     >,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<(), RepairAuthorityMismatch> {
     let inode_id = tidefs_types_vfs_core::InodeId::new(block_id.inode_id);
     let record = state
@@ -683,7 +709,7 @@ fn verify_current_repair_authority(
                     current: record.data_version,
                 });
             }
-            match current_content_layout(inode_id, record, store, content_layout_cache)? {
+            match current_content_layout(inode_id, record, store, content_layout_cache, keyspace)? {
                 crate::records::ContentLayout::Chunked(_) => Ok(()),
                 crate::records::ContentLayout::Inline(_) => {
                     Err(RepairAuthorityMismatch::BlockKindMismatch)
@@ -691,7 +717,7 @@ fn verify_current_repair_authority(
             }
         }
         ScrubBlockKind::ContentChunk { chunk_index } => {
-            match current_content_layout(inode_id, record, store, content_layout_cache)? {
+            match current_content_layout(inode_id, record, store, content_layout_cache, keyspace)? {
                 crate::records::ContentLayout::Chunked(manifest) => {
                     let Some(chunk_ref) = manifest
                         .chunks
@@ -727,13 +753,16 @@ fn current_content_layout(
         tidefs_types_vfs_core::InodeId,
         crate::records::ContentLayout,
     >,
+    keyspace: FilesystemObjectKeyspace,
 ) -> Result<crate::records::ContentLayout, RepairAuthorityMismatch> {
     if let Some(layout) = content_layout_cache.get(&inode_id) {
         return Ok(layout.clone());
     }
 
-    let layout = crate::content::read_content_layout_from_store(store, inode_id, record)
-        .map_err(|_| RepairAuthorityMismatch::CurrentAuthorityUnavailable)?;
+    let layout = crate::content::read_content_layout_from_store_in_keyspace(
+        store, inode_id, record, keyspace,
+    )
+    .map_err(|_| RepairAuthorityMismatch::CurrentAuthorityUnavailable)?;
     content_layout_cache.insert(inode_id, layout.clone());
     Ok(layout)
 }
