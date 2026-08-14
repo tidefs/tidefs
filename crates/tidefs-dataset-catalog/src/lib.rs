@@ -190,6 +190,10 @@ impl DatasetFlags {
         Self(self.0 | other.0)
     }
     #[must_use]
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+    #[must_use]
     pub const fn default_create() -> Self {
         Self(Self::COMPRESSION.0 | Self::CHECKSUMS.0)
     }
@@ -464,6 +468,8 @@ pub enum CatalogError {
     AlreadyPublished,
     /// The dataset type does not support lineage (e.g., standalone filesystem).
     LineageNotSupported,
+    /// A published clone or snapshot still depends on this dataset.
+    LineageInUse,
 }
 
 impl fmt::Display for CatalogError {
@@ -500,6 +506,9 @@ impl fmt::Display for CatalogError {
             }
             CatalogError::LineageNotSupported => {
                 f.write_str("dataset type does not support lineage")
+            }
+            CatalogError::LineageInUse => {
+                f.write_str("dataset is retained by published clone or snapshot lineage")
             }
         }
     }
@@ -559,10 +568,6 @@ fn replace_prefix(path: &str, old_prefix: &str, new_prefix: &str) -> String {
     format!("{new_prefix}{rest}")
 }
 
-fn pool_component(path: &str) -> &str {
-    path.split('/').next().unwrap_or("")
-}
-
 fn snapshot_base_path(path: &str) -> Option<&str> {
     path.rsplit_once('@')
         .map(|(base, _snapshot)| base)
@@ -578,10 +583,6 @@ fn lineage_parent_matches_dataset_authority(
     child_entry: &CatalogEntry,
     parent_path: &str,
 ) -> bool {
-    if pool_component(child_path) != pool_component(parent_path) {
-        return false;
-    }
-
     if child_entry.dataset_type == DatasetType::Snapshot {
         let Some(base_path) = snapshot_base_path(child_path) else {
             return false;
@@ -841,8 +842,14 @@ impl DatasetCatalog {
     /// destroyed separately (space reclamation, etc.).
     pub fn destroy(&mut self, path: &str) -> Result<(), CatalogError> {
         validate_path(path)?;
-        if !self.contains(path) {
-            return Err(CatalogError::NotFound);
+        let dataset_id = self
+            .tree
+            .get(&path.to_string())
+            .map(|entry| entry.dataset_id)
+            .ok_or(CatalogError::NotFound)?;
+
+        if self.published_lineage_references(dataset_id)? {
+            return Err(CatalogError::LineageInUse);
         }
 
         // Check for children
@@ -1181,6 +1188,53 @@ impl DatasetCatalog {
         let mut entry = entry.clone();
         entry.lineage_parent_id = Some(lineage_parent_id);
         self.tree.insert(path.to_string(), entry);
+        Ok(())
+    }
+
+    /// Return the exact lineage parent of one catalog entry.
+    pub fn lineage_parent(&self, path: &str) -> Result<Option<DatasetId>, CatalogError> {
+        validate_path(path)?;
+        self.tree
+            .get(&path.to_string())
+            .map(|entry| entry.lineage_parent_id)
+            .ok_or(CatalogError::NotFound)
+    }
+
+    /// Promote a writable clone into an independent dataset.
+    ///
+    /// Promotion is refused while another published entry depends on the
+    /// clone: changing the clone's ancestry would otherwise invalidate that
+    /// descendant's committed lineage summary.
+    pub fn promote_clone(&mut self, path: &str) -> Result<(), CatalogError> {
+        validate_path(path)?;
+        let mut entry = self
+            .tree
+            .get(&path.to_string())
+            .cloned()
+            .ok_or(CatalogError::NotFound)?;
+        if !entry.flags.contains(DatasetFlags::CLONE) || entry.lineage_parent_id.is_none() {
+            return Err(CatalogError::LineageNotSupported);
+        }
+        if self.published_lineage_references(entry.dataset_id)? {
+            return Err(CatalogError::LineageInUse);
+        }
+
+        entry.flags = entry.flags.without(DatasetFlags::CLONE);
+        entry.lineage_parent_id = None;
+        entry.published = false;
+        entry.lineage_summary = [0_u8; 32];
+        self.tree.insert(path.to_string(), entry);
+        self.publish_root(path)
+    }
+
+    /// Recompute every published lineage summary and fail closed on stale or
+    /// invalid ancestry.
+    pub fn validate_published_lineage(&self) -> Result<(), CatalogError> {
+        for (path, entry) in self.tree.entries() {
+            if entry.published && self.validate_lineage(&path)? != entry.lineage_summary {
+                return Err(CatalogError::CorruptEncoding);
+            }
+        }
         Ok(())
     }
 
@@ -4801,6 +4855,94 @@ mod tests {
 
         let entry = cat.get_entry("pool/clone1").unwrap();
         assert_eq!(entry.lineage_parent_id, Some(did(1)));
+    }
+
+    #[test]
+    fn published_volume_clone_retains_snapshot_until_promotion() {
+        let mut cat = DatasetCatalog::new();
+        cat.create(
+            "vol",
+            did(1),
+            DatasetType::Volume,
+            1,
+            empty_props(),
+            DatasetFlags::CHECKSUMS,
+            SyncGuarantee::Local,
+        )
+        .unwrap();
+        cat.create(
+            "vol@base",
+            did(10),
+            DatasetType::Snapshot,
+            2,
+            empty_props(),
+            DatasetFlags::READONLY.union(DatasetFlags::CHECKSUMS),
+            SyncGuarantee::Local,
+        )
+        .unwrap();
+        cat.set_lineage_parent("vol@base", did(1)).unwrap();
+        cat.publish_root("vol@base").unwrap();
+        cat.create(
+            "clone",
+            did(11),
+            DatasetType::Volume,
+            3,
+            empty_props(),
+            DatasetFlags::CLONE.union(DatasetFlags::CHECKSUMS),
+            SyncGuarantee::Local,
+        )
+        .unwrap();
+        cat.set_lineage_parent("clone", did(10)).unwrap();
+        cat.publish_root("clone").unwrap();
+
+        assert_eq!(cat.destroy("vol@base"), Err(CatalogError::LineageInUse));
+        cat.validate_published_lineage().unwrap();
+        cat.promote_clone("clone").unwrap();
+        let (_, _, _, _, flags, _) = cat.get_by_id(&did(11)).unwrap();
+        assert!(!flags.contains(DatasetFlags::CLONE));
+        assert_eq!(cat.lineage_parent("clone"), Ok(None));
+        cat.destroy("vol@base").unwrap();
+    }
+
+    #[test]
+    fn published_volume_clone_may_use_another_path_hierarchy_in_the_same_pool() {
+        let mut cat = DatasetCatalog::new();
+        make_filesystem(&mut cat, "clones", 0);
+        cat.create(
+            "vol",
+            did(1),
+            DatasetType::Volume,
+            1,
+            empty_props(),
+            DatasetFlags::CHECKSUMS,
+            SyncGuarantee::Local,
+        )
+        .unwrap();
+        cat.create(
+            "vol@base",
+            did(10),
+            DatasetType::Snapshot,
+            2,
+            empty_props(),
+            DatasetFlags::READONLY,
+            SyncGuarantee::Local,
+        )
+        .unwrap();
+        cat.set_lineage_parent("vol@base", did(1)).unwrap();
+        cat.publish_root("vol@base").unwrap();
+        cat.create(
+            "clones/clone",
+            did(11),
+            DatasetType::Volume,
+            3,
+            empty_props(),
+            DatasetFlags::CLONE,
+            SyncGuarantee::Local,
+        )
+        .unwrap();
+        cat.set_lineage_parent("clones/clone", did(10)).unwrap();
+        cat.publish_root("clones/clone").unwrap();
+        cat.validate_published_lineage().unwrap();
     }
 
     // --- Already published ----------------------------------------------------

@@ -21,7 +21,7 @@ use tidefs_local_filesystem::{
     SnapshotRetentionReport, SnapshotSummary,
 };
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
-use tidefs_pool_runtime::{PoolRuntime, VolumeSnapshotSummary};
+use tidefs_pool_runtime::{PoolRuntime, VolumeCloneSummary, VolumeSnapshotSummary};
 #[cfg(feature = "remote-snapshot")]
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
@@ -219,7 +219,7 @@ pub enum SnapshotCommand {
     Create(SnapshotCreateArgs),
     /// List snapshots stored in the backing filesystem
     List(SnapshotListArgs),
-    /// Manage writable local snapshot clones
+    /// Manage writable local volume clones from canonical snapshots
     Clone(SnapshotCloneArgs),
     /// Manage lightweight local snapshot bookmarks
     Bookmark(SnapshotBookmarkArgs),
@@ -319,24 +319,26 @@ pub struct SnapshotCloneArgs {
 /// Subcommands for `snapshot clone`.
 #[derive(Subcommand, Debug)]
 pub enum SnapshotCloneCommand {
-    /// Create a writable clone from a source snapshot or clone
+    /// Create a writable volume clone from a canonical volume snapshot
     Create(SnapshotCloneCreateArgs),
-    /// Delete a clone through clone lifecycle authority
+    /// Delete an unpromoted writable volume clone
     Delete(SnapshotCloneDeleteArgs),
-    /// Promote a clone to an independent regular snapshot
+    /// Promote a writable volume clone to an independent volume
     Promote(SnapshotClonePromoteArgs),
 }
 
-/// `snapshot clone create <pool> <clone> <source> [--devices <dev>...]`
+/// `snapshot clone create <pool> <clone> <volume@snapshot> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct SnapshotCloneCreateArgs {
-    /// Pool, clone name, and source snapshot/clone name
-    #[arg(
-        value_name = "POOL_CLONE_SOURCE",
-        num_args = 2..=3,
-        required = true
-    )]
-    pub operands: Vec<String>,
+    /// Pool that owns the snapshot and clone
+    pub pool: String,
+
+    /// Writable clone dataset path
+    pub clone: String,
+
+    /// Canonical source volume@snapshot path
+    #[arg(value_name = "VOLUME@SNAPSHOT")]
+    pub source: String,
 
     /// Retired directory object-store backing mode.
     #[arg(
@@ -347,7 +349,7 @@ pub struct SnapshotCloneCreateArgs {
     )]
     pub backing_dir: Option<PathBuf>,
 
-    /// Block devices for offline/not-yet-imported clone access
+    /// Block devices for offline/not-yet-imported volume-clone access
     #[arg(
         short = 'd',
         long = "devices",
@@ -360,9 +362,11 @@ pub struct SnapshotCloneCreateArgs {
 /// `snapshot clone delete <pool> <clone> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct SnapshotCloneDeleteArgs {
-    /// Pool and clone name
-    #[arg(value_name = "POOL_AND_CLONE", num_args = 1..=2, required = true)]
-    pub operands: Vec<String>,
+    /// Pool that owns the clone
+    pub pool: String,
+
+    /// Writable volume-clone dataset path
+    pub clone: String,
 
     /// Retired directory object-store backing mode.
     #[arg(
@@ -373,7 +377,7 @@ pub struct SnapshotCloneDeleteArgs {
     )]
     pub backing_dir: Option<PathBuf>,
 
-    /// Block devices for offline/not-yet-imported clone access
+    /// Block devices for offline/not-yet-imported volume-clone access
     #[arg(
         short = 'd',
         long = "devices",
@@ -386,9 +390,11 @@ pub struct SnapshotCloneDeleteArgs {
 /// `snapshot clone promote <pool> <clone> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct SnapshotClonePromoteArgs {
-    /// Pool and clone name
-    #[arg(value_name = "POOL_AND_CLONE", num_args = 1..=2, required = true)]
-    pub operands: Vec<String>,
+    /// Pool that owns the clone
+    pub pool: String,
+
+    /// Writable volume-clone dataset path
+    pub clone: String,
 
     /// Retired directory object-store backing mode.
     #[arg(
@@ -399,7 +405,7 @@ pub struct SnapshotClonePromoteArgs {
     )]
     pub backing_dir: Option<PathBuf>,
 
-    /// Block devices for offline/not-yet-imported clone access
+    /// Block devices for offline/not-yet-imported volume-clone access
     #[arg(
         short = 'd',
         long = "devices",
@@ -1051,6 +1057,55 @@ fn parse_volume_snapshot_target(raw: &str) -> Result<(String, String, String), S
     Ok((pool, format!("{source}@{snapshot}"), source))
 }
 
+fn parse_volume_clone_create_operands(
+    backing_dir: Option<&PathBuf>,
+    operands: &[String],
+) -> Result<(String, String, String), String> {
+    if backing_dir.is_some() {
+        return Err("directory-backed object-store clone mode is retired".to_string());
+    }
+    let [pool, clone, source] = operands else {
+        return Err(
+            "expected '<pool> <clone> <volume@snapshot>' for writable volume clone creation"
+                .to_string(),
+        );
+    };
+    let pool = crate::parser::parse_pool_name(pool)?;
+    let clone = crate::parser::parse_dataset_path(clone)?;
+    if clone.contains('@') {
+        return Err("volume clone target must be an ordinary dataset path".to_string());
+    }
+    if !source.contains('@') {
+        return Err(format!(
+            "source '{source}' is a filesystem snapshot alias, not an independently writable dataset; filesystem clone creation is unsupported until filesystem roots have dataset-scoped object namespaces"
+        ));
+    }
+    let (source_pool, source, _) = parse_volume_snapshot_target(&format!("{pool}/{source}"))?;
+    debug_assert_eq!(source_pool, pool);
+    Ok((pool, clone, source))
+}
+
+fn parse_volume_clone_target_operands(
+    operation: &str,
+    backing_dir: Option<&PathBuf>,
+    operands: &[String],
+) -> Result<(String, String), String> {
+    if backing_dir.is_some() {
+        return Err("directory-backed object-store clone mode is retired".to_string());
+    }
+    let [pool, clone] = operands else {
+        return Err(format!(
+            "expected '<pool> <clone>' for writable volume clone {operation}"
+        ));
+    };
+    let pool = crate::parser::parse_pool_name(pool)?;
+    let clone = crate::parser::parse_dataset_path(clone)?;
+    if clone.contains('@') {
+        return Err("volume clone target must be an ordinary dataset path".to_string());
+    }
+    Ok((pool, clone))
+}
+
 enum NamedSnapshotTarget {
     Filesystem { pool: Option<String>, name: String },
     Volume { pool: String, target: String },
@@ -1685,6 +1740,54 @@ fn print_volume_snapshot_outcome(outcome: &str, summary: &VolumeSnapshotSummary,
     }
 }
 
+fn volume_clone_line(summary: &VolumeCloneSummary) -> String {
+    format!(
+        "volume clone '{}' source_snapshot='{}' source_volume='{}' kind=volume promoted={} generation={} size={} block_size={}",
+        summary.path,
+        summary.source_snapshot_path,
+        summary.source_volume_path,
+        summary.promoted,
+        summary.generation,
+        summary.geometry.capacity_bytes,
+        summary.geometry.block_size_bytes,
+    )
+}
+
+fn volume_clone_json(summary: &VolumeCloneSummary) -> serde_json::Value {
+    serde_json::json!({
+        "path": summary.path,
+        "id": summary.clone_id.to_string(),
+        "source_snapshot": summary.source_snapshot_path,
+        "source_snapshot_id": summary.source_snapshot_id.to_string(),
+        "source_volume": summary.source_volume_path,
+        "source_volume_id": summary.source_volume_id.to_string(),
+        "kind": "volume",
+        "promoted": summary.promoted,
+        "generation": summary.generation,
+        "size": summary.geometry.capacity_bytes,
+        "block_size": summary.geometry.block_size_bytes,
+    })
+}
+
+fn print_volume_clone_outcome(outcome: &str, summary: &VolumeCloneSummary, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "outcome": outcome,
+                "physical_reclaim": false,
+                "clone": volume_clone_json(summary),
+            })
+        );
+    } else {
+        println!("{} {outcome}", volume_clone_line(summary));
+        if outcome == "logically destroyed" {
+            println!("physical reclaim remains pending; no secure-erasure claim is made");
+        }
+    }
+}
+
 fn handle_list(args: SnapshotListArgs) {
     if args.backing_dir.is_none() && args.devices.as_deref().is_none_or(<[_]>::is_empty) {
         let pool = args
@@ -1781,107 +1884,128 @@ fn handle_clone(cmd: SnapshotCloneCommand) {
 fn handle_clone_create(args: SnapshotCloneCreateArgs) {
     let _guard = super::authz::require_local_only("snapshot clone create");
 
+    let SnapshotCloneCreateArgs {
+        pool: pool_operand,
+        clone: clone_operand,
+        source: source_operand,
+        backing_dir,
+        devices,
+    } = args;
+    let operands = [pool_operand, clone_operand, source_operand];
     let (pool, clone_name, source_name) =
-        parse_pair_snapshot_operands("clone create", args.backing_dir.as_ref(), &args.operands);
-    let mut fs = open_filesystem_with_live_args(
-        args.backing_dir.as_ref(),
-        pool.as_deref(),
-        args.devices.as_deref(),
-        "clone create",
-        RecoveryPolicy::default(),
-        super::live_owner::live_admin_args([
-            ("clone", LivePoolAdminArg::String(clone_name.clone())),
-            ("source", LivePoolAdminArg::String(source_name.clone())),
-        ]),
-    );
-
-    match fs.create_clone(&clone_name, &source_name) {
-        Ok(summary) => {
-            println!(
-                "clone '{}' created from '{}' (source tx={}, source gen={}, created gen={})",
-                summary.name,
-                summary.origin,
-                summary.source_transaction_id,
-                summary.source_generation,
-                summary.created_at_generation
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "tidefsctl snapshot clone create: failed to create clone '{clone_name}' from '{source_name}': {err}"
-            );
-            process::exit(1);
-        }
-    }
+        parse_volume_clone_create_operands(backing_dir.as_ref(), &operands)
+            .unwrap_or_else(|error| volume_snapshot_exit("clone create", error, false));
+    let live_args = super::live_owner::live_admin_args([
+        ("clone", LivePoolAdminArg::String(clone_name.clone())),
+        ("source", LivePoolAdminArg::String(source_name.clone())),
+    ]);
+    let summary = if let Some(devices) = devices.as_deref().filter(|devices| !devices.is_empty()) {
+        with_offline_volume_snapshot_runtime(
+            &pool,
+            devices,
+            "clone-create",
+            false,
+            &live_args,
+            |runtime| {
+                runtime
+                    .create_volume_clone(&clone_name, &source_name)
+                    .map_err(|error| error.to_string())
+            },
+        )
+    } else {
+        super::live_owner::route_with_format_and_args(
+            "snapshot",
+            "clone-create",
+            &pool,
+            false,
+            live_args,
+        )
+    };
+    print_volume_clone_outcome("created", &summary, false);
 }
 
 fn handle_clone_delete(args: SnapshotCloneDeleteArgs) {
     let _guard = super::authz::require_local_only("snapshot clone delete");
 
+    let SnapshotCloneDeleteArgs {
+        pool: pool_operand,
+        clone: clone_operand,
+        backing_dir,
+        devices,
+    } = args;
+    let operands = [pool_operand, clone_operand];
     let (pool, clone_name) =
-        parse_named_snapshot_operands("clone delete", args.backing_dir.as_ref(), &args.operands);
-    let mut fs = open_filesystem_with_live_args(
-        args.backing_dir.as_ref(),
-        pool.as_deref(),
-        args.devices.as_deref(),
-        "clone delete",
-        RecoveryPolicy::default(),
-        super::live_owner::live_admin_args([(
-            "clone",
-            LivePoolAdminArg::String(clone_name.clone()),
-        )]),
-    );
-
-    match fs.delete_clone(&clone_name) {
-        Ok(summary) => {
-            println!(
-                "clone '{}' deleted (source tx={}, source gen={}, created gen={})",
-                summary.name,
-                summary.source_transaction_id,
-                summary.source_generation,
-                summary.created_at_generation
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "tidefsctl snapshot clone delete: failed to delete clone '{clone_name}': {err}"
-            );
-            process::exit(1);
-        }
-    }
+        parse_volume_clone_target_operands("delete", backing_dir.as_ref(), &operands)
+            .unwrap_or_else(|error| volume_snapshot_exit("clone delete", error, false));
+    let live_args = super::live_owner::live_admin_args([(
+        "clone",
+        LivePoolAdminArg::String(clone_name.clone()),
+    )]);
+    let summary = if let Some(devices) = devices.as_deref().filter(|devices| !devices.is_empty()) {
+        with_offline_volume_snapshot_runtime(
+            &pool,
+            devices,
+            "clone-delete",
+            false,
+            &live_args,
+            |runtime| {
+                runtime
+                    .destroy_volume_clone(&clone_name)
+                    .map_err(|error| error.to_string())
+            },
+        )
+    } else {
+        super::live_owner::route_with_format_and_args(
+            "snapshot",
+            "clone-delete",
+            &pool,
+            false,
+            live_args,
+        )
+    };
+    print_volume_clone_outcome("logically destroyed", &summary, false);
 }
 
 fn handle_clone_promote(args: SnapshotClonePromoteArgs) {
     let _guard = super::authz::require_local_only("snapshot clone promote");
 
+    let SnapshotClonePromoteArgs {
+        pool: pool_operand,
+        clone: clone_operand,
+        backing_dir,
+        devices,
+    } = args;
+    let operands = [pool_operand, clone_operand];
     let (pool, clone_name) =
-        parse_named_snapshot_operands("clone promote", args.backing_dir.as_ref(), &args.operands);
-    let mut fs = open_filesystem_with_live_args(
-        args.backing_dir.as_ref(),
-        pool.as_deref(),
-        args.devices.as_deref(),
-        "clone promote",
-        RecoveryPolicy::default(),
-        super::live_owner::live_admin_args([(
-            "clone",
-            LivePoolAdminArg::String(clone_name.clone()),
-        )]),
-    );
-
-    match fs.promote_clone(&clone_name) {
-        Ok(report) => {
-            println!(
-                "clone '{}' promoted to snapshot (previous origin='{}', generation={})",
-                report.name, report.previous_origin, report.generation
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "tidefsctl snapshot clone promote: failed to promote clone '{clone_name}': {err}"
-            );
-            process::exit(1);
-        }
-    }
+        parse_volume_clone_target_operands("promotion", backing_dir.as_ref(), &operands)
+            .unwrap_or_else(|error| volume_snapshot_exit("clone promote", error, false));
+    let live_args = super::live_owner::live_admin_args([(
+        "clone",
+        LivePoolAdminArg::String(clone_name.clone()),
+    )]);
+    let summary = if let Some(devices) = devices.as_deref().filter(|devices| !devices.is_empty()) {
+        with_offline_volume_snapshot_runtime(
+            &pool,
+            devices,
+            "clone-promote",
+            false,
+            &live_args,
+            |runtime| {
+                runtime
+                    .promote_volume_clone(&clone_name)
+                    .map_err(|error| error.to_string())
+            },
+        )
+    } else {
+        super::live_owner::route_with_format_and_args(
+            "snapshot",
+            "clone-promote",
+            &pool,
+            false,
+            live_args,
+        )
+    };
+    print_volume_clone_outcome("promoted", &summary, false);
 }
 
 fn handle_bookmark(cmd: SnapshotBookmarkCommand) {
@@ -2697,6 +2821,38 @@ mod tests {
         assert!(parse_volume_snapshot_target("tank/vol").is_err());
         assert!(parse_volume_snapshot_target("tank/vol@snap/nested").is_err());
         assert!(parse_volume_snapshot_target("tank/vol@snap@nested").is_err());
+    }
+
+    #[test]
+    fn volume_clone_operands_select_canonical_volume_snapshot_shape() {
+        assert_eq!(
+            parse_volume_clone_create_operands(
+                None,
+                &["tank".into(), "clone".into(), "vol@before".into()],
+            )
+            .unwrap(),
+            ("tank".into(), "clone".into(), "vol@before".into())
+        );
+        assert_eq!(
+            parse_volume_clone_target_operands(
+                "promotion",
+                None,
+                &["tank".into(), "clone".into()],
+            )
+            .unwrap(),
+            ("tank".into(), "clone".into())
+        );
+    }
+
+    #[test]
+    fn volume_clone_operands_truthfully_refuse_filesystem_snapshot_aliases() {
+        let error = parse_volume_clone_create_operands(
+            None,
+            &["tank".into(), "clone".into(), "filesystem-before".into()],
+        )
+        .unwrap_err();
+        assert!(error.contains("filesystem snapshot alias"));
+        assert!(error.contains("not an independently writable dataset"));
     }
 
     #[test]

@@ -225,7 +225,9 @@ impl PoolRuntime {
             pending_metadata: None,
             publication_requires_reopen: false,
         };
+        runtime.root.catalog.validate_published_lineage()?;
         runtime.validate_snapshot_roots()?;
+        runtime.validate_volume_clones()?;
         Ok(runtime)
     }
 
@@ -818,6 +820,8 @@ impl PoolRuntime {
             DatasetFlags::READONLY.union(DatasetFlags::CHECKSUMS),
             self.root.catalog.sync_guarantee(source_path)?,
         )?;
+        next.catalog.set_lineage_parent(path, volume.dataset_id)?;
+        next.catalog.publish_root(path)?;
         next.dataset_roots.insert(snapshot_id, snapshot_reference);
         next.dataset_roots
             .insert(volume.dataset_id, volume_reference);
@@ -964,6 +968,132 @@ impl PoolRuntime {
         let mut next = self.root.clone();
         next.catalog.destroy(path)?;
         next.dataset_roots.remove(&snapshot_id);
+        next.generation = next_generation(next.generation)?;
+        self.publish_root(next)?;
+        Ok(summary)
+    }
+
+    /// Atomically create one writable volume clone from a canonical snapshot.
+    ///
+    /// The clone receives its own stable dataset identity and typed volume
+    /// root. Its initial immutable map may share the captured snapshot graph;
+    /// later writes publish target-namespaced chunks and map nodes.
+    pub fn create_volume_clone(
+        &mut self,
+        clone_path: &str,
+        snapshot_path: &str,
+    ) -> Result<VolumeCloneSummary> {
+        self.ensure_publishable()?;
+        if self.pending_metadata.is_some() {
+            return Err(PoolRuntimeError::CorruptRoot(
+                "pending metadata must publish before volume clone creation",
+            ));
+        }
+        if clone_path.contains('@') {
+            return Err(PoolRuntimeError::InvalidVolume(
+                "clone target must be an ordinary dataset path",
+            ));
+        }
+        if self.root.catalog.contains(clone_path) {
+            return Err(PoolRuntimeError::InvalidVolume(
+                "clone target already exists",
+            ));
+        }
+
+        let (snapshot_id, snapshot_reference, snapshot_root) =
+            self.open_volume_snapshot(snapshot_path)?;
+        let (source_path, captured_root) =
+            self.validate_volume_snapshot(snapshot_path, snapshot_reference, &snapshot_root)?;
+        let clone_id = volume_clone_dataset_id(clone_path, snapshot_id);
+        if self.root.catalog.get_by_id(&clone_id).is_some() {
+            return Err(PoolRuntimeError::InvalidVolume(
+                "derived clone identity collides with an existing dataset",
+            ));
+        }
+
+        let clone_bytes = encode_volume_root(&captured_root);
+        let clone_reference = make_dataset_root_ref(
+            clone_id,
+            DatasetRootKind::Volume,
+            captured_root.generation,
+            &clone_bytes,
+        );
+        let mut next = self.root.clone();
+        let pool_generation = next_generation(next.generation)?;
+        let (_, _, _, _, source_flags, _) = next
+            .catalog
+            .get_by_id(&snapshot_root.source_reference.dataset_id)
+            .ok_or(PoolRuntimeError::InvalidSnapshot(
+                "snapshot source is missing from the catalog",
+            ))?;
+        let clone_flags =
+            DatasetFlags::from_bits(source_flags.bits() & !DatasetFlags::READONLY.bits())
+                .union(DatasetFlags::CLONE)
+                .union(DatasetFlags::CHECKSUMS);
+        next.catalog.create(
+            clone_path,
+            clone_id,
+            DatasetType::Volume,
+            pool_generation,
+            Vec::new(),
+            clone_flags,
+            self.root.catalog.sync_guarantee(&source_path)?,
+        )?;
+        next.catalog.set_lineage_parent(clone_path, snapshot_id)?;
+        next.catalog.publish_root(clone_path)?;
+        next.dataset_roots.insert(clone_id, clone_reference);
+        next.generation = pool_generation;
+
+        self.pool.put(
+            DeviceIoClass::Data,
+            clone_reference.object_key,
+            &clone_bytes,
+        )?;
+        self.pool.sync_all()?;
+        self.publish_root(next)?;
+
+        Ok(VolumeCloneSummary {
+            path: clone_path.to_string(),
+            clone_id,
+            source_snapshot_path: snapshot_path.to_string(),
+            source_snapshot_id: snapshot_id,
+            source_volume_path: source_path,
+            source_volume_id: snapshot_root.source_reference.dataset_id,
+            generation: captured_root.generation,
+            geometry: captured_root.geometry,
+            promoted: false,
+        })
+    }
+
+    /// Atomically sever one volume clone's snapshot lineage.
+    pub fn promote_volume_clone(&mut self, path: &str) -> Result<VolumeCloneSummary> {
+        self.ensure_publishable()?;
+        if self.pending_metadata.is_some() {
+            return Err(PoolRuntimeError::CorruptRoot(
+                "pending metadata must publish before volume clone promotion",
+            ));
+        }
+        let mut summary = self.open_volume_clone(path)?;
+        let mut next = self.root.clone();
+        next.catalog.promote_clone(path)?;
+        next.generation = next_generation(next.generation)?;
+        self.publish_root(next)?;
+        summary.promoted = true;
+        Ok(summary)
+    }
+
+    /// Atomically remove one unpromoted volume clone's catalog and root.
+    pub fn destroy_volume_clone(&mut self, path: &str) -> Result<VolumeCloneSummary> {
+        self.ensure_publishable()?;
+        if self.pending_metadata.is_some() {
+            return Err(PoolRuntimeError::CorruptRoot(
+                "pending metadata must publish before volume clone destroy",
+            ));
+        }
+        let summary = self.open_volume_clone(path)?;
+        let mut next = self.root.clone();
+        next.catalog.destroy(path)?;
+        next.dataset_roots.remove(&summary.clone_id);
         next.generation = next_generation(next.generation)?;
         self.publish_root(next)?;
         Ok(summary)
@@ -1178,6 +1308,75 @@ impl PoolRuntime {
         }
         Ok(())
     }
+
+    fn validate_volume_clones(&self) -> Result<()> {
+        for (path, _, dataset_type, _, flags, _) in self.root.catalog.list_all() {
+            if dataset_type == DatasetType::Volume && flags.contains(DatasetFlags::CLONE) {
+                let _ = self.open_volume_clone(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn open_volume_clone(&self, path: &str) -> Result<VolumeCloneSummary> {
+        let clone_id = self.root.catalog.lookup(path)?;
+        let (_, _, dataset_type, _, flags, _) =
+            self.root
+                .catalog
+                .get_by_id(&clone_id)
+                .ok_or(PoolRuntimeError::CorruptRoot(
+                    "clone catalog lookup lost dataset identity",
+                ))?;
+        if dataset_type != DatasetType::Volume || !flags.contains(DatasetFlags::CLONE) {
+            return Err(PoolRuntimeError::InvalidVolume(
+                "dataset is not an unpromoted volume clone",
+            ));
+        }
+        if !self.root.catalog.is_published(path)? {
+            return Err(PoolRuntimeError::InvalidVolume(
+                "volume clone lineage is not published",
+            ));
+        }
+        let source_snapshot_id =
+            self.root
+                .catalog
+                .lineage_parent(path)?
+                .ok_or(PoolRuntimeError::InvalidVolume(
+                    "volume clone has no snapshot lineage parent",
+                ))?;
+        let (source_snapshot_path, _, source_type, _, _, _) =
+            self.root.catalog.get_by_id(&source_snapshot_id).ok_or(
+                PoolRuntimeError::InvalidVolume("volume clone snapshot parent is missing"),
+            )?;
+        if source_type != DatasetType::Snapshot {
+            return Err(PoolRuntimeError::InvalidVolume(
+                "volume clone lineage parent is not a snapshot",
+            ));
+        }
+        let snapshot_reference = *self
+            .root
+            .dataset_roots
+            .get(&source_snapshot_id)
+            .ok_or(PoolRuntimeError::MissingRoot(source_snapshot_id))?;
+        let snapshot_root = self.load_snapshot_root(source_snapshot_id)?;
+        let (source_volume_path, _source_root) = self.validate_volume_snapshot(
+            &source_snapshot_path,
+            snapshot_reference,
+            &snapshot_root,
+        )?;
+        let clone = self.open_volume(path)?;
+        Ok(VolumeCloneSummary {
+            path: path.to_string(),
+            clone_id,
+            source_snapshot_path,
+            source_snapshot_id,
+            source_volume_path,
+            source_volume_id: snapshot_root.source_reference.dataset_id,
+            generation: clone.root.generation,
+            geometry: clone.root.geometry,
+            promoted: false,
+        })
+    }
 }
 
 /// Committed local-volume geometry.
@@ -1220,6 +1419,20 @@ pub struct VolumeSnapshotRestoreResult {
     pub generation: u64,
     pub resize_generation: u64,
     pub snapshot_generation: u64,
+}
+
+/// Operator-visible identity and state of one Pool-backed writable clone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeCloneSummary {
+    pub path: String,
+    pub clone_id: DatasetId,
+    pub source_snapshot_path: String,
+    pub source_snapshot_id: DatasetId,
+    pub source_volume_path: String,
+    pub source_volume_id: DatasetId,
+    pub generation: u64,
+    pub geometry: VolumeGeometry,
+    pub promoted: bool,
 }
 
 impl VolumeGeometry {
@@ -1573,6 +1786,16 @@ fn volume_snapshot_dataset_id(path: &str, source_id: DatasetId) -> DatasetId {
     let mut identity = Vec::with_capacity(path.len().saturating_add(48));
     identity.extend_from_slice(b"tidefs:volume-snapshot-id:v1\0");
     identity.extend_from_slice(source_id.as_bytes());
+    identity.extend_from_slice(path.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&blake3::hash(&identity).as_bytes()[..16]);
+    DatasetId::from_bytes(bytes)
+}
+
+fn volume_clone_dataset_id(path: &str, snapshot_id: DatasetId) -> DatasetId {
+    let mut identity = Vec::with_capacity(path.len().saturating_add(48));
+    identity.extend_from_slice(b"tidefs:volume-clone-id:v1\0");
+    identity.extend_from_slice(snapshot_id.as_bytes());
     identity.extend_from_slice(path.as_bytes());
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&blake3::hash(&identity).as_bytes()[..16]);
@@ -2813,6 +3036,84 @@ mod tests {
                 "snapshot source root cannot itself be a snapshot"
             ))
         ));
+    }
+
+    #[test]
+    fn volume_clone_is_independent_cow_and_retains_snapshot_until_promoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        create_volume(&mut owner, "source", 45);
+        let mut source = owner.open_volume("source").unwrap();
+        source.write_blocks(&owner, 0, &vec![0x11; 4096]).unwrap();
+        source.flush(&mut owner).unwrap();
+        owner.create_volume_snapshot("source@base").unwrap();
+
+        let created = owner.create_volume_clone("clone", "source@base").unwrap();
+        assert_eq!(created.path, "clone");
+        assert_eq!(created.source_snapshot_path, "source@base");
+        assert_eq!(created.geometry.capacity_bytes, 4 * 1024 * 1024);
+        assert!(!created.promoted);
+
+        let mut clone = owner.open_volume("clone").unwrap();
+        assert_eq!(clone.read_blocks(&owner, 0, 1).unwrap(), vec![0x11; 4096]);
+        clone.write_blocks(&owner, 0, &vec![0x22; 4096]).unwrap();
+        clone.flush(&mut owner).unwrap();
+        assert_eq!(
+            owner
+                .open_volume("source")
+                .unwrap()
+                .read_blocks(&owner, 0, 1)
+                .unwrap(),
+            vec![0x11; 4096]
+        );
+        assert!(matches!(
+            owner.destroy_volume_snapshot("source@base"),
+            Err(PoolRuntimeError::Catalog(CatalogError::LineageInUse))
+        ));
+
+        let mut owner = reopen(owner);
+        assert_eq!(
+            owner
+                .open_volume("clone")
+                .unwrap()
+                .read_blocks(&owner, 0, 1)
+                .unwrap(),
+            vec![0x22; 4096]
+        );
+        assert_eq!(
+            owner
+                .open_volume("source")
+                .unwrap()
+                .read_blocks(&owner, 0, 1)
+                .unwrap(),
+            vec![0x11; 4096]
+        );
+
+        let promoted = owner.promote_volume_clone("clone").unwrap();
+        assert!(promoted.promoted);
+        owner.destroy_volume_snapshot("source@base").unwrap();
+        assert!(owner.open_volume("clone").is_ok());
+        assert!(matches!(
+            owner.destroy_volume_clone("clone"),
+            Err(PoolRuntimeError::InvalidVolume(
+                "dataset is not an unpromoted volume clone"
+            ))
+        ));
+    }
+
+    #[test]
+    fn volume_clone_destroy_releases_snapshot_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        create_volume(&mut owner, "source", 46);
+        owner.create_volume_snapshot("source@base").unwrap();
+        let clone = owner.create_volume_clone("clone", "source@base").unwrap();
+
+        assert_eq!(owner.destroy_volume_clone("clone").unwrap(), clone);
+        owner.destroy_volume_snapshot("source@base").unwrap();
+        let owner = reopen(owner);
+        assert!(owner.open_volume("clone").is_err());
+        assert!(owner.dataset_catalog().lookup("source@base").is_err());
     }
 
     #[test]

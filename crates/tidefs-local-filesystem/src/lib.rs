@@ -2983,6 +2983,57 @@ impl LocalFileSystem {
         result.map_err(FileSystemError::from)
     }
 
+    /// Atomically create one writable Pool volume clone from a canonical
+    /// volume snapshot.
+    pub fn create_volume_clone_dataset(
+        &mut self,
+        clone_path: &str,
+        snapshot_path: &str,
+    ) -> Result<tidefs_pool_runtime::VolumeCloneSummary> {
+        self.ensure_mutation_allowed("create Pool volume clone")?;
+        let result = self.store.create_volume_clone(clone_path, snapshot_path);
+        if matches!(
+            &result,
+            Err(tidefs_pool_runtime::PoolRuntimeError::PublicationOutcomeUncertain(_))
+        ) {
+            self.arm_mutation_reopen_fence();
+        }
+        result.map_err(FileSystemError::from)
+    }
+
+    /// Atomically sever one Pool volume clone's snapshot lineage while
+    /// retaining its writable dataset and bytes.
+    pub fn promote_volume_clone_dataset(
+        &mut self,
+        path: &str,
+    ) -> Result<tidefs_pool_runtime::VolumeCloneSummary> {
+        self.ensure_mutation_allowed("promote Pool volume clone")?;
+        let result = self.store.promote_volume_clone(path);
+        if matches!(
+            &result,
+            Err(tidefs_pool_runtime::PoolRuntimeError::PublicationOutcomeUncertain(_))
+        ) {
+            self.arm_mutation_reopen_fence();
+        }
+        result.map_err(FileSystemError::from)
+    }
+
+    /// Atomically remove one unpromoted Pool volume clone's catalog and root.
+    pub fn destroy_volume_clone_dataset(
+        &mut self,
+        path: &str,
+    ) -> Result<tidefs_pool_runtime::VolumeCloneSummary> {
+        self.ensure_mutation_allowed("destroy Pool volume clone")?;
+        let result = self.store.destroy_volume_clone(path);
+        if matches!(
+            &result,
+            Err(tidefs_pool_runtime::PoolRuntimeError::PublicationOutcomeUncertain(_))
+        ) {
+            self.arm_mutation_reopen_fence();
+        }
+        result.map_err(FileSystemError::from)
+    }
+
     /// Atomically remove one named Pool-backed volume's catalog entry and
     /// typed root. Physical reclaim remains separate.
     pub fn destroy_volume_dataset(&mut self, path: &str) -> Result<DatasetId> {

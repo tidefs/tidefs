@@ -82,7 +82,7 @@ enum Command {
         #[command(subcommand)]
         cmd: commands::device::DeviceCommand,
     },
-    /// Manage filesystem snapshots
+    /// Manage filesystem/volume snapshots and writable volume clones
     Snapshot {
         #[command(subcommand)]
         cmd: commands::snapshot::SnapshotCommand,
@@ -1003,7 +1003,7 @@ mod tests {
                 "create",
                 "mypool",
                 "clone-a",
-                "snap-a",
+                "volume-a@snap-a",
             ]
             .as_slice(),
             [

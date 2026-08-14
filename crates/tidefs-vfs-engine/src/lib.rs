@@ -1929,6 +1929,9 @@ pub enum LivePoolAdminCommand {
     DatasetRotateKey,
     SnapshotCreate,
     SnapshotList,
+    SnapshotCloneCreate,
+    SnapshotCloneDelete,
+    SnapshotClonePromote,
     SnapshotDestroy,
     SnapshotRollback,
     SnapshotExtract,
@@ -1979,6 +1982,21 @@ const LIVE_POOL_ADMIN_COMMAND_ROUTES: &[(LivePoolAdminCommand, &str, &str)] = &[
     ),
     (LivePoolAdminCommand::SnapshotCreate, "snapshot", "create"),
     (LivePoolAdminCommand::SnapshotList, "snapshot", "list"),
+    (
+        LivePoolAdminCommand::SnapshotCloneCreate,
+        "snapshot",
+        "clone-create",
+    ),
+    (
+        LivePoolAdminCommand::SnapshotCloneDelete,
+        "snapshot",
+        "clone-delete",
+    ),
+    (
+        LivePoolAdminCommand::SnapshotClonePromote,
+        "snapshot",
+        "clone-promote",
+    ),
     (LivePoolAdminCommand::SnapshotDestroy, "snapshot", "destroy"),
     (
         LivePoolAdminCommand::SnapshotRollback,

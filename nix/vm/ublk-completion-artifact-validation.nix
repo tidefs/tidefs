@@ -273,6 +273,8 @@ ERROR_STARTED_EXPORT_ARTIFACT=/tmp/validation/ublk/started-export-admission-erro
 POOL_DEVICE=/dev/vda
 POOL_NAME=ublk_completion_pool
 VOLUME_NAME=completion
+CLONE_NAME=completion_clone
+DELETE_CLONE_NAME=completion_clone_delete
 ERROR_VOLUME_NAME=completion_error
 SNAPSHOT_TARGET="$POOL_NAME/$VOLUME_NAME@before_overwrite"
 VOLUME_SIZE_BYTES=$((BLOCK_COUNT * 4096))
@@ -285,6 +287,9 @@ ATTACH_LOG=/tmp/tidefs-ublk-attach.log
 ERROR_ATTACH_LOG=/tmp/tidefs-ublk-attach-error.log
 LIFECYCLE_ARTIFACT=/tmp/validation/ublk/lifecycle-completion.json
 LIFECYCLE_STARTED_ARTIFACT=/tmp/validation/ublk/lifecycle-started-export.json
+CLONE_ARTIFACT=/tmp/validation/ublk/clone-completion.json
+CLONE_STARTED_ARTIFACT=/tmp/validation/ublk/clone-started-export.json
+CLONE_ATTACH_LOG=/tmp/tidefs-ublk-clone-attach.log
 
 create_pool_volumes() {
     for _ in $(seq 1 30); do
@@ -507,6 +512,7 @@ make_pattern_file /tmp/discard-pattern D
 make_pattern_file /tmp/write-zeroes-pattern Z
 make_pattern_file /tmp/removed-tail-pattern T
 make_pattern_file /tmp/overwritten-pattern O
+make_pattern_file /tmp/clone-pattern C
 make_zero_file /tmp/zero-pattern
 
 write_expected_block /tmp/retained-pattern "$RETAINED_OFFSET" "retained-prefix pattern"
@@ -567,6 +573,26 @@ if ! grep -F "actively exported" /tmp/active-snapshot-create.log >/dev/null; the
 fi
 echo "PASS: active volume export refused concurrent snapshot create"
 
+if [ "$SCENARIO" = "qemu-ublk-smoke" ]; then
+    set +e
+    tidefsctl snapshot clone create "$POOL_NAME" "$CLONE_NAME" \
+        "$VOLUME_NAME@before_overwrite" --devices "$POOL_DEVICE" \
+        >/tmp/active-clone-create.log 2>&1
+    ACTIVE_CLONE_CREATE_RC=$?
+    set -e
+    if [ "$ACTIVE_CLONE_CREATE_RC" -eq 0 ]; then
+        echo "FAIL: clone create succeeded while its source volume was actively exported"
+        cat /tmp/active-clone-create.log 2>&1 || true
+        poweroff -f
+    fi
+    if ! grep -F "actively exported" /tmp/active-clone-create.log >/dev/null; then
+        echo "FAIL: active source clone create did not report export admission refusal"
+        cat /tmp/active-clone-create.log 2>&1 || true
+        poweroff -f
+    fi
+    echo "PASS: active source volume export refused concurrent clone create"
+fi
+
 stop_attach() {
     attach_log="$1"
     echo "--- Stop tidefsctl block attach ---"
@@ -605,6 +631,73 @@ if ! tidefsctl snapshot list "$POOL_NAME" --devices "$POOL_DEVICE" \
 fi
 echo "PASS: committed volume snapshot created and listed"
 
+if [ "$SCENARIO" = "qemu-ublk-smoke" ]; then
+    echo "--- Create and mutate writable volume clone ---"
+    if ! tidefsctl snapshot clone create "$POOL_NAME" "$CLONE_NAME" \
+        "$VOLUME_NAME@before_overwrite" --devices "$POOL_DEVICE" \
+        >/tmp/clone-create.log 2>&1; then
+        echo "FAIL: writable volume clone create"
+        cat /tmp/clone-create.log 2>&1 || true
+        poweroff -f
+    fi
+    if ! grep -F "kind=volume" /tmp/clone-create.log >/dev/null; then
+        echo "FAIL: clone create did not report a volume dataset"
+        cat /tmp/clone-create.log 2>&1 || true
+        poweroff -f
+    fi
+    start_attach "$CLONE_ARTIFACT" "$CLONE_STARTED_ARTIFACT" "$CLONE_NAME" \
+        "$CLONE_ATTACH_LOG" "$SCENARIO" none "$VOLUME_SIZE_BYTES"
+    verify_expected_block /tmp/retained-pattern "$RETAINED_OFFSET" "clone sees captured source bytes"
+    verify_expected_block /tmp/zero-pattern "$DISCARD_OFFSET" "clone sees captured discarded range"
+    verify_expected_block /tmp/zero-pattern "$WRITE_ZEROES_OFFSET" "clone sees captured write-zeroes range"
+    verify_expected_block /tmp/removed-tail-pattern "$REMOVED_TAIL_OFFSET" "clone sees captured geometry tail"
+
+    write_expected_block /tmp/clone-pattern "$RETAINED_OFFSET" "clone private write"
+    write_expected_block /tmp/discard-pattern "$DISCARD_OFFSET" "clone discard setup"
+    write_expected_block /tmp/write-zeroes-pattern "$WRITE_ZEROES_OFFSET" "clone write-zeroes setup"
+    if ! blkdiscard -f --offset "$DISCARD_OFFSET" --length 4096 /dev/ublkb0 \
+        2>/tmp/clone-discard.err; then
+        echo "FAIL: clone discard"
+        cat /tmp/clone-discard.err 2>&1 || true
+        poweroff -f
+    fi
+    if ! blkdiscard -z -f --offset "$WRITE_ZEROES_OFFSET" --length 4096 /dev/ublkb0 \
+        2>/tmp/clone-write-zeroes.err; then
+        echo "FAIL: clone write zeroes"
+        cat /tmp/clone-write-zeroes.err 2>&1 || true
+        poweroff -f
+    fi
+    if ! blockdev --flushbufs /dev/ublkb0 2>/tmp/clone-flush.err; then
+        echo "FAIL: clone flush"
+        cat /tmp/clone-flush.err 2>&1 || true
+        poweroff -f
+    fi
+    verify_expected_block /tmp/clone-pattern "$RETAINED_OFFSET" "clone private write before reopen"
+    verify_expected_block /tmp/zero-pattern "$DISCARD_OFFSET" "clone discard before reopen"
+    verify_expected_block /tmp/zero-pattern "$WRITE_ZEROES_OFFSET" "clone write zeroes before reopen"
+
+    for clone_operation in delete promote; do
+        set +e
+        tidefsctl snapshot clone "$clone_operation" "$POOL_NAME" "$CLONE_NAME" \
+            --devices "$POOL_DEVICE" >"/tmp/active-clone-$clone_operation.log" 2>&1
+        ACTIVE_CLONE_RC=$?
+        set -e
+        if [ "$ACTIVE_CLONE_RC" -eq 0 ]; then
+            echo "FAIL: clone $clone_operation succeeded while the clone export was active"
+            cat "/tmp/active-clone-$clone_operation.log" 2>&1 || true
+            poweroff -f
+        fi
+        if ! grep -F "actively exported" "/tmp/active-clone-$clone_operation.log" >/dev/null; then
+            echo "FAIL: active clone $clone_operation did not report export admission refusal"
+            cat "/tmp/active-clone-$clone_operation.log" 2>&1 || true
+            poweroff -f
+        fi
+    done
+    echo "PASS: active clone export refused concurrent delete and promote"
+    stop_attach "$CLONE_ATTACH_LOG"
+    wait_ublk_gone
+fi
+
 echo "--- Reopen committed volume data ---"
 start_attach "$LIFECYCLE_ARTIFACT" "$LIFECYCLE_STARTED_ARTIFACT" "$VOLUME_NAME" \
     "$ATTACH_LOG" "$SCENARIO" none "$VOLUME_SIZE_BYTES"
@@ -641,6 +734,18 @@ echo "PASS: active volume export refused concurrent snapshot rollback and destro
 stop_attach "$ATTACH_LOG"
 wait_ublk_gone
 
+if [ "$SCENARIO" = "qemu-ublk-smoke" ]; then
+    echo "--- Reopen diverged volume clone ---"
+    start_attach "$CLONE_ARTIFACT" "$CLONE_STARTED_ARTIFACT" "$CLONE_NAME" \
+        "$CLONE_ATTACH_LOG" "$SCENARIO" none "$VOLUME_SIZE_BYTES"
+    verify_expected_block /tmp/clone-pattern "$RETAINED_OFFSET" "clone private write after reopen"
+    verify_expected_block /tmp/zero-pattern "$DISCARD_OFFSET" "clone discard after reopen"
+    verify_expected_block /tmp/zero-pattern "$WRITE_ZEROES_OFFSET" "clone write zeroes after reopen"
+    verify_expected_block /tmp/removed-tail-pattern "$REMOVED_TAIL_OFFSET" "clone retained captured tail after reopen"
+    stop_attach "$CLONE_ATTACH_LOG"
+    wait_ublk_gone
+fi
+
 echo "--- Restore exact snapshot bytes and geometry ---"
 if ! tidefsctl dataset resize "$POOL_NAME/$VOLUME_NAME" --size "$SHRUNK_VOLUME_SIZE_BYTES" \
     --devices "$POOL_DEVICE" >/tmp/snapshot-pre-restore-shrink.log 2>&1; then
@@ -666,6 +771,66 @@ if ! tidefsctl snapshot list "$POOL_NAME" --devices "$POOL_DEVICE" \
     echo "FAIL: rollback did not retain volume snapshot"
     cat /tmp/snapshot-retained-list.log 2>&1 || true
     poweroff -f
+fi
+if [ "$SCENARIO" = "qemu-ublk-smoke" ]; then
+    set +e
+    tidefsctl snapshot destroy "$SNAPSHOT_TARGET" --devices "$POOL_DEVICE" \
+        >/tmp/clone-lineage-snapshot-destroy.log 2>&1
+    CLONE_LINEAGE_DESTROY_RC=$?
+    set -e
+    if [ "$CLONE_LINEAGE_DESTROY_RC" -eq 0 ]; then
+        echo "FAIL: snapshot destroy succeeded while a clone retained its lineage"
+        cat /tmp/clone-lineage-snapshot-destroy.log 2>&1 || true
+        poweroff -f
+    fi
+    if ! grep -F "retained by published clone" /tmp/clone-lineage-snapshot-destroy.log >/dev/null; then
+        echo "FAIL: snapshot lineage refusal was not explicit"
+        cat /tmp/clone-lineage-snapshot-destroy.log 2>&1 || true
+        poweroff -f
+    fi
+
+    if ! tidefsctl snapshot clone create "$POOL_NAME" "$DELETE_CLONE_NAME" \
+        "$VOLUME_NAME@before_overwrite" --devices "$POOL_DEVICE" \
+        >/tmp/delete-clone-create.log 2>&1; then
+        echo "FAIL: disposable clone create"
+        cat /tmp/delete-clone-create.log 2>&1 || true
+        poweroff -f
+    fi
+    if ! tidefsctl snapshot clone delete "$POOL_NAME" "$DELETE_CLONE_NAME" \
+        --devices "$POOL_DEVICE" >/tmp/delete-clone.log 2>&1; then
+        echo "FAIL: disposable clone delete"
+        cat /tmp/delete-clone.log 2>&1 || true
+        poweroff -f
+    fi
+    if ! tidefsctl snapshot list "$POOL_NAME" --devices "$POOL_DEVICE" \
+        >/tmp/post-clone-delete-list.log 2>&1 || \
+        ! grep -F "$VOLUME_NAME@before_overwrite" /tmp/post-clone-delete-list.log >/dev/null; then
+        echo "FAIL: clone delete removed or hid its source snapshot"
+        cat /tmp/post-clone-delete-list.log 2>&1 || true
+        poweroff -f
+    fi
+    set +e
+    tidefsctl block attach "$POOL_NAME/$DELETE_CLONE_NAME" --devices "$POOL_DEVICE" \
+        >/tmp/deleted-clone-attach.log 2>&1
+    DELETED_CLONE_ATTACH_RC=$?
+    set -e
+    if [ "$DELETED_CLONE_ATTACH_RC" -eq 0 ] || [ -b /dev/ublkb0 ]; then
+        echo "FAIL: deleted clone remained attachable"
+        cat /tmp/deleted-clone-attach.log 2>&1 || true
+        poweroff -f
+    fi
+    if ! tidefsctl snapshot clone promote "$POOL_NAME" "$CLONE_NAME" \
+        --devices "$POOL_DEVICE" >/tmp/clone-promote.log 2>&1; then
+        echo "FAIL: volume clone promote"
+        cat /tmp/clone-promote.log 2>&1 || true
+        poweroff -f
+    fi
+    if ! grep -F "promoted=true" /tmp/clone-promote.log >/dev/null; then
+        echo "FAIL: clone promotion output did not report severed lineage"
+        cat /tmp/clone-promote.log 2>&1 || true
+        poweroff -f
+    fi
+    echo "PASS: clone lineage retained the snapshot until delete or promotion"
 fi
 if ! tidefsctl snapshot destroy "$SNAPSHOT_TARGET" --devices "$POOL_DEVICE" \
     >/tmp/snapshot-destroy.log 2>&1; then
@@ -695,6 +860,33 @@ if [ "$DESTROYED_SNAPSHOT_ROLLBACK_RC" -eq 0 ]; then
     poweroff -f
 fi
 echo "PASS: volume snapshot retained, logically destroyed, and later restore refused"
+
+if [ "$SCENARIO" = "qemu-ublk-smoke" ]; then
+    echo "--- Reopen promoted volume clone after source snapshot destroy ---"
+    start_attach "$CLONE_ARTIFACT" "$CLONE_STARTED_ARTIFACT" "$CLONE_NAME" \
+        "$CLONE_ATTACH_LOG" "$SCENARIO" none "$VOLUME_SIZE_BYTES"
+    verify_expected_block /tmp/clone-pattern "$RETAINED_OFFSET" "promoted clone retained private bytes"
+    verify_expected_block /tmp/removed-tail-pattern "$REMOVED_TAIL_OFFSET" "promoted clone retained captured geometry"
+    stop_attach "$CLONE_ATTACH_LOG"
+    wait_ublk_gone
+    if ! tidefsctl dataset destroy "$POOL_NAME/$CLONE_NAME" --devices "$POOL_DEVICE" \
+        >/tmp/promoted-clone-destroy.log 2>&1; then
+        echo "FAIL: promoted clone dataset destroy"
+        cat /tmp/promoted-clone-destroy.log 2>&1 || true
+        poweroff -f
+    fi
+    set +e
+    tidefsctl block attach "$POOL_NAME/$CLONE_NAME" --devices "$POOL_DEVICE" \
+        >/tmp/destroyed-clone-attach.log 2>&1
+    DESTROYED_CLONE_ATTACH_RC=$?
+    set -e
+    if [ "$DESTROYED_CLONE_ATTACH_RC" -eq 0 ] || [ -b /dev/ublkb0 ]; then
+        echo "FAIL: destroyed promoted clone attached successfully"
+        cat /tmp/destroyed-clone-attach.log 2>&1 || true
+        poweroff -f
+    fi
+    echo "PASS: promoted clone survived source snapshot destroy and later dataset destroy refused attach"
+fi
 
 echo "--- Shrink committed volume geometry ---"
 if ! tidefsctl dataset resize "$POOL_NAME/$VOLUME_NAME" --size "$SHRUNK_VOLUME_SIZE_BYTES" \

@@ -144,6 +144,32 @@ its own lifecycle pin and catalog entry. The clone remains usable; the dangling
 origin is detectable via `clone_origin()` which returns the stored name even
 when the origin snapshot no longer exists.
 
+### 2.6 Product clone boundary and volume clones
+
+The filesystem lifecycle above is a `SnapshotRecord` shared-root alias. It is
+data-retaining metadata for filesystem snapshot/deadlist work, but it is not a
+separate writable filesystem dataset and cannot be mounted independently.
+`tidefsctl snapshot clone create` therefore refuses filesystem snapshot
+sources with that precise unsupported result; it does not report this alias as
+a writable product clone.
+
+Local volume clones use the canonical Pool runtime instead. A volume clone is
+a new `DatasetType::Volume` with its own stable `DatasetId`, typed volume root,
+and `DatasetFlags::CLONE`, plus a published lineage parent naming the exact
+canonical volume snapshot. Its initial map may reference the snapshot's
+immutable map/chunk graph, while clone writes publish clone-`DatasetId`
+namespaced successors. Snapshot destroy refuses while this published lineage
+exists. Promotion removes the lineage and clone flag without changing the
+clone's bytes; clone delete removes only an unpromoted clone's catalog/root
+authority. Pool reopen validates every published lineage edge and every
+remaining volume-clone root. The live owner also refuses create while the
+source volume is exported and refuses delete or promote while the clone is
+exported.
+
+Source: `crates/tidefs-pool-runtime/src/lib.rs`,
+`crates/tidefs-dataset-catalog/src/lib.rs`, and
+`apps/tidefs-posix-filesystem-adapter-daemon/src/live_owner.rs`.
+
 ## 3. Bookmark Model
 
 ### 3.1 Purpose
@@ -510,17 +536,23 @@ compute_export_identity, receive_changed_records_into_staging_with_skip.
    unpin the root while clones still reference it (enforced by independent
    lifecycle pins per record).
 
-3. **Incremental receive base-root invariant**: The base root for an incremental
+3. **Volume-clone lineage invariant**: Every unpromoted writable volume clone
+   is a complete typed volume dataset whose published catalog lineage parent
+   names a canonical typed volume snapshot. Snapshot destroy must refuse that
+   dependency; promotion must sever it without changing bytes; reopen must
+   reject missing, stale, cross-authority, or wrong-root lineage.
+
+4. **Incremental receive base-root invariant**: The base root for an incremental
    receive must be a data-retaining snapshot or clone in the target, protected
    by the snapshot authority. The target must hold all content objects that
    the incremental stream omits.
 
-4. **Stream integrity invariant**: Every changed-record export must carry a
+5. **Stream integrity invariant**: Every changed-record export must carry a
    self-describing spec and stream version. Every record must carry a checksum.
    The receiver must validate the spec, version, and per-record checksums
    before persisting any object.
 
-5. **Deadlist invariant (design decided, not implemented)**: After a
+6. **Deadlist invariant (design decided, not implemented)**: After a
    snapshot or clone is deleted and its lifecycle pin is released, objects
    reachable only through that released root must be persisted as
    receipt-bound dead-object candidates. No object may appear on the deadlist
@@ -530,9 +562,13 @@ compute_export_identity, receive_changed_records_into_staging_with_skip.
 
 ### 7.3 What the authority model requires of future changes
 
-- Any new snapshot or clone lifecycle operation must go through the four-part
+- Any new filesystem snapshot or snapshot-table clone lifecycle operation must
+  go through the four-part
   authority (state map, catalog, typed Pool root, lifecycle pins) and call
   `ensure_snapshot_authority_consistent` before mutating.
+- Any volume-clone lifecycle operation must publish its catalog, typed volume
+  root, and exact typed-snapshot lineage through one Pool-root transition and
+  must preserve target-`DatasetId` namespacing for every new mutable successor.
 - Any deadlist implementation must follow the section 4 decision: entries are
   derived from released roots after subtracting the current root and pinned
   lifecycle roots, persisted through the receipt-bound dead-object reclaim
@@ -548,6 +584,8 @@ compute_export_identity, receive_changed_records_into_staging_with_skip.
 ### 8.1 In scope (this document)
 
 - Single-node local-filesystem snapshot, clone, bookmark, hold, and retention.
+- Single-node local-volume writable clone creation, promotion, deletion,
+  lineage retention, and active-export fencing.
 - Single-node local-filesystem send/receive stream format, export, and import.
 - Cross-subsystem contracts between snapshot state, catalog, lifecycle pins,
   and object store.
