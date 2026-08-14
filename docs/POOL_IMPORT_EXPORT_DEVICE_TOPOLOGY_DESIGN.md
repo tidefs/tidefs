@@ -25,6 +25,14 @@ The current source-backed pool import/export boundary is:
   replace device label updates.
 - `crates/tidefs-local-object-store/src/device_health.rs`: device health state
   used by topology management.
+- `crates/tidefs-local-object-store/src/pool/mod.rs`: durable removal marker,
+  allocation fence, receipt-backed evacuation, survivor topology publication,
+  and redundant byte-device label writes.
+- `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` and `recovery.rs`:
+  mounted-owner receipt reconciliation, authenticated-root refresh, and
+  marker-bound interrupted-removal recovery.
+- `apps/tidefsctl/src/commands/device.rs`: live-owner-only local removal
+  routing and truthful operator projection.
 
 This document does not supersede source. If source and this summary disagree,
 source plus focused validation wins and this file must be corrected.
@@ -49,11 +57,47 @@ health, read-only/read-write access, expected/present/missing counts, and an
 indexed GUID/presence list. This boundary adds truthful read-only degraded
 status only; it does not authorize writable degraded import or rebuild.
 
+## Mounted Online Removal Boundary
+
+The bounded local removal path is owned by the reachable mounted filesystem,
+not by an offline CLI helper. It syncs mounted state, refuses before evacuation
+when another dataset or a data-retaining snapshot/clone owns an immutable root,
+persists a removal marker, and allocation-fences the target. Pool evacuation
+then rewrites every receipt-backed logical object to surviving members while
+the target stays attached.
+
+Chunk relocation advances placement-receipt generations. The mounted owner
+therefore validates survivor payload identity, writes changed content
+manifests under new inode data-version keys, and authenticates all resulting
+inode and manifest references in one filesystem transaction. It never
+overwrites predecessor-manifest bytes before that replacement root commits.
+Marker-bound recovery can consequently select the old or new authenticated
+root after any interruption: an old root admits only its unchanged predecessor
+manifest plus successor receipts that validate the same chunk identity,
+length, checksum, and payload. The owner then turns every one of the four
+retained filesystem root slots before detaching the target. Arbitrary receipt
+regressions or manifest changes remain corruption.
+
+After higher-layer roots are durable, Pool authority detaches the target and
+stages the reduced ordered GUID roster to redundant label copies on every
+survivor. Each copy is read back and verified before the marker clears. Import
+and scan select the highest complete checksummed roster; a partial higher
+generation cannot supersede the previous complete topology, and a retired
+member's stale lower-generation label does not restore membership.
+
+The operator result reports evacuation counts, committed topology generation,
+and remaining members. It explicitly provides no secure-erase,
+media-remanence, sanitization, or decommissioning guarantee. Failed-device
+loss, replacement/rebuild, writable degraded operation, multi-dataset atomic
+removal, and snapshot/clone root rewriting remain separate work.
+
 ## Authority Limits
 
-This file is not product-readiness evidence for hot spares, evacuation,
-cluster-aware pool ownership, online topology conversion, hardware failure
-survival, availability, operational safety, or incumbent comparison claims.
+This file is not product-readiness evidence for hot spares, general evacuation,
+cluster-aware pool ownership, arbitrary online topology conversion, hardware
+failure survival, availability, operational safety, or incumbent comparison
+claims. The mounted removal section describes only the exact present-member,
+single-filesystem local boundary above.
 Those scopes require current source evidence, runtime validation, and claim IDs
 where they become publishing-facing claims.
 

@@ -437,12 +437,26 @@ pub(crate) fn load_canonical_committed_state_for_dataset(
 ) -> Result<(FileSystemState, RootCommitRecord)> {
     let bytes = runtime.load_dataset_root(dataset_id, DatasetRootKind::Filesystem)?;
     let root = decode_root_commit(&bytes)?;
-    let mut state = load_state_from_transaction_pool_for_dataset(
+    let ordinary = load_state_from_transaction_pool_for_dataset(
         runtime.pool(),
         dataset_id,
         &root,
         root_authentication_key,
-    )?;
+    );
+    let mut state = match ordinary {
+        Ok(state) => state,
+        Err(error) => {
+            if runtime.pool().pending_device_removal_path()?.is_none() {
+                return Err(error);
+            }
+            load_state_from_transaction_pool_for_pending_removal(
+                runtime.pool(),
+                dataset_id,
+                &root,
+                root_authentication_key,
+            )?
+        }
+    };
     state.set_inode_authority_dataset_id(*dataset_id.as_bytes());
     Ok((state, root))
 }
@@ -2363,6 +2377,194 @@ pub(crate) fn load_state_from_transaction_pool_for_dataset(
     )?;
     state.set_inode_authority_dataset_id(*dataset_id.as_bytes());
     Ok(state)
+}
+
+/// Load an authenticated committed state while a durable device-removal
+/// marker keeps the predecessor member attached.
+///
+/// Ordinary recovery remains exact. This boundary admits only the one
+/// marker-bound transition that mounted removal owns: evacuation may advance
+/// a chunk's placement receipt while the still-authenticated predecessor
+/// manifest retains the prior generation. Every successor receipt must
+/// strictly read and validate the same chunk payload. Reconciliation itself
+/// is copy-on-write, so this path never admits changed predecessor-manifest
+/// bytes before their replacement root is durable.
+fn load_state_from_transaction_pool_for_pending_removal(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<FileSystemState> {
+    let keyspace = FilesystemObjectKeyspace::new(dataset_id);
+    let candidate =
+        read_pool_transaction_candidate_objects(pool, root, root_authentication_key, keyspace)?;
+    let superblock = decode_candidate_superblock(root, &candidate.superblock_bytes)?;
+    let mut state = load_state_from_superblock_for_content_inspection(
+        pool.raw_primary_store(),
+        &superblock,
+        root.transaction_id,
+        &candidate.manifest.entries,
+        Some(&candidate.objects),
+        keyspace,
+    )?;
+
+    let mut authenticated_content_checksums = BTreeMap::new();
+    for entry in &candidate.manifest.entries {
+        if entry.role != TransactionManifestObjectRole::VersionedContent {
+            continue;
+        }
+        if authenticated_content_checksums
+            .insert(entry.object_key, entry.checksum)
+            .is_some()
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "pending removal manifest repeats a versioned-content key",
+            });
+        }
+    }
+
+    validate_transaction_manifest_matches_loaded_state_with_content(
+        pool.raw_primary_store(),
+        root,
+        &state,
+        &candidate.manifest,
+        &candidate.superblock_bytes,
+        Some(&candidate.objects),
+        |inode| {
+            pending_removal_transaction_content_entries(
+                pool,
+                inode,
+                keyspace,
+                &authenticated_content_checksums,
+            )
+        },
+        keyspace,
+    )?;
+    state.set_inode_authority_dataset_id(*dataset_id.as_bytes());
+    Ok(state)
+}
+
+fn pending_removal_transaction_content_entries(
+    pool: &Pool,
+    inode: &InodeRecord,
+    keyspace: FilesystemObjectKeyspace,
+    authenticated_content_checksums: &BTreeMap<ObjectKey, IntegrityDigest64>,
+) -> Result<Vec<TransactionManifestEntry>> {
+    if inode.size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let logical_content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+    let content_key = keyspace.scope(logical_content_key);
+    let expected_checksum = authenticated_content_checksums
+        .get(&content_key)
+        .copied()
+        .ok_or(FileSystemError::CorruptState {
+            reason: "pending removal root is missing its authenticated content-manifest checksum",
+        })?;
+    let survivor = pool.get_with_removal_survivor_receipt(DeviceIoClass::Data, content_key)?;
+    let predecessor = if survivor
+        .as_ref()
+        .is_some_and(|(bytes, _)| checksum64(bytes) == expected_checksum)
+    {
+        None
+    } else {
+        pool.get_with_removal_predecessor_receipt(DeviceIoClass::Data, content_key)?
+    };
+    let authenticated_bytes = survivor
+        .as_ref()
+        .filter(|(bytes, _)| checksum64(bytes) == expected_checksum)
+        .map(|(bytes, _)| bytes.as_slice())
+        .or_else(|| {
+            predecessor
+                .as_ref()
+                .filter(|(bytes, _)| checksum64(bytes) == expected_checksum)
+                .map(|(bytes, _)| bytes.as_slice())
+        })
+        .ok_or(FileSystemError::CorruptState {
+            reason: "pending removal cannot recover the authenticated content-manifest bytes",
+        })?;
+
+    let authenticated_layout = crate::content::decode_content_layout(authenticated_bytes)?;
+    crate::content::validate_content_layout(inode.inode_id, inode, &authenticated_layout)?;
+
+    if survivor
+        .as_ref()
+        .is_some_and(|(bytes, _)| bytes.as_slice() != authenticated_bytes)
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "pending removal changed authenticated predecessor-manifest bytes",
+        });
+    }
+    let authenticated_manifest = match &authenticated_layout {
+        ContentLayout::Inline(_) => None,
+        ContentLayout::Chunked(manifest) => Some(manifest),
+    };
+
+    let mut entries = vec![TransactionManifestEntry {
+        role: TransactionManifestObjectRole::VersionedContent,
+        object_key: content_key,
+        checksum: expected_checksum,
+    }];
+    if let Some(authenticated_manifest) = authenticated_manifest {
+        for authenticated_ref in &authenticated_manifest.chunks {
+            if authenticated_ref.is_hole() {
+                continue;
+            }
+            let logical_chunk_key = content_chunk_object_key_for_version(
+                authenticated_manifest.inode_id,
+                authenticated_ref.data_version,
+                authenticated_ref.chunk_index,
+            );
+            let chunk_key = keyspace.scope(logical_chunk_key);
+            let survivor_chunk =
+                pool.get_with_removal_survivor_receipt(DeviceIoClass::Data, chunk_key)?;
+            if let Some((bytes, receipt)) = survivor_chunk {
+                let mut candidate = authenticated_ref.clone();
+                candidate.placement_receipt_generation = receipt.generation;
+                if receipt.generation == 0
+                    || receipt.generation < authenticated_ref.placement_receipt_generation
+                    || !crate::allocation::pending_removal_chunk_payload_matches_ref(
+                        pool,
+                        &candidate,
+                        logical_chunk_key,
+                        &bytes,
+                        keyspace,
+                    )
+                {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "pending removal survivor receipt does not preserve authenticated content",
+                    });
+                }
+            } else {
+                let (bytes, receipt) = pool
+                    .get_with_removal_predecessor_receipt(DeviceIoClass::Data, chunk_key)?
+                    .ok_or(FileSystemError::CorruptState {
+                        reason:
+                            "pending removal lost both predecessor and survivor chunk authority",
+                    })?;
+                if receipt.generation != authenticated_ref.placement_receipt_generation
+                    || !crate::allocation::pending_removal_chunk_payload_matches_ref(
+                        pool,
+                        authenticated_ref,
+                        logical_chunk_key,
+                        &bytes,
+                        keyspace,
+                    )
+                {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "pending removal predecessor receipt does not match authenticated content",
+                    });
+                }
+            }
+            entries.push(TransactionManifestEntry {
+                role: TransactionManifestObjectRole::VersionedContentChunk,
+                object_key: chunk_key,
+                checksum: authenticated_ref.checksum,
+            });
+        }
+    }
+    Ok(entries)
 }
 
 fn read_pool_transaction_candidate_objects(

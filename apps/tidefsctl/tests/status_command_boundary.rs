@@ -258,3 +258,155 @@ fn live_degraded_pool_status_reports_durable_member_identity() {
         "{human}"
     );
 }
+
+#[test]
+fn live_device_remove_cli_commits_survivor_topology() {
+    let fixture = tempfile::tempdir().expect("create live removal fixture");
+    let metadata_dir = fixture.path().join("metadata");
+    let devices = [
+        fixture.path().join("member-0.img"),
+        fixture.path().join("member-1.img"),
+    ];
+    fs::create_dir_all(&metadata_dir).expect("create Pool metadata directory");
+    for device in &devices {
+        File::create(device)
+            .expect("create regular-file Pool member")
+            .set_len(16 * 1024 * 1024)
+            .expect("size regular-file Pool member");
+    }
+
+    let pool_name = format!(
+        "device-remove-{}-{}",
+        std::process::id(),
+        NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let redundancy_policy = PoolRedundancyPolicy::replicated(1);
+    let mut filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        &devices,
+        &pool_name,
+        redundancy_policy,
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::default(),
+    )
+    .expect("create two-member filesystem");
+
+    let mut expected_files = Vec::new();
+    for index in 0..4u8 {
+        let path = format!("/remove-{index:02}.bin");
+        let payload = vec![index.wrapping_add(1); 4096 + index as usize];
+        filesystem
+            .create_file(&path, 0o600)
+            .expect("create receipt-backed mounted file");
+        filesystem
+            .write_file(&path, 0, &payload)
+            .expect("write receipt-backed mounted file");
+        expected_files.push((path, payload));
+    }
+    filesystem
+        .sync_all()
+        .expect("sync mounted files before removal");
+
+    let scanned = tidefs_pool_scan::scan_labels(&devices).expect("scan created Pool labels");
+    let pool_uuid = scanned[0].pool_guid.expect("created label has a Pool UUID");
+    assert_eq!(scanned[1].pool_guid, Some(pool_uuid));
+
+    let engine = VfsLocalFileSystem::new(filesystem);
+    let shared_filesystem = engine.shared_filesystem();
+    let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create live-owner adapter");
+    let runtime_dir = PathBuf::from("/run/tidefs/pools").join(hex_guid(&pool_uuid));
+    assert!(
+        !runtime_dir.exists(),
+        "unique test Pool runtime directory unexpectedly exists: {}",
+        runtime_dir.display()
+    );
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let owner = start_fuse_owner(
+        LiveOwnerConfig {
+            pool_name: pool_name.clone(),
+            pool_uuid,
+            backing_dir: metadata_dir.clone(),
+            mountpoint: fixture.path().join("not-mounted"),
+            runtime_dir: runtime_dir.clone(),
+            read_only: false,
+        },
+        adapter.engine_handle(),
+        adapter.dataset_replacement_handle(),
+        shared_filesystem.clone(),
+        Arc::clone(&shutdown),
+    )
+    .expect("start live owner for device removal");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args([
+            "device",
+            "remove",
+            &pool_name,
+            devices[1].to_str().expect("UTF-8 device path"),
+        ])
+        .output()
+        .expect("run tidefsctl device remove");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("device remove output is UTF-8");
+    for expected in [
+        "receipt-backed evacuation",
+        "durable survivor topology commit",
+        "remaining_devices=1",
+        "does not establish secure erase",
+        "media-remanence",
+        "decommissioning guarantees",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "output omitted {expected:?}: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("objects_evacuated=") && !stdout.contains("objects_evacuated=0"),
+        "test data must exercise actual target evacuation: {stdout}"
+    );
+
+    {
+        let filesystem = shared_filesystem.borrow();
+        assert_eq!(filesystem.pool_topology_status().members.len(), 1);
+        for (path, expected) in &expected_files {
+            assert_eq!(
+                filesystem
+                    .read_file(path)
+                    .expect("read file through live owner after removal"),
+                *expected,
+                "live owner read mismatch for {path}"
+            );
+        }
+    }
+
+    owner.stop();
+    drop(shared_filesystem);
+    drop(adapter);
+    fs::remove_dir(&runtime_dir).expect("remove empty test Pool runtime directory");
+
+    let survivor = [devices[0].clone()];
+    let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        &survivor,
+        &pool_name,
+        redundancy_policy,
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::default(),
+    )
+    .expect("reimport survivor-only committed topology");
+    assert_eq!(reopened.pool_topology_status().members.len(), 1);
+    for (path, expected) in &expected_files {
+        assert_eq!(
+            reopened
+                .read_file(path)
+                .expect("read file after survivor-only reimport"),
+            *expected,
+            "survivor-only read mismatch for {path}"
+        );
+    }
+}

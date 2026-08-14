@@ -14,10 +14,6 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process;
 
-#[cfg(feature = "distributed-repair")]
-use tidefs_device_removal::admission::{
-    validate_live_owner_response, DeviceRemovalAdmissionRequest, DEVICE_REMOVAL_AUTHORITY_KIND,
-};
 use tidefs_vfs_engine::{
     LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminError,
     LivePoolAdminOutput, LivePoolAdminRequest, LivePoolAdminResponse, LivePoolAdminResponseBody,
@@ -448,8 +444,6 @@ fn cached_without_owner_json(
     if let Some(pool_uuid) = pool_uuid {
         out["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
     }
-    #[cfg(feature = "distributed-repair")]
-    annotate_device_removal_authority_json(command, operation, &mut out);
     out
 }
 
@@ -470,10 +464,6 @@ fn cached_without_owner_lines(
             "tidefsctl {command} {operation}: cached pool uuid {}",
             hex_uuid(&pool_uuid)
         ));
-    }
-    #[cfg(feature = "distributed-repair")]
-    if let Some(line) = device_removal_authority_line(command, operation, None) {
-        lines.push(line);
     }
     lines.push(format!(
         "tidefsctl {command} {operation}: live state must be handled by the kernel UAPI or userspace daemon that owns the import"
@@ -533,8 +523,6 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
         if let Some(pool_uuid) = route.pool_uuid {
             out["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
         }
-        #[cfg(feature = "distributed-repair")]
-        annotate_device_removal_authority_json(command, operation, &mut out);
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         process::exit(1);
     }
@@ -549,11 +537,6 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
             "tidefsctl {command} {operation}: request identified pool uuid {}",
             hex_uuid(&pool_uuid)
         );
-    }
-    #[cfg(feature = "distributed-repair")]
-    if let Some(line) = device_removal_authority_line(command, operation, route_device_path(&route))
-    {
-        eprintln!("{line}");
     }
     eprintln!(
         "tidefsctl {command} {operation}: cached imported-pool state is evidence, not an authority interface"
@@ -710,8 +693,6 @@ fn send_live_owner_request_at(
                 ));
             }
             let response_json = live_owner_bytes_json(&bytes_hex, declared_bytes);
-            #[cfg(feature = "distributed-repair")]
-            validate_required_owner_evidence(route, &response_json)?;
             if route.json {
                 println!(
                     "{}",
@@ -737,8 +718,6 @@ fn send_live_owner_request_at(
         }
         LivePoolAdminResponseBody::MachineJson(machine_json) => {
             let mut value = parse_live_owner_machine_json(&machine_json)?;
-            #[cfg(feature = "distributed-repair")]
-            validate_required_owner_evidence(route, &value)?;
             if route.json {
                 annotate_live_owner_status_json(route, &mut value);
                 println!(
@@ -761,8 +740,6 @@ fn send_live_owner_request_at(
         }
         LivePoolAdminResponseBody::Text(text) => {
             let response_json = live_owner_status_text_json(route, &text);
-            #[cfg(feature = "distributed-repair")]
-            validate_required_owner_evidence(route, &response_json)?;
             if route.json {
                 println!(
                     "{}",
@@ -782,8 +759,6 @@ fn send_live_owner_request_at(
         }
         LivePoolAdminResponseBody::Empty => {
             let response_json = live_owner_status_text_json(route, "");
-            #[cfg(feature = "distributed-repair")]
-            validate_required_owner_evidence(route, &response_json)?;
             if route.json && is_status_route(route) {
                 println!(
                     "{}",
@@ -866,23 +841,6 @@ fn validate_live_owner_response_envelope(
     }
 }
 
-#[cfg(feature = "distributed-repair")]
-fn validate_required_owner_evidence(
-    route: &LivePoolRoute<'_>,
-    response: &serde_json::Value,
-) -> Result<(), LiveOwnerRequestError> {
-    let Some(request) = device_removal_admission_request(route) else {
-        return Ok(());
-    };
-    validate_live_owner_response(&request, response)
-        .map(|_| ())
-        .map_err(|err| LiveOwnerRequestError::Owner {
-            exit_code: 1,
-            message: err.to_string(),
-            detail: None,
-        })
-}
-
 fn parse_live_owner_machine_json(value: &str) -> Result<serde_json::Value, LiveOwnerRequestError> {
     serde_json::from_str(value).map_err(|err| LiveOwnerRequestError::Owner {
         exit_code: 2,
@@ -897,77 +855,6 @@ fn live_owner_bytes_json(bytes_hex: &str, bytes: usize) -> serde_json::Value {
         "bytes": bytes,
         "bytes_hex": bytes_hex,
     })
-}
-
-#[cfg(feature = "distributed-repair")]
-fn device_removal_admission_request(
-    route: &LivePoolRoute<'_>,
-) -> Option<DeviceRemovalAdmissionRequest> {
-    if route.command != "device" || route.operation != "remove" {
-        return None;
-    }
-    let device_path = route
-        .args
-        .0
-        .get("device_path")
-        .and_then(|value| match value {
-            LivePoolAdminArg::String(value) => Some(value.as_str()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    Some(DeviceRemovalAdmissionRequest::new(route.pool, device_path))
-}
-
-#[cfg(feature = "distributed-repair")]
-fn is_device_removal_route(command: &str, operation: &str) -> bool {
-    command == "device" && operation == "remove"
-}
-
-#[cfg(feature = "distributed-repair")]
-fn route_device_path<'route>(route: &'route LivePoolRoute<'_>) -> Option<&'route str> {
-    route
-        .args
-        .0
-        .get("device_path")
-        .and_then(|value| match value {
-            LivePoolAdminArg::String(value) => Some(value.as_str()),
-            _ => None,
-        })
-}
-
-#[cfg(feature = "distributed-repair")]
-fn annotate_device_removal_authority_json(
-    command: &str,
-    operation: &str,
-    out: &mut serde_json::Value,
-) {
-    if !is_device_removal_route(command, operation) {
-        return;
-    }
-    out["required_authority"] =
-        serde_json::Value::String(DEVICE_REMOVAL_AUTHORITY_KIND.to_string());
-    out["authority_error"] = serde_json::Value::String(
-        "device removal requires committed evacuation receipt authority from a reachable live owner"
-            .to_string(),
-    );
-}
-
-#[cfg(feature = "distributed-repair")]
-fn device_removal_authority_line(
-    command: &str,
-    operation: &str,
-    device_path: Option<&str>,
-) -> Option<String> {
-    if !is_device_removal_route(command, operation) {
-        return None;
-    }
-    let target = device_path
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(" for device '{value}'"))
-        .unwrap_or_default();
-    Some(format!(
-        "tidefsctl {command} {operation}: missing committed evacuation receipt authority{target}; cached imported-pool state is not removal authority"
-    ))
 }
 
 fn is_status_route(route: &LivePoolRoute<'_>) -> bool {
@@ -1733,14 +1620,6 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
-    #[cfg(feature = "distributed-repair")]
-    use tidefs_device_removal::admission::{
-        DeviceRemovalAdmissionEvidence, DEVICE_REMOVAL_AUTHORITY_FIELD,
-        DEVICE_REMOVAL_AUTHORITY_KIND,
-    };
-    #[cfg(feature = "distributed-repair")]
-    use tidefs_device_removal::{EvacuationCompletionGeneration, EvacuationReceipt};
-
     fn write_owner_manifest(root: &Path, socket_path: &Path) {
         let uuid = [0x42; 16];
         let manifest_path = owner_manifest_path(root, &uuid);
@@ -1755,20 +1634,6 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-    }
-
-    #[cfg(feature = "distributed-repair")]
-    fn test_receipt(device_guid: [u8; 16], topology_generation: u64) -> EvacuationReceipt {
-        EvacuationReceipt::new(
-            EvacuationCompletionGeneration {
-                target_device_guid: device_guid,
-                target_topology_generation: topology_generation,
-                evacuation_set_digest: [0x55; 32],
-                removal_chain_digest: [0x66; 32],
-            },
-            vec![],
-            9,
-        )
     }
 
     fn spawn_owner_response(
@@ -1818,24 +1683,6 @@ mod tests {
         })
     }
 
-    #[cfg(feature = "distributed-repair")]
-    fn device_remove_route() -> LivePoolRoute<'static> {
-        LivePoolRoute {
-            command: "device",
-            operation: "remove",
-            pool: "tank",
-            pool_uuid: None,
-            json: false,
-            args: live_admin_args([
-                ("device_path", LivePoolAdminArg::String("/dev/disk2".into())),
-                (
-                    "required_authority",
-                    LivePoolAdminArg::String(DEVICE_REMOVAL_AUTHORITY_KIND.into()),
-                ),
-            ]),
-        }
-    }
-
     #[test]
     fn owner_interface_requires_decodable_manifest_and_reachable_socket() {
         let dir = tempfile::tempdir().unwrap();
@@ -1858,62 +1705,6 @@ mod tests {
         .unwrap();
 
         assert!(!owner_interface_reachable_by_uuid_at(dir.path(), &uuid));
-    }
-
-    #[cfg(feature = "distributed-repair")]
-    #[test]
-    fn device_remove_live_owner_response_requires_committed_receipt_authority() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("owner.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        write_owner_manifest(dir.path(), &socket_path);
-        let handle = spawn_owner_response(listener, LivePoolAdminResponse::ok_text("removed"));
-        let route = device_remove_route();
-
-        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
-        let request = handle.join().unwrap();
-
-        assert_eq!(
-            request.args.0.get("required_authority"),
-            Some(&LivePoolAdminArg::String(
-                DEVICE_REMOVAL_AUTHORITY_KIND.to_string()
-            ))
-        );
-        match err {
-            LiveOwnerRequestError::Owner { message, .. } => {
-                assert!(message.contains("committed evacuation receipt authority"));
-            }
-            LiveOwnerRequestError::Unavailable(message) => {
-                panic!("missing authority should be an owner refusal, got {message}");
-            }
-        }
-    }
-
-    #[cfg(feature = "distributed-repair")]
-    #[test]
-    fn device_remove_live_owner_accepts_receipt_shaped_authority() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("owner.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        write_owner_manifest(dir.path(), &socket_path);
-        let receipt = test_receipt([0x42; 16], 11);
-        let authority =
-            DeviceRemovalAdmissionEvidence::committed("tank", "/dev/disk2", 11, receipt);
-        let mut response = serde_json::json!({
-            "ok": true,
-            "text": "removed",
-        });
-        response[DEVICE_REMOVAL_AUTHORITY_FIELD] = serde_json::to_value(authority).unwrap();
-        let handle = spawn_owner_response(
-            listener,
-            LivePoolAdminResponse::ok_machine_json(serde_json::to_string(&response).unwrap()),
-        );
-        let route = device_remove_route();
-
-        send_live_owner_request_at(dir.path(), &route).unwrap();
-        let request = handle.join().unwrap();
-
-        assert_eq!(request.command, LivePoolAdminCommand::DeviceRemove);
     }
 
     #[test]
@@ -2418,50 +2209,6 @@ mod tests {
                 panic!("unsupported route should fail before socket lookup, got {message}");
             }
         }
-    }
-
-    #[cfg(feature = "distributed-repair")]
-    #[test]
-    fn device_remove_cached_owner_refusal_names_receipt_authority() {
-        let json = cached_without_owner_json("device", "remove", "tank", None);
-
-        assert_eq!(
-            json.get("source:status")
-                .and_then(serde_json::Value::as_str),
-            Some(super::super::classification::StatusSource::CachedLocalMetadata.label())
-        );
-        assert_eq!(
-            json.get("required_authority")
-                .and_then(serde_json::Value::as_str),
-            Some(DEVICE_REMOVAL_AUTHORITY_KIND)
-        );
-        assert!(json
-            .get("authority_error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap()
-            .contains("committed evacuation receipt authority"));
-
-        let lines = cached_without_owner_lines("device", "remove", "tank", None);
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("[source:cached-local-metadata]")));
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("committed evacuation receipt authority")));
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("cached imported-pool state is not removal authority")));
-    }
-
-    #[cfg(feature = "distributed-repair")]
-    #[test]
-    fn device_remove_unavailable_owner_refusal_names_target_device_authority() {
-        let line = device_removal_authority_line("device", "remove", Some("/dev/disk2"))
-            .expect("device removal should require receipt authority");
-
-        assert!(line.contains("committed evacuation receipt authority"));
-        assert!(line.contains("/dev/disk2"));
-        assert!(device_removal_authority_line("device", "status", Some("/dev/disk2")).is_none());
     }
 
     #[test]

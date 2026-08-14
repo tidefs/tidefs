@@ -162,10 +162,9 @@ block that work.
 The default `tidefsctl` build is this local pool, mount, device, dataset,
 snapshot, defrag, live-owner, and status carrier. Block-volume commands,
 cluster authority, remote snapshot transport, kernel/validation diagnostics,
-receive-merge inspection, distributed device-removal receipt validation,
-optional data policy, and storage-intent policy inspection remain in the same
-CLI source behind the explicit `block-volume`, `cluster`, `remote-snapshot`,
-`diagnostics`, `receive-merge`, `distributed-repair`, `data-policy`, and
+receive-merge inspection, optional data policy, and storage-intent policy
+inspection remain in the same CLI source behind the explicit `block-volume`,
+`cluster`, `remote-snapshot`, `diagnostics`, `receive-merge`, `data-policy`, and
 `storage-intent` features. Packaging that needs every retained development
 surface selects the `full` feature explicitly; the default does not carry
 unavailable commands in its parser, help, or command-classification registry.
@@ -175,6 +174,19 @@ mounted core. Replication I/O, quorum writes, distributed repair and erasure,
 policy observation, and optional data policy are source-owned Cargo features;
 `full` restores the retained development subsystems without changing the
 default mount authority.
+
+The current source also implements one bounded pilot lifecycle operation:
+`tidefsctl device remove` can route to the reachable mounted local owner of a
+single-filesystem Pool, evacuate receipt-backed objects, reconcile embedded
+content receipt generations through copy-on-write manifests, refresh the
+authenticated filesystem root ring, and publish a redundant survivor-only
+topology before reporting success. The durable removal marker recovers
+interruption between those phases without overwriting predecessor-manifest
+bytes before their replacement root commits. Removal refuses before evacuation
+when another dataset or a data-retaining snapshot or clone owns roots that the
+mounted filesystem cannot update atomically. This is current implementation
+behavior, not a production-readiness, failed-device, replacement, rebuild,
+secure-erase, media-remanence, sanitization, or decommissioning claim.
 
 ## Current Policy
 

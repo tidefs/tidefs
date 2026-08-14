@@ -47,11 +47,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use tidefs_types_pool_label_core::{
-    decode_label, features, DeviceClass, LabelError, PoolLabelV1, PoolRedundancyPolicy, PoolState,
-    POOL_LABEL_MAGIC, POOL_LABEL_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE,
-    POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE,
-    POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET, POOL_LABEL_V1_EXT_WIRE_SIZE,
-    POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
+    decode_label, decode_topology_roster_v1, features, DeviceClass, LabelError, PoolLabelV1,
+    PoolRedundancyPolicy, PoolState, POOL_LABEL_MAGIC, POOL_LABEL_SIZE,
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE,
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET,
+    POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 
 #[cfg(any(feature = "distributed-repair", test))]
@@ -816,6 +816,40 @@ impl DeviceClassifier {
 /// Tries label copy 0 (first 256 KiB) then label copy 1 (last 256 KiB).
 pub struct PoolLabelReader;
 
+#[derive(Clone, Debug)]
+struct ScannedLabelCopy {
+    label: PoolLabelV1,
+    topology_roster: Option<Vec<[u8; 16]>>,
+    completed_evacuations: Vec<CompletedEvacuation>,
+}
+
+impl ScannedLabelCopy {
+    fn has_self_consistent_roster(&self) -> bool {
+        let Some(roster) = self.topology_roster.as_ref() else {
+            return false;
+        };
+        roster.len() == self.label.device_count as usize
+            && roster.get(self.label.device_index as usize) == Some(&self.label.device_guid)
+            && roster
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == roster.len()
+    }
+
+    fn same_topology(&self, other: &Self) -> bool {
+        self.label.pool_guid == other.label.pool_guid
+            && self.label.topology_generation == other.label.topology_generation
+            && self.label.device_count == other.label.device_count
+            && self.label.pool_name_len == other.label.pool_name_len
+            && self.label.pool_name == other.label.pool_name
+            && self.label.pool_state == other.label.pool_state
+            && self.label.redundancy_policy == other.label.redundancy_policy
+            && self.topology_roster == other.topology_roster
+    }
+}
+
 impl PoolLabelReader {
     /// Read and parse a pool label from `device_path`.
     ///
@@ -830,6 +864,13 @@ impl PoolLabelReader {
     pub fn read_label_with_completed_evacuations(
         device_path: &Path,
     ) -> Result<Option<(PoolLabelV1, Vec<CompletedEvacuation>)>, ScanError> {
+        Ok(Self::read_label_copies(device_path)?
+            .into_iter()
+            .next()
+            .map(|copy| (copy.label, copy.completed_evacuations)))
+    }
+
+    fn read_label_copies(device_path: &Path) -> Result<Vec<ScannedLabelCopy>, ScanError> {
         let mut file = std::fs::File::open(device_path).map_err(|e| ScanError::Io {
             path: device_path.to_path_buf(),
             msg: format!("open: {e}"),
@@ -840,27 +881,26 @@ impl PoolLabelReader {
             msg: format!("seek: {e}"),
         })?;
 
-        // Read label 0 at offset 0.
+        let mut copies = Vec::with_capacity(2);
         if let Some(label) = Self::try_read_at(&mut file, 0)? {
-            return Ok(Some(label));
+            copies.push(label);
         }
 
-        // Read label 1 at offset (size - 256 KiB), if the device is big enough.
         let label_area = tidefs_types_pool_label_core::POOL_LABEL_SIZE as u64;
-        if size >= label_area {
+        if size >= label_area && size - label_area != 0 {
             if let Some(label) = Self::try_read_at(&mut file, size - label_area)? {
-                return Ok(Some(label));
+                copies.push(label);
             }
         }
 
-        Ok(None)
+        Ok(copies)
     }
 
     /// Try to read a label from a specific byte offset on an already-open file.
     fn try_read_at(
         file: &mut std::fs::File,
         offset: u64,
-    ) -> Result<Option<(PoolLabelV1, Vec<CompletedEvacuation>)>, ScanError> {
+    ) -> Result<Option<ScannedLabelCopy>, ScanError> {
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| ScanError::Io {
                 path: PathBuf::from("<file>"),
@@ -903,6 +943,24 @@ impl PoolLabelReader {
         }
         match decode_label(&full) {
             Ok(label) => {
+                let topology_roster = decode_topology_roster_v1(&full)
+                    .map_err(|_| ScanError::LabelEvidence {
+                        path: PathBuf::from("<file>"),
+                        msg: "topology roster is corrupt or unreadable".to_string(),
+                    })?
+                    .map(|roster| {
+                        (0..roster.len())
+                            .map(|index| {
+                                roster
+                                    .member_guid(index)
+                                    .ok_or_else(|| ScanError::LabelEvidence {
+                                        path: PathBuf::from("<file>"),
+                                        msg: "topology roster member is unreadable".to_string(),
+                                    })
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?;
                 let extension_offset =
                     decoded_label_wire_size(&label).map_err(|msg| ScanError::LabelEvidence {
                         path: PathBuf::from("<file>"),
@@ -925,15 +983,18 @@ impl PoolLabelReader {
                             msg,
                         }
                     })?;
-                Ok(Some((label, completed_evacuations)))
+                Ok(Some(ScannedLabelCopy {
+                    label,
+                    topology_roster,
+                    completed_evacuations,
+                }))
             }
             Err(_) => Ok(None),
         }
     }
 
-    /// Scan a `DeviceInfo` and produce a `DeviceScanEntry` with label status.
-    pub fn scan_device(info: &DeviceInfo) -> DeviceScanEntry {
-        let mut entry = DeviceScanEntry {
+    fn empty_scan_entry(info: &DeviceInfo) -> DeviceScanEntry {
+        DeviceScanEntry {
             device_path: info.device_path.clone(),
             size_bytes: info.size_bytes,
             kind: info.kind,
@@ -959,39 +1020,54 @@ impl PoolLabelReader {
             device_checksum_errors: None,
             redundancy_policy: None,
             completed_evacuations: vec![],
-        };
+        }
+    }
 
+    fn scan_device_with_copy(info: &DeviceInfo, copy: Option<ScannedLabelCopy>) -> DeviceScanEntry {
+        let mut entry = Self::empty_scan_entry(info);
+        let Some(copy) = copy else {
+            entry.label_status = "no label".to_string();
+            return entry;
+        };
+        let label = copy.label;
+        entry.has_tidefs_label = true;
+        entry.label_valid = true;
+        entry.pool_guid = Some(label.pool_guid);
+        entry.pool_name = Some(label.pool_name_str().to_string());
+        entry.pool_state = Some(label.pool_state);
+        entry.device_guid = Some(label.device_guid);
+        entry.device_index = Some(label.device_index);
+        entry.device_count = Some(label.device_count);
+        entry.topology_generation = Some(label.topology_generation);
+        entry.device_class = Some(label.device_class);
+        entry.device_capacity_bytes = Some(label.device_capacity_bytes);
+        entry.device_health = Some(DeviceHealth::from_label_health(label.device_health));
+        entry.device_read_errors = Some(label.device_read_errors);
+        entry.device_write_errors = Some(label.device_write_errors);
+        entry.device_checksum_errors = Some(label.device_checksum_errors);
+        entry.redundancy_policy = Some(label.redundancy_policy);
+        entry.completed_evacuations = copy.completed_evacuations;
+        entry.label_status = format!("pool={} state={}", label.pool_name_str(), label.pool_state);
+        entry
+    }
+
+    /// Scan a `DeviceInfo` and produce a `DeviceScanEntry` with label status.
+    pub fn scan_device(info: &DeviceInfo) -> DeviceScanEntry {
         match Self::read_label_with_completed_evacuations(&info.device_path) {
-            Ok(Some((label, completed_evacuations))) => {
-                entry.has_tidefs_label = true;
-                entry.label_valid = true;
-                entry.pool_guid = Some(label.pool_guid);
-                entry.pool_name = Some(label.pool_name_str().to_string());
-                entry.pool_state = Some(label.pool_state);
-                entry.device_guid = Some(label.device_guid);
-                entry.device_index = Some(label.device_index);
-                entry.device_count = Some(label.device_count);
-                entry.topology_generation = Some(label.topology_generation);
-                entry.device_class = Some(label.device_class);
-                entry.device_capacity_bytes = Some(label.device_capacity_bytes);
-                entry.device_health = Some(DeviceHealth::from_label_health(label.device_health));
-                entry.device_read_errors = Some(label.device_read_errors);
-                entry.device_write_errors = Some(label.device_write_errors);
-                entry.device_checksum_errors = Some(label.device_checksum_errors);
-                entry.redundancy_policy = Some(label.redundancy_policy);
-                entry.completed_evacuations = completed_evacuations;
-                entry.label_status =
-                    format!("pool={} state={}", label.pool_name_str(), label.pool_state);
-            }
-            Ok(None) => {
-                entry.label_status = "no label".to_string();
-            }
+            Ok(copy) => Self::scan_device_with_copy(
+                info,
+                copy.map(|(label, completed_evacuations)| ScannedLabelCopy {
+                    label,
+                    topology_roster: None,
+                    completed_evacuations,
+                }),
+            ),
             Err(ref e) => {
+                let mut entry = Self::empty_scan_entry(info);
                 entry.label_status = format!("error: {e}");
+                entry
             }
         }
-
-        entry
     }
 }
 
@@ -1088,7 +1164,7 @@ pub fn scan_devices(
 /// label and returns a `DeviceScanEntry`.  Devices without a label are
 /// included with `has_tidefs_label = false`.
 pub fn scan_labels(device_paths: &[PathBuf]) -> Result<Vec<DeviceScanEntry>, ScanError> {
-    let mut entries = Vec::with_capacity(device_paths.len());
+    let mut scanned = Vec::with_capacity(device_paths.len());
     for p in device_paths {
         let mut info = DeviceInfo::new(p.clone());
         // Read size from the device file or block-device ioctl.
@@ -1099,16 +1175,97 @@ pub fn scan_labels(device_paths: &[PathBuf]) -> Result<Vec<DeviceScanEntry>, Sca
             info.device_backing = Some(backing);
             info.discard_capability = discard_capability_for_backing(p, backing);
         }
-        let entry = PoolLabelReader::scan_device(&info);
-        if entry.label_status.starts_with("error:") {
-            return Err(ScanError::Io {
-                path: p.clone(),
-                msg: entry.label_status.clone(),
-            });
-        }
-        entries.push(entry);
+        let copies = PoolLabelReader::read_label_copies(p)?;
+        scanned.push((info, copies));
     }
+
+    let selected = select_highest_complete_topology(&scanned)?;
+    let entries = scanned
+        .into_iter()
+        .map(|(info, mut copies)| {
+            let copy = selected
+                .as_ref()
+                .and_then(|selection| selection.get(&info.device_path).cloned())
+                .or_else(|| {
+                    selected
+                        .is_none()
+                        .then(|| copies.drain(..).next())
+                        .flatten()
+                });
+            PoolLabelReader::scan_device_with_copy(&info, copy)
+        })
+        .collect();
     Ok(entries)
+}
+
+fn select_highest_complete_topology(
+    scanned: &[(DeviceInfo, Vec<ScannedLabelCopy>)],
+) -> Result<Option<BTreeMap<PathBuf, ScannedLabelCopy>>, ScanError> {
+    let pool_guids = scanned
+        .iter()
+        .flat_map(|(_, copies)| copies.iter().map(|copy| copy.label.pool_guid))
+        .collect::<std::collections::BTreeSet<_>>();
+    if pool_guids.len() != 1 {
+        return Ok(None);
+    }
+
+    let mut complete: Vec<(ScannedLabelCopy, BTreeMap<PathBuf, ScannedLabelCopy>)> = Vec::new();
+    for (_, copies) in scanned {
+        for candidate in copies {
+            if !candidate.has_self_consistent_roster() {
+                continue;
+            }
+            let roster = candidate.topology_roster.as_ref().unwrap();
+            let mut selection = BTreeMap::new();
+            let mut complete_candidate = true;
+            for (index, guid) in roster.iter().enumerate() {
+                let mut matching_path: Option<(&PathBuf, &ScannedLabelCopy)> = None;
+                for (info, path_copies) in scanned {
+                    if let Some(copy) = path_copies.iter().find(|copy| {
+                        copy.same_topology(candidate)
+                            && copy.label.device_guid == *guid
+                            && copy.label.device_index == index as u32
+                    }) {
+                        if matching_path
+                            .as_ref()
+                            .is_some_and(|(path, _)| *path != &info.device_path)
+                        {
+                            complete_candidate = false;
+                            break;
+                        }
+                        matching_path = Some((&info.device_path, copy));
+                    }
+                }
+                let Some((path, copy)) = matching_path else {
+                    complete_candidate = false;
+                    break;
+                };
+                selection.insert(path.clone(), copy.clone());
+            }
+            if complete_candidate && selection.len() == roster.len() {
+                complete.push((candidate.clone(), selection));
+            }
+        }
+    }
+
+    let Some(max_generation) = complete
+        .iter()
+        .map(|(candidate, _)| candidate.label.topology_generation)
+        .max()
+    else {
+        return Ok(None);
+    };
+    let mut highest = complete
+        .into_iter()
+        .filter(|(candidate, _)| candidate.label.topology_generation == max_generation);
+    let (authority, selection) = highest.next().unwrap();
+    if highest.any(|(candidate, _)| !candidate.same_topology(&authority)) {
+        return Err(ScanError::LabelEvidence {
+            path: PathBuf::from("<pool-topology>"),
+            msg: format!("conflicting complete topology rosters at generation {max_generation}"),
+        });
+    }
+    Ok(Some(selection))
 }
 
 // ---------------------------------------------------------------------------
@@ -2593,7 +2750,10 @@ pub fn build_tier_policy_from_device_tree(
 mod tests {
     use super::*;
     use std::io::Write;
-    use tidefs_types_pool_label_core::{encode_label, seal_label, POOL_LABEL_V1_EXT_WIRE_SIZE};
+    use tidefs_types_pool_label_core::{
+        encode_label, encode_label_with_extensions, seal_label, seal_label_with_extensions,
+        POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
+    };
 
     // -- DeviceKind tests --
 
@@ -2749,6 +2909,120 @@ mod tests {
         }
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(&buf).unwrap();
+    }
+
+    fn write_topology_label_at_offset(
+        path: &Path,
+        pool_guid: [u8; 16],
+        device_guid: [u8; 16],
+        device_index: u32,
+        topology_generation: u64,
+        roster: &[[u8; 16]],
+        offset: u64,
+    ) {
+        let mut label = PoolLabelV1::new(pool_guid, device_guid, "topology-test");
+        label.pool_state = PoolState::Active;
+        label.device_index = device_index;
+        label.device_count = roster.len() as u32;
+        label.topology_generation = topology_generation;
+        let layout = [0u8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        let label = seal_label_with_extensions(label, Some(&layout), Some(roster)).unwrap();
+        let mut buf = vec![0u8; POOL_LABEL_SIZE];
+        encode_label_with_extensions(&label, Some(&layout), Some(roster), &mut buf).unwrap();
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        file.set_len(2 * POOL_LABEL_SIZE as u64).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&buf).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn write_complete_topology(
+        paths: &[PathBuf],
+        pool_guid: [u8; 16],
+        roster: &[[u8; 16]],
+        topology_generation: u64,
+        offset: u64,
+    ) {
+        for (device_index, (path, device_guid)) in paths.iter().zip(roster).enumerate() {
+            write_topology_label_at_offset(
+                path,
+                pool_guid,
+                *device_guid,
+                device_index as u32,
+                topology_generation,
+                roster,
+                offset,
+            );
+        }
+    }
+
+    #[test]
+    fn complete_topology_partial_backup_staging_selects_old_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..3)
+            .map(|index| dir.path().join(format!("device-{index}")))
+            .collect();
+        let pool_guid = [0x31; 16];
+        let old_roster = [[0x41; 16], [0x42; 16], [0x43; 16]];
+        write_complete_topology(&paths, pool_guid, &old_roster, 7, 0);
+
+        let reduced_roster = [old_roster[1], old_roster[2]];
+        write_topology_label_at_offset(
+            &paths[1],
+            pool_guid,
+            reduced_roster[0],
+            0,
+            8,
+            &reduced_roster,
+            POOL_LABEL_SIZE as u64,
+        );
+
+        let entries = scan_labels(&paths).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|entry| entry.has_tidefs_label));
+        assert!(entries
+            .iter()
+            .all(|entry| entry.topology_generation == Some(7)));
+        assert!(entries.iter().all(|entry| entry.device_count == Some(3)));
+    }
+
+    #[test]
+    fn complete_topology_fully_staged_reduced_roster_excludes_stale_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..3)
+            .map(|index| dir.path().join(format!("device-{index}")))
+            .collect();
+        let pool_guid = [0x51; 16];
+        let old_roster = [[0x61; 16], [0x62; 16], [0x63; 16]];
+        write_complete_topology(&paths, pool_guid, &old_roster, 11, 0);
+
+        let survivor_paths = paths[1..].to_vec();
+        let reduced_roster = [old_roster[1], old_roster[2]];
+        write_complete_topology(
+            &survivor_paths,
+            pool_guid,
+            &reduced_roster,
+            12,
+            POOL_LABEL_SIZE as u64,
+        );
+
+        let entries = scan_labels(&paths).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(!entries[0].has_tidefs_label);
+        assert_eq!(entries[0].device_path, paths[0]);
+        for (index, entry) in entries[1..].iter().enumerate() {
+            assert!(entry.has_tidefs_label);
+            assert_eq!(entry.topology_generation, Some(12));
+            assert_eq!(entry.device_count, Some(2));
+            assert_eq!(entry.device_index, Some(index as u32));
+            assert_eq!(entry.device_guid, Some(reduced_roster[index]));
+        }
     }
 
     #[test]

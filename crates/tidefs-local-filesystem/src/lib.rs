@@ -2716,6 +2716,10 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
         self.store.pool_stats()
     }
 
+    fn has_pending_device_removal(&self) -> Result<bool> {
+        Ok(self.store.pending_device_removal_path()?.is_some())
+    }
+
     fn committed_content_used_bytes(&self, state: &FileSystemState) -> Result<u64> {
         content_allocation_entries_for_state_pool(self.store, state)
             .and_then(|entries| allocation_bytes(&entries))
@@ -4500,6 +4504,7 @@ impl LocalFileSystem {
         // Construct the capacity authority from pool geometry and committed
         // usage. This is the single production source for used/free/reserved/
         // pending byte counters for the lifetime of this filesystem instance.
+        let pending_device_removal_recovery = open_recovery.has_pending_device_removal()?;
         let capacity_authority = {
             let pool_stats = open_recovery.pool_stats();
             let block_size = StatfsResult::DEFAULT_BLOCK_SIZE as u32;
@@ -4519,21 +4524,42 @@ impl LocalFileSystem {
             // rather than raw object-store usage. The raw pool counter includes
             // metadata/log bytes, while LocalStorageAllocatorPolicy's capacity
             // is the user-content ceiling enforced by fallocate/write paths.
-            let used_bytes = open_recovery
-                .committed_content_used_bytes(&state)?
-                .min(total_bytes);
+            let used_bytes = if pending_device_removal_recovery {
+                // The authenticated predecessor state can temporarily carry
+                // older embedded receipt generations after Pool evacuation.
+                // Keep admission conservatively closed until mounted recovery
+                // copy-on-writes those manifests and then rebuilds capacity
+                // from ordinary exact receipt authority below.
+                total_bytes
+            } else {
+                open_recovery
+                    .committed_content_used_bytes(&state)?
+                    .min(total_bytes)
+            };
             let mut counters = *state.space_accounting.counters();
-            if counters.logical_used_bytes < used_bytes {
+            if !pending_device_removal_recovery && counters.logical_used_bytes < used_bytes {
                 counters.logical_used_bytes = used_bytes;
                 state.space_accounting =
                     SpaceAccounting::new(counters, state.space_accounting.domain_id());
             }
-            CapacityAuthority::from_committed_accounting(
-                total_bytes,
-                &state.space_accounting,
-                block_size,
-                root_reserve_bytes,
-            )
+            if pending_device_removal_recovery {
+                counters.logical_used_bytes = used_bytes;
+                let provisional =
+                    SpaceAccounting::new(counters, state.space_accounting.domain_id());
+                CapacityAuthority::from_committed_accounting(
+                    total_bytes,
+                    &provisional,
+                    block_size,
+                    root_reserve_bytes,
+                )
+            } else {
+                CapacityAuthority::from_committed_accounting(
+                    total_bytes,
+                    &state.space_accounting,
+                    block_size,
+                    root_reserve_bytes,
+                )
+            }
         };
         drop(open_recovery);
         let reclaim_queue_inner = load_filesystem_reclaim_queue(
@@ -4732,6 +4758,52 @@ impl LocalFileSystem {
             #[cfg(feature = "data-policy")]
             cleanup_engine: None,
         };
+
+        if fs.store.pool().pending_device_removal_path()?.is_some() {
+            if !recovery_policy.allows_any_mutation() {
+                return Err(FileSystemError::CorruptState {
+                    reason: "read-only mount refuses pending device removal recovery",
+                });
+            }
+            let resumed = fs.resume_pending_mounted_device_removal()?.ok_or(
+                FileSystemError::CorruptState {
+                    reason: "pending device removal marker disappeared during mounted recovery",
+                },
+            )?;
+            if !resumed.complete || resumed.objects_failed > 0 {
+                return Err(FileSystemError::CorruptState {
+                    reason: "pending device removal evacuation remains incomplete",
+                });
+            }
+        }
+
+        if pending_device_removal_recovery {
+            let pool_stats = fs.store.pool().pool_stats();
+            let total_bytes = if pool_stats.total_capacity_bytes > 0 {
+                pool_stats
+                    .total_capacity_bytes
+                    .min(fs.allocator_policy.content_capacity_bytes)
+            } else {
+                fs.allocator_policy.content_capacity_bytes
+            };
+            let used_bytes = allocation_bytes(&content_allocation_entries_for_state_pool(
+                fs.store.pool(),
+                &fs.state,
+            )?)?
+            .min(total_bytes);
+            let mut counters = *fs.state.space_accounting.counters();
+            if counters.logical_used_bytes < used_bytes {
+                counters.logical_used_bytes = used_bytes;
+                fs.state.space_accounting =
+                    SpaceAccounting::new(counters, fs.state.space_accounting.domain_id());
+            }
+            fs.capacity_authority = CapacityAuthority::from_committed_accounting(
+                total_bytes,
+                &fs.state.space_accounting,
+                StatfsResult::DEFAULT_BLOCK_SIZE as u32,
+                0,
+            );
+        }
 
         // Replay BLAKE3-verified namespace intent-log segments recorded by
         // the mutation intent log (tidefs-intent-log). This complements the
