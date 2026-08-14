@@ -1334,6 +1334,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cli_parse_device_replace_keeps_only_live_owner_inputs() {
+        use clap::Parser;
+        let parsed = Cli::try_parse_from([
+            "tidefsctl",
+            "device",
+            "replace",
+            "mypool",
+            "/dev/sdc",
+            "/dev/sdd",
+            "--json",
+        ]);
+        assert!(parsed.is_ok(), "device replace --json should parse");
+
+        for args in [
+            vec!["tidefsctl", "device", "replace", "mypool", "/dev/sdc"],
+            vec![
+                "tidefsctl",
+                "device",
+                "replace",
+                "mypool",
+                "/dev/sdc",
+                "/dev/sdd",
+                "--devices",
+                "/dev/sdb",
+            ],
+            vec![
+                "tidefsctl",
+                "device",
+                "replace",
+                "mypool",
+                "/dev/sdc",
+                "/dev/sdd",
+                "--backing-dir",
+                "/var/lib/tidefs/pool",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "device replace must not admit offline or incomplete inputs"
+            );
+        }
+    }
+
     // -- Block CLI parse tests -------------------------------------------
 
     #[cfg(feature = "block-volume")]

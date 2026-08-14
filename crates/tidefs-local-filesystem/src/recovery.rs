@@ -446,10 +446,12 @@ pub(crate) fn load_canonical_committed_state_for_dataset(
     let mut state = match ordinary {
         Ok(state) => state,
         Err(error) => {
-            if runtime.pool().pending_device_removal_path()?.is_none() {
+            let pending_removal = runtime.pool().pending_device_removal_path()?.is_some();
+            let pending_replacement = runtime.pool().has_device_replacement_predecessor_resume();
+            if !pending_removal && !pending_replacement {
                 return Err(error);
             }
-            load_state_from_transaction_pool_for_pending_removal(
+            load_state_from_transaction_pool_for_pending_device_lifecycle(
                 runtime.pool(),
                 dataset_id,
                 &root,
@@ -2379,17 +2381,17 @@ pub(crate) fn load_state_from_transaction_pool_for_dataset(
     Ok(state)
 }
 
-/// Load an authenticated committed state while a durable device-removal
-/// marker keeps the predecessor member attached.
+/// Load an authenticated committed state while durable removal or replacement
+/// evidence keeps the predecessor member attached and allocation-fenced.
 ///
 /// Ordinary recovery remains exact. This boundary admits only the one
-/// marker-bound transition that mounted removal owns: evacuation may advance
-/// a chunk's placement receipt while the still-authenticated predecessor
-/// manifest retains the prior generation. Every successor receipt must
-/// strictly read and validate the same chunk payload. Reconciliation itself
-/// is copy-on-write, so this path never admits changed predecessor-manifest
-/// bytes before their replacement root is durable.
-fn load_state_from_transaction_pool_for_pending_removal(
+/// evidence-bound transition that mounted device lifecycle owns: evacuation
+/// or rebuild may advance a chunk's placement receipt while the authenticated
+/// predecessor manifest retains the prior generation. Every successor receipt
+/// must strictly read and validate the same chunk payload. Reconciliation is
+/// copy-on-write, so this path never admits changed predecessor-manifest bytes
+/// before its replacement root is durable.
+fn load_state_from_transaction_pool_for_pending_device_lifecycle(
     pool: &Pool,
     dataset_id: DatasetId,
     root: &RootCommitRecord,
@@ -2418,7 +2420,7 @@ fn load_state_from_transaction_pool_for_pending_removal(
             .is_some()
         {
             return Err(FileSystemError::CorruptState {
-                reason: "pending removal manifest repeats a versioned-content key",
+                reason: "pending device lifecycle manifest repeats a versioned-content key",
             });
         }
     }
@@ -2431,7 +2433,7 @@ fn load_state_from_transaction_pool_for_pending_removal(
         &candidate.superblock_bytes,
         Some(&candidate.objects),
         |inode| {
-            pending_removal_transaction_content_entries(
+            pending_device_lifecycle_transaction_content_entries(
                 pool,
                 inode,
                 keyspace,
@@ -2444,7 +2446,7 @@ fn load_state_from_transaction_pool_for_pending_removal(
     Ok(state)
 }
 
-fn pending_removal_transaction_content_entries(
+fn pending_device_lifecycle_transaction_content_entries(
     pool: &Pool,
     inode: &InodeRecord,
     keyspace: FilesystemObjectKeyspace,
@@ -2460,8 +2462,9 @@ fn pending_removal_transaction_content_entries(
         .get(&content_key)
         .copied()
         .ok_or(FileSystemError::CorruptState {
-            reason: "pending removal root is missing its authenticated content-manifest checksum",
-        })?;
+        reason:
+            "pending device lifecycle root is missing its authenticated content-manifest checksum",
+    })?;
     let survivor = pool.get_with_removal_survivor_receipt(DeviceIoClass::Data, content_key)?;
     let predecessor = if survivor
         .as_ref()
@@ -2482,7 +2485,8 @@ fn pending_removal_transaction_content_entries(
                 .map(|(bytes, _)| bytes.as_slice())
         })
         .ok_or(FileSystemError::CorruptState {
-            reason: "pending removal cannot recover the authenticated content-manifest bytes",
+            reason:
+                "pending device lifecycle cannot recover the authenticated content-manifest bytes",
         })?;
 
     let authenticated_layout = crate::content::decode_content_layout(authenticated_bytes)?;
@@ -2493,7 +2497,7 @@ fn pending_removal_transaction_content_entries(
         .is_some_and(|(bytes, _)| bytes.as_slice() != authenticated_bytes)
     {
         return Err(FileSystemError::CorruptState {
-            reason: "pending removal changed authenticated predecessor-manifest bytes",
+            reason: "pending device lifecycle changed authenticated predecessor-manifest bytes",
         });
     }
     let authenticated_manifest = match &authenticated_layout {
@@ -2533,7 +2537,7 @@ fn pending_removal_transaction_content_entries(
                     )
                 {
                     return Err(FileSystemError::CorruptState {
-                        reason: "pending removal survivor receipt does not preserve authenticated content",
+                        reason: "pending device lifecycle survivor receipt does not preserve authenticated content",
                     });
                 }
             } else {
@@ -2541,7 +2545,7 @@ fn pending_removal_transaction_content_entries(
                     .get_with_removal_predecessor_receipt(DeviceIoClass::Data, chunk_key)?
                     .ok_or(FileSystemError::CorruptState {
                         reason:
-                            "pending removal lost both predecessor and survivor chunk authority",
+                            "pending device lifecycle lost both predecessor and survivor chunk authority",
                     })?;
                 if receipt.generation != authenticated_ref.placement_receipt_generation
                     || !crate::allocation::pending_removal_chunk_payload_matches_ref(
@@ -2553,7 +2557,7 @@ fn pending_removal_transaction_content_entries(
                     )
                 {
                     return Err(FileSystemError::CorruptState {
-                        reason: "pending removal predecessor receipt does not match authenticated content",
+                        reason: "pending device lifecycle predecessor receipt does not match authenticated content",
                     });
                 }
             }

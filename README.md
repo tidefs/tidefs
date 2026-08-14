@@ -188,6 +188,19 @@ mounted filesystem cannot update atomically. This is current implementation
 behavior, not a production-readiness, failed-device, replacement, rebuild,
 secure-erase, media-remanence, sanitization, or decommissioning claim.
 
+The same carrier implements one bounded present-member replacement row:
+`tidefsctl device replace` routes only to the reachable mounted local owner of
+an exact writable two-member `Replicated { copies: 2 }` Pool. It persists
+old/new identity and rebuild progress, keeps the readable old member attached
+and allocation-fenced, rewrites current receipt-backed objects onto the
+survivor plus replacement, copy-on-writes mounted content manifests, refreshes
+the authenticated root ring, and only then publishes redundant
+same-cardinality labels. Replacement requires a distinct blank same-backing
+candidate with sufficient capacity and refuses other datasets or data-retaining
+snapshots/clones. This row does not claim failed-member rebuild, writable
+degraded operation, secure erase, media remanence, sanitization,
+decommissioning, or production readiness.
+
 ## Current Policy
 
 - License: `GPL-2.0-only WITH Linux-syscall-note`.

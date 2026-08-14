@@ -5,10 +5,11 @@
 //! ## Media authority
 //!
 //! Device status routes to the live owner before this module opens any store.
-//! Device removal routes only to the reachable mounted pool owner, which owns
-//! receipt-backed evacuation and durable topology-label publication. Retired
-//! directory object-store evacuation/rebuild arguments fail closed instead of
-//! acting as operator pool media.
+//! Device removal and replacement route only to the reachable mounted pool
+//! owner, which owns receipt-backed evacuation/rebuild and durable
+//! topology-label publication. Retired directory object-store
+//! evacuation/rebuild arguments fail closed instead of acting as operator pool
+//! media.
 
 use std::path::PathBuf;
 
@@ -17,6 +18,25 @@ use clap::Subcommand;
 /// Device management subcommands.
 #[derive(Subcommand, Debug)]
 pub enum DeviceCommand {
+    /// Replace a present readable member with a blank same-backing device.
+    ///
+    /// Routed only to the live owner for receipt-backed rebuild, mounted-root
+    /// reconciliation, and same-cardinality topology publication.
+    Replace {
+        /// Pool whose mounted owner has replacement authority.
+        pool_name: String,
+
+        /// Exact current member path to replace.
+        old_device_path: PathBuf,
+
+        /// Distinct blank replacement device path.
+        new_device_path: PathBuf,
+
+        /// Output the typed replacement result as JSON.
+        #[arg(long = "json")]
+        json: bool,
+    },
+
     /// Remove a device from a pool.
     ///
     /// Routed to the live owner for receipt-backed evacuation and detach.
@@ -85,6 +105,35 @@ pub enum DeviceCommand {
 /// Handle the `tidefsctl device` subcommand.
 pub fn handle_device(cmd: DeviceCommand) {
     match cmd {
+        DeviceCommand::Replace {
+            pool_name,
+            old_device_path,
+            new_device_path,
+            json,
+        } => {
+            let _guard = super::authz::require_local_only("device replace");
+            super::live_owner::route_with_format_and_args(
+                "device",
+                "replace",
+                &pool_name,
+                json,
+                super::live_owner::live_admin_args([
+                    (
+                        "old_device_path",
+                        tidefs_vfs_engine::LivePoolAdminArg::String(
+                            old_device_path.display().to_string(),
+                        ),
+                    ),
+                    (
+                        "new_device_path",
+                        tidefs_vfs_engine::LivePoolAdminArg::String(
+                            new_device_path.display().to_string(),
+                        ),
+                    ),
+                ]),
+            );
+        }
+
         DeviceCommand::Remove {
             pool_name,
             device_path,

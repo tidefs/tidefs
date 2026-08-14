@@ -1329,6 +1329,10 @@ impl VfsLocalFileSystem {
                     LivePoolAdminCommand::DeviceRemove => {
                         self.live_device_remove(&args, wants_json)
                     }
+                    LivePoolAdminCommand::DeviceReplace => {
+                        self.live_device_replace(&args, wants_json)
+                    }
+                    LivePoolAdminCommand::DeviceStatus => self.live_device_status(wants_json),
                     command => {
                         let (command_name, operation) = command.parts();
                         live_admin_typed_error(LivePoolAdminError::unsupported_command(
@@ -1366,6 +1370,7 @@ impl VfsLocalFileSystem {
             | LivePoolAdminCommand::SnapshotSend
             | LivePoolAdminCommand::PerformanceAdmissionSnapshot
             | LivePoolAdminCommand::DeviceRemove
+            | LivePoolAdminCommand::DeviceReplace
             | LivePoolAdminCommand::BlockAttach => true,
             LivePoolAdminCommand::DatasetSetStrategy => !matches!(
                 request.args.0.get("list"),
@@ -3241,6 +3246,278 @@ impl VfsLocalFileSystem {
         live_admin_ok_text(out)
     }
 
+    fn live_device_status(&self, wants_json: bool) -> LivePoolAdminResponse {
+        let fs = self.fs.borrow();
+        let topology = fs.store.pool().topology_status();
+        let replacement = fs.store.pool().device_replacement_result();
+        let state_name = |state| match state {
+            tidefs_local_object_store::pool::ReplacementRebuildStatusState::Pending => "pending",
+            tidefs_local_object_store::pool::ReplacementRebuildStatusState::Resuming => "resuming",
+            tidefs_local_object_store::pool::ReplacementRebuildStatusState::Completed => {
+                "completed"
+            }
+            tidefs_local_object_store::pool::ReplacementRebuildStatusState::Refused => "refused",
+        };
+        let guid = |value: &[u8; 16]| {
+            value
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+
+        if wants_json {
+            let replacement = replacement.map(|result| {
+                json!({
+                    "state": state_name(result.state),
+                    "old_device_path": result.old_path.display().to_string(),
+                    "new_device_path": result.new_path.display().to_string(),
+                    "old_device_guid": guid(&result.old_device_guid),
+                    "new_device_guid": guid(&result.new_device_guid),
+                    "topology_generation": result.topology_generation,
+                    "objects_total": result.objects_total,
+                    "objects_rebuilt": result.objects_rebuilt,
+                    "objects_failed": result.objects_failed,
+                    "verified_receipt_count": result.verified_receipt_count,
+                    "bytes_rebuilt": result.bytes_rebuilt,
+                    "topology_commit_pending": result.topology_commit_pending,
+                    "complete": result.complete,
+                    "old_device_detach_allowed": result.detach_decision.is_safe(),
+                    "media_privacy_claimed": false,
+                    "secure_erase_claimed": false,
+                    "sanitization_claimed": false,
+                    "decommissioning_claimed": false,
+                })
+            });
+            return LivePoolAdminResponse::ok_machine_json(
+                json!({
+                    "health": format!("{:?}", topology.health),
+                    "access": if topology.read_only { "ReadOnly" } else { "ReadWrite" },
+                    "members_expected": topology.expected_members,
+                    "members_present": topology.present_members,
+                    "members_missing": topology.missing_members,
+                    "replacement": replacement,
+                })
+                .to_string(),
+            );
+        }
+
+        let mut message = format!(
+            "device status: health={:?} access={} members_expected={} members_present={} members_missing={}",
+            topology.health,
+            if topology.read_only { "ReadOnly" } else { "ReadWrite" },
+            topology.expected_members,
+            topology.present_members,
+            topology.missing_members,
+        );
+        if let Some(result) = replacement {
+            let _ = write!(
+                message,
+                "\n  replacement: state={} old={} ({}) new={} ({}) objects={}/{} failed={} verified_receipts={} bytes={} topology_generation={} topology_commit_pending={} old_device_detach_allowed={}\n  remanence: media_privacy=false secure_erase=false sanitization=false decommissioning=false",
+                state_name(result.state),
+                result.old_path.display(),
+                guid(&result.old_device_guid),
+                result.new_path.display(),
+                guid(&result.new_device_guid),
+                result.objects_rebuilt,
+                result.objects_total,
+                result.objects_failed,
+                result.verified_receipt_count,
+                result.bytes_rebuilt,
+                result.topology_generation,
+                result.topology_commit_pending,
+                result.detach_decision.is_safe(),
+            );
+        } else {
+            message.push_str("\n  replacement: none");
+        }
+        live_admin_ok_text(message)
+    }
+
+    fn live_device_replace(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
+        let old_device_path = match live_admin_arg(args, "old_device_path") {
+            Ok(value) => std::path::PathBuf::from(value),
+            Err(err) => return live_admin_error(2, err),
+        };
+        let new_device_path = match live_admin_arg(args, "new_device_path") {
+            Ok(value) => std::path::PathBuf::from(value),
+            Err(err) => return live_admin_error(2, err),
+        };
+        let guid = |value: &[u8; 16]| {
+            value
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let refusal = |exit_code: i32,
+                       message: String,
+                       evidence: Option<
+            tidefs_local_object_store::pool::DeviceReplacementResult,
+        >| {
+            if wants_json {
+                let old_device_guid = evidence
+                    .as_ref()
+                    .map(|result| guid(&result.old_device_guid));
+                let new_device_guid = evidence
+                    .as_ref()
+                    .map(|result| guid(&result.new_device_guid));
+                let topology_generation =
+                    evidence.as_ref().map(|result| result.topology_generation);
+                return LivePoolAdminResponse::error_machine_json(
+                    exit_code,
+                    message.clone(),
+                    json!({
+                        "status": "refused",
+                        "old_device_path": old_device_path.display().to_string(),
+                        "new_device_path": new_device_path.display().to_string(),
+                        "old_device_guid": old_device_guid,
+                        "new_device_guid": new_device_guid,
+                        "topology_generation": topology_generation,
+                        "topology_committed": false,
+                        "old_device_detach_allowed": false,
+                        "media_privacy_claimed": false,
+                        "secure_erase_claimed": false,
+                        "sanitization_claimed": false,
+                        "decommissioning_claimed": false,
+                        "message": message,
+                    })
+                    .to_string(),
+                );
+            }
+            live_admin_error(exit_code, message)
+        };
+        if old_device_path == new_device_path {
+            return refusal(
+                2,
+                "device replace: old and new device paths must differ".to_string(),
+                None,
+            );
+        }
+        if let Err(err) = self
+            .fs
+            .borrow()
+            .ensure_mutation_allowed("replace mounted pool device")
+        {
+            let evidence = self.fs.borrow().store.pool().device_replacement_result();
+            return refusal(
+                1,
+                format!("device replace: mutation requires reopen: {err}"),
+                evidence,
+            );
+        }
+
+        let mut fs = self.fs.borrow_mut();
+        // A reopened replacement is deliberately generation-fenced until Pool
+        // reattaches the exact recorded candidate or finishes terminal
+        // evidence for an already-published topology. Resume that Pool
+        // boundary first; the mounted replacement path below then reconciles
+        // authenticated roots and syncs them before terminal publication.
+        // Fresh replacement still requires the ordinary pre-rebuild mounted
+        // sync.
+        let replacement_resume = fs.store.pool().has_device_replacement_resume();
+        if !replacement_resume {
+            if let Err(err) = fs.sync_all() {
+                let evidence = fs.store.pool().device_replacement_result();
+                return refusal(
+                    1,
+                    format!(
+                        "device replace: could not sync mounted filesystem state before rebuilding '{}': {err}",
+                        old_device_path.display()
+                    ),
+                    evidence,
+                );
+            }
+        }
+        let result =
+            match fs.complete_mounted_device_replacement(&old_device_path, &new_device_path) {
+                Ok(result) => result,
+                Err(err) => {
+                    let evidence = fs.store.pool().device_replacement_result();
+                    return refusal(
+                        1,
+                        format!(
+                    "device replace: mounted pool owner could not replace '{}' with '{}': {err}",
+                    old_device_path.display(),
+                    new_device_path.display()
+                ),
+                        evidence,
+                    );
+                }
+            };
+        if !result.complete || result.objects_failed > 0 {
+            let message = format!(
+                "device replace: rebuild remains incomplete; old member '{}' remains attached and no replacement topology was committed (objects_rebuilt={}, objects_total={}, objects_failed={}, verified_receipts={}, bytes_rebuilt={})",
+                old_device_path.display(),
+                result.objects_rebuilt,
+                result.objects_total,
+                result.objects_failed,
+                result.verified_receipt_count,
+                result.bytes_rebuilt,
+            );
+            return if wants_json {
+                LivePoolAdminResponse::error_machine_json(
+                    1,
+                    message,
+                    json!({
+                        "status": "incomplete",
+                        "old_device_path": old_device_path.display().to_string(),
+                        "new_device_path": new_device_path.display().to_string(),
+                        "old_device_guid": guid(&result.old_device_guid),
+                        "new_device_guid": guid(&result.new_device_guid),
+                        "objects_rebuilt": result.objects_rebuilt,
+                        "objects_total": result.objects_total,
+                        "objects_failed": result.objects_failed,
+                        "verified_receipt_count": result.verified_receipt_count,
+                        "bytes_rebuilt": result.bytes_rebuilt,
+                        "topology_committed": false,
+                        "old_device_detach_allowed": false,
+                    })
+                    .to_string(),
+                )
+            } else {
+                live_admin_error(1, message)
+            };
+        }
+
+        let message = format!(
+            "device replace: replaced '{}' ({}) with '{}' ({}) after receipt-backed rebuild and durable same-cardinality topology commit (objects_rebuilt={}, verified_receipts={}, bytes_rebuilt={}, topology_generation={}); old-device detach is allowed, but this does not establish secure erase, media-remanence, sanitization, or decommissioning guarantees",
+            old_device_path.display(),
+            guid(&result.old_device_guid),
+            new_device_path.display(),
+            guid(&result.new_device_guid),
+            result.objects_rebuilt,
+            result.verified_receipt_count,
+            result.bytes_rebuilt,
+            result.topology_generation,
+        );
+        if wants_json {
+            LivePoolAdminResponse::ok_machine_json(
+                json!({
+                    "status": "completed",
+                    "old_device_path": old_device_path.display().to_string(),
+                    "new_device_path": new_device_path.display().to_string(),
+                    "old_device_guid": guid(&result.old_device_guid),
+                    "new_device_guid": guid(&result.new_device_guid),
+                    "objects_total": result.objects_total,
+                    "objects_rebuilt": result.objects_rebuilt,
+                    "objects_failed": result.objects_failed,
+                    "verified_receipt_count": result.verified_receipt_count,
+                    "bytes_rebuilt": result.bytes_rebuilt,
+                    "topology_generation": result.topology_generation,
+                    "topology_committed": true,
+                    "old_device_detach_allowed": true,
+                    "media_privacy_claimed": false,
+                    "secure_erase_claimed": false,
+                    "sanitization_claimed": false,
+                    "decommissioning_claimed": false,
+                    "message": message,
+                })
+                .to_string(),
+            )
+        } else {
+            live_admin_ok_text(message)
+        }
+    }
+
     fn live_device_remove(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
         if let Err(err) = self
             .fs
@@ -3354,7 +3631,7 @@ impl LocalFileSystem {
         &mut self,
         device_path: &std::path::Path,
     ) -> crate::Result<tidefs_local_object_store::device_removal::EvacuationResult> {
-        self.ensure_exclusive_device_removal_root_authority()?;
+        self.ensure_exclusive_device_lifecycle_root_authority("remove device from mounted pool")?;
         let preparation = self
             .store
             .pool_mut()
@@ -3405,7 +3682,87 @@ impl LocalFileSystem {
         self.complete_mounted_device_removal(&device_path).map(Some)
     }
 
-    fn ensure_exclusive_device_removal_root_authority(&self) -> crate::Result<()> {
+    /// Complete a receipt-backed mounted member replacement and publish the
+    /// replacement topology only after every authenticated filesystem root
+    /// slot refers to successor receipts.
+    pub(crate) fn complete_mounted_device_replacement(
+        &mut self,
+        old_device_path: &std::path::Path,
+        new_device_path: &std::path::Path,
+    ) -> crate::Result<tidefs_local_object_store::pool::DeviceReplacementResult> {
+        self.ensure_exclusive_device_lifecycle_root_authority("replace device in mounted pool")?;
+        let old_config = self
+            .store
+            .pool()
+            .config()
+            .devices
+            .iter()
+            .find(|config| config.path == old_device_path)
+            .cloned()
+            .ok_or(FileSystemError::Unsupported {
+                operation: "replace device in mounted pool",
+                reason: "the old device path is not an exact current Pool member",
+            })?;
+        let mut replacement_config = old_config;
+        replacement_config.path = new_device_path.to_path_buf();
+        replacement_config.kind = match replacement_config.kind {
+            tidefs_local_object_store::DeviceKind::Block { .. } => {
+                tidefs_local_object_store::DeviceKind::Block {
+                    path: new_device_path.to_path_buf(),
+                }
+            }
+            tidefs_local_object_store::DeviceKind::Single { .. } => {
+                tidefs_local_object_store::DeviceKind::Single {
+                    path: new_device_path.to_path_buf(),
+                }
+            }
+            _ => {
+                return Err(FileSystemError::Unsupported {
+                    operation: "replace device in mounted pool",
+                    reason: "mounted replacement supports only one byte-addressable member per device configuration",
+                })
+            }
+        };
+
+        let preparation = self.store.pool_mut().replace_device(
+            old_device_path,
+            replacement_config,
+            &tidefs_local_object_store::StoreOptions::default(),
+        );
+        if preparation.as_ref().is_ok_and(|result| result.complete) {
+            return preparation.map_err(FileSystemError::from);
+        }
+        if preparation.is_err() && self.store.pool().device_replacement_result().is_none() {
+            return preparation.map_err(FileSystemError::from);
+        }
+
+        // Preparation may have published a prefix of successor receipts.
+        // Reconcile every valid content manifest before propagating an error,
+        // preserving the same predecessor-root recovery rule as removal.
+        self.reconcile_relocated_content_receipts()?;
+        self.store.pool_mut().sync_all()?;
+        for _ in 0..crate::constants::FILESYSTEM_ROOT_SLOT_COUNT {
+            self.persist_dataset_catalog()?;
+        }
+        self.store.pool_mut().sync_all()?;
+
+        let preparation = preparation.map_err(FileSystemError::from)?;
+        if preparation.objects_failed > 0 {
+            return Ok(preparation);
+        }
+        let result = self
+            .store
+            .pool_mut()
+            .finish_safe_replace_device(old_device_path)?;
+        self.store.pool_mut().sync_all()?;
+        self.rebuild_capacity_authority_from_committed_content()?;
+        Ok(result)
+    }
+
+    fn ensure_exclusive_device_lifecycle_root_authority(
+        &self,
+        operation: &'static str,
+    ) -> crate::Result<()> {
         if self
             .state
             .snapshots
@@ -3413,7 +3770,7 @@ impl LocalFileSystem {
             .any(crate::snapshot::snapshot_record_retains_data)
         {
             return Err(FileSystemError::Unsupported {
-                operation: "remove device from mounted pool",
+                operation,
                 reason: "data-retaining snapshots or clones require atomic receipt reconciliation of their immutable roots",
             });
         }
@@ -3426,7 +3783,7 @@ impl LocalFileSystem {
             .any(|(_, dataset_id, _, _, _, _)| *dataset_id != mounted_dataset_id)
         {
             return Err(FileSystemError::Unsupported {
-                operation: "remove device from mounted pool",
+                operation,
                 reason: "another dataset in the Pool requires its own mounted owner to join atomic receipt reconciliation",
             });
         }
@@ -7894,6 +8251,244 @@ mod tests {
         reopened
             .stat("/")
             .expect("reopened mounted namespace remains readable");
+    }
+
+    #[test]
+    fn live_device_replace_json_refusal_is_structured() {
+        let (engine, td, devices) = temp_fs_with_block_devices(2);
+        let refused = live_device_admin(
+            &engine,
+            "replace",
+            json!({
+                "old_device_path": devices[0].display().to_string(),
+                "new_device_path": devices[0].display().to_string(),
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "replacement refusal: {refused}");
+        assert_eq!(refused["json"]["status"], "refused");
+        assert_eq!(
+            refused["json"]["old_device_path"],
+            devices[0].display().to_string()
+        );
+        assert_eq!(
+            refused["json"]["new_device_path"],
+            devices[0].display().to_string()
+        );
+        assert_eq!(refused["json"]["old_device_guid"], Value::Null);
+        assert_eq!(refused["json"]["new_device_guid"], Value::Null);
+        assert_eq!(refused["json"]["topology_committed"], false);
+        assert_eq!(refused["json"]["old_device_detach_allowed"], false);
+        assert_eq!(refused["json"]["media_privacy_claimed"], false);
+        assert_eq!(refused["json"]["secure_erase_claimed"], false);
+        assert_eq!(refused["json"]["sanitization_claimed"], false);
+        assert_eq!(refused["json"]["decommissioning_claimed"], false);
+        assert_eq!(engine.fs.borrow().store.pool().stats().device_count, 2);
+        drop(engine);
+        drop(td);
+    }
+
+    #[test]
+    fn live_device_replace_rebuilds_mounted_bytes_and_reopens_new_topology() {
+        let td = tempfile::tempdir().expect("replacement fixture");
+        let metadata = td.path().join("metadata");
+        std::fs::create_dir_all(&metadata).expect("create replacement metadata dir");
+        let old_devices = [td.path().join("dev0.img"), td.path().join("dev1.img")];
+        let replacement = td.path().join("replacement.img");
+        for path in old_devices.iter().chain(std::iter::once(&replacement)) {
+            let file = std::fs::File::create(path).expect("create replacement device image");
+            file.set_len(16 * 1024 * 1024)
+                .expect("size replacement device image");
+        }
+        let policy = tidefs_local_object_store::pool::PoolRedundancyPolicy::replicated(2);
+        let mut filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &old_devices,
+            "live-device-replace",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("create replicated mounted filesystem");
+        let payload = b"mounted replacement keeps exact committed bytes";
+        filesystem
+            .create_file("/replace.bin", 0o600)
+            .expect("create replacement test file");
+        filesystem
+            .write_file("/replace.bin", 0, payload)
+            .expect("write replacement test file");
+        filesystem.sync_all().expect("commit replacement test file");
+        let engine = VfsLocalFileSystem::new(filesystem);
+
+        let replaced = live_device_admin(
+            &engine,
+            "replace",
+            json!({
+                "old_device_path": old_devices[0].display().to_string(),
+                "new_device_path": replacement.display().to_string(),
+            }),
+            true,
+        );
+        assert_eq!(replaced["ok"], true, "replace response: {replaced}");
+        assert_eq!(replaced["json"]["status"], "completed");
+        assert_eq!(replaced["json"]["topology_committed"], true);
+        assert_eq!(replaced["json"]["objects_failed"], 0);
+        assert_eq!(replaced["json"]["old_device_detach_allowed"], true);
+        assert_eq!(replaced["json"]["media_privacy_claimed"], false);
+        assert_eq!(replaced["json"]["secure_erase_claimed"], false);
+        assert_eq!(replaced["json"]["sanitization_claimed"], false);
+        assert_eq!(replaced["json"]["decommissioning_claimed"], false);
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_file("/replace.bin")
+                .expect("read through live owner after replacement"),
+            payload
+        );
+        drop(engine);
+
+        let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &[replacement, old_devices[1].clone()],
+            "live-device-replace",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("reopen replacement plus survivor");
+        assert_eq!(
+            reopened
+                .read_file("/replace.bin")
+                .expect("read exact bytes after replacement reimport"),
+            payload
+        );
+    }
+
+    #[test]
+    fn live_device_replace_resumes_stable_prepublication_evidence() {
+        let td = tempfile::tempdir().expect("replacement resume fixture");
+        let metadata = td.path().join("metadata");
+        std::fs::create_dir_all(&metadata).expect("create replacement resume metadata dir");
+        let old_devices = [td.path().join("dev0.img"), td.path().join("dev1.img")];
+        let replacement = td.path().join("replacement.img");
+        for path in old_devices.iter().chain(std::iter::once(&replacement)) {
+            let file = std::fs::File::create(path).expect("create replacement resume image");
+            file.set_len(16 * 1024 * 1024)
+                .expect("size replacement resume image");
+        }
+        let policy = tidefs_local_object_store::pool::PoolRedundancyPolicy::replicated(2);
+        let mut filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &old_devices,
+            "live-device-replace-resume",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("create replacement resume filesystem");
+        let payload = b"resume reconciles predecessor manifests before topology commit";
+        filesystem
+            .create_file("/resume.bin", 0o600)
+            .expect("create replacement resume file");
+        filesystem
+            .write_file("/resume.bin", 0, payload)
+            .expect("write replacement resume file");
+        filesystem
+            .sync_all()
+            .expect("commit replacement resume file");
+
+        let old_config = filesystem.store.pool().config().devices[0].clone();
+        let mut replacement_config = old_config;
+        replacement_config.path = replacement.clone();
+        replacement_config.kind = tidefs_local_object_store::DeviceKind::Block {
+            path: replacement.clone(),
+        };
+        let prepared = filesystem
+            .store
+            .pool_mut()
+            .replace_device(
+                &old_devices[0],
+                replacement_config,
+                &tidefs_local_object_store::StoreOptions::default(),
+            )
+            .expect("prepare replacement before simulated crash");
+        assert!(!prepared.complete);
+        assert_eq!(prepared.objects_failed, 0);
+        drop(filesystem);
+
+        let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &old_devices,
+            "live-device-replace-resume",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("reopen predecessor topology with replacement evidence");
+        let engine = VfsLocalFileSystem::new(reopened);
+        let resumed = live_device_admin(
+            &engine,
+            "replace",
+            json!({
+                "old_device_path": old_devices[0].display().to_string(),
+                "new_device_path": replacement.display().to_string(),
+            }),
+            true,
+        );
+        assert_eq!(
+            resumed["ok"], true,
+            "replacement resume response: {resumed}"
+        );
+        assert_eq!(resumed["json"]["status"], "completed");
+        let post_resume_payload = b"writes resume only after replacement authority converges";
+        {
+            let mut filesystem = engine.fs.borrow_mut();
+            assert_eq!(
+                filesystem
+                    .read_file("/resume.bin")
+                    .expect("read after replacement resume"),
+                payload
+            );
+            filesystem
+                .create_file("/post-resume.bin", 0o600)
+                .expect("create after replacement resume");
+            filesystem
+                .write_file("/post-resume.bin", 0, post_resume_payload)
+                .expect("write after replacement resume");
+            filesystem
+                .sync_all()
+                .expect("commit write after replacement resume");
+        }
+        drop(engine);
+
+        let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &[replacement, old_devices[1].clone()],
+            "live-device-replace-resume",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("reopen completed resumed replacement topology");
+        assert_eq!(
+            reopened
+                .read_file("/resume.bin")
+                .expect("read after resumed replacement reimport"),
+            payload
+        );
+        assert_eq!(
+            reopened
+                .read_file("/post-resume.bin")
+                .expect("read post-resume write after replacement reimport"),
+            post_resume_payload
+        );
     }
 
     #[test]
