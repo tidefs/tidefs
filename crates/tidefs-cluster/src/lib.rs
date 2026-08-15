@@ -113,13 +113,16 @@ pub use pool_orchestrator::{
     OrchestratorError, PoolCreateDispatchEvidence, PoolTransport,
     CLUSTER_POOL_CREATE_DISPATCH_EVIDENCE,
 };
-pub use pool_owner_lease::{PoolOwnerLeaseAuthority, PoolOwnerLeaseError};
+pub use pool_owner_lease::{
+    PoolOwnerLeaseAuthority, PoolOwnerLeaseError, PoolOwnerLeaseObservation,
+};
 pub use pool_protocol::{
     CatalogEntryRow, CatalogQueryType, ClusterPoolCatalogDeltaRequest,
     ClusterPoolCatalogDeltaResponse, ClusterPoolCatalogQueryRequest,
     ClusterPoolCatalogQueryResponse, ClusterPoolCreateRequest, ClusterPoolCreateResponse,
     ClusterPoolImportRequest, ClusterPoolImportResponse, ClusterPoolLeaseAction,
-    ClusterPoolLeaseRequest, ClusterPoolLeaseResponse, ClusterPoolMessage, NodeDeviceSpec,
+    ClusterPoolLeaseRequest, ClusterPoolLeaseResponse, ClusterPoolMessage,
+    ClusterPoolOwnerObservationRequest, ClusterPoolOwnerObservationResponse, NodeDeviceSpec,
     PoolProtocolError,
 };
 pub use protocol::{

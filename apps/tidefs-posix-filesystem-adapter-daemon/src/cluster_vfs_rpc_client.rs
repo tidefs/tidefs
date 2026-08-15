@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Clustered mounted-filesystem client over authenticated inline VFS_RPC.
 //!
-//! The public connector consumes provisioned node credentials and the exact
-//! trusted owner identity. It performs one refused epoch-zero discovery
-//! exchange, retries once with the authenticated owner epoch, and derives all
-//! writer/dataset/term/epoch authority from the owner-issued preface.
+//! The public connector authenticates the configured Pool lease authority,
+//! observes the current writer/epoch/fence without receiving a lease token,
+//! selects that node from an exact provisioned endpoint/identity map, and
+//! requires the owner-issued preface to match the observation.
 //! If one inline request loses its transport before the response arrives, the
 //! client opens one fresh mutually authenticated session and replays the exact
 //! request and operation ID only when the full owner authority is unchanged.
@@ -40,38 +40,59 @@ use tidefs_vfs_rpc::{
     DEFAULT_INLINE_THRESHOLD,
 };
 
+use crate::cluster_pool_owner_observer::{observe_pool_owner, AuthenticatedPoolOwnerObservation};
+
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 const CLIENT_RECONNECT_ATTEMPTS: usize = 1;
 
-/// Operator-provisioned inputs for one authenticated remote owner connection.
+/// Provisioned VFS_RPC endpoint and exact public identity for one candidate.
+#[derive(Clone, Debug)]
+pub struct ClusterVfsRpcOwnerCandidate {
+    /// Provisioned TCP endpoint for this exact node identity.
+    pub addr: SocketAddr,
+    /// Exact public identity required at the endpoint.
+    pub identity: NodePublicIdentity,
+}
+
+impl ClusterVfsRpcOwnerCandidate {
+    #[must_use]
+    pub const fn new(addr: SocketAddr, identity: NodePublicIdentity) -> Self {
+        Self { addr, identity }
+    }
+}
+
+/// Operator-provisioned inputs for authenticated owner discovery.
 ///
-/// No dataset, writer, term, membership epoch, or lease token can be supplied
-/// here. Those fields are accepted only from the authenticated owner's VFS_RPC
-/// session authority.
+/// The candidate list provisions connectivity and trust only. The lease
+/// authority observation, not list ordering or a direct caller choice,
+/// selects the current owner, epoch, and writer-fence generation.
 #[derive(Debug)]
 pub struct ClusterVfsRpcClientConfig {
-    owner_addr: SocketAddr,
+    authority_addr: SocketAddr,
     expected_pool_guid: [u8; 16],
     local_credential: NodePrivateCredential,
-    trusted_owner_identity: NodePublicIdentity,
+    trusted_authority_identity: NodePublicIdentity,
+    owner_candidates: Vec<ClusterVfsRpcOwnerCandidate>,
     authority_lost: Arc<AtomicBool>,
 }
 
 impl ClusterVfsRpcClientConfig {
     #[must_use]
     pub fn new(
-        owner_addr: SocketAddr,
+        authority_addr: SocketAddr,
         expected_pool_guid: [u8; 16],
         local_credential: NodePrivateCredential,
-        trusted_owner_identity: NodePublicIdentity,
+        trusted_authority_identity: NodePublicIdentity,
+        owner_candidates: Vec<ClusterVfsRpcOwnerCandidate>,
     ) -> Self {
         Self {
-            owner_addr,
+            authority_addr,
             expected_pool_guid,
             local_credential,
-            trusted_owner_identity,
+            trusted_authority_identity,
+            owner_candidates,
             authority_lost: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -106,16 +127,23 @@ pub enum ClusterVfsRpcClientError {
         found: [u8; 16],
     },
     ExpectedPoolGuidZero,
+    MissingOwnerCandidates,
+    InvalidOwnerCandidate(u64),
+    DuplicateOwnerCandidate(u64),
+    ConflictingNodeIdentity(u64),
+    OwnerObservation(String),
+    ObservedOwnerNotProvisioned(u64),
+    ObservedAuthorityMismatch {
+        observed_owner: u64,
+        observed_term: u64,
+        observed_epoch: u64,
+        preface_owner: u64,
+        preface_term: u64,
+        preface_epoch: u64,
+    },
     Credential(String),
     TrustStore(String),
     Transport(String),
-    EpochDiscoveryEstablished,
-    InvalidDiscoveredEpoch {
-        expected_owner: u64,
-        authenticated_peer: u64,
-        proposed_epoch: u64,
-        required_epoch: u64,
-    },
     EpochMoved {
         authenticated_peer: u64,
         attempted_epoch: u64,
@@ -173,6 +201,39 @@ impl fmt::Display for ClusterVfsRpcClientError {
             Self::ExpectedPoolGuidZero => {
                 write!(f, "cluster VFS_RPC expected Pool GUID must be nonzero")
             }
+            Self::MissingOwnerCandidates => {
+                write!(f, "cluster VFS_RPC requires at least one provisioned owner candidate")
+            }
+            Self::InvalidOwnerCandidate(node) => write!(
+                f,
+                "cluster VFS_RPC provisioned candidate has invalid node ID {node}"
+            ),
+            Self::DuplicateOwnerCandidate(node) => write!(
+                f,
+                "cluster VFS_RPC has more than one provisioned candidate for node {node}"
+            ),
+            Self::ConflictingNodeIdentity(node) => write!(
+                f,
+                "cluster VFS_RPC has conflicting provisioned identities for node {node}"
+            ),
+            Self::OwnerObservation(error) => {
+                write!(f, "observe current Pool owner: {error}")
+            }
+            Self::ObservedOwnerNotProvisioned(node) => write!(
+                f,
+                "Pool lease authority selected owner node {node}, but no exact VFS_RPC candidate is provisioned"
+            ),
+            Self::ObservedAuthorityMismatch {
+                observed_owner,
+                observed_term,
+                observed_epoch,
+                preface_owner,
+                preface_term,
+                preface_epoch,
+            } => write!(
+                f,
+                "cluster VFS_RPC owner preface {preface_owner}/{preface_term}/{preface_epoch} does not match lease-authority observation {observed_owner}/{observed_term}/{observed_epoch}"
+            ),
             Self::Credential(error) => {
                 write!(f, "load cluster VFS_RPC client credential: {error}")
             }
@@ -180,19 +241,6 @@ impl fmt::Display for ClusterVfsRpcClientError {
                 write!(f, "configure cluster VFS_RPC trust: {error}")
             }
             Self::Transport(error) => write!(f, "connect cluster VFS_RPC owner: {error}"),
-            Self::EpochDiscoveryEstablished => write!(
-                f,
-                "cluster VFS_RPC owner established an epoch-zero discovery session"
-            ),
-            Self::InvalidDiscoveredEpoch {
-                expected_owner,
-                authenticated_peer,
-                proposed_epoch,
-                required_epoch,
-            } => write!(
-                f,
-                "cluster VFS_RPC epoch discovery expected owner {expected_owner} and proposed epoch 0, but authenticated peer {authenticated_peer} reported {proposed_epoch} -> {required_epoch}"
-            ),
             Self::EpochMoved {
                 authenticated_peer,
                 attempted_epoch,
@@ -247,55 +295,31 @@ pub struct ClusterVfsRpcClient {
 }
 
 impl ClusterVfsRpcClient {
-    /// Connect to the exact trusted owner without caller-supplied epoch or
-    /// mounted writer authority.
+    /// Discover and connect to the current authority-selected Pool owner.
     pub fn connect(config: ClusterVfsRpcClientConfig) -> Result<Self, ClusterVfsRpcClientError> {
         if config.expected_pool_guid == [0; 16] {
             return Err(ClusterVfsRpcClientError::ExpectedPoolGuidZero);
         }
-        let expected_owner = config.trusted_owner_identity.node_id();
-
-        let (mut discovery, discovery_session) =
-            connect_transport(&config, 0, CLIENT_AUTHORITY_TIMEOUT)?;
-        let owner_epoch = match discovery.perform_handshake(discovery_session) {
-            Err(TransportError::AttestedEpochMismatch {
-                authenticated_peer,
-                proposed_epoch,
-                required_epoch,
-                ..
-            }) if authenticated_peer == expected_owner
-                && proposed_epoch == 0
-                && required_epoch != 0 =>
-            {
-                required_epoch
-            }
-            Err(TransportError::AttestedEpochMismatch {
-                authenticated_peer,
-                proposed_epoch,
-                required_epoch,
-                ..
-            }) => {
-                return Err(ClusterVfsRpcClientError::InvalidDiscoveredEpoch {
-                    expected_owner,
-                    authenticated_peer,
-                    proposed_epoch,
-                    required_epoch,
-                });
-            }
-            Err(error) => {
-                return Err(ClusterVfsRpcClientError::Transport(error.to_string()));
-            }
-            Ok(()) => {
-                let _ =
-                    discovery.close_session(discovery_session, SessionCloseReason::LocalShutdown);
-                return Err(ClusterVfsRpcClientError::EpochDiscoveryEstablished);
-            }
-        };
-        drop(discovery);
-
+        validate_client_config(&config)?;
+        let observation = observe_pool_owner(
+            config.authority_addr,
+            config.expected_pool_guid,
+            &config.local_credential,
+            &config.trusted_authority_identity,
+        )
+        .map_err(ClusterVfsRpcClientError::OwnerObservation)?;
+        let owner = owner_candidate(&config, observation.owner_node_id)?;
+        let observation_remaining = observation.remaining();
+        if observation_remaining.is_zero() {
+            return Err(ClusterVfsRpcClientError::AuthorityDeadlineExpired { remaining_ms: 0 });
+        }
         let authority_observation_started = Instant::now();
-        let (mut transport, session_id) =
-            connect_transport(&config, owner_epoch, CLIENT_AUTHORITY_TIMEOUT)?;
+        let (mut transport, session_id) = connect_transport(
+            &config,
+            owner,
+            observation.membership_epoch,
+            observation_remaining.min(CLIENT_AUTHORITY_TIMEOUT),
+        )?;
         match transport.perform_handshake(session_id) {
             Ok(()) => Self::from_authenticated_transport(
                 transport,
@@ -303,6 +327,7 @@ impl ClusterVfsRpcClient {
                 config.expected_pool_guid,
                 Some(config),
                 authority_observation_started,
+                Some(observation),
             ),
             Err(TransportError::AttestedEpochMismatch {
                 authenticated_peer,
@@ -331,6 +356,7 @@ impl ClusterVfsRpcClient {
             expected_pool_guid,
             None,
             Instant::now(),
+            None,
         )
     }
 
@@ -340,6 +366,7 @@ impl ClusterVfsRpcClient {
         expected_pool_guid: [u8; 16],
         reconnect_config: Option<ClusterVfsRpcClientConfig>,
         authority_observation_started: Instant,
+        expected_observation: Option<AuthenticatedPoolOwnerObservation>,
     ) -> Result<Self, ClusterVfsRpcClientError> {
         let authenticated_peer = validate_construction_session(&transport, session_id)?;
         transport
@@ -353,8 +380,39 @@ impl ClusterVfsRpcClient {
         authority
             .validate_for_client(expected_pool_guid, authenticated_peer)
             .map_err(map_session_authority_error)?;
-        let (authority_valid_until, next_authority_refresh) =
+        if let Some(observation) = expected_observation {
+            if observation.pool_guid != expected_pool_guid
+                || observation.owner_node_id != authority.writer_node()
+                || observation.owner_node_id != authenticated_peer
+                || observation.membership_epoch != authority.epoch()
+                || observation.write_fence_generation != authority.term()
+            {
+                return Err(ClusterVfsRpcClientError::ObservedAuthorityMismatch {
+                    observed_owner: observation.owner_node_id,
+                    observed_term: observation.write_fence_generation,
+                    observed_epoch: observation.membership_epoch,
+                    preface_owner: authority.writer_node(),
+                    preface_term: authority.term(),
+                    preface_epoch: authority.epoch(),
+                });
+            }
+            if observation.remaining().is_zero() {
+                return Err(ClusterVfsRpcClientError::AuthorityDeadlineExpired { remaining_ms: 0 });
+            }
+        }
+        let (mut authority_valid_until, mut next_authority_refresh) =
             authority_schedule(authority_observation_started, authority)?;
+        if let Some(observation) = expected_observation {
+            authority_valid_until = authority_valid_until.min(observation.valid_until);
+            let now = Instant::now();
+            let remaining = authority_valid_until.saturating_duration_since(now);
+            if remaining.is_zero() {
+                return Err(ClusterVfsRpcClientError::AuthorityDeadlineExpired {
+                    remaining_ms: authority.lease_remaining_ms(),
+                });
+            }
+            next_authority_refresh = now.checked_add(remaining / 2).unwrap_or(now);
+        }
 
         let writer = authority.writer_node();
         let dataset_id = authority.dataset_id();
@@ -438,20 +496,68 @@ impl ClusterVfsRpcClient {
     }
 }
 
+fn validate_client_config(
+    config: &ClusterVfsRpcClientConfig,
+) -> Result<(), ClusterVfsRpcClientError> {
+    if config.owner_candidates.is_empty() {
+        return Err(ClusterVfsRpcClientError::MissingOwnerCandidates);
+    }
+    let local_identity = config.local_credential.public_identity().into_identity();
+    let mut identities = vec![
+        &local_identity,
+        config.trusted_authority_identity.identity(),
+    ];
+    let mut candidate_nodes = std::collections::BTreeSet::new();
+    for candidate in &config.owner_candidates {
+        let node = candidate.identity.node_id();
+        if node == 0 {
+            return Err(ClusterVfsRpcClientError::InvalidOwnerCandidate(node));
+        }
+        if !candidate_nodes.insert(node) {
+            return Err(ClusterVfsRpcClientError::DuplicateOwnerCandidate(node));
+        }
+        identities.push(candidate.identity.identity());
+    }
+    for (index, left) in identities.iter().enumerate() {
+        for right in &identities[index + 1..] {
+            if left.node_id == right.node_id && left != right {
+                return Err(ClusterVfsRpcClientError::ConflictingNodeIdentity(
+                    left.node_id,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn owner_candidate(
+    config: &ClusterVfsRpcClientConfig,
+    owner_node_id: u64,
+) -> Result<&ClusterVfsRpcOwnerCandidate, ClusterVfsRpcClientError> {
+    config
+        .owner_candidates
+        .iter()
+        .find(|candidate| candidate.identity.node_id() == owner_node_id)
+        .ok_or(ClusterVfsRpcClientError::ObservedOwnerNotProvisioned(
+            owner_node_id,
+        ))
+}
+
 fn connect_transport(
     config: &ClusterVfsRpcClientConfig,
+    owner: &ClusterVfsRpcOwnerCandidate,
     epoch: u64,
     timeout: Duration,
 ) -> Result<(Transport, SessionId), ClusterVfsRpcClientError> {
     let local_node = config.local_credential.node_id();
-    let owner_node = config.trusted_owner_identity.node_id();
+    let owner_node = owner.identity.node_id();
     let local_identity = config.local_credential.public_identity().into_identity();
     let mut known_identities = NodeKeyStore::new();
     known_identities
         .register(local_identity.clone())
         .map_err(|error| ClusterVfsRpcClientError::TrustStore(error.to_string()))?;
     known_identities
-        .register(config.trusted_owner_identity.identity().clone())
+        .register(owner.identity.identity().clone())
         .map_err(|error| ClusterVfsRpcClientError::TrustStore(error.to_string()))?;
     let local_keypair = config
         .local_credential
@@ -466,7 +572,7 @@ fn connect_transport(
     transport.set_attestation_bootstrap_from_handshake(false);
     transport.add_node(NodeInfo::new(
         owner_node,
-        vec![TransportAddr::Tcp(config.owner_addr)],
+        vec![TransportAddr::Tcp(owner.addr)],
         epoch,
     ));
     let session_id = transport
@@ -1012,8 +1118,10 @@ impl ClientState {
             return Err(Errno::ESTALE);
         }
         let observation_started = Instant::now();
+        let owner = owner_candidate(config, self.writer).map_err(|_| Errno::ESTALE)?;
         let (mut replacement, replacement_session) = connect_transport(
             config,
+            owner,
             self.authority.epoch(),
             remaining.min(CLIENT_AUTHORITY_TIMEOUT),
         )

@@ -12,9 +12,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tidefs_auth::{
-    NodePrivateCredential, NodePublicIdentity, NODE_PRIVATE_CREDENTIAL_WIRE_SIZE,
+    NodeKeyStore, NodePrivateCredential, NodePublicIdentity, NODE_PRIVATE_CREDENTIAL_WIRE_SIZE,
     NODE_PUBLIC_IDENTITY_WIRE_SIZE,
 };
+use tidefs_cluster::{ClusterPoolMessage, ClusterPoolOwnerObservationResponse};
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId as LifecycleDatasetId, SyncGuarantee};
 use tidefs_local_filesystem::{
     human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem,
@@ -22,16 +23,20 @@ use tidefs_local_filesystem::{
     LocalStorageAllocatorPolicy, RootAuthenticationKey,
 };
 use tidefs_local_object_store::pool::PoolRedundancyPolicy;
+use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_client::ClusterVfsRpcOwnerCandidate;
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_owner::{
     ClusterVfsRpcOwnerConfig, ClusterVfsRpcOwnerHandle, ClusterVfsRpcWriterFence,
 };
 use tidefs_posix_filesystem_adapter_daemon::fuse_vfs_adapter::FuseVfsAdapter;
 use tidefs_posix_filesystem_adapter_daemon::{run_cluster_vfs_rpc_mount, ClusterVfsRpcMountConfig};
 use tidefs_recovery_loop::RecoveryPolicy;
+use tidefs_transport::{EndpointFamily, SessionId, Transport, TransportAddr, TransportError};
 use tidefs_vfs_rpc::DatasetId;
 
 const OWNER_NODE: u64 = 62;
+const SUCCESSOR_NODE: u64 = 64;
 const CLIENT_NODE: u64 = 63;
+const AUTHORITY_NODE: u64 = 65;
 const WRITER_TERM: u64 = 81;
 const WRITER_EPOCH: u64 = 14;
 const POOL_GUID: [u8; 16] = [0x62; 16];
@@ -67,6 +72,98 @@ impl ProvisionedIdentity {
     }
 }
 
+fn accept_session(transport: &mut Transport) -> SessionId {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        match transport.accept_incoming() {
+            Ok(session_id) => return session_id,
+            Err(TransportError::Generic(message)) if message == "no pending connections" => {
+                assert!(Instant::now() < deadline, "authority accept timed out");
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("authority accept failed: {error}"),
+        }
+    }
+}
+
+fn spawn_owner_observation_authority(
+    authority_identity: &ProvisionedIdentity,
+    client_identity: &ProvisionedIdentity,
+    observations: Vec<(u64, u64, u64)>,
+) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+    let credential = Arc::new(authority_identity.credential());
+    let authority_public = credential.public_identity().into_identity();
+    let mut known_identities = NodeKeyStore::new();
+    known_identities
+        .register(authority_public.clone())
+        .expect("register mount authority identity");
+    known_identities
+        .register(client_identity.public_identity().into_identity())
+        .expect("register mount client identity");
+    let mut authority = Transport::new(AUTHORITY_NODE)
+        .with_attestation(
+            credential.keypair().expect("load mount authority keypair"),
+            authority_public,
+        )
+        .with_known_identities(known_identities);
+    authority.set_endpoint_family(EndpointFamily::Control);
+    authority.set_attestation_bootstrap_from_handshake(false);
+    authority
+        .bind(TransportAddr::Tcp("127.0.0.1:0".parse().unwrap()))
+        .expect("bind mount authority");
+    let address = match authority.bind_addr {
+        Some(TransportAddr::Tcp(address)) => address,
+        _ => panic!("mount authority must publish TCP address"),
+    };
+    let handle = thread::spawn(move || {
+        for (owner_node_id, writer_term, membership_epoch) in observations {
+            let session_id = accept_session(&mut authority);
+            authority
+                .perform_handshake(session_id)
+                .expect("authenticate mount owner observer");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let raw = loop {
+                match authority.recv_message(session_id) {
+                    Ok(raw) => break raw,
+                    Err(TransportError::WouldBlock(_)) => {
+                        assert!(Instant::now() < deadline, "mount observation timed out");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("receive mount observation: {error}"),
+                }
+            };
+            assert_eq!(&raw[..4], b"CP01");
+            let request = ClusterPoolMessage::decode(&raw[4..]).expect("decode mount observation");
+            let ClusterPoolMessage::OwnerObservationRequest(request) = request else {
+                panic!("expected mount owner observation request");
+            };
+            assert_eq!(request.pool_guid, POOL_GUID);
+            assert_eq!(request.requesting_node_id, CLIENT_NODE);
+            let response =
+                ClusterPoolMessage::OwnerObservationResponse(ClusterPoolOwnerObservationResponse {
+                    request_id: request.request_id,
+                    node_id: AUTHORITY_NODE,
+                    pool_guid: POOL_GUID,
+                    success: true,
+                    owner_node_id: Some(owner_node_id),
+                    membership_epoch: Some(membership_epoch),
+                    write_fence_generation: Some(writer_term),
+                    lease_remaining_ms: Some(60_000),
+                    error: None,
+                })
+                .encode()
+                .expect("encode mount observation");
+            let mut wire = Vec::with_capacity(4 + response.len());
+            wire.extend_from_slice(b"CP01");
+            wire.extend_from_slice(&response);
+            authority
+                .send_message(session_id, &wire)
+                .expect("send mount observation");
+        }
+    });
+    (address, handle)
+}
+
 fn mount_is_present(mountpoint: &Path) -> bool {
     fs::read_to_string("/proc/self/mountinfo").is_ok_and(|mountinfo| {
         mountinfo.lines().any(|line| {
@@ -85,7 +182,14 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
     }
 
     let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
+    let successor_identity = ProvisionedIdentity::new(SUCCESSOR_NODE);
     let client_identity = ProvisionedIdentity::new(CLIENT_NODE);
+    let authority_identity = ProvisionedIdentity::new(AUTHORITY_NODE);
+    let successor_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("reserve successor VFS_RPC endpoint");
+    let successor_addr = successor_listener
+        .local_addr()
+        .expect("read reserved successor endpoint");
     let root = tempfile::tempdir().expect("create persistent test root");
     let metadata_dir = root.path().join("metadata");
     let member = root.path().join("member.img");
@@ -144,7 +248,7 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
         WRITER_TERM,
         WRITER_EPOCH,
     )));
-    let initial_authority_deadline = Instant::now() + Duration::from_secs(12);
+    let initial_authority_deadline = Instant::now() + Duration::from_secs(20);
     let authority_deadline = ExternalMutationDeadline::new_until(initial_authority_deadline);
     let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
         "127.0.0.1:0".parse().unwrap(),
@@ -160,12 +264,25 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
     ))
     .expect("start Pool-backed VFS_RPC owner");
 
+    let (authority_addr, authority_thread) = spawn_owner_observation_authority(
+        &authority_identity,
+        &client_identity,
+        vec![
+            (OWNER_NODE, WRITER_TERM, WRITER_EPOCH),
+            (SUCCESSOR_NODE, WRITER_TERM + 1, WRITER_EPOCH),
+        ],
+    );
+
     let mount_config = ClusterVfsRpcMountConfig::new(
         mountpoint.clone(),
-        owner.bound_addr(),
+        authority_addr,
         POOL_GUID,
         client_identity.credential(),
-        owner_identity.public_identity(),
+        authority_identity.public_identity(),
+        vec![
+            ClusterVfsRpcOwnerCandidate::new(successor_addr, successor_identity.public_identity()),
+            ClusterVfsRpcOwnerCandidate::new(owner.bound_addr(), owner_identity.public_identity()),
+        ],
     );
     let mount_thread = thread::spawn(move || run_cluster_vfs_rpc_mount(mount_config));
     let mount_start_deadline = Instant::now() + Duration::from_secs(10);
@@ -182,12 +299,13 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
         );
         thread::sleep(Duration::from_millis(10));
     }
-    authority_deadline.renew_until(initial_authority_deadline + Duration::from_secs(3));
+    authority_deadline.renew_until(initial_authority_deadline + Duration::from_secs(5));
 
     let file_path = mountpoint.join("remote-file");
     let expected = b"real FUSE path reached the authenticated remote Pool owner";
     let mut file = OpenOptions::new()
         .create(true)
+        .truncate(true)
         .read(true)
         .write(true)
         .open(&file_path)
@@ -231,6 +349,13 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
     );
     fs::remove_file(&hard_link).expect("unlink remote hard link");
     fs::remove_dir(&directory).expect("rmdir through real remote mount");
+    let successor_visible = b"fresh authority observation reached the higher-fence successor";
+    let successor_file = mountpoint.join("successor-visible");
+    let mut file = File::create(&successor_file).expect("create successor-visible file");
+    file.write_all(successor_visible)
+        .expect("write successor-visible file");
+    file.sync_all().expect("commit successor-visible file");
+    drop(file);
 
     while Instant::now() <= initial_authority_deadline + Duration::from_millis(20) {
         assert!(
@@ -242,7 +367,7 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
     fs::metadata(&mountpoint).expect("serve mounted metadata past the original authority deadline");
 
     authority_deadline.fence();
-    let idle_unmount_deadline = initial_authority_deadline + Duration::from_secs(5);
+    let idle_unmount_deadline = initial_authority_deadline + Duration::from_secs(9);
     while !mount_thread.is_finished() && Instant::now() < idle_unmount_deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -268,5 +393,86 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
         .expect_err("expired owner deadline must stop the owner service");
     assert!(owner_error.contains("mutation authority deadline has expired"));
     assert!(shutdown.load(Ordering::Acquire));
+
+    drop(successor_listener);
+    let successor_shutdown = Arc::new(AtomicBool::new(false));
+    let successor_deadline =
+        ExternalMutationDeadline::new_until(Instant::now() + Duration::from_secs(6));
+    let successor_fence = Arc::new(Mutex::new(ClusterVfsRpcWriterFence::new(
+        SUCCESSOR_NODE,
+        WRITER_TERM + 1,
+        WRITER_EPOCH,
+    )));
+    let mut successor = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
+        successor_addr,
+        SUCCESSOR_NODE,
+        Arc::new(successor_identity.credential()),
+        vec![client_identity.public_identity()],
+        POOL_GUID,
+        dataset_id,
+        successor_fence,
+        successor_deadline.clone(),
+        owner_adapter.engine_handle(),
+        Arc::clone(&successor_shutdown),
+    ))
+    .expect("start higher-fence successor VFS_RPC owner");
+
+    let successor_mountpoint = root.path().join("successor-mount");
+    let successor_config = ClusterVfsRpcMountConfig::new(
+        successor_mountpoint.clone(),
+        authority_addr,
+        POOL_GUID,
+        client_identity.credential(),
+        authority_identity.public_identity(),
+        vec![
+            ClusterVfsRpcOwnerCandidate::new(owner.bound_addr(), owner_identity.public_identity()),
+            ClusterVfsRpcOwnerCandidate::new(
+                successor.bound_addr(),
+                successor_identity.public_identity(),
+            ),
+        ],
+    );
+    let successor_mount_thread = thread::spawn(move || run_cluster_vfs_rpc_mount(successor_config));
+    let successor_mount_deadline = Instant::now() + Duration::from_secs(10);
+    while !mount_is_present(&successor_mountpoint) {
+        if successor_mount_thread.is_finished() {
+            let result = successor_mount_thread
+                .join()
+                .expect("successor mount thread must not panic");
+            panic!("higher-fence successor mount exited during startup: {result:?}");
+        }
+        assert!(
+            Instant::now() < successor_mount_deadline,
+            "higher-fence successor mount did not appear"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        fs::read(successor_mountpoint.join("successor-visible"))
+            .expect("read committed data through authority-selected successor"),
+        successor_visible
+    );
+
+    successor_deadline.fence();
+    let successor_unmount_deadline = Instant::now() + Duration::from_secs(8);
+    while !successor_mount_thread.is_finished() && Instant::now() < successor_unmount_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        successor_mount_thread.is_finished(),
+        "higher-fence successor frontend did not expire"
+    );
+    successor_mount_thread
+        .join()
+        .expect("successor mount thread must not panic")
+        .expect_err("fenced successor authority must unmount the fresh frontend");
+    let successor_error = successor
+        .stop()
+        .expect_err("fenced successor must stop with expired authority");
+    assert!(successor_error.contains("mutation authority deadline has expired"));
+    assert!(successor_shutdown.load(Ordering::Acquire));
+    authority_thread
+        .join()
+        .expect("owner observation authority thread");
     drop(owner_adapter);
 }

@@ -64,6 +64,27 @@ pub enum PoolOwnerLeaseError {
     Expired { expiration_deadline_ms: u64 },
     #[error("membership handoff is fenced until {blocked_until_ms}")]
     EpochHandoffPending { blocked_until_ms: u64 },
+    #[error("active Pool owner authority contains a zero identity or fence field")]
+    InvalidAuthorityState,
+}
+
+/// Read-only observation of the current committed Pool owner.
+///
+/// This deliberately omits the lease identifier, slot, absolute authority
+/// deadline, and complete [`PoolLeaseToken`]. It can select and fence a client
+/// connection, but cannot authorize Pool import or mutate lease authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PoolOwnerLeaseObservation {
+    /// Observed Pool GUID.
+    pub pool_guid: [u8; 16],
+    /// Current committed owner node.
+    pub owner_node_id: u64,
+    /// Membership epoch binding the owner lease.
+    pub membership_epoch: EpochId,
+    /// Monotonic write-fence generation for this ownership incarnation.
+    pub write_fence_generation: u64,
+    /// Authority-measured time remaining at observation.
+    pub lease_remaining_ms: u64,
 }
 
 /// Live authority for Pool-scoped single-writer ownership.
@@ -387,6 +408,37 @@ impl PoolOwnerLeaseAuthority {
         self.active.get(&pool_guid).cloned()
     }
 
+    /// Observe the current owner without exposing import-capable lease state.
+    pub fn observe_owner(
+        &mut self,
+        pool_guid: [u8; 16],
+        now_ms: u64,
+    ) -> Result<PoolOwnerLeaseObservation, PoolOwnerLeaseError> {
+        self.expire_pool(pool_guid, now_ms);
+        let token = self
+            .active
+            .get(&pool_guid)
+            .ok_or(PoolOwnerLeaseError::NotOwned)?;
+        let lease_remaining_ms = token.expiration_deadline_ms.saturating_sub(now_ms);
+        if pool_guid == [0; 16]
+            || token.pool_guid != pool_guid
+            || token.node_id == 0
+            || token.epoch.0 == 0
+            || token.write_fence.epoch != token.epoch
+            || token.write_fence.generation == 0
+            || lease_remaining_ms == 0
+        {
+            return Err(PoolOwnerLeaseError::InvalidAuthorityState);
+        }
+        Ok(PoolOwnerLeaseObservation {
+            pool_guid,
+            owner_node_id: token.node_id,
+            membership_epoch: token.epoch,
+            write_fence_generation: token.write_fence.generation,
+            lease_remaining_ms,
+        })
+    }
+
     fn expire_pool(&mut self, pool_guid: [u8; 16], now_ms: u64) {
         if self
             .active
@@ -515,10 +567,31 @@ mod tests {
     fn pool_owner_lease_release_allows_newer_fence_handoff() {
         let mut authority = authority();
         let first = authority.acquire(POOL, 11, 1_000).unwrap();
+        assert_eq!(
+            authority.observe_owner(POOL, 1_500).unwrap(),
+            PoolOwnerLeaseObservation {
+                pool_guid: POOL,
+                owner_node_id: 11,
+                membership_epoch: EpochId::new(7),
+                write_fence_generation: first.write_fence.generation,
+                lease_remaining_ms: 29_500,
+            }
+        );
         authority.release(&first).unwrap();
+        assert_eq!(
+            authority.observe_owner(POOL, 2_000),
+            Err(PoolOwnerLeaseError::NotOwned)
+        );
         let second = authority.acquire(POOL, 12, 2_000).unwrap();
         assert!(second.write_fence.is_later_than(&first.write_fence));
         assert_ne!(second.lease_id, first.lease_id);
+        let observed = authority.observe_owner(POOL, 2_001).unwrap();
+        assert_eq!(observed.owner_node_id, 12);
+        assert_eq!(
+            observed.write_fence_generation,
+            second.write_fence.generation
+        );
+        assert_eq!(observed.lease_remaining_ms, 29_999);
     }
 
     #[test]
