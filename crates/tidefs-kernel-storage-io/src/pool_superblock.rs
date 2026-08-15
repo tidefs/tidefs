@@ -184,6 +184,9 @@ impl From<LabelError> for PoolSuperblockError {
             | LabelError::UnsupportedTopologyRosterVersion(_)
             | LabelError::DuplicateTopologyRosterGuid
             | LabelError::TopologyRosterChecksumMismatch
+            | LabelError::BadPoolLifecycle
+            | LabelError::UnsupportedPoolLifecycleVersion(_)
+            | LabelError::PoolLifecycleChecksumMismatch
             | LabelError::NameTooLong
             | LabelError::LastDevice => Self::Corrupt,
         }
@@ -815,6 +818,20 @@ mod tests {
             LabelError::UnsupportedTopologyRosterVersion(2),
             LabelError::DuplicateTopologyRosterGuid,
             LabelError::TopologyRosterChecksumMismatch,
+        ] {
+            assert_eq!(
+                PoolSuperblockError::from(error),
+                PoolSuperblockError::Corrupt
+            );
+        }
+    }
+
+    #[test]
+    fn pool_lifecycle_label_errors_map_to_corrupt() {
+        for error in [
+            LabelError::BadPoolLifecycle,
+            LabelError::UnsupportedPoolLifecycleVersion(2),
+            LabelError::PoolLifecycleChecksumMismatch,
         ] {
             assert_eq!(
                 PoolSuperblockError::from(error),
