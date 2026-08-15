@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId as LifecycleDatasetId, SyncGuarantee};
 use tidefs_local_filesystem::{
     human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem,
-    RootAuthenticationKey,
+    LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy, RootAuthenticationKey,
 };
 use tidefs_local_object_store::pool::PoolRedundancyPolicy;
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_owner::{
@@ -34,17 +35,19 @@ const OWNER_NODE: u64 = 2;
 const CLIENT_NODE: u64 = 1;
 const WRITER_TERM: u64 = 77;
 const WRITER_EPOCH: u64 = 9;
+const TEST_SESSION_KEY: [u8; 32] = [0xA4; 32];
 
 struct RpcClient {
     transport: Transport,
     session_id: SessionId,
     adapter: VfsRpcTransportAdapter,
+    dataset_id: DatasetId,
     next_op_id: u64,
     next_sequence: u64,
 }
 
 impl RpcClient {
-    fn connect(local_node: u64, owner_addr: SocketAddr) -> Self {
+    fn connect(local_node: u64, owner_addr: SocketAddr, dataset_id: DatasetId) -> Self {
         let mut transport = Transport::new(local_node);
         transport.set_endpoint_family(EndpointFamily::Control);
         transport
@@ -61,6 +64,14 @@ impl RpcClient {
         transport
             .perform_handshake(session_id)
             .expect("authenticate owner transport");
+        transport
+            .sessions
+            .get(&session_id)
+            .expect("client session exists")
+            .lock()
+            .expect("lock client session")
+            .init_ciphers_from_key(&TEST_SESSION_KEY, true);
+        assert!(transport.session_has_authenticated_confidentiality(session_id));
 
         let mut sessions = TransportSessionSet::new();
         sessions.add_binding_with_epoch(OWNER_NODE, session_id, WRITER_EPOCH);
@@ -69,6 +80,7 @@ impl RpcClient {
             transport,
             session_id,
             adapter: VfsRpcTransportAdapter::new(VfsRpcTransportAdapterConfig::default(), sessions),
+            dataset_id,
             next_op_id: 1,
             next_sequence: 0,
         }
@@ -99,8 +111,17 @@ impl RpcClient {
     ) -> VfsRpcRequest {
         let op_id = OpId::new(self.next_op_id);
         self.next_op_id = self.next_op_id.saturating_add(1);
-        VfsRpcRequest::new(op_id, term, epoch, flags, payload, credentials)
-            .expect("encode VFS_RPC request")
+        VfsRpcRequest::new(
+            op_id,
+            OWNER_NODE,
+            self.dataset_id,
+            term,
+            epoch,
+            flags,
+            payload,
+            credentials,
+        )
+        .expect("encode VFS_RPC request")
     }
 
     fn round_trip(&mut self, request: &VfsRpcRequest) -> VfsRpcResponse {
@@ -129,6 +150,8 @@ impl RpcClient {
     fn raw_bulk_round_trip(&mut self, request: &VfsRpcRequest) -> VfsRpcResponse {
         let placeholder = VfsRpcRequest::new(
             request.header.op_id,
+            request.header.writer_node,
+            request.header.dataset_id,
             request.header.term,
             request.header.epoch,
             0,
@@ -182,7 +205,7 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
         .set_len(32 * 1024 * 1024)
         .expect("size regular-file Pool member");
 
-    let filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+    let mut root_filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
         &metadata_dir,
         std::slice::from_ref(&member),
         "tidefs-vfs-rpc-owner",
@@ -192,6 +215,35 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
         RecoveryPolicy::default(),
     )
     .expect("open regular-file Pool-backed filesystem");
+    let canonical_dataset_id = LifecycleDatasetId::from_bytes([0x48; 16]);
+    root_filesystem
+        .create_filesystem_dataset(
+            "clustered",
+            canonical_dataset_id,
+            Vec::new(),
+            DatasetFlags::default_create(),
+            SyncGuarantee::Local,
+        )
+        .expect("publish nonzero clustered filesystem dataset identity");
+    drop(root_filesystem);
+
+    let filesystem = LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+        &metadata_dir,
+        "tidefs-vfs-rpc-owner",
+        PoolRedundancyPolicy::default(),
+        "clustered",
+        LocalFileSystemOpenConfig {
+            options: StoreOptions::default(),
+            allocator_policy: LocalStorageAllocatorPolicy::default(),
+            root_authentication_key: RootAuthenticationKey::demo_key(),
+            encryption: None,
+            compression: None,
+            log_device_device_path: None,
+            recovery_policy: RecoveryPolicy::default(),
+            block_devices: Some(std::slice::from_ref(&member)),
+        },
+    )
+    .expect("open exact named Pool-backed filesystem dataset");
     let topology = filesystem.pool_topology_status();
     assert_eq!(topology.present_members, 1);
     let dataset_id = DatasetId::new(u128::from_le_bytes(filesystem.mounted_dataset_id()));
@@ -204,17 +256,37 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
         WRITER_TERM,
         WRITER_EPOCH,
     )));
-    let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
+    let zero_dataset = ClusterVfsRpcOwnerConfig::new(
         "127.0.0.1:0".parse().unwrap(),
         OWNER_NODE,
         CLIENT_NODE,
-        dataset_id,
-        writer_fence,
-        engine,
+        DatasetId::new(0),
+        Arc::clone(&writer_fence),
+        Arc::clone(&engine),
         Arc::clone(&shutdown),
-    ))
+    )
+    .with_authenticated_session_key(TEST_SESSION_KEY);
+    match ClusterVfsRpcOwnerHandle::start(zero_dataset) {
+        Err(error) => assert_eq!(error, "cluster VFS_RPC dataset identity must be nonzero"),
+        Ok(mut unexpected_owner) => {
+            let _ = unexpected_owner.stop();
+            panic!("zero VFS dataset identity must fail closed");
+        }
+    }
+    let mut owner = ClusterVfsRpcOwnerHandle::start(
+        ClusterVfsRpcOwnerConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            OWNER_NODE,
+            CLIENT_NODE,
+            dataset_id,
+            writer_fence,
+            engine,
+            Arc::clone(&shutdown),
+        )
+        .with_authenticated_session_key(TEST_SESSION_KEY),
+    )
     .expect("start Pool-backed VFS_RPC owner");
-    let mut client = RpcClient::connect(CLIENT_NODE, owner.bound_addr());
+    let mut client = RpcClient::connect(CLIENT_NODE, owner.bound_addr(), dataset_id);
 
     let create = client.new_request(
         WRITER_TERM,

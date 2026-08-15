@@ -112,6 +112,8 @@ pub mod xfstests_harness;
 
 pub mod capacity;
 #[cfg(feature = "cluster")]
+pub mod cluster_vfs_rpc_client;
+#[cfg(feature = "cluster")]
 pub mod cluster_vfs_rpc_owner;
 #[cfg(feature = "cluster")]
 pub mod clustered_lock_forwarder;

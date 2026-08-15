@@ -1349,6 +1349,8 @@ mod tests {
     fn sample_request() -> VfsRpcRequest {
         VfsRpcRequest::new(
             OpId(7),
+            9,
+            DatasetId::new(1),
             2,
             3,
             0,
@@ -1509,6 +1511,8 @@ mod tests {
             VfsRpcTransportAdapter::new(VfsRpcTransportAdapterConfig::default(), sessions);
         let request = VfsRpcRequest::new(
             OpId(7),
+            9,
+            DatasetId::new(1),
             2,
             3,
             0,
@@ -1603,6 +1607,8 @@ mod tests {
         );
         let flagged = VfsRpcRequest::new(
             OpId(8),
+            9,
+            DatasetId::new(1),
             2,
             3,
             REQ_FLAG_BULK_PENDING,
@@ -1628,6 +1634,8 @@ mod tests {
 
         let bulk = VfsRpcRequest::new(
             OpId(9),
+            9,
+            DatasetId::new(1),
             2,
             3,
             0,
@@ -1679,6 +1687,8 @@ mod tests {
         let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, 4096).expect("descriptor");
         let request = VfsRpcRequest::new(
             OpId(42),
+            9,
+            DatasetId::new(1),
             2,
             3,
             REQ_FLAG_BULK_PENDING,
@@ -1736,6 +1746,8 @@ mod tests {
         );
         let read = VfsRpcRequest::new(
             OpId(55),
+            9,
+            DatasetId::new(1),
             2,
             3,
             0,
@@ -1815,6 +1827,8 @@ mod tests {
         let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, 3).expect("descriptor");
         let request = VfsRpcRequest::new(
             OpId(90),
+            9,
+            DatasetId::new(1),
             2,
             3,
             REQ_FLAG_BULK_PENDING,
@@ -1862,6 +1876,8 @@ mod tests {
         let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, 3).expect("descriptor");
         let request = VfsRpcRequest::new(
             OpId(90),
+            9,
+            DatasetId::new(1),
             2,
             3,
             REQ_FLAG_BULK_PENDING,
@@ -1925,6 +1941,8 @@ mod tests {
         let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, 3).expect("descriptor");
         let request = VfsRpcRequest::new(
             OpId(90),
+            9,
+            DatasetId::new(1),
             2,
             3,
             REQ_FLAG_BULK_PENDING,
@@ -1989,6 +2007,8 @@ mod tests {
         let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, 3).expect("descriptor");
         let request = VfsRpcRequest::new(
             OpId(90),
+            9,
+            DatasetId::new(1),
             2,
             3,
             REQ_FLAG_BULK_PENDING,
@@ -2163,6 +2183,8 @@ mod tests {
         );
         let request = VfsRpcRequest::new(
             OpId(7),
+            9,
+            DatasetId::new(1),
             2,
             3,
             0,

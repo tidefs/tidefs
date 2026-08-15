@@ -26,10 +26,10 @@ pub mod vfs_engine_bridge;
 pub const VFS_RPC_SERVICE_ID: u8 = 0x06;
 
 /// Wire format version for this crate's VFS_RPC payloads.
-pub const VFS_RPC_WIRE_VERSION: u8 = 1;
+pub const VFS_RPC_WIRE_VERSION: u8 = 2;
 
 /// Byte length of `VfsRpcRequestHeaderV1`.
-pub const REQUEST_HEADER_LEN: usize = 44;
+pub const REQUEST_HEADER_LEN: usize = 68;
 
 /// Byte length of `VfsRpcResponseHeaderV1`.
 pub const RESPONSE_HEADER_LEN: usize = 24;
@@ -106,6 +106,7 @@ pub enum VfsRpcMethod {
     Removexattr = 0x0C,
     Access = 0x0D,
     Create = 0x0E,
+    GetRoot = 0x0F,
     Getattr = 0x10,
     Setattr = 0x11,
     Open = 0x12,
@@ -167,6 +168,7 @@ impl VfsRpcMethod {
             0x0C => Self::Removexattr,
             0x0D => Self::Access,
             0x0E => Self::Create,
+            0x0F => Self::GetRoot,
             0x10 => Self::Getattr,
             0x11 => Self::Setattr,
             0x12 => Self::Open,
@@ -234,6 +236,8 @@ impl VfsRpcMessageKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VfsRpcRequestHeader {
     pub op_id: OpId,
+    pub writer_node: u64,
+    pub dataset_id: DatasetId,
     pub term: u64,
     pub epoch: u64,
     pub flags: u16,
@@ -246,6 +250,8 @@ impl VfsRpcRequestHeader {
     #[must_use]
     pub const fn new(
         op_id: OpId,
+        writer_node: u64,
+        dataset_id: DatasetId,
         term: u64,
         epoch: u64,
         flags: u16,
@@ -255,6 +261,8 @@ impl VfsRpcRequestHeader {
     ) -> Self {
         Self {
             op_id,
+            writer_node,
+            dataset_id,
             term,
             epoch,
             flags,
@@ -266,19 +274,23 @@ impl VfsRpcRequestHeader {
 
     pub fn encode_into(self, out: &mut Vec<u8>) {
         put_u64(out, self.op_id.0);
+        put_u64(out, self.writer_node);
+        put_u128(out, self.dataset_id.0);
         put_u64(out, self.term);
         put_u64(out, self.epoch);
         put_u16(out, self.flags);
         put_u16(out, self.method.id());
         put_u32(out, self.payload_len);
         put_u32(out, self.creds_len);
-        put_u64(out, 0);
+        put_u64(out, u64::from(VFS_RPC_WIRE_VERSION));
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, VfsRpcError> {
         let mut cursor = WireCursor::new(bytes);
         let header = Self {
             op_id: OpId(cursor.u64()?),
+            writer_node: cursor.u64()?,
+            dataset_id: DatasetId(cursor.u128()?),
             term: cursor.u64()?,
             epoch: cursor.u64()?,
             flags: cursor.u16()?,
@@ -286,9 +298,9 @@ impl VfsRpcRequestHeader {
             payload_len: cursor.u32()?,
             creds_len: cursor.u32()?,
         };
-        let reserved = cursor.u64()?;
-        if reserved != 0 {
-            return Err(VfsRpcError::ReservedNonZero);
+        let wire_version = cursor.u64()?;
+        if wire_version != u64::from(VFS_RPC_WIRE_VERSION) {
+            return Err(VfsRpcError::UnsupportedWireVersion(wire_version));
         }
         cursor.finish()?;
         Ok(header)
@@ -320,7 +332,7 @@ impl VfsRpcResponseHeader {
         put_u16(out, self.errno.raw());
         put_u16(out, self.flags);
         put_u32(out, self.payload_len);
-        put_u64(out, 0);
+        put_u64(out, u64::from(VFS_RPC_WIRE_VERSION));
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, VfsRpcError> {
@@ -331,9 +343,9 @@ impl VfsRpcResponseHeader {
             flags: cursor.u16()?,
             payload_len: cursor.u32()?,
         };
-        let reserved = cursor.u64()?;
-        if reserved != 0 {
-            return Err(VfsRpcError::ReservedNonZero);
+        let wire_version = cursor.u64()?;
+        if wire_version != u64::from(VFS_RPC_WIRE_VERSION) {
+            return Err(VfsRpcError::UnsupportedWireVersion(wire_version));
         }
         cursor.finish()?;
         Ok(header)
@@ -347,6 +359,8 @@ pub struct VfsRpcCredentials {
     pub auth_tag: [u8; 16],
     pub uid: u32,
     pub gid: u32,
+    pub pid: u32,
+    pub umask: u32,
     pub groups: Vec<u32>,
 }
 
@@ -358,6 +372,8 @@ impl VfsRpcCredentials {
             auth_tag: [0; 16],
             uid: 0,
             gid: 0,
+            pid: 0,
+            umask: 0,
             groups: vec![0],
         }
     }
@@ -370,6 +386,8 @@ impl VfsRpcCredentials {
         out.extend_from_slice(&self.auth_tag);
         put_u32(out, self.uid);
         put_u32(out, self.gid);
+        put_u32(out, self.pid);
+        put_u32(out, self.umask);
         put_u16(out, self.groups.len() as u16);
         for group in &self.groups {
             put_u32(out, *group);
@@ -383,6 +401,8 @@ impl VfsRpcCredentials {
         let auth_tag = cursor.array16()?;
         let uid = cursor.u32()?;
         let gid = cursor.u32()?;
+        let pid = cursor.u32()?;
+        let umask = cursor.u32()?;
         let group_count = cursor.u16()? as usize;
         let mut groups = Vec::with_capacity(group_count);
         for _ in 0..group_count {
@@ -394,6 +414,8 @@ impl VfsRpcCredentials {
             auth_tag,
             uid,
             gid,
+            pid,
+            umask,
             groups,
         })
     }
@@ -570,6 +592,7 @@ impl VfsRpcHandleType {
 /// Method-specific VFS_RPC request body.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VfsRpcRequestPayload {
+    GetRoot,
     Lookup {
         parent: InodeId,
         name: Vec<u8>,
@@ -762,6 +785,7 @@ impl VfsRpcRequestPayload {
     #[must_use]
     pub const fn method(&self) -> VfsRpcMethod {
         match self {
+            Self::GetRoot => VfsRpcMethod::GetRoot,
             Self::Lookup { .. } => VfsRpcMethod::Lookup,
             Self::Mknod { .. } => VfsRpcMethod::Mknod,
             Self::Mkdir { .. } => VfsRpcMethod::Mkdir,
@@ -808,6 +832,7 @@ impl VfsRpcRequestPayload {
 
     fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), VfsRpcError> {
         match self {
+            Self::GetRoot => {}
             Self::Lookup { parent, name } => {
                 put_inode(out, *parent);
                 put_bytes(out, name)?;
@@ -1054,6 +1079,7 @@ impl VfsRpcRequestPayload {
     fn decode(method: VfsRpcMethod, bytes: &[u8]) -> Result<Self, VfsRpcError> {
         let mut cursor = WireCursor::new(bytes);
         let payload = match method {
+            VfsRpcMethod::GetRoot => Self::GetRoot,
             VfsRpcMethod::Lookup => Self::Lookup {
                 parent: cursor.inode()?,
                 name: cursor.bytes()?,
@@ -1269,6 +1295,7 @@ impl VfsRpcRequestPayload {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VfsRpcResponsePayload {
     Empty,
+    RootInode(InodeId),
     Attr(InodeAttr),
     Lookup {
         inode: InodeId,
@@ -1300,6 +1327,7 @@ impl VfsRpcResponsePayload {
     fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), VfsRpcError> {
         match self {
             Self::Empty => {}
+            Self::RootInode(inode) => put_inode(out, *inode),
             Self::Attr(attr) => put_inode_attr(out, attr),
             Self::Lookup { inode, attr } => {
                 put_inode(out, *inode);
@@ -1345,6 +1373,7 @@ impl VfsRpcResponsePayload {
     fn decode(method: VfsRpcMethod, bytes: &[u8]) -> Result<Self, VfsRpcError> {
         let mut cursor = WireCursor::new(bytes);
         let payload = match method {
+            VfsRpcMethod::GetRoot => Self::RootInode(cursor.inode()?),
             VfsRpcMethod::Lookup => Self::Lookup {
                 inode: cursor.inode()?,
                 attr: cursor.inode_attr()?,
@@ -1415,6 +1444,8 @@ pub struct VfsRpcRequest {
 impl VfsRpcRequest {
     pub fn new(
         op_id: OpId,
+        writer_node: u64,
+        dataset_id: DatasetId,
         term: u64,
         epoch: u64,
         flags: u16,
@@ -1431,6 +1462,8 @@ impl VfsRpcRequest {
         Ok(Self {
             header: VfsRpcRequestHeader::new(
                 op_id,
+                writer_node,
+                dataset_id,
                 term,
                 epoch,
                 flags,
@@ -1664,6 +1697,8 @@ pub struct VfsRpcStats {
 /// Client-side request id correlation and retry accounting.
 #[derive(Clone, Debug)]
 pub struct VfsRpcClient {
+    writer_node: u64,
+    dataset_id: DatasetId,
     term: u64,
     epoch: u64,
     next_op_id: u64,
@@ -1676,8 +1711,17 @@ pub struct VfsRpcClient {
 
 impl VfsRpcClient {
     #[must_use]
-    pub fn new(term: u64, epoch: u64, max_in_flight: usize, retry_after: Duration) -> Self {
+    pub fn new(
+        writer_node: u64,
+        dataset_id: DatasetId,
+        term: u64,
+        epoch: u64,
+        max_in_flight: usize,
+        retry_after: Duration,
+    ) -> Self {
         Self {
+            writer_node,
+            dataset_id,
             term,
             epoch,
             next_op_id: 1,
@@ -1702,8 +1746,16 @@ impl VfsRpcClient {
         let op_id = OpId(self.next_op_id);
         self.next_op_id = self.next_op_id.saturating_add(1).max(1);
         let method = payload.method();
-        let request =
-            VfsRpcRequest::new(op_id, self.term, self.epoch, flags, payload, credentials)?;
+        let request = VfsRpcRequest::new(
+            op_id,
+            self.writer_node,
+            self.dataset_id,
+            self.term,
+            self.epoch,
+            flags,
+            payload,
+            credentials,
+        )?;
         self.in_flight.insert(
             op_id,
             PendingRequest {
@@ -1899,7 +1951,7 @@ pub enum VfsRpcError {
         actual: usize,
     },
     HeaderLengthMismatch,
-    ReservedNonZero,
+    UnsupportedWireVersion(u64),
     BoolOutOfRange(u8),
     TooManyGroups(usize),
     TooManyInFlight(usize),
@@ -1949,7 +2001,9 @@ impl fmt::Display for VfsRpcError {
                 )
             }
             Self::HeaderLengthMismatch => write!(f, "VFS_RPC header length does not match payload"),
-            Self::ReservedNonZero => write!(f, "VFS_RPC reserved field is non-zero"),
+            Self::UnsupportedWireVersion(version) => {
+                write!(f, "unsupported VFS_RPC wire version {version}")
+            }
             Self::BoolOutOfRange(value) => write!(f, "VFS_RPC boolean value {value} is invalid"),
             Self::TooManyGroups(count) => write!(f, "too many VFS_RPC credential groups: {count}"),
             Self::TooManyInFlight(limit) => {
@@ -2343,6 +2397,8 @@ mod tests {
     fn roundtrip_request(payload: VfsRpcRequestPayload) {
         let request = VfsRpcRequest::new(
             OpId(19),
+            7,
+            DatasetId::new(0xfeed),
             2,
             3,
             0,
@@ -2365,16 +2421,26 @@ mod tests {
     }
 
     #[test]
-    fn request_header_is_fixed_width_and_rejects_reserved_bits() {
-        let header = VfsRpcRequestHeader::new(OpId(1), 2, 3, 4, VfsRpcMethod::Lookup, 5, 6);
+    fn request_header_is_fixed_width_and_rejects_wrong_wire_version() {
+        let header = VfsRpcRequestHeader::new(
+            OpId(1),
+            9,
+            DatasetId::new(10),
+            2,
+            3,
+            4,
+            VfsRpcMethod::Lookup,
+            5,
+            6,
+        );
         let mut encoded = Vec::new();
         header.encode_into(&mut encoded);
         assert_eq!(encoded.len(), REQUEST_HEADER_LEN);
         assert_eq!(VfsRpcRequestHeader::decode(&encoded).unwrap(), header);
-        encoded[36] = 1;
+        encoded[REQUEST_HEADER_LEN - 1] ^= 1;
         assert_eq!(
             VfsRpcRequestHeader::decode(&encoded).unwrap_err(),
-            VfsRpcError::ReservedNonZero
+            VfsRpcError::UnsupportedWireVersion(u64::from(VFS_RPC_WIRE_VERSION) ^ (1_u64 << 56))
         );
     }
 
@@ -2405,6 +2471,7 @@ mod tests {
     fn request_payload_roundtrips_for_vfs_surface() {
         let handle = sample_handle();
         let payloads = vec![
+            VfsRpcRequestPayload::GetRoot,
             VfsRpcRequestPayload::Lookup {
                 parent: InodeId(1),
                 name: b"a".to_vec(),
@@ -2695,7 +2762,8 @@ mod tests {
     #[test]
     fn client_correlates_responses_and_tracks_retry_timeout_state() {
         let start = Instant::now();
-        let mut client = VfsRpcClient::new(1, 1, 4, Duration::from_millis(10));
+        let mut client =
+            VfsRpcClient::new(2, DatasetId::new(3), 1, 1, 4, Duration::from_millis(10));
         let request = client
             .begin_request(
                 start,
@@ -2730,7 +2798,7 @@ mod tests {
     #[test]
     fn client_enforces_in_flight_bound() {
         let start = Instant::now();
-        let mut client = VfsRpcClient::new(1, 1, 1, Duration::from_secs(1));
+        let mut client = VfsRpcClient::new(2, DatasetId::new(3), 1, 1, 1, Duration::from_secs(1));
         client
             .begin_request(
                 start,
@@ -2755,6 +2823,8 @@ mod tests {
         let mut window = VfsRpcDedupWindow::new(1);
         let request = VfsRpcRequest::new(
             OpId(10),
+            2,
+            DatasetId::new(3),
             1,
             1,
             0,
@@ -2788,6 +2858,8 @@ mod tests {
         let mut window = VfsRpcDedupWindow::new(8);
         let request = VfsRpcRequest::new(
             OpId(10),
+            2,
+            DatasetId::new(3),
             1,
             1,
             REQ_FLAG_NO_DEDUP,
