@@ -7609,6 +7609,35 @@ mod tests {
         label
     }
 
+    fn remove_legacy_device_lifecycle_files(metadata: &std::path::Path) {
+        for name in [
+            ".tidefs_device_removal_pending",
+            ".tidefs_device_removal_pending.tmp",
+            ".tidefs_device_replacement_evidence",
+            ".tidefs_device_replacement_evidence.tmp",
+        ] {
+            match std::fs::remove_file(metadata.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove obsolete lifecycle side file {name}: {error}"),
+            }
+        }
+    }
+
+    fn assert_legacy_device_lifecycle_files_absent(metadata: &std::path::Path) {
+        for name in [
+            ".tidefs_device_removal_pending",
+            ".tidefs_device_removal_pending.tmp",
+            ".tidefs_device_replacement_evidence",
+            ".tidefs_device_replacement_evidence.tmp",
+        ] {
+            assert!(
+                !metadata.join(name).exists(),
+                "obsolete lifecycle side file {name} must not be recovery authority"
+            );
+        }
+    }
+
     #[test]
     fn live_pool_admin_unsupported_local_command_returns_typed_error() {
         let (engine, _td) = temp_fs();
@@ -8330,7 +8359,7 @@ mod tests {
             .iter()
             .map(|path| fixed_offset_pool_label(path))
             .collect();
-        let marker_path = td.path().join("metadata/.tidefs_device_removal_pending");
+        let metadata = td.path().join("metadata");
 
         let removed = live_device_admin(
             &engine,
@@ -8370,7 +8399,7 @@ mod tests {
             }),
             "success response must report committed authority and its remanence limit: {removed}"
         );
-        assert!(!marker_path.exists());
+        assert_legacy_device_lifecycle_files_absent(&metadata);
 
         let fs = engine.fs.borrow();
         assert_eq!(fs.store.pool().stats().device_count, 1);
@@ -8405,11 +8434,35 @@ mod tests {
             .find(|index| *index != target_index)
             .expect("one survivor remains");
         let survivor_path = devices[survivor_index].clone();
-        assert_eq!(
+        let original_target =
+            tidefs_types_pool_label_core::decode_label(&original_labels[target_index])
+                .expect("decode original target topology");
+        for retired_bytes in [
             fixed_offset_pool_label(&target_path),
-            original_labels[target_index],
-            "the retired member keeps its stale lower-generation label"
-        );
+            fixed_offset_backup_pool_label(&target_path),
+        ] {
+            let retired = tidefs_types_pool_label_core::decode_label(&retired_bytes)
+                .expect("decode retired-member label");
+            let roster = tidefs_types_pool_label_core::decode_topology_roster_v1(&retired_bytes)
+                .expect("decode retired-member roster")
+                .expect("retired member retains predecessor roster");
+            let lifecycle = tidefs_types_pool_label_core::decode_pool_lifecycle_v1(&retired_bytes)
+                .expect("decode retired-member lifecycle")
+                .expect("retired member retains removal intent");
+            assert_eq!(retired.device_guid, original_target.device_guid);
+            assert_eq!(retired.device_index, original_target.device_index);
+            assert_eq!(retired.device_count, original_target.device_count);
+            assert_eq!(
+                retired.topology_generation,
+                original_target.topology_generation
+            );
+            assert_eq!(roster.len(), devices.len());
+            assert_eq!(roster.member_guid(target_index), Some(target_guid));
+            assert_eq!(
+                lifecycle.kind(),
+                tidefs_types_pool_label_core::PoolLifecycleKindV1::DeviceRemoval
+            );
+        }
 
         let expected_generation = removed["json"]["topology_generation"]
             .as_u64()
@@ -8431,13 +8484,13 @@ mod tests {
         drop(engine);
 
         let reopened = LocalFileSystem::open_with_block_devices(
-            td.path().join("metadata"),
+            &metadata,
             std::slice::from_ref(&survivor_path),
             tidefs_local_object_store::StoreOptions::default(),
             RootAuthenticationKey::demo_key(),
         )
         .expect("reopen committed survivor-only topology");
-        assert!(!marker_path.exists());
+        assert_legacy_device_lifecycle_files_absent(&metadata);
         assert_eq!(reopened.store.pool().stats().device_count, 1);
         assert_eq!(
             reopened
@@ -8590,6 +8643,7 @@ mod tests {
         assert_eq!(replaced["json"]["secure_erase_claimed"], false);
         assert_eq!(replaced["json"]["sanitization_claimed"], false);
         assert_eq!(replaced["json"]["decommissioning_claimed"], false);
+        assert_legacy_device_lifecycle_files_absent(&metadata);
         assert_eq!(
             engine
                 .fs
@@ -8721,6 +8775,9 @@ mod tests {
             .expect("prepare replacement before simulated crash");
         assert!(!prepared.complete);
         assert_eq!(prepared.objects_failed, 0);
+        assert_legacy_device_lifecycle_files_absent(&metadata);
+        remove_legacy_device_lifecycle_files(&metadata);
+        assert_legacy_device_lifecycle_files_absent(&metadata);
         drop(filesystem);
 
         let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
@@ -8810,7 +8867,7 @@ mod tests {
     #[test]
     fn live_device_remove_pending_evacuation_recovers_before_cow_root_publication() {
         let (engine, td, devices) = temp_fs_with_block_devices(2);
-        let marker_path = td.path().join("metadata/.tidefs_device_removal_pending");
+        let metadata = td.path().join("metadata");
         engine
             .fs
             .borrow_mut()
@@ -8824,7 +8881,6 @@ mod tests {
             .expect("create independent removal-resume filesystem");
         drop(engine);
         let independent_payload = b"removal resume preserves independent bytes";
-        let metadata = td.path().join("metadata");
         let mut independent = open_named_test_filesystem(
             &metadata,
             &devices,
@@ -8937,23 +8993,25 @@ mod tests {
                 .pool_mut()
                 .sync_all()
                 .expect("sync survivor evacuation before simulated crash");
-            assert!(marker_path.exists());
+            assert_legacy_device_lifecycle_files_absent(&metadata);
             selected
         };
 
         // Drop without finish_safe_remove_device(): this simulates the exact
         // crash window after receipt relocation but before copy-on-write
         // manifest reconciliation publishes its replacement root.
+        remove_legacy_device_lifecycle_files(&metadata);
+        assert_legacy_device_lifecycle_files_absent(&metadata);
         drop(engine);
 
         let reopened = LocalFileSystem::open_with_block_devices(
-            td.path().join("metadata"),
+            &metadata,
             &devices,
             tidefs_local_object_store::StoreOptions::default(),
             RootAuthenticationKey::demo_key(),
         )
         .expect("marker-bound recovery republishes roots and finishes removal");
-        assert!(!marker_path.exists());
+        assert_legacy_device_lifecycle_files_absent(&metadata);
         assert_eq!(reopened.store.pool().stats().device_count, 1);
         assert_eq!(
             reopened
@@ -9013,10 +9071,7 @@ mod tests {
         assert!(snapshot_refusal["error"]
             .as_str()
             .is_some_and(|message| message.contains("data-retaining snapshots or clones")));
-        assert!(!snapshot_root
-            .path()
-            .join("metadata/.tidefs_device_removal_pending")
-            .exists());
+        assert_legacy_device_lifecycle_files_absent(&snapshot_root.path().join("metadata"));
         assert_eq!(
             snapshot_engine
                 .fs
@@ -9067,10 +9122,7 @@ mod tests {
             true,
         );
         assert_eq!(corrupt_refusal["ok"], false, "{corrupt_refusal}");
-        assert!(!corrupt_root
-            .path()
-            .join("metadata/.tidefs_device_removal_pending")
-            .exists());
+        assert_legacy_device_lifecycle_files_absent(&corrupt_root.path().join("metadata"));
         assert_eq!(
             corrupt_engine.fs.borrow().store.pool().stats().device_count,
             2
@@ -9127,10 +9179,7 @@ mod tests {
             true,
         );
         assert_eq!(dataset_removal["ok"], true, "{dataset_removal}");
-        assert!(!dataset_root
-            .path()
-            .join("metadata/.tidefs_device_removal_pending")
-            .exists());
+        assert_legacy_device_lifecycle_files_absent(&metadata);
         assert_eq!(
             dataset_engine.fs.borrow().store.pool().stats().device_count,
             1

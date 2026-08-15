@@ -10,8 +10,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use tidefs_types_pool_label_core::{
-    decode_label, features, verify_label_checksum, LabelError, PoolLabelV1, POOL_LABEL_MAGIC,
-    POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
+    decode_label, decode_pool_lifecycle_v1, features, verify_label_checksum, LabelError,
+    PoolLabelV1, POOL_LABEL_MAGIC, POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
+    POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 
 use crate::{decode_completed_evacuations_label_extension, CompletedEvacuation};
@@ -139,18 +140,19 @@ impl std::fmt::Display for LabelErrorKind {
 impl From<&LabelError> for LabelErrorKind {
     fn from(e: &LabelError) -> Self {
         match e {
-            LabelError::ChecksumMismatch | LabelError::TopologyRosterChecksumMismatch => {
-                Self::ChecksumMismatch
-            }
+            LabelError::ChecksumMismatch
+            | LabelError::TopologyRosterChecksumMismatch
+            | LabelError::PoolLifecycleChecksumMismatch => Self::ChecksumMismatch,
             LabelError::BadMagic => Self::Other,
             LabelError::BufferTooSmall => Self::Other,
-            LabelError::UnsupportedVersion(_) | LabelError::UnsupportedTopologyRosterVersion(_) => {
-                Self::UnsupportedVersion
-            }
+            LabelError::UnsupportedVersion(_)
+            | LabelError::UnsupportedTopologyRosterVersion(_)
+            | LabelError::UnsupportedPoolLifecycleVersion(_) => Self::UnsupportedVersion,
             LabelError::BadPoolState(_)
             | LabelError::BadDeviceClass(_)
             | LabelError::BadRedundancyPolicy { .. }
             | LabelError::BadTopologyRoster
+            | LabelError::BadPoolLifecycle
             | LabelError::DuplicateTopologyRosterGuid => Self::BadField,
             LabelError::NameTooLong => Self::BadField,
             LabelError::LastDevice => Self::Other,
@@ -508,7 +510,10 @@ impl LabelReader {
             return Ok(None);
         }
         let label = decode_label(&full).map_err(|e| format!("label decode failed: {e}"))?;
-        let extension_offset = crate::decoded_label_wire_size(&label)?;
+        let lifecycle = decode_pool_lifecycle_v1(&full)
+            .map_err(|e| format!("Pool lifecycle decode failed: {e}"))?;
+        let extension_offset =
+            crate::decoded_label_wire_size(&label, lifecycle.map(|record| record.payload().len()))?;
         let mut extension = full[extension_offset..].to_vec();
         let label_area_bytes = usize::try_from(self.config.label_area_bytes)
             .map_err(|_| "configured label area does not fit in usize".to_string())?;

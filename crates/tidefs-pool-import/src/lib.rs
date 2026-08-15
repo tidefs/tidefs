@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -28,6 +29,18 @@ pub mod create;
 use committed_root::{recover_committed_root_from_file, CommittedRoot, CommittedRootError};
 #[cfg(test)]
 use tidefs_encryption::StoreKey;
+
+type PoolLifecycleOwned = (
+    u64,
+    tidefs_types_pool_label_core::PoolLifecycleKindV1,
+    Vec<u8>,
+);
+type DecodedMemberLabel = (
+    tidefs_types_pool_label_core::PoolLabelV1,
+    Option<tidefs_types_pool_label_core::DeviceLayoutV1Bytes>,
+    Option<Vec<[u8; 16]>>,
+    Option<PoolLifecycleOwned>,
+);
 
 // ---------------------------------------------------------------------------
 // ── Device layout constants for intent-log replay ──────────────────
@@ -347,6 +360,10 @@ struct LabelAgreementMember {
     features_compat: u64,
     /// Encoded DeviceLayoutV1 record read from the label header.
     device_layout_v1: Option<tidefs_types_pool_label_core::DeviceLayoutV1Bytes>,
+    /// Canonical durable member GUID roster selected with this label copy.
+    topology_roster_v1: Option<Vec<[u8; 16]>>,
+    /// Exact lifecycle sequence, kind, and opaque payload selected with it.
+    pool_lifecycle_v1: Option<PoolLifecycleOwned>,
     /// Pool state recorded in the label.
     pool_state: tidefs_types_pool_label_core::PoolState,
 }
@@ -384,17 +401,20 @@ pub fn pool_import(
     encryption_key: Option<tidefs_encryption::StoreKey>,
     min_epoch: Option<u64>,
 ) -> Result<ImportedPool, ImportError> {
-    let label_agreement = build_label_agreement_report_for_paths(device_paths)?;
+    let label_offsets = tidefs_pool_scan::select_label_copy_offsets(device_paths)
+        .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
+    let label_agreement = build_label_agreement_report_for_paths(device_paths, &label_offsets)?;
     verify_label_agreement(&label_agreement)?;
     let committed_root_agreement =
-        build_committed_root_agreement_report_for_paths(device_paths, min_epoch)?;
+        build_committed_root_agreement_report_for_paths(device_paths, &label_offsets, min_epoch)?;
     verify_committed_root_agreement(&committed_root_agreement)?;
 
     let entries = tidefs_pool_scan::scan_labels(device_paths)
         .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
     let config = tidefs_pool_scan::PoolAssembler::assemble(&entries, None)
         .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
-    let mut import = PoolImport::new(config, lock_dir, encryption_key, min_epoch);
+    let mut import = PoolImport::new(config, lock_dir, encryption_key, min_epoch)
+        .with_label_offsets(label_offsets);
     let stats = if read_only {
         import.import_readonly()?
     } else {
@@ -417,14 +437,17 @@ pub fn pool_import_owned(
     read_only: bool,
     encryption_key: Option<tidefs_encryption::StoreKey>,
 ) -> Result<PoolImportOwner, ImportError> {
-    let label_agreement = build_label_agreement_report_for_paths(device_paths)?;
+    let label_offsets = tidefs_pool_scan::select_label_copy_offsets(device_paths)
+        .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
+    let label_agreement = build_label_agreement_report_for_paths(device_paths, &label_offsets)?;
     verify_label_agreement(&label_agreement)?;
 
     let entries = tidefs_pool_scan::scan_labels(device_paths)
         .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
     let config = tidefs_pool_scan::PoolAssembler::assemble(&entries, None)
         .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
-    let mut admission = PoolImport::new(config, lock_dir, encryption_key, None);
+    let mut admission =
+        PoolImport::new(config, lock_dir, encryption_key, None).with_label_offsets(label_offsets);
     let stats = admission.admit_owned(read_only)?;
     let imported = ImportedPool {
         config: admission.config().clone(),
@@ -478,6 +501,8 @@ pub fn pool_export(
     lock_dir: &Path,
     force: bool,
 ) -> Result<(), ImportError> {
+    let label_offsets = tidefs_pool_scan::select_label_copy_offsets(device_paths)
+        .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
     // 1. Scan and assemble the pool config.
     let entries = tidefs_pool_scan::scan_labels(device_paths)
         .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
@@ -488,7 +513,8 @@ pub fn pool_export(
     let mut devices: Vec<DeviceHandle> = Vec::new();
     let leaves = collect_leaves(&config.device_tree);
     for leaf in &leaves {
-        let handle = DeviceHandle::open_rw(&leaf.device_path, leaf.device_index)?;
+        let handle = DeviceHandle::open_rw(&leaf.device_path, leaf.device_index)?
+            .with_label_offset(label_offsets.get(&leaf.device_path).copied().unwrap_or(0));
         devices.push(handle);
     }
 
@@ -557,6 +583,8 @@ pub fn pool_export(
 /// zeroed after the tombstone label is written, preventing accidental
 /// re-import.  After a successful destroy the pool cannot be imported again.
 pub fn pool_destroy(device_paths: &[PathBuf], zero_superblock: bool) -> Result<(), ImportError> {
+    let label_offsets = tidefs_pool_scan::select_label_copy_offsets(device_paths)
+        .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
     let entries = tidefs_pool_scan::scan_labels(device_paths)
         .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
     let config = tidefs_pool_scan::PoolAssembler::assemble(&entries, None)
@@ -565,7 +593,8 @@ pub fn pool_destroy(device_paths: &[PathBuf], zero_superblock: bool) -> Result<(
     let mut devices: Vec<DeviceHandle> = Vec::new();
     let leaves = collect_leaves(&config.device_tree);
     for leaf in &leaves {
-        let handle = DeviceHandle::open_rw(&leaf.device_path, leaf.device_index)?;
+        let handle = DeviceHandle::open_rw(&leaf.device_path, leaf.device_index)?
+            .with_label_offset(label_offsets.get(&leaf.device_path).copied().unwrap_or(0));
         devices.push(handle);
     }
 
@@ -608,6 +637,8 @@ struct DeviceHandle {
     device_path: PathBuf,
     /// 0-based device index from the topology.
     device_index: u32,
+    /// Exact redundant copy selected as complete topology/lifecycle authority.
+    label_offset: u64,
     /// Opened file handle.
     file: File,
 }
@@ -626,6 +657,7 @@ impl DeviceHandle {
         Ok(Self {
             device_path: device_path.to_path_buf(),
             device_index,
+            label_offset: 0,
             file,
         })
     }
@@ -639,15 +671,21 @@ impl DeviceHandle {
         Ok(Self {
             device_path: device_path.to_path_buf(),
             device_index,
+            label_offset: 0,
             file,
         })
     }
 
-    /// Read the first `POOL_LABEL_SIZE` bytes from this device.
+    fn with_label_offset(mut self, label_offset: u64) -> Self {
+        self.label_offset = label_offset;
+        self
+    }
+
+    /// Read the selected `POOL_LABEL_SIZE` bytes from this device.
     fn read_label_bytes(&mut self) -> Result<Vec<u8>, ImportError> {
         let mut buf = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
         self.file
-            .seek(SeekFrom::Start(0))
+            .seek(SeekFrom::Start(self.label_offset))
             .map_err(|e| ImportError::Io {
                 device_path: Some(self.device_path.clone()),
                 msg: format!("seek: {e}"),
@@ -656,7 +694,7 @@ impl DeviceHandle {
             .read_exact(&mut buf)
             .map_err(|e| ImportError::Io {
                 device_path: Some(self.device_path.clone()),
-                msg: format!("read label 0: {e}"),
+                msg: format!("read selected label at {}: {e}", self.label_offset),
             })?;
         Ok(buf)
     }
@@ -699,31 +737,70 @@ impl DeviceHandle {
         Ok(())
     }
 
-    /// Rewrite the primary encoded pool label without clobbering the
-    /// reserved commit-record/system area that shares the label region.
+    /// Rewrite the selected encoded pool label without clobbering the
+    /// reserved commit-record/system area that shares its label region.
     fn write_label_bytes(&mut self, buf: &[u8]) -> Result<(), ImportError> {
         debug_assert_eq!(buf.len(), tidefs_types_pool_label_core::POOL_LABEL_SIZE);
         let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
         let has_device_layout =
             features_compat & tidefs_types_pool_label_core::features::DEVICE_LAYOUT_V1 != 0;
+        let has_topology_roster =
+            features_compat & tidefs_types_pool_label_core::features::TOPOLOGY_ROSTER_V1 != 0;
+        let has_lifecycle =
+            features_compat & tidefs_types_pool_label_core::features::POOL_LIFECYCLE_V1 != 0;
         let write_len = if buf.iter().all(|b| *b == 0) {
             tidefs_types_pool_label_core::POOL_LABEL_SIZE
+        } else if has_topology_roster {
+            let roster = tidefs_types_pool_label_core::decode_topology_roster_v1(buf)
+                .map_err(|e| ImportError::Io {
+                    device_path: Some(self.device_path.clone()),
+                    msg: format!("decode topology roster before label write: {e}"),
+                })?
+                .ok_or_else(|| ImportError::Io {
+                    device_path: Some(self.device_path.clone()),
+                    msg: "topology roster feature has no encoded roster".to_string(),
+                })?;
+            let roster_len = tidefs_types_pool_label_core::POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+                + tidefs_types_pool_label_core::POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+                + roster.len()
+                    * tidefs_types_pool_label_core::POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE
+                + tidefs_types_pool_label_core::POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE;
+            if has_lifecycle {
+                let lifecycle = tidefs_types_pool_label_core::decode_pool_lifecycle_v1(buf)
+                    .map_err(|e| ImportError::Io {
+                        device_path: Some(self.device_path.clone()),
+                        msg: format!("decode lifecycle before label write: {e}"),
+                    })?
+                    .ok_or_else(|| ImportError::Io {
+                        device_path: Some(self.device_path.clone()),
+                        msg: "lifecycle feature has no encoded record".to_string(),
+                    })?;
+                roster_len
+                    + tidefs_types_pool_label_core::pool_lifecycle_v1_wire_size(lifecycle).map_err(
+                        |e| ImportError::Io {
+                            device_path: Some(self.device_path.clone()),
+                            msg: format!("measure lifecycle before label write: {e}"),
+                        },
+                    )?
+            } else {
+                roster_len
+            }
         } else if has_device_layout {
             tidefs_types_pool_label_core::POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE
         } else {
             tidefs_types_pool_label_core::POOL_LABEL_V1_EXT_WIRE_SIZE
         };
         self.file
-            .seek(SeekFrom::Start(0))
+            .seek(SeekFrom::Start(self.label_offset))
             .map_err(|e| ImportError::Io {
                 device_path: Some(self.device_path.clone()),
-                msg: format!("seek: {e}"),
+                msg: format!("seek to selected label at {}: {e}", self.label_offset),
             })?;
         self.file
             .write_all(&buf[..write_len])
             .map_err(|e| ImportError::Io {
                 device_path: Some(self.device_path.clone()),
-                msg: format!("write label 0: {e}"),
+                msg: format!("write selected label at {}: {e}", self.label_offset),
             })
     }
 }
@@ -741,9 +818,48 @@ fn encode_label_update_preserving_device_layout(
         device_path: Some(device_path.to_path_buf()),
         msg: format!("decode DeviceLayoutV1 during {operation}: {e}"),
     })?;
-    let sealed = tidefs_types_pool_label_core::seal_label_with_device_layout(
+    let topology_roster_v1 =
+        tidefs_types_pool_label_core::decode_topology_roster_v1(source_label_buf)
+            .map_err(|e| ImportError::Io {
+                device_path: Some(device_path.to_path_buf()),
+                msg: format!("decode topology roster during {operation}: {e}"),
+            })?
+            .map(|roster| {
+                (0..roster.len())
+                    .map(|index| roster.member_guid(index))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| ImportError::Io {
+                        device_path: Some(device_path.to_path_buf()),
+                        msg: format!("decode topology roster member during {operation}"),
+                    })
+            })
+            .transpose()?;
+    let lifecycle_owned = tidefs_types_pool_label_core::decode_pool_lifecycle_v1(source_label_buf)
+        .map_err(|e| ImportError::Io {
+            device_path: Some(device_path.to_path_buf()),
+            msg: format!("decode lifecycle during {operation}: {e}"),
+        })?
+        .map(|record| (record.sequence(), record.kind(), record.payload().to_vec()));
+    let lifecycle_record = lifecycle_owned
+        .as_ref()
+        .map(|(sequence, kind, payload)| {
+            tidefs_types_pool_label_core::PoolLifecycleRecordV1::new(
+                *sequence,
+                label.topology_generation,
+                *kind,
+                payload,
+            )
+        })
+        .transpose()
+        .map_err(|e| ImportError::Io {
+            device_path: Some(device_path.to_path_buf()),
+            msg: format!("bind lifecycle during {operation}: {e}"),
+        })?;
+    let sealed = tidefs_types_pool_label_core::seal_label_with_all_extensions(
         label,
         device_layout_v1.as_ref(),
+        topology_roster_v1.as_deref(),
+        lifecycle_record,
     )
     .map_err(|e| ImportError::Io {
         device_path: Some(device_path.to_path_buf()),
@@ -751,9 +867,11 @@ fn encode_label_update_preserving_device_layout(
     })?;
 
     let mut out_buf = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
-    tidefs_types_pool_label_core::encode_label_with_device_layout(
+    tidefs_types_pool_label_core::encode_label_with_all_extensions(
         &sealed,
         device_layout_v1.as_ref(),
+        topology_roster_v1.as_deref(),
+        lifecycle_record,
         &mut out_buf,
     )
     .map_err(|e| ImportError::Io {
@@ -772,10 +890,13 @@ const SUPPORTED_COMPAT_FEATURES: u64 = tidefs_types_pool_label_core::features::D
     | tidefs_types_pool_label_core::features::DEVICE_HEALTH_STATE
     | tidefs_types_pool_label_core::features::CLUSTER_POOL_COMPAT
     | tidefs_types_pool_label_core::features::POOL_REDUNDANCY_POLICY
-    | tidefs_types_pool_label_core::features::DEVICE_LAYOUT_V1;
+    | tidefs_types_pool_label_core::features::DEVICE_LAYOUT_V1
+    | tidefs_types_pool_label_core::features::TOPOLOGY_ROSTER_V1
+    | tidefs_types_pool_label_core::features::POOL_LIFECYCLE_V1;
 
 fn build_label_agreement_report_for_paths(
     device_paths: &[PathBuf],
+    label_offsets: &BTreeMap<PathBuf, u64>,
 ) -> Result<LabelAgreementReport, ImportError> {
     let mut members = Vec::with_capacity(device_paths.len());
 
@@ -784,7 +905,9 @@ fn build_label_agreement_report_for_paths(
             device_path: device_path.clone(),
             msg: e.to_string(),
         })?;
-        let (label, device_layout_v1) = read_member_label_from_file(&mut file, device_path)?;
+        let label_offset = label_offsets.get(device_path).copied().unwrap_or(0);
+        let (label, device_layout_v1, topology_roster_v1, pool_lifecycle_v1) =
+            read_member_label_from_file(&mut file, device_path, label_offset)?;
         ensure_supported_label_features(
             label.features_incompat,
             label.features_ro_compat,
@@ -794,6 +917,8 @@ fn build_label_agreement_report_for_paths(
             device_path.clone(),
             label,
             device_layout_v1,
+            topology_roster_v1,
+            pool_lifecycle_v1,
         ));
     }
 
@@ -820,6 +945,8 @@ fn build_label_agreement_report_for_devices(
             device_path: Some(device.device_path.clone()),
             msg: format!("decode DeviceLayoutV1 from label: {e}"),
         })?;
+        let topology_roster_v1 = decode_topology_roster_owned(&label_buf, &device.device_path)?;
+        let pool_lifecycle_v1 = decode_pool_lifecycle_owned(&label_buf, &device.device_path)?;
         ensure_supported_label_features(
             label.features_incompat,
             label.features_ro_compat,
@@ -829,6 +956,8 @@ fn build_label_agreement_report_for_devices(
             device.device_path.clone(),
             label,
             device_layout_v1,
+            topology_roster_v1,
+            pool_lifecycle_v1,
         ));
     }
 
@@ -837,6 +966,7 @@ fn build_label_agreement_report_for_devices(
 
 fn build_committed_root_agreement_report_for_paths(
     device_paths: &[PathBuf],
+    label_offsets: &BTreeMap<PathBuf, u64>,
     min_epoch: Option<u64>,
 ) -> Result<CommittedRootAgreementReport, ImportError> {
     let mut members = Vec::with_capacity(device_paths.len());
@@ -846,7 +976,8 @@ fn build_committed_root_agreement_report_for_paths(
             device_path: device_path.clone(),
             msg: e.to_string(),
         })?;
-        let (label, _) = read_member_label_from_file(&mut file, device_path)?;
+        let label_offset = label_offsets.get(device_path).copied().unwrap_or(0);
+        let (label, _, _, _) = read_member_label_from_file(&mut file, device_path, label_offset)?;
         let committed_root = recover_member_committed_root(&mut file, device_path, min_epoch)?;
         members.push(CommittedRootAgreementMember {
             device_path: device_path.clone(),
@@ -887,22 +1018,18 @@ fn build_committed_root_agreement_report_for_devices(
 fn read_member_label_from_file(
     file: &mut File,
     device_path: &Path,
-) -> Result<
-    (
-        tidefs_types_pool_label_core::PoolLabelV1,
-        Option<tidefs_types_pool_label_core::DeviceLayoutV1Bytes>,
-    ),
-    ImportError,
-> {
+    label_offset: u64,
+) -> Result<DecodedMemberLabel, ImportError> {
     let mut label_buf = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
-    file.seek(SeekFrom::Start(0)).map_err(|e| ImportError::Io {
-        device_path: Some(device_path.to_path_buf()),
-        msg: format!("seek to label 0: {e}"),
-    })?;
+    file.seek(SeekFrom::Start(label_offset))
+        .map_err(|e| ImportError::Io {
+            device_path: Some(device_path.to_path_buf()),
+            msg: format!("seek to selected label at {label_offset}: {e}"),
+        })?;
     file.read_exact(&mut label_buf)
         .map_err(|e| ImportError::Io {
             device_path: Some(device_path.to_path_buf()),
-            msg: format!("read label 0: {e}"),
+            msg: format!("read selected label at {label_offset}: {e}"),
         })?;
     let label =
         tidefs_types_pool_label_core::decode_label(&label_buf).map_err(|e| ImportError::Io {
@@ -914,7 +1041,49 @@ fn read_member_label_from_file(
             device_path: Some(device_path.to_path_buf()),
             msg: format!("decode DeviceLayoutV1 from label: {e}"),
         })?;
-    Ok((label, device_layout_v1))
+    let topology_roster_v1 = decode_topology_roster_owned(&label_buf, device_path)?;
+    let pool_lifecycle_v1 = decode_pool_lifecycle_owned(&label_buf, device_path)?;
+    Ok((
+        label,
+        device_layout_v1,
+        topology_roster_v1,
+        pool_lifecycle_v1,
+    ))
+}
+
+fn decode_topology_roster_owned(
+    label_buf: &[u8],
+    device_path: &Path,
+) -> Result<Option<Vec<[u8; 16]>>, ImportError> {
+    tidefs_types_pool_label_core::decode_topology_roster_v1(label_buf)
+        .map_err(|e| ImportError::Io {
+            device_path: Some(device_path.to_path_buf()),
+            msg: format!("decode topology roster from label: {e}"),
+        })?
+        .map(|roster| {
+            (0..roster.len())
+                .map(|index| roster.member_guid(index))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| ImportError::Io {
+                    device_path: Some(device_path.to_path_buf()),
+                    msg: "decode topology roster member from label".to_string(),
+                })
+        })
+        .transpose()
+}
+
+fn decode_pool_lifecycle_owned(
+    label_buf: &[u8],
+    device_path: &Path,
+) -> Result<Option<PoolLifecycleOwned>, ImportError> {
+    Ok(
+        tidefs_types_pool_label_core::decode_pool_lifecycle_v1(label_buf)
+            .map_err(|e| ImportError::Io {
+                device_path: Some(device_path.to_path_buf()),
+                msg: format!("decode lifecycle from label: {e}"),
+            })?
+            .map(|record| (record.sequence(), record.kind(), record.payload().to_vec())),
+    )
 }
 
 fn recover_member_committed_root(
@@ -943,6 +1112,8 @@ fn label_agreement_member(
     device_path: PathBuf,
     label: tidefs_types_pool_label_core::PoolLabelV1,
     device_layout_v1: Option<tidefs_types_pool_label_core::DeviceLayoutV1Bytes>,
+    topology_roster_v1: Option<Vec<[u8; 16]>>,
+    pool_lifecycle_v1: Option<PoolLifecycleOwned>,
 ) -> LabelAgreementMember {
     LabelAgreementMember {
         device_path,
@@ -959,6 +1130,8 @@ fn label_agreement_member(
         features_ro_compat: label.features_ro_compat,
         features_compat: label.features_compat,
         device_layout_v1,
+        topology_roster_v1,
+        pool_lifecycle_v1,
         pool_state: label.pool_state,
     }
 }
@@ -987,6 +1160,7 @@ fn verify_label_agreement(report: &LabelAgreementReport) -> Result<(), ImportErr
     ensure_redundancy_policies_agree(report)?;
     ensure_device_classes_agree(report)?;
     ensure_feature_flags_agree(report)?;
+    ensure_topology_and_lifecycle_agree(report)?;
     ensure_device_layout_records_match_feature_flags(report)?;
     ensure_device_layout_records_decode(report)?;
 
@@ -1255,6 +1429,59 @@ fn ensure_feature_flags_agree(report: &LabelAgreementReport) -> Result<(), Impor
     Ok(())
 }
 
+fn ensure_topology_and_lifecycle_agree(report: &LabelAgreementReport) -> Result<(), ImportError> {
+    let first = &report.members[0];
+    if report
+        .members
+        .iter()
+        .any(|member| member.topology_roster_v1 != first.topology_roster_v1)
+    {
+        return Err(ImportError::SuperblockDisagreement {
+            field: "topology_roster_v1".to_string(),
+            values: report
+                .members
+                .iter()
+                .map(|member| {
+                    let mut bytes = Vec::new();
+                    if let Some(roster) = &member.topology_roster_v1 {
+                        for guid in roster {
+                            bytes.extend_from_slice(guid);
+                        }
+                    }
+                    format!(
+                        "{}:members={},digest={}",
+                        member.device_path.display(),
+                        member.topology_roster_v1.as_ref().map_or(0, Vec::len),
+                        hex_digest_prefix(blake3::hash(&bytes).as_bytes())
+                    )
+                })
+                .collect(),
+        });
+    }
+    if report
+        .members
+        .iter()
+        .any(|member| member.pool_lifecycle_v1 != first.pool_lifecycle_v1)
+    {
+        return Err(ImportError::SuperblockDisagreement {
+            field: "pool_lifecycle_v1".to_string(),
+            values: report
+                .members
+                .iter()
+                .map(|member| match &member.pool_lifecycle_v1 {
+                    Some((sequence, kind, payload)) => format!(
+                        "{}:sequence={sequence},kind={kind:?},digest={}",
+                        member.device_path.display(),
+                        hex_digest_prefix(blake3::hash(payload).as_bytes())
+                    ),
+                    None => format!("{}:none", member.device_path.display()),
+                })
+                .collect(),
+        });
+    }
+    Ok(())
+}
+
 fn ensure_device_layout_records_match_feature_flags(
     report: &LabelAgreementReport,
 ) -> Result<(), ImportError> {
@@ -1333,6 +1560,8 @@ fn hex_digest_prefix(digest: &[u8; 32]) -> String {
 pub struct PoolImport {
     /// Assembled pool configuration from the scan phase.
     pool_config: PoolConfig,
+    /// Selected redundant label copy for each member path.
+    label_offsets: BTreeMap<PathBuf, u64>,
     /// Open handles to all leaf devices.
     devices: Vec<DeviceHandle>,
     /// Import lock file path (import mutex).
@@ -1370,6 +1599,7 @@ impl PoolImport {
         let lock_path = lock_dir.join(hex_uuid(&pool_config.pool_uuid));
         Self {
             pool_config,
+            label_offsets: BTreeMap::new(),
             devices: Vec::new(),
             lock_path,
             stats: PoolImportStats::default(),
@@ -1379,6 +1609,11 @@ impl PoolImport {
             recovery_commit_group: 0,
             recovered_root: None,
         }
+    }
+
+    fn with_label_offsets(mut self, label_offsets: BTreeMap<PathBuf, u64>) -> Self {
+        self.label_offsets = label_offsets;
+        self
     }
 
     /// Return a reference to the assembled pool configuration.
@@ -1554,7 +1789,16 @@ impl PoolImport {
         let leaves = collect_leaves(&self.pool_config.device_tree);
         self.devices = leaves
             .iter()
-            .map(|leaf| DeviceHandle::open_rw(&leaf.device_path, leaf.device_index))
+            .map(|leaf| {
+                DeviceHandle::open_rw(&leaf.device_path, leaf.device_index).map(|handle| {
+                    handle.with_label_offset(
+                        self.label_offsets
+                            .get(&leaf.device_path)
+                            .copied()
+                            .unwrap_or(0),
+                    )
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         self.stats.devices_opened = self.devices.len();
         Ok(())
@@ -1565,7 +1809,16 @@ impl PoolImport {
         let leaves = collect_leaves(&self.pool_config.device_tree);
         self.devices = leaves
             .iter()
-            .map(|leaf| DeviceHandle::open_ro(&leaf.device_path, leaf.device_index))
+            .map(|leaf| {
+                DeviceHandle::open_ro(&leaf.device_path, leaf.device_index).map(|handle| {
+                    handle.with_label_offset(
+                        self.label_offsets
+                            .get(&leaf.device_path)
+                            .copied()
+                            .unwrap_or(0),
+                    )
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         self.stats.devices_opened = self.devices.len();
         Ok(())
@@ -2195,8 +2448,10 @@ mod tests {
     use tidefs_local_object_store::device_layout::{encode_device_layout_v1, DeviceLayoutPolicy};
     use tidefs_pool_scan::DeviceHealth;
     use tidefs_types_pool_label_core::{
-        encode_label, encode_label_with_device_layout, seal_label, seal_label_with_device_layout,
-        DeviceClass, DeviceLayoutV1Bytes, PoolLabelV1, PoolRedundancyPolicy, PoolState,
+        decode_pool_lifecycle_v1, encode_label, encode_label_with_all_extensions,
+        encode_label_with_device_layout, seal_label, seal_label_with_all_extensions,
+        seal_label_with_device_layout, DeviceClass, DeviceLayoutV1Bytes, PoolLabelV1,
+        PoolLifecycleKindV1, PoolLifecycleRecordV1, PoolRedundancyPolicy, PoolState,
         POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE, POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
     };
 
@@ -2444,6 +2699,82 @@ mod tests {
         let label = tidefs_types_pool_label_core::decode_label(&handle.read_label_bytes().unwrap())
             .unwrap();
         label.pool_state
+    }
+
+    fn read_label_bytes_at(path: &Path, offset: u64) -> Vec<u8> {
+        let mut handle = DeviceHandle::open_ro(path, 0)
+            .unwrap()
+            .with_label_offset(offset);
+        handle.read_label_bytes().unwrap()
+    }
+
+    fn create_backup_lifecycle_pool(dir: &Path, pool_name: &str) -> (Vec<PathBuf>, u64, Vec<u8>) {
+        let device_size = 4 * 1024 * 1024;
+        let device_paths = vec![dir.join("device0"), dir.join("device1")];
+        for path in &device_paths {
+            let file = File::create(path).unwrap();
+            file.set_len(device_size).unwrap();
+        }
+
+        let config = crate::create::PoolCreateConfig {
+            pool_name: pool_name.to_string(),
+            pool_guid: Some([0xC7; 16]),
+            redundancy: PoolRedundancyPolicy::replicated(2),
+            encryption_key: None,
+            clustered: false,
+        };
+        let created = crate::create::PoolCreator::create_pool(&device_paths, &config).unwrap();
+        let backup_offset = device_size - POOL_LABEL_SIZE as u64;
+        let lifecycle_payload = b"replacement-label-authority".to_vec();
+
+        for path in &device_paths {
+            let primary = read_label_bytes_at(path, 0);
+            let mut label = tidefs_types_pool_label_core::decode_label(&primary).unwrap();
+            let layout = tidefs_types_pool_label_core::decode_device_layout_v1_bytes(&primary)
+                .unwrap()
+                .unwrap();
+            label.topology_generation = 2;
+            label.pool_state = PoolState::Exported;
+            let lifecycle = PoolLifecycleRecordV1::new(
+                9,
+                label.topology_generation,
+                PoolLifecycleKindV1::DeviceReplacement,
+                &lifecycle_payload,
+            )
+            .unwrap();
+            let sealed = seal_label_with_all_extensions(
+                label,
+                Some(&layout),
+                Some(&created.device_guids),
+                Some(lifecycle),
+            )
+            .unwrap();
+            let mut encoded = vec![0; POOL_LABEL_SIZE];
+            encode_label_with_all_extensions(
+                &sealed,
+                Some(&layout),
+                Some(&created.device_guids),
+                Some(lifecycle),
+                &mut encoded,
+            )
+            .unwrap();
+            let mut file = OpenOptions::new().write(true).open(path).unwrap();
+            file.seek(SeekFrom::Start(backup_offset)).unwrap();
+            file.write_all(&encoded).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        (device_paths, backup_offset, lifecycle_payload)
+    }
+
+    fn mirror_selected_lifecycle_family_to_primary(device_paths: &[PathBuf], source_offset: u64) {
+        for path in device_paths {
+            let selected = read_label_bytes_at(path, source_offset);
+            let mut file = OpenOptions::new().write(true).open(path).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&selected).unwrap();
+            file.sync_all().unwrap();
+        }
     }
 
     // -- open_devices tests --
@@ -3459,7 +3790,109 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn pool_import_owned_selects_complete_backup_lifecycle_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let (device_paths, backup_offset, _) =
+            create_backup_lifecycle_pool(dir.path(), "backup-family-import");
+
+        let selected = tidefs_pool_scan::select_label_copy_offsets(&device_paths).unwrap();
+        assert_eq!(selected.len(), device_paths.len());
+        assert!(device_paths
+            .iter()
+            .all(|path| selected.get(path) == Some(&backup_offset)));
+
+        let owner = pool_import_owned(&device_paths, &dir.path().join("locks"), true, None)
+            .expect("read-only import from complete backup lifecycle family");
+        assert_eq!(owner.imported().config.topology_generation, 2);
+        assert_eq!(owner.imported().config.device_count, 2);
+        owner.export().unwrap();
+    }
+
     // -- activation tests --
+
+    #[test]
+    fn activation_and_export_preserve_selected_label_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (device_paths, backup_offset, expected_payload) =
+            create_backup_lifecycle_pool(dir.path(), "backup-lifecycle-roundtrip");
+        let primary_before = device_paths
+            .iter()
+            .map(|path| read_label_bytes_at(path, 0))
+            .collect::<Vec<_>>();
+
+        let owner = pool_import_owned(&device_paths, &dir.path().join("locks"), false, None)
+            .expect("activate selected backup lifecycle family");
+
+        for (path, expected_primary) in device_paths.iter().zip(&primary_before) {
+            let primary = read_label_bytes_at(path, 0);
+            assert_eq!(&primary, expected_primary);
+            assert!(decode_pool_lifecycle_v1(&primary).unwrap().is_none());
+
+            let active_backup = read_label_bytes_at(path, backup_offset);
+            let active_label = tidefs_types_pool_label_core::decode_label(&active_backup).unwrap();
+            let active_lifecycle = decode_pool_lifecycle_v1(&active_backup).unwrap().unwrap();
+            assert_eq!(active_label.pool_state, PoolState::Active);
+            assert_eq!(active_label.topology_generation, 2);
+            assert_eq!(active_lifecycle.sequence(), 9);
+            assert_eq!(
+                active_lifecycle.kind(),
+                PoolLifecycleKindV1::DeviceReplacement
+            );
+            assert_eq!(active_lifecycle.payload(), expected_payload);
+        }
+
+        owner.export().expect("export selected lifecycle family");
+        for path in &device_paths {
+            let exported_backup = read_label_bytes_at(path, backup_offset);
+            let exported_label =
+                tidefs_types_pool_label_core::decode_label(&exported_backup).unwrap();
+            let exported_lifecycle = decode_pool_lifecycle_v1(&exported_backup).unwrap().unwrap();
+            assert_eq!(exported_label.pool_state, PoolState::Exported);
+            assert_eq!(exported_label.topology_generation, 2);
+            assert_eq!(exported_lifecycle.sequence(), 9);
+            assert_eq!(
+                exported_lifecycle.kind(),
+                PoolLifecycleKindV1::DeviceReplacement
+            );
+            assert_eq!(exported_lifecycle.payload(), expected_payload);
+        }
+    }
+
+    #[test]
+    fn activation_and_export_keep_equal_sequence_lifecycle_family_selectable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (device_paths, backup_offset, expected_payload) =
+            create_backup_lifecycle_pool(dir.path(), "equal-sequence-lifecycle-roundtrip");
+        mirror_selected_lifecycle_family_to_primary(&device_paths, backup_offset);
+
+        let owner = pool_import_owned(&device_paths, &dir.path().join("locks"), false, None)
+            .expect("activate equal-sequence redundant lifecycle family");
+        let active_offsets = tidefs_pool_scan::select_label_copy_offsets(&device_paths)
+            .expect("select completed ACTIVE lifecycle family");
+        for path in &device_paths {
+            let active = read_label_bytes_at(path, active_offsets[path]);
+            let label = tidefs_types_pool_label_core::decode_label(&active).unwrap();
+            let lifecycle = decode_pool_lifecycle_v1(&active).unwrap().unwrap();
+            assert_eq!(label.pool_state, PoolState::Active);
+            assert_eq!(lifecycle.sequence(), 9);
+            assert_eq!(lifecycle.payload(), expected_payload);
+        }
+
+        owner
+            .export()
+            .expect("export equal-sequence lifecycle family");
+        let exported_offsets = tidefs_pool_scan::select_label_copy_offsets(&device_paths)
+            .expect("select completed EXPORTED lifecycle family");
+        for path in &device_paths {
+            let exported = read_label_bytes_at(path, exported_offsets[path]);
+            let label = tidefs_types_pool_label_core::decode_label(&exported).unwrap();
+            let lifecycle = decode_pool_lifecycle_v1(&exported).unwrap().unwrap();
+            assert_eq!(label.pool_state, PoolState::Exported);
+            assert_eq!(lifecycle.sequence(), 9);
+            assert_eq!(lifecycle.payload(), expected_payload);
+        }
+    }
 
     #[test]
     fn activate_pool_single_device_writes_active_label() {
@@ -3577,9 +4010,10 @@ mod tests {
             f.flush().unwrap();
         }
 
-        let test_pattern: Vec<u8> = (0..tidefs_types_pool_label_core::POOL_LABEL_SIZE)
-            .map(|i| (i % 251) as u8)
-            .collect();
+        let test_label =
+            seal_label(PoolLabelV1::new([0xAA; 16], [0xBB; 16], "reserved-area")).unwrap();
+        let mut test_pattern = vec![0; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
+        encode_label(&test_label, &mut test_pattern).unwrap();
 
         // Write the pattern.
         let mut handle = DeviceHandle::open_rw(&dev_path, 0).unwrap();
