@@ -5,6 +5,7 @@ use std::fs::{self, File};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tidefs_auth::{
     NodeKeyStore, NodePrivateCredential, NodePublicIdentity, NODE_PRIVATE_CREDENTIAL_WIRE_SIZE,
@@ -17,7 +18,7 @@ use tidefs_local_filesystem::{
 };
 use tidefs_local_object_store::pool::PoolRedundancyPolicy;
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_client::{
-    ClusterVfsRpcClient, ClusterVfsRpcClientError,
+    ClusterVfsRpcClient, ClusterVfsRpcClientConfig, ClusterVfsRpcClientError,
 };
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_owner::{
     ClusterVfsRpcOwnerConfig, ClusterVfsRpcOwnerHandle, ClusterVfsRpcWriterFence,
@@ -58,10 +59,12 @@ impl ProvisionedIdentity {
     }
 
     fn credential(&self) -> Arc<NodePrivateCredential> {
-        Arc::new(
-            NodePrivateCredential::decode_fixed(&self.credential_bytes)
-                .expect("decode provisioned test credential"),
-        )
+        Arc::new(self.private_credential())
+    }
+
+    fn private_credential(&self) -> NodePrivateCredential {
+        NodePrivateCredential::decode_fixed(&self.credential_bytes)
+            .expect("decode provisioned test credential")
     }
 
     fn public_identity(&self) -> NodePublicIdentity {
@@ -121,6 +124,95 @@ fn request_ctx() -> RequestCtx {
         umask: 0o027,
         groups: vec![4242, 4343],
     }
+}
+
+#[test]
+fn connector_refuses_owner_epoch_movement_before_authority() {
+    let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
+    let client_identity = ProvisionedIdentity::new(CLIENT_NODE);
+    let owner_credential = owner_identity.credential();
+    let owner_public = owner_credential.public_identity().into_identity();
+    let mut known_identities = NodeKeyStore::new();
+    known_identities
+        .register(owner_public.clone())
+        .expect("register owner identity");
+    known_identities
+        .register(client_identity.public_identity().into_identity())
+        .expect("register client identity");
+    let mut owner = Transport::new(OWNER_NODE)
+        .with_attestation(
+            owner_credential.keypair().expect("load owner keypair"),
+            owner_public,
+        )
+        .with_known_identities(known_identities)
+        .with_epoch(WRITER_EPOCH);
+    owner.set_endpoint_family(EndpointFamily::Control);
+    owner.set_attestation_bootstrap_from_handshake(false);
+    owner
+        .bind(TransportAddr::Tcp("127.0.0.1:0".parse().unwrap()))
+        .expect("bind epoch-moving owner");
+    let owner_addr = match owner.bind_addr {
+        Some(TransportAddr::Tcp(addr)) => addr,
+        _ => panic!("owner must publish its TCP address"),
+    };
+
+    let owner_handle = std::thread::spawn(move || {
+        let accept = |transport: &mut Transport| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match transport.accept_incoming() {
+                    Ok(session_id) => break session_id,
+                    Err(TransportError::Generic(message))
+                        if message == "no pending connections" =>
+                    {
+                        assert!(Instant::now() < deadline, "owner accept timed out");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("owner accept failed: {error}"),
+                }
+            }
+        };
+
+        let discovery = accept(&mut owner);
+        assert!(matches!(
+            owner.perform_handshake(discovery),
+            Err(TransportError::AttestedEpochMismatch {
+                proposed_epoch: 0,
+                required_epoch: WRITER_EPOCH,
+                ..
+            })
+        ));
+        owner.epoch = WRITER_EPOCH + 1;
+        let retry = accept(&mut owner);
+        assert!(matches!(
+            owner.perform_handshake(retry),
+            Err(TransportError::AttestedEpochMismatch {
+                proposed_epoch: WRITER_EPOCH,
+                required_epoch,
+                ..
+            }) if required_epoch == WRITER_EPOCH + 1
+        ));
+    });
+
+    match ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+        owner_addr,
+        POOL_GUID,
+        client_identity.private_credential(),
+        owner_identity.public_identity(),
+    )) {
+        Err(ClusterVfsRpcClientError::EpochMoved {
+            authenticated_peer,
+            attempted_epoch,
+            required_epoch,
+        }) => {
+            assert_eq!(authenticated_peer, OWNER_NODE);
+            assert_eq!(attempted_epoch, WRITER_EPOCH);
+            assert_eq!(required_epoch, WRITER_EPOCH + 1);
+        }
+        Err(other) => panic!("unexpected epoch-movement refusal: {other}"),
+        Ok(_) => panic!("epoch movement must fail before client construction"),
+    }
+    owner_handle.join().expect("epoch-moving owner thread");
 }
 
 #[test]
@@ -203,9 +295,13 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
     ))
     .expect("start Pool-backed VFS_RPC owner");
 
-    let (transport, session_id) = connect(owner.bound_addr(), &client_identity, &owner_identity);
-    let client = ClusterVfsRpcClient::new(transport, session_id, POOL_GUID)
-        .expect("construct admitted cluster VFS_RPC client");
+    let client = ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+        owner.bound_addr(),
+        POOL_GUID,
+        client_identity.private_credential(),
+        owner_identity.public_identity(),
+    ))
+    .expect("discover owner epoch and construct admitted cluster VFS_RPC client");
     let remote_adapter = FuseVfsAdapter::new(Box::new(VfsDispatchEngineBridge::new(client)))
         .expect("construct FUSE adapter over authenticated cluster VFS_RPC");
     let remote_engine = remote_adapter.engine_handle();
@@ -304,16 +400,25 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
 
     let untrusted_same_node = ProvisionedIdentity::new(CLIENT_NODE);
     assert!(
-        connect_result(owner.bound_addr(), &untrusted_same_node, &owner_identity,).is_err(),
+        ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+            owner.bound_addr(),
+            POOL_GUID,
+            untrusted_same_node.private_credential(),
+            owner_identity.public_identity(),
+        ))
+        .is_err(),
         "a different key for the admitted numeric peer ID must fail the real handshake"
     );
     owner
         .check_health()
         .expect("owner must remain healthy after refusing the untrusted key");
 
-    let (wrong_pool_transport, wrong_pool_session) =
-        connect(owner.bound_addr(), &client_identity, &owner_identity);
-    match ClusterVfsRpcClient::new(wrong_pool_transport, wrong_pool_session, [0x50; 16]) {
+    match ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+        owner.bound_addr(),
+        [0x50; 16],
+        client_identity.private_credential(),
+        owner_identity.public_identity(),
+    )) {
         Err(ClusterVfsRpcClientError::WrongPool { expected, found }) => {
             assert_eq!(expected, [0x50; 16]);
             assert_eq!(found, POOL_GUID);
@@ -333,7 +438,18 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
         Ok(_) => panic!("unknown transport session must fail closed"),
     }
 
+    let unavailable_addr = owner.bound_addr();
     owner.stop().expect("stop Pool-backed VFS_RPC owner");
+    assert!(
+        ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+            unavailable_addr,
+            POOL_GUID,
+            client_identity.private_credential(),
+            owner_identity.public_identity(),
+        ))
+        .is_err(),
+        "an unavailable owner must fail before constructing a client"
+    );
     assert!(!shutdown.load(Ordering::Acquire));
     drop(owner_adapter);
 }

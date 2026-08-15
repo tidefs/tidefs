@@ -44,6 +44,21 @@ pub enum TransportError {
         reason: String,
     },
 
+    /// The exact trusted peer authenticated the full HELLO transcript but
+    /// refused to establish the session because the initiator proposed a
+    /// different membership epoch. Callers may use the authenticated
+    /// `required_epoch` for one fresh connection attempt; this session never
+    /// becomes established.
+    #[error(
+        "session {session_id} authenticated peer {authenticated_peer} requires membership epoch {required_epoch}, not proposed epoch {proposed_epoch}"
+    )]
+    AttestedEpochMismatch {
+        session_id: SessionId,
+        authenticated_peer: u64,
+        proposed_epoch: u64,
+        required_epoch: u64,
+    },
+
     #[error("max sessions ({max}) reached, cannot establish session to {peer}")]
     MaxSessionsReached { max: usize, peer: u64 },
 

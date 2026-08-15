@@ -1298,6 +1298,19 @@ impl Transport {
 
                         result
                     }
+                    Err(tidefs_auth::AttestationError::EpochMismatch {
+                        client_epoch,
+                        server_epoch,
+                    }) => {
+                        let authenticated_peer = hello_resp.server_identity.node_id;
+                        self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                        return Err(TransportError::AttestedEpochMismatch {
+                            session_id,
+                            authenticated_peer,
+                            proposed_epoch: client_epoch,
+                            required_epoch: server_epoch,
+                        });
+                    }
                     Err(e) => {
                         self.close_session(session_id, SessionCloseReason::AuthFailed)?;
                         return Err(TransportError::HandshakeFailed {
@@ -1395,32 +1408,12 @@ impl Transport {
                         ),
                     });
                 }
-                if hello.proposed_epoch != self.epoch {
-                    self.close_session(session_id, SessionCloseReason::AuthFailed)?;
-                    return Err(TransportError::HandshakeFailed {
-                        session_id,
-                        reason: format!(
-                            "epoch mismatch: client proposed {}, local {}",
-                            hello.proposed_epoch, self.epoch
-                        ),
-                    });
-                }
-
-                // Build the signed response and complete the one-use key
-                // agreement before advertising an established session.
+                // Build the signed response before comparing epochs. The
+                // response is released for an epoch mismatch only after the
+                // complete mutual-attestation verifier authenticates both
+                // identities, signatures, nonces, and ephemeral key shares.
                 let key_agreement = EphemeralKeyAgreement::generate();
                 let responder_ephemeral_public = key_agreement.public_key();
-                let shared_secret = match key_agreement.complete(hello.client_ephemeral_public) {
-                    Ok(secret) => secret,
-                    Err(error) => {
-                        self.close_session(session_id, SessionCloseReason::AuthFailed)?;
-                        return Err(TransportError::HandshakeFailed {
-                            session_id,
-                            reason: format!("authenticated key agreement failed: {error}"),
-                        });
-                    }
-                };
-
                 let session_id_u64 = session_id.0;
                 let hello_resp = HelloResponse::new(
                     our_identity.clone(),
@@ -1434,19 +1427,52 @@ impl Transport {
                     self.epoch,
                 );
 
-                if let Err(error) = verify_mutual_attestation(
+                match verify_mutual_attestation(
                     &hello.client_nonce,
                     &hello_resp.server_nonce,
                     &hello,
                     &hello_resp,
                     &self.known_identities,
                 ) {
-                    self.close_session(session_id, SessionCloseReason::AuthFailed)?;
-                    return Err(TransportError::HandshakeFailed {
-                        session_id,
-                        reason: format!("mutual attestation failed: {error}"),
-                    });
+                    Ok(_) => {}
+                    Err(tidefs_auth::AttestationError::EpochMismatch {
+                        client_epoch,
+                        server_epoch,
+                    }) => {
+                        let resp_bytes = bincode::serialize(&hello_resp).map_err(|error| {
+                            TransportError::Generic(format!(
+                                "attestation response serialize failed: {error}"
+                            ))
+                        })?;
+                        conn.write_frame(&resp_bytes)?;
+                        let authenticated_peer = hello.client_identity.node_id;
+                        self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                        return Err(TransportError::AttestedEpochMismatch {
+                            session_id,
+                            authenticated_peer,
+                            proposed_epoch: client_epoch,
+                            required_epoch: server_epoch,
+                        });
+                    }
+                    Err(error) => {
+                        self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                        return Err(TransportError::HandshakeFailed {
+                            session_id,
+                            reason: format!("mutual attestation failed: {error}"),
+                        });
+                    }
                 }
+
+                let shared_secret = match key_agreement.complete(hello.client_ephemeral_public) {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                        return Err(TransportError::HandshakeFailed {
+                            session_id,
+                            reason: format!("authenticated key agreement failed: {error}"),
+                        });
+                    }
+                };
 
                 let session_keys = match derive_session_keys(
                     &shared_secret,
@@ -5071,6 +5097,194 @@ mod tests {
             .close_session(client_sid, SessionCloseReason::LocalShutdown)
             .expect("client close");
         server_handle.join().expect("server thread");
+    }
+
+    /// An epoch-zero client may learn only the exact trusted responder's
+    /// signed nonzero epoch. That discovery exchange is refused on both ends;
+    /// a fresh exact-epoch connection is the first established session.
+    #[test]
+    fn authenticated_epoch_discovery_refuses_then_exact_retry_establishes() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        const CLIENT_NODE: u64 = 31;
+        const OWNER_NODE: u64 = 47;
+        const OWNER_EPOCH: u64 = 19;
+
+        fn client_transport(
+            credential: &tidefs_auth::NodePrivateCredential,
+            owner_identity: &tidefs_auth::NodeIdentity,
+            owner_addr: SocketAddr,
+            epoch: u64,
+        ) -> Transport {
+            let local_identity = credential.public_identity().into_identity();
+            let mut known = NodeKeyStore::new();
+            known
+                .register(local_identity.clone())
+                .expect("register client identity");
+            known
+                .register(owner_identity.clone())
+                .expect("register exact owner identity");
+            let mut transport = Transport::new(CLIENT_NODE)
+                .with_attestation(
+                    credential.keypair().expect("load client keypair"),
+                    local_identity,
+                )
+                .with_known_identities(known)
+                .with_epoch(epoch);
+            transport.set_endpoint_family(EndpointFamily::Control);
+            transport.set_attestation_bootstrap_from_handshake(false);
+            transport.add_node(NodeInfo::new(
+                OWNER_NODE,
+                vec![TransportAddr::Tcp(owner_addr)],
+                epoch,
+            ));
+            transport
+        }
+
+        let client_credential =
+            tidefs_auth::NodePrivateCredential::generate(CLIENT_NODE).expect("client credential");
+        let owner_credential =
+            tidefs_auth::NodePrivateCredential::generate(OWNER_NODE).expect("owner credential");
+        let client_identity = client_credential.public_identity().into_identity();
+        let owner_identity = owner_credential.public_identity().into_identity();
+
+        let mut owner_known = NodeKeyStore::new();
+        owner_known
+            .register(owner_identity.clone())
+            .expect("register owner identity");
+        owner_known
+            .register(client_identity)
+            .expect("register exact client identity");
+        let mut owner = Transport::new(OWNER_NODE)
+            .with_attestation(
+                owner_credential.keypair().expect("load owner keypair"),
+                owner_identity.clone(),
+            )
+            .with_known_identities(owner_known)
+            .with_epoch(OWNER_EPOCH);
+        owner.set_endpoint_family(EndpointFamily::Control);
+        owner.set_attestation_bootstrap_from_handshake(false);
+        owner
+            .bind(TransportAddr::Tcp(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+            )))
+            .expect("bind owner");
+        let owner_addr = match owner.bind_addr {
+            Some(TransportAddr::Tcp(addr)) => addr,
+            _ => panic!("owner must publish its TCP address"),
+        };
+
+        let owner_handle = thread::spawn(move || {
+            let accept = |transport: &mut Transport| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match transport.accept_incoming() {
+                        Ok(session_id) => break session_id,
+                        Err(TransportError::Generic(message))
+                            if message == "no pending connections" =>
+                        {
+                            assert!(Instant::now() < deadline, "owner accept timed out");
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("owner accept failed: {error}"),
+                    }
+                }
+            };
+
+            let discovery_session = accept(&mut owner);
+            match owner.perform_handshake(discovery_session) {
+                Err(TransportError::AttestedEpochMismatch {
+                    session_id,
+                    authenticated_peer,
+                    proposed_epoch,
+                    required_epoch,
+                }) => {
+                    assert_eq!(session_id, discovery_session);
+                    assert_eq!(authenticated_peer, CLIENT_NODE);
+                    assert_eq!(proposed_epoch, 0);
+                    assert_eq!(required_epoch, OWNER_EPOCH);
+                }
+                other => panic!("unexpected owner discovery result: {other:?}"),
+            }
+            assert!(matches!(
+                owner
+                    .sessions
+                    .get(&discovery_session)
+                    .expect("discovery session retained")
+                    .lock()
+                    .expect("discovery session lock")
+                    .state,
+                SessionState::Closed { .. }
+            ));
+
+            let exact_session = accept(&mut owner);
+            owner
+                .perform_handshake(exact_session)
+                .expect("exact-epoch owner handshake");
+            assert!(owner
+                .sessions
+                .get(&exact_session)
+                .expect("exact session retained")
+                .lock()
+                .expect("exact session lock")
+                .is_established());
+            owner
+                .close_session(exact_session, SessionCloseReason::LocalShutdown)
+                .expect("close exact owner session");
+        });
+
+        let mut discovery = client_transport(&client_credential, &owner_identity, owner_addr, 0);
+        let discovery_session = discovery.connect(OWNER_NODE).expect("connect discovery");
+        let discovered_epoch = match discovery.perform_handshake(discovery_session) {
+            Err(TransportError::AttestedEpochMismatch {
+                session_id,
+                authenticated_peer,
+                proposed_epoch,
+                required_epoch,
+            }) => {
+                assert_eq!(session_id, discovery_session);
+                assert_eq!(authenticated_peer, OWNER_NODE);
+                assert_eq!(proposed_epoch, 0);
+                assert_eq!(required_epoch, OWNER_EPOCH);
+                required_epoch
+            }
+            other => panic!("unexpected client discovery result: {other:?}"),
+        };
+        assert!(matches!(
+            discovery
+                .sessions
+                .get(&discovery_session)
+                .expect("discovery session retained")
+                .lock()
+                .expect("discovery session lock")
+                .state,
+            SessionState::Closed { .. }
+        ));
+        drop(discovery);
+
+        let mut exact = client_transport(
+            &client_credential,
+            &owner_identity,
+            owner_addr,
+            discovered_epoch,
+        );
+        let exact_session = exact.connect(OWNER_NODE).expect("connect exact epoch");
+        exact
+            .perform_handshake(exact_session)
+            .expect("exact-epoch client handshake");
+        assert!(exact
+            .sessions
+            .get(&exact_session)
+            .expect("exact session retained")
+            .lock()
+            .expect("exact session lock")
+            .is_established());
+        exact
+            .close_session(exact_session, SessionCloseReason::LocalShutdown)
+            .expect("close exact client session");
+
+        owner_handle.join().expect("owner thread");
     }
 
     /// Non-LocalEmbed endpoint without attestation key is refused.

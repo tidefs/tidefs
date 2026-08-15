@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Clustered mounted-filesystem client over authenticated inline VFS_RPC.
 //!
-//! The client consumes an already-configured [`Transport`] and an established
-//! Control session. It does not generate keys, configure attestation, connect,
-//! or accept writer/dataset/lease authority from an endpoint or command-line
-//! value; those values come from the authenticated owner-issued preface.
+//! The public connector consumes provisioned node credentials and the exact
+//! trusted owner identity. It performs one refused epoch-zero discovery
+//! exchange, retries once with the authenticated owner epoch, and derives all
+//! writer/dataset/term/epoch authority from the owner-issued preface.
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tidefs_auth::{NodeKeyStore, NodePrivateCredential, NodePublicIdentity};
 use tidefs_transport::{
-    EndpointFamily, SessionCloseReason, SessionId, SessionState, Transport, TransportError,
-    TransportSessionSet,
+    EndpointFamily, NodeInfo, SessionCloseReason, SessionId, SessionState, Transport,
+    TransportAddr, TransportError, TransportSessionSet,
 };
 use tidefs_types_vfs_core::{
     DirHandleId, EngineDirHandle, EngineFileHandle, Errno, FileHandleId, InodeId, RequestCtx,
@@ -34,6 +36,36 @@ use tidefs_vfs_rpc::{
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Operator-provisioned inputs for one authenticated remote owner connection.
+///
+/// No dataset, writer, term, membership epoch, or lease token can be supplied
+/// here. Those fields are accepted only from the authenticated owner's VFS_RPC
+/// session authority.
+#[derive(Debug)]
+pub struct ClusterVfsRpcClientConfig {
+    owner_addr: SocketAddr,
+    expected_pool_guid: [u8; 16],
+    local_credential: NodePrivateCredential,
+    trusted_owner_identity: NodePublicIdentity,
+}
+
+impl ClusterVfsRpcClientConfig {
+    #[must_use]
+    pub const fn new(
+        owner_addr: SocketAddr,
+        expected_pool_guid: [u8; 16],
+        local_credential: NodePrivateCredential,
+        trusted_owner_identity: NodePublicIdentity,
+    ) -> Self {
+        Self {
+            owner_addr,
+            expected_pool_guid,
+            local_credential,
+            trusted_owner_identity,
+        }
+    }
+}
 
 /// Construction or explicit-teardown failure at the authenticated client
 /// boundary.
@@ -57,6 +89,21 @@ pub enum ClusterVfsRpcClientError {
         found: [u8; 16],
     },
     ExpectedPoolGuidZero,
+    Credential(String),
+    TrustStore(String),
+    Transport(String),
+    EpochDiscoveryEstablished,
+    InvalidDiscoveredEpoch {
+        expected_owner: u64,
+        authenticated_peer: u64,
+        proposed_epoch: u64,
+        required_epoch: u64,
+    },
+    EpochMoved {
+        authenticated_peer: u64,
+        attempted_epoch: u64,
+        required_epoch: u64,
+    },
     MissingActiveConnection(SessionId),
     UnauthenticatedSession(SessionId),
     ConfigureNonblocking(String),
@@ -103,6 +150,34 @@ impl fmt::Display for ClusterVfsRpcClientError {
             Self::ExpectedPoolGuidZero => {
                 write!(f, "cluster VFS_RPC expected Pool GUID must be nonzero")
             }
+            Self::Credential(error) => {
+                write!(f, "load cluster VFS_RPC client credential: {error}")
+            }
+            Self::TrustStore(error) => {
+                write!(f, "configure cluster VFS_RPC trust: {error}")
+            }
+            Self::Transport(error) => write!(f, "connect cluster VFS_RPC owner: {error}"),
+            Self::EpochDiscoveryEstablished => write!(
+                f,
+                "cluster VFS_RPC owner established an epoch-zero discovery session"
+            ),
+            Self::InvalidDiscoveredEpoch {
+                expected_owner,
+                authenticated_peer,
+                proposed_epoch,
+                required_epoch,
+            } => write!(
+                f,
+                "cluster VFS_RPC epoch discovery expected owner {expected_owner} and proposed epoch 0, but authenticated peer {authenticated_peer} reported {proposed_epoch} -> {required_epoch}"
+            ),
+            Self::EpochMoved {
+                authenticated_peer,
+                attempted_epoch,
+                required_epoch,
+            } => write!(
+                f,
+                "cluster VFS_RPC owner {authenticated_peer} moved from authenticated epoch {attempted_epoch} to {required_epoch} before the exact retry"
+            ),
             Self::MissingActiveConnection(session) => write!(
                 f,
                 "cluster VFS_RPC session {session} has no active transport connection"
@@ -139,6 +214,68 @@ pub struct ClusterVfsRpcClient {
 }
 
 impl ClusterVfsRpcClient {
+    /// Connect to the exact trusted owner without caller-supplied epoch or
+    /// mounted writer authority.
+    pub fn connect(config: ClusterVfsRpcClientConfig) -> Result<Self, ClusterVfsRpcClientError> {
+        if config.expected_pool_guid == [0; 16] {
+            return Err(ClusterVfsRpcClientError::ExpectedPoolGuidZero);
+        }
+        let expected_owner = config.trusted_owner_identity.node_id();
+
+        let (mut discovery, discovery_session) = connect_transport(&config, 0)?;
+        let owner_epoch = match discovery.perform_handshake(discovery_session) {
+            Err(TransportError::AttestedEpochMismatch {
+                authenticated_peer,
+                proposed_epoch,
+                required_epoch,
+                ..
+            }) if authenticated_peer == expected_owner
+                && proposed_epoch == 0
+                && required_epoch != 0 =>
+            {
+                required_epoch
+            }
+            Err(TransportError::AttestedEpochMismatch {
+                authenticated_peer,
+                proposed_epoch,
+                required_epoch,
+                ..
+            }) => {
+                return Err(ClusterVfsRpcClientError::InvalidDiscoveredEpoch {
+                    expected_owner,
+                    authenticated_peer,
+                    proposed_epoch,
+                    required_epoch,
+                });
+            }
+            Err(error) => {
+                return Err(ClusterVfsRpcClientError::Transport(error.to_string()));
+            }
+            Ok(()) => {
+                let _ =
+                    discovery.close_session(discovery_session, SessionCloseReason::LocalShutdown);
+                return Err(ClusterVfsRpcClientError::EpochDiscoveryEstablished);
+            }
+        };
+        drop(discovery);
+
+        let (mut transport, session_id) = connect_transport(&config, owner_epoch)?;
+        match transport.perform_handshake(session_id) {
+            Ok(()) => Self::new(transport, session_id, config.expected_pool_guid),
+            Err(TransportError::AttestedEpochMismatch {
+                authenticated_peer,
+                proposed_epoch,
+                required_epoch,
+                ..
+            }) => Err(ClusterVfsRpcClientError::EpochMoved {
+                authenticated_peer,
+                attempted_epoch: proposed_epoch,
+                required_epoch,
+            }),
+            Err(error) => Err(ClusterVfsRpcClientError::Transport(error.to_string())),
+        }
+    }
+
     /// Consume an already-authenticated Control transport/session and derive
     /// request authority from its owner-issued preface.
     pub fn new(
@@ -202,6 +339,41 @@ impl ClusterVfsRpcClient {
             ClusterVfsRpcClientError::CloseFailed(format!("session {}: {error}", state.session_id))
         })
     }
+}
+
+fn connect_transport(
+    config: &ClusterVfsRpcClientConfig,
+    epoch: u64,
+) -> Result<(Transport, SessionId), ClusterVfsRpcClientError> {
+    let local_node = config.local_credential.node_id();
+    let owner_node = config.trusted_owner_identity.node_id();
+    let local_identity = config.local_credential.public_identity().into_identity();
+    let mut known_identities = NodeKeyStore::new();
+    known_identities
+        .register(local_identity.clone())
+        .map_err(|error| ClusterVfsRpcClientError::TrustStore(error.to_string()))?;
+    known_identities
+        .register(config.trusted_owner_identity.identity().clone())
+        .map_err(|error| ClusterVfsRpcClientError::TrustStore(error.to_string()))?;
+    let local_keypair = config
+        .local_credential
+        .keypair()
+        .map_err(|error| ClusterVfsRpcClientError::Credential(error.to_string()))?;
+    let mut transport = Transport::new(local_node)
+        .with_attestation(local_keypair, local_identity)
+        .with_known_identities(known_identities)
+        .with_epoch(epoch);
+    transport.set_endpoint_family(EndpointFamily::Control);
+    transport.set_attestation_bootstrap_from_handshake(false);
+    transport.add_node(NodeInfo::new(
+        owner_node,
+        vec![TransportAddr::Tcp(config.owner_addr)],
+        epoch,
+    ));
+    let session_id = transport
+        .connect(owner_node)
+        .map_err(|error| ClusterVfsRpcClientError::Transport(error.to_string()))?;
+    Ok((transport, session_id))
 }
 
 impl VfsDispatch for ClusterVfsRpcClient {
