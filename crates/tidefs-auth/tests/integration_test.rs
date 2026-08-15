@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use tidefs_auth::*;
 
+const CLIENT_SHARE: [u8; 32] = [0x11; 32];
+const SERVER_SHARE: [u8; 32] = [0x22; 32];
+
 #[test]
 fn test_node_identity_generate_and_verify() {
     let (identity, _) = NodeIdentity::generate(42).expect("generate failed");
@@ -47,6 +50,7 @@ fn test_hello_message_sign_and_verify() {
     let msg = HelloMessage::new(
         client_id.clone(),
         &client_key,
+        CLIENT_SHARE,
         vec![1],
         SessionClass::FullMesh,
         42,
@@ -62,6 +66,8 @@ fn test_hello_response_sign_and_verify() {
         server_id,
         &server_key,
         nonce,
+        CLIENT_SHARE,
+        SERVER_SHARE,
         1,
         SessionClass::FullMesh,
         100,
@@ -69,6 +75,12 @@ fn test_hello_response_sign_and_verify() {
     );
     resp.verify().expect("HelloResponse should verify");
     assert_eq!(resp.client_nonce_echo, nonce);
+    let mut tampered = resp;
+    tampered.session_token.session_id += 1;
+    assert!(
+        tampered.verify().is_err(),
+        "the signed response must bind the session identifier"
+    );
 }
 
 #[test]
@@ -78,11 +90,20 @@ fn test_full_mutual_attestation() {
     let mut store = NodeKeyStore::new();
     store.register(client_id.clone()).expect("register failed");
     store.register(server_id.clone()).expect("register failed");
-    let client_msg = HelloMessage::new(client_id, &client_key, vec![1], SessionClass::FullMesh, 42);
+    let client_msg = HelloMessage::new(
+        client_id,
+        &client_key,
+        CLIENT_SHARE,
+        vec![1],
+        SessionClass::FullMesh,
+        42,
+    );
     let server_resp = HelloResponse::new(
         server_id,
         &server_key,
         client_msg.client_nonce,
+        client_msg.client_ephemeral_public,
+        SERVER_SHARE,
         1,
         SessionClass::FullMesh,
         100,
@@ -107,16 +128,65 @@ fn test_mutual_attestation_unknown_identity_rejected() {
     let (server_id, server_key) = NodeIdentity::generate(2).expect("generate failed");
     let mut store = NodeKeyStore::new();
     store.register(client_id.clone()).expect("register failed");
-    let client_msg = HelloMessage::new(client_id, &client_key, vec![1], SessionClass::FullMesh, 1);
+    let client_msg = HelloMessage::new(
+        client_id,
+        &client_key,
+        CLIENT_SHARE,
+        vec![1],
+        SessionClass::FullMesh,
+        1,
+    );
     let server_resp = HelloResponse::new(
         server_id,
         &server_key,
         client_msg.client_nonce,
+        client_msg.client_ephemeral_public,
+        SERVER_SHARE,
         1,
         SessionClass::FullMesh,
         100,
         1,
     );
+    assert!(verify_mutual_attestation(
+        &client_msg.client_nonce,
+        &server_resp.server_nonce,
+        &client_msg,
+        &server_resp,
+        &store,
+    )
+    .is_err());
+}
+
+#[test]
+fn test_mutual_attestation_rejects_different_key_for_known_node_id() {
+    let (client_id, client_key) = NodeIdentity::generate(1).expect("generate failed");
+    let (server_id, server_key) = NodeIdentity::generate(2).expect("generate failed");
+    let (impostor_server_id, _) = NodeIdentity::generate(2).expect("generate impostor");
+    let mut store = NodeKeyStore::new();
+    store.register(client_id.clone()).expect("register client");
+    store
+        .register(impostor_server_id)
+        .expect("register trusted server identity");
+    let client_msg = HelloMessage::new(
+        client_id,
+        &client_key,
+        CLIENT_SHARE,
+        vec![1],
+        SessionClass::FullMesh,
+        1,
+    );
+    let server_resp = HelloResponse::new(
+        server_id,
+        &server_key,
+        client_msg.client_nonce,
+        client_msg.client_ephemeral_public,
+        SERVER_SHARE,
+        1,
+        SessionClass::FullMesh,
+        100,
+        1,
+    );
+
     assert!(verify_mutual_attestation(
         &client_msg.client_nonce,
         &server_resp.server_nonce,
@@ -134,11 +204,20 @@ fn test_mutual_attestation_epoch_mismatch() {
     let mut store = NodeKeyStore::new();
     store.register(client_id.clone()).expect("register failed");
     store.register(server_id.clone()).expect("register failed");
-    let client_msg = HelloMessage::new(client_id, &client_key, vec![1], SessionClass::FullMesh, 42);
+    let client_msg = HelloMessage::new(
+        client_id,
+        &client_key,
+        CLIENT_SHARE,
+        vec![1],
+        SessionClass::FullMesh,
+        42,
+    );
     let server_resp = HelloResponse::new(
         server_id,
         &server_key,
         client_msg.client_nonce,
+        client_msg.client_ephemeral_public,
+        SERVER_SHARE,
         1,
         SessionClass::FullMesh,
         100,

@@ -35,7 +35,6 @@ const OWNER_NODE: u64 = 2;
 const CLIENT_NODE: u64 = 1;
 const WRITER_TERM: u64 = 77;
 const WRITER_EPOCH: u64 = 9;
-const TEST_SESSION_KEY: [u8; 32] = [0xA4; 32];
 
 struct RpcClient {
     transport: Transport,
@@ -64,13 +63,6 @@ impl RpcClient {
         transport
             .perform_handshake(session_id)
             .expect("authenticate owner transport");
-        transport
-            .sessions
-            .get(&session_id)
-            .expect("client session exists")
-            .lock()
-            .expect("lock client session")
-            .init_ciphers_from_key(&TEST_SESSION_KEY, true);
         assert!(transport.session_has_authenticated_confidentiality(session_id));
 
         let mut sessions = TransportSessionSet::new();
@@ -264,8 +256,7 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
         Arc::clone(&writer_fence),
         Arc::clone(&engine),
         Arc::clone(&shutdown),
-    )
-    .with_authenticated_session_key(TEST_SESSION_KEY);
+    );
     match ClusterVfsRpcOwnerHandle::start(zero_dataset) {
         Err(error) => assert_eq!(error, "cluster VFS_RPC dataset identity must be nonzero"),
         Ok(mut unexpected_owner) => {
@@ -273,18 +264,15 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
             panic!("zero VFS dataset identity must fail closed");
         }
     }
-    let mut owner = ClusterVfsRpcOwnerHandle::start(
-        ClusterVfsRpcOwnerConfig::new(
-            "127.0.0.1:0".parse().unwrap(),
-            OWNER_NODE,
-            CLIENT_NODE,
-            dataset_id,
-            writer_fence,
-            engine,
-            Arc::clone(&shutdown),
-        )
-        .with_authenticated_session_key(TEST_SESSION_KEY),
-    )
+    let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        OWNER_NODE,
+        CLIENT_NODE,
+        dataset_id,
+        writer_fence,
+        engine,
+        Arc::clone(&shutdown),
+    ))
     .expect("start Pool-backed VFS_RPC owner");
     let mut client = RpcClient::connect(CLIENT_NODE, owner.bound_addr(), dataset_id);
 

@@ -59,8 +59,9 @@ pub use capability::{
 pub use envelope::{SecurityResponseClass, SecurityResponseEnvelope};
 pub use error::{AttestationError, AuthorizationError, IdentityError};
 pub use handshake::{
-    derive_session_keys, HandshakeState, HelloHandshake, HelloHandshakeResult, SessionKeys,
-    VerifyMessage, HANDSHAKE_TIMEOUT,
+    derive_session_keys, AuthenticatedSharedSecret, EphemeralKeyAgreement, HandshakeState,
+    HelloHandshake, HelloHandshakeResult, SessionKeyContext, SessionKeys, VerifyMessage,
+    HANDSHAKE_TIMEOUT,
 };
 pub use identity::{
     check_revocation_status, check_revocation_status_with_grace, current_time_utils,

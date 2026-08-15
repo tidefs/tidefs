@@ -9,12 +9,14 @@
 //! - Session state machine transitions
 //! - Error cases during negotiation
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 use tidefs_transport::{
-    backend::TransportBackendKind, FamilyVersion, NodeInfo, Session, SessionCloseReason, SessionId,
-    SessionState, Transport, TransportError,
+    backend::TransportBackendKind, FamilyVersion, NodeIdentityPublic, NodeInfo, Session,
+    SessionCloseReason, SessionId, SessionState, Transport, TransportError,
 };
 use tidefs_types_transport_session::EndpointFamily;
 
@@ -55,6 +57,32 @@ fn blocking_accept(transport: &mut Transport) -> SessionId {
     panic!("timeout waiting for incoming connection");
 }
 
+#[derive(Serialize, Deserialize)]
+struct BasicHandshakeMessage {
+    identity: NodeIdentityPublic,
+    families: Vec<FamilyVersion>,
+    endpoint_family: u32,
+    epoch: u64,
+    mtu: u32,
+    feature_flags: u64,
+}
+
+fn read_tcp_frame(stream: &mut TcpStream) -> Vec<u8> {
+    let mut length = [0u8; 4];
+    stream.read_exact(&mut length).expect("read frame length");
+    let mut frame = vec![0u8; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut frame).expect("read frame payload");
+    frame
+}
+
+fn write_tcp_frame(stream: &mut TcpStream, frame: &[u8]) {
+    stream
+        .write_all(&(frame.len() as u32).to_be_bytes())
+        .expect("write frame length");
+    stream.write_all(frame).expect("write frame payload");
+    stream.flush().expect("flush frame");
+}
+
 // ---------------------------------------------------------------------------
 // Full session negotiation flow
 // ---------------------------------------------------------------------------
@@ -76,6 +104,10 @@ fn full_session_negotiation_flow() {
         {
             let s = server.sessions.get(&sid).unwrap().lock().unwrap();
             assert!(s.is_established(), "server session should be established");
+            assert!(
+                !s.has_authenticated_confidentiality(),
+                "LocalEmbed must remain explicitly plaintext"
+            );
         }
         // Read a message from client
         let msg = server.recv_message(sid).expect("server recv");
@@ -317,7 +349,17 @@ fn session_negotiation_endpoint_family_propagation() {
                 EndpointFamily::Control,
                 "server session endpoint family should be Control"
             );
+            assert!(
+                s.has_authenticated_confidentiality(),
+                "Control session must install authenticated ciphers before establishment"
+            );
         }
+
+        let request = server.recv_message(sid).expect("server encrypted receive");
+        assert_eq!(request, b"encrypted control request");
+        server
+            .send_message(sid, b"encrypted control response")
+            .expect("server encrypted send");
 
         server
             .close_session(sid, SessionCloseReason::LocalShutdown)
@@ -336,13 +378,99 @@ fn session_negotiation_endpoint_family_propagation() {
             EndpointFamily::Control,
             "client session endpoint family should be Control"
         );
+        assert!(
+            s.has_authenticated_confidentiality(),
+            "Control session must install authenticated ciphers before establishment"
+        );
     }
+
+    client
+        .send_message(sid, b"encrypted control request")
+        .expect("client encrypted send");
+    assert_eq!(
+        client.recv_message(sid).expect("client encrypted receive"),
+        b"encrypted control response"
+    );
 
     client
         .close_session(sid, SessionCloseReason::LocalShutdown)
         .expect("close");
 
     server_handle.join().expect("server thread");
+}
+
+#[test]
+fn session_negotiation_rejects_substituted_signed_key_share() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake peer");
+    let peer_addr = listener.local_addr().expect("fake peer address");
+    let (server_identity, server_key) =
+        tidefs_auth::NodeIdentity::generate(1).expect("generate fake peer identity");
+
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept fake peer connection");
+        let client_basic: BasicHandshakeMessage =
+            bincode::deserialize(&read_tcp_frame(&mut stream)).expect("decode client handshake");
+        let server_basic = BasicHandshakeMessage {
+            identity: server_identity.clone(),
+            families: Vec::new(),
+            endpoint_family: EndpointFamily::Control as u32,
+            epoch: 0,
+            mtu: 64 * 1024,
+            feature_flags: tidefs_transport::session_handshake::DEFAULT_FEATURE_FLAGS,
+        };
+        write_tcp_frame(
+            &mut stream,
+            &bincode::serialize(&server_basic).expect("encode server handshake"),
+        );
+
+        let hello: tidefs_auth::HelloMessage =
+            bincode::deserialize(&read_tcp_frame(&mut stream)).expect("decode attestation hello");
+        assert_eq!(
+            client_basic.identity.node_id, hello.client_identity.node_id,
+            "basic and attested initiator identities must agree"
+        );
+        let responder_agreement = tidefs_auth::EphemeralKeyAgreement::generate();
+        let mut response = tidefs_auth::HelloResponse::new(
+            server_identity,
+            &server_key,
+            hello.client_nonce,
+            hello.client_ephemeral_public,
+            responder_agreement.public_key(),
+            1,
+            tidefs_auth::SessionClass::FullMesh,
+            77,
+            0,
+        );
+        response.server_ephemeral_public[0] ^= 0x80;
+        write_tcp_frame(
+            &mut stream,
+            &bincode::serialize(&response).expect("encode substituted response"),
+        );
+    });
+
+    let mut client = Transport::new(2);
+    client.endpoint_family = EndpointFamily::Control;
+    configure_attestation_for_family(&mut client, EndpointFamily::Control);
+    client.add_node(NodeInfo::new(
+        1,
+        vec![tidefs_transport::TransportAddr::Tcp(peer_addr)],
+        0,
+    ));
+    let sid = client.connect(1).expect("connect fake peer");
+    let result = client.perform_handshake(sid);
+    assert!(
+        matches!(result, Err(TransportError::HandshakeFailed { .. })),
+        "substituted signed share must fail attestation: {result:?}"
+    );
+    let session = client.sessions.get(&sid).expect("refused session retained");
+    assert!(matches!(
+        session.lock().expect("lock refused session").state,
+        SessionState::Closed {
+            reason: SessionCloseReason::AuthFailed
+        }
+    ));
+
+    peer.join().expect("fake peer thread");
 }
 
 /// Verify that session negotiation works across all four endpoint families.

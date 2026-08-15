@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tidefs_auth::{self, verify_mutual_attestation, HelloMessage, HelloResponse, NodeKeyStore};
+use tidefs_auth::{
+    self, derive_session_keys, verify_mutual_attestation, EphemeralKeyAgreement,
+    HelloHandshakeResult, HelloMessage, HelloResponse, NodeKeyStore, SessionKeyContext,
+};
 
 use crate::backend::{ConnectionLike, TransportBackend, TransportBackendKind};
 use crate::carrier_selection::CarrierDisclosure;
@@ -1237,7 +1240,7 @@ impl Transport {
         // ------------------------------------------------------------------
         // Mutual attestation handshake.
         // ------------------------------------------------------------------
-        if requires_attestation {
+        let auth_result = if requires_attestation {
             let attestation_key = self.attestation_key.as_ref().ok_or_else(|| {
                 TransportError::Generic("attestation key missing after attestation gate".into())
             })?;
@@ -1250,9 +1253,11 @@ impl Transport {
 
             if is_initiator {
                 // ── Initiator: send HelloMessage, receive HelloResponse ──
+                let key_agreement = EphemeralKeyAgreement::generate();
                 let hello = HelloMessage::new(
                     our_identity,
                     attestation_key,
+                    key_agreement.public_key(),
                     vec![1],
                     tidefs_auth::SessionClass::FullMesh,
                     self.epoch,
@@ -1264,12 +1269,19 @@ impl Transport {
                 conn.write_frame(&hello_bytes)?;
 
                 let resp_bytes = conn.read_frame()?;
-                let hello_resp: HelloResponse = bincode::deserialize(&resp_bytes).map_err(|e| {
-                    TransportError::Generic(format!("attestation response deserialize failed: {e}"))
-                })?;
+                let hello_resp: HelloResponse = match bincode::deserialize(&resp_bytes) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                        return Err(TransportError::HandshakeFailed {
+                            session_id,
+                            reason: format!("attestation response deserialize failed: {error}"),
+                        });
+                    }
+                };
 
                 let nonce = hello.client_nonce;
-                match verify_mutual_attestation(
+                let attestation = match verify_mutual_attestation(
                     &nonce,
                     &hello_resp.server_nonce,
                     &hello,
@@ -1284,14 +1296,7 @@ impl Transport {
                                 TransportError::Generic(format!("register peer identity: {e}"))
                             })?;
 
-                        // Update session peer identity with verified identity
-                        let session = self.sessions.get(&session_id).unwrap();
-                        let mut session = session.lock().map_err(|e| {
-                            TransportError::Generic(format!("session lock poisoned: {e}"))
-                        })?;
-                        if let Some(ref mut info) = session.peer_info {
-                            info.identity = result.peer_identity;
-                        }
+                        result
                     }
                     Err(e) => {
                         self.close_session(session_id, SessionCloseReason::AuthFailed)?;
@@ -1300,21 +1305,83 @@ impl Transport {
                             reason: format!("mutual attestation failed: {e}"),
                         });
                     }
-                }
+                };
+
+                let shared_secret = match key_agreement.complete(hello_resp.server_ephemeral_public)
+                {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                        return Err(TransportError::HandshakeFailed {
+                            session_id,
+                            reason: format!("authenticated key agreement failed: {error}"),
+                        });
+                    }
+                };
+                let session_keys = match derive_session_keys(
+                    &shared_secret,
+                    &SessionKeyContext {
+                        initiator_nonce: hello.client_nonce,
+                        responder_nonce: hello_resp.server_nonce,
+                        initiator_ephemeral_public: hello.client_ephemeral_public,
+                        responder_ephemeral_public: hello_resp.server_ephemeral_public,
+                        initiator_identity: &hello.client_identity,
+                        responder_identity: &hello_resp.server_identity,
+                        session_id: hello_resp.session_token.session_id,
+                        initiator_endpoint_family: local_handshake.endpoint_family,
+                        responder_endpoint_family: peer_handshake.endpoint_family,
+                        epoch: hello_resp.server_epoch,
+                        accepted_protocol: hello_resp.accepted_protocol_version,
+                        accepted_features: negotiated_feature_flags,
+                    },
+                    true,
+                ) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                        return Err(TransportError::HandshakeFailed {
+                            session_id,
+                            reason: format!("session key derivation failed: {error}"),
+                        });
+                    }
+                };
+                Some(HelloHandshakeResult {
+                    session_keys,
+                    session_token: hello_resp.session_token,
+                    peer_identity: attestation.peer_identity,
+                    accepted_protocol: hello_resp.accepted_protocol_version,
+                    accepted_features: negotiated_feature_flags,
+                    epoch: hello_resp.server_epoch,
+                })
             } else {
                 // ── Responder: receive HelloMessage, send HelloResponse ──
                 let hello_bytes = conn.read_frame()?;
-                let hello: HelloMessage = bincode::deserialize(&hello_bytes).map_err(|e| {
-                    TransportError::Generic(format!("attestation hello deserialize failed: {e}"))
-                })?;
+                let hello: HelloMessage = match bincode::deserialize(&hello_bytes) {
+                    Ok(hello) => hello,
+                    Err(error) => {
+                        self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                        return Err(TransportError::HandshakeFailed {
+                            session_id,
+                            reason: format!("attestation hello deserialize failed: {error}"),
+                        });
+                    }
+                };
 
                 // Verify the initiator before responding
-                hello.verify().map_err(|e| {
-                    TransportError::Generic(format!("attestation hello verify failed: {e}"))
-                })?;
-                hello.client_identity.verify_self_signature().map_err(|e| {
-                    TransportError::Generic(format!("attestation peer self-signature failed: {e}"))
-                })?;
+                if let Err(error) = hello.verify() {
+                    self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                    return Err(TransportError::HandshakeFailed {
+                        session_id,
+                        reason: format!("attestation hello verify failed: {error}"),
+                    });
+                }
+                if let Err(error) = hello.client_identity.verify_self_signature() {
+                    self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                    return Err(TransportError::HandshakeFailed {
+                        session_id,
+                        reason: format!("attestation peer self-signature failed: {error}"),
+                    });
+                }
                 if !self
                     .known_identities
                     .contains(hello.client_identity.node_id)
@@ -1339,17 +1406,75 @@ impl Transport {
                     });
                 }
 
-                // Build and send response
+                // Build the signed response and complete the one-use key
+                // agreement before advertising an established session.
+                let key_agreement = EphemeralKeyAgreement::generate();
+                let responder_ephemeral_public = key_agreement.public_key();
+                let shared_secret = match key_agreement.complete(hello.client_ephemeral_public) {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                        return Err(TransportError::HandshakeFailed {
+                            session_id,
+                            reason: format!("authenticated key agreement failed: {error}"),
+                        });
+                    }
+                };
+
                 let session_id_u64 = session_id.0;
                 let hello_resp = HelloResponse::new(
-                    our_identity,
+                    our_identity.clone(),
                     attestation_key,
                     hello.client_nonce,
+                    hello.client_ephemeral_public,
+                    responder_ephemeral_public,
                     1, // accepted protocol version
                     tidefs_auth::SessionClass::FullMesh,
                     session_id_u64,
                     self.epoch,
                 );
+
+                if let Err(error) = verify_mutual_attestation(
+                    &hello.client_nonce,
+                    &hello_resp.server_nonce,
+                    &hello,
+                    &hello_resp,
+                    &self.known_identities,
+                ) {
+                    self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                    return Err(TransportError::HandshakeFailed {
+                        session_id,
+                        reason: format!("mutual attestation failed: {error}"),
+                    });
+                }
+
+                let session_keys = match derive_session_keys(
+                    &shared_secret,
+                    &SessionKeyContext {
+                        initiator_nonce: hello.client_nonce,
+                        responder_nonce: hello_resp.server_nonce,
+                        initiator_ephemeral_public: hello.client_ephemeral_public,
+                        responder_ephemeral_public,
+                        initiator_identity: &hello.client_identity,
+                        responder_identity: &our_identity,
+                        session_id: session_id_u64,
+                        initiator_endpoint_family: peer_handshake.endpoint_family,
+                        responder_endpoint_family: local_handshake.endpoint_family,
+                        epoch: self.epoch,
+                        accepted_protocol: hello_resp.accepted_protocol_version,
+                        accepted_features: negotiated_feature_flags,
+                    },
+                    true,
+                ) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                        return Err(TransportError::HandshakeFailed {
+                            session_id,
+                            reason: format!("session key derivation failed: {error}"),
+                        });
+                    }
+                };
 
                 let resp_bytes = bincode::serialize(&hello_resp).map_err(|e| {
                     TransportError::Generic(format!("attestation response serialize failed: {e}"))
@@ -1361,22 +1486,35 @@ impl Transport {
                     .register(hello.client_identity.clone())
                     .map_err(|e| TransportError::Generic(format!("register peer identity: {e}")))?;
 
-                // Update session peer identity with verified identity
-                let session = self.sessions.get(&session_id).unwrap();
-                let mut session = session
-                    .lock()
-                    .map_err(|e| TransportError::Generic(format!("session lock poisoned: {e}")))?;
-                if let Some(ref mut info) = session.peer_info {
-                    info.identity = hello.client_identity;
-                }
+                Some(HelloHandshakeResult {
+                    session_keys,
+                    session_token: hello_resp.session_token,
+                    peer_identity: hello.client_identity,
+                    accepted_protocol: hello_resp.accepted_protocol_version,
+                    accepted_features: negotiated_feature_flags,
+                    epoch: self.epoch,
+                })
             }
-        }
+        } else {
+            None
+        };
 
         // Transition: Handshaking -> Established
         let session = self.sessions.get(&session_id).unwrap();
         let mut session = session
             .lock()
             .map_err(|e| TransportError::Generic(format!("session lock poisoned: {e}")))?;
+
+        if let Some(ref result) = auth_result {
+            if let Err(error) = session.apply_auth_handshake(result, is_initiator) {
+                drop(session);
+                self.close_session(session_id, SessionCloseReason::AuthFailed)?;
+                return Err(TransportError::HandshakeFailed {
+                    session_id,
+                    reason: format!("session cipher setup failed: {error}"),
+                });
+            }
+        }
 
         session
             .transition(SessionState::Established {

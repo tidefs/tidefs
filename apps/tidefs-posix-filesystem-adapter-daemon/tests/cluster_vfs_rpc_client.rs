@@ -34,10 +34,8 @@ const OWNER_NODE: u64 = 2;
 const CLIENT_NODE: u64 = 1;
 const WRITER_TERM: u64 = 77;
 const WRITER_EPOCH: u64 = 9;
-const MAIN_SESSION_KEY: [u8; 32] = [0xA5; 32];
-const WRONG_DATASET_SESSION_KEY: [u8; 32] = [0xA6; 32];
 
-fn connect(owner_addr: SocketAddr, session_key: &[u8; 32]) -> (Transport, SessionId) {
+fn connect(owner_addr: SocketAddr) -> (Transport, SessionId) {
     let mut transport = Transport::new(CLIENT_NODE);
     transport.set_endpoint_family(EndpointFamily::Control);
     transport
@@ -54,13 +52,6 @@ fn connect(owner_addr: SocketAddr, session_key: &[u8; 32]) -> (Transport, Sessio
     transport
         .perform_handshake(session_id)
         .expect("authenticate owner transport");
-    transport
-        .sessions
-        .get(&session_id)
-        .expect("client session exists")
-        .lock()
-        .expect("lock client session")
-        .init_ciphers_from_key(session_key, true);
     assert!(transport.session_has_authenticated_confidentiality(session_id));
     (transport, session_id)
 }
@@ -97,11 +88,10 @@ fn request_ctx() -> RequestCtx {
 
 fn assert_get_root_refused(
     owner_addr: SocketAddr,
-    session_key: &[u8; 32],
     authority: ClusteredPosixMountRuntime,
     expected: Errno,
 ) {
-    let (transport, session_id) = connect(owner_addr, session_key);
+    let (transport, session_id) = connect(owner_addr);
     let client = ClusterVfsRpcClient::new(transport, session_id, authority)
         .expect("construct authenticated cluster VFS_RPC client");
     let bridge = VfsDispatchEngineBridge::new(client);
@@ -177,21 +167,18 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
         WRITER_TERM,
         WRITER_EPOCH,
     )));
-    let mut owner = ClusterVfsRpcOwnerHandle::start(
-        ClusterVfsRpcOwnerConfig::new(
-            "127.0.0.1:0".parse().unwrap(),
-            OWNER_NODE,
-            CLIENT_NODE,
-            dataset_id,
-            Arc::clone(&writer_fence),
-            owner_adapter.engine_handle(),
-            Arc::clone(&shutdown),
-        )
-        .with_authenticated_session_key(MAIN_SESSION_KEY),
-    )
+    let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        OWNER_NODE,
+        CLIENT_NODE,
+        dataset_id,
+        Arc::clone(&writer_fence),
+        owner_adapter.engine_handle(),
+        Arc::clone(&shutdown),
+    ))
     .expect("start Pool-backed VFS_RPC owner");
 
-    let (transport, session_id) = connect(owner.bound_addr(), &MAIN_SESSION_KEY);
+    let (transport, session_id) = connect(owner.bound_addr());
     let client = ClusterVfsRpcClient::new(
         transport,
         session_id,
@@ -280,23 +267,19 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
         .stop()
         .expect("stop primary Pool-backed VFS_RPC owner");
 
-    let mut owner = ClusterVfsRpcOwnerHandle::start(
-        ClusterVfsRpcOwnerConfig::new(
-            "127.0.0.1:0".parse().unwrap(),
-            OWNER_NODE,
-            CLIENT_NODE,
-            dataset_id,
-            Arc::clone(&writer_fence),
-            owner_adapter.engine_handle(),
-            Arc::clone(&shutdown),
-        )
-        .with_authenticated_session_key(WRONG_DATASET_SESSION_KEY),
-    )
+    let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        OWNER_NODE,
+        CLIENT_NODE,
+        dataset_id,
+        Arc::clone(&writer_fence),
+        owner_adapter.engine_handle(),
+        Arc::clone(&shutdown),
+    ))
     .expect("restart Pool-backed VFS_RPC owner with fresh session authority");
 
     assert_get_root_refused(
         owner.bound_addr(),
-        &WRONG_DATASET_SESSION_KEY,
         runtime(
             DatasetId::new(if dataset_id.0 == 1 { 2 } else { 1 }),
             OWNER_NODE,
@@ -306,8 +289,7 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
         Errno::ESTALE,
     );
 
-    let (wrong_writer_transport, wrong_writer_session) =
-        connect(owner.bound_addr(), &WRONG_DATASET_SESSION_KEY);
+    let (wrong_writer_transport, wrong_writer_session) = connect(owner.bound_addr());
     match ClusterVfsRpcClient::new(
         wrong_writer_transport,
         wrong_writer_session,
@@ -324,8 +306,7 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
         Ok(_) => panic!("wrong VFS writer must fail closed"),
     }
 
-    let (wrong_session_transport, _actual_session) =
-        connect(owner.bound_addr(), &WRONG_DATASET_SESSION_KEY);
+    let (wrong_session_transport, _actual_session) = connect(owner.bound_addr());
     let missing_session = SessionId::new(u64::MAX);
     match ClusterVfsRpcClient::new(
         wrong_session_transport,
