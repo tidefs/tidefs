@@ -14,7 +14,9 @@
 //! reachable live owner and fail closed when no owner can provide evidence.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
+use tidefs_auth::{NodeKeyStore, NodePrivateCredential, NodePublicIdentity};
 use tidefs_membership_epoch::MemberClass;
 use tidefs_membership_live::BackendDisclosure;
 use tidefs_transport::{
@@ -36,6 +38,57 @@ pub struct RuntimeAuthority {
     member_class: Option<MemberClass>,
     failure_domain: Option<u64>,
     replication_factor: u8,
+    transport_identity: Option<ProvisionedTransportIdentity>,
+}
+
+/// Exact provisioned identity and trust set for the live storage-node
+/// transport. Private credential bytes remain host-local and are redacted by
+/// [`NodePrivateCredential`].
+#[derive(Clone, Debug)]
+pub struct ProvisionedTransportIdentity {
+    local_credential: Arc<NodePrivateCredential>,
+    trusted_peers: Vec<NodePublicIdentity>,
+}
+
+impl ProvisionedTransportIdentity {
+    fn new(
+        local_credential: NodePrivateCredential,
+        trusted_peers: Vec<NodePublicIdentity>,
+    ) -> Result<Self, String> {
+        let local_identity = local_credential.public_identity().into_identity();
+        let mut exact_trust = NodeKeyStore::new();
+        exact_trust
+            .register(local_identity)
+            .map_err(|error| format!("register local transport identity: {error}"))?;
+        for identity in &trusted_peers {
+            if let Some(existing) = exact_trust.identities.get(&identity.node_id()) {
+                if existing != identity.identity() {
+                    return Err(format!(
+                        "transport trust contains conflicting identities for node {}",
+                        identity.node_id()
+                    ));
+                }
+                continue;
+            }
+            exact_trust
+                .register(identity.identity().clone())
+                .map_err(|error| format!("register trusted transport identity: {error}"))?;
+        }
+        Ok(Self {
+            local_credential: Arc::new(local_credential),
+            trusted_peers,
+        })
+    }
+
+    #[must_use]
+    pub fn local_credential(&self) -> Arc<NodePrivateCredential> {
+        Arc::clone(&self.local_credential)
+    }
+
+    #[must_use]
+    pub fn trusted_peers(&self) -> &[NodePublicIdentity] {
+        &self.trusted_peers
+    }
 }
 
 impl RuntimeAuthority {
@@ -57,7 +110,32 @@ impl RuntimeAuthority {
             member_class,
             failure_domain,
             replication_factor,
+            transport_identity: None,
         })
+    }
+
+    /// Bind this live authority to one exact local credential and an explicit
+    /// peer trust set. Numeric node identity is derived from the credential.
+    pub fn with_transport_identity(
+        mut self,
+        local_credential: NodePrivateCredential,
+        trusted_peers: Vec<NodePublicIdentity>,
+    ) -> Result<Self, String> {
+        if local_credential.node_id() != self.node_id {
+            return Err(format!(
+                "transport credential names node {}, expected configured storage node {}",
+                local_credential.node_id(),
+                self.node_id
+            ));
+        }
+        if trusted_peers.is_empty() {
+            return Err("provisioned transport trust set must not be empty".to_string());
+        }
+        self.transport_identity = Some(ProvisionedTransportIdentity::new(
+            local_credential,
+            trusted_peers,
+        )?);
+        Ok(self)
     }
 
     /// The disclosed active backend.
@@ -94,6 +172,11 @@ impl RuntimeAuthority {
     #[must_use]
     pub fn replication_factor(&self) -> u8 {
         self.replication_factor
+    }
+
+    #[must_use]
+    pub fn transport_identity(&self) -> Option<&ProvisionedTransportIdentity> {
+        self.transport_identity.as_ref()
     }
 
     /// Returns `true` when the backend uses a real network transport.
@@ -267,5 +350,48 @@ mod tests {
             let a = RuntimeAuthority::build(d, 1, None, None, rf).expect("build");
             assert_eq!(a.replication_factor(), rf, "rf={rf}");
         }
+    }
+
+    #[test]
+    fn provisioned_transport_identity_derives_exact_node_and_trust() {
+        let local = NodePrivateCredential::generate(7).unwrap();
+        let peer = NodePrivateCredential::generate(9)
+            .unwrap()
+            .public_identity();
+        let authority = RuntimeAuthority::build(BackendDisclosure::Loopback, 7, None, None, 1)
+            .unwrap()
+            .with_transport_identity(local, vec![peer.clone()])
+            .unwrap();
+        let identity = authority.transport_identity().unwrap();
+        assert_eq!(identity.local_credential().node_id(), 7);
+        assert_eq!(identity.trusted_peers(), &[peer]);
+    }
+
+    #[test]
+    fn provisioned_transport_identity_rejects_node_mismatch_and_empty_trust() {
+        let mismatch = RuntimeAuthority::build(BackendDisclosure::Loopback, 7, None, None, 1)
+            .unwrap()
+            .with_transport_identity(NodePrivateCredential::generate(8).unwrap(), Vec::new())
+            .unwrap_err();
+        assert!(mismatch.contains("credential names node 8"));
+
+        let empty = RuntimeAuthority::build(BackendDisclosure::Loopback, 7, None, None, 1)
+            .unwrap()
+            .with_transport_identity(NodePrivateCredential::generate(7).unwrap(), Vec::new())
+            .unwrap_err();
+        assert!(empty.contains("trust set must not be empty"));
+    }
+
+    #[test]
+    fn provisioned_transport_identity_rejects_conflicting_node_keys() {
+        let local = NodePrivateCredential::generate(7).unwrap();
+        let conflicting_local = NodePrivateCredential::generate(7)
+            .unwrap()
+            .public_identity();
+        let error = RuntimeAuthority::build(BackendDisclosure::Loopback, 7, None, None, 1)
+            .unwrap()
+            .with_transport_identity(local, vec![conflicting_local])
+            .unwrap_err();
+        assert!(error.contains("conflicting identities for node 7"));
     }
 }

@@ -75,6 +75,48 @@ fn require_explicit_store_paths(store_paths: Vec<PathBuf>) -> Result<Vec<PathBuf
     }
 }
 
+fn load_node_credential(
+    path: &std::path::Path,
+) -> Result<tidefs_auth::NodePrivateCredential, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("read node credential {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "node credential {} is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "node credential {} grants group or other permissions",
+            path.display()
+        ));
+    }
+    let mut bytes = std::fs::read(path)
+        .map_err(|error| format!("read node credential {}: {error}", path.display()))?;
+    let credential = tidefs_auth::NodePrivateCredential::decode_fixed(&bytes)
+        .map_err(|error| format!("validate node credential {}: {error}", path.display()));
+    bytes.fill(0);
+    credential
+}
+
+fn load_public_identity(path: &std::path::Path) -> Result<tidefs_auth::NodePublicIdentity, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("read trusted peer identity {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "trusted peer identity {} is not a regular file",
+            path.display()
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("read trusted peer identity {}: {error}", path.display()))?;
+    tidefs_auth::NodePublicIdentity::decode_fixed(&bytes)
+        .map_err(|error| format!("validate trusted peer identity {}: {error}", path.display()))
+}
+
 // ── CLI definition ──
 
 #[derive(Parser)]
@@ -160,6 +202,25 @@ struct ServerArgs {
         requires = "membership_checkpoint_dir"
     )]
     cluster_lease: bool,
+
+    /// Host-local private credential for this storage-node transport.
+    #[arg(
+        long = "transport-node-credential",
+        value_name = "PATH",
+        requires = "cluster_lease",
+        required_if_eq("cluster_lease", "true")
+    )]
+    transport_node_credential: Option<PathBuf>,
+
+    /// Exact public identities admitted on the cluster-lease transport.
+    #[arg(
+        long = "transport-trusted-peer-identity",
+        value_name = "PATH",
+        action = clap::ArgAction::Append,
+        requires = "cluster_lease",
+        required_if_eq("cluster_lease", "true")
+    )]
+    transport_trusted_peer_identities: Vec<PathBuf>,
 }
 
 #[derive(Args)]
@@ -294,6 +355,8 @@ fn run_server(args: ServerArgs) -> ! {
         replication_factor,
         membership_checkpoint_dir,
         cluster_lease,
+        transport_node_credential,
+        transport_trusted_peer_identities,
     } = args;
 
     let config = if let Some(cfg_path) = &config_file {
@@ -311,7 +374,7 @@ fn run_server(args: ServerArgs) -> ! {
             BackendDisclosure::Tcp(bind_addr)
         };
 
-        let authority = RuntimeAuthority::build(
+        let mut authority = RuntimeAuthority::build(
             disclosure,
             node_id,
             member_class,
@@ -322,6 +385,31 @@ fn run_server(args: ServerArgs) -> ! {
             eprintln!("failed to build runtime authority spine: {e}");
             std::process::exit(1);
         });
+        if cluster_lease {
+            let local_credential = load_node_credential(
+                transport_node_credential
+                    .as_deref()
+                    .expect("clap requires a credential for cluster lease"),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("failed to load storage-node transport credential: {error}");
+                std::process::exit(1);
+            });
+            let trusted_peers = transport_trusted_peer_identities
+                .iter()
+                .map(|path| load_public_identity(path))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_or_else(|error| {
+                    eprintln!("failed to load storage-node transport trust: {error}");
+                    std::process::exit(1);
+                });
+            authority = authority
+                .with_transport_identity(local_credential, trusted_peers)
+                .unwrap_or_else(|error| {
+                    eprintln!("failed to configure storage-node transport identity: {error}");
+                    std::process::exit(1);
+                });
+        }
 
         eprintln!(
             "[storage-node] authority spine: backend={} node_id={} live={} rf={}",
@@ -522,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_cluster_lease_requires_membership_checkpoint_dir() {
+    fn cli_cluster_lease_requires_checkpoint_and_transport_trust() {
         let argv = make_argv(
             "server",
             &[
@@ -535,6 +623,20 @@ mod tests {
         );
         assert!(Cli::try_parse_from(argv).is_err());
 
+        let missing_transport_trust = make_argv(
+            "server",
+            &[
+                "--node-id",
+                "1",
+                "--bind",
+                "127.0.0.1:9000",
+                "--cluster-lease",
+                "--membership-checkpoint-dir",
+                "/var/lib/tidefs/membership",
+            ],
+        );
+        assert!(Cli::try_parse_from(missing_transport_trust).is_err());
+
         let args = parse_server(&[
             "--node-id",
             "1",
@@ -543,12 +645,61 @@ mod tests {
             "--cluster-lease",
             "--membership-checkpoint-dir",
             "/var/lib/tidefs/membership",
+            "--transport-node-credential",
+            "/etc/tidefs/node.credential",
+            "--transport-trusted-peer-identity",
+            "/etc/tidefs/owner.identity",
         ]);
         assert!(args.cluster_lease);
         assert_eq!(
             args.membership_checkpoint_dir,
             Some(PathBuf::from("/var/lib/tidefs/membership"))
         );
+        assert_eq!(
+            args.transport_node_credential,
+            Some(PathBuf::from("/etc/tidefs/node.credential"))
+        );
+        assert_eq!(
+            args.transport_trusted_peer_identities,
+            vec![PathBuf::from("/etc/tidefs/owner.identity")]
+        );
+    }
+
+    #[test]
+    fn cluster_lease_transport_identity_files_load_fail_closed() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let credential_path = root.path().join("node.credential");
+        let identity_path = root.path().join("peer.identity");
+        let local = tidefs_auth::NodePrivateCredential::generate(7).unwrap();
+        let peer = tidefs_auth::NodePrivateCredential::generate(9).unwrap();
+        let mut credential_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&credential_path)
+            .unwrap();
+        credential_file.write_all(&local.encode_fixed()).unwrap();
+        credential_file.sync_all().unwrap();
+        std::fs::write(&identity_path, peer.public_identity().encode_fixed()).unwrap();
+
+        assert_eq!(load_node_credential(&credential_path).unwrap().node_id(), 7);
+        assert_eq!(load_public_identity(&identity_path).unwrap().node_id(), 9);
+
+        std::fs::set_permissions(&credential_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(load_node_credential(&credential_path)
+            .unwrap_err()
+            .contains("grants group or other permissions"));
+
+        let mut identity_bytes = std::fs::read(&identity_path).unwrap();
+        identity_bytes[0] ^= 0xff;
+        std::fs::write(&identity_path, identity_bytes).unwrap();
+        assert!(load_public_identity(&identity_path)
+            .unwrap_err()
+            .contains("invalid public identity record magic"));
     }
 
     #[test]

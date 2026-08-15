@@ -1753,7 +1753,7 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[test]
-    fn cli_parse_cluster_pool_mount_accepts_explicit_owner_and_authority_surfaces() {
+    fn cli_parse_cluster_pool_mount_accepts_explicit_identity_surfaces() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
@@ -1762,16 +1762,14 @@ mod tests {
             "testpool",
             "/mnt/tidefs",
             "--cluster",
-            "--cluster-owner-node-id",
-            "2",
-            "--cluster-authority-node-id",
-            "1",
             "--cluster-authority-addr",
             "127.0.0.1:7411",
             "--cluster-vfs-rpc-bind",
             "127.0.0.1:7412",
             "--cluster-node-credential",
             "/etc/tidefs/node.credential",
+            "--cluster-trusted-authority-identity",
+            "/etc/tidefs/authority.identity",
             "--cluster-trusted-vfs-rpc-peer-identity",
             "/etc/tidefs/peer.identity",
         ]);
@@ -1827,14 +1825,12 @@ mod tests {
             "testpool",
             "/mnt/tidefs",
             "--cluster",
-            "--cluster-owner-node-id",
-            "2",
-            "--cluster-authority-node-id",
-            "1",
             "--cluster-authority-addr",
             "127.0.0.1:7411",
             "--cluster-node-credential",
             "/etc/tidefs/node.credential",
+            "--cluster-trusted-authority-identity",
+            "/etc/tidefs/authority.identity",
             "--cluster-trusted-vfs-rpc-peer-identity",
             "/etc/tidefs/peer.identity",
         ]);
@@ -1856,10 +1852,6 @@ mod tests {
             "testpool",
             "/mnt/tidefs",
             "--cluster",
-            "--cluster-owner-node-id",
-            "2",
-            "--cluster-authority-node-id",
-            "1",
             "--cluster-authority-addr",
             "127.0.0.1:7411",
             "--cluster-vfs-rpc-bind",
@@ -1896,6 +1888,38 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[test]
+    fn cli_parse_cluster_pool_mount_rejects_retired_numeric_authority_flags() {
+        use clap::Parser;
+        for flag in ["--cluster-owner-node-id", "--cluster-authority-node-id"] {
+            let args = Cli::try_parse_from([
+                "tidefsctl",
+                "pool",
+                "mount",
+                "testpool",
+                "/mnt/tidefs",
+                "--cluster",
+                "--cluster-authority-addr",
+                "127.0.0.1:7411",
+                "--cluster-vfs-rpc-bind",
+                "127.0.0.1:7412",
+                "--cluster-node-credential",
+                "/etc/tidefs/node.credential",
+                "--cluster-trusted-authority-identity",
+                "/etc/tidefs/authority.identity",
+                "--cluster-trusted-vfs-rpc-peer-identity",
+                "/etc/tidefs/peer.identity",
+                flag,
+                "2",
+            ]);
+            assert!(
+                args.is_err(),
+                "retired numeric authority flag {flag} parsed"
+            );
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
     fn cli_parse_cluster_pool_mount_rejects_authority_without_cluster_mode() {
         use clap::Parser;
         let args = Cli::try_parse_from([
@@ -1904,8 +1928,8 @@ mod tests {
             "mount",
             "testpool",
             "/mnt/tidefs",
-            "--cluster-owner-node-id",
-            "2",
+            "--cluster-trusted-authority-identity",
+            "/etc/tidefs/authority.identity",
         ]);
 
         assert!(

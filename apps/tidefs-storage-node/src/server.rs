@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tidefs_auth::NodeKeyStore;
 use tidefs_cluster::placement_heal::RelocationFlowCommitPlacementPublication;
 use tidefs_cluster::pool_protocol::{
     CatalogEntryRow, ClusterPoolCatalogDeltaResponse, ClusterPoolCatalogQueryResponse,
@@ -81,10 +82,11 @@ use tidefs_send_stream::{
 use tidefs_transport::carrier_selection::CarrierPolicy;
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
-    build_read_responses, send_replication_msg, send_segment_fetch_response, ObjectTransferMessage,
-    PlacementMap as TransportPlacementMap, PlacementMapRefusalReason, PlacementVersionTracker,
-    ReplicationMessage, SegmentFetchRequest, SegmentFetchResponse, SessionCloseReason, SyncEntry,
-    Transport, TransportError, MAX_CHUNK_PAYLOAD, SEGMENT_FETCH_REQUEST_MAGIC,
+    build_read_responses, send_replication_msg, send_segment_fetch_response, EndpointFamily,
+    ObjectTransferMessage, PlacementMap as TransportPlacementMap, PlacementMapRefusalReason,
+    PlacementVersionTracker, ReplicationMessage, SegmentFetchRequest, SegmentFetchResponse,
+    SessionCloseReason, SyncEntry, Transport, TransportError, MAX_CHUNK_PAYLOAD,
+    SEGMENT_FETCH_REQUEST_MAGIC,
 };
 use tidefs_types_pool_label_core::PoolRedundancyPolicy as LabelPoolRedundancyPolicy;
 
@@ -3601,6 +3603,18 @@ impl StorageNode {
                     .to_string(),
             );
         }
+        if config.cluster_lease_config.is_some()
+            && config
+                .authority
+                .as_ref()
+                .and_then(RuntimeAuthority::transport_identity)
+                .is_none()
+        {
+            return Err(
+                "cluster lease authority requires an exact provisioned transport credential and peer trust set"
+                    .to_string(),
+            );
+        }
 
         // ── Extract the runtime authority spine ──────────────────────
         let authority = config.authority.clone();
@@ -3693,9 +3707,36 @@ impl StorageNode {
         if carrier_policy == CarrierPolicy::Enforce {
             eprintln!("[storage-node] carrier_policy=enforce: RDMA claim will fail closed on TCP fallback");
         }
-        transport
-            .configure_generated_attestation(true)
-            .map_err(|e| format!("transport attestation setup failed: {e}"))?;
+        if let Some(identity) = authority
+            .as_ref()
+            .and_then(RuntimeAuthority::transport_identity)
+        {
+            let local_credential = identity.local_credential();
+            let local_identity = local_credential.public_identity().into_identity();
+            let mut exact_trust = NodeKeyStore::new();
+            exact_trust
+                .register(local_identity.clone())
+                .map_err(|error| format!("register local transport identity: {error}"))?;
+            for peer in identity.trusted_peers() {
+                exact_trust
+                    .register(peer.identity().clone())
+                    .map_err(|error| format!("register trusted transport peer: {error}"))?;
+            }
+            transport = transport
+                .with_attestation(
+                    local_credential
+                        .keypair()
+                        .map_err(|error| format!("load storage-node credential: {error}"))?,
+                    local_identity,
+                )
+                .with_known_identities(exact_trust);
+            transport.set_endpoint_family(EndpointFamily::Control);
+            transport.set_attestation_bootstrap_from_handshake(false);
+        } else {
+            transport
+                .configure_generated_attestation(true)
+                .map_err(|e| format!("transport attestation setup failed: {e}"))?;
+        }
 
         // Gate outbound sends with a concurrency limit to prevent a fast
         // sender from exhausting transport memory when the receiver or
@@ -6805,6 +6846,20 @@ mod cluster_pool_handler_tests {
             Err(error) => error,
         };
         assert!(error.contains("requires membership_checkpoint_dir"));
+    }
+
+    #[test]
+    fn cluster_lease_startup_requires_exact_transport_identity() {
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.cluster_lease_config = Some(ClusterLeaseConfig::default());
+        config.membership_checkpoint_dir = Some(checkpoint_root.path().to_path_buf());
+
+        let error = match StorageNode::start(config) {
+            Ok(_) => panic!("cluster lease startup without exact identity must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("exact provisioned transport credential"));
     }
 
     #[test]
