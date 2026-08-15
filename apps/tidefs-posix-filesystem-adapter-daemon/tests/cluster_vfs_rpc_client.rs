@@ -529,6 +529,25 @@ fn client_replays_one_mutation_after_authenticated_reconnect_and_fences_term_mov
         let (moved_session, _) = admit_test_session(&mut owner_transport, moved_authority);
         let _ = owner_transport.close_session(moved_session, SessionCloseReason::LocalShutdown);
 
+        let no_retry_deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            match owner_transport.accept_incoming() {
+                Ok(session_id) => panic!(
+                    "terminally fenced client opened unexpected session {session_id} after authority movement"
+                ),
+                Err(TransportError::Generic(message))
+                    if message == "no pending connections"
+                        && Instant::now() < no_retry_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(TransportError::Generic(message)) if message == "no pending connections" => {
+                    break;
+                }
+                Err(error) => panic!("post-fence owner accept failed: {error}"),
+            }
+        }
+
         (
             first_request.header.op_id,
             following_request.header.op_id,
@@ -536,12 +555,16 @@ fn client_replays_one_mutation_after_authenticated_reconnect_and_fences_term_mov
         )
     });
 
-    let client = ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
-        owner_addr,
-        POOL_GUID,
-        client_identity.private_credential(),
-        owner_identity.public_identity(),
-    ))
+    let authority_lost = Arc::new(AtomicBool::new(false));
+    let client = ClusterVfsRpcClient::connect(
+        ClusterVfsRpcClientConfig::new(
+            owner_addr,
+            POOL_GUID,
+            client_identity.private_credential(),
+            owner_identity.public_identity(),
+        )
+        .with_authority_loss_signal(Arc::clone(&authority_lost)),
+    )
     .expect("construct reconnecting cluster VFS_RPC client");
     let remote_adapter = FuseVfsAdapter::new(Box::new(VfsDispatchEngineBridge::new(client)))
         .expect("construct reconnecting adapter engine");
@@ -559,12 +582,15 @@ fn client_replays_one_mutation_after_authenticated_reconnect_and_fences_term_mov
                 .inode_id,
             created.inode_id
         );
+        assert!(!authority_lost.load(Ordering::Acquire));
         assert_eq!(
             engine
                 .mkdir(ROOT_INODE_ID, b"authority-moved", 0o755, &ctx)
                 .unwrap_err(),
             Errno::ESTALE
         );
+        assert!(authority_lost.load(Ordering::Acquire));
+        assert_eq!(engine.get_root_inode(&ctx).unwrap_err(), Errno::ESTALE);
     }
     drop(remote_engine);
     drop(remote_adapter);

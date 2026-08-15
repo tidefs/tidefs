@@ -436,6 +436,7 @@ impl ClusterVfsRpcMountConfig {
 pub struct ClusterVfsRpcMountHandle {
     mountpoint: PathBuf,
     shutdown: Arc<AtomicBool>,
+    authority_lost: Arc<AtomicBool>,
     session: Option<fuser::BackgroundSession>,
 }
 
@@ -451,6 +452,13 @@ impl ClusterVfsRpcMountHandle {
         self.session
             .as_ref()
             .is_none_or(|session| session.guard.is_finished())
+    }
+
+    /// Report authenticated owner-authority movement that terminally fences
+    /// this old frontend.
+    #[must_use]
+    pub fn authority_lost(&self) -> bool {
+        self.authority_lost.load(Ordering::Acquire)
     }
 
     pub fn request_shutdown(&self) {
@@ -2004,13 +2012,15 @@ fn start_cluster_vfs_rpc_mount_with_shutdown(
     prepare_mountpoint_directory(&mountpoint)
         .map_err(|error| format!("create mountpoint {}: {error}", mountpoint.display()))?;
 
+    let authority_lost = Arc::new(AtomicBool::new(false));
     let client = cluster_vfs_rpc_client::ClusterVfsRpcClient::connect(
         cluster_vfs_rpc_client::ClusterVfsRpcClientConfig::new(
             owner_addr,
             expected_pool_guid,
             local_credential,
             trusted_owner_identity,
-        ),
+        )
+        .with_authority_loss_signal(Arc::clone(&authority_lost)),
     )
     .map_err(|error| format!("authenticate remote Pool owner: {error}"))?;
     let engine: Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send> =
@@ -2065,6 +2075,7 @@ fn start_cluster_vfs_rpc_mount_with_shutdown(
     Ok(ClusterVfsRpcMountHandle {
         mountpoint,
         shutdown,
+        authority_lost,
         session: Some(session),
     })
 }
@@ -2076,15 +2087,23 @@ pub fn run_cluster_vfs_rpc_mount(config: ClusterVfsRpcMountConfig) -> Result<(),
     install_signal_handlers(Arc::clone(&shutdown))
         .map_err(|error| format!("cluster client signal handler: {error}"))?;
     let mut mount = start_cluster_vfs_rpc_mount_with_shutdown(config, Arc::clone(&shutdown))?;
-    while !shutdown.load(Ordering::Acquire) && !mount.is_finished() {
+    while !shutdown.load(Ordering::Acquire) && !mount.authority_lost() && !mount.is_finished() {
         std::thread::park_timeout(Duration::from_millis(100));
+    }
+    let authority_lost = mount.authority_lost();
+    if authority_lost {
+        eprintln!("cluster client owner authority moved; unmounting stale frontend");
     }
     mount.stop();
     eprintln!(
         "tidefsctl: clustered filesystem unmounted from {}",
         mount.mountpoint().display()
     );
-    Ok(())
+    if authority_lost {
+        Err("cluster client owner authority moved; stale frontend unmounted".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 /// Bootstrap the TideFS FUSE mount lifecycle.
