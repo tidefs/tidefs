@@ -83,6 +83,26 @@ tombstone rather than silently carrying stale completed evidence. No
 `.tidefs_device_removal_pending` or
 `.tidefs_device_replacement_evidence` host file is recovery authority.
 
+## Offline Destroy Publication
+
+Offline destroy first resolves and validates the exact complete label family
+for every supplied member and derives one identity-preserving `Destroyed`
+label from that authority. It writes and rereads the trailing copy on every
+member before writing and rereading the primary copy. Before trailing-family
+completion the predecessor primary family remains complete; afterward the
+complete terminal family supersedes it. A successful non-zeroing destroy
+therefore leaves both redundant copies terminal rather than depending on
+selection of one offset.
+
+When explicit label-area zeroing is requested, destroy starts only after both
+terminal families verify. It zeroes, syncs, and rereads every full trailing
+256 KiB label area before doing the same to the primaries. During the final
+stage, any interruption leaves either a complete terminal primary family or
+too few valid labels to assemble the Pool. Success leaves no valid label copy.
+One-label-size fixtures alias the two offsets and are written once. This order
+is Pool discovery and stale-label hygiene only; it does not erase data regions
+or establish media privacy, secure erase, sanitization, or decommissioning.
+
 ## Mounted Online Removal Boundary
 
 The bounded local removal path is owned by the reachable mounted filesystem,

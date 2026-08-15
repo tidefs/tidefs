@@ -218,6 +218,17 @@ writable degraded operation, simultaneous multi-mounted filesystem atomicity,
 secure erase, media remanence, sanitization, decommissioning, or production
 readiness.
 
+The offline local carrier implements one bounded Pool-destroy row for an exact
+exported Pool supplied with all member paths. `tidefsctl pool destroy` writes
+and rereads a complete `Destroyed` trailing-label family before promoting and
+rereading the primary family. With `--zero-superblock`, it then zeroes and
+verifies each full trailing label area before each primary label area, so
+success leaves no redundant label copy discoverable or importable. The command
+reports this as label-area hygiene and explicitly makes no media-privacy,
+secure-erase, sanitization, or decommissioning claim. It does not erase Pool
+data regions, destroy an imported/live owner, or establish general
+production-ready Pool destruction.
+
 ## Current Policy
 
 - License: `GPL-2.0-only WITH Linux-syscall-note`.

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 
 use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -546,6 +547,90 @@ fn live_degraded_pool_status_reports_durable_member_identity() {
         human.contains(&format!("member 1:   {} Present", hex_guid(&present_guid))),
         "{human}"
     );
+}
+
+#[test]
+fn pool_destroy_zero_superblock_retires_redundant_labels() {
+    let fixture = tempfile::tempdir().expect("create pool destroy fixture");
+    let device = fixture.path().join("member-0.img");
+    File::create(&device)
+        .expect("create regular-file Pool member")
+        .set_len(16 * 1024 * 1024)
+        .expect("size regular-file Pool member");
+    let pool_name = format!(
+        "pool-destroy-{}-{}",
+        std::process::id(),
+        NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+
+    let create = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args([
+            "pool",
+            "create",
+            &pool_name,
+            "--file-devices",
+            "--devices",
+            device.to_str().expect("UTF-8 device path"),
+            "--json",
+        ])
+        .output()
+        .expect("create exported Pool through tidefsctl");
+    assert!(create.status.success(), "{create:?}");
+
+    let device_size = device.metadata().expect("stat Pool member").len();
+    let label_size = tidefs_types_pool_label_core::POOL_LABEL_SIZE as u64;
+    let label_offsets = [0, device_size - label_size];
+    assert_ne!(label_offsets[0], label_offsets[1]);
+    let mut file = File::open(&device).expect("open created Pool member");
+    for offset in label_offsets {
+        let mut magic = [0u8; 4];
+        file.seek(SeekFrom::Start(offset))
+            .expect("seek created label copy");
+        file.read_exact(&mut magic)
+            .expect("read created label magic");
+        assert_eq!(magic, tidefs_types_pool_label_core::POOL_LABEL_MAGIC);
+    }
+    drop(file);
+
+    let destroy = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args([
+            "pool",
+            "destroy",
+            &pool_name,
+            "--zero-superblock",
+            "--json",
+            "--devices",
+            device.to_str().expect("UTF-8 device path"),
+        ])
+        .output()
+        .expect("destroy exported Pool through tidefsctl");
+    assert!(destroy.status.success(), "{destroy:?}");
+    assert!(destroy.stderr.is_empty(), "{destroy:?}");
+    let result: serde_json::Value =
+        serde_json::from_slice(&destroy.stdout).expect("parse pool destroy JSON");
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["zero_superblock"], true, "{result}");
+    assert_eq!(result["redundant_label_areas_zeroed"], true, "{result}");
+    assert_eq!(result["media_privacy_claimed"], false, "{result}");
+    assert_eq!(result["secure_erase_claimed"], false, "{result}");
+    assert_eq!(result["sanitization_claimed"], false, "{result}");
+    assert_eq!(result["decommissioning_claimed"], false, "{result}");
+
+    let mut file = File::open(&device).expect("reopen destroyed Pool member");
+    for offset in label_offsets {
+        let mut label_area = vec![0u8; label_size as usize];
+        file.seek(SeekFrom::Start(offset))
+            .expect("seek destroyed label copy");
+        file.read_exact(&mut label_area)
+            .expect("read destroyed label area");
+        assert!(
+            label_area.iter().all(|byte| *byte == 0),
+            "label copy at {offset} was not zeroed"
+        );
+    }
+    let entries = tidefs_pool_scan::scan_labels(std::slice::from_ref(&device))
+        .expect("scan zeroed Pool member");
+    assert!(!entries[0].has_tidefs_label);
 }
 
 #[test]
