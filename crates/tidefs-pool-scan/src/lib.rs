@@ -47,11 +47,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use tidefs_types_pool_label_core::{
-    decode_label, decode_topology_roster_v1, features, DeviceClass, LabelError, PoolLabelV1,
-    PoolRedundancyPolicy, PoolState, POOL_LABEL_MAGIC, POOL_LABEL_SIZE,
-    POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE,
-    POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET,
-    POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
+    decode_label, decode_pool_lifecycle_v1, decode_topology_roster_v1, features, DeviceClass,
+    LabelError, PoolLabelV1, PoolLifecycleKindV1, PoolRedundancyPolicy, PoolState,
+    POOL_LABEL_LIFECYCLE_V1_CHECKSUM_SIZE, POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE, POOL_LABEL_MAGIC,
+    POOL_LABEL_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE,
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE,
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET, POOL_LABEL_V1_EXT_WIRE_SIZE,
+    POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 
 #[cfg(any(feature = "distributed-repair", test))]
@@ -72,16 +74,30 @@ const COMPLETED_EVACUATIONS_EXTENSION_VERSION: u32 = 1;
 const COMPLETED_EVACUATIONS_EXTENSION_HEADER_SIZE: usize = 48;
 const COMPLETED_EVACUATION_RECORD_SIZE: usize = 64;
 
-fn decoded_label_wire_size(label: &PoolLabelV1) -> Result<usize, String> {
+fn decoded_label_wire_size(
+    label: &PoolLabelV1,
+    lifecycle_payload_len: Option<usize>,
+) -> Result<usize, String> {
     if label.features_compat & features::TOPOLOGY_ROSTER_V1 != 0 {
-        return usize::try_from(label.device_count)
+        let roster_end = usize::try_from(label.device_count)
             .ok()
             .and_then(|count| count.checked_mul(POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE))
             .and_then(|size| size.checked_add(POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE))
             .and_then(|size| size.checked_add(POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE))
             .and_then(|size| POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET.checked_add(size))
             .filter(|end| *end <= POOL_LABEL_SIZE)
-            .ok_or_else(|| "topology roster extent is outside the label envelope".to_string());
+            .ok_or_else(|| "topology roster extent is outside the label envelope".to_string())?;
+        if label.features_compat & features::POOL_LIFECYCLE_V1 == 0 {
+            return Ok(roster_end);
+        }
+        let payload_len = lifecycle_payload_len
+            .ok_or_else(|| "Pool lifecycle extent is missing from the label".to_string())?;
+        return roster_end
+            .checked_add(POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE)
+            .and_then(|end| end.checked_add(payload_len))
+            .and_then(|end| end.checked_add(POOL_LABEL_LIFECYCLE_V1_CHECKSUM_SIZE))
+            .filter(|end| *end <= POOL_LABEL_SIZE)
+            .ok_or_else(|| "Pool lifecycle extent is outside the label envelope".to_string());
     }
     if label.features_compat & features::DEVICE_LAYOUT_V1 != 0 {
         Ok(POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE)
@@ -818,9 +834,18 @@ pub struct PoolLabelReader;
 
 #[derive(Clone, Debug)]
 struct ScannedLabelCopy {
+    label_offset: u64,
     label: PoolLabelV1,
     topology_roster: Option<Vec<[u8; 16]>>,
+    lifecycle: Option<ScannedLifecycleRecord>,
     completed_evacuations: Vec<CompletedEvacuation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScannedLifecycleRecord {
+    sequence: u64,
+    kind: PoolLifecycleKindV1,
+    payload: Vec<u8>,
 }
 
 impl ScannedLabelCopy {
@@ -838,15 +863,31 @@ impl ScannedLabelCopy {
                 == roster.len()
     }
 
-    fn same_topology(&self, other: &Self) -> bool {
+    fn same_topology_authority(&self, other: &Self) -> bool {
         self.label.pool_guid == other.label.pool_guid
             && self.label.topology_generation == other.label.topology_generation
             && self.label.device_count == other.label.device_count
             && self.label.pool_name_len == other.label.pool_name_len
             && self.label.pool_name == other.label.pool_name
-            && self.label.pool_state == other.label.pool_state
             && self.label.redundancy_policy == other.label.redundancy_policy
             && self.topology_roster == other.topology_roster
+            && self.lifecycle == other.lifecycle
+    }
+
+    fn same_topology(&self, other: &Self) -> bool {
+        self.same_topology_authority(other) && self.label.pool_state == other.label.pool_state
+    }
+
+    fn lifecycle_sequence(&self) -> u64 {
+        self.lifecycle.as_ref().map_or(0, |record| record.sequence)
+    }
+}
+
+fn pool_state_transition_rank(state: PoolState) -> u8 {
+    match state {
+        PoolState::Destroyed => 2,
+        PoolState::Active => 1,
+        PoolState::Exported => 0,
     }
 }
 
@@ -961,11 +1002,21 @@ impl PoolLabelReader {
                             .collect::<Result<Vec<_>, _>>()
                     })
                     .transpose()?;
-                let extension_offset =
-                    decoded_label_wire_size(&label).map_err(|msg| ScanError::LabelEvidence {
-                        path: PathBuf::from("<file>"),
-                        msg,
-                    })?;
+                let lifecycle = decode_pool_lifecycle_v1(&full)
+                    .map_err(ScanError::Label)?
+                    .map(|record| ScannedLifecycleRecord {
+                        sequence: record.sequence(),
+                        kind: record.kind(),
+                        payload: record.payload().to_vec(),
+                    });
+                let extension_offset = decoded_label_wire_size(
+                    &label,
+                    lifecycle.as_ref().map(|record| record.payload.len()),
+                )
+                .map_err(|msg| ScanError::LabelEvidence {
+                    path: PathBuf::from("<file>"),
+                    msg,
+                })?;
                 let mut extension = full[extension_offset..].to_vec();
                 if full.len() < POOL_LABEL_SIZE {
                     let extension_len = POOL_LABEL_SIZE.saturating_sub(full.len());
@@ -984,11 +1035,18 @@ impl PoolLabelReader {
                         }
                     })?;
                 Ok(Some(ScannedLabelCopy {
+                    label_offset: offset,
                     label,
                     topology_roster,
+                    lifecycle,
                     completed_evacuations,
                 }))
             }
+            Err(
+                error @ (LabelError::BadPoolLifecycle
+                | LabelError::UnsupportedPoolLifecycleVersion(_)
+                | LabelError::PoolLifecycleChecksumMismatch),
+            ) => Err(ScanError::Label(error)),
             Err(_) => Ok(None),
         }
     }
@@ -1057,8 +1115,10 @@ impl PoolLabelReader {
             Ok(copy) => Self::scan_device_with_copy(
                 info,
                 copy.map(|(label, completed_evacuations)| ScannedLabelCopy {
+                    label_offset: 0,
                     label,
                     topology_roster: None,
+                    lifecycle: None,
                     completed_evacuations,
                 }),
             ),
@@ -1198,6 +1258,42 @@ pub fn scan_labels(device_paths: &[PathBuf]) -> Result<Vec<DeviceScanEntry>, Sca
     Ok(entries)
 }
 
+/// Select the exact redundant label copy that carries the highest complete
+/// topology and lifecycle authority for each supplied member path.
+///
+/// Importers use these offsets so a crash during staged backup/primary label
+/// publication cannot make a mixed primary family supersede the previous or
+/// newly completed family.
+pub fn select_label_copy_offsets(
+    device_paths: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, u64>, ScanError> {
+    let mut scanned = Vec::with_capacity(device_paths.len());
+    for path in device_paths {
+        let mut info = DeviceInfo::new(path.clone());
+        if let Ok(size) = device_capacity_bytes(path) {
+            info.size_bytes = size;
+        }
+        scanned.push((info, PoolLabelReader::read_label_copies(path)?));
+    }
+
+    if let Some(selected) = select_highest_complete_topology(&scanned)? {
+        return Ok(selected
+            .into_iter()
+            .map(|(path, copy)| (path, copy.label_offset))
+            .collect());
+    }
+
+    Ok(scanned
+        .into_iter()
+        .filter_map(|(info, copies)| {
+            copies
+                .into_iter()
+                .next()
+                .map(|copy| (info.device_path, copy.label_offset))
+        })
+        .collect())
+}
+
 fn select_highest_complete_topology(
     scanned: &[(DeviceInfo, Vec<ScannedLabelCopy>)],
 ) -> Result<Option<BTreeMap<PathBuf, ScannedLabelCopy>>, ScanError> {
@@ -1255,14 +1351,49 @@ fn select_highest_complete_topology(
     else {
         return Ok(None);
     };
-    let mut highest = complete
+    let highest = complete
         .into_iter()
         .filter(|(candidate, _)| candidate.label.topology_generation == max_generation);
+    let max_lifecycle_sequence = highest
+        .clone()
+        .map(|(candidate, _)| candidate.lifecycle_sequence())
+        .max()
+        .unwrap_or(0);
+    let highest = highest
+        .filter(|(candidate, _)| candidate.lifecycle_sequence() == max_lifecycle_sequence)
+        .collect::<Vec<_>>();
+    let lifecycle_authority = &highest[0].0;
+    if highest
+        .iter()
+        .any(|(candidate, _)| !candidate.same_topology_authority(lifecycle_authority))
+    {
+        return Err(ScanError::LabelEvidence {
+            path: PathBuf::from("<pool-topology>"),
+            msg: format!(
+                "conflicting complete topology or lifecycle authority at topology generation \
+                 {max_generation}, lifecycle sequence {max_lifecycle_sequence}"
+            ),
+        });
+    }
+    // ACTIVE is the completed successor of EXPORTED during import, while
+    // DESTROYED is terminal. A partial state transition has no complete
+    // successor family and therefore continues selecting its predecessor.
+    let state_rank = highest
+        .iter()
+        .map(|(candidate, _)| pool_state_transition_rank(candidate.label.pool_state))
+        .max()
+        .unwrap();
+    let mut highest = highest.into_iter().filter(|(candidate, _)| {
+        pool_state_transition_rank(candidate.label.pool_state) == state_rank
+    });
     let (authority, selection) = highest.next().unwrap();
     if highest.any(|(candidate, _)| !candidate.same_topology(&authority)) {
         return Err(ScanError::LabelEvidence {
             path: PathBuf::from("<pool-topology>"),
-            msg: format!("conflicting complete topology rosters at generation {max_generation}"),
+            msg: format!(
+                "conflicting complete topology or lifecycle records at topology generation \
+                 {max_generation}, lifecycle sequence {max_lifecycle_sequence}"
+            ),
         });
     }
     Ok(Some(selection))
@@ -2751,8 +2882,10 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tidefs_types_pool_label_core::{
-        encode_label, encode_label_with_extensions, seal_label, seal_label_with_extensions,
-        POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
+        encode_label, encode_label_with_all_extensions, encode_label_with_extensions, seal_label,
+        seal_label_with_all_extensions, seal_label_with_extensions, PoolLifecycleKindV1,
+        PoolLifecycleRecordV1, POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE,
+        POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
     };
 
     // -- DeviceKind tests --
@@ -2962,6 +3095,94 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn write_lifecycle_topology_label_at_offset(
+        path: &Path,
+        pool_guid: [u8; 16],
+        device_guid: [u8; 16],
+        device_index: u32,
+        topology_generation: u64,
+        roster: &[[u8; 16]],
+        lifecycle_sequence: u64,
+        lifecycle_kind: PoolLifecycleKindV1,
+        lifecycle_payload: &[u8],
+        offset: u64,
+    ) {
+        let mut label = PoolLabelV1::new(pool_guid, device_guid, "topology-test");
+        label.pool_state = PoolState::Active;
+        label.device_index = device_index;
+        label.device_count = roster.len() as u32;
+        label.topology_generation = topology_generation;
+        let layout = [0u8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        let lifecycle = PoolLifecycleRecordV1::new(
+            lifecycle_sequence,
+            topology_generation,
+            lifecycle_kind,
+            lifecycle_payload,
+        )
+        .unwrap();
+        let label =
+            seal_label_with_all_extensions(label, Some(&layout), Some(roster), Some(lifecycle))
+                .unwrap();
+        let mut buf = vec![0u8; POOL_LABEL_SIZE];
+        encode_label_with_all_extensions(
+            &label,
+            Some(&layout),
+            Some(roster),
+            Some(lifecycle),
+            &mut buf,
+        )
+        .unwrap();
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        file.set_len(2 * POOL_LABEL_SIZE as u64).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&buf).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn write_complete_lifecycle_topology(
+        paths: &[PathBuf],
+        pool_guid: [u8; 16],
+        roster: &[[u8; 16]],
+        topology_generation: u64,
+        lifecycle: (u64, PoolLifecycleKindV1, &[u8]),
+        offset: u64,
+    ) {
+        let (lifecycle_sequence, lifecycle_kind, lifecycle_payload) = lifecycle;
+        for (device_index, (path, device_guid)) in paths.iter().zip(roster).enumerate() {
+            write_lifecycle_topology_label_at_offset(
+                path,
+                pool_guid,
+                *device_guid,
+                device_index as u32,
+                topology_generation,
+                roster,
+                lifecycle_sequence,
+                lifecycle_kind,
+                lifecycle_payload,
+                offset,
+            );
+        }
+    }
+
+    fn read_scanned_copies(paths: &[PathBuf]) -> Vec<(DeviceInfo, Vec<ScannedLabelCopy>)> {
+        paths
+            .iter()
+            .map(|path| {
+                (
+                    DeviceInfo::new(path.clone()),
+                    PoolLabelReader::read_label_copies(path).unwrap(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn complete_topology_partial_backup_staging_selects_old_roster() {
         let dir = tempfile::tempdir().unwrap();
@@ -3023,6 +3244,149 @@ mod tests {
             assert_eq!(entry.device_index, Some(index as u32));
             assert_eq!(entry.device_guid, Some(reduced_roster[index]));
         }
+    }
+
+    #[test]
+    fn lifecycle_highest_complete_sequence_selects_clear_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..2)
+            .map(|index| dir.path().join(format!("lifecycle-device-{index}")))
+            .collect();
+        let pool_guid = [0x71; 16];
+        let roster = [[0x81; 16], [0x82; 16]];
+        write_complete_lifecycle_topology(
+            &paths,
+            pool_guid,
+            &roster,
+            13,
+            (4, PoolLifecycleKindV1::DeviceRemoval, b"old-removal"),
+            0,
+        );
+        write_complete_lifecycle_topology(
+            &paths,
+            pool_guid,
+            &roster,
+            13,
+            (5, PoolLifecycleKindV1::Clear, b""),
+            POOL_LABEL_SIZE as u64,
+        );
+
+        let scanned = read_scanned_copies(&paths);
+        let selected = select_highest_complete_topology(&scanned).unwrap().unwrap();
+        for path in &paths {
+            let lifecycle = selected[path].lifecycle.as_ref().unwrap();
+            assert_eq!(lifecycle.sequence, 5);
+            assert_eq!(lifecycle.kind, PoolLifecycleKindV1::Clear);
+            assert!(lifecycle.payload.is_empty());
+        }
+    }
+
+    #[test]
+    fn lifecycle_partial_higher_sequence_keeps_complete_predecessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..2)
+            .map(|index| dir.path().join(format!("lifecycle-partial-{index}")))
+            .collect();
+        let pool_guid = [0x91; 16];
+        let roster = [[0xA1; 16], [0xA2; 16]];
+        write_complete_lifecycle_topology(
+            &paths,
+            pool_guid,
+            &roster,
+            17,
+            (8, PoolLifecycleKindV1::DeviceReplacement, b"complete"),
+            0,
+        );
+        write_lifecycle_topology_label_at_offset(
+            &paths[0],
+            pool_guid,
+            roster[0],
+            0,
+            17,
+            &roster,
+            9,
+            PoolLifecycleKindV1::DeviceReplacement,
+            b"partial",
+            POOL_LABEL_SIZE as u64,
+        );
+
+        let scanned = read_scanned_copies(&paths);
+        let selected = select_highest_complete_topology(&scanned).unwrap().unwrap();
+        for path in &paths {
+            let lifecycle = selected[path].lifecycle.as_ref().unwrap();
+            assert_eq!(lifecycle.sequence, 8);
+            assert_eq!(lifecycle.payload, b"complete");
+        }
+    }
+
+    #[test]
+    fn lifecycle_same_sequence_conflict_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..2)
+            .map(|index| dir.path().join(format!("lifecycle-conflict-{index}")))
+            .collect();
+        let pool_guid = [0xB1; 16];
+        let roster = [[0xC1; 16], [0xC2; 16]];
+        write_complete_lifecycle_topology(
+            &paths,
+            pool_guid,
+            &roster,
+            19,
+            (12, PoolLifecycleKindV1::DeviceRemoval, b"first"),
+            0,
+        );
+        write_complete_lifecycle_topology(
+            &paths,
+            pool_guid,
+            &roster,
+            19,
+            (12, PoolLifecycleKindV1::DeviceReplacement, b"second"),
+            POOL_LABEL_SIZE as u64,
+        );
+
+        let scanned = read_scanned_copies(&paths);
+        let error = select_highest_complete_topology(&scanned).unwrap_err();
+        assert!(error.to_string().contains("lifecycle sequence 12"));
+    }
+
+    #[test]
+    fn lifecycle_checksum_corruption_is_a_label_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lifecycle-corrupt");
+        let pool_guid = [0xD1; 16];
+        let roster = [[0xE1; 16]];
+        write_lifecycle_topology_label_at_offset(
+            &path,
+            pool_guid,
+            roster[0],
+            0,
+            23,
+            &roster,
+            15,
+            PoolLifecycleKindV1::DeviceRemoval,
+            b"intent",
+            0,
+        );
+        let lifecycle_offset = POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(
+            (lifecycle_offset + POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE) as u64,
+        ))
+        .unwrap();
+        file.write_all(&[0xFF]).unwrap();
+        file.sync_all().unwrap();
+
+        assert!(matches!(
+            scan_labels(&[path]),
+            Err(ScanError::Label(LabelError::PoolLifecycleChecksumMismatch))
+        ));
     }
 
     #[test]

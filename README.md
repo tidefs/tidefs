@@ -184,24 +184,29 @@ authenticated filesystem root, and publish a redundant survivor-only topology
 before reporting success. Before evacuation the owner authenticates every
 current filesystem root through the shared Pool runtime. It durably queues
 predecessor manifests and publishes each successor typed root before topology
-publication; the removal marker recovers interruption between those phases
-without overwriting predecessor-manifest bytes. Co-owned Pool-runtime volumes,
-volume snapshots, and volume clones survive because their immutable typed roots
-carry keys and digests while Pool lifecycle relocates their complete
-receipt-backed object graphs. Removal still refuses before evacuation for
-filesystem-sourced snapshots/clones, data-retaining mounted or independent
-filesystem snapshots, filesystem clones, or non-active filesystem datasets.
-This is current implementation behavior, not a production-readiness,
-failed-device, replacement, rebuild, secure-erase, media-remanence,
-sanitization, or decommissioning claim.
+publication. Before mutation, redundant member labels record a versioned,
+checksummed removal intent bound to the Pool GUID, target member index and GUID,
+and successor topology generation; paths are descriptive runtime locators only.
+Reopen selects exact lifecycle agreement from the highest complete label
+topology before receipt recovery and resumes without a host-side marker file or
+runtime directory. Co-owned Pool-runtime volumes, volume snapshots, and volume
+clones survive because their immutable typed roots carry keys and digests while
+Pool lifecycle relocates their complete receipt-backed object graphs. Removal
+still refuses before evacuation for filesystem-sourced snapshots/clones,
+data-retaining mounted or independent filesystem snapshots, filesystem clones,
+or non-active filesystem datasets. This is current implementation behavior,
+not a production-readiness, failed-device, replacement, rebuild, secure-erase,
+media-remanence, sanitization, or decommissioning claim.
 
 The same carrier implements one bounded present-member replacement row:
 `tidefsctl device replace` routes only to the reachable mounted local owner of
-an exact writable two-member `Replicated { copies: 2 }` Pool. It persists
-old/new identity and rebuild progress, keeps the readable old member attached
-and allocation-fenced, rewrites current receipt-backed objects onto the
-survivor plus replacement, copy-on-writes mounted content manifests, refreshes
-the authenticated root ring, and only then publishes redundant
+an exact writable two-member `Replicated { copies: 2 }` Pool. Redundant labels
+persist checksummed old/new GUID identity, member index, successor topology
+generation, rebuild progress, and terminal state before mutation; no host-side
+evidence file is recovery authority. The owner keeps the readable old member
+attached and allocation-fenced, rewrites current receipt-backed objects onto
+the survivor plus replacement, copy-on-writes mounted content manifests,
+refreshes the authenticated root ring, and only then publishes redundant
 same-cardinality labels. Replacement requires a distinct blank same-backing
 candidate with sufficient capacity. It preserves co-owned Pool-runtime
 volumes, volume snapshots, volume clones, and active unmounted independent

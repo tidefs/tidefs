@@ -1618,6 +1618,9 @@ pub struct Pool {
     /// the target. The target remains attached until the mounted owner has
     /// advanced any receipt references embedded above Pool authority.
     pending_device_removal: Option<(PathBuf, [u8; 16], crate::device_removal::EvacuationResult)>,
+    /// Device-authoritative removal intent decoded from the selected label
+    /// family before receipt recovery begins.
+    device_removal_marker: Option<DeviceRemovalMarker>,
     /// Attached predecessor excluded from new placement while a durable
     /// removal or replacement lifecycle record is active.
     allocation_fenced_device_guid: Option<[u8; 16]>,
@@ -1632,6 +1635,10 @@ pub struct Pool {
     /// transform keys; callers must supply device configuration again when
     /// resuming after reopen.
     replacement_evidence: Option<DeviceReplacementEvidenceMarker>,
+    /// Highest complete lifecycle record selected with the current label
+    /// topology. A cleared record retains the monotonic sequence so stale
+    /// label copies cannot resurrect an earlier operation.
+    label_lifecycle: Option<PoolLifecycleLabelRecord>,
     /// Block allocator for free-space tracking and TRIM coordination.
     /// Initialised via [`set_allocator`].
     allocator: Option<BlockAllocator>,
@@ -1677,6 +1684,28 @@ struct DeviceReplacementEvidenceMarker {
     bytes_rebuilt: u64,
     evidence_stable: bool,
     state: ReplacementRebuildStatusState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PoolLifecycleLabelRecord {
+    sequence: u64,
+    kind: pool_label::PoolLifecycleKindV1,
+    payload: Vec<u8>,
+}
+
+type SelectedPoolTopology = (Vec<DeviceConfig>, BTreeMap<PathBuf, Vec<u8>>);
+
+fn next_pool_lifecycle_sequence(current: Option<u64>) -> Result<u64> {
+    match current {
+        None => Ok(1),
+        Some(sequence) => sequence.checked_add(1).ok_or(StoreError::InvalidOptions {
+            reason: "Pool lifecycle label sequence exhausted",
+        }),
+    }
+}
+
+fn checked_successor_topology_generation(current: u64) -> Option<u64> {
+    current.checked_add(1)
 }
 
 /// Discover the current logical subjects whose authoritative placement receipt
@@ -1783,8 +1812,6 @@ impl DeviceReplacementEvidenceMarker {
     }
 }
 
-const DEVICE_REPLACEMENT_EVIDENCE_FILE: &str = ".tidefs_device_replacement_evidence";
-const DEVICE_REPLACEMENT_EVIDENCE_TMP_FILE: &str = ".tidefs_device_replacement_evidence.tmp";
 const DEVICE_REPLACEMENT_EVIDENCE_MAGIC_V2: &[u8; 8] = b"TFSDRP2\0";
 const DEVICE_REPLACEMENT_EVIDENCE_CHECKSUM_LEN: usize = 32;
 const DEVICE_REPLACEMENT_EVIDENCE_STABLE_FLAG: u8 = 1;
@@ -1947,74 +1974,115 @@ fn decode_device_replacement_evidence(encoded: &[u8]) -> Result<DeviceReplacemen
     Ok(decoded)
 }
 
-fn persist_device_replacement_evidence(
-    pool_root: &Path,
+fn replacement_evidence_matches_topology(
     evidence: &DeviceReplacementEvidenceMarker,
-) -> Result<()> {
-    let evidence_path = pool_root.join(DEVICE_REPLACEMENT_EVIDENCE_FILE);
-    let tmp_path = pool_root.join(DEVICE_REPLACEMENT_EVIDENCE_TMP_FILE);
-    let encoded = encode_device_replacement_evidence(evidence)?;
-    let persist_result = (|| -> std::io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-        drop(file);
-
-        fs::rename(&tmp_path, &evidence_path)?;
-        fs::File::open(pool_root)?.sync_all()
-    })();
-
-    if let Err(source) = persist_result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(StoreError::Io {
-            operation: "persist_device_replacement_evidence",
-            path: evidence_path,
-            source,
-        });
+    device_guids: &[[u8; 16]],
+    topology_generation: u64,
+) -> bool {
+    match device_guids.get(evidence.device_index) {
+        Some(guid) if *guid == evidence.old_device_guid => {
+            !device_guids.contains(&evidence.new_device_guid)
+                && checked_successor_topology_generation(topology_generation)
+                    == Some(evidence.topology_epoch)
+        }
+        Some(guid) if *guid == evidence.new_device_guid => {
+            !device_guids.contains(&evidence.old_device_guid)
+                && evidence.topology_epoch == topology_generation
+        }
+        _ => false,
     }
-    Ok(())
 }
 
-fn read_device_replacement_evidence(
-    evidence_path: &Path,
-) -> Result<DeviceReplacementEvidenceMarker> {
-    let encoded = fs::read(evidence_path).map_err(|source| StoreError::Io {
-        operation: "read_device_replacement_evidence",
-        path: evidence_path.to_path_buf(),
-        source,
-    })?;
-    decode_device_replacement_evidence(&encoded)
+fn validate_label_lifecycle_topology(
+    pool_guid: [u8; 16],
+    durable_device_guids: &[[u8; 16]],
+    topology_generation: u64,
+    lifecycle: Option<&PoolLifecycleLabelRecord>,
+) -> Result<()> {
+    let Some(lifecycle) = lifecycle else {
+        return Ok(());
+    };
+    match lifecycle.kind {
+        pool_label::PoolLifecycleKindV1::Clear => Ok(()),
+        pool_label::PoolLifecycleKindV1::DeviceRemoval => {
+            let marker = decode_device_removal_marker(&lifecycle.payload)?;
+            if marker.pool_guid != pool_guid {
+                return Err(StoreError::InvalidOptions {
+                    reason: "device removal label intent belongs to a different pool",
+                });
+            }
+            if durable_device_guids.get(marker.target_index) != Some(&marker.target_guid)
+                || checked_successor_topology_generation(topology_generation)
+                    != Some(marker.successor_topology_generation)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "device removal label intent does not match the durable topology",
+                });
+            }
+            Ok(())
+        }
+        pool_label::PoolLifecycleKindV1::DeviceReplacement => {
+            let evidence = decode_device_replacement_evidence(&lifecycle.payload)?;
+            if evidence.pool_guid != pool_guid {
+                return Err(StoreError::InvalidOptions {
+                    reason: "device replacement label intent belongs to a different pool",
+                });
+            }
+            if !replacement_evidence_matches_topology(
+                &evidence,
+                durable_device_guids,
+                topology_generation,
+            ) {
+                return Err(StoreError::InvalidOptions {
+                    reason: "device replacement evidence does not match the loaded topology",
+                });
+            }
+            let loaded_guid = durable_device_guids.get(evidence.device_index).copied();
+            if evidence.state == ReplacementRebuildStatusState::Completed
+                && (!evidence.evidence_stable
+                    || loaded_guid != Some(evidence.new_device_guid)
+                    || evidence.topology_epoch != topology_generation)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "completed device replacement evidence does not match committed replacement topology",
+                });
+            }
+            Ok(())
+        }
+    }
 }
 
 fn restore_device_replacement_evidence(pool: &mut Pool) -> Result<()> {
-    let evidence_path = pool.config.root_path.join(DEVICE_REPLACEMENT_EVIDENCE_FILE);
-    if !evidence_path.exists() {
+    let Some(lifecycle) = pool.label_lifecycle.as_ref() else {
+        return Ok(());
+    };
+    if lifecycle.kind != pool_label::PoolLifecycleKindV1::DeviceReplacement {
         return Ok(());
     }
-
-    let mut evidence = read_device_replacement_evidence(&evidence_path)?;
+    let mut evidence = decode_device_replacement_evidence(&lifecycle.payload)?;
     if evidence.pool_guid != pool.pool_guid {
         return Err(StoreError::InvalidOptions {
             reason: "device replacement evidence belongs to a different pool",
         });
     }
-    let loaded_path = pool
-        .devices
-        .get(evidence.device_index)
-        .map(|device| device.root());
     let loaded_guid = pool.device_guids.get(evidence.device_index).copied();
-    let old_topology_loaded = loaded_path == Some(evidence.old_path.as_path())
-        && loaded_guid == Some(evidence.old_device_guid);
-    let new_topology_loaded = loaded_path == Some(evidence.new_path.as_path())
-        && loaded_guid == Some(evidence.new_device_guid);
-    if !old_topology_loaded && !new_topology_loaded {
+    let old_topology_loaded = loaded_guid == Some(evidence.old_device_guid);
+    let new_topology_loaded = loaded_guid == Some(evidence.new_device_guid);
+    if !replacement_evidence_matches_topology(&evidence, &pool.device_guids, pool.placement_epoch) {
         return Err(StoreError::InvalidOptions {
             reason: "device replacement evidence does not match the loaded topology",
         });
+    }
+    if let Some(current_path) = pool
+        .devices
+        .get(evidence.device_index)
+        .map(|device| device.root().to_path_buf())
+    {
+        if old_topology_loaded {
+            evidence.old_path = current_path;
+        } else if new_topology_loaded {
+            evidence.new_path = current_path;
+        }
     }
     if evidence.state == ReplacementRebuildStatusState::Completed
         && (!new_topology_loaded
@@ -2043,18 +2111,18 @@ fn restore_device_replacement_evidence(pool: &mut Pool) -> Result<()> {
     Ok(())
 }
 
-/// File written to pool root during device removal to enable
-/// crash-safe resume on next pool open.
-const DEVICE_REMOVAL_MARKER_FILE: &str = ".tidefs_device_removal_pending";
-const DEVICE_REMOVAL_MARKER_TMP_FILE: &str = ".tidefs_device_removal_pending.tmp";
-const DEVICE_REMOVAL_MARKER_MAGIC_V2: &[u8; 8] = b"TFSDRM2\0";
+/// Payload committed to redundant Pool labels for crash-safe device-removal
+/// resume on the next Pool open.
+const DEVICE_REMOVAL_MARKER_MAGIC_V3: &[u8; 8] = b"TFSDRM3\0";
 const DEVICE_REMOVAL_MARKER_CHECKSUM_LEN: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DeviceRemovalMarker {
     pool_guid: [u8; 16],
+    target_index: usize,
     target_path: PathBuf,
     target_guid: [u8; 16],
+    successor_topology_generation: u64,
 }
 
 fn invalid_device_removal_marker() -> StoreError {
@@ -2065,25 +2133,31 @@ fn invalid_device_removal_marker() -> StoreError {
 
 fn encode_device_removal_marker(
     pool_guid: [u8; 16],
+    target_index: usize,
     target_path: &Path,
     target_guid: [u8; 16],
+    successor_topology_generation: u64,
 ) -> Result<Vec<u8>> {
     let path = target_path.as_os_str().as_bytes();
-    if path.is_empty() {
+    if path.is_empty() || successor_topology_generation == 0 {
         return Err(invalid_device_removal_marker());
     }
+    let target_index = u32::try_from(target_index).map_err(|_| invalid_device_removal_marker())?;
     let path_len = u32::try_from(path.len()).map_err(|_| invalid_device_removal_marker())?;
     let mut encoded = Vec::with_capacity(
-        DEVICE_REMOVAL_MARKER_MAGIC_V2.len()
+        DEVICE_REMOVAL_MARKER_MAGIC_V3.len()
             + pool_guid.len()
             + target_guid.len()
-            + std::mem::size_of::<u32>()
+            + std::mem::size_of::<u32>() * 2
+            + std::mem::size_of::<u64>()
             + path.len()
             + DEVICE_REMOVAL_MARKER_CHECKSUM_LEN,
     );
-    encoded.extend_from_slice(DEVICE_REMOVAL_MARKER_MAGIC_V2);
+    encoded.extend_from_slice(DEVICE_REMOVAL_MARKER_MAGIC_V3);
     encoded.extend_from_slice(&pool_guid);
     encoded.extend_from_slice(&target_guid);
+    encoded.extend_from_slice(&target_index.to_le_bytes());
+    encoded.extend_from_slice(&successor_topology_generation.to_le_bytes());
     encoded.extend_from_slice(&path_len.to_le_bytes());
     encoded.extend_from_slice(path);
     let checksum = blake3::hash(&encoded);
@@ -2094,13 +2168,15 @@ fn encode_device_removal_marker(
 fn decode_device_removal_marker(encoded: &[u8]) -> Result<DeviceRemovalMarker> {
     let decoded = (|| -> Option<DeviceRemovalMarker> {
         let mut cursor = ReceiptCursor::new(encoded);
-        if cursor.take(DEVICE_REMOVAL_MARKER_MAGIC_V2.len())? != DEVICE_REMOVAL_MARKER_MAGIC_V2 {
+        if cursor.take(DEVICE_REMOVAL_MARKER_MAGIC_V3.len())? != DEVICE_REMOVAL_MARKER_MAGIC_V3 {
             return None;
         }
         let pool_guid = cursor.array()?;
         let target_guid = cursor.array()?;
+        let target_index = u32::from_le_bytes(cursor.array()?) as usize;
+        let successor_topology_generation = u64::from_le_bytes(cursor.array()?);
         let path_len = u32::from_le_bytes(cursor.array()?) as usize;
-        if path_len == 0 {
+        if path_len == 0 || successor_topology_generation == 0 {
             return None;
         }
         let target_path = PathBuf::from(OsString::from_vec(cursor.take(path_len)?.to_vec()));
@@ -2116,136 +2192,35 @@ fn decode_device_removal_marker(encoded: &[u8]) -> Result<DeviceRemovalMarker> {
         }
         Some(DeviceRemovalMarker {
             pool_guid,
+            target_index,
             target_path,
             target_guid,
+            successor_topology_generation,
         })
     })();
 
     decoded.ok_or_else(invalid_device_removal_marker)
 }
 
-fn persist_device_removal_marker(
-    pool_root: &Path,
-    pool_guid: [u8; 16],
-    target_path: &Path,
-    target_guid: [u8; 16],
-) -> Result<()> {
-    let marker_path = pool_root.join(DEVICE_REMOVAL_MARKER_FILE);
-    let tmp_path = pool_root.join(DEVICE_REMOVAL_MARKER_TMP_FILE);
-    let encoded = encode_device_removal_marker(pool_guid, target_path, target_guid)?;
-    let persist_result = (|| -> std::io::Result<()> {
-        let mut marker = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)?;
-        marker.write_all(&encoded)?;
-        marker.sync_all()?;
-        drop(marker);
-
-        fs::rename(&tmp_path, &marker_path)?;
-        fs::File::open(pool_root)?.sync_all()
-    })();
-
-    if let Err(source) = persist_result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(StoreError::Io {
-            operation: "persist_device_removal_marker",
-            path: marker_path,
-            source,
-        });
-    }
-    Ok(())
-}
-
-fn read_device_removal_marker(marker_path: &Path) -> Result<DeviceRemovalMarker> {
-    let encoded = fs::read(marker_path).map_err(|source| StoreError::Io {
-        operation: "read_device_removal_marker",
-        path: marker_path.to_path_buf(),
-        source,
-    })?;
-    decode_device_removal_marker(&encoded)
-}
-
-fn read_device_removal_marker_if_present(
-    marker_path: &Path,
-) -> Result<Option<DeviceRemovalMarker>> {
-    match read_device_removal_marker(marker_path) {
-        Ok(marker) => Ok(Some(marker)),
-        Err(StoreError::Io {
-            operation,
-            path,
-            source,
-        }) if source.kind() == std::io::ErrorKind::NotFound => {
-            match fs::symlink_metadata(marker_path) {
-                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
-                    Ok(None)
-                }
-                Ok(_) => Err(StoreError::Io {
-                    operation,
-                    path,
-                    source,
-                }),
-                Err(source) => Err(StoreError::Io {
-                    operation: "inspect_device_removal_marker",
-                    path: marker_path.to_path_buf(),
-                    source,
-                }),
-            }
-        }
-        Err(err) => Err(err),
-    }
-}
-
 fn validate_read_only_lifecycle_state(
-    config: &PoolConfig,
-    pool_guid: [u8; 16],
-    device_guids: &[[u8; 16]],
+    durable_device_guids: &[[u8; 16]],
     topology_generation: u64,
+    lifecycle: Option<&PoolLifecycleLabelRecord>,
 ) -> Result<()> {
-    let removal_marker_path = config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
-    if read_device_removal_marker_if_present(&removal_marker_path)?
-        .is_some_and(|marker| marker.pool_guid == pool_guid)
-    {
+    let Some(lifecycle) = lifecycle else {
+        return Ok(());
+    };
+    if lifecycle.kind == pool_label::PoolLifecycleKindV1::Clear {
+        return Ok(());
+    }
+    if lifecycle.kind == pool_label::PoolLifecycleKindV1::DeviceRemoval {
         return Err(StoreError::InvalidOptions {
             reason: "read-only pool import refuses pending device removal",
         });
     }
-
-    let evidence_path = config.root_path.join(DEVICE_REPLACEMENT_EVIDENCE_FILE);
-    let evidence = match fs::symlink_metadata(&evidence_path) {
-        Ok(_) => Some(read_device_replacement_evidence(&evidence_path)?),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
-        Err(source) => {
-            return Err(StoreError::Io {
-                operation: "inspect_device_replacement_evidence",
-                path: evidence_path,
-                source,
-            })
-        }
-    };
-    let Some(evidence) = evidence else {
-        return Ok(());
-    };
-    if evidence.pool_guid != pool_guid {
-        return Err(StoreError::InvalidOptions {
-            reason: "device replacement evidence belongs to a different pool",
-        });
-    }
-    let loaded_path = config
-        .devices
-        .get(evidence.device_index)
-        .map(device_root_path);
-    let loaded_guid = device_guids.get(evidence.device_index).copied();
-    let old_topology_loaded = loaded_path.as_deref() == Some(evidence.old_path.as_path())
-        && loaded_guid == Some(evidence.old_device_guid);
-    let new_topology_loaded = loaded_path.as_deref() == Some(evidence.new_path.as_path())
-        && loaded_guid == Some(evidence.new_device_guid);
-    if !old_topology_loaded && !new_topology_loaded {
-        return Err(StoreError::InvalidOptions {
-            reason: "device replacement evidence does not match the loaded topology",
-        });
-    }
+    let evidence = decode_device_replacement_evidence(&lifecycle.payload)?;
+    let loaded_guid = durable_device_guids.get(evidence.device_index).copied();
+    let new_topology_loaded = loaded_guid == Some(evidence.new_device_guid);
     if evidence.state == ReplacementRebuildStatusState::Completed
         && evidence.evidence_stable
         && new_topology_loaded
@@ -2258,6 +2233,40 @@ fn validate_read_only_lifecycle_state(
     })
 }
 
+fn restore_device_removal_evidence(pool: &mut Pool) -> Result<()> {
+    let Some(lifecycle) = pool.label_lifecycle.as_ref() else {
+        return Ok(());
+    };
+    if lifecycle.kind != pool_label::PoolLifecycleKindV1::DeviceRemoval {
+        return Ok(());
+    }
+    let mut marker = decode_device_removal_marker(&lifecycle.payload)?;
+    if marker.pool_guid != pool.pool_guid {
+        return Err(StoreError::InvalidOptions {
+            reason: "device removal label intent belongs to a different pool",
+        });
+    }
+    if pool.durable_device_guids.get(marker.target_index) != Some(&marker.target_guid)
+        || pool.device_guids.get(marker.target_index) != Some(&marker.target_guid)
+        || checked_successor_topology_generation(pool.placement_epoch)
+            != Some(marker.successor_topology_generation)
+    {
+        return Err(StoreError::InvalidOptions {
+            reason: "device removal label intent does not match the durable topology",
+        });
+    }
+    marker.target_path = pool
+        .devices
+        .get(marker.target_index)
+        .ok_or(StoreError::InvalidOptions {
+            reason: "device removal label intent target is missing",
+        })?
+        .root()
+        .to_path_buf();
+    pool.device_removal_marker = Some(marker);
+    Ok(())
+}
+
 /// Check for a pending device removal marker and finish only an already
 /// committed reduced topology.
 ///
@@ -2266,31 +2275,11 @@ fn validate_read_only_lifecycle_state(
 /// owner can durably advance receipt references embedded in content manifests
 /// before the target is detached.
 fn resume_device_removal_if_pending(pool: &mut Pool) -> Result<()> {
-    let marker_path = pool.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
-    if let Some(marker) = read_device_removal_marker_if_present(&marker_path)? {
+    if let Some(marker) = pool.device_removal_marker.clone() {
         if marker.pool_guid != pool.pool_guid {
-            // A marker copied from another pool cannot authorize automatic
-            // evacuation or detach in this pool, even if a device GUID
-            // happens to be reused.
-            return Ok(());
-        }
-        let marker_tmp_path = pool.config.root_path.join(DEVICE_REMOVAL_MARKER_TMP_FILE);
-        match fs::remove_file(&marker_tmp_path) {
-            Ok(()) => fs::File::open(&pool.config.root_path)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|source| StoreError::Io {
-                    operation: "clear_stale_device_removal_marker_temp",
-                    path: marker_tmp_path,
-                    source,
-                })?,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(StoreError::Io {
-                    operation: "clear_stale_device_removal_marker_temp",
-                    path: marker_tmp_path,
-                    source,
-                });
-            }
+            return Err(StoreError::InvalidOptions {
+                reason: "device removal label intent belongs to a different pool",
+            });
         }
         let mut unique_device_guids = BTreeSet::new();
         if pool.device_guids.len() != pool.devices.len()
@@ -2303,29 +2292,14 @@ fn resume_device_removal_if_pending(pool: &mut Pool) -> Result<()> {
             // Preserve the marker when topology identity cannot be trusted.
             return Ok(());
         }
-        let target_path = pool
-            .device_guids
-            .iter()
-            .position(|guid| *guid == marker.target_guid)
-            .and_then(|idx| pool.devices.get(idx))
-            .map(|device| device.root().to_path_buf());
-        if target_path.is_some() {
-            pool.allocation_fenced_device_guid = Some(marker.target_guid);
-        }
-        if target_path.is_none()
-            && !pool
-                .devices
-                .iter()
-                .any(|device| device.root() == marker.target_path)
+        if pool.device_guids.get(marker.target_index) != Some(&marker.target_guid)
+            || pool.devices.get(marker.target_index).is_none()
         {
-            // A complete higher-generation roster selected from the
-            // redundant labels is durable detach proof. Reverify and finish
-            // the marker/generation transition before admitting writes.
-            pool.set_receipt_generation_authority_state(
-                ReceiptGenerationAuthorityState::RemovalTopologyCommitRequired,
-            );
-            pool.publish_pending_removal_topology()?;
+            return Err(StoreError::InvalidOptions {
+                reason: "device removal label intent target is missing or mismatched",
+            });
         }
+        pool.allocation_fenced_device_guid = Some(marker.target_guid);
     }
     Ok(())
 }
@@ -2865,6 +2839,7 @@ struct PoolLabelCopy {
     bytes: Vec<u8>,
     label: PoolLabelV1,
     topology_roster: Option<Vec<[u8; 16]>>,
+    lifecycle: Option<PoolLifecycleLabelRecord>,
 }
 
 impl PoolLabelCopy {
@@ -2877,15 +2852,31 @@ impl PoolLabelCopy {
             && roster.iter().copied().collect::<BTreeSet<_>>().len() == roster.len()
     }
 
-    fn same_topology(&self, other: &Self) -> bool {
+    fn same_topology_authority(&self, other: &Self) -> bool {
         self.label.pool_guid == other.label.pool_guid
             && self.label.topology_generation == other.label.topology_generation
             && self.label.device_count == other.label.device_count
             && self.label.pool_name_len == other.label.pool_name_len
             && self.label.pool_name == other.label.pool_name
-            && self.label.pool_state == other.label.pool_state
             && self.label.redundancy_policy == other.label.redundancy_policy
             && self.topology_roster == other.topology_roster
+            && self.lifecycle == other.lifecycle
+    }
+
+    fn same_topology(&self, other: &Self) -> bool {
+        self.same_topology_authority(other) && self.label.pool_state == other.label.pool_state
+    }
+
+    fn lifecycle_sequence(&self) -> u64 {
+        self.lifecycle.as_ref().map_or(0, |record| record.sequence)
+    }
+}
+
+fn pool_state_transition_rank(state: PoolState) -> u8 {
+    match state {
+        PoolState::Destroyed => 2,
+        PoolState::Active => 1,
+        PoolState::Exported => 0,
     }
 }
 
@@ -2893,16 +2884,23 @@ fn decode_pool_label_copy(bytes: Vec<u8>) -> Option<PoolLabelCopy> {
     let label = pool_label::decode_label(&bytes).ok()?;
     let topology_roster = pool_label::decode_topology_roster_v1(&bytes)
         .ok()?
-        .map(|roster| {
+        .and_then(|roster| {
             (0..roster.len())
                 .map(|index| roster.member_guid(index))
                 .collect::<Option<Vec<_>>>()
-        })
-        .flatten();
+        });
+    let lifecycle = pool_label::decode_pool_lifecycle_v1(&bytes)
+        .ok()?
+        .map(|record| PoolLifecycleLabelRecord {
+            sequence: record.sequence(),
+            kind: record.kind(),
+            payload: record.payload().to_vec(),
+        });
     Some(PoolLabelCopy {
         bytes,
         label,
         topology_roster,
+        lifecycle,
     })
 }
 
@@ -2955,7 +2953,7 @@ fn read_pool_label_copies(config: &DeviceConfig) -> Result<Vec<PoolLabelCopy>> {
 
 fn select_highest_complete_pool_topology(
     config: &PoolConfig,
-) -> Result<Option<(Vec<DeviceConfig>, BTreeMap<PathBuf, Vec<u8>>)>> {
+) -> Result<Option<SelectedPoolTopology>> {
     let mut scanned = Vec::with_capacity(config.devices.len());
     for device_config in &config.devices {
         scanned.push((device_config, read_pool_label_copies(device_config)?));
@@ -3013,9 +3011,38 @@ fn select_highest_complete_pool_topology(
     else {
         return Ok(None);
     };
-    let mut highest = complete
+    let highest = complete
         .into_iter()
         .filter(|(candidate, _, _)| candidate.label.topology_generation == max_generation);
+    let highest_generation = highest
+        .clone()
+        .map(|(candidate, _, _)| candidate.lifecycle_sequence())
+        .max()
+        .unwrap_or(0);
+    let highest = highest
+        .filter(|(candidate, _, _)| candidate.lifecycle_sequence() == highest_generation)
+        .collect::<Vec<_>>();
+    let lifecycle_authority = &highest[0].0;
+    if highest
+        .iter()
+        .any(|(candidate, _, _)| !candidate.same_topology_authority(lifecycle_authority))
+    {
+        return Err(StoreError::InvalidOptions {
+            reason:
+                "conflicting complete pool topology or lifecycle authority at the same generation",
+        });
+    }
+    // ACTIVE is the completed successor of EXPORTED during import, while
+    // DESTROYED is terminal. A partial state transition has no complete
+    // successor family and therefore continues selecting its predecessor.
+    let state_rank = highest
+        .iter()
+        .map(|(candidate, _, _)| pool_state_transition_rank(candidate.label.pool_state))
+        .max()
+        .unwrap();
+    let mut highest = highest.into_iter().filter(|(candidate, _, _)| {
+        pool_state_transition_rank(candidate.label.pool_state) == state_rank
+    });
     let (authority, configs, selected) = highest.next().unwrap();
     if highest.any(|(candidate, _, _)| !candidate.same_topology(&authority)) {
         return Err(StoreError::InvalidOptions {
@@ -3174,11 +3201,13 @@ impl Pool {
             receipt_generation_authority_state: ReceiptGenerationAuthorityState::Converged,
             raw_store_mutation_allowed,
             pending_device_removal: None,
+            device_removal_marker: None,
             allocation_fenced_device_guid: None,
             spare_policy: SparePolicy::Manual,
             health_transitions: Vec::new(),
             replacement: None,
             replacement_evidence: None,
+            label_lifecycle: None,
             allocator: None,
             locked: false,
             pending_deletions: BTreeMap::new(),
@@ -3290,6 +3319,8 @@ impl Pool {
         let mut device_label_indices = Vec::with_capacity(config.devices.len());
         let mut durable_device_guids: Option<Vec<[u8; 16]>> = None;
         let mut topology_roster_label_count = 0usize;
+        let mut selected_lifecycle: Option<PoolLifecycleLabelRecord> = None;
+        let mut lifecycle_label_count = 0usize;
 
         // Attempt to read a label from each configured device path.
         for (configured_index, vc) in config.devices.iter().enumerate() {
@@ -3369,6 +3400,28 @@ impl Pool {
                         });
                     }
                     None => durable_device_guids = Some(roster_guids),
+                    Some(_) => {}
+                }
+            }
+            let decoded_lifecycle = pool_label::decode_pool_lifecycle_v1(&buf).map_err(|_| {
+                StoreError::InvalidOptions {
+                    reason: "pool label lifecycle record is corrupt or unreadable",
+                }
+            })?;
+            if let Some(record) = decoded_lifecycle {
+                lifecycle_label_count += 1;
+                let owned = PoolLifecycleLabelRecord {
+                    sequence: record.sequence(),
+                    kind: record.kind(),
+                    payload: record.payload().to_vec(),
+                };
+                match selected_lifecycle.as_ref() {
+                    Some(existing) if existing != &owned => {
+                        return Err(StoreError::InvalidOptions {
+                            reason: "pool lifecycle record mismatch across labels",
+                        });
+                    }
+                    None => selected_lifecycle = Some(owned),
                     Some(_) => {}
                 }
             }
@@ -3544,6 +3597,11 @@ impl Pool {
                 reason: "pool topology roster presence mismatch across labels",
             });
         }
+        if lifecycle_label_count != 0 && lifecycle_label_count != labeled_device_count {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool lifecycle record presence mismatch across labels",
+            });
+        }
 
         let expected_device_count = expected_device_count.unwrap_or(config.devices.len() as u32);
 
@@ -3637,12 +3695,18 @@ impl Pool {
         // Labels were found and validated — open the pool with the
         // recovered identity.
         let pg = pool_guid.unwrap();
+        let selected_topology_generation = topology_generation.unwrap_or(1).max(1);
+        validate_label_lifecycle_topology(
+            pg,
+            &durable_device_guids,
+            selected_topology_generation,
+            selected_lifecycle.as_ref(),
+        )?;
         if mode == PoolOpenMode::ReadOnlyExisting {
             validate_read_only_lifecycle_state(
-                &config,
-                pg,
-                &device_guids,
-                topology_generation.unwrap_or(1).max(1),
+                &durable_device_guids,
+                selected_topology_generation,
+                selected_lifecycle.as_ref(),
             )?;
         }
 
@@ -3804,18 +3868,20 @@ impl Pool {
             device_guids,
             expected_device_count,
             device_label_indices,
-            placement_epoch: topology_generation.unwrap_or(1).max(1),
-            persisted_label_epoch: Some(topology_generation.unwrap_or(1).max(1)),
+            placement_epoch: selected_topology_generation,
+            persisted_label_epoch: Some(selected_topology_generation),
             next_placement_receipt_generation,
             reserved_placement_receipt_generation_through,
             receipt_generation_authority_state: ReceiptGenerationAuthorityState::Converged,
             raw_store_mutation_allowed,
             pending_device_removal: None,
+            device_removal_marker: None,
             allocation_fenced_device_guid: None,
             spare_policy: SparePolicy::Manual,
             health_transitions: Vec::new(),
             replacement: None,
             replacement_evidence: None,
+            label_lifecycle: selected_lifecycle,
             allocator: None,
             locked,
             pending_deletions: BTreeMap::new(),
@@ -3846,6 +3912,7 @@ impl Pool {
             pool.reconcile_pending_deletions_on_open();
         }
         if mode == PoolOpenMode::Writable {
+            restore_device_removal_evidence(&mut pool)?;
             restore_device_replacement_evidence(&mut pool)?;
             // Resume interrupted device removal if a pending marker exists.
             resume_device_removal_if_pending(&mut pool)?;
@@ -3874,11 +3941,12 @@ impl Pool {
                     reason: "pool export missing device config",
                 })?;
             let label = self.build_label(i, device);
-            write_pool_label(
+            write_pool_label_with_lifecycle(
                 config,
                 label,
                 self.device_layouts.get(i),
                 &self.device_guids,
+                self.label_lifecycle.as_ref(),
                 "pool_export_write_label",
             )?;
         }
@@ -4059,13 +4127,177 @@ impl Pool {
         }
     }
 
+    fn next_lifecycle_record(
+        &self,
+        kind: pool_label::PoolLifecycleKindV1,
+        payload: Vec<u8>,
+    ) -> Result<PoolLifecycleLabelRecord> {
+        let sequence = next_pool_lifecycle_sequence(
+            self.label_lifecycle
+                .as_ref()
+                .map(|current| current.sequence),
+        )?;
+        pool_label::PoolLifecycleRecordV1::new(sequence, self.placement_epoch, kind, &payload)
+            .map_err(|_| StoreError::InvalidOptions {
+                reason: "Pool lifecycle label record is invalid",
+            })?;
+        Ok(PoolLifecycleLabelRecord {
+            sequence,
+            kind,
+            payload,
+        })
+    }
+
+    fn persist_lifecycle_record_on_current_topology(
+        &mut self,
+        kind: pool_label::PoolLifecycleKindV1,
+        payload: Vec<u8>,
+        operation: &'static str,
+    ) -> Result<()> {
+        let next = self.next_lifecycle_record(kind, payload)?;
+        for (device_index, device) in self.devices.iter().enumerate() {
+            let label = self.build_label_with_state(device_index, device, PoolState::Active);
+            write_pool_label_copies_with_lifecycle(
+                &self.config.devices[device_index],
+                label,
+                self.device_layouts.get(device_index),
+                &self.device_guids,
+                Some(&next),
+                PoolLabelCopyTarget::Backup,
+                operation,
+            )?;
+        }
+        self.verify_active_topology_label_copies(1, operation, Some(&next))?;
+        for (device_index, device) in self.devices.iter().enumerate() {
+            let label = self.build_label_with_state(device_index, device, PoolState::Active);
+            write_pool_label_copies_with_lifecycle(
+                &self.config.devices[device_index],
+                label,
+                self.device_layouts.get(device_index),
+                &self.device_guids,
+                Some(&next),
+                PoolLabelCopyTarget::Primary,
+                operation,
+            )?;
+        }
+        self.verify_active_topology_label_copies(2, operation, Some(&next))?;
+        self.label_lifecycle = Some(next);
+        Ok(())
+    }
+
+    fn persist_replacement_evidence_in_labels(
+        &mut self,
+        evidence: &DeviceReplacementEvidenceMarker,
+    ) -> Result<()> {
+        let payload = encode_device_replacement_evidence(evidence)?;
+        if self.devices.len() == self.expected_device_count as usize {
+            return self.persist_lifecycle_record_on_current_topology(
+                pool_label::PoolLifecycleKindV1::DeviceReplacement,
+                payload,
+                "replacement-lifecycle",
+            );
+        }
+
+        // During rebuild the candidate occupies the durable target index and
+        // the predecessor is retained as one extra runtime device. Update
+        // only the still-authoritative predecessor label topology; the
+        // candidate cannot become topology authority until higher roots are
+        // reconciled.
+        if self.devices.len() != self.expected_device_count as usize + 1
+            || self.expected_device_count != 2
+            || self.durable_device_guids.len() != self.expected_device_count as usize
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "replacement lifecycle label topology is not reconstructable",
+            });
+        }
+        let old_runtime_index = self
+            .device_guids
+            .iter()
+            .position(|guid| *guid == evidence.old_device_guid)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "replacement lifecycle labels lost the predecessor member",
+            })?;
+        let topology_generation = self
+            .persisted_label_epoch
+            .ok_or(StoreError::InvalidOptions {
+                reason: "replacement lifecycle labels lost predecessor topology generation",
+            })?;
+        let next = self
+            .next_lifecycle_record(pool_label::PoolLifecycleKindV1::DeviceReplacement, payload)?;
+
+        for target in [PoolLabelCopyTarget::Backup, PoolLabelCopyTarget::Primary] {
+            for durable_index in 0..self.expected_device_count as usize {
+                let runtime_index = if durable_index == evidence.device_index {
+                    old_runtime_index
+                } else {
+                    durable_index
+                };
+                let device = &self.devices[runtime_index];
+                let mut label =
+                    self.build_label_with_state(runtime_index, device, PoolState::Active);
+                label.device_guid = self.durable_device_guids[durable_index];
+                label.device_index = durable_index as u32;
+                label.device_count = self.expected_device_count;
+                label.topology_generation = topology_generation;
+                write_pool_label_copies_with_lifecycle(
+                    &self.config.devices[runtime_index],
+                    label,
+                    self.device_layouts.get(runtime_index),
+                    &self.durable_device_guids,
+                    Some(&next),
+                    target,
+                    "replacement-lifecycle",
+                )?;
+            }
+
+            let required_matches = if matches!(target, PoolLabelCopyTarget::Backup) {
+                1
+            } else {
+                2
+            };
+            for durable_index in 0..self.expected_device_count as usize {
+                let runtime_index = if durable_index == evidence.device_index {
+                    old_runtime_index
+                } else {
+                    durable_index
+                };
+                let config = &self.config.devices[runtime_index];
+                let matching = read_pool_label_copies(config)?
+                    .into_iter()
+                    .filter(|copy| {
+                        copy.label.pool_guid == self.pool_guid
+                            && copy.label.device_guid == self.durable_device_guids[durable_index]
+                            && copy.label.device_index == durable_index as u32
+                            && copy.label.device_count == self.expected_device_count
+                            && copy.label.topology_generation == topology_generation
+                            && copy.topology_roster.as_deref()
+                                == Some(self.durable_device_guids.as_slice())
+                            && copy.lifecycle.as_ref() == Some(&next)
+                    })
+                    .count();
+                let required_matches = if config.backing.uses_fixed_offset_pool_labels() {
+                    required_matches
+                } else {
+                    1
+                };
+                if matching < required_matches {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "replacement lifecycle label readback did not verify every required copy",
+                    });
+                }
+            }
+        }
+        self.label_lifecycle = Some(next);
+        Ok(())
+    }
+
     fn persist_active_labels_if_needed(&mut self) -> Result<()> {
         if self.persisted_label_epoch == Some(self.placement_epoch) {
             return Ok(());
         }
 
-        let removal_marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
-        if let Some(marker) = read_device_removal_marker_if_present(&removal_marker_path)? {
+        if let Some(marker) = self.device_removal_marker.as_ref() {
             if marker.pool_guid == self.pool_guid {
                 // The current device list and placement epoch are in-memory
                 // state until removal has one durable topology commit. Do not
@@ -4086,6 +4318,26 @@ impl Pool {
             return Ok(());
         }
 
+        let lifecycle = match self.label_lifecycle.as_ref() {
+            Some(record) if record.kind == pool_label::PoolLifecycleKindV1::DeviceReplacement => {
+                let evidence = decode_device_replacement_evidence(&record.payload)?;
+                if replacement_evidence_matches_topology(
+                    &evidence,
+                    &self.device_guids,
+                    self.placement_epoch,
+                ) {
+                    Some(record.clone())
+                } else {
+                    Some(self.next_lifecycle_record(
+                        pool_label::PoolLifecycleKindV1::Clear,
+                        Vec::new(),
+                    )?)
+                }
+            }
+            Some(record) => Some(record.clone()),
+            None => None,
+        };
+
         for (device_index, device) in self.devices.iter().enumerate() {
             let config =
                 self.config
@@ -4095,37 +4347,45 @@ impl Pool {
                         reason: "pool device label persistence missing device config",
                     })?;
             let label = self.build_label_with_state(device_index, device, PoolState::Active);
-            write_pool_label(
+            write_pool_label_with_lifecycle(
                 config,
                 label,
                 self.device_layouts.get(device_index),
                 &self.device_guids,
+                lifecycle.as_ref(),
                 "pool_active_write_label",
             )?;
         }
 
         self.persisted_label_epoch = Some(self.placement_epoch);
+        self.durable_device_guids.clone_from(&self.device_guids);
+        self.expected_device_count = self.device_guids.len() as u32;
+        self.device_label_indices = (0..self.expected_device_count).collect();
+        self.label_lifecycle = lifecycle;
         Ok(())
     }
 
     fn publish_pending_removal_topology(&mut self) -> Result<()> {
-        let removal_marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
-        let marker = read_device_removal_marker_if_present(&removal_marker_path)?.ok_or(
-            StoreError::InvalidOptions {
-                reason: "device removal marker is missing while topology commit is pending",
-            },
-        )?;
+        let marker =
+            self.device_removal_marker
+                .as_ref()
+                .cloned()
+                .ok_or(StoreError::InvalidOptions {
+                    reason:
+                        "device removal label intent is missing while topology commit is pending",
+                })?;
         if marker.pool_guid != self.pool_guid
-            || self
-                .devices
-                .iter()
-                .any(|device| device.root() == marker.target_path)
+            || self.durable_device_guids.get(marker.target_index) != Some(&marker.target_guid)
             || self.device_guids.contains(&marker.target_guid)
+            || marker.successor_topology_generation != self.placement_epoch
         {
             return Err(StoreError::InvalidOptions {
-                reason: "device removal marker does not authorize the reduced topology",
+                reason: "device removal label intent does not authorize the reduced topology",
             });
         }
+
+        let cleared =
+            self.next_lifecycle_record(pool_label::PoolLifecycleKindV1::Clear, Vec::new())?;
 
         for (device_index, device) in self.devices.iter().enumerate() {
             let config =
@@ -4136,45 +4396,39 @@ impl Pool {
                         reason: "removal topology commit missing survivor device config",
                     })?;
             let label = self.build_label_with_state(device_index, device, PoolState::Active);
-            write_pool_label_copies(
+            write_pool_label_copies_with_lifecycle(
                 config,
                 label,
                 self.device_layouts.get(device_index),
                 &self.device_guids,
+                Some(&cleared),
                 PoolLabelCopyTarget::Backup,
                 "pool_removal_stage_backup_label",
             )?;
         }
-        self.verify_active_topology_label_copies(1, "removal")?;
+        self.verify_active_topology_label_copies(1, "removal", Some(&cleared))?;
 
         for (device_index, device) in self.devices.iter().enumerate() {
             let config = &self.config.devices[device_index];
             let label = self.build_label_with_state(device_index, device, PoolState::Active);
-            write_pool_label_copies(
+            write_pool_label_copies_with_lifecycle(
                 config,
                 label,
                 self.device_layouts.get(device_index),
                 &self.device_guids,
+                Some(&cleared),
                 PoolLabelCopyTarget::Primary,
                 "pool_removal_promote_primary_label",
             )?;
         }
-        self.verify_active_topology_label_copies(2, "removal")?;
+        self.verify_active_topology_label_copies(2, "removal", Some(&cleared))?;
         self.persisted_label_epoch = Some(self.placement_epoch);
+        self.durable_device_guids.clone_from(&self.device_guids);
+        self.expected_device_count = self.device_guids.len() as u32;
+        self.device_label_indices = (0..self.expected_device_count).collect();
         self.converge_receipt_generation_authority()?;
-
-        fs::remove_file(&removal_marker_path).map_err(|source| StoreError::Io {
-            operation: "clear_committed_device_removal_marker",
-            path: removal_marker_path.clone(),
-            source,
-        })?;
-        fs::File::open(&self.config.root_path)
-            .and_then(|root| root.sync_all())
-            .map_err(|source| StoreError::Io {
-                operation: "sync_committed_device_removal_marker_clear",
-                path: self.config.root_path.clone(),
-                source,
-            })?;
+        self.label_lifecycle = Some(cleared);
+        self.device_removal_marker = None;
         self.allocation_fenced_device_guid = None;
         Ok(())
     }
@@ -4183,6 +4437,7 @@ impl Pool {
         &self,
         required_matches: usize,
         operation: &'static str,
+        expected_lifecycle: Option<&PoolLifecycleLabelRecord>,
     ) -> Result<()> {
         for (device_index, config) in self.config.devices.iter().enumerate() {
             let expected = self.build_label_with_state(
@@ -4203,6 +4458,7 @@ impl Pool {
                         && copy.label.topology_generation == expected.topology_generation
                         && copy.label.redundancy_policy == expected.redundancy_policy
                         && copy.topology_roster.as_deref() == Some(self.device_guids.as_slice())
+                        && copy.lifecycle.as_ref() == expected_lifecycle
                 })
                 .count();
             let required_matches = if config.backing.uses_fixed_offset_pool_labels() {
@@ -4213,7 +4469,7 @@ impl Pool {
             if matching < required_matches {
                 return Err(StoreError::InvalidOptions {
                     reason: match operation {
-                        "replacement" => {
+                        "replacement" | "replacement-lifecycle" => {
                             "replacement topology label readback did not verify every required copy"
                         }
                         _ => "removal topology label readback did not verify every required copy",
@@ -4580,20 +4836,21 @@ impl Pool {
 
     fn replacement_resume_evidence(&self) -> Option<&DeviceReplacementEvidenceMarker> {
         let evidence = self.replacement_evidence.as_ref()?;
-        let old_topology_loaded = self
-            .devices
-            .get(evidence.device_index)
-            .is_some_and(|device| device.root() == evidence.old_path)
-            && self.device_guids.get(evidence.device_index) == Some(&evidence.old_device_guid)
-            && evidence.topology_epoch == self.placement_epoch.saturating_add(1).max(1)
+        let old_topology_loaded = self.device_guids.get(evidence.device_index)
+            == Some(&evidence.old_device_guid)
+            && replacement_evidence_matches_topology(
+                evidence,
+                &self.device_guids,
+                self.placement_epoch,
+            )
             && self.allocation_fenced_device_guid == Some(evidence.old_device_guid);
-        let new_topology_loaded = self
-            .devices
-            .get(evidence.device_index)
-            .is_some_and(|device| device.root() == evidence.new_path)
-            && self.device_guids.get(evidence.device_index) == Some(&evidence.new_device_guid)
-            && !self.device_guids.contains(&evidence.old_device_guid)
-            && evidence.topology_epoch == self.placement_epoch
+        let new_topology_loaded = self.device_guids.get(evidence.device_index)
+            == Some(&evidence.new_device_guid)
+            && replacement_evidence_matches_topology(
+                evidence,
+                &self.device_guids,
+                self.placement_epoch,
+            )
             && self.allocation_fenced_device_guid.is_none();
 
         (!self.read_only
@@ -4612,12 +4869,12 @@ impl Pool {
 
     fn predecessor_replacement_resume_evidence(&self) -> Option<&DeviceReplacementEvidenceMarker> {
         let evidence = self.replacement_resume_evidence()?;
-        (self
-            .devices
-            .get(evidence.device_index)
-            .is_some_and(|device| device.root() == evidence.old_path)
-            && self.device_guids.get(evidence.device_index) == Some(&evidence.old_device_guid)
-            && evidence.topology_epoch == self.placement_epoch.saturating_add(1).max(1))
+        (self.device_guids.get(evidence.device_index) == Some(&evidence.old_device_guid)
+            && replacement_evidence_matches_topology(
+                evidence,
+                &self.device_guids,
+                self.placement_epoch,
+            ))
         .then_some(evidence)
     }
 
@@ -7008,6 +7265,14 @@ impl Pool {
             self.pool_guid,
             self.reserved_placement_receipt_generation_through,
         )?;
+        let added_log_device =
+            if config.class == DeviceClass::IntentLog && self.log_device.is_none() {
+                let mut prospective_configs = self.config.devices.clone();
+                prospective_configs.push(config_for_record.clone());
+                open_log_device_for_devices(&prospective_configs)?
+            } else {
+                None
+            };
         let capacity_bytes = device.store().capacity_bytes();
         let device_layout = self
             .properties
@@ -7039,6 +7304,9 @@ impl Pool {
         self.write_allocator = WriteAllocator::new(self.media_classes.clone(), total_bytes);
         self.health = compute_health(&self.devices);
         self.config.devices.push(config_for_record);
+        if added_log_device.is_some() {
+            self.log_device = added_log_device;
+        }
         self.bump_placement_epoch();
         self.persist_active_labels_if_needed()?;
         self.converge_receipt_generation_authority()?;
@@ -7300,15 +7568,18 @@ impl Pool {
             return Ok(None);
         }
 
-        let marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
-        let marker = read_device_removal_marker_if_present(&marker_path)?.ok_or(
-            StoreError::InvalidOptions {
-                reason: "device removal marker is missing while topology commit is pending",
-            },
-        )?;
+        let marker = self
+            .device_removal_marker
+            .as_ref()
+            .ok_or(StoreError::InvalidOptions {
+                reason: "device removal label intent is missing while topology commit is pending",
+            })?;
         if marker.pool_guid != self.pool_guid
             || marker.target_guid != *pending_guid
             || marker.target_path != *pending_path
+            || self.device_guids.get(marker.target_index) != Some(pending_guid)
+            || checked_successor_topology_generation(self.placement_epoch)
+                != Some(marker.successor_topology_generation)
         {
             return Err(StoreError::InvalidOptions {
                 reason: "device removal marker does not match pending in-memory detach",
@@ -7323,7 +7594,9 @@ impl Pool {
                 reason: "pending device removal target is no longer attached",
             });
         };
-        if self.device_guids.get(target_idx) != Some(pending_guid) {
+        if target_idx != marker.target_index
+            || self.device_guids.get(target_idx) != Some(pending_guid)
+        {
             return Err(StoreError::InvalidOptions {
                 reason: "pending device removal target identity changed",
             });
@@ -7337,8 +7610,7 @@ impl Pool {
     /// The GUID, rather than the recorded path alone, selects the current
     /// member so a path rebound cannot redirect mounted resume.
     pub fn pending_device_removal_path(&self) -> Result<Option<PathBuf>> {
-        let marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
-        let Some(marker) = read_device_removal_marker_if_present(&marker_path)? else {
+        let Some(marker) = self.device_removal_marker.as_ref() else {
             return Ok(None);
         };
         if marker.pool_guid != self.pool_guid {
@@ -7346,22 +7618,18 @@ impl Pool {
                 reason: "device removal marker belongs to a different pool",
             });
         }
-        let mut matching = self
-            .device_guids
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, guid)| (*guid == marker.target_guid).then_some(idx));
-        let Some(target_idx) = matching.next() else {
-            return Ok(None);
-        };
-        if matching.next().is_some() {
+        if self.durable_device_guids.get(marker.target_index) != Some(&marker.target_guid)
+            || self.device_guids.get(marker.target_index) != Some(&marker.target_guid)
+            || checked_successor_topology_generation(self.placement_epoch)
+                != Some(marker.successor_topology_generation)
+        {
             return Err(StoreError::InvalidOptions {
-                reason: "device removal marker target GUID is ambiguous",
+                reason: "device removal label intent does not match the current topology",
             });
         }
         Ok(self
             .devices
-            .get(target_idx)
+            .get(marker.target_index)
             .map(|device| device.root().to_path_buf()))
     }
 
@@ -7475,8 +7743,7 @@ impl Pool {
         // Write a removal-pending marker so a crash can be resumed on
         // next pool open. Device identity is GUID-bound so path rebinding
         // cannot make an attached target look already removed.
-        let marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
-        if let Some(pending_marker) = read_device_removal_marker_if_present(&marker_path)? {
+        if let Some(pending_marker) = self.device_removal_marker.as_ref() {
             if pending_marker.pool_guid != self.pool_guid {
                 return Err(StoreError::InvalidOptions {
                     reason: "device removal marker belongs to a different pool",
@@ -7488,10 +7755,35 @@ impl Pool {
                 });
             }
         }
-        // Publish the marker atomically and sync both the file and pool root
-        // before evacuation starts. A crash during a retry therefore leaves
-        // either the previous complete marker or the new complete marker.
-        persist_device_removal_marker(&self.config.root_path, self.pool_guid, path, target_guid)?;
+        // Publish the intent to both redundant label families before
+        // evacuation starts. A crash during staging selects either the
+        // previous complete label family or the higher lifecycle sequence.
+        let successor_topology_generation = checked_successor_topology_generation(
+            self.placement_epoch,
+        )
+        .ok_or(StoreError::InvalidOptions {
+            reason: "device removal topology generation exhausted",
+        })?;
+        let marker = DeviceRemovalMarker {
+            pool_guid: self.pool_guid,
+            target_index: target_idx,
+            target_path: path.to_path_buf(),
+            target_guid,
+            successor_topology_generation,
+        };
+        let payload = encode_device_removal_marker(
+            marker.pool_guid,
+            marker.target_index,
+            &marker.target_path,
+            marker.target_guid,
+            marker.successor_topology_generation,
+        )?;
+        self.persist_lifecycle_record_on_current_topology(
+            pool_label::PoolLifecycleKindV1::DeviceRemoval,
+            payload,
+            "removal-lifecycle",
+        )?;
+        self.device_removal_marker = Some(marker);
         self.allocation_fenced_device_guid = Some(target_guid);
 
         // This removal path rewrites every receipt-backed object through the
@@ -7998,7 +8290,7 @@ impl Pool {
             && subjects_completed == evidence.total_subjects
             && verified_receipt_count >= evidence.total_subjects;
         evidence.state = ReplacementRebuildStatusState::Pending;
-        persist_device_replacement_evidence(&self.config.root_path, &evidence)?;
+        self.persist_replacement_evidence_in_labels(&evidence)?;
         self.replacement_evidence = Some(evidence.clone());
         if let Some(replacement) = self.replacement.as_mut() {
             replacement.state = if evidence.evidence_stable {
@@ -8045,16 +8337,24 @@ impl Pool {
 
         if let Some(evidence) = self.replacement_evidence.as_ref().filter(|evidence| {
             evidence.state == ReplacementRebuildStatusState::Completed
-                && evidence.old_path == old_path
-                && evidence.new_path == new_config.path
+                && evidence.evidence_stable
+                && !self.devices.iter().any(|device| device.root() == old_path)
+                && self
+                    .devices
+                    .get(evidence.device_index)
+                    .is_some_and(|device| device.root() == new_config.path)
         }) {
-            let new_topology_loaded = self
-                .devices
-                .get(evidence.device_index)
-                .is_some_and(|device| device.root() == evidence.new_path)
-                && self.device_guids.get(evidence.device_index) == Some(&evidence.new_device_guid)
-                && self.placement_epoch == evidence.topology_epoch;
-            if new_topology_loaded && evidence.evidence_stable {
+            let new_topology_loaded = self.device_guids.get(evidence.device_index)
+                == Some(&evidence.new_device_guid)
+                && replacement_evidence_matches_topology(
+                    evidence,
+                    &self.device_guids,
+                    self.placement_epoch,
+                );
+            if new_topology_loaded {
+                let mut evidence = evidence.clone();
+                evidence.old_path = old_path.to_path_buf();
+                evidence.new_path = new_config.path.clone();
                 return Ok(evidence.result(true));
             }
         }
@@ -8069,15 +8369,15 @@ impl Pool {
                     reason: "a different device replacement is already in progress",
                 });
             }
-            let evidence = self
+            let mut evidence = self
                 .replacement_evidence
                 .as_ref()
                 .filter(|evidence| {
                     evidence.state.is_active()
-                        && evidence.old_path == old_path
-                        && evidence.new_path == new_config.path
                         && evidence.old_device_guid == replacement.old_device_guid
                         && evidence.device_index == replacement.device_index
+                        && self.device_guids.get(evidence.device_index)
+                            == Some(&evidence.new_device_guid)
                 })
                 .cloned()
                 .ok_or(StoreError::InvalidOptions {
@@ -8090,6 +8390,19 @@ impl Pool {
                 .ok_or(StoreError::InvalidOptions {
                     reason: "active device replacement lost its predecessor member",
                 })?;
+            if self.devices[old_runtime_idx].root() != old_path
+                || self
+                    .devices
+                    .get(evidence.device_index)
+                    .is_none_or(|device| device.root() != new_config.path)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason:
+                        "active device replacement paths do not resolve to its durable identities",
+                });
+            }
+            evidence.old_path = old_path.to_path_buf();
+            evidence.new_path = new_config.path.clone();
             return self.rebuild_replacement_receipts(evidence, old_runtime_idx);
         }
 
@@ -8104,19 +8417,17 @@ impl Pool {
         ) =
             replayed_evidence
         {
-            if old_path != evidence.old_path || new_config.path != evidence.new_path {
-                return Err(StoreError::InvalidOptions {
-                    reason: "device replacement resume does not match durable evidence",
-                });
-            }
             let new_topology_loaded = self.devices.len() == self.expected_device_count as usize
                 && self
                     .devices
                     .get(evidence.device_index)
-                    .is_some_and(|device| device.root() == evidence.new_path)
+                    .is_some_and(|device| device.root() == new_config.path)
                 && self.device_guids.get(evidence.device_index) == Some(&evidence.new_device_guid)
-                && !self.device_guids.contains(&evidence.old_device_guid)
-                && evidence.topology_epoch == self.placement_epoch;
+                && replacement_evidence_matches_topology(
+                    &evidence,
+                    &self.device_guids,
+                    self.placement_epoch,
+                );
             if new_topology_loaded {
                 if !evidence.evidence_stable {
                     return Err(StoreError::InvalidOptions {
@@ -8127,6 +8438,8 @@ impl Pool {
                     ReceiptGenerationAuthorityState::RecoveryRequired,
                 );
                 self.converge_receipt_generation_authority()?;
+                evidence.old_path = old_path.to_path_buf();
+                evidence.new_path = new_config.path.clone();
                 evidence.state = ReplacementRebuildStatusState::Pending;
                 self.replacement_evidence = Some(evidence.clone());
                 return Ok(evidence.result(false));
@@ -8136,7 +8449,11 @@ impl Pool {
                 .get(evidence.device_index)
                 .is_none_or(|device| device.root() != old_path)
                 || self.device_guids.get(evidence.device_index) != Some(&evidence.old_device_guid)
-                || evidence.topology_epoch != self.placement_epoch.saturating_add(1).max(1)
+                || !replacement_evidence_matches_topology(
+                    &evidence,
+                    &self.device_guids,
+                    self.placement_epoch,
+                )
             {
                 return Err(StoreError::InvalidOptions {
                     reason: "device replacement resume does not match durable evidence",
@@ -8152,6 +8469,8 @@ impl Pool {
                 })?;
             evidence.state = ReplacementRebuildStatusState::Pending;
             evidence.subjects_failed = 0;
+            evidence.old_path = old_path.to_path_buf();
+            evidence.new_path = new_config.path.clone();
             (
                 evidence.device_index,
                 old_config,
@@ -8210,11 +8529,17 @@ impl Pool {
             }
             let old_device_guid = self.device_guid_for_index(idx);
             let total_subjects = discover_replacement_rebuild_subject_count(self, old_device_guid)?;
+            let successor_topology_generation = checked_successor_topology_generation(
+                self.placement_epoch,
+            )
+            .ok_or(StoreError::InvalidOptions {
+                reason: "device replacement topology generation exhausted",
+            })?;
             let evidence = DeviceReplacementEvidenceMarker {
                 pool_guid: self.pool_guid,
                 old_device_guid,
                 new_device_guid: rand::random(),
-                topology_epoch: self.placement_epoch.saturating_add(1).max(1),
+                topology_epoch: successor_topology_generation,
                 device_index: idx,
                 old_path: old_path.to_path_buf(),
                 new_path: new_config.path.clone(),
@@ -8256,7 +8581,7 @@ impl Pool {
         };
         let evidence_persisted_before_candidate = preflighted_candidate.is_some();
         if evidence_persisted_before_candidate {
-            persist_device_replacement_evidence(&self.config.root_path, &replacement_evidence)?;
+            self.persist_replacement_evidence_in_labels(&replacement_evidence)?;
             self.replacement_evidence = Some(replacement_evidence.clone());
             self.set_receipt_generation_authority_state(
                 ReceiptGenerationAuthorityState::ReplacementResumeRequired,
@@ -8327,9 +8652,7 @@ impl Pool {
         // device plus the same evidence; it never relies on the in-memory
         // swap as proof of replacement completion.
         if !resuming && !evidence_persisted_before_candidate {
-            if let Err(error) =
-                persist_device_replacement_evidence(&self.config.root_path, &replacement_evidence)
-            {
+            if let Err(error) = self.persist_replacement_evidence_in_labels(&replacement_evidence) {
                 self.receipt_generation_authority_state =
                     ReceiptGenerationAuthorityState::Converged;
                 self.refresh_raw_store_mutation_gate();
@@ -8469,36 +8792,21 @@ impl Pool {
                 ReceiptGenerationAuthorityState::RecoveryRequired,
             );
 
-            for (device_index, device) in self.devices.iter().enumerate() {
-                let config = &self.config.devices[device_index];
-                let label = self.build_label_with_state(device_index, device, PoolState::Active);
-                write_pool_label_copies(
-                    config,
-                    label,
-                    self.device_layouts.get(device_index),
-                    &self.device_guids,
-                    PoolLabelCopyTarget::Backup,
-                    "pool_replacement_stage_backup_label",
-                )?;
-            }
-            self.verify_active_topology_label_copies(1, "replacement")?;
-            for (device_index, device) in self.devices.iter().enumerate() {
-                let config = &self.config.devices[device_index];
-                let label = self.build_label_with_state(device_index, device, PoolState::Active);
-                write_pool_label_copies(
-                    config,
-                    label,
-                    self.device_layouts.get(device_index),
-                    &self.device_guids,
-                    PoolLabelCopyTarget::Primary,
-                    "pool_replacement_promote_primary_label",
-                )?;
-            }
-            self.verify_active_topology_label_copies(2, "replacement")?;
+            // Carry the stable active replacement record onto the successor
+            // topology. The higher topology is selectable only after one
+            // complete redundant family has been written and reread.
+            self.persist_replacement_evidence_in_labels(&evidence)?;
             self.persisted_label_epoch = Some(self.placement_epoch);
+            self.durable_device_guids.clone_from(&self.device_guids);
+            self.expected_device_count = self.device_guids.len() as u32;
+            self.device_label_indices = (0..self.expected_device_count).collect();
             self.converge_receipt_generation_authority()?;
         } else {
-            self.verify_active_topology_label_copies(2, "replacement")?;
+            self.verify_active_topology_label_copies(
+                2,
+                "replacement",
+                self.label_lifecycle.as_ref(),
+            )?;
             self.set_receipt_generation_authority_state(
                 ReceiptGenerationAuthorityState::RecoveryRequired,
             );
@@ -8506,7 +8814,7 @@ impl Pool {
         }
 
         evidence.state = ReplacementRebuildStatusState::Completed;
-        persist_device_replacement_evidence(&self.config.root_path, &evidence)?;
+        self.persist_replacement_evidence_in_labels(&evidence)?;
         self.replacement_evidence = Some(evidence.clone());
         if let Some(replacement) = self.replacement.as_mut() {
             replacement.state = ReplacementState::CopyComplete;
@@ -10150,6 +10458,7 @@ fn device_config_has_label_authority(config: &DeviceConfig) -> bool {
     label_file_path(&device_root).exists()
 }
 
+#[cfg(test)]
 fn write_pool_label(
     device_config: &DeviceConfig,
     label: PoolLabelV1,
@@ -10157,11 +10466,30 @@ fn write_pool_label(
     topology_roster: &[[u8; 16]],
     operation: &'static str,
 ) -> Result<()> {
-    write_pool_label_copies(
+    write_pool_label_with_lifecycle(
         device_config,
         label,
         device_layout,
         topology_roster,
+        None,
+        operation,
+    )
+}
+
+fn write_pool_label_with_lifecycle(
+    device_config: &DeviceConfig,
+    label: PoolLabelV1,
+    device_layout: Option<&DeviceLayoutV1>,
+    topology_roster: &[[u8; 16]],
+    lifecycle: Option<&PoolLifecycleLabelRecord>,
+    operation: &'static str,
+) -> Result<()> {
+    write_pool_label_copies_with_lifecycle(
+        device_config,
+        label,
+        device_layout,
+        topology_roster,
+        lifecycle,
         PoolLabelCopyTarget::Both,
         operation,
     )
@@ -10174,11 +10502,12 @@ enum PoolLabelCopyTarget {
     Both,
 }
 
-fn write_pool_label_copies(
+fn write_pool_label_copies_with_lifecycle(
     device_config: &DeviceConfig,
     label: PoolLabelV1,
     device_layout: Option<&DeviceLayoutV1>,
     topology_roster: &[[u8; 16]],
+    lifecycle: Option<&PoolLifecycleLabelRecord>,
     target: PoolLabelCopyTarget,
     operation: &'static str,
 ) -> Result<()> {
@@ -10187,11 +10516,28 @@ fn write_pool_label_copies(
         encode_device_layout_v1(layout, &mut bytes);
         bytes
     });
-    let sealed =
-        pool_label::seal_label_with_extensions(label, layout_bytes.as_ref(), Some(topology_roster))
-            .map_err(|_| StoreError::InvalidOptions {
-                reason: "label seal failed",
-            })?;
+    let lifecycle_record = lifecycle
+        .map(|record| {
+            pool_label::PoolLifecycleRecordV1::new(
+                record.sequence,
+                label.topology_generation,
+                record.kind,
+                &record.payload,
+            )
+        })
+        .transpose()
+        .map_err(|_| StoreError::InvalidOptions {
+            reason: "Pool lifecycle label record is invalid",
+        })?;
+    let sealed = pool_label::seal_label_with_all_extensions(
+        label,
+        layout_bytes.as_ref(),
+        Some(topology_roster),
+        lifecycle_record,
+    )
+    .map_err(|_| StoreError::InvalidOptions {
+        reason: "label seal failed",
+    })?;
 
     let roster_bytes = topology_roster
         .len()
@@ -10201,17 +10547,32 @@ fn write_pool_label_copies(
         .ok_or(StoreError::InvalidOptions {
             reason: "pool topology roster is too large",
         })?;
-    let encoded_size = pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+    let mut encoded_size = pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
         .checked_add(roster_bytes)
         .filter(|size| *size <= pool_label::POOL_LABEL_SIZE)
         .ok_or(StoreError::InvalidOptions {
             reason: "pool topology roster does not fit the label envelope",
         })?;
+    if let Some(record) = lifecycle_record {
+        encoded_size = encoded_size
+            .checked_add(
+                pool_label::pool_lifecycle_v1_wire_size(record).map_err(|_| {
+                    StoreError::InvalidOptions {
+                        reason: "Pool lifecycle record does not fit the label envelope",
+                    }
+                })?,
+            )
+            .filter(|size| *size <= pool_label::POOL_LABEL_SIZE)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "Pool lifecycle record does not fit the label envelope",
+            })?;
+    }
     let mut buf = vec![0u8; encoded_size];
-    pool_label::encode_label_with_extensions(
+    pool_label::encode_label_with_all_extensions(
         &sealed,
         layout_bytes.as_ref(),
         Some(topology_roster),
+        lifecycle_record,
         &mut buf,
     )
     .map_err(|_| StoreError::InvalidOptions {
@@ -10410,7 +10771,6 @@ mod tests {
     use super::*;
     use crate::device::DeviceClass;
     use crate::ObjectKey;
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -10956,6 +11316,49 @@ mod tests {
         assert_eq!(result.objects_failed, 0, "{result:?}");
     }
 
+    fn assert_legacy_device_lifecycle_files_absent(root: &Path) {
+        for name in [
+            ".tidefs_device_removal_pending",
+            ".tidefs_device_removal_pending.tmp",
+            ".tidefs_device_replacement_evidence",
+            ".tidefs_device_replacement_evidence.tmp",
+        ] {
+            assert!(
+                !root.join(name).exists(),
+                "obsolete lifecycle side file {name}"
+            );
+        }
+    }
+
+    fn assert_pool_label_lifecycle(pool: &Pool, kind: pool_label::PoolLifecycleKindV1) {
+        let expected = pool
+            .label_lifecycle
+            .as_ref()
+            .expect("Pool has selected lifecycle authority");
+        assert_eq!(expected.kind, kind);
+        for config in &pool.config.devices {
+            let copies = read_pool_label_copies(config).expect("read lifecycle label copies");
+            assert!(!copies.is_empty());
+            assert!(copies
+                .iter()
+                .all(|copy| copy.lifecycle.as_ref() == Some(expected)));
+        }
+    }
+
+    #[test]
+    fn lifecycle_counter_exhaustion_fails_closed() {
+        assert_eq!(next_pool_lifecycle_sequence(None).unwrap(), 1);
+        assert_eq!(next_pool_lifecycle_sequence(Some(41)).unwrap(), 42);
+        assert!(matches!(
+            next_pool_lifecycle_sequence(Some(u64::MAX)),
+            Err(StoreError::InvalidOptions {
+                reason: "Pool lifecycle label sequence exhausted"
+            })
+        ));
+        assert_eq!(checked_successor_topology_generation(41), Some(42));
+        assert_eq!(checked_successor_topology_generation(u64::MAX), None);
+    }
+
     fn deterministic_device_guid(idx: usize) -> [u8; 16] {
         let mut guid = [0x42; 16];
         guid[..8].copy_from_slice(&(0xA11C_E000_0000_0000u64 + idx as u64).to_le_bytes());
@@ -11092,20 +11495,6 @@ mod tests {
         ));
         drop(read_only);
 
-        persist_device_removal_marker(
-            &metadata_root,
-            pool_guid,
-            &config.devices[1].path,
-            removal_target_guid,
-        )
-        .expect("persist pending-removal fixture");
-        assert_invalid_options_reason_contains(
-            Pool::open_read_only_existing(config.clone(), properties.clone(), &options),
-            "pending device removal",
-        );
-        std::fs::remove_file(metadata_root.join(DEVICE_REMOVAL_MARKER_FILE))
-            .expect("remove pending-removal fixture");
-
         let mut incomplete = config.clone();
         incomplete.devices.remove(0);
         assert_invalid_options_reason_contains(
@@ -11192,6 +11581,61 @@ mod tests {
         metadata_entries_after.sort();
         assert_eq!(metadata_entries_after, metadata_entries_before);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_open_selects_completed_active_state_over_exported_predecessor() {
+        let root = temp_dir("active-lifecycle-state-selection");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = PoolConfig {
+            name: "active-lifecycle-state-selection".into(),
+            root_path: root.join("metadata"),
+            devices: vec![
+                regular_file_device_config(root.join("device-0.img")),
+                regular_file_device_config(root.join("device-1.img")),
+            ],
+        };
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options())
+            .expect("create state-selection Pool");
+        pool.persist_lifecycle_record_on_current_topology(
+            pool_label::PoolLifecycleKindV1::Clear,
+            Vec::new(),
+            "test-state-selection-lifecycle",
+        )
+        .expect("publish lifecycle tombstone");
+        let lifecycle = pool.label_lifecycle.clone().unwrap();
+
+        // Model the completed import transition: the primary family is
+        // ACTIVE while the redundant predecessor family remains EXPORTED at
+        // the exact same topology and lifecycle sequence.
+        for device_index in 0..pool.devices.len() {
+            let label = pool.build_label_with_state(
+                device_index,
+                &pool.devices[device_index],
+                PoolState::Exported,
+            );
+            write_pool_label_copies_with_lifecycle(
+                &pool.config.devices[device_index],
+                label,
+                pool.device_layouts.get(device_index),
+                &pool.device_guids,
+                Some(&lifecycle),
+                PoolLabelCopyTarget::Backup,
+                "test-exported-predecessor-label",
+            )
+            .expect("write exported predecessor copy");
+        }
+        drop(pool);
+
+        let reopened = Pool::open(config, properties, &test_options())
+            .expect("select completed ACTIVE lifecycle family");
+        assert_eq!(reopened.label_lifecycle, Some(lifecycle));
+        assert_eq!(reopened.stats().device_count, 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -15858,7 +16302,8 @@ mod tests {
             })
         ));
         assert_eq!(pool.stats().device_count, 4);
-        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_pool_label_lifecycle(&pool, pool_label::PoolLifecycleKindV1::DeviceRemoval);
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -15912,7 +16357,8 @@ mod tests {
             })
         ));
         assert_eq!(pool.stats().device_count, 3);
-        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_pool_label_lifecycle(&pool, pool_label::PoolLifecycleKindV1::DeviceRemoval);
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -15952,7 +16398,8 @@ mod tests {
         assert_eq!(result.objects_failed, 1);
         assert_eq!(result.failed_keys, vec![shard_key]);
         assert_eq!(pool.stats().device_count, 4);
-        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_pool_label_lifecycle(&pool, pool_label::PoolLifecycleKindV1::DeviceRemoval);
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16213,7 +16660,7 @@ mod tests {
             );
         }
 
-        assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_legacy_device_lifecycle_files_absent(&root);
         assert!(matches!(
             pool.safe_remove_device(&victim_path),
             Err(StoreError::InvalidOptions {
@@ -16343,7 +16790,8 @@ mod tests {
             pool.devices[victim_idx].get(key).unwrap(),
             Some(payload.to_vec())
         );
-        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_pool_label_lifecycle(&pool, pool_label::PoolLifecycleKindV1::DeviceRemoval);
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16444,7 +16892,8 @@ mod tests {
         assert_eq!(result.objects_failed, 1);
         assert_eq!(result.failed_keys, vec![key]);
         assert_eq!(pool.stats().device_count, 3);
-        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_pool_label_lifecycle(&pool, pool_label::PoolLifecycleKindV1::DeviceRemoval);
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16567,7 +17016,8 @@ mod tests {
             pool.get(IoClass::Data, key).unwrap(),
             Some(payload.to_vec())
         );
-        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_pool_label_lifecycle(&pool, pool_label::PoolLifecycleKindV1::DeviceRemoval);
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16616,7 +17066,7 @@ mod tests {
             })
         ));
         assert_eq!(pool.stats().device_count, 2);
-        assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16651,7 +17101,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             device_roots_before
         );
-        assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16674,7 +17124,7 @@ mod tests {
             })
         ));
         assert_eq!(pool.stats().device_count, 3);
-        assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16699,7 +17149,7 @@ mod tests {
             })
         ));
         assert_eq!(pool.stats().device_count, 3);
-        assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16725,7 +17175,8 @@ mod tests {
             })
         ));
         assert_eq!(pool.stats().device_count, 2);
-        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_pool_label_lifecycle(&pool, pool_label::PoolLifecycleKindV1::DeviceRemoval);
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16779,7 +17230,8 @@ mod tests {
             pool.get(IoClass::Data, key).unwrap(),
             Some(payload.to_vec())
         );
-        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_pool_label_lifecycle(&pool, pool_label::PoolLifecycleKindV1::DeviceRemoval);
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16810,9 +17262,18 @@ mod tests {
             })
         ));
         assert_eq!(pool.stats().device_count, 3);
-        let marker = read_device_removal_marker(&root.join(DEVICE_REMOVAL_MARKER_FILE)).unwrap();
+        let marker = pool
+            .device_removal_marker
+            .as_ref()
+            .expect("first removal label intent remains selected");
         assert_eq!(marker.target_path, first_target);
         assert_eq!(marker.target_guid, first_target_guid);
+        assert_eq!(marker.target_index, 0);
+        assert_eq!(
+            marker.successor_topology_generation,
+            checked_successor_topology_generation(pool.placement_epoch()).unwrap()
+        );
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16832,13 +17293,12 @@ mod tests {
         assert_eq!(pool.stats().device_count, 2);
         assert!(!pool.device_guids.contains(&first_target_guid));
 
-        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        assert!(!marker_path.exists());
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let second_result = pool.safe_remove_device(&second_target).unwrap();
         assert_topology_committed(&second_result);
         assert_eq!(pool.stats().device_count, 1);
-        assert!(!marker_path.exists());
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -16943,7 +17403,8 @@ mod tests {
     fn safe_remove_device_resume_after_interrupt() {
         // Simulate a crash during device removal.
         // 1. Create a 2-device pool with objects.
-        // 2. Manually write the removal-pending marker (as if crash in safe_remove_device).
+        // 2. Publish and use device-authoritative lifecycle intent, then drop
+        //    the runtime metadata owner.
         // 3. Re-open the pool, then let the raw owner explicitly resume and
         //    remove the device.
 
@@ -16996,12 +17457,11 @@ mod tests {
         assert!(pool.get(IoClass::Data, key2).unwrap().is_some());
         assert!(pool.get(IoClass::Data, key3).unwrap().is_some());
 
-        // Simulate crash: publish the marker file manually.
-        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        let pool_guid = pool.pool_guid;
-        let target_guid = pool.device_guid_for_index(0);
-        persist_device_removal_marker(&root, pool_guid, &d1, target_guid).unwrap();
-        assert!(marker_path.exists());
+        let prepared = pool.prepare_safe_remove_device(&d1).unwrap();
+        assert!(!prepared.complete);
+        assert!(prepared.topology_commit_pending);
+        assert_pool_label_lifecycle(&pool, pool_label::PoolLifecycleKindV1::DeviceRemoval);
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         // Drop the pool (simulating crash / process exit).
         drop(pool);
@@ -17013,11 +17473,13 @@ mod tests {
         // exist.
         let mut pool2 =
             Pool::open(config.clone(), PoolProperties::default(), &test_options()).unwrap();
-        assert!(marker_path.exists());
+        assert_pool_label_lifecycle(&pool2, pool_label::PoolLifecycleKindV1::DeviceRemoval);
+        assert_legacy_device_lifecycle_files_absent(&root);
         assert_eq!(pool2.stats().device_count, 2);
         let resumed = pool2.safe_remove_device(&d1).unwrap();
         assert_topology_committed(&resumed);
-        assert!(!marker_path.exists());
+        assert_pool_label_lifecycle(&pool2, pool_label::PoolLifecycleKindV1::Clear);
+        assert_legacy_device_lifecycle_files_absent(&root);
         assert_eq!(pool2.stats().device_count, 1);
 
         // All objects must still be readable.
@@ -17056,7 +17518,8 @@ mod tests {
         // A caller may still supply the pre-removal device list. Complete
         // higher-generation label authority filters out the stale target.
         let pool3 = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
-        assert!(!marker_path.exists());
+        assert_pool_label_lifecycle(&pool3, pool_label::PoolLifecycleKindV1::Clear);
+        assert_legacy_device_lifecycle_files_absent(&root);
         assert_eq!(pool3.stats().device_count, 1);
         assert_eq!(pool3.get(IoClass::Data, key1).unwrap(), Some(data1));
         assert_eq!(pool3.get(IoClass::Data, key2).unwrap(), Some(data2));
@@ -17069,7 +17532,7 @@ mod tests {
     fn safe_remove_device_resume_resolves_target_by_guid() {
         let root = temp_dir("safe-remove-resume-guid");
         let _ = std::fs::remove_dir_all(&root);
-        let config = multi_data_device_config(&root, 2);
+        let mut config = multi_data_device_config(&root, 2);
         let mut pool =
             Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
         let key = ObjectKey::from_name(b"resume-guid-object");
@@ -17077,25 +17540,29 @@ mod tests {
         pool.put(IoClass::Data, key, payload).unwrap();
         pool.sync_all().unwrap();
 
-        let target_guid = pool.device_guid_for_index(0);
-        let stale_target_path = root.join("previous-device-path");
-        persist_device_removal_marker(&root, pool.pool_guid, &stale_target_path, target_guid)
-            .unwrap();
-        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-
+        let old_target_path = config.devices[0].path.clone();
+        let prepared = pool.prepare_safe_remove_device(&old_target_path).unwrap();
+        assert_eq!(prepared.objects_failed, 0);
+        assert_pool_label_lifecycle(&pool, pool_label::PoolLifecycleKindV1::DeviceRemoval);
         drop(pool);
 
+        let renamed_target_path = root.join("renamed-device-0");
+        std::fs::rename(&old_target_path, &renamed_target_path).unwrap();
+        config.devices[0].path = renamed_target_path.clone();
+        config.devices[0].kind = DeviceKind::Single {
+            path: renamed_target_path.clone(),
+        };
         let mut reopened =
             Pool::open(config.clone(), PoolProperties::default(), &test_options()).unwrap();
-        assert!(marker_path.exists());
         let resolved_target = reopened
             .pending_device_removal_path()
             .unwrap()
-            .expect("marker resolves target GUID to its attached path");
-        assert_eq!(resolved_target, config.devices[0].path);
+            .expect("label intent resolves target index/GUID to its attached path");
+        assert_eq!(resolved_target, renamed_target_path);
         let resumed = reopened.safe_remove_device(&resolved_target).unwrap();
         assert_topology_committed(&resumed);
-        assert!(!marker_path.exists());
+        assert_pool_label_lifecycle(&reopened, pool_label::PoolLifecycleKindV1::Clear);
+        assert_legacy_device_lifecycle_files_absent(&root);
         assert_eq!(reopened.stats().device_count, 1);
         assert_eq!(
             reopened.get(IoClass::Data, key).unwrap(),
@@ -17113,7 +17580,7 @@ mod tests {
         );
         drop(reduced);
         let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
-        assert!(!marker_path.exists());
+        assert_pool_label_lifecycle(&reopened, pool_label::PoolLifecycleKindV1::Clear);
         assert_eq!(reopened.stats().device_count, 1);
         assert_eq!(
             reopened.get(IoClass::Data, key).unwrap(),
@@ -17124,348 +17591,95 @@ mod tests {
     }
 
     #[test]
-    fn safe_remove_device_resume_clears_marker_for_committed_reduced_config() {
-        let root = temp_dir("safe-remove-resume-reduced-config");
-        let _ = std::fs::remove_dir_all(&root);
-        let d1 = root.join("data1");
-        let d2 = root.join("data2");
-        let config = PoolConfig {
-            name: "testpool".into(),
-            root_path: root.to_path_buf(),
-            devices: vec![
-                DeviceConfig {
-                    media_class: Default::default(),
-                    path: d1.clone(),
-                    backing: DeviceBacking::DirectoryObjectStoreCompat,
-                    class: DeviceClass::Data,
-                    kind: DeviceKind::Single { path: d1.clone() },
-                    encryption: None,
-                    compression: None,
-                },
-                DeviceConfig {
-                    media_class: Default::default(),
-                    path: d2.clone(),
-                    backing: DeviceBacking::DirectoryObjectStoreCompat,
-                    class: DeviceClass::Data,
-                    kind: DeviceKind::Single { path: d2.clone() },
-                    encryption: None,
-                    compression: None,
-                },
-            ],
-        };
-
-        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
-        let key = ObjectKey::from_name(b"resume-preserves-marker-after-detach");
-        let data = b"in-memory detach does not clear removal marker".to_vec();
-        pool.put(IoClass::Data, key, &data).unwrap();
-        pool.sync_all().unwrap();
-
-        let target_guid = pool.device_guid_for_index(0);
-        let result = pool.safe_remove_device(&d1).unwrap();
-        assert_topology_committed(&result);
-        assert_eq!(pool.stats().device_count, 1);
-        assert!(d1.exists());
-        let post_commit_key = ObjectKey::from_name(b"post-removal-topology-commit");
-        pool.put(
-            IoClass::Data,
-            post_commit_key,
-            b"writes resume only after topology publication",
-        )
-        .unwrap();
-
-        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        assert!(!marker_path.exists());
-        // Simulate a crash after the reduced labels committed but before the
-        // recovery marker's directory entry was durably cleared.
-        persist_device_removal_marker(&root, pool.pool_guid, &d1, target_guid).unwrap();
-
-        resume_device_removal_if_pending(&mut pool).unwrap();
-
-        assert!(!marker_path.exists());
-        assert_eq!(pool.stats().device_count, 1);
-        assert_eq!(pool.get(IoClass::Data, key).unwrap(), Some(data));
-        assert_eq!(
-            pool.get(IoClass::Data, post_commit_key).unwrap(),
-            Some(b"writes resume only after topology publication".to_vec())
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn safe_remove_device_resume_preserves_marker_for_incomplete_guid_table() {
-        let root = temp_dir("safe-remove-resume-incomplete-guid-table");
+    fn device_removal_label_intent_wrong_target_fails_pool_open() {
+        let root = temp_dir("device-removal-label-wrong-target");
         let _ = std::fs::remove_dir_all(&root);
         let config = multi_data_device_config(&root, 2);
-        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
-        let target_path = pool.devices[1].root().to_path_buf();
-        let target_guid = pool.device_guid_for_index(1);
-        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        persist_device_removal_marker(&root, pool.pool_guid, &target_path, target_guid).unwrap();
-
-        pool.device_guids.pop();
-        resume_device_removal_if_pending(&mut pool).unwrap();
-
-        assert!(marker_path.exists());
-        assert_eq!(pool.stats().device_count, 2);
-        assert!(pool
-            .devices
-            .iter()
-            .any(|device| device.root() == target_path));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn safe_remove_device_resume_preserves_marker_for_different_pool() {
-        let root = temp_dir("safe-remove-resume-different-pool");
-        let _ = std::fs::remove_dir_all(&root);
-        let config = multi_data_device_config(&root, 2);
-        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
-        let target_path = pool.devices[1].root().to_path_buf();
-        let target_guid = pool.device_guid_for_index(1);
-        let mut marker_pool_guid = pool.pool_guid;
-        marker_pool_guid[0] ^= 0xff;
-        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        persist_device_removal_marker(&root, marker_pool_guid, &target_path, target_guid).unwrap();
-
-        resume_device_removal_if_pending(&mut pool).unwrap();
-
-        let marker = read_device_removal_marker(&marker_path).unwrap();
-        assert_eq!(marker.pool_guid, marker_pool_guid);
-        assert_eq!(marker.target_guid, target_guid);
-        assert_eq!(pool.stats().device_count, 2);
-        assert!(matches!(
-            pool.safe_remove_device(&target_path),
-            Err(StoreError::InvalidOptions {
-                reason: "device removal marker belongs to a different pool"
-            })
-        ));
-        assert_eq!(pool.stats().device_count, 2);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn safe_remove_device_resume_preserves_marker_for_rebound_target_path() {
-        let root = temp_dir("safe-remove-resume-rebound-target-path");
-        let _ = std::fs::remove_dir_all(&root);
-        let config = multi_data_device_config(&root, 2);
-        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
-        set_deterministic_device_guids(&mut pool);
-        let target_path = pool.devices[1].root().to_path_buf();
-        let target_guid = pool.device_guid_for_index(1);
-        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        persist_device_removal_marker(&root, pool.pool_guid, &target_path, target_guid).unwrap();
-
-        pool.device_guids[1] = deterministic_device_guid(2);
-        resume_device_removal_if_pending(&mut pool).unwrap();
-
-        let marker = read_device_removal_marker(&marker_path).unwrap();
-        assert_eq!(marker.pool_guid, pool.pool_guid);
-        assert_eq!(marker.target_path, target_path);
-        assert_eq!(marker.target_guid, target_guid);
-        assert_eq!(pool.stats().device_count, 2);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn safe_remove_device_resume_round_trips_target_path_bytes() {
-        let root = temp_dir("safe-remove-resume-exact-target-path");
-        let _ = std::fs::remove_dir_all(&root);
-        let target_path = root.join(OsString::from_vec(b"data-\xff ".to_vec()));
-        let mut config = multi_data_device_config(&root, 2);
-        config.devices[0].path = target_path.clone();
-        config.devices[0].kind = DeviceKind::Single {
-            path: target_path.clone(),
-        };
-
         let mut pool =
             Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
-        let rogue_key = ObjectKey::from_name(b"exact-target-path-removal-blocker");
-        let rogue_payload = b"resume must not lose a byte-exact target path";
+        let target_path = pool.devices[0].root().to_path_buf();
+        let payload = encode_device_removal_marker(
+            pool.pool_guid,
+            0,
+            &target_path,
+            pool.device_guid_for_index(1),
+            checked_successor_topology_generation(pool.placement_epoch()).unwrap(),
+        )
+        .unwrap();
+        pool.persist_lifecycle_record_on_current_topology(
+            pool_label::PoolLifecycleKindV1::DeviceRemoval,
+            payload,
+            "test-wrong-removal-target",
+        )
+        .unwrap();
+        drop(pool);
+
+        assert_invalid_options_reason_contains(
+            Pool::open(config, PoolProperties::default(), &test_options()),
+            "does not match the durable topology",
+        );
+        assert_legacy_device_lifecycle_files_absent(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn device_removal_label_intent_corruption_fails_pool_open() {
+        let root = temp_dir("device-removal-label-corrupt");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let mut pool =
+            Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
+        let target_path = pool.devices[0].root().to_path_buf();
+        pool.prepare_safe_remove_device(&target_path).unwrap();
+        drop(pool);
+
+        for device in &config.devices {
+            let label_path = label_file_path(&device_root_path(device));
+            let mut encoded = std::fs::read(&label_path).unwrap();
+            let roster_size = pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+                + config.devices.len() * pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE
+                + pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE;
+            let lifecycle_offset = pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET + roster_size;
+            encoded[lifecycle_offset + pool_label::POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE] ^= 0x80;
+            std::fs::write(label_path, encoded).unwrap();
+        }
+
+        assert_invalid_options_reason_contains(
+            Pool::open(config, PoolProperties::default(), &test_options()),
+            "pool label corrupt or unreadable",
+        );
+        assert_legacy_device_lifecycle_files_absent(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_resume_preserves_label_intent_after_refusal() {
+        let root = temp_dir("safe-remove-resume-refusal");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let mut pool =
+            Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
+        let target_path = pool.devices[0].root().to_path_buf();
+        let rogue_key = ObjectKey::from_name(b"resume-rogue-unreceipted-object");
+        let rogue_payload = b"resume refusal keeps label intent";
         pool.devices[0].put(rogue_key, rogue_payload).unwrap();
 
-        let result = pool.safe_remove_device(&target_path).unwrap();
-        assert!(!result.complete);
-        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        let marker = read_device_removal_marker(&marker_path).unwrap();
-        assert_eq!(
-            marker.target_path.as_os_str().as_bytes(),
-            target_path.as_os_str().as_bytes()
-        );
-
+        let refused = pool.prepare_safe_remove_device(&target_path).unwrap();
+        assert_eq!(refused.objects_failed, 1);
+        assert_pool_label_lifecycle(&pool, pool_label::PoolLifecycleKindV1::DeviceRemoval);
         drop(pool);
 
         let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
-        let marker = read_device_removal_marker(&marker_path).unwrap();
+        assert_pool_label_lifecycle(&reopened, pool_label::PoolLifecycleKindV1::DeviceRemoval);
         assert_eq!(
-            marker.target_path.as_os_str().as_bytes(),
-            target_path.as_os_str().as_bytes()
+            reopened.pending_device_removal_path().unwrap(),
+            Some(target_path)
         );
-        assert_eq!(reopened.stats().device_count, 2);
         assert_eq!(
             reopened.devices[0].get(rogue_key).unwrap(),
             Some(rogue_payload.to_vec())
         );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn device_removal_marker_corrupt_bytes_fail_pool_open() {
-        let root = temp_dir("device-removal-marker-corrupt");
-        let _ = std::fs::remove_dir_all(&root);
-        let config = multi_data_device_config(&root, 2);
-        let pool =
-            Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
-        let target_path = pool.devices[0].root().to_path_buf();
-        let mut encoded = encode_device_removal_marker(
-            pool.pool_guid,
-            &target_path,
-            pool.device_guid_for_index(0),
-        )
-        .unwrap();
-        let checksum_byte = encoded.last_mut().unwrap();
-        *checksum_byte ^= 0x80;
-        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        drop(pool);
-        std::fs::write(&marker_path, &encoded).unwrap();
-
-        assert!(matches!(
-            Pool::open(config, PoolProperties::default(), &test_options()),
-            Err(StoreError::InvalidOptions {
-                reason: "device removal marker is corrupt or unverifiable"
-            })
-        ));
-        assert_eq!(std::fs::read(&marker_path).unwrap(), encoded);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn device_removal_marker_truncated_bytes_fail_pool_open() {
-        let root = temp_dir("device-removal-marker-truncated");
-        let _ = std::fs::remove_dir_all(&root);
-        let config = multi_data_device_config(&root, 2);
-        let pool =
-            Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
-        let target_path = pool.devices[0].root().to_path_buf();
-        let mut encoded = encode_device_removal_marker(
-            pool.pool_guid,
-            &target_path,
-            pool.device_guid_for_index(0),
-        )
-        .unwrap();
-        encoded.truncate(encoded.len() - 1);
-        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        drop(pool);
-        std::fs::write(&marker_path, &encoded).unwrap();
-
-        assert!(matches!(
-            Pool::open(config, PoolProperties::default(), &test_options()),
-            Err(StoreError::InvalidOptions {
-                reason: "device removal marker is corrupt or unverifiable"
-            })
-        ));
-        assert_eq!(std::fs::read(&marker_path).unwrap(), encoded);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn device_removal_marker_lookup_error_fails_pool_open() {
-        let root = temp_dir("device-removal-marker-lookup-error");
-        let _ = std::fs::remove_dir_all(&root);
-        let config = multi_data_device_config(&root, 2);
-        let pool =
-            Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
-        drop(pool);
-
-        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        std::os::unix::fs::symlink(root.join("missing-marker-target"), &marker_path).unwrap();
-
-        let error = match Pool::open(config, PoolProperties::default(), &test_options()) {
-            Ok(_) => panic!("marker lookup failure must fail pool open"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            StoreError::Io {
-                operation: "read_device_removal_marker",
-                ..
-            }
-        ));
-
-        std::fs::remove_file(&marker_path).unwrap();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn safe_remove_device_resume_preserves_marker_after_refusal() {
-        let root = temp_dir("safe-remove-resume-refusal");
-        let _ = std::fs::remove_dir_all(&root);
-        let d1 = root.join("data1");
-        let d2 = root.join("data2");
-        let config = PoolConfig {
-            name: "testpool".into(),
-            root_path: root.to_path_buf(),
-            devices: vec![
-                DeviceConfig {
-                    media_class: Default::default(),
-                    path: d1.clone(),
-                    backing: DeviceBacking::DirectoryObjectStoreCompat,
-                    class: DeviceClass::Data,
-                    kind: DeviceKind::Single { path: d1.clone() },
-                    encryption: None,
-                    compression: None,
-                },
-                DeviceConfig {
-                    media_class: Default::default(),
-                    path: d2.clone(),
-                    backing: DeviceBacking::DirectoryObjectStoreCompat,
-                    class: DeviceClass::Data,
-                    kind: DeviceKind::Single { path: d2.clone() },
-                    encryption: None,
-                    compression: None,
-                },
-            ],
-        };
-
-        let mut pool =
-            Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
-        let rogue_key = ObjectKey::from_name(b"resume-rogue-unreceipted-object");
-        let rogue_payload = b"resume refusal keeps marker";
-        pool.devices[0].put(rogue_key, rogue_payload).unwrap();
-
-        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        let target_guid = pool.device_guid_for_index(0);
-        persist_device_removal_marker(&root, pool.pool_guid, &d1, target_guid).unwrap();
-        let marker_tmp_path = root.join(DEVICE_REMOVAL_MARKER_TMP_FILE);
-        std::fs::write(
-            &marker_tmp_path,
-            b"partial marker from interrupted publication",
-        )
-        .unwrap();
-
-        drop(pool);
-
-        let pool2 = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
-
-        assert!(marker_path.exists());
-        assert!(!marker_tmp_path.exists());
-        let marker = read_device_removal_marker(&marker_path).unwrap();
-        assert_eq!(marker.target_path, d1);
-        assert_eq!(marker.target_guid, target_guid);
-        assert_eq!(pool2.stats().device_count, 2);
-        assert_eq!(
-            pool2.devices[0].get(rogue_key).unwrap(),
-            Some(rogue_payload.to_vec())
-        );
-        assert_eq!(pool2.devices[1].get(rogue_key).unwrap(), None);
-
+        assert_legacy_device_lifecycle_files_absent(&root);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -17608,8 +17822,9 @@ mod tests {
         crash_cut.bytes_rebuilt = 0;
         crash_cut.evidence_stable = false;
         crash_cut.state = ReplacementRebuildStatusState::Pending;
-        persist_device_replacement_evidence(&root, &crash_cut)
-            .expect("persist pre-progress replacement crash cut");
+        pool.persist_replacement_evidence_in_labels(&crash_cut)
+            .expect("persist pre-progress replacement crash cut in member labels");
+        assert_legacy_device_lifecycle_files_absent(&root);
         drop(pool);
 
         let mut reopened = Pool::open(original_config, properties.clone(), &test_options())
@@ -17676,8 +17891,9 @@ mod tests {
             .expect("completed replacement evidence");
         assert!(crash_cut.evidence_stable);
         crash_cut.state = ReplacementRebuildStatusState::Pending;
-        persist_device_replacement_evidence(&root, &crash_cut)
-            .expect("persist pre-terminal replacement crash cut");
+        pool.persist_replacement_evidence_in_labels(&crash_cut)
+            .expect("persist pre-terminal replacement crash cut in member labels");
+        assert_legacy_device_lifecycle_files_absent(&root);
         drop(pool);
 
         let mut reopened = Pool::open(final_config, properties, &test_options())
@@ -17840,89 +18056,22 @@ mod tests {
             .expect("prepare replacement");
         drop(pool);
 
-        let evidence_path = root.join(DEVICE_REPLACEMENT_EVIDENCE_FILE);
-        let mut encoded = std::fs::read(&evidence_path).expect("read replacement evidence");
-        encoded[DEVICE_REPLACEMENT_EVIDENCE_MAGIC_V2.len()] ^= 0x80;
-        std::fs::write(&evidence_path, encoded).expect("corrupt replacement evidence");
+        for device in &config.devices {
+            let label_path = label_file_path(&device_root_path(device));
+            let mut encoded = std::fs::read(&label_path).unwrap();
+            let roster_size = pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+                + config.devices.len() * pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE
+                + pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE;
+            let lifecycle_offset = pool_label::POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET + roster_size;
+            encoded[lifecycle_offset + pool_label::POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE] ^= 0x80;
+            std::fs::write(label_path, encoded).unwrap();
+        }
 
-        assert!(matches!(
+        assert_invalid_options_reason_contains(
             Pool::open(config, properties, &test_options()),
-            Err(StoreError::InvalidOptions {
-                reason: "device replacement evidence is corrupt or unverifiable"
-            })
-        ));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn replacement_evidence_publish_failure_keeps_old_topology() {
-        let (root, old_path, _config, _properties, replacement_config, mut pool) =
-            replacement_replay_test_pool("replace-evidence-publish-failure");
-        let old_device_guids = pool.device_guids.clone();
-        let old_topology_epoch = pool.placement_epoch();
-        std::fs::create_dir(root.join(DEVICE_REPLACEMENT_EVIDENCE_TMP_FILE))
-            .expect("block evidence temporary-file publication");
-
-        assert!(pool
-            .replace_device(&old_path, replacement_config, &test_options())
-            .is_err());
-        assert_eq!(pool.devices.len(), 2);
-        assert_eq!(pool.devices[0].root(), old_path);
-        assert_eq!(pool.device_guids, old_device_guids);
-        assert_eq!(pool.placement_epoch(), old_topology_epoch);
-        assert!(pool.replacement_status().is_none());
-        assert!(pool.replacement_rebuild_evidence_status().is_none());
-        assert!(!root.join(DEVICE_REPLACEMENT_EVIDENCE_FILE).exists());
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn replace_device_evidence_publish_failure_preserves_blank_block_candidate() {
-        let root = temp_dir("replace-evidence-block-publish-failure");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create replacement fixture root");
-        let metadata = root.join("metadata");
-        let config = PoolConfig {
-            name: "replace-evidence-block-publish-failure".into(),
-            root_path: metadata.clone(),
-            devices: vec![
-                regular_file_device_config(root.join("member-0.img")),
-                regular_file_device_config(root.join("member-1.img")),
-            ],
-        };
-        let properties = PoolProperties {
-            redundancy_policy: PoolRedundancyPolicy::replicated(2),
-            ..PoolProperties::default()
-        };
-        let mut pool = Pool::create(config, properties, &StoreOptions::default())
-            .expect("create regular-file replacement Pool");
-        let old_path = pool.devices[0].root().to_path_buf();
-        let replacement_path = root.join("replacement.img");
-        let replacement_config = regular_file_device_config(replacement_path.clone());
-        let replacement_capacity = byte_addressable_path_raw_capacity(&replacement_path)
-            .expect("read replacement capacity");
-        std::fs::create_dir(metadata.join(DEVICE_REPLACEMENT_EVIDENCE_TMP_FILE))
-            .expect("block replacement evidence publication");
-
-        assert!(pool
-            .replace_device(&old_path, replacement_config, &StoreOptions::default())
-            .is_err());
-        let inspection = LocalObjectStore::inspect_block_device_bootstrap(
-            &replacement_path,
-            replacement_capacity - pool_label::POOL_LABEL_SIZE as u64,
-        )
-        .expect("inspect failed replacement candidate");
-        assert_eq!(inspection.identity, None);
-        assert_eq!(inspection.record, None);
-        assert_eq!(pool.devices.len(), 2);
-        pool.put_with_receipt(
-            IoClass::Data,
-            ObjectKey::from_name(b"write-after-replacement-evidence-failure"),
-            b"old topology remains writable",
-        )
-        .expect("keep old topology generation authority writable");
+            "pool label corrupt or unreadable",
+        );
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -18590,7 +18739,8 @@ mod tests {
             std::fs::metadata(&log_path).unwrap().len(),
             log_len_before_remove
         );
-        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_pool_label_lifecycle(&pool, pool_label::PoolLifecycleKindV1::DeviceRemoval);
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         // Simulate the owning commit/replay layer draining the records. Safe
         // removal must still refuse truncated or corrupt drain authority.
@@ -18638,7 +18788,7 @@ mod tests {
         assert_eq!(pool.log_device_count(), 0);
         assert!(!pool.log_device_healthy());
         assert!(!pool.has_log_device());
-        assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_legacy_device_lifecycle_files_absent(&root);
         assert_eq!(std::fs::metadata(&log_path).unwrap().len(), drained_log_len);
 
         // Mutation resumes only after both label copies have committed. With
@@ -19762,7 +19912,7 @@ mod tests {
             }
         ));
         assert_eq!(locked_pool.stats().device_count, 2);
-        assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+        assert_legacy_device_lifecycle_files_absent(&root);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -254,6 +254,35 @@ fn assert_reimported_independent_filesystem(
     );
 }
 
+fn remove_legacy_device_lifecycle_files(metadata_dir: &std::path::Path) {
+    for name in [
+        ".tidefs_device_removal_pending",
+        ".tidefs_device_removal_pending.tmp",
+        ".tidefs_device_replacement_evidence",
+        ".tidefs_device_replacement_evidence.tmp",
+    ] {
+        match fs::remove_file(metadata_dir.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove obsolete lifecycle side file {name}: {error}"),
+        }
+    }
+}
+
+fn assert_legacy_device_lifecycle_files_absent(metadata_dir: &std::path::Path) {
+    for name in [
+        ".tidefs_device_removal_pending",
+        ".tidefs_device_removal_pending.tmp",
+        ".tidefs_device_replacement_evidence",
+        ".tidefs_device_replacement_evidence.tmp",
+    ] {
+        assert!(
+            !metadata_dir.join(name).exists(),
+            "obsolete lifecycle side file {name} must not be recovery authority"
+        );
+    }
+}
+
 fn run_status(command: &str, json: bool) -> (String, Output) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -638,6 +667,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
         stdout.contains("objects_evacuated=") && !stdout.contains("objects_evacuated=0"),
         "test data must exercise actual target evacuation: {stdout}"
     );
+    assert_legacy_device_lifecycle_files_absent(&metadata_dir);
 
     {
         let mut filesystem = shared_filesystem.borrow_mut();
@@ -658,6 +688,8 @@ fn live_device_remove_cli_commits_survivor_topology() {
     drop(shared_filesystem);
     drop(adapter);
     fs::remove_dir(&runtime_dir).expect("remove empty test Pool runtime directory");
+    remove_legacy_device_lifecycle_files(&metadata_dir);
+    assert_legacy_device_lifecycle_files_absent(&metadata_dir);
 
     let survivor = [devices[0].clone()];
     let mut reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
@@ -804,6 +836,7 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
     assert_eq!(result["secure_erase_claimed"], false, "{result}");
     assert_eq!(result["sanitization_claimed"], false, "{result}");
     assert_eq!(result["decommissioning_claimed"], false, "{result}");
+    assert_legacy_device_lifecycle_files_absent(&metadata_dir);
 
     let status_output = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
         .args(["device", "status", &pool_name, "--json"])
@@ -836,6 +869,8 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
     drop(shared_filesystem);
     drop(adapter);
     fs::remove_dir(&runtime_dir).expect("remove empty test Pool runtime directory");
+    remove_legacy_device_lifecycle_files(&metadata_dir);
+    assert_legacy_device_lifecycle_files_absent(&metadata_dir);
 
     let replacement_topology = [replacement.clone(), devices[1].clone()];
     let mut reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(

@@ -338,6 +338,11 @@ pub mod features {
     /// DeviceLayoutV1 record. Durable member indices are the roster offsets.
     /// Compat bit 11.
     pub const TOPOLOGY_ROSTER_V1: u64 = 1 << 11;
+    /// A checksummed Pool lifecycle record follows the topology roster. The
+    /// record supplies bootstrap recovery authority before receipt-backed
+    /// objects can be opened after an interrupted device operation.
+    /// Compat bit 12.
+    pub const POOL_LIFECYCLE_V1: u64 = 1 << 12;
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +492,92 @@ pub const POOL_LABEL_TOPOLOGY_ROSTER_V1_MIN_WIRE_SIZE: usize =
         + POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE
         + POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE;
 
+/// Magic bytes for the Pool lifecycle bootstrap extension.
+pub const POOL_LABEL_LIFECYCLE_V1_MAGIC: [u8; 8] = *b"TDFSLIF1";
+
+/// Version of the Pool lifecycle bootstrap extension.
+pub const POOL_LABEL_LIFECYCLE_V1_VERSION: u16 = 1;
+
+/// Fixed bytes before the lifecycle payload.
+pub const POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE: usize = 36;
+
+/// BLAKE3-256 checksum bytes after the lifecycle payload.
+pub const POOL_LABEL_LIFECYCLE_V1_CHECKSUM_SIZE: usize = 32;
+
+/// Minimum encoded lifecycle size for a cleared record with no payload.
+pub const POOL_LABEL_LIFECYCLE_V1_MIN_WIRE_SIZE: usize =
+    POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE + POOL_LABEL_LIFECYCLE_V1_CHECKSUM_SIZE;
+
+/// Durable lifecycle state carried by one record generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum PoolLifecycleKindV1 {
+    /// No operation is active; the sequence remains as a durable tombstone.
+    Clear = 0,
+    /// One present member is being evacuated and removed.
+    DeviceRemoval = 1,
+    /// One present member is being rebuilt onto a replacement.
+    DeviceReplacement = 2,
+}
+
+impl PoolLifecycleKindV1 {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Clear),
+            1 => Some(Self::DeviceRemoval),
+            2 => Some(Self::DeviceReplacement),
+            _ => None,
+        }
+    }
+}
+
+/// Verified borrowed view of one label lifecycle record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PoolLifecycleRecordV1<'a> {
+    sequence: u64,
+    topology_generation: u64,
+    kind: PoolLifecycleKindV1,
+    payload: &'a [u8],
+}
+
+impl<'a> PoolLifecycleRecordV1<'a> {
+    /// Build a lifecycle record for label encoding.
+    pub fn new(
+        sequence: u64,
+        topology_generation: u64,
+        kind: PoolLifecycleKindV1,
+        payload: &'a [u8],
+    ) -> Result<Self, LabelError> {
+        validate_pool_lifecycle_record(sequence, kind, payload)?;
+        Ok(Self {
+            sequence,
+            topology_generation,
+            kind,
+            payload,
+        })
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub const fn topology_generation(&self) -> u64 {
+        self.topology_generation
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> PoolLifecycleKindV1 {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+}
+
 /// A verified borrowed view of one durable topology roster.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PoolTopologyRosterV1<'a> {
@@ -561,6 +652,12 @@ pub enum LabelError {
     DuplicateTopologyRosterGuid,
     /// TopologyRosterV1 checksum mismatch.
     TopologyRosterChecksumMismatch,
+    /// Pool lifecycle extension header, kind, sequence, or payload is invalid.
+    BadPoolLifecycle,
+    /// Pool lifecycle extension uses an unsupported version.
+    UnsupportedPoolLifecycleVersion(u16),
+    /// Pool lifecycle extension checksum mismatch.
+    PoolLifecycleChecksumMismatch,
     /// Cannot remove the last remaining device from a pool.
     LastDevice,
 }
@@ -593,6 +690,11 @@ impl fmt::Display for LabelError {
             Self::TopologyRosterChecksumMismatch => {
                 f.write_str("topology roster checksum mismatch")
             }
+            Self::BadPoolLifecycle => f.write_str("bad Pool lifecycle record"),
+            Self::UnsupportedPoolLifecycleVersion(version) => {
+                write!(f, "unsupported Pool lifecycle version {version}")
+            }
+            Self::PoolLifecycleChecksumMismatch => f.write_str("Pool lifecycle checksum mismatch"),
             Self::LastDevice => f.write_str("cannot remove last device from pool"),
         }
     }
@@ -685,6 +787,18 @@ pub fn encode_label_with_extensions(
     topology_roster_v1: Option<&[[u8; 16]]>,
     buf: &mut [u8],
 ) -> Result<(), LabelError> {
+    encode_label_with_all_extensions(label, device_layout_v1, topology_roster_v1, None, buf)
+}
+
+/// Encode a `PoolLabelV1` plus its optional layout, roster, and lifecycle
+/// bootstrap extensions.
+pub fn encode_label_with_all_extensions(
+    label: &PoolLabelV1,
+    device_layout_v1: Option<&DeviceLayoutV1Bytes>,
+    topology_roster_v1: Option<&[[u8; 16]]>,
+    pool_lifecycle_v1: Option<PoolLifecycleRecordV1<'_>>,
+    buf: &mut [u8],
+) -> Result<(), LabelError> {
     if buf.len() < POOL_LABEL_V1_WIRE_SIZE {
         return Err(LabelError::BufferTooSmall);
     }
@@ -704,13 +818,41 @@ pub fn encode_label_with_extensions(
             return Err(LabelError::BufferTooSmall);
         }
     }
+    let lifecycle_offset = match (topology_roster_v1, roster_wire_size) {
+        (Some(_), Some(wire_size)) => POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+            .checked_add(wire_size)
+            .ok_or(LabelError::BadPoolLifecycle)?,
+        (None, None) if pool_lifecycle_v1.is_none() => 0,
+        _ => return Err(LabelError::BadPoolLifecycle),
+    };
+    let lifecycle_wire_size = pool_lifecycle_v1
+        .map(pool_lifecycle_v1_wire_size)
+        .transpose()?;
+    if let Some(wire_size) = lifecycle_wire_size {
+        if buf.len()
+            < lifecycle_offset
+                .checked_add(wire_size)
+                .ok_or(LabelError::BadPoolLifecycle)?
+        {
+            return Err(LabelError::BufferTooSmall);
+        }
+    }
     let health_ext = buf.len() >= POOL_LABEL_V1_HEALTH_WIRE_SIZE;
     let policy_ext = buf.len() >= POOL_LABEL_V1_EXT_WIRE_SIZE;
     let layout_ext =
         buf.len() >= POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE && device_layout_v1.is_some();
     let roster_ext = topology_roster_v1.is_some();
+    let lifecycle_ext = pool_lifecycle_v1.is_some();
 
-    encode_label_header(label, health_ext, policy_ext, layout_ext, roster_ext, buf)?;
+    encode_label_header(
+        label,
+        health_ext,
+        policy_ext,
+        layout_ext,
+        roster_ext,
+        lifecycle_ext,
+        buf,
+    )?;
 
     if layout_ext {
         buf[POOL_LABEL_DEVICE_LAYOUT_V1_OFFSET..POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE]
@@ -719,6 +861,12 @@ pub fn encode_label_with_extensions(
 
     if let Some(members) = topology_roster_v1 {
         encode_topology_roster_v1(label, members, buf)?;
+    }
+    if let Some(record) = pool_lifecycle_v1 {
+        if record.topology_generation != label.topology_generation {
+            return Err(LabelError::BadPoolLifecycle);
+        }
+        encode_pool_lifecycle_v1(record, lifecycle_offset, buf)?;
     }
 
     Ok(())
@@ -730,6 +878,7 @@ fn encode_label_header(
     policy_ext: bool,
     layout_ext: bool,
     roster_ext: bool,
+    lifecycle_ext: bool,
     buf: &mut [u8],
 ) -> Result<(), LabelError> {
     if buf.len() < POOL_LABEL_V1_WIRE_SIZE {
@@ -759,7 +908,8 @@ fn encode_label_header(
         & !(features::DEVICE_HEALTH_STATE
             | features::POOL_REDUNDANCY_POLICY
             | features::DEVICE_LAYOUT_V1
-            | features::TOPOLOGY_ROSTER_V1);
+            | features::TOPOLOGY_ROSTER_V1
+            | features::POOL_LIFECYCLE_V1);
     if health_ext {
         features_compat_wire |= features::DEVICE_HEALTH_STATE;
     }
@@ -771,6 +921,9 @@ fn encode_label_header(
     }
     if roster_ext {
         features_compat_wire |= features::TOPOLOGY_ROSTER_V1;
+    }
+    if lifecycle_ext {
+        features_compat_wire |= features::POOL_LIFECYCLE_V1;
     }
     buf[371..379].copy_from_slice(&features_compat_wire.to_le_bytes());
 
@@ -877,6 +1030,139 @@ fn validate_topology_roster_v1(
     Ok(())
 }
 
+fn validate_pool_lifecycle_record(
+    sequence: u64,
+    kind: PoolLifecycleKindV1,
+    payload: &[u8],
+) -> Result<(), LabelError> {
+    if sequence == 0
+        || (kind == PoolLifecycleKindV1::Clear && !payload.is_empty())
+        || (kind != PoolLifecycleKindV1::Clear && payload.is_empty())
+    {
+        return Err(LabelError::BadPoolLifecycle);
+    }
+    Ok(())
+}
+
+/// Encoded size of one lifecycle record, excluding the preceding label,
+/// layout, and roster bytes.
+pub fn pool_lifecycle_v1_wire_size(record: PoolLifecycleRecordV1<'_>) -> Result<usize, LabelError> {
+    validate_pool_lifecycle_record(record.sequence, record.kind, record.payload)?;
+    POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE
+        .checked_add(record.payload.len())
+        .and_then(|size| size.checked_add(POOL_LABEL_LIFECYCLE_V1_CHECKSUM_SIZE))
+        .filter(|size| *size <= POOL_LABEL_SIZE)
+        .ok_or(LabelError::BadPoolLifecycle)
+}
+
+fn encode_pool_lifecycle_v1(
+    record: PoolLifecycleRecordV1<'_>,
+    start: usize,
+    buf: &mut [u8],
+) -> Result<(), LabelError> {
+    let wire_size = pool_lifecycle_v1_wire_size(record)?;
+    let end = start
+        .checked_add(wire_size)
+        .ok_or(LabelError::BadPoolLifecycle)?;
+    let encoded = buf.get_mut(start..end).ok_or(LabelError::BufferTooSmall)?;
+    encoded.fill(0);
+    encoded[0..8].copy_from_slice(&POOL_LABEL_LIFECYCLE_V1_MAGIC);
+    encoded[8..10].copy_from_slice(&POOL_LABEL_LIFECYCLE_V1_VERSION.to_le_bytes());
+    encoded[10] = record.kind as u8;
+    encoded[12..20].copy_from_slice(&record.sequence.to_le_bytes());
+    encoded[20..28].copy_from_slice(&record.topology_generation.to_le_bytes());
+    let payload_len =
+        u32::try_from(record.payload.len()).map_err(|_| LabelError::BadPoolLifecycle)?;
+    encoded[28..32].copy_from_slice(&payload_len.to_le_bytes());
+    let payload_end = POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE
+        .checked_add(record.payload.len())
+        .ok_or(LabelError::BadPoolLifecycle)?;
+    encoded[POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE..payload_end].copy_from_slice(record.payload);
+    let digest = blake3::hash(&encoded[..payload_end]);
+    encoded[payload_end..].copy_from_slice(digest.as_bytes());
+    Ok(())
+}
+
+/// Return a verified borrowed view of the optional Pool lifecycle record.
+pub fn decode_pool_lifecycle_v1(
+    buf: &[u8],
+) -> Result<Option<PoolLifecycleRecordV1<'_>>, LabelError> {
+    if buf.len() < POOL_LABEL_V1_WIRE_SIZE {
+        return Err(LabelError::BufferTooSmall);
+    }
+    let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
+    if features_compat & features::POOL_LIFECYCLE_V1 == 0 {
+        return Ok(None);
+    }
+    if features_compat & features::TOPOLOGY_ROSTER_V1 == 0 {
+        return Err(LabelError::BadPoolLifecycle);
+    }
+    let roster = decode_topology_roster_v1(buf)?.ok_or(LabelError::BadPoolLifecycle)?;
+    let roster_wire_size = topology_roster_v1_wire_size_for_count(roster.len())?;
+    let start = POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+        .checked_add(roster_wire_size)
+        .ok_or(LabelError::BadPoolLifecycle)?;
+    let minimum_end = start
+        .checked_add(POOL_LABEL_LIFECYCLE_V1_MIN_WIRE_SIZE)
+        .ok_or(LabelError::BadPoolLifecycle)?;
+    if minimum_end > POOL_LABEL_SIZE || buf.len() < minimum_end {
+        return Err(LabelError::BadPoolLifecycle);
+    }
+    let encoded = &buf[start..];
+    if encoded[0..8] != POOL_LABEL_LIFECYCLE_V1_MAGIC
+        || encoded[11] != 0
+        || encoded[32..36] != [0, 0, 0, 0]
+    {
+        return Err(LabelError::BadPoolLifecycle);
+    }
+    let version = u16::from_le_bytes(encoded[8..10].try_into().unwrap());
+    if version != POOL_LABEL_LIFECYCLE_V1_VERSION {
+        return Err(LabelError::UnsupportedPoolLifecycleVersion(version));
+    }
+    let kind = PoolLifecycleKindV1::from_u8(encoded[10]).ok_or(LabelError::BadPoolLifecycle)?;
+    let sequence = u64::from_le_bytes(encoded[12..20].try_into().unwrap());
+    let topology_generation = u64::from_le_bytes(encoded[20..28].try_into().unwrap());
+    let payload_len = u32::from_le_bytes(encoded[28..32].try_into().unwrap()) as usize;
+    let payload_end = POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE
+        .checked_add(payload_len)
+        .ok_or(LabelError::BadPoolLifecycle)?;
+    let wire_size = payload_end
+        .checked_add(POOL_LABEL_LIFECYCLE_V1_CHECKSUM_SIZE)
+        .ok_or(LabelError::BadPoolLifecycle)?;
+    if start
+        .checked_add(wire_size)
+        .is_none_or(|end| end > POOL_LABEL_SIZE)
+        || encoded.len() < wire_size
+    {
+        return Err(LabelError::BadPoolLifecycle);
+    }
+    let payload = &encoded[POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE..payload_end];
+    validate_pool_lifecycle_record(sequence, kind, payload)?;
+    if blake3::hash(&encoded[..payload_end]).as_bytes() != &encoded[payload_end..wire_size] {
+        return Err(LabelError::PoolLifecycleChecksumMismatch);
+    }
+    Ok(Some(PoolLifecycleRecordV1 {
+        sequence,
+        topology_generation,
+        kind,
+        payload,
+    }))
+}
+
+fn topology_roster_v1_wire_size_for_count(member_count: usize) -> Result<usize, LabelError> {
+    if member_count == 0 {
+        return Err(LabelError::BadTopologyRoster);
+    }
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+        .checked_add(
+            member_count
+                .checked_mul(POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE)
+                .ok_or(LabelError::BadTopologyRoster)?,
+        )
+        .and_then(|size| size.checked_add(POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE))
+        .ok_or(LabelError::BadTopologyRoster)
+}
+
 pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
     // Truncate to at most EXT_WIRE_SIZE bytes; callers may pass
     // the full label file which can be > 256 KiB.
@@ -928,6 +1214,7 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
     let has_policy = features_compat & features::POOL_REDUNDANCY_POLICY != 0;
     let has_device_layout = features_compat & features::DEVICE_LAYOUT_V1 != 0;
     let has_topology_roster = features_compat & features::TOPOLOGY_ROSTER_V1 != 0;
+    let has_pool_lifecycle = features_compat & features::POOL_LIFECYCLE_V1 != 0;
     // If health extension bit is set but the buffer is too short for the
     // extended label, reject early before slicing past the buffer.
     if has_health && buf.len() < POOL_LABEL_V1_HEALTH_WIRE_SIZE {
@@ -955,6 +1242,9 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
     }
     if has_topology_roster && !has_device_layout {
         return Err(LabelError::BadTopologyRoster);
+    }
+    if has_pool_lifecycle && !has_topology_roster {
+        return Err(LabelError::BadPoolLifecycle);
     }
     let (device_health, device_read_errors, device_write_errors, device_checksum_errors) =
         if has_health {
@@ -1009,6 +1299,11 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
             return Err(LabelError::BadTopologyRoster);
         }
     }
+    if let Some(lifecycle) = decode_pool_lifecycle_v1(buf)? {
+        if lifecycle.topology_generation() != topology_generation {
+            return Err(LabelError::BadPoolLifecycle);
+        }
+    }
 
     Ok(PoolLabelV1 {
         magic,
@@ -1061,15 +1356,34 @@ pub fn seal_label_with_device_layout(
 /// topology-roster feature bits. Each sidecar keeps its own integrity field;
 /// the label checksum commits their presence.
 pub fn seal_label_with_extensions(
+    label: PoolLabelV1,
+    device_layout_v1: Option<&DeviceLayoutV1Bytes>,
+    topology_roster_v1: Option<&[[u8; 16]]>,
+) -> Result<PoolLabelV1, LabelError> {
+    seal_label_with_all_extensions(label, device_layout_v1, topology_roster_v1, None)
+}
+
+/// Seal a label while committing the presence of every current extension.
+pub fn seal_label_with_all_extensions(
     mut label: PoolLabelV1,
     device_layout_v1: Option<&DeviceLayoutV1Bytes>,
     topology_roster_v1: Option<&[[u8; 16]]>,
+    pool_lifecycle_v1: Option<PoolLifecycleRecordV1<'_>>,
 ) -> Result<PoolLabelV1, LabelError> {
     if topology_roster_v1.is_some() && device_layout_v1.is_none() {
         return Err(LabelError::BadTopologyRoster);
     }
+    if pool_lifecycle_v1.is_some() && topology_roster_v1.is_none() {
+        return Err(LabelError::BadPoolLifecycle);
+    }
     if let Some(members) = topology_roster_v1 {
         validate_topology_roster_v1(&label, members)?;
+    }
+    if let Some(record) = pool_lifecycle_v1 {
+        if record.topology_generation != label.topology_generation {
+            return Err(LabelError::BadPoolLifecycle);
+        }
+        pool_lifecycle_v1_wire_size(record)?;
     }
     let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
     label.checksum = [0u8; 32];
@@ -1083,12 +1397,18 @@ pub fn seal_label_with_extensions(
     } else {
         label.features_compat &= !features::TOPOLOGY_ROSTER_V1;
     }
+    if pool_lifecycle_v1.is_some() {
+        label.features_compat |= features::POOL_LIFECYCLE_V1;
+    } else {
+        label.features_compat &= !features::POOL_LIFECYCLE_V1;
+    }
     encode_label_header(
         &label,
         true,
         true,
         device_layout_v1.is_some(),
         topology_roster_v1.is_some(),
+        pool_lifecycle_v1.is_some(),
         &mut buf,
     )?;
     label
@@ -1197,7 +1517,8 @@ pub fn verify_label_checksum(label: &PoolLabelV1) -> bool {
     let policy = label.features_compat & features::POOL_REDUNDANCY_POLICY != 0;
     let layout = label.features_compat & features::DEVICE_LAYOUT_V1 != 0;
     let roster = label.features_compat & features::TOPOLOGY_ROSTER_V1 != 0;
-    if encode_label_header(label, health, policy, layout, roster, &mut buf).is_err() {
+    let lifecycle = label.features_compat & features::POOL_LIFECYCLE_V1 != 0;
+    if encode_label_header(label, health, policy, layout, roster, lifecycle, &mut buf).is_err() {
         return false;
     }
     let (checksum_offset, checksum_end) = if policy {
@@ -1633,6 +1954,169 @@ mod tests {
         assert_eq!(
             decode_label(&incomplete),
             Err(LabelError::BadTopologyRoster)
+        );
+    }
+
+    fn encode_lifecycle_label(kind: PoolLifecycleKindV1, sequence: u64, payload: &[u8]) -> Vec<u8> {
+        let layout = [0x5Au8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        let members = [[0x11; 16], [0x22; 16]];
+        let mut label = PoolLabelV1::new([0xAA; 16], members[1], "lifecycle");
+        label.device_index = 1;
+        label.device_count = 2;
+        label.topology_generation = 9;
+        let lifecycle = PoolLifecycleRecordV1::new(sequence, 9, kind, payload).unwrap();
+        let sealed =
+            seal_label_with_all_extensions(label, Some(&layout), Some(&members), Some(lifecycle))
+                .unwrap();
+        let mut encoded = vec![0; POOL_LABEL_SIZE];
+        encode_label_with_all_extensions(
+            &sealed,
+            Some(&layout),
+            Some(&members),
+            Some(lifecycle),
+            &mut encoded,
+        )
+        .unwrap();
+        encoded
+    }
+
+    fn lifecycle_offset(member_count: usize) -> usize {
+        POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE
+            + member_count * POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE
+            + POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE
+    }
+
+    fn rechecksum_lifecycle(encoded: &mut [u8], start: usize, payload_len: usize) {
+        let checksum_offset = start + POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE + payload_len;
+        let checksum = blake3::hash(&encoded[start..checksum_offset]);
+        encoded[checksum_offset..checksum_offset + POOL_LABEL_LIFECYCLE_V1_CHECKSUM_SIZE]
+            .copy_from_slice(checksum.as_bytes());
+    }
+
+    #[test]
+    fn lifecycle_roundtrip_preserves_clear_removal_and_replacement() {
+        let cases: &[(PoolLifecycleKindV1, u64, &[u8])] = &[
+            (PoolLifecycleKindV1::Clear, 4, b""),
+            (PoolLifecycleKindV1::DeviceRemoval, 5, b"removal-intent"),
+            (
+                PoolLifecycleKindV1::DeviceReplacement,
+                6,
+                b"replacement-evidence",
+            ),
+        ];
+
+        for &(kind, sequence, payload) in cases {
+            let encoded = encode_lifecycle_label(kind, sequence, payload);
+            let label = decode_label(&encoded).unwrap();
+            assert!(label.features_compat & features::POOL_LIFECYCLE_V1 != 0);
+            let lifecycle = decode_pool_lifecycle_v1(&encoded).unwrap().unwrap();
+            assert_eq!(lifecycle.sequence(), sequence);
+            assert_eq!(lifecycle.topology_generation(), 9);
+            assert_eq!(lifecycle.kind(), kind);
+            assert_eq!(lifecycle.payload(), payload);
+            assert_eq!(
+                pool_lifecycle_v1_wire_size(lifecycle).unwrap(),
+                POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE
+                    + payload.len()
+                    + POOL_LABEL_LIFECYCLE_V1_CHECKSUM_SIZE
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_requires_roster_valid_sequence_and_matching_topology() {
+        let layout = [0x5Au8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        let members = [[0x11; 16], [0x22; 16]];
+        let mut label = PoolLabelV1::new([0xAA; 16], members[0], "lifecycle-invalid");
+        label.device_count = 2;
+        label.topology_generation = 9;
+        let removal =
+            PoolLifecycleRecordV1::new(1, 9, PoolLifecycleKindV1::DeviceRemoval, b"intent")
+                .unwrap();
+
+        assert_eq!(
+            seal_label_with_all_extensions(label.clone(), Some(&layout), None, Some(removal)),
+            Err(LabelError::BadPoolLifecycle)
+        );
+        let stale = PoolLifecycleRecordV1::new(1, 8, PoolLifecycleKindV1::DeviceRemoval, b"intent")
+            .unwrap();
+        assert_eq!(
+            seal_label_with_all_extensions(label, Some(&layout), Some(&members), Some(stale)),
+            Err(LabelError::BadPoolLifecycle)
+        );
+        assert_eq!(
+            PoolLifecycleRecordV1::new(0, 9, PoolLifecycleKindV1::Clear, b""),
+            Err(LabelError::BadPoolLifecycle)
+        );
+        assert_eq!(
+            PoolLifecycleRecordV1::new(1, 9, PoolLifecycleKindV1::Clear, b"payload"),
+            Err(LabelError::BadPoolLifecycle)
+        );
+        assert_eq!(
+            PoolLifecycleRecordV1::new(1, 9, PoolLifecycleKindV1::DeviceRemoval, b""),
+            Err(LabelError::BadPoolLifecycle)
+        );
+    }
+
+    #[test]
+    fn lifecycle_checksum_corruption_and_truncation_fail_closed() {
+        let mut encoded = encode_lifecycle_label(PoolLifecycleKindV1::DeviceRemoval, 7, b"intent");
+        let start = lifecycle_offset(2);
+        encoded[start + POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE] ^= 1;
+        assert_eq!(
+            decode_label(&encoded),
+            Err(LabelError::PoolLifecycleChecksumMismatch)
+        );
+
+        let encoded = encode_lifecycle_label(PoolLifecycleKindV1::Clear, 8, b"");
+        let exact_end = start + POOL_LABEL_LIFECYCLE_V1_MIN_WIRE_SIZE;
+        assert_eq!(
+            decode_label(&encoded[..exact_end - 1]),
+            Err(LabelError::BadPoolLifecycle)
+        );
+    }
+
+    #[test]
+    fn lifecycle_rejects_invalid_kind_reserved_payload_and_generation() {
+        let start = lifecycle_offset(2);
+
+        let mut invalid_kind =
+            encode_lifecycle_label(PoolLifecycleKindV1::DeviceRemoval, 9, b"intent");
+        invalid_kind[start + 10] = 0xFF;
+        assert_eq!(
+            decode_label(&invalid_kind),
+            Err(LabelError::BadPoolLifecycle)
+        );
+
+        let mut reserved = encode_lifecycle_label(PoolLifecycleKindV1::DeviceRemoval, 9, b"intent");
+        reserved[start + 11] = 1;
+        assert_eq!(decode_label(&reserved), Err(LabelError::BadPoolLifecycle));
+
+        let mut clear_with_payload =
+            encode_lifecycle_label(PoolLifecycleKindV1::DeviceRemoval, 9, b"intent");
+        clear_with_payload[start + 10] = PoolLifecycleKindV1::Clear as u8;
+        rechecksum_lifecycle(&mut clear_with_payload, start, b"intent".len());
+        assert_eq!(
+            decode_label(&clear_with_payload),
+            Err(LabelError::BadPoolLifecycle)
+        );
+
+        let mut active_without_payload = encode_lifecycle_label(PoolLifecycleKindV1::Clear, 9, b"");
+        active_without_payload[start + 10] = PoolLifecycleKindV1::DeviceReplacement as u8;
+        rechecksum_lifecycle(&mut active_without_payload, start, 0);
+        assert_eq!(
+            decode_label(&active_without_payload),
+            Err(LabelError::BadPoolLifecycle)
+        );
+
+        let mut stale_generation =
+            encode_lifecycle_label(PoolLifecycleKindV1::DeviceRemoval, 9, b"intent");
+        stale_generation[start + 20..start + 28].copy_from_slice(&8u64.to_le_bytes());
+        rechecksum_lifecycle(&mut stale_generation, start, b"intent".len());
+        assert_eq!(
+            decode_label(&stale_generation),
+            Err(LabelError::BadPoolLifecycle)
         );
     }
 
