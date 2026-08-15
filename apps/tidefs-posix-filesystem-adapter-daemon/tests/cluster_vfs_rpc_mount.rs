@@ -5,8 +5,11 @@ use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tidefs_auth::{
     NodePrivateCredential, NodePublicIdentity, NODE_PRIVATE_CREDENTIAL_WIRE_SIZE,
@@ -14,17 +17,16 @@ use tidefs_auth::{
 };
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId as LifecycleDatasetId, SyncGuarantee};
 use tidefs_local_filesystem::{
-    human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem,
-    LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy, RootAuthenticationKey,
+    human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem,
+    ExternalMutationDeadline, LocalFileSystem, LocalFileSystemOpenConfig,
+    LocalStorageAllocatorPolicy, RootAuthenticationKey,
 };
 use tidefs_local_object_store::pool::PoolRedundancyPolicy;
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_owner::{
     ClusterVfsRpcOwnerConfig, ClusterVfsRpcOwnerHandle, ClusterVfsRpcWriterFence,
 };
 use tidefs_posix_filesystem_adapter_daemon::fuse_vfs_adapter::FuseVfsAdapter;
-use tidefs_posix_filesystem_adapter_daemon::{
-    start_cluster_vfs_rpc_mount, ClusterVfsRpcMountConfig,
-};
+use tidefs_posix_filesystem_adapter_daemon::{run_cluster_vfs_rpc_mount, ClusterVfsRpcMountConfig};
 use tidefs_recovery_loop::RecoveryPolicy;
 use tidefs_vfs_rpc::DatasetId;
 
@@ -63,6 +65,16 @@ impl ProvisionedIdentity {
         NodePublicIdentity::decode_fixed(&self.public_bytes)
             .expect("decode provisioned test public identity")
     }
+}
+
+fn mount_is_present(mountpoint: &Path) -> bool {
+    fs::read_to_string("/proc/self/mountinfo").is_ok_and(|mountinfo| {
+        mountinfo.lines().any(|line| {
+            line.split_whitespace()
+                .nth(4)
+                .is_some_and(|path| Path::new(path) == mountpoint)
+        })
+    })
 }
 
 #[test]
@@ -132,6 +144,8 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
         WRITER_TERM,
         WRITER_EPOCH,
     )));
+    let initial_authority_deadline = Instant::now() + Duration::from_secs(12);
+    let authority_deadline = ExternalMutationDeadline::new_until(initial_authority_deadline);
     let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
         "127.0.0.1:0".parse().unwrap(),
         OWNER_NODE,
@@ -140,20 +154,35 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
         POOL_GUID,
         dataset_id,
         writer_fence,
+        authority_deadline.clone(),
         owner_adapter.engine_handle(),
         Arc::clone(&shutdown),
     ))
     .expect("start Pool-backed VFS_RPC owner");
 
-    let mut mount = start_cluster_vfs_rpc_mount(ClusterVfsRpcMountConfig::new(
+    let mount_config = ClusterVfsRpcMountConfig::new(
         mountpoint.clone(),
         owner.bound_addr(),
         POOL_GUID,
         client_identity.credential(),
         owner_identity.public_identity(),
-    ))
-    .expect("mount authenticated remote Pool through FUSE");
-    assert_eq!(mount.mountpoint(), mountpoint);
+    );
+    let mount_thread = thread::spawn(move || run_cluster_vfs_rpc_mount(mount_config));
+    let mount_start_deadline = Instant::now() + Duration::from_secs(10);
+    while !mount_is_present(&mountpoint) {
+        if mount_thread.is_finished() {
+            let result = mount_thread
+                .join()
+                .expect("cluster VFS_RPC mount thread must not panic");
+            panic!("cluster VFS_RPC mount exited during startup: {result:?}");
+        }
+        assert!(
+            Instant::now() < mount_start_deadline,
+            "cluster VFS_RPC mount did not appear before its startup deadline"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    authority_deadline.renew_until(initial_authority_deadline + Duration::from_secs(3));
 
     let file_path = mountpoint.join("remote-file");
     let expected = b"real FUSE path reached the authenticated remote Pool owner";
@@ -203,8 +232,41 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
     fs::remove_file(&hard_link).expect("unlink remote hard link");
     fs::remove_dir(&directory).expect("rmdir through real remote mount");
 
-    mount.stop();
-    owner.stop().expect("stop Pool-backed VFS_RPC owner");
-    assert!(!shutdown.load(Ordering::Acquire));
+    while Instant::now() <= initial_authority_deadline + Duration::from_millis(20) {
+        assert!(
+            !mount_thread.is_finished(),
+            "renewable owner mount exited before the original authority deadline"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    fs::metadata(&mountpoint).expect("serve mounted metadata past the original authority deadline");
+
+    authority_deadline.fence();
+    let idle_unmount_deadline = initial_authority_deadline + Duration::from_secs(5);
+    while !mount_thread.is_finished() && Instant::now() < idle_unmount_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        mount_thread.is_finished(),
+        "idle clustered FUSE run loop did not expire and unmount the stale frontend"
+    );
+    let mount_error = mount_thread
+        .join()
+        .expect("cluster VFS_RPC mount thread must not panic")
+        .expect_err("expired owner authority must fail the clustered mount run loop");
+    assert!(
+        mount_error.contains("owner authority lost or expired")
+            && mount_error.contains("stale frontend unmounted"),
+        "unexpected stale-mount error: {mount_error}"
+    );
+    assert!(
+        !mount_is_present(&mountpoint),
+        "authority-expired clustered FUSE frontend must be unmounted"
+    );
+    let owner_error = owner
+        .stop()
+        .expect_err("expired owner deadline must stop the owner service");
+    assert!(owner_error.contains("mutation authority deadline has expired"));
+    assert!(shutdown.load(Ordering::Acquire));
     drop(owner_adapter);
 }

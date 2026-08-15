@@ -13,6 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use tidefs_auth::{NodeKeyStore, NodePrivateCredential, NodePublicIdentity};
+use tidefs_local_filesystem::ExternalMutationDeadline;
 use tidefs_transport::{
     EndpointFamily, SessionCloseReason, SessionId, Transport, TransportAddr, TransportError,
     TransportSessionSet,
@@ -80,6 +81,7 @@ pub struct ClusterVfsRpcOwnerConfig {
     pool_guid: [u8; 16],
     dataset_id: DatasetId,
     writer_fence: Arc<Mutex<ClusterVfsRpcWriterFence>>,
+    mutation_deadline: ExternalMutationDeadline,
     engine: LiveOwnerEngine,
     shutdown: Arc<AtomicBool>,
 }
@@ -94,6 +96,7 @@ impl ClusterVfsRpcOwnerConfig {
         pool_guid: [u8; 16],
         dataset_id: DatasetId,
         writer_fence: Arc<Mutex<ClusterVfsRpcWriterFence>>,
+        mutation_deadline: ExternalMutationDeadline,
         engine: LiveOwnerEngine,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
@@ -105,6 +108,7 @@ impl ClusterVfsRpcOwnerConfig {
             pool_guid,
             dataset_id,
             writer_fence,
+            mutation_deadline,
             engine,
             shutdown,
         }
@@ -151,6 +155,7 @@ impl ClusterVfsRpcOwnerConfig {
             return Err("cluster VFS_RPC dataset identity must be nonzero".to_string());
         }
         self.current_writer_fence()?;
+        self.current_lease_remaining_ms()?;
         Ok(())
     }
 
@@ -166,6 +171,17 @@ impl ClusterVfsRpcOwnerConfig {
             );
         }
         Ok(fence)
+    }
+
+    fn current_lease_remaining_ms(&self) -> Result<u64, String> {
+        let remaining_ms =
+            u64::try_from(self.mutation_deadline.remaining().as_millis()).unwrap_or(u64::MAX);
+        if remaining_ms == 0 {
+            return Err(
+                "cluster VFS_RPC owner mutation authority deadline has expired".to_string(),
+            );
+        }
+        Ok(remaining_ms)
     }
 
     fn trusted_peer_nodes(&self) -> BTreeSet<u64> {
@@ -327,6 +343,7 @@ fn run_owner(
 
     while !stop.load(Ordering::Acquire) && !config.shutdown.load(Ordering::Acquire) {
         let writer = config.current_writer_fence()?;
+        config.current_lease_remaining_ms()?;
         bridge.update_writer(writer.bridge_writer(config.dataset_id));
         let mut made_progress = false;
         match transport.accept_incoming() {
@@ -459,12 +476,14 @@ impl OwnerSession {
         sessions.mark_healthy(session_id);
         let adapter =
             VfsRpcTransportAdapter::new(VfsRpcTransportAdapterConfig::default(), sessions);
+        let lease_remaining_ms = config.current_lease_remaining_ms()?;
         let authority = VfsRpcSessionAuthority::new(
             config.pool_guid,
             config.dataset_id,
             fence.writer_node,
             fence.term,
             fence.epoch,
+            lease_remaining_ms,
         )
         .map_err(|error| format!("build cluster VFS_RPC session authority: {error}"))?;
         let (mut authority_envelope, authority_payload) = adapter
