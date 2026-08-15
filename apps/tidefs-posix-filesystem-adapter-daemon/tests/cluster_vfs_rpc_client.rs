@@ -355,21 +355,6 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
     owner
         .check_health()
         .expect("owner must remain healthy after refusing the untrusted key");
-    owner
-        .stop()
-        .expect("stop owner after the deliberate authentication refusal");
-    let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        OWNER_NODE,
-        CLIENT_NODE,
-        owner_identity.credential(),
-        client_identity.public_identity(),
-        dataset_id,
-        Arc::clone(&writer_fence),
-        owner_adapter.engine_handle(),
-        Arc::clone(&shutdown),
-    ))
-    .expect("restart exact-trust owner after the negative handshake proof");
 
     assert_get_root_refused(
         owner.bound_addr(),

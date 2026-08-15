@@ -508,7 +508,7 @@ impl ClientState {
             let received_at = Instant::now();
             let inbound = self
                 .adapter
-                .unwrap_inbound(received_at, &envelope, &payload)
+                .unwrap_inbound(received_at, self.session_id, &envelope, &payload)
                 .map_err(|error| error.errno())?;
             let VfsRpcInboundFrame::Response { response, .. } = inbound else {
                 return Err(Errno::EPROTO);
