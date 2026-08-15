@@ -58,6 +58,7 @@ pub mod pool_label_bridge;
 pub mod pool_lease_client;
 pub mod pool_lease_token;
 pub mod pool_orchestrator;
+pub mod pool_owner_lease;
 pub mod pool_protocol;
 
 pub mod authority;
@@ -112,11 +113,13 @@ pub use pool_orchestrator::{
     OrchestratorError, PoolCreateDispatchEvidence, PoolTransport,
     CLUSTER_POOL_CREATE_DISPATCH_EVIDENCE,
 };
+pub use pool_owner_lease::{PoolOwnerLeaseAuthority, PoolOwnerLeaseError};
 pub use pool_protocol::{
     CatalogEntryRow, CatalogQueryType, ClusterPoolCatalogDeltaRequest,
     ClusterPoolCatalogDeltaResponse, ClusterPoolCatalogQueryRequest,
     ClusterPoolCatalogQueryResponse, ClusterPoolCreateRequest, ClusterPoolCreateResponse,
-    ClusterPoolImportRequest, ClusterPoolImportResponse, ClusterPoolMessage, NodeDeviceSpec,
+    ClusterPoolImportRequest, ClusterPoolImportResponse, ClusterPoolLeaseAction,
+    ClusterPoolLeaseRequest, ClusterPoolLeaseResponse, ClusterPoolMessage, NodeDeviceSpec,
     PoolProtocolError,
 };
 pub use protocol::{

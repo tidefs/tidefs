@@ -21,8 +21,8 @@
 use crate::pool_lease_token::PoolLeaseToken;
 use crate::pool_protocol::{
     CatalogQueryType, ClusterPoolCatalogDeltaRequest, ClusterPoolCatalogDeltaResponse,
-    ClusterPoolCatalogQueryRequest, ClusterPoolCatalogQueryResponse, ClusterPoolLeaseRequest,
-    ClusterPoolMessage, PoolProtocolError,
+    ClusterPoolCatalogQueryRequest, ClusterPoolCatalogQueryResponse, ClusterPoolLeaseAction,
+    ClusterPoolLeaseRequest, ClusterPoolMessage, PoolProtocolError,
 };
 
 /// Magic prefix for cluster pool protocol messages (CP01 = Cluster Pool v1).
@@ -109,6 +109,7 @@ impl ClusterLeaseClient {
             request_id: 1,
             pool_guid,
             requesting_node_id,
+            action: ClusterPoolLeaseAction::Acquire,
         });
         let encoded = request.encode()?;
 
@@ -288,7 +289,8 @@ mod tests {
 
     use crate::pool_lease_token::PoolLeaseToken;
     use crate::pool_protocol::{
-        ClusterPoolLeaseRequest, ClusterPoolLeaseResponse, ClusterPoolMessage,
+        ClusterPoolLeaseAction, ClusterPoolLeaseRequest, ClusterPoolLeaseResponse,
+        ClusterPoolMessage,
     };
     use crate::write_fence::WriteFence;
     use tidefs_membership_epoch::EpochId;
@@ -299,6 +301,7 @@ mod tests {
             request_id: 42,
             pool_guid: [0xAB; 16],
             requesting_node_id: 7,
+            action: ClusterPoolLeaseAction::Acquire,
         });
         let encoded = req.encode().unwrap();
         let decoded = ClusterPoolMessage::decode(&encoded).unwrap();
@@ -325,6 +328,7 @@ mod tests {
             success: true,
             lease_token_bytes: Some(token_bytes.clone()),
             lease_expiration_ms: Some(120_000),
+            lease_remaining_ms: Some(30_000),
             error: None,
         });
         let encoded = resp.encode().unwrap();
@@ -350,6 +354,7 @@ mod tests {
             success: false,
             lease_token_bytes: None,
             lease_expiration_ms: None,
+            lease_remaining_ms: None,
             error: Some("no active lease".into()),
         });
         let encoded = resp.encode().unwrap();

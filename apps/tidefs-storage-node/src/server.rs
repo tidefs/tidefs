@@ -14,12 +14,13 @@ use std::time::{Duration, Instant};
 use tidefs_cluster::placement_heal::RelocationFlowCommitPlacementPublication;
 use tidefs_cluster::pool_protocol::{
     CatalogEntryRow, ClusterPoolCatalogDeltaResponse, ClusterPoolCatalogQueryResponse,
-    ClusterPoolCreateResponse, ClusterPoolImportResponse, ClusterPoolLeaseResponse,
-    ClusterPoolMessage,
+    ClusterPoolCreateResponse, ClusterPoolImportResponse, ClusterPoolLeaseAction,
+    ClusterPoolLeaseResponse, ClusterPoolMessage,
 };
 use tidefs_cluster::{
     ClusterLeaseConfig, ClusterLeaseRuntime, FenceAuthority, FenceValidator, PlacementMap,
-    RebuildFlowCommitPlacementPublication, RebuildHealCompletionPublication,
+    PoolOwnerLeaseAuthority, RebuildFlowCommitPlacementPublication,
+    RebuildHealCompletionPublication,
 };
 use tidefs_cluster::{ClusterPlacementPolicy, ClusterRedundancy};
 use tidefs_durability_layout::DurabilityLayoutV1;
@@ -2833,6 +2834,8 @@ struct SessionContext {
     /// When None (not yet wired), lease requests are refused with a
     /// "not configured" error.
     lease_runtime: Option<std::sync::Arc<std::sync::Mutex<ClusterLeaseRuntime>>>,
+    /// Requester-bound live writer leases for mounted Pool owners.
+    pool_owner_leases: Option<Arc<Mutex<PoolOwnerLeaseAuthority>>>,
     /// Split-brain guard for partition-based fencing of write operations.
     /// When set and the node is on the minority side of a partition,
     /// write-gating operations (import, catalog mutations, lease grants)
@@ -2879,6 +2882,8 @@ pub struct StorageNode {
     /// Wrapped in Arc<Mutex<>> so it can be shared into SessionContext
     /// for per-session lease token grants.
     cluster_lease_runtime: Option<Arc<Mutex<ClusterLeaseRuntime>>>,
+    /// Requester-bound live writer leases for mounted Pool owners.
+    pool_owner_leases: Option<Arc<Mutex<PoolOwnerLeaseAuthority>>>,
     /// Write-fence validator for transport-layer write gating.
     /// Extracted from the FenceAuthority in ClusterLeaseRuntime.
     fence_validator: Option<FenceValidator>,
@@ -3776,6 +3781,16 @@ impl StorageNode {
             } else {
                 (None, None)
             };
+        let pool_owner_leases = config
+            .cluster_lease_config
+            .as_ref()
+            .map(|lease_config| {
+                let epoch = membership.lock().unwrap().view().epoch;
+                PoolOwnerLeaseAuthority::new(epoch, lease_config.lease_term_ms)
+                    .map(|authority| Arc::new(Mutex::new(authority)))
+                    .map_err(|error| format!("initialize Pool owner lease authority: {error}"))
+            })
+            .transpose()?;
 
         Ok(Self {
             transport: storage_transport,
@@ -3799,6 +3814,7 @@ impl StorageNode {
             join_pipeline: JoinPipeline::new(),
             stop: Arc::new(AtomicBool::new(false)),
             cluster_lease_runtime,
+            pool_owner_leases,
             fence_validator,
             split_brain_guard,
         })
@@ -4051,6 +4067,7 @@ impl StorageNode {
             active_barrier: Arc::clone(&self.active_barrier),
             fence_validator: self.fence_validator.clone(),
             lease_runtime: self.cluster_lease_runtime.as_ref().map(Arc::clone),
+            pool_owner_leases: self.pool_owner_leases.as_ref().map(Arc::clone),
         };
 
         thread::spawn(move || {
@@ -4550,6 +4567,75 @@ fn check_partition_fence(ctx: &SessionContext) -> Result<(), String> {
     Ok(())
 }
 
+fn monotonic_time_millis() -> u64 {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    ORIGIN
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn authenticate_pool_owner_request(
+    peer_node_id: Option<u64>,
+    requesting_node_id: u64,
+) -> Result<(), String> {
+    match peer_node_id {
+        Some(authenticated) if authenticated == requesting_node_id => Ok(()),
+        Some(authenticated) => Err(format!(
+            "lease requester identity mismatch: authenticated node {authenticated}, request names {requesting_node_id}"
+        )),
+        None => Err("lease requester has no authenticated transport identity".to_string()),
+    }
+}
+
+fn admitted_pool_owner_epoch(
+    ctx: &SessionContext,
+    requesting_node_id: u64,
+) -> Result<EpochId, String> {
+    let view = ctx.membership.lock().unwrap().view();
+    admitted_pool_owner_epoch_from_view(&view, requesting_node_id)
+}
+
+fn admitted_pool_owner_epoch_from_view(
+    view: &MembershipView,
+    requesting_node_id: u64,
+) -> Result<EpochId, String> {
+    if view.epoch.0 == 0 {
+        return Err("membership has no committed epoch".to_string());
+    }
+    let member = view
+        .nodes
+        .iter()
+        .find(|node| node.member_id.0 == requesting_node_id)
+        .ok_or_else(|| {
+            format!(
+                "node {requesting_node_id} is not in committed membership epoch {}",
+                view.epoch.0
+            )
+        })?;
+    if member.epoch != view.epoch {
+        return Err(format!(
+            "node {requesting_node_id} membership epoch {} is not current epoch {}",
+            member.epoch.0, view.epoch.0
+        ));
+    }
+    if member.health != HealthClass::Healthy {
+        return Err(format!(
+            "node {requesting_node_id} is not healthy in membership epoch {}: {:?}",
+            view.epoch.0, member.health
+        ));
+    }
+    if member.joining || member.draining {
+        return Err(format!(
+            "node {requesting_node_id} is not eligible for Pool ownership: joining={} draining={}",
+            member.joining, member.draining
+        ));
+    }
+    Ok(view.epoch)
+}
+
 fn handle_cluster_pool_message(
     session_id: tidefs_transport::SessionId,
     peer_node_id: Option<u64>,
@@ -4741,90 +4827,104 @@ fn handle_cluster_pool_message(
             ))
         }
         ClusterPoolMessage::LeaseRequest(req) => {
+            let action_name = match &req.action {
+                ClusterPoolLeaseAction::Acquire => "acquire",
+                ClusterPoolLeaseAction::Renew { .. } => "renew",
+                ClusterPoolLeaseAction::Release { .. } => "release",
+            };
             eprintln!(
-                "[storage-node] session {session_id}: cluster pool lease request pool_guid={:02x?} requesting_node={}",
-                &req.pool_guid[..4], req.requesting_node_id
+                "[storage-node] session {session_id}: cluster pool lease {action_name} pool_guid={:02x?} requesting_node={}",
+                &req.pool_guid[..4], req.requesting_node_id,
             );
 
-            if let Err(fence_err) = check_partition_fence(ctx) {
-                eprintln!("[storage-node] session {session_id}: lease refused: {fence_err}");
-                return Some(ClusterPoolMessage::LeaseResponse(
+            let refusal = |error: String| {
+                Some(ClusterPoolMessage::LeaseResponse(
                     ClusterPoolLeaseResponse {
                         request_id: req.request_id,
-                        node_id: req.requesting_node_id,
+                        node_id: ctx.config.node_id,
                         pool_guid: req.pool_guid,
                         success: false,
                         lease_token_bytes: None,
                         lease_expiration_ms: None,
-                        error: Some(fence_err),
+                        lease_remaining_ms: None,
+                        error: Some(error),
                     },
-                ));
+                ))
+            };
+
+            if let Err(error) =
+                authenticate_pool_owner_request(peer_node_id, req.requesting_node_id)
+            {
+                return refusal(error);
             }
 
-            let (success, lease_token_bytes, lease_expiration_ms, error) =
-                if let Some(ref lease_rt) = ctx.lease_runtime {
-                    let mut rt = lease_rt.lock().unwrap();
-                    match rt.try_get_pool_lease_token(req.pool_guid) {
-                        Some(token) => {
-                            if token.authorizes_pool(&req.pool_guid) {
-                                let token_bytes = bincode::serialize(&token).unwrap_or_default();
-                                // Track this remote client in the active-client mode tracker.
-                                // Derive a dataset_id from the pool_guid for per-pool tracking.
-                                let dataset_id = u64::from_le_bytes([
-                                    req.pool_guid[0],
-                                    req.pool_guid[1],
-                                    req.pool_guid[2],
-                                    req.pool_guid[3],
-                                    req.pool_guid[4],
-                                    req.pool_guid[5],
-                                    req.pool_guid[6],
-                                    req.pool_guid[7],
-                                ]);
-                                let _ =
-                                    rt.remote_client_mounted(dataset_id, req.requesting_node_id);
-                                (
-                                    true,
-                                    Some(token_bytes),
-                                    Some(token.expiration_deadline_ms),
-                                    None,
-                                )
-                            } else {
-                                (
-                                    false,
-                                    None,
-                                    None,
-                                    Some("lease token pool GUID mismatch".to_string()),
-                                )
-                            }
-                        }
-                        None => (
-                            false,
-                            None,
-                            None,
-                            Some(
-                                "no active lease for this pool; acquire cluster membership first"
-                                    .to_string(),
-                            ),
-                        ),
+            if !matches!(&req.action, ClusterPoolLeaseAction::Release { .. }) {
+                if let Err(error) = check_partition_fence(ctx) {
+                    return refusal(error);
+                }
+            }
+
+            let epoch = match admitted_pool_owner_epoch(ctx, req.requesting_node_id) {
+                Ok(epoch) => epoch,
+                Err(_error) if matches!(&req.action, ClusterPoolLeaseAction::Release { .. }) => {
+                    ctx.membership.lock().unwrap().view().epoch
+                }
+                Err(error) => return refusal(error),
+            };
+            let now_ms = monotonic_time_millis();
+            let Some(ref authority) = ctx.pool_owner_leases else {
+                return refusal("Pool owner lease authority is not configured".to_string());
+            };
+            let mut authority = authority.lock().unwrap();
+            if let Err(error) = authority.advance_epoch(epoch, now_ms) {
+                return refusal(error.to_string());
+            }
+
+            let token = match &req.action {
+                ClusterPoolLeaseAction::Acquire => authority
+                    .acquire(req.pool_guid, req.requesting_node_id, now_ms)
+                    .map(Some),
+                ClusterPoolLeaseAction::Renew { token } => {
+                    if token.node_id != req.requesting_node_id || token.pool_guid != req.pool_guid {
+                        Err(tidefs_cluster::PoolOwnerLeaseError::StaleToken)
+                    } else {
+                        authority.renew(token.clone(), now_ms).map(Some)
                     }
-                } else {
-                    (
-                        false,
-                        None,
-                        None,
-                        Some("cluster lease runtime not configured on this node".to_string()),
-                    )
-                };
+                }
+                ClusterPoolLeaseAction::Release { token } => {
+                    if token.node_id != req.requesting_node_id || token.pool_guid != req.pool_guid {
+                        Err(tidefs_cluster::PoolOwnerLeaseError::StaleToken)
+                    } else {
+                        authority.release(token).map(|()| None)
+                    }
+                }
+            };
+            let token = match token {
+                Ok(token) => token,
+                Err(error) => return refusal(error.to_string()),
+            };
+            let (lease_token_bytes, lease_expiration_ms, lease_remaining_ms) = match token {
+                Some(token) => match bincode::serialize(&token) {
+                    Ok(bytes) => (
+                        Some(bytes),
+                        Some(token.expiration_deadline_ms),
+                        Some(token.expiration_deadline_ms.saturating_sub(now_ms)),
+                    ),
+                    Err(error) => return refusal(format!("serialize Pool owner lease: {error}")),
+                },
+                None => (None, None, None),
+            };
 
             Some(ClusterPoolMessage::LeaseResponse(
                 ClusterPoolLeaseResponse {
                     request_id: req.request_id,
-                    node_id: req.requesting_node_id,
+                    node_id: ctx.config.node_id,
                     pool_guid: req.pool_guid,
-                    success,
+                    success: true,
                     lease_token_bytes,
                     lease_expiration_ms,
-                    error,
+                    lease_remaining_ms,
+                    error: None,
                 },
             ))
         }
@@ -6316,8 +6416,193 @@ mod cluster_pool_handler_tests {
             active_barrier: Arc::new(Mutex::new(None)),
             fence_validator: None,
             lease_runtime: None,
+            pool_owner_leases: None,
             split_brain_guard: None,
         }
+    }
+
+    fn pool_owner_membership_view(
+        health: HealthClass,
+        joining: bool,
+        draining: bool,
+    ) -> MembershipView {
+        MembershipView {
+            epoch: EpochId::new(7),
+            config_class: tidefs_membership_epoch::ConfigClass::Normal,
+            local_member: MemberId::new(1),
+            nodes: vec![tidefs_membership_live::MembershipViewNode {
+                member_id: MemberId::new(2),
+                member_class: MemberClass::Voter,
+                health,
+                epoch: EpochId::new(7),
+                failure_domain: 2,
+                joining,
+                draining,
+            }],
+            placement_version: 0,
+        }
+    }
+
+    #[test]
+    fn cluster_pool_handler_authenticates_the_named_pool_owner() {
+        assert!(authenticate_pool_owner_request(Some(2), 2).is_ok());
+        assert!(authenticate_pool_owner_request(None, 2)
+            .unwrap_err()
+            .contains("no authenticated transport identity"));
+        assert!(authenticate_pool_owner_request(Some(3), 2)
+            .unwrap_err()
+            .contains("identity mismatch"));
+    }
+
+    #[test]
+    fn cluster_pool_handler_admits_only_current_healthy_active_member() {
+        let healthy = pool_owner_membership_view(HealthClass::Healthy, false, false);
+        assert_eq!(
+            admitted_pool_owner_epoch_from_view(&healthy, 2).unwrap(),
+            EpochId::new(7)
+        );
+        assert!(admitted_pool_owner_epoch_from_view(&healthy, 99)
+            .unwrap_err()
+            .contains("not in committed membership"));
+
+        let suspect = pool_owner_membership_view(HealthClass::Suspect, false, false);
+        assert!(admitted_pool_owner_epoch_from_view(&suspect, 2)
+            .unwrap_err()
+            .contains("not healthy"));
+
+        let joining = pool_owner_membership_view(HealthClass::Healthy, true, false);
+        assert!(admitted_pool_owner_epoch_from_view(&joining, 2)
+            .unwrap_err()
+            .contains("joining=true"));
+
+        let draining = pool_owner_membership_view(HealthClass::Healthy, false, true);
+        assert!(admitted_pool_owner_epoch_from_view(&draining, 2)
+            .unwrap_err()
+            .contains("draining=true"));
+    }
+
+    fn lease_response_token(response: ClusterPoolMessage) -> tidefs_cluster::PoolLeaseToken {
+        let ClusterPoolMessage::LeaseResponse(response) = response else {
+            panic!("expected Pool lease response");
+        };
+        assert!(
+            response.success,
+            "lease request refused: {:?}",
+            response.error
+        );
+        let expiration = response
+            .lease_expiration_ms
+            .expect("successful acquire/renew returns authority deadline");
+        let remaining = response
+            .lease_remaining_ms
+            .expect("successful acquire/renew returns remaining validity");
+        let token: tidefs_cluster::PoolLeaseToken = bincode::deserialize(
+            &response
+                .lease_token_bytes
+                .expect("successful acquire/renew returns token"),
+        )
+        .expect("decode Pool lease token");
+        assert_eq!(token.expiration_deadline_ms, expiration);
+        assert!(remaining > 0 && remaining <= expiration);
+        token
+    }
+
+    #[test]
+    fn cluster_pool_handler_lease_acquire_renew_release_handoff() {
+        let (_store_dir, store) = frame_local_store();
+        let mut ctx = frame_test_context(store);
+        {
+            let mut membership = ctx.membership.lock().unwrap();
+            membership.add_peer(MemberId::new(2), MemberClass::Voter, 2);
+            membership.add_peer(MemberId::new(3), MemberClass::Voter, 3);
+        }
+        ctx.pool_owner_leases = Some(Arc::new(Mutex::new(
+            PoolOwnerLeaseAuthority::new(EpochId::new(1), 30_000).unwrap(),
+        )));
+        let pool_guid = [0xA7; 16];
+        let request = |request_id, requesting_node_id, action| {
+            ClusterPoolMessage::LeaseRequest(
+                tidefs_cluster::pool_protocol::ClusterPoolLeaseRequest {
+                    request_id,
+                    pool_guid,
+                    requesting_node_id,
+                    action,
+                },
+            )
+        };
+
+        let first = lease_response_token(
+            handle_cluster_pool_message(
+                tidefs_transport::SessionId::new(10),
+                Some(2),
+                &request(1, 2, ClusterPoolLeaseAction::Acquire),
+                &ctx,
+            )
+            .expect("acquire response"),
+        );
+
+        let refused = handle_cluster_pool_message(
+            tidefs_transport::SessionId::new(11),
+            Some(3),
+            &request(2, 3, ClusterPoolLeaseAction::Acquire),
+            &ctx,
+        )
+        .expect("second owner refusal response");
+        let ClusterPoolMessage::LeaseResponse(refused) = refused else {
+            panic!("expected Pool lease response");
+        };
+        assert!(!refused.success);
+
+        let renewed = lease_response_token(
+            handle_cluster_pool_message(
+                tidefs_transport::SessionId::new(10),
+                Some(2),
+                &request(
+                    3,
+                    2,
+                    ClusterPoolLeaseAction::Renew {
+                        token: first.clone(),
+                    },
+                ),
+                &ctx,
+            )
+            .expect("renew response"),
+        );
+        assert_eq!(renewed.node_id, first.node_id);
+        assert_eq!(renewed.lease_id, first.lease_id);
+        assert_eq!(renewed.write_fence, first.write_fence);
+        assert!(renewed.expiration_deadline_ms >= first.expiration_deadline_ms);
+
+        let released = handle_cluster_pool_message(
+            tidefs_transport::SessionId::new(10),
+            Some(2),
+            &request(
+                4,
+                2,
+                ClusterPoolLeaseAction::Release {
+                    token: renewed.clone(),
+                },
+            ),
+            &ctx,
+        )
+        .expect("release response");
+        let ClusterPoolMessage::LeaseResponse(released) = released else {
+            panic!("expected Pool lease response");
+        };
+        assert!(released.success);
+        assert!(released.lease_token_bytes.is_none());
+
+        let handed_off = lease_response_token(
+            handle_cluster_pool_message(
+                tidefs_transport::SessionId::new(11),
+                Some(3),
+                &request(5, 3, ClusterPoolLeaseAction::Acquire),
+                &ctx,
+            )
+            .expect("handoff response"),
+        );
+        assert_eq!(handed_off.node_id, 3);
+        assert!(handed_off.write_fence.generation > first.write_fence.generation);
     }
 
     fn frame_local_store() -> (tempfile::TempDir, Arc<Mutex<StoreBackend>>) {

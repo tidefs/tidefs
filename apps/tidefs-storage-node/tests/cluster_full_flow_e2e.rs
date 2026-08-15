@@ -29,7 +29,7 @@ use tidefs_membership_epoch::HealthClass;
 use tidefs_storage_node::server::{StorageNode, StorageNodeConfig};
 
 const CLUSTER_POOL_MAGIC: &[u8; 4] = b"CP01";
-const TEST_DEVICE_BYTES: u64 = 1_048_576; // 1 MiB
+const TEST_DEVICE_BYTES: u64 = 2 * 1_048_576; // 2 MiB
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -215,8 +215,9 @@ fn cluster_full_flow_create_lease_catalog_heal() {
     let server1 = TestServer::spawn(1, scratch_store_paths("cff-s1", 1), true);
     let server2 = TestServer::spawn(2, scratch_store_paths("cff-s2", 1), true);
 
-    // Connect client to both servers.
-    let mut client = tidefs_transport::Transport::new(9990);
+    // Node 1 acts as the authenticated Pool owner and connects to both
+    // storage-node transports.
+    let mut client = tidefs_transport::Transport::new(1);
     let sid1 = connect_client(&mut client, 1, server1.addr());
     let sid2 = connect_client(&mut client, 2, server2.addr());
 
@@ -292,40 +293,123 @@ fn cluster_full_flow_create_lease_catalog_heal() {
     let lease_req = ClusterPoolLeaseRequest {
         request_id: 200,
         pool_guid,
-        requesting_node_id: 9990,
+        requesting_node_id: 1,
+        action: tidefs_cluster::ClusterPoolLeaseAction::Acquire,
     };
     send_cp01(
         &mut client,
         sid1,
         &ClusterPoolMessage::LeaseRequest(lease_req),
     );
-    let lease_resp = recv_cp01(&mut client, sid1, 100);
-    match lease_resp {
-        Some(ClusterPoolMessage::LeaseResponse(ref resp)) => {
-            if resp.success {
-                if let Some(ref token_bytes) = resp.lease_token_bytes {
-                    match bincode::deserialize::<PoolLeaseToken>(token_bytes) {
-                        Ok(token) => {
-                            assert_eq!(token.node_id, 1, "lease must be from node 1");
-                            assert!(
-                                token.authorizes_pool(&pool_guid),
-                                "token must authorize pool"
-                            );
-                            eprintln!(
-                                "[test] lease OK via session: node={} epoch={} lease_id={}",
-                                token.node_id, token.epoch.0, token.lease_id
-                            );
-                        }
-                        Err(e) => eprintln!("[test] lease token deser failed: {e:?}"),
-                    }
-                } else {
-                    eprintln!("[test] lease granted but no token bytes");
-                }
-            } else {
-                eprintln!("[test] lease refused via session: {:?}", resp.error);
-            }
+    let first_token = match recv_cp01(&mut client, sid1, 100) {
+        Some(ClusterPoolMessage::LeaseResponse(resp)) => {
+            assert!(resp.success, "lease refused via session: {:?}", resp.error);
+            bincode::deserialize::<PoolLeaseToken>(
+                &resp
+                    .lease_token_bytes
+                    .expect("acquire response returns Pool lease token"),
+            )
+            .expect("deserialize acquired Pool lease token")
         }
-        other => eprintln!("[test] unexpected lease response via session: {other:?}"),
+        other => panic!("unexpected lease response via session: {other:?}"),
+    };
+    assert_eq!(first_token.node_id, 1, "requester must own the lease");
+    assert!(first_token.authorizes_pool(&pool_guid));
+
+    send_cp01(
+        &mut client,
+        sid1,
+        &ClusterPoolMessage::LeaseRequest(ClusterPoolLeaseRequest {
+            request_id: 201,
+            pool_guid,
+            requesting_node_id: 1,
+            action: tidefs_cluster::ClusterPoolLeaseAction::Renew {
+                token: first_token.clone(),
+            },
+        }),
+    );
+    let renewed_token = match recv_cp01(&mut client, sid1, 100) {
+        Some(ClusterPoolMessage::LeaseResponse(resp)) => {
+            assert!(resp.success, "renew refused via session: {:?}", resp.error);
+            bincode::deserialize::<PoolLeaseToken>(
+                &resp
+                    .lease_token_bytes
+                    .expect("renew response returns Pool lease token"),
+            )
+            .expect("deserialize renewed Pool lease token")
+        }
+        other => panic!("unexpected renew response via session: {other:?}"),
+    };
+    assert_eq!(renewed_token.lease_id, first_token.lease_id);
+    assert_eq!(renewed_token.write_fence, first_token.write_fence);
+    assert!(renewed_token.expiration_deadline_ms > first_token.expiration_deadline_ms);
+
+    send_cp01(
+        &mut client,
+        sid1,
+        &ClusterPoolMessage::LeaseRequest(ClusterPoolLeaseRequest {
+            request_id: 202,
+            pool_guid,
+            requesting_node_id: 1,
+            action: tidefs_cluster::ClusterPoolLeaseAction::Release {
+                token: renewed_token,
+            },
+        }),
+    );
+    match recv_cp01(&mut client, sid1, 100) {
+        Some(ClusterPoolMessage::LeaseResponse(resp)) => {
+            assert!(
+                resp.success,
+                "release refused via session: {:?}",
+                resp.error
+            );
+            assert!(resp.lease_token_bytes.is_none());
+        }
+        other => panic!("unexpected release response via session: {other:?}"),
+    }
+
+    send_cp01(
+        &mut client,
+        sid1,
+        &ClusterPoolMessage::LeaseRequest(ClusterPoolLeaseRequest {
+            request_id: 203,
+            pool_guid,
+            requesting_node_id: 1,
+            action: tidefs_cluster::ClusterPoolLeaseAction::Acquire,
+        }),
+    );
+    let next_token = match recv_cp01(&mut client, sid1, 100) {
+        Some(ClusterPoolMessage::LeaseResponse(resp)) => {
+            assert!(
+                resp.success,
+                "reacquire refused via session: {:?}",
+                resp.error
+            );
+            bincode::deserialize::<PoolLeaseToken>(
+                &resp
+                    .lease_token_bytes
+                    .expect("reacquire response returns Pool lease token"),
+            )
+            .expect("deserialize reacquired Pool lease token")
+        }
+        other => panic!("unexpected reacquire response via session: {other:?}"),
+    };
+    assert!(next_token.write_fence > first_token.write_fence);
+    send_cp01(
+        &mut client,
+        sid1,
+        &ClusterPoolMessage::LeaseRequest(ClusterPoolLeaseRequest {
+            request_id: 204,
+            pool_guid,
+            requesting_node_id: 1,
+            action: tidefs_cluster::ClusterPoolLeaseAction::Release { token: next_token },
+        }),
+    );
+    match recv_cp01(&mut client, sid1, 100) {
+        Some(ClusterPoolMessage::LeaseResponse(resp)) => {
+            assert!(resp.success, "final release refused: {:?}", resp.error);
+        }
+        other => panic!("unexpected final release response: {other:?}"),
     }
 
     // -- Phase 4: Catalog delta (create dataset) through CP01 --

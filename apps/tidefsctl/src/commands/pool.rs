@@ -198,6 +198,26 @@ pub enum PoolCommand {
 
         #[command(flatten)]
         runtime: crate::commands::mount::PoolMountRuntimeArgs,
+
+        #[cfg(feature = "cluster")]
+        /// Request a cluster-authoritative mount.
+        #[arg(long = "cluster", default_value_t = false)]
+        cluster: bool,
+
+        #[cfg(feature = "cluster")]
+        /// Transport address of the storage node granting the Pool lease.
+        #[arg(long = "cluster-authority-addr", requires = "cluster")]
+        cluster_authority_addr: Option<String>,
+
+        #[cfg(feature = "cluster")]
+        /// Committed member ID that will own and mount the Pool.
+        #[arg(long = "cluster-owner-node-id", requires = "cluster")]
+        cluster_owner_node_id: Option<u64>,
+
+        #[cfg(feature = "cluster")]
+        /// Committed member ID of the storage node granting the Pool lease.
+        #[arg(long = "cluster-authority-node-id", requires = "cluster")]
+        cluster_authority_node_id: Option<u64>,
     },
 
     /// Run an integrity check through the live owner, or offline with explicit devices
@@ -356,6 +376,14 @@ pub fn handle_pool(cmd: PoolCommand) {
             encryption_passphrase,
             encryption_salt,
             runtime,
+            #[cfg(feature = "cluster")]
+            cluster,
+            #[cfg(feature = "cluster")]
+            cluster_authority_addr,
+            #[cfg(feature = "cluster")]
+            cluster_owner_node_id,
+            #[cfg(feature = "cluster")]
+            cluster_authority_node_id,
         } => {
             crate::commands::mount::handle_mount(crate::commands::mount::PoolMountArgs {
                 pool_name,
@@ -369,11 +397,13 @@ pub fn handle_pool(cmd: PoolCommand) {
                 encryption_salt,
                 runtime,
                 #[cfg(feature = "cluster")]
-                cluster: false,
+                cluster,
                 #[cfg(feature = "cluster")]
-                cluster_node_addr: None,
+                cluster_authority_addr,
                 #[cfg(feature = "cluster")]
-                cluster_node_id: None,
+                cluster_owner_node_id,
+                #[cfg(feature = "cluster")]
+                cluster_authority_node_id,
             });
         }
         PoolCommand::IntegrityCheck {
