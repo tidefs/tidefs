@@ -11,6 +11,7 @@ use tidefs_auth::{
     NodeKeyStore, NodePrivateCredential, NodePublicIdentity, NODE_PRIVATE_CREDENTIAL_WIRE_SIZE,
     NODE_PUBLIC_IDENTITY_WIRE_SIZE,
 };
+use tidefs_cluster::{ClusterPoolMessage, ClusterPoolOwnerObservationResponse};
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId as LifecycleDatasetId, SyncGuarantee};
 use tidefs_local_filesystem::{
     human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem,
@@ -20,6 +21,7 @@ use tidefs_local_filesystem::{
 use tidefs_local_object_store::pool::PoolRedundancyPolicy;
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_client::{
     ClusterVfsRpcClient, ClusterVfsRpcClientConfig, ClusterVfsRpcClientError,
+    ClusterVfsRpcOwnerCandidate,
 };
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_owner::{
     ClusterVfsRpcOwnerConfig, ClusterVfsRpcOwnerHandle, ClusterVfsRpcWriterFence,
@@ -44,9 +46,18 @@ use tidefs_vfs_rpc::{DatasetId, PeerId, VfsRpcRequest, VfsRpcResponse, RESP_FLAG
 const OWNER_NODE: u64 = 2;
 const CLIENT_NODE: u64 = 1;
 const CLIENT_B_NODE: u64 = 3;
+const SUCCESSOR_NODE_FOR_REFUSAL: u64 = 4;
+const AUTHORITY_NODE: u64 = 99;
 const WRITER_TERM: u64 = 77;
 const WRITER_EPOCH: u64 = 9;
 const POOL_GUID: [u8; 16] = [0x49; 16];
+
+#[derive(Clone, Copy)]
+struct TestOwnerObservation {
+    owner_node_id: u64,
+    writer_term: u64,
+    membership_epoch: u64,
+}
 
 fn live_authority_deadline() -> ExternalMutationDeadline {
     ExternalMutationDeadline::new_until(Instant::now() + Duration::from_secs(60))
@@ -85,6 +96,127 @@ impl ProvisionedIdentity {
         NodePublicIdentity::decode_fixed(&self.public_bytes)
             .expect("decode provisioned test public identity")
     }
+}
+
+fn spawn_owner_observation_authority(
+    authority_identity: &ProvisionedIdentity,
+    client_identity: &ProvisionedIdentity,
+    pool_guid: [u8; 16],
+    owner_node_id: u64,
+    writer_term: u64,
+    membership_epoch: u64,
+    lease_remaining_ms: u64,
+) -> (SocketAddr, std::thread::JoinHandle<()>) {
+    let requester_node = client_identity.public_identity().node_id();
+    let credential = authority_identity.credential();
+    let authority_public = credential.public_identity().into_identity();
+    let mut known_identities = NodeKeyStore::new();
+    known_identities
+        .register(authority_public.clone())
+        .expect("register observation authority identity");
+    known_identities
+        .register(client_identity.public_identity().into_identity())
+        .expect("register observation client identity");
+    let mut authority = Transport::new(AUTHORITY_NODE)
+        .with_attestation(
+            credential
+                .keypair()
+                .expect("load observation authority keypair"),
+            authority_public,
+        )
+        .with_known_identities(known_identities);
+    authority.set_endpoint_family(EndpointFamily::Control);
+    authority.set_attestation_bootstrap_from_handshake(false);
+    authority
+        .bind(TransportAddr::Tcp("127.0.0.1:0".parse().unwrap()))
+        .expect("bind observation authority");
+    let address = match authority.bind_addr {
+        Some(TransportAddr::Tcp(address)) => address,
+        _ => panic!("observation authority must publish TCP address"),
+    };
+    let handle = std::thread::spawn(move || {
+        let session_id = accept_test_session(&mut authority);
+        authority
+            .perform_handshake(session_id)
+            .expect("authenticate observation client");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let raw = loop {
+            match authority.recv_message(session_id) {
+                Ok(raw) => break raw,
+                Err(TransportError::WouldBlock(_)) => {
+                    assert!(Instant::now() < deadline, "owner observation timed out");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("receive owner observation request: {error}"),
+            }
+        };
+        assert_eq!(&raw[..4], b"CP01");
+        let request = ClusterPoolMessage::decode(&raw[4..]).expect("decode observation request");
+        let ClusterPoolMessage::OwnerObservationRequest(request) = request else {
+            panic!("expected owner observation request");
+        };
+        assert_eq!(request.pool_guid, pool_guid);
+        assert_eq!(request.requesting_node_id, requester_node);
+        let response =
+            ClusterPoolMessage::OwnerObservationResponse(ClusterPoolOwnerObservationResponse {
+                request_id: request.request_id,
+                node_id: AUTHORITY_NODE,
+                pool_guid,
+                success: true,
+                owner_node_id: Some(owner_node_id),
+                membership_epoch: Some(membership_epoch),
+                write_fence_generation: Some(writer_term),
+                lease_remaining_ms: Some(lease_remaining_ms),
+                error: None,
+            })
+            .encode()
+            .expect("encode owner observation response");
+        let mut wire = Vec::with_capacity(4 + response.len());
+        wire.extend_from_slice(b"CP01");
+        wire.extend_from_slice(&response);
+        authority
+            .send_message(session_id, &wire)
+            .expect("send owner observation response");
+    });
+    (address, handle)
+}
+
+fn discover_client(
+    owner_addr: SocketAddr,
+    expected_pool_guid: [u8; 16],
+    client_identity: &ProvisionedIdentity,
+    owner_identity: &ProvisionedIdentity,
+    observation: TestOwnerObservation,
+    authority_lost: Option<Arc<AtomicBool>>,
+) -> Result<ClusterVfsRpcClient, ClusterVfsRpcClientError> {
+    let authority_identity = ProvisionedIdentity::new(AUTHORITY_NODE);
+    let (authority_addr, authority_thread) = spawn_owner_observation_authority(
+        &authority_identity,
+        client_identity,
+        expected_pool_guid,
+        observation.owner_node_id,
+        observation.writer_term,
+        observation.membership_epoch,
+        60_000,
+    );
+    let mut config = ClusterVfsRpcClientConfig::new(
+        authority_addr,
+        expected_pool_guid,
+        client_identity.private_credential(),
+        authority_identity.public_identity(),
+        vec![ClusterVfsRpcOwnerCandidate::new(
+            owner_addr,
+            owner_identity.public_identity(),
+        )],
+    );
+    if let Some(authority_lost) = authority_lost {
+        config = config.with_authority_loss_signal(authority_lost);
+    }
+    let result = ClusterVfsRpcClient::connect(config);
+    authority_thread
+        .join()
+        .expect("owner observation authority thread");
+    result
 }
 
 fn connect(
@@ -314,15 +446,6 @@ fn connector_refuses_owner_epoch_movement_before_authority() {
             }
         };
 
-        let discovery = accept(&mut owner);
-        assert!(matches!(
-            owner.perform_handshake(discovery),
-            Err(TransportError::AttestedEpochMismatch {
-                proposed_epoch: 0,
-                required_epoch: WRITER_EPOCH,
-                ..
-            })
-        ));
         owner.epoch = WRITER_EPOCH + 1;
         let retry = accept(&mut owner);
         assert!(matches!(
@@ -335,12 +458,18 @@ fn connector_refuses_owner_epoch_movement_before_authority() {
         ));
     });
 
-    match ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+    match discover_client(
         owner_addr,
         POOL_GUID,
-        client_identity.private_credential(),
-        owner_identity.public_identity(),
-    )) {
+        &client_identity,
+        &owner_identity,
+        TestOwnerObservation {
+            owner_node_id: OWNER_NODE,
+            writer_term: WRITER_TERM,
+            membership_epoch: WRITER_EPOCH,
+        },
+        None,
+    ) {
         Err(ClusterVfsRpcClientError::EpochMoved {
             authenticated_peer,
             attempted_epoch,
@@ -354,6 +483,154 @@ fn connector_refuses_owner_epoch_movement_before_authority() {
         Ok(_) => panic!("epoch movement must fail before client construction"),
     }
     owner_handle.join().expect("epoch-moving owner thread");
+}
+
+#[test]
+fn connector_refuses_ambiguous_or_absent_authority_selected_candidates() {
+    let client_identity = ProvisionedIdentity::new(CLIENT_NODE);
+    let authority_identity = ProvisionedIdentity::new(AUTHORITY_NODE);
+    let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
+    let candidate_addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+    assert!(matches!(
+        ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+            candidate_addr,
+            POOL_GUID,
+            client_identity.private_credential(),
+            authority_identity.public_identity(),
+            Vec::new(),
+        )),
+        Err(ClusterVfsRpcClientError::MissingOwnerCandidates)
+    ));
+
+    assert!(matches!(
+        ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+            candidate_addr,
+            POOL_GUID,
+            client_identity.private_credential(),
+            authority_identity.public_identity(),
+            vec![
+                ClusterVfsRpcOwnerCandidate::new(candidate_addr, owner_identity.public_identity(),),
+                ClusterVfsRpcOwnerCandidate::new(
+                    "127.0.0.1:10".parse().unwrap(),
+                    owner_identity.public_identity(),
+                ),
+            ],
+        )),
+        Err(ClusterVfsRpcClientError::DuplicateOwnerCandidate(
+            OWNER_NODE
+        ))
+    ));
+
+    let conflicting_client_identity = ProvisionedIdentity::new(CLIENT_NODE);
+    assert!(matches!(
+        ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+            candidate_addr,
+            POOL_GUID,
+            client_identity.private_credential(),
+            authority_identity.public_identity(),
+            vec![ClusterVfsRpcOwnerCandidate::new(
+                candidate_addr,
+                conflicting_client_identity.public_identity(),
+            )],
+        )),
+        Err(ClusterVfsRpcClientError::ConflictingNodeIdentity(
+            CLIENT_NODE
+        ))
+    ));
+
+    assert!(matches!(
+        discover_client(
+            candidate_addr,
+            POOL_GUID,
+            &client_identity,
+            &owner_identity,
+            TestOwnerObservation {
+                owner_node_id: SUCCESSOR_NODE_FOR_REFUSAL,
+                writer_term: WRITER_TERM,
+                membership_epoch: WRITER_EPOCH,
+            },
+            None,
+        ),
+        Err(ClusterVfsRpcClientError::ObservedOwnerNotProvisioned(
+            SUCCESSOR_NODE_FOR_REFUSAL
+        ))
+    ));
+
+    let expired_authority = ProvisionedIdentity::new(AUTHORITY_NODE);
+    let (expired_authority_addr, expired_authority_thread) = spawn_owner_observation_authority(
+        &expired_authority,
+        &client_identity,
+        POOL_GUID,
+        OWNER_NODE,
+        WRITER_TERM,
+        WRITER_EPOCH,
+        0,
+    );
+    let expired = ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+        expired_authority_addr,
+        POOL_GUID,
+        client_identity.private_credential(),
+        expired_authority.public_identity(),
+        vec![ClusterVfsRpcOwnerCandidate::new(
+            candidate_addr,
+            owner_identity.public_identity(),
+        )],
+    ));
+    expired_authority_thread
+        .join()
+        .expect("expired observation authority thread");
+    assert!(matches!(
+        expired,
+        Err(ClusterVfsRpcClientError::OwnerObservation(ref error))
+            if error.contains("zero authority field")
+    ));
+}
+
+#[test]
+fn connector_refuses_owner_preface_that_disagrees_with_observed_fence() {
+    let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
+    let client_identity = ProvisionedIdentity::new(CLIENT_NODE);
+    let (mut owner_transport, owner_addr) = bind_test_owner(&owner_identity, &client_identity);
+    let owner_thread = std::thread::spawn(move || {
+        let authority = VfsRpcSessionAuthority::new(
+            POOL_GUID,
+            DatasetId::new(1),
+            OWNER_NODE,
+            WRITER_TERM,
+            WRITER_EPOCH,
+            60_000,
+        )
+        .expect("build mismatched owner preface");
+        let (session_id, _) = admit_test_session(&mut owner_transport, authority);
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = owner_transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+    });
+
+    let result = discover_client(
+        owner_addr,
+        POOL_GUID,
+        &client_identity,
+        &owner_identity,
+        TestOwnerObservation {
+            owner_node_id: OWNER_NODE,
+            writer_term: WRITER_TERM + 1,
+            membership_epoch: WRITER_EPOCH,
+        },
+        None,
+    );
+    owner_thread.join().expect("mismatched owner thread");
+    assert!(matches!(
+        result,
+        Err(ClusterVfsRpcClientError::ObservedAuthorityMismatch {
+            observed_owner: OWNER_NODE,
+            observed_term,
+            observed_epoch: WRITER_EPOCH,
+            preface_owner: OWNER_NODE,
+            preface_term: WRITER_TERM,
+            preface_epoch: WRITER_EPOCH,
+        }) if observed_term == WRITER_TERM + 1
+    ));
 }
 
 #[test]
@@ -417,17 +694,6 @@ fn client_replays_one_mutation_after_authenticated_reconnect_and_fences_term_mov
     let (mut owner_transport, owner_addr) = bind_test_owner(&owner_identity, &client_identity);
 
     let owner_thread = std::thread::spawn(move || {
-        let discovery = accept_test_session(&mut owner_transport);
-        assert!(matches!(
-            owner_transport.perform_handshake(discovery),
-            Err(TransportError::AttestedEpochMismatch {
-                authenticated_peer: CLIENT_NODE,
-                proposed_epoch: 0,
-                required_epoch: WRITER_EPOCH,
-                ..
-            })
-        ));
-
         let authority = VfsRpcSessionAuthority::new(
             POOL_GUID,
             dataset_id,
@@ -563,14 +829,17 @@ fn client_replays_one_mutation_after_authenticated_reconnect_and_fences_term_mov
     });
 
     let authority_lost = Arc::new(AtomicBool::new(false));
-    let client = ClusterVfsRpcClient::connect(
-        ClusterVfsRpcClientConfig::new(
-            owner_addr,
-            POOL_GUID,
-            client_identity.private_credential(),
-            owner_identity.public_identity(),
-        )
-        .with_authority_loss_signal(Arc::clone(&authority_lost)),
+    let client = discover_client(
+        owner_addr,
+        POOL_GUID,
+        &client_identity,
+        &owner_identity,
+        TestOwnerObservation {
+            owner_node_id: OWNER_NODE,
+            writer_term: WRITER_TERM,
+            membership_epoch: WRITER_EPOCH,
+        },
+        Some(Arc::clone(&authority_lost)),
     )
     .expect("construct reconnecting cluster VFS_RPC client");
     let remote_adapter = FuseVfsAdapter::new(Box::new(VfsDispatchEngineBridge::new(client)))
@@ -753,14 +1022,17 @@ fn client_refreshes_live_owner_deadline_then_fences_idle_expiry() {
     .expect("start deadline-gated VFS_RPC owner");
 
     let authority_lost = Arc::new(AtomicBool::new(false));
-    let client = ClusterVfsRpcClient::connect(
-        ClusterVfsRpcClientConfig::new(
-            owner.bound_addr(),
-            POOL_GUID,
-            client_identity.private_credential(),
-            owner_identity.public_identity(),
-        )
-        .with_authority_loss_signal(Arc::clone(&authority_lost)),
+    let client = discover_client(
+        owner.bound_addr(),
+        POOL_GUID,
+        &client_identity,
+        &owner_identity,
+        TestOwnerObservation {
+            owner_node_id: OWNER_NODE,
+            writer_term: WRITER_TERM,
+            membership_epoch: WRITER_EPOCH,
+        },
+        Some(Arc::clone(&authority_lost)),
     )
     .expect("connect deadline-gated VFS_RPC client");
     let authority_monitor = client.clone();
@@ -903,12 +1175,18 @@ fn two_authenticated_adapter_engines_share_pool_owner_and_isolate_session_failur
     ))
     .expect("start Pool-backed VFS_RPC owner");
 
-    let client = ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+    let client = discover_client(
         owner.bound_addr(),
         POOL_GUID,
-        client_identity.private_credential(),
-        owner_identity.public_identity(),
-    ))
+        &client_identity,
+        &owner_identity,
+        TestOwnerObservation {
+            owner_node_id: OWNER_NODE,
+            writer_term: WRITER_TERM,
+            membership_epoch: WRITER_EPOCH,
+        },
+        None,
+    )
     .expect("discover owner epoch and construct admitted cluster VFS_RPC client");
     let remote_adapter = FuseVfsAdapter::new(Box::new(VfsDispatchEngineBridge::new(client)))
         .expect("construct FUSE adapter over authenticated cluster VFS_RPC");
@@ -979,12 +1257,18 @@ fn two_authenticated_adapter_engines_share_pool_owner_and_isolate_session_failur
         created.inode_id
     };
 
-    let client_b = ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+    let client_b = discover_client(
         owner.bound_addr(),
         POOL_GUID,
-        client_b_identity.private_credential(),
-        owner_identity.public_identity(),
-    ))
+        &client_b_identity,
+        &owner_identity,
+        TestOwnerObservation {
+            owner_node_id: OWNER_NODE,
+            writer_term: WRITER_TERM,
+            membership_epoch: WRITER_EPOCH,
+        },
+        None,
+    )
     .expect("connect second independently authenticated cluster VFS_RPC client");
     let remote_adapter_b = FuseVfsAdapter::new(Box::new(VfsDispatchEngineBridge::new(client_b)))
         .expect("construct second FUSE adapter over authenticated cluster VFS_RPC");
@@ -1042,12 +1326,18 @@ fn two_authenticated_adapter_engines_share_pool_owner_and_isolate_session_failur
 
     let untrusted_same_node = ProvisionedIdentity::new(CLIENT_NODE);
     assert!(
-        ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+        discover_client(
             owner.bound_addr(),
             POOL_GUID,
-            untrusted_same_node.private_credential(),
-            owner_identity.public_identity(),
-        ))
+            &untrusted_same_node,
+            &owner_identity,
+            TestOwnerObservation {
+                owner_node_id: OWNER_NODE,
+                writer_term: WRITER_TERM,
+                membership_epoch: WRITER_EPOCH,
+            },
+            None,
+        )
         .is_err(),
         "a different key for an admitted numeric peer ID must fail the live handshake"
     );
@@ -1156,12 +1446,18 @@ fn two_authenticated_adapter_engines_share_pool_owner_and_isolate_session_failur
     ))
     .expect("restart Pool-backed VFS_RPC owner with fresh session authority");
 
-    match ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+    match discover_client(
         owner.bound_addr(),
         [0x50; 16],
-        client_identity.private_credential(),
-        owner_identity.public_identity(),
-    )) {
+        &client_identity,
+        &owner_identity,
+        TestOwnerObservation {
+            owner_node_id: OWNER_NODE,
+            writer_term: WRITER_TERM,
+            membership_epoch: WRITER_EPOCH,
+        },
+        None,
+    ) {
         Err(ClusterVfsRpcClientError::WrongPool { expected, found }) => {
             assert_eq!(expected, [0x50; 16]);
             assert_eq!(found, POOL_GUID);
@@ -1184,12 +1480,18 @@ fn two_authenticated_adapter_engines_share_pool_owner_and_isolate_session_failur
     let unavailable_addr = owner.bound_addr();
     owner.stop().expect("stop Pool-backed VFS_RPC owner");
     assert!(
-        ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+        discover_client(
             unavailable_addr,
             POOL_GUID,
-            client_identity.private_credential(),
-            owner_identity.public_identity(),
-        ))
+            &client_identity,
+            &owner_identity,
+            TestOwnerObservation {
+                owner_node_id: OWNER_NODE,
+                writer_term: WRITER_TERM,
+                membership_epoch: WRITER_EPOCH,
+            },
+            None,
+        )
         .is_err(),
         "an unavailable owner must fail before constructing a client"
     );

@@ -1675,12 +1675,16 @@ mod tests {
             "testpool",
             "/mnt/tidefs",
             "--cluster-client",
+            "--cluster-authority-addr",
+            "127.0.0.1:7411",
             "--cluster-vfs-rpc-addr",
             "127.0.0.1:7412",
             "--cluster-pool-guid",
             "00112233445566778899aabbccddeeff",
             "--cluster-node-credential",
             "/etc/tidefs/client.credential",
+            "--cluster-trusted-authority-identity",
+            "/etc/tidefs/authority.identity",
             "--cluster-trusted-vfs-rpc-peer-identity",
             "/etc/tidefs/owner.identity",
         ]);
@@ -1693,10 +1697,14 @@ mod tests {
             "testpool",
             "/mnt/tidefs",
             "--cluster-client",
+            "--cluster-authority-addr",
+            "127.0.0.1:7411",
             "--cluster-vfs-rpc-addr",
             "127.0.0.1:7412",
             "--cluster-node-credential",
             "/etc/tidefs/client.credential",
+            "--cluster-trusted-authority-identity",
+            "/etc/tidefs/authority.identity",
             "--cluster-trusted-vfs-rpc-peer-identity",
             "/etc/tidefs/owner.identity",
         ]);
@@ -1712,12 +1720,16 @@ mod tests {
             "testpool",
             "/mnt/tidefs",
             "--cluster-client",
+            "--cluster-authority-addr",
+            "127.0.0.1:7411",
             "--cluster-vfs-rpc-addr",
             "127.0.0.1:7412",
             "--cluster-pool-guid",
             "00112233445566778899aabbccddeeff",
             "--cluster-node-credential",
             "/etc/tidefs/client.credential",
+            "--cluster-trusted-authority-identity",
+            "/etc/tidefs/authority.identity",
             "--cluster-trusted-vfs-rpc-peer-identity",
             "/etc/tidefs/owner.identity",
             "--devices",
@@ -1922,7 +1934,7 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[test]
-    fn cli_parse_cluster_pool_mount_rejects_authority_without_cluster_mode() {
+    fn cli_parse_cluster_pool_mount_leaves_mode_validation_to_mount_boundary() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
@@ -1934,10 +1946,10 @@ mod tests {
             "/etc/tidefs/authority.identity",
         ]);
 
-        assert!(
-            args.is_err(),
-            "cluster authority flags must not be silently ignored by a local mount"
-        );
+        assert!(args.is_ok());
+        // `handle_mount` rejects trust records unless one of the two cluster
+        // modes is active. The shared authority flags must remain parseable
+        // for both owner and client mode, so this is a runtime mode boundary.
     }
 
     #[test]

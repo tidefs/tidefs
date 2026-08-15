@@ -112,6 +112,8 @@ pub mod xfstests_harness;
 
 pub mod capacity;
 #[cfg(feature = "cluster")]
+pub mod cluster_pool_owner_observer;
+#[cfg(feature = "cluster")]
 pub mod cluster_vfs_rpc_client;
 #[cfg(feature = "cluster")]
 pub mod cluster_vfs_rpc_owner;
@@ -391,16 +393,18 @@ impl Default for MountRuntimeOptions {
 /// Inputs for the authenticated remote clustered-filesystem carrier.
 ///
 /// This configuration deliberately has no local Pool path, device list,
-/// dataset selector, writer, term, membership epoch, or lease token. The
-/// remote owner supplies mounted authority only after mutual attestation.
+/// dataset selector, caller-selected writer, term, membership epoch, or lease
+/// token. The authenticated lease authority selects one provisioned VFS_RPC
+/// candidate before the remote owner supplies mounted authority.
 #[cfg(feature = "cluster")]
 #[derive(Debug)]
 pub struct ClusterVfsRpcMountConfig {
     mountpoint: PathBuf,
-    owner_addr: std::net::SocketAddr,
+    authority_addr: std::net::SocketAddr,
     expected_pool_guid: [u8; 16],
     local_credential: tidefs_auth::NodePrivateCredential,
-    trusted_owner_identity: tidefs_auth::NodePublicIdentity,
+    trusted_authority_identity: tidefs_auth::NodePublicIdentity,
+    owner_candidates: Vec<cluster_vfs_rpc_client::ClusterVfsRpcOwnerCandidate>,
     debug: bool,
 }
 
@@ -409,17 +413,19 @@ impl ClusterVfsRpcMountConfig {
     #[must_use]
     pub const fn new(
         mountpoint: PathBuf,
-        owner_addr: std::net::SocketAddr,
+        authority_addr: std::net::SocketAddr,
         expected_pool_guid: [u8; 16],
         local_credential: tidefs_auth::NodePrivateCredential,
-        trusted_owner_identity: tidefs_auth::NodePublicIdentity,
+        trusted_authority_identity: tidefs_auth::NodePublicIdentity,
+        owner_candidates: Vec<cluster_vfs_rpc_client::ClusterVfsRpcOwnerCandidate>,
     ) -> Self {
         Self {
             mountpoint,
-            owner_addr,
+            authority_addr,
             expected_pool_guid,
             local_credential,
-            trusted_owner_identity,
+            trusted_authority_identity,
+            owner_candidates,
             debug: false,
         }
     }
@@ -996,7 +1002,7 @@ impl ClusterMountAuthority {
             writer_fence: Arc::new(Mutex::new(
                 cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence::new(
                     self.token.node_id,
-                    self.token.lease_id,
+                    self.token.write_fence.generation,
                     self.token.epoch.0,
                 ),
             )),
@@ -1050,7 +1056,7 @@ impl ClusterMountAuthority {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence::new(
                     self.token.node_id,
-                    self.token.lease_id,
+                    self.token.write_fence.generation,
                     self.token.epoch.0,
                 );
         }
@@ -2015,10 +2021,11 @@ fn start_cluster_vfs_rpc_mount_with_shutdown(
 
     let ClusterVfsRpcMountConfig {
         mountpoint,
-        owner_addr,
+        authority_addr,
         expected_pool_guid,
         local_credential,
-        trusted_owner_identity,
+        trusted_authority_identity,
+        owner_candidates,
         debug,
     } = config;
     prepare_mountpoint_directory(&mountpoint)
@@ -2027,10 +2034,11 @@ fn start_cluster_vfs_rpc_mount_with_shutdown(
     let authority_lost = Arc::new(AtomicBool::new(false));
     let client = cluster_vfs_rpc_client::ClusterVfsRpcClient::connect(
         cluster_vfs_rpc_client::ClusterVfsRpcClientConfig::new(
-            owner_addr,
+            authority_addr,
             expected_pool_guid,
             local_credential,
-            trusted_owner_identity,
+            trusted_authority_identity,
+            owner_candidates,
         )
         .with_authority_loss_signal(Arc::clone(&authority_lost)),
     )
@@ -2076,7 +2084,7 @@ fn start_cluster_vfs_rpc_mount_with_shutdown(
     }
     if debug {
         eprintln!(
-            "cluster: authenticated remote Pool owner at {owner_addr} for {:02x?}",
+            "cluster: authenticated lease authority at {authority_addr} selected remote Pool owner for {:02x?}",
             &expected_pool_guid[..4]
         );
     }
@@ -2848,7 +2856,7 @@ mod cluster_mount_authority_tests {
         };
         assert_eq!(
             *rpc_writer_fence.lock().unwrap(),
-            cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence::new(7, 99, 2)
+            cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence::new(7, 9, 2)
         );
         let deadline = authority.external_mutation_deadline().unwrap();
         let MountAuthority::ClusterLease(cluster) = &mut authority else {
@@ -2862,7 +2870,7 @@ mod cluster_mount_authority_tests {
         assert!(deadline.is_live());
         assert_eq!(
             *rpc_writer_fence.lock().unwrap(),
-            cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence::new(7, 99, 2)
+            cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence::new(7, 9, 2)
         );
         authority.release_unmounted().unwrap();
         assert_eq!(releases.load(AtomicOrdering::Relaxed), 1);

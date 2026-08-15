@@ -48,6 +48,8 @@ enum PoolDiscriminant {
     ImportResponse = 0x13,
     LeaseRequest = 0x14,
     LeaseResponse = 0x15,
+    OwnerObservationRequest = 0x1a,
+    OwnerObservationResponse = 0x1b,
 }
 
 impl PoolDiscriminant {
@@ -63,6 +65,8 @@ impl PoolDiscriminant {
             0x17 => Some(Self::CatalogDeltaResponse),
             0x18 => Some(Self::CatalogQueryRequest),
             0x19 => Some(Self::CatalogQueryResponse),
+            0x1a => Some(Self::OwnerObservationRequest),
+            0x1b => Some(Self::OwnerObservationResponse),
             _ => None,
         }
     }
@@ -267,6 +271,46 @@ pub struct ClusterPoolLeaseResponse {
 }
 
 // ---------------------------------------------------------------------------
+// ClusterPoolOwnerObservationRequest / Response
+// ---------------------------------------------------------------------------
+
+/// Request a non-capability observation of one Pool's current owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterPoolOwnerObservationRequest {
+    /// Opaque request ID for response correlation.
+    pub request_id: u64,
+    /// Pool whose current owner is requested.
+    pub pool_guid: [u8; 16],
+    /// Must equal the transport-authenticated requester.
+    pub requesting_node_id: u64,
+}
+
+/// Current committed Pool owner as observed by the lease authority.
+///
+/// No import-capable [`PoolLeaseToken`] material is present in this message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterPoolOwnerObservationResponse {
+    /// Matches the corresponding request ID.
+    pub request_id: u64,
+    /// Lease-authority node producing the observation.
+    pub node_id: u64,
+    /// Pool GUID for response correlation.
+    pub pool_guid: [u8; 16],
+    /// Whether a complete current observation follows.
+    pub success: bool,
+    /// Current committed owner node on success.
+    pub owner_node_id: Option<u64>,
+    /// Current committed membership epoch on success.
+    pub membership_epoch: Option<u64>,
+    /// Current writer-fence generation on success.
+    pub write_fence_generation: Option<u64>,
+    /// Authority-measured remaining lease lifetime on success.
+    pub lease_remaining_ms: Option<u64>,
+    /// Refusal reason on failure.
+    pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // CatalogQueryType
 // ---------------------------------------------------------------------------
 
@@ -403,6 +447,8 @@ pub enum ClusterPoolMessage {
     ImportResponse(ClusterPoolImportResponse),
     LeaseRequest(ClusterPoolLeaseRequest),
     LeaseResponse(ClusterPoolLeaseResponse),
+    OwnerObservationRequest(ClusterPoolOwnerObservationRequest),
+    OwnerObservationResponse(ClusterPoolOwnerObservationResponse),
     CatalogDeltaRequest(ClusterPoolCatalogDeltaRequest),
     CatalogDeltaResponse(ClusterPoolCatalogDeltaResponse),
     CatalogQueryRequest(ClusterPoolCatalogQueryRequest),
@@ -441,6 +487,8 @@ impl ClusterPoolMessage {
             Self::ImportResponse(_) => PoolDiscriminant::ImportResponse as u8,
             Self::LeaseRequest(_) => PoolDiscriminant::LeaseRequest as u8,
             Self::LeaseResponse(_) => PoolDiscriminant::LeaseResponse as u8,
+            Self::OwnerObservationRequest(_) => PoolDiscriminant::OwnerObservationRequest as u8,
+            Self::OwnerObservationResponse(_) => PoolDiscriminant::OwnerObservationResponse as u8,
             Self::CatalogDeltaRequest(_) => PoolDiscriminant::CatalogDeltaRequest as u8,
             Self::CatalogDeltaResponse(_) => PoolDiscriminant::CatalogDeltaResponse as u8,
             Self::CatalogQueryRequest(_) => PoolDiscriminant::CatalogQueryRequest as u8,
@@ -462,6 +510,10 @@ impl ClusterPoolMessage {
                 Self::LeaseRequest(m) => bincode::serialize(m)
                     .map_err(|e| PoolProtocolError::Serialize(e.to_string()))?,
                 Self::LeaseResponse(m) => bincode::serialize(m)
+                    .map_err(|e| PoolProtocolError::Serialize(e.to_string()))?,
+                Self::OwnerObservationRequest(m) => bincode::serialize(m)
+                    .map_err(|e| PoolProtocolError::Serialize(e.to_string()))?,
+                Self::OwnerObservationResponse(m) => bincode::serialize(m)
                     .map_err(|e| PoolProtocolError::Serialize(e.to_string()))?,
                 Self::CatalogDeltaRequest(m) => bincode::serialize(m)
                     .map_err(|e| PoolProtocolError::Serialize(e.to_string()))?,
@@ -509,6 +561,16 @@ impl ClusterPoolMessage {
                 let msg: ClusterPoolLeaseResponse = bincode::deserialize(payload)
                     .map_err(|e| PoolProtocolError::Deserialize(e.to_string()))?;
                 Ok(Self::LeaseResponse(msg))
+            }
+            PoolDiscriminant::OwnerObservationRequest => {
+                let msg: ClusterPoolOwnerObservationRequest = bincode::deserialize(payload)
+                    .map_err(|e| PoolProtocolError::Deserialize(e.to_string()))?;
+                Ok(Self::OwnerObservationRequest(msg))
+            }
+            PoolDiscriminant::OwnerObservationResponse => {
+                let msg: ClusterPoolOwnerObservationResponse = bincode::deserialize(payload)
+                    .map_err(|e| PoolProtocolError::Deserialize(e.to_string()))?;
+                Ok(Self::OwnerObservationResponse(msg))
             }
             PoolDiscriminant::CatalogDeltaRequest => {
                 let msg: ClusterPoolCatalogDeltaRequest = bincode::deserialize(payload)
@@ -851,6 +913,35 @@ mod tests {
         let encoded = msg.encode().unwrap();
         let decoded = ClusterPoolMessage::decode(&encoded).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn roundtrip_owner_observation_request_and_response_without_lease_capability() {
+        let request =
+            ClusterPoolMessage::OwnerObservationRequest(ClusterPoolOwnerObservationRequest {
+                request_id: 44,
+                pool_guid: [0x44; 16],
+                requesting_node_id: 9,
+            });
+        let encoded = request.encode().unwrap();
+        assert_eq!(encoded[0], 0x1a);
+        assert_eq!(ClusterPoolMessage::decode(&encoded).unwrap(), request);
+
+        let response =
+            ClusterPoolMessage::OwnerObservationResponse(ClusterPoolOwnerObservationResponse {
+                request_id: 44,
+                node_id: 1,
+                pool_guid: [0x44; 16],
+                success: true,
+                owner_node_id: Some(7),
+                membership_epoch: Some(12),
+                write_fence_generation: Some(81),
+                lease_remaining_ms: Some(29_000),
+                error: None,
+            });
+        let encoded = response.encode().unwrap();
+        assert_eq!(encoded[0], 0x1b);
+        assert_eq!(ClusterPoolMessage::decode(&encoded).unwrap(), response);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use tidefs_cluster::placement_heal::RelocationFlowCommitPlacementPublication;
 use tidefs_cluster::pool_protocol::{
     CatalogEntryRow, ClusterPoolCatalogDeltaResponse, ClusterPoolCatalogQueryResponse,
     ClusterPoolCreateResponse, ClusterPoolImportResponse, ClusterPoolLeaseAction,
-    ClusterPoolLeaseResponse, ClusterPoolMessage,
+    ClusterPoolLeaseResponse, ClusterPoolMessage, ClusterPoolOwnerObservationResponse,
 };
 use tidefs_cluster::{
     ClusterLeaseConfig, ClusterLeaseRuntime, FenceAuthority, FenceValidator, PlacementMap,
@@ -4864,6 +4864,31 @@ fn commit_pool_owner_lease_transition(
     }
 }
 
+fn commit_pool_owner_observation(
+    committed: &Arc<Mutex<PoolOwnerLeaseAuthority>>,
+    checkpoint: &PoolOwnerLeaseCheckpointStore,
+    epoch: EpochId,
+    now_ms: u64,
+    pool_guid: [u8; 16],
+) -> Result<tidefs_cluster::PoolOwnerLeaseObservation, String> {
+    let mut committed = committed.lock().unwrap();
+    let mut candidate = committed.clone();
+    candidate
+        .advance_epoch(epoch, now_ms)
+        .map_err(|error| error.to_string())?;
+    let observation = candidate.observe_owner(pool_guid, now_ms);
+
+    // Epoch advancement and expired-owner removal are real authority changes,
+    // including when no current owner can be returned.
+    if candidate != *committed {
+        checkpoint
+            .persist(&candidate)
+            .map_err(|error| format!("persist Pool owner lease authority: {error}"))?;
+        *committed = candidate;
+    }
+    observation.map_err(|error| error.to_string())
+}
+
 fn handle_cluster_pool_message(
     session_id: tidefs_transport::SessionId,
     peer_node_id: Option<u64>,
@@ -5145,6 +5170,82 @@ fn handle_cluster_pool_message(
                 },
             ))
         }
+        ClusterPoolMessage::OwnerObservationRequest(req) => {
+            eprintln!(
+                "[storage-node] session {session_id}: observe cluster Pool owner pool_guid={:02x?} requesting_node={}",
+                &req.pool_guid[..4], req.requesting_node_id,
+            );
+            let refusal = |error: String| {
+                Some(ClusterPoolMessage::OwnerObservationResponse(
+                    ClusterPoolOwnerObservationResponse {
+                        request_id: req.request_id,
+                        node_id: ctx.config.node_id,
+                        pool_guid: req.pool_guid,
+                        success: false,
+                        owner_node_id: None,
+                        membership_epoch: None,
+                        write_fence_generation: None,
+                        lease_remaining_ms: None,
+                        error: Some(error),
+                    },
+                ))
+            };
+
+            if let Err(error) =
+                authenticate_pool_owner_request(peer_node_id, req.requesting_node_id)
+            {
+                return refusal(error);
+            }
+            if let Err(error) = check_partition_fence(ctx) {
+                return refusal(error);
+            }
+            let epoch = match admitted_pool_owner_epoch(ctx, req.requesting_node_id) {
+                Ok(epoch) => epoch,
+                Err(error) => return refusal(error),
+            };
+            let now_ms = monotonic_time_millis();
+            let Some(ref authority) = ctx.pool_owner_leases else {
+                return refusal("Pool owner lease authority is not configured".to_string());
+            };
+            let Some(ref checkpoint) = ctx.pool_owner_lease_checkpoint else {
+                return refusal(
+                    "Pool owner lease durable checkpoint is not configured".to_string(),
+                );
+            };
+            let observation = match commit_pool_owner_observation(
+                authority,
+                checkpoint,
+                epoch,
+                now_ms,
+                req.pool_guid,
+            ) {
+                Ok(observation) => observation,
+                Err(error) => return refusal(error),
+            };
+            if observation.membership_epoch != epoch
+                || observation.owner_node_id == 0
+                || observation.write_fence_generation == 0
+                || observation.lease_remaining_ms == 0
+            {
+                return refusal(
+                    "Pool owner observation does not match current admitted authority".to_string(),
+                );
+            }
+
+            Some(ClusterPoolMessage::OwnerObservationResponse(
+                ClusterPoolOwnerObservationResponse {
+                    request_id: req.request_id,
+                    node_id: ctx.config.node_id,
+                    pool_guid: observation.pool_guid,
+                    success: true,
+                    owner_node_id: Some(observation.owner_node_id),
+                    membership_epoch: Some(observation.membership_epoch.0),
+                    write_fence_generation: Some(observation.write_fence_generation),
+                    lease_remaining_ms: Some(observation.lease_remaining_ms),
+                    error: None,
+                },
+            ))
+        }
         ClusterPoolMessage::CatalogDeltaRequest(req) => {
             eprintln!(
                 "[storage-node] session {session_id}: catalog delta request pool_guid={:02x?} requesting_node={}",
@@ -5258,6 +5359,7 @@ fn handle_cluster_pool_message(
         ClusterPoolMessage::CreateResponse(_)
         | ClusterPoolMessage::ImportResponse(_)
         | ClusterPoolMessage::LeaseResponse(_)
+        | ClusterPoolMessage::OwnerObservationResponse(_)
         | ClusterPoolMessage::CatalogDeltaResponse(_)
         | ClusterPoolMessage::CatalogQueryResponse(_) => {
             eprintln!(
@@ -6725,6 +6827,35 @@ mod cluster_pool_handler_tests {
         token
     }
 
+    fn owner_observation(
+        response: ClusterPoolMessage,
+    ) -> tidefs_cluster::PoolOwnerLeaseObservation {
+        let ClusterPoolMessage::OwnerObservationResponse(response) = response else {
+            panic!("expected Pool owner observation response");
+        };
+        assert!(
+            response.success,
+            "owner observation refused: {:?}",
+            response.error
+        );
+        assert!(response.error.is_none());
+        tidefs_cluster::PoolOwnerLeaseObservation {
+            pool_guid: response.pool_guid,
+            owner_node_id: response.owner_node_id.expect("observed owner"),
+            membership_epoch: EpochId::new(
+                response
+                    .membership_epoch
+                    .expect("observed membership epoch"),
+            ),
+            write_fence_generation: response
+                .write_fence_generation
+                .expect("observed write fence"),
+            lease_remaining_ms: response
+                .lease_remaining_ms
+                .expect("observed remaining lifetime"),
+        }
+    }
+
     fn configure_pool_owner_authority(
         ctx: &mut SessionContext,
         epoch: EpochId,
@@ -6761,6 +6892,32 @@ mod cluster_pool_handler_tests {
                 },
             )
         };
+        let observe = |request_id, requesting_node_id| {
+            ClusterPoolMessage::OwnerObservationRequest(
+                tidefs_cluster::ClusterPoolOwnerObservationRequest {
+                    request_id,
+                    pool_guid,
+                    requesting_node_id,
+                },
+            )
+        };
+
+        let no_owner = handle_cluster_pool_message(
+            tidefs_transport::SessionId::new(10),
+            Some(2),
+            &observe(9, 2),
+            &ctx,
+        )
+        .expect("unowned observation refusal");
+        let ClusterPoolMessage::OwnerObservationResponse(no_owner) = no_owner else {
+            panic!("expected Pool owner observation response");
+        };
+        assert!(!no_owner.success);
+        assert!(no_owner.owner_node_id.is_none());
+        assert!(no_owner
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("no active owner")));
 
         let first = lease_response_token(
             handle_cluster_pool_message(
@@ -6771,6 +6928,37 @@ mod cluster_pool_handler_tests {
             )
             .expect("acquire response"),
         );
+        let observed_first = owner_observation(
+            handle_cluster_pool_message(
+                tidefs_transport::SessionId::new(11),
+                Some(3),
+                &observe(6, 3),
+                &ctx,
+            )
+            .expect("first owner observation"),
+        );
+        assert_eq!(observed_first.owner_node_id, 2);
+        assert_eq!(observed_first.membership_epoch, first.epoch);
+        assert_eq!(
+            observed_first.write_fence_generation,
+            first.write_fence.generation
+        );
+        assert!(observed_first.lease_remaining_ms > 0);
+        let wrong_requester = handle_cluster_pool_message(
+            tidefs_transport::SessionId::new(11),
+            Some(3),
+            &observe(8, 2),
+            &ctx,
+        )
+        .expect("mismatched observation requester refusal");
+        let ClusterPoolMessage::OwnerObservationResponse(wrong_requester) = wrong_requester else {
+            panic!("expected Pool owner observation response");
+        };
+        assert!(!wrong_requester.success);
+        assert!(wrong_requester
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("identity mismatch")));
 
         let refused = handle_cluster_pool_message(
             tidefs_transport::SessionId::new(11),
@@ -6834,6 +7022,21 @@ mod cluster_pool_handler_tests {
         );
         assert_eq!(handed_off.node_id, 3);
         assert!(handed_off.write_fence.generation > first.write_fence.generation);
+        let observed_successor = owner_observation(
+            handle_cluster_pool_message(
+                tidefs_transport::SessionId::new(10),
+                Some(2),
+                &observe(7, 2),
+                &ctx,
+            )
+            .expect("successor owner observation"),
+        );
+        assert_eq!(observed_successor.owner_node_id, 3);
+        assert_eq!(observed_successor.membership_epoch, handed_off.epoch);
+        assert_eq!(
+            observed_successor.write_fence_generation,
+            handed_off.write_fence.generation
+        );
     }
 
     #[test]

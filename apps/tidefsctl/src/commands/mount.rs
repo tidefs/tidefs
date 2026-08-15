@@ -180,13 +180,14 @@ pub struct PoolMountArgs {
     pub cluster_client: bool,
 
     #[cfg(feature = "cluster")]
-    /// Authenticated owner VFS_RPC address. Required for --cluster-client.
+    /// Provisioned VFS_RPC candidate address. Repeat once per trusted identity.
     #[arg(
         long = "cluster-vfs-rpc-addr",
         requires = "cluster_client",
-        required_if_eq("cluster_client", "true")
+        required_if_eq("cluster_client", "true"),
+        action = clap::ArgAction::Append
     )]
-    pub cluster_vfs_rpc_addr: Option<String>,
+    pub cluster_vfs_rpc_addr: Vec<String>,
 
     #[cfg(feature = "cluster")]
     /// Expected Pool GUID as exactly 32 hexadecimal digits.
@@ -205,9 +206,11 @@ pub struct PoolMountArgs {
     pub cluster: bool,
 
     #[cfg(feature = "cluster")]
-    /// Transport address of the storage node that grants the Pool lease.
-    /// Required when --cluster is set. Format: host:port.
-    #[arg(long = "cluster-authority-addr", requires = "cluster")]
+    /// Transport address of the storage node owning Pool lease authority.
+    #[arg(
+        long = "cluster-authority-addr",
+        required_if_eq_any([("cluster", "true"), ("cluster_client", "true")])
+    )]
     pub cluster_authority_addr: Option<String>,
 
     #[cfg(feature = "cluster")]
@@ -230,18 +233,17 @@ pub struct PoolMountArgs {
     pub cluster_node_credential: Option<PathBuf>,
 
     #[cfg(feature = "cluster")]
-    /// Exact storage-node identity trusted to grant the renewable Pool lease.
+    /// Exact storage-node identity trusted as Pool lease authority.
     #[arg(
         long = "cluster-trusted-authority-identity",
         value_name = "PATH",
-        requires = "cluster",
-        required_if_eq("cluster", "true")
+        required_if_eq_any([("cluster", "true"), ("cluster_client", "true")])
     )]
     pub cluster_trusted_authority_identity: Option<PathBuf>,
 
     #[cfg(feature = "cluster")]
-    /// Shareable public identity trusted for a VFS_RPC peer. Repeat for each
-    /// admitted peer on a cluster owner; cluster clients require exactly one.
+    /// Shareable VFS_RPC candidate identity. Repeat in address-pair order for
+    /// clients, or for every admitted client peer on an owner.
     #[arg(
         long = "cluster-trusted-vfs-rpc-peer-identity",
         value_name = "PATH",
@@ -844,14 +846,8 @@ fn build_cluster_client_mount(
     if args.cluster {
         return Err("--cluster-client conflicts with owner mode --cluster".to_string());
     }
-    if args.cluster_authority_addr.is_some()
-        || args.cluster_trusted_authority_identity.is_some()
-        || args.cluster_vfs_rpc_bind.is_some()
-    {
-        return Err(
-            "--cluster-client refuses owner-mode lease authority and VFS_RPC bind arguments"
-                .to_string(),
-        );
+    if args.cluster_vfs_rpc_bind.is_some() {
+        return Err("--cluster-client refuses owner-mode --cluster-vfs-rpc-bind".to_string());
     }
     if cluster_client_uses_local_mount_inputs(args) {
         return Err(
@@ -860,45 +856,98 @@ fn build_cluster_client_mount(
         );
     }
 
-    let owner_addr: SocketAddr = args
-        .cluster_vfs_rpc_addr
+    let authority_addr: SocketAddr = args
+        .cluster_authority_addr
         .as_deref()
-        .ok_or_else(|| "--cluster-client requires --cluster-vfs-rpc-addr".to_string())?
+        .ok_or_else(|| "--cluster-client requires --cluster-authority-addr".to_string())?
         .parse()
-        .map_err(|error| format!("invalid --cluster-vfs-rpc-addr: {error}"))?;
+        .map_err(|error| format!("invalid --cluster-authority-addr: {error}"))?;
     let pool_guid = parse_cluster_pool_guid(
         args.cluster_pool_guid
             .as_deref()
             .ok_or_else(|| "--cluster-client requires --cluster-pool-guid".to_string())?,
     )?;
-    let trusted_owner_path = match args.cluster_trusted_vfs_rpc_peer_identity.as_slice() {
-        [path] => path,
-        [] => {
-            return Err(
-                "--cluster-client requires --cluster-trusted-vfs-rpc-peer-identity".to_string(),
-            );
-        }
-        _ => {
-            return Err(
-                "--cluster-client requires exactly one --cluster-trusted-vfs-rpc-peer-identity"
-                    .to_string(),
-            );
-        }
-    };
+    if args.cluster_vfs_rpc_addr.is_empty() {
+        return Err("--cluster-client requires --cluster-vfs-rpc-addr".to_string());
+    }
+    if args.cluster_trusted_vfs_rpc_peer_identity.is_empty() {
+        return Err(
+            "--cluster-client requires --cluster-trusted-vfs-rpc-peer-identity".to_string(),
+        );
+    }
+    if args.cluster_vfs_rpc_addr.len() != args.cluster_trusted_vfs_rpc_peer_identity.len() {
+        return Err(
+            "--cluster-client requires one --cluster-vfs-rpc-addr for each --cluster-trusted-vfs-rpc-peer-identity"
+                .to_string(),
+        );
+    }
     let local_credential = load_cluster_node_credential(
         args.cluster_node_credential
             .as_deref()
             .ok_or_else(|| "--cluster-client requires --cluster-node-credential".to_string())?,
     )?;
-    let trusted_owner_identity = load_cluster_public_identity(trusted_owner_path)?;
+    let trusted_authority_identity = load_cluster_public_identity(
+        args.cluster_trusted_authority_identity
+            .as_deref()
+            .ok_or_else(|| {
+                "--cluster-client requires --cluster-trusted-authority-identity".to_string()
+            })?,
+    )?;
+    let owner_addresses = args
+        .cluster_vfs_rpc_addr
+        .iter()
+        .map(|address| {
+            address
+                .parse::<SocketAddr>()
+                .map_err(|error| format!("invalid --cluster-vfs-rpc-addr {address}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let owner_identities = args
+        .cluster_trusted_vfs_rpc_peer_identity
+        .iter()
+        .map(|path| load_cluster_public_identity(path))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let local_identity = local_credential.public_identity().into_identity();
+    let mut identity_roles = vec![
+        ("cluster client credential", &local_identity),
+        (
+            "trusted Pool lease authority",
+            trusted_authority_identity.identity(),
+        ),
+    ];
+    identity_roles.extend(
+        owner_identities
+            .iter()
+            .map(|identity| ("provisioned VFS_RPC owner candidate", identity.identity())),
+    );
+    validate_cluster_identity_consistency(&identity_roles)?;
+
+    let mut candidate_nodes = std::collections::BTreeSet::new();
+    let owner_candidates = owner_addresses
+        .into_iter()
+        .zip(owner_identities)
+        .map(|(address, identity)| {
+            if !candidate_nodes.insert(identity.node_id()) {
+                return Err(format!(
+                    "--cluster-client has more than one VFS_RPC candidate for node {}",
+                    identity.node_id()
+                ));
+            }
+            Ok(tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_client::ClusterVfsRpcOwnerCandidate::new(
+                address, identity,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     Ok(
         tidefs_posix_filesystem_adapter_daemon::ClusterVfsRpcMountConfig::new(
             args.mount_point.clone(),
-            owner_addr,
+            authority_addr,
             pool_guid,
             local_credential,
-            trusted_owner_identity,
+            trusted_authority_identity,
+            owner_candidates,
         ),
     )
 }
@@ -930,7 +979,11 @@ pub fn handle_mount(args: PoolMountArgs) {
 
     #[cfg(feature = "cluster")]
     if !args.cluster
-        && (args.cluster_node_credential.is_some()
+        && (args.cluster_authority_addr.is_some()
+            || !args.cluster_vfs_rpc_addr.is_empty()
+            || args.cluster_pool_guid.is_some()
+            || args.cluster_vfs_rpc_bind.is_some()
+            || args.cluster_node_credential.is_some()
             || args.cluster_trusted_authority_identity.is_some()
             || !args.cluster_trusted_vfs_rpc_peer_identity.is_empty())
     {
@@ -1670,13 +1723,13 @@ mod tests {
             encryption_salt: None,
             runtime: PoolMountRuntimeArgs::default(),
             cluster_client: true,
-            cluster_vfs_rpc_addr: Some("127.0.0.1:7412".into()),
+            cluster_vfs_rpc_addr: vec!["127.0.0.1:7412".into()],
             cluster_pool_guid: Some("00112233445566778899aabbccddeeff".into()),
             cluster: false,
-            cluster_authority_addr: None,
+            cluster_authority_addr: Some("127.0.0.1:7411".into()),
             cluster_vfs_rpc_bind: None,
             cluster_node_credential: None,
-            cluster_trusted_authority_identity: None,
+            cluster_trusted_authority_identity: Some(PathBuf::from("/unused/authority.identity")),
             cluster_trusted_vfs_rpc_peer_identity: Vec::new(),
         };
         let error = build_cluster_client_mount(&args).unwrap_err();
@@ -1685,7 +1738,7 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[test]
-    fn cluster_client_pool_mount_requires_exactly_one_owner_identity() {
+    fn cluster_client_pool_mount_requires_one_to_one_owner_candidates() {
         let make_args = |trusted_owner_identities| PoolMountArgs {
             pool_name: "remote".into(),
             mount_point: PathBuf::from("/mnt/remote"),
@@ -1698,13 +1751,13 @@ mod tests {
             encryption_salt: None,
             runtime: PoolMountRuntimeArgs::default(),
             cluster_client: true,
-            cluster_vfs_rpc_addr: Some("127.0.0.1:7412".into()),
+            cluster_vfs_rpc_addr: vec!["127.0.0.1:7412".into()],
             cluster_pool_guid: Some("00112233445566778899aabbccddeeff".into()),
             cluster: false,
-            cluster_authority_addr: None,
+            cluster_authority_addr: Some("127.0.0.1:7411".into()),
             cluster_vfs_rpc_bind: None,
             cluster_node_credential: Some(PathBuf::from("/unused/client.credential")),
-            cluster_trusted_authority_identity: None,
+            cluster_trusted_authority_identity: Some(PathBuf::from("/unused/authority.identity")),
             cluster_trusted_vfs_rpc_peer_identity: trusted_owner_identities,
         };
 
@@ -1716,7 +1769,7 @@ mod tests {
             PathBuf::from("/unused/owner-b.identity"),
         ]))
         .unwrap_err();
-        assert!(repeated.contains("requires exactly one"));
+        assert!(repeated.contains("one --cluster-vfs-rpc-addr for each"));
     }
 
     #[cfg(feature = "cluster")]
@@ -1856,7 +1909,7 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster_client: false,
             #[cfg(feature = "cluster")]
-            cluster_vfs_rpc_addr: None,
+            cluster_vfs_rpc_addr: Vec::new(),
             #[cfg(feature = "cluster")]
             cluster_pool_guid: None,
             #[cfg(feature = "cluster")]
@@ -1898,7 +1951,7 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster_client: false,
             #[cfg(feature = "cluster")]
-            cluster_vfs_rpc_addr: None,
+            cluster_vfs_rpc_addr: Vec::new(),
             #[cfg(feature = "cluster")]
             cluster_pool_guid: None,
             dataset: "root".into(),
@@ -1934,7 +1987,7 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster_client: false,
             #[cfg(feature = "cluster")]
-            cluster_vfs_rpc_addr: None,
+            cluster_vfs_rpc_addr: Vec::new(),
             #[cfg(feature = "cluster")]
             cluster_pool_guid: None,
             #[cfg(feature = "cluster")]
@@ -1969,7 +2022,7 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster_client: false,
             #[cfg(feature = "cluster")]
-            cluster_vfs_rpc_addr: None,
+            cluster_vfs_rpc_addr: Vec::new(),
             #[cfg(feature = "cluster")]
             cluster_pool_guid: None,
             #[cfg(feature = "cluster")]

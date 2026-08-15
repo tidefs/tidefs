@@ -209,13 +209,14 @@ pub enum PoolCommand {
         cluster_client: bool,
 
         #[cfg(feature = "cluster")]
-        /// Authenticated owner VFS_RPC address.
+        /// Provisioned VFS_RPC candidate address. Repeat per trusted identity.
         #[arg(
             long = "cluster-vfs-rpc-addr",
             requires = "cluster_client",
-            required_if_eq("cluster_client", "true")
+            required_if_eq("cluster_client", "true"),
+            action = clap::ArgAction::Append
         )]
-        cluster_vfs_rpc_addr: Option<String>,
+        cluster_vfs_rpc_addr: Vec<String>,
 
         #[cfg(feature = "cluster")]
         /// Expected Pool GUID as exactly 32 hexadecimal digits.
@@ -232,8 +233,11 @@ pub enum PoolCommand {
         cluster: bool,
 
         #[cfg(feature = "cluster")]
-        /// Transport address of the storage node granting the Pool lease.
-        #[arg(long = "cluster-authority-addr", requires = "cluster")]
+        /// Transport address of the storage node owning Pool lease authority.
+        #[arg(
+            long = "cluster-authority-addr",
+            required_if_eq_any([("cluster", "true"), ("cluster_client", "true")])
+        )]
         cluster_authority_addr: Option<String>,
 
         #[cfg(feature = "cluster")]
@@ -255,18 +259,17 @@ pub enum PoolCommand {
         cluster_node_credential: Option<PathBuf>,
 
         #[cfg(feature = "cluster")]
-        /// Exact storage-node identity trusted to grant the renewable Pool lease.
+        /// Exact storage-node identity trusted as Pool lease authority.
         #[arg(
             long = "cluster-trusted-authority-identity",
             value_name = "PATH",
-            requires = "cluster",
-            required_if_eq("cluster", "true")
+            required_if_eq_any([("cluster", "true"), ("cluster_client", "true")])
         )]
         cluster_trusted_authority_identity: Option<PathBuf>,
 
         #[cfg(feature = "cluster")]
-        /// Shareable public identity trusted for a VFS_RPC peer. Repeat for
-        /// each admitted peer on a cluster owner; clients require exactly one.
+        /// Shareable VFS_RPC candidate identity. Repeat in address-pair order
+        /// for clients, or for each admitted peer on an owner.
         #[arg(
             long = "cluster-trusted-vfs-rpc-peer-identity",
             value_name = "PATH",
