@@ -1720,12 +1720,39 @@ impl VfsRpcClient {
         max_in_flight: usize,
         retry_after: Duration,
     ) -> Self {
+        Self::new_with_initial_op_id(
+            writer_node,
+            dataset_id,
+            term,
+            epoch,
+            OpId(1),
+            max_in_flight,
+            retry_after,
+        )
+    }
+
+    /// Construct a client with an explicit first operation identifier.
+    ///
+    /// Long-lived authenticated callers use a fresh non-zero starting point
+    /// for each client incarnation so an owner's retained per-peer replay
+    /// window cannot confuse a new mount with an earlier incarnation. A live
+    /// client keeps this sequence across transport reconnections.
+    #[must_use]
+    pub fn new_with_initial_op_id(
+        writer_node: u64,
+        dataset_id: DatasetId,
+        term: u64,
+        epoch: u64,
+        initial_op_id: OpId,
+        max_in_flight: usize,
+        retry_after: Duration,
+    ) -> Self {
         Self {
             writer_node,
             dataset_id,
             term,
             epoch,
-            next_op_id: 1,
+            next_op_id: initial_op_id.0.max(1),
             retry_after,
             max_in_flight: max_in_flight.max(1),
             in_flight: BTreeMap::new(),
@@ -1745,7 +1772,7 @@ impl VfsRpcClient {
             return Err(VfsRpcError::TooManyInFlight(self.max_in_flight));
         }
         let op_id = OpId(self.next_op_id);
-        self.next_op_id = self.next_op_id.saturating_add(1).max(1);
+        self.next_op_id = self.next_op_id.wrapping_add(1).max(1);
         let method = payload.method();
         let request = VfsRpcRequest::new(
             op_id,
@@ -1828,6 +1855,14 @@ impl VfsRpcClient {
             self.stats.timeouts = self.stats.timeouts.saturating_add(1);
         }
         expired
+    }
+
+    /// Retire one request after the caller has exhausted transport recovery.
+    ///
+    /// This does not classify the request as a protocol timeout: the carrier
+    /// owns the final error returned to its caller.
+    pub fn abandon_request(&mut self, op_id: OpId) -> Option<PendingRequest> {
+        self.in_flight.remove(&op_id)
     }
 
     #[must_use]
@@ -2831,6 +2866,49 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, VfsRpcError::TooManyInFlight(1));
+    }
+
+    #[test]
+    fn client_uses_explicit_nonzero_operation_incarnation_and_wraps_zero() {
+        let start = Instant::now();
+        let mut client = VfsRpcClient::new_with_initial_op_id(
+            2,
+            DatasetId::new(3),
+            1,
+            1,
+            OpId(u64::MAX),
+            1,
+            Duration::from_secs(1),
+        );
+        let last = client
+            .begin_request(start, 0, VfsRpcRequestPayload::GetRoot, None)
+            .unwrap();
+        assert_eq!(last.header.op_id, OpId(u64::MAX));
+        assert!(client.abandon_request(last.header.op_id).is_some());
+
+        let wrapped = client
+            .begin_request(start, 0, VfsRpcRequestPayload::GetRoot, None)
+            .unwrap();
+        assert_eq!(wrapped.header.op_id, OpId(1));
+        assert!(client.abandon_request(wrapped.header.op_id).is_some());
+
+        let mut zero_seed = VfsRpcClient::new_with_initial_op_id(
+            2,
+            DatasetId::new(3),
+            1,
+            1,
+            OpId(0),
+            1,
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            zero_seed
+                .begin_request(start, 0, VfsRpcRequestPayload::GetRoot, None)
+                .unwrap()
+                .header
+                .op_id,
+            OpId(1)
+        );
     }
 
     #[test]
