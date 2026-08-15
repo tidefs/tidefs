@@ -38,10 +38,10 @@ pub const VFS_RPC_CONTROL_LANE: LaneClass = CONTROL_SERVICE_LANE;
 /// Control-service message type carrying the owner-issued session authority.
 pub const VFS_RPC_SESSION_AUTHORITY_MESSAGE_TYPE: u8 = 0xff;
 /// Exact byte length of a VFS_RPC session-authority record.
-pub const VFS_RPC_SESSION_AUTHORITY_WIRE_SIZE: usize = 64;
+pub const VFS_RPC_SESSION_AUTHORITY_WIRE_SIZE: usize = 72;
 
 const VFS_RPC_SESSION_AUTHORITY_MAGIC: [u8; 4] = *b"TVSA";
-const VFS_RPC_SESSION_AUTHORITY_VERSION: u16 = 1;
+const VFS_RPC_SESSION_AUTHORITY_VERSION: u16 = 2;
 
 /// Owner-issued authority for requests on one authenticated VFS_RPC session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +51,7 @@ pub struct VfsRpcSessionAuthority {
     writer_node: u64,
     term: u64,
     epoch: u64,
+    lease_remaining_ms: u64,
 }
 
 impl VfsRpcSessionAuthority {
@@ -60,6 +61,7 @@ impl VfsRpcSessionAuthority {
         writer_node: u64,
         term: u64,
         epoch: u64,
+        lease_remaining_ms: u64,
     ) -> Result<Self, VfsRpcSessionAuthorityError> {
         let authority = Self {
             pool_guid,
@@ -67,6 +69,7 @@ impl VfsRpcSessionAuthority {
             writer_node,
             term,
             epoch,
+            lease_remaining_ms,
         };
         authority.validate_nonzero()?;
         Ok(authority)
@@ -97,6 +100,23 @@ impl VfsRpcSessionAuthority {
         self.epoch
     }
 
+    /// Remaining owner-lease validity sampled when this authority was issued.
+    #[must_use]
+    pub const fn lease_remaining_ms(&self) -> u64 {
+        self.lease_remaining_ms
+    }
+
+    /// Compare the durable owner incarnation while allowing a refreshed lease
+    /// lifetime to decrease or advance independently.
+    #[must_use]
+    pub fn same_owner_incarnation(&self, other: &Self) -> bool {
+        self.pool_guid == other.pool_guid
+            && self.dataset_id.0 == other.dataset_id.0
+            && self.writer_node == other.writer_node
+            && self.term == other.term
+            && self.epoch == other.epoch
+    }
+
     /// Encode the strict fixed-width little-endian authority record.
     #[must_use]
     pub fn encode_fixed(&self) -> [u8; VFS_RPC_SESSION_AUTHORITY_WIRE_SIZE] {
@@ -109,6 +129,7 @@ impl VfsRpcSessionAuthority {
         bytes[40..48].copy_from_slice(&self.writer_node.to_le_bytes());
         bytes[48..56].copy_from_slice(&self.term.to_le_bytes());
         bytes[56..64].copy_from_slice(&self.epoch.to_le_bytes());
+        bytes[64..72].copy_from_slice(&self.lease_remaining_ms.to_le_bytes());
         bytes
     }
 
@@ -162,6 +183,11 @@ impl VfsRpcSessionAuthority {
                     .try_into()
                     .expect("fixed authority record has eight epoch bytes"),
             ),
+            lease_remaining_ms: u64::from_le_bytes(
+                bytes[64..72]
+                    .try_into()
+                    .expect("fixed authority record has eight lease-lifetime bytes"),
+            ),
         };
         authority.validate_nonzero()?;
         Ok(authority)
@@ -208,6 +234,9 @@ impl VfsRpcSessionAuthority {
         if self.epoch == 0 {
             return Err(VfsRpcSessionAuthorityError::ZeroEpoch);
         }
+        if self.lease_remaining_ms == 0 {
+            return Err(VfsRpcSessionAuthorityError::ZeroLeaseRemaining);
+        }
         Ok(())
     }
 }
@@ -247,6 +276,7 @@ pub enum VfsRpcSessionAuthorityError {
     ZeroWriterNode,
     ZeroTerm,
     ZeroEpoch,
+    ZeroLeaseRemaining,
     WrongPoolGuid {
         expected: [u8; 16],
         found: [u8; 16],
@@ -296,6 +326,9 @@ impl fmt::Display for VfsRpcSessionAuthorityError {
             Self::ZeroWriterNode => write!(f, "VFS_RPC authority writer must be nonzero"),
             Self::ZeroTerm => write!(f, "VFS_RPC authority term must be nonzero"),
             Self::ZeroEpoch => write!(f, "VFS_RPC authority epoch must be nonzero"),
+            Self::ZeroLeaseRemaining => {
+                write!(f, "VFS_RPC authority remaining lease lifetime must be nonzero")
+            }
             Self::WrongPoolGuid { expected, found } => write!(
                 f,
                 "VFS_RPC authority Pool GUID {found:02x?} does not match expected {expected:02x?}"
@@ -1741,7 +1774,7 @@ mod tests {
     }
 
     fn sample_session_authority() -> VfsRpcSessionAuthority {
-        VfsRpcSessionAuthority::new([0x41; 16], DatasetId::new(0x52), 9, 7, 3)
+        VfsRpcSessionAuthority::new([0x41; 16], DatasetId::new(0x52), 9, 7, 3, 30_000)
             .expect("valid session authority")
     }
 
@@ -1804,10 +1837,10 @@ mod tests {
             Err(VfsRpcSessionAuthorityError::BadMagic(_))
         ));
         let mut bad_version = encoded;
-        bad_version[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        bad_version[4..6].copy_from_slice(&3_u16.to_le_bytes());
         assert_eq!(
             VfsRpcSessionAuthority::decode_fixed(&bad_version),
-            Err(VfsRpcSessionAuthorityError::UnsupportedVersion(2))
+            Err(VfsRpcSessionAuthorityError::UnsupportedVersion(3))
         );
         let mut bad_declared_length = encoded;
         bad_declared_length[6..8].copy_from_slice(&63_u16.to_le_bytes());
@@ -1825,6 +1858,7 @@ mod tests {
             (40..48, VfsRpcSessionAuthorityError::ZeroWriterNode),
             (48..56, VfsRpcSessionAuthorityError::ZeroTerm),
             (56..64, VfsRpcSessionAuthorityError::ZeroEpoch),
+            (64..72, VfsRpcSessionAuthorityError::ZeroLeaseRemaining),
         ] {
             let mut zeroed = encoded;
             zeroed[range].fill(0);

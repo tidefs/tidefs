@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tidefs_auth::{
     NodeKeyStore, NodePrivateCredential, NodePublicIdentity, NODE_PRIVATE_CREDENTIAL_WIRE_SIZE,
@@ -13,8 +13,9 @@ use tidefs_auth::{
 };
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId as LifecycleDatasetId, SyncGuarantee};
 use tidefs_local_filesystem::{
-    human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem,
-    LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy, RootAuthenticationKey,
+    human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem,
+    ExternalMutationDeadline, LocalFileSystem, LocalFileSystemOpenConfig,
+    LocalStorageAllocatorPolicy, RootAuthenticationKey,
 };
 use tidefs_local_object_store::pool::PoolRedundancyPolicy;
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_owner::{
@@ -42,6 +43,10 @@ const CLIENT_B_NODE: u64 = 3;
 const WRITER_TERM: u64 = 77;
 const WRITER_EPOCH: u64 = 9;
 const POOL_GUID: [u8; 16] = [0x47; 16];
+
+fn live_authority_deadline() -> ExternalMutationDeadline {
+    ExternalMutationDeadline::new_until(Instant::now() + Duration::from_secs(60))
+}
 
 struct ProvisionedIdentity {
     credential_bytes: [u8; NODE_PRIVATE_CREDENTIAL_WIRE_SIZE],
@@ -352,6 +357,7 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
         POOL_GUID,
         DatasetId::new(0),
         Arc::clone(&writer_fence),
+        live_authority_deadline(),
         Arc::clone(&engine),
         Arc::clone(&shutdown),
     );
@@ -371,6 +377,7 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
             POOL_GUID,
             dataset_id,
             Arc::clone(&writer_fence),
+            live_authority_deadline(),
             Arc::clone(&engine),
             Arc::clone(&shutdown),
         ),
@@ -389,6 +396,7 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
             POOL_GUID,
             dataset_id,
             Arc::clone(&writer_fence),
+            live_authority_deadline(),
             Arc::clone(&engine),
             Arc::clone(&shutdown),
         ),
@@ -403,10 +411,26 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
             POOL_GUID,
             dataset_id,
             Arc::clone(&writer_fence),
+            live_authority_deadline(),
             Arc::clone(&engine),
             Arc::clone(&shutdown),
         ),
         "trusted peer node 2 conflicts with the local owner node",
+    );
+    assert_owner_start_refused(
+        ClusterVfsRpcOwnerConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            OWNER_NODE,
+            owner_identity.credential(),
+            vec![client_identity.public_identity()],
+            POOL_GUID,
+            dataset_id,
+            Arc::clone(&writer_fence),
+            ExternalMutationDeadline::new_until(Instant::now()),
+            Arc::clone(&engine),
+            Arc::clone(&shutdown),
+        ),
+        "mutation authority deadline has expired",
     );
     let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
         "127.0.0.1:0".parse().unwrap(),
@@ -419,6 +443,7 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
         POOL_GUID,
         dataset_id,
         writer_fence,
+        live_authority_deadline(),
         engine,
         Arc::clone(&shutdown),
     ))

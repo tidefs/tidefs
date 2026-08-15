@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use tidefs_auth::{NodeKeyStore, NodePrivateCredential, NodePublicIdentity};
 use tidefs_transport::{
-    EndpointFamily, NodeInfo, SessionCloseReason, SessionId, SessionState, Transport,
+    EndpointFamily, NodeInfo, SessionCloseReason, SessionId, SessionState, TcpTransport, Transport,
     TransportAddr, TransportError, TransportSessionSet,
 };
 use tidefs_types_vfs_core::{
@@ -127,6 +127,12 @@ pub enum ClusterVfsRpcClientError {
     AuthorityTimeout(SessionId),
     AuthorityTransport(String),
     MalformedAuthority(VfsRpcSessionAuthorityError),
+    AuthorityDeadlineExpired {
+        remaining_ms: u64,
+    },
+    AuthorityDeadlineOverflow {
+        remaining_ms: u64,
+    },
     CloseFailed(String),
 }
 
@@ -216,6 +222,14 @@ impl fmt::Display for ClusterVfsRpcClientError {
             Self::MalformedAuthority(error) => {
                 write!(f, "refuse cluster VFS_RPC owner authority: {error}")
             }
+            Self::AuthorityDeadlineExpired { remaining_ms } => write!(
+                f,
+                "cluster VFS_RPC owner authority expired during authenticated observation of its {remaining_ms}ms remaining lifetime"
+            ),
+            Self::AuthorityDeadlineOverflow { remaining_ms } => write!(
+                f,
+                "cluster VFS_RPC owner authority lifetime {remaining_ms}ms exceeds the local monotonic clock"
+            ),
             Self::CloseFailed(error) => write!(f, "close cluster VFS_RPC client: {error}"),
         }
     }
@@ -226,8 +240,10 @@ impl std::error::Error for ClusterVfsRpcClientError {}
 /// Synchronous dispatch client installed behind [`FuseVfsAdapter`].
 ///
 /// [`FuseVfsAdapter`]: crate::fuse_vfs_adapter::FuseVfsAdapter
+#[derive(Clone)]
 pub struct ClusterVfsRpcClient {
-    state: Mutex<ClientState>,
+    state: Arc<Mutex<ClientState>>,
+    authority_lost: Arc<AtomicBool>,
 }
 
 impl ClusterVfsRpcClient {
@@ -239,7 +255,8 @@ impl ClusterVfsRpcClient {
         }
         let expected_owner = config.trusted_owner_identity.node_id();
 
-        let (mut discovery, discovery_session) = connect_transport(&config, 0)?;
+        let (mut discovery, discovery_session) =
+            connect_transport(&config, 0, CLIENT_AUTHORITY_TIMEOUT)?;
         let owner_epoch = match discovery.perform_handshake(discovery_session) {
             Err(TransportError::AttestedEpochMismatch {
                 authenticated_peer,
@@ -276,13 +293,16 @@ impl ClusterVfsRpcClient {
         };
         drop(discovery);
 
-        let (mut transport, session_id) = connect_transport(&config, owner_epoch)?;
+        let authority_observation_started = Instant::now();
+        let (mut transport, session_id) =
+            connect_transport(&config, owner_epoch, CLIENT_AUTHORITY_TIMEOUT)?;
         match transport.perform_handshake(session_id) {
             Ok(()) => Self::from_authenticated_transport(
                 transport,
                 session_id,
                 config.expected_pool_guid,
                 Some(config),
+                authority_observation_started,
             ),
             Err(TransportError::AttestedEpochMismatch {
                 authenticated_peer,
@@ -305,7 +325,13 @@ impl ClusterVfsRpcClient {
         session_id: SessionId,
         expected_pool_guid: [u8; 16],
     ) -> Result<Self, ClusterVfsRpcClientError> {
-        Self::from_authenticated_transport(transport, session_id, expected_pool_guid, None)
+        Self::from_authenticated_transport(
+            transport,
+            session_id,
+            expected_pool_guid,
+            None,
+            Instant::now(),
+        )
     }
 
     fn from_authenticated_transport(
@@ -313,15 +339,22 @@ impl ClusterVfsRpcClient {
         session_id: SessionId,
         expected_pool_guid: [u8; 16],
         reconnect_config: Option<ClusterVfsRpcClientConfig>,
+        authority_observation_started: Instant,
     ) -> Result<Self, ClusterVfsRpcClientError> {
         let authenticated_peer = validate_construction_session(&transport, session_id)?;
         transport
             .set_nonblocking(true)
             .map_err(|error| ClusterVfsRpcClientError::ConfigureNonblocking(error.to_string()))?;
-        let authority = receive_session_authority(&mut transport, session_id)?;
+        let authority = receive_session_authority(
+            &mut transport,
+            session_id,
+            Instant::now() + CLIENT_AUTHORITY_TIMEOUT,
+        )?;
         authority
             .validate_for_client(expected_pool_guid, authenticated_peer)
             .map_err(map_session_authority_error)?;
+        let (authority_valid_until, next_authority_refresh) =
+            authority_schedule(authority_observation_started, authority)?;
 
         let writer = authority.writer_node();
         let dataset_id = authority.dataset_id();
@@ -335,7 +368,8 @@ impl ClusterVfsRpcClient {
         sessions.mark_healthy(session_id);
 
         Ok(Self {
-            state: Mutex::new(ClientState {
+            authority_lost: Arc::clone(&authority_lost),
+            state: Arc::new(Mutex::new(ClientState {
                 transport,
                 session_id,
                 local_node,
@@ -362,18 +396,42 @@ impl ClusterVfsRpcClient {
                 directories: BTreeMap::new(),
                 closed: false,
                 authority,
+                authority_valid_until,
+                next_authority_refresh,
                 reconnect_config,
                 authority_lost,
-            }),
+            })),
         })
+    }
+
+    /// Refresh or expire the authenticated owner authority without requiring
+    /// a filesystem request from the mounted frontend.
+    pub fn poll_authority(&self) -> Result<(), Errno> {
+        let Ok(mut state) = self.state.lock() else {
+            self.authority_lost.store(true, Ordering::Release);
+            return Err(Errno::ESTALE);
+        };
+        state.poll_authority()
+    }
+
+    /// Time until the next authority refresh or terminal deadline check.
+    #[must_use]
+    pub fn authority_poll_wait(&self) -> Duration {
+        match self.state.lock() {
+            Ok(state) => state.authority_poll_wait(),
+            Err(_) => {
+                self.authority_lost.store(true, Ordering::Release);
+                Duration::ZERO
+            }
+        }
     }
 
     /// Close the client session before the owner/Pool lifecycle is torn down.
     pub fn close(&self) -> Result<(), ClusterVfsRpcClientError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ClusterVfsRpcClientError::SessionLockPoisoned(SessionId::new(0)))?;
+        let mut state = self.state.lock().map_err(|_| {
+            self.authority_lost.store(true, Ordering::Release);
+            ClusterVfsRpcClientError::SessionLockPoisoned(SessionId::new(0))
+        })?;
         state.close().map_err(|error| {
             ClusterVfsRpcClientError::CloseFailed(format!("session {}: {error}", state.session_id))
         })
@@ -383,6 +441,7 @@ impl ClusterVfsRpcClient {
 fn connect_transport(
     config: &ClusterVfsRpcClientConfig,
     epoch: u64,
+    timeout: Duration,
 ) -> Result<(Transport, SessionId), ClusterVfsRpcClientError> {
     let local_node = config.local_credential.node_id();
     let owner_node = config.trusted_owner_identity.node_id();
@@ -398,10 +457,11 @@ fn connect_transport(
         .local_credential
         .keypair()
         .map_err(|error| ClusterVfsRpcClientError::Credential(error.to_string()))?;
-    let mut transport = Transport::new(local_node)
-        .with_attestation(local_keypair, local_identity)
-        .with_known_identities(known_identities)
-        .with_epoch(epoch);
+    let mut transport =
+        Transport::with_backend(local_node, Box::new(TcpTransport::new(timeout, timeout)))
+            .with_attestation(local_keypair, local_identity)
+            .with_known_identities(known_identities)
+            .with_epoch(epoch);
     transport.set_endpoint_family(EndpointFamily::Control);
     transport.set_attestation_bootstrap_from_handshake(false);
     transport.add_node(NodeInfo::new(
@@ -435,12 +495,30 @@ fn randomized_operation_id(local_node: u64, authority: VfsRpcSessionAuthority) -
     }
 }
 
+fn authority_schedule(
+    observation_started: Instant,
+    authority: VfsRpcSessionAuthority,
+) -> Result<(Instant, Instant), ClusterVfsRpcClientError> {
+    let remaining_ms = authority.lease_remaining_ms();
+    let valid_until = observation_started
+        .checked_add(Duration::from_millis(remaining_ms))
+        .ok_or(ClusterVfsRpcClientError::AuthorityDeadlineOverflow { remaining_ms })?;
+    let now = Instant::now();
+    let remaining = valid_until.saturating_duration_since(now);
+    if remaining.is_zero() {
+        return Err(ClusterVfsRpcClientError::AuthorityDeadlineExpired { remaining_ms });
+    }
+    let next_refresh = now.checked_add(remaining / 2).unwrap_or(now);
+    Ok((valid_until, next_refresh))
+}
+
 impl VfsDispatch for ClusterVfsRpcClient {
     fn dispatch(&self, operation: VfsOperation) -> Result<VfsResponse, Errno> {
-        self.state
-            .lock()
-            .map_err(|_| Errno::EIO)?
-            .dispatch(operation)
+        let Ok(mut state) = self.state.lock() else {
+            self.authority_lost.store(true, Ordering::Release);
+            return Err(Errno::ESTALE);
+        };
+        state.dispatch(operation)
     }
 }
 
@@ -471,6 +549,8 @@ struct ClientState {
     directories: BTreeMap<DirHandleId, DirHandleRecord>,
     closed: bool,
     authority: VfsRpcSessionAuthority,
+    authority_valid_until: Instant,
+    next_authority_refresh: Instant,
     reconnect_config: Option<ClusterVfsRpcClientConfig>,
     authority_lost: Arc<AtomicBool>,
 }
@@ -480,6 +560,7 @@ impl ClientState {
         if self.authority_lost.load(Ordering::Acquire) {
             return Err(Errno::ESTALE);
         }
+        self.ensure_authority_live()?;
         use engine_op::{
             GetRootInodeResponse, InodeAttrResponse, OpenDirResponse, OpenResponse,
             ReadDirResponse, ReadResponse, StatFsResponse, UnitResponse, WriteResponse,
@@ -817,6 +898,7 @@ impl ClientState {
         if self.authority_lost.load(Ordering::Acquire) {
             return Err(Errno::ESTALE);
         }
+        self.ensure_authority_live()?;
         if self.closed {
             return Err(Errno::ESTALE);
         }
@@ -856,7 +938,8 @@ impl ClientState {
                 return Err(error.errno);
             }
 
-            let deadline = Instant::now() + CLIENT_REQUEST_TIMEOUT;
+            let deadline =
+                (Instant::now() + CLIENT_REQUEST_TIMEOUT).min(self.authority_valid_until);
             loop {
                 let (envelope, payload) = match self.transport.recv_envelope(self.session_id) {
                     Ok(frame) => frame,
@@ -883,6 +966,7 @@ impl ClientState {
                     }
                 };
                 let received_at = Instant::now();
+                self.ensure_authority_live()?;
                 let inbound = self
                     .adapter
                     .unwrap_inbound(received_at, self.session_id, &envelope, &payload)
@@ -918,9 +1002,22 @@ impl ClientState {
     }
 
     fn reconnect_exact(&mut self) -> Result<(), Errno> {
+        self.ensure_authority_live()?;
         let config = self.reconnect_config.as_ref().ok_or(Errno::EIO)?;
-        let (mut replacement, replacement_session) =
-            connect_transport(config, self.authority.epoch()).map_err(|_| Errno::EIO)?;
+        let remaining = self
+            .authority_valid_until
+            .saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.fence_authority_loss();
+            return Err(Errno::ESTALE);
+        }
+        let observation_started = Instant::now();
+        let (mut replacement, replacement_session) = connect_transport(
+            config,
+            self.authority.epoch(),
+            remaining.min(CLIENT_AUTHORITY_TIMEOUT),
+        )
+        .map_err(|_| Errno::EIO)?;
         match replacement.perform_handshake(replacement_session) {
             Ok(()) => {}
             Err(TransportError::AttestedEpochMismatch { .. }) => {
@@ -934,28 +1031,86 @@ impl ClientState {
         let authenticated_peer = validate_construction_session(&replacement, replacement_session)
             .map_err(|_| Errno::EIO)?;
         replacement.set_nonblocking(true).map_err(|_| Errno::EIO)?;
-        let replacement_authority =
-            receive_session_authority(&mut replacement, replacement_session)
-                .map_err(|_| Errno::EIO)?;
+        let authority_receive_deadline = self
+            .authority_valid_until
+            .min(Instant::now() + CLIENT_AUTHORITY_TIMEOUT);
+        let replacement_authority = receive_session_authority(
+            &mut replacement,
+            replacement_session,
+            authority_receive_deadline,
+        )
+        .map_err(|_| Errno::EIO)?;
         if replacement_authority
             .validate_for_client(config.expected_pool_guid, authenticated_peer)
             .is_err()
-            || replacement_authority != self.authority
+            || !replacement_authority.same_owner_incarnation(&self.authority)
         {
             let _ =
                 replacement.close_session(replacement_session, SessionCloseReason::TransportError);
             self.fence_authority_loss();
             return Err(Errno::ESTALE);
         }
+        let (authority_valid_until, next_authority_refresh) =
+            match authority_schedule(observation_started, replacement_authority) {
+                Ok(schedule) => schedule,
+                Err(_) => {
+                    let _ = replacement
+                        .close_session(replacement_session, SessionCloseReason::TransportError);
+                    self.fence_authority_loss();
+                    return Err(Errno::ESTALE);
+                }
+            };
 
         let old_session = self.session_id;
         let mut old_transport = std::mem::replace(&mut self.transport, replacement);
         self.session_id = replacement_session;
         self.next_sequence = 0;
         self.closed = false;
+        self.authority = replacement_authority;
+        self.authority_valid_until = authority_valid_until;
+        self.next_authority_refresh = next_authority_refresh;
         self.reset_adapter_for_current_session();
         let _ = old_transport.close_session(old_session, SessionCloseReason::TransportError);
         Ok(())
+    }
+
+    fn ensure_authority_live(&mut self) -> Result<(), Errno> {
+        if Instant::now() < self.authority_valid_until {
+            return Ok(());
+        }
+        self.fence_authority_loss();
+        Err(Errno::ESTALE)
+    }
+
+    fn poll_authority(&mut self) -> Result<(), Errno> {
+        if self.authority_lost.load(Ordering::Acquire) || self.closed {
+            return Err(Errno::ESTALE);
+        }
+        self.ensure_authority_live()?;
+        let now = Instant::now();
+        if now < self.next_authority_refresh {
+            return Ok(());
+        }
+
+        let remaining = self.authority_valid_until.saturating_duration_since(now);
+        self.next_authority_refresh = now.checked_add(remaining / 2).unwrap_or(now);
+        match self.reconnect_exact() {
+            Ok(()) => Ok(()),
+            Err(Errno::ESTALE) => Err(Errno::ESTALE),
+            Err(_) if Instant::now() >= self.authority_valid_until => {
+                self.fence_authority_loss();
+                Err(Errno::ESTALE)
+            }
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn authority_poll_wait(&self) -> Duration {
+        if self.authority_lost.load(Ordering::Acquire) || self.closed {
+            return Duration::ZERO;
+        }
+        let next_check = self.next_authority_refresh.min(self.authority_valid_until);
+        next_check.saturating_duration_since(Instant::now())
     }
 
     fn fence_authority_loss(&mut self) {
@@ -1167,8 +1322,8 @@ fn authenticated_session_peer(
 fn receive_session_authority(
     transport: &mut Transport,
     session_id: SessionId,
+    deadline: Instant,
 ) -> Result<tidefs_vfs_rpc::transport_adapter::VfsRpcSessionAuthority, ClusterVfsRpcClientError> {
-    let deadline = Instant::now() + CLIENT_AUTHORITY_TIMEOUT;
     loop {
         match transport.recv_envelope(session_id) {
             Ok((envelope, payload)) => {

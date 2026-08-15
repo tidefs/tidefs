@@ -13,8 +13,9 @@ use tidefs_auth::{
 };
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId as LifecycleDatasetId, SyncGuarantee};
 use tidefs_local_filesystem::{
-    human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem,
-    LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy, RootAuthenticationKey,
+    human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem,
+    ExternalMutationDeadline, LocalFileSystem, LocalFileSystemOpenConfig,
+    LocalStorageAllocatorPolicy, RootAuthenticationKey,
 };
 use tidefs_local_object_store::pool::PoolRedundancyPolicy;
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_client::{
@@ -46,6 +47,10 @@ const CLIENT_B_NODE: u64 = 3;
 const WRITER_TERM: u64 = 77;
 const WRITER_EPOCH: u64 = 9;
 const POOL_GUID: [u8; 16] = [0x49; 16];
+
+fn live_authority_deadline() -> ExternalMutationDeadline {
+    ExternalMutationDeadline::new_until(Instant::now() + Duration::from_secs(60))
+}
 
 struct ProvisionedIdentity {
     credential_bytes: [u8; NODE_PRIVATE_CREDENTIAL_WIRE_SIZE],
@@ -429,6 +434,7 @@ fn client_replays_one_mutation_after_authenticated_reconnect_and_fences_term_mov
             OWNER_NODE,
             WRITER_TERM,
             WRITER_EPOCH,
+            60_000,
         )
         .expect("build reconnect authority");
         let mut bridge = VfsEngineBridge::new(VfsEngineBridgeWriter::new(
@@ -524,6 +530,7 @@ fn client_replays_one_mutation_after_authenticated_reconnect_and_fences_term_mov
             OWNER_NODE,
             WRITER_TERM + 1,
             WRITER_EPOCH,
+            60_000,
         )
         .expect("build moved reconnect authority");
         let (moved_session, _) = admit_test_session(&mut owner_transport, moved_authority);
@@ -616,6 +623,203 @@ fn client_replays_one_mutation_after_authenticated_reconnect_and_fences_term_mov
 }
 
 #[test]
+fn in_flight_request_cannot_outlive_authenticated_owner_deadline() {
+    let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
+    let client_identity = ProvisionedIdentity::new(CLIENT_NODE);
+    let (mut owner_transport, owner_addr) = bind_test_owner(&owner_identity, &client_identity);
+    let owner_thread = std::thread::spawn(move || {
+        let authority = VfsRpcSessionAuthority::new(
+            POOL_GUID,
+            DatasetId::new(0x5353),
+            OWNER_NODE,
+            WRITER_TERM,
+            WRITER_EPOCH,
+            800,
+        )
+        .expect("build short-lived request authority");
+        let (session_id, mut adapter) = admit_test_session(&mut owner_transport, authority);
+        let request = receive_test_request(&mut owner_transport, session_id, &mut adapter);
+        assert!(matches!(
+            request.payload,
+            tidefs_vfs_rpc::VfsRpcRequestPayload::GetRoot
+        ));
+        std::thread::sleep(Duration::from_millis(1200));
+        let _ = owner_transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+    });
+
+    let (transport, session_id) = connect(owner_addr, &client_identity, &owner_identity);
+    let client = ClusterVfsRpcClient::new(transport, session_id, POOL_GUID)
+        .expect("construct short-lived authenticated client");
+    let ctx = request_ctx();
+    let request_started = Instant::now();
+    assert_eq!(
+        client
+            .dispatch(VfsOperation::GetRootInode(
+                tidefs_vfs_engine::operation::GetRootInodeRequest { ctx: ctx.clone() },
+            ))
+            .unwrap_err(),
+        Errno::ESTALE
+    );
+    assert!(
+        request_started.elapsed() < Duration::from_secs(2),
+        "in-flight request waited beyond its authenticated owner deadline"
+    );
+    assert_eq!(
+        client
+            .dispatch(VfsOperation::GetRootInode(
+                tidefs_vfs_engine::operation::GetRootInodeRequest { ctx },
+            ))
+            .unwrap_err(),
+        Errno::ESTALE
+    );
+    owner_thread.join().expect("short-lived owner thread");
+}
+
+#[test]
+fn client_refreshes_live_owner_deadline_then_fences_idle_expiry() {
+    let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
+    let client_identity = ProvisionedIdentity::new(CLIENT_NODE);
+    let root = tempfile::tempdir().expect("create authority deadline test root");
+    let metadata_dir = root.path().join("metadata");
+    let member = root.path().join("member.img");
+    fs::create_dir_all(&metadata_dir).expect("create Pool metadata directory");
+    File::create(&member)
+        .expect("create regular-file Pool member")
+        .set_len(32 * 1024 * 1024)
+        .expect("size regular-file Pool member");
+
+    let mut root_filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        std::slice::from_ref(&member),
+        "tidefs-vfs-rpc-authority-deadline",
+        PoolRedundancyPolicy::default(),
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::default(),
+    )
+    .expect("open Pool-backed root filesystem");
+    let canonical_dataset_id = LifecycleDatasetId::from_bytes([0x59; 16]);
+    root_filesystem
+        .create_filesystem_dataset(
+            "clustered",
+            canonical_dataset_id,
+            Vec::new(),
+            DatasetFlags::default_create(),
+            SyncGuarantee::Local,
+        )
+        .expect("publish clustered filesystem dataset");
+    drop(root_filesystem);
+
+    let filesystem = LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+        &metadata_dir,
+        "tidefs-vfs-rpc-authority-deadline",
+        PoolRedundancyPolicy::default(),
+        "clustered",
+        LocalFileSystemOpenConfig {
+            options: StoreOptions::default(),
+            allocator_policy: LocalStorageAllocatorPolicy::default(),
+            root_authentication_key: RootAuthenticationKey::demo_key(),
+            encryption: None,
+            compression: None,
+            log_device_device_path: None,
+            recovery_policy: RecoveryPolicy::default(),
+            block_devices: Some(std::slice::from_ref(&member)),
+        },
+    )
+    .expect("open deadline-gated Pool-backed dataset");
+    let dataset_id = DatasetId::new(u128::from_le_bytes(filesystem.mounted_dataset_id()));
+    let owner_adapter = FuseVfsAdapter::new(Box::new(VfsLocalFileSystem::new(filesystem)))
+        .expect("create deadline-gated owner adapter");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let writer_fence = Arc::new(Mutex::new(ClusterVfsRpcWriterFence::new(
+        OWNER_NODE,
+        WRITER_TERM,
+        WRITER_EPOCH,
+    )));
+    let initial_owner_deadline = Instant::now() + Duration::from_secs(3);
+    let owner_deadline = ExternalMutationDeadline::new_until(initial_owner_deadline);
+    let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        OWNER_NODE,
+        owner_identity.credential(),
+        vec![client_identity.public_identity()],
+        POOL_GUID,
+        dataset_id,
+        writer_fence,
+        owner_deadline.clone(),
+        owner_adapter.engine_handle(),
+        Arc::clone(&shutdown),
+    ))
+    .expect("start deadline-gated VFS_RPC owner");
+
+    let authority_lost = Arc::new(AtomicBool::new(false));
+    let client = ClusterVfsRpcClient::connect(
+        ClusterVfsRpcClientConfig::new(
+            owner.bound_addr(),
+            POOL_GUID,
+            client_identity.private_credential(),
+            owner_identity.public_identity(),
+        )
+        .with_authority_loss_signal(Arc::clone(&authority_lost)),
+    )
+    .expect("connect deadline-gated VFS_RPC client");
+    let authority_monitor = client.clone();
+    let remote_adapter = FuseVfsAdapter::new(Box::new(VfsDispatchEngineBridge::new(client)))
+        .expect("construct deadline-gated remote adapter");
+    let remote_engine = remote_adapter.engine_handle();
+    let ctx = request_ctx();
+
+    owner_deadline.renew_until(initial_owner_deadline + Duration::from_millis(1500));
+    let past_original_deadline = initial_owner_deadline + Duration::from_millis(100);
+    while Instant::now() < past_original_deadline {
+        authority_monitor
+            .poll_authority()
+            .expect("refresh exact owner authority before the original deadline");
+        std::thread::sleep(
+            authority_monitor
+                .authority_poll_wait()
+                .min(Duration::from_millis(25)),
+        );
+    }
+    assert_eq!(
+        remote_engine
+            .lock()
+            .expect("lock refreshed remote engine")
+            .get_root_inode(&ctx)
+            .expect("serve after the original deadline using refreshed authority"),
+        ROOT_INODE_ID
+    );
+    assert!(!authority_lost.load(Ordering::Acquire));
+
+    owner_deadline.fence();
+    let expiry_wait = Instant::now() + Duration::from_secs(3);
+    while !authority_lost.load(Ordering::Acquire) && Instant::now() < expiry_wait {
+        let _ = authority_monitor.poll_authority();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        authority_lost.load(Ordering::Acquire),
+        "idle client must terminally fence when refreshed owner authority expires"
+    );
+    assert_eq!(
+        remote_engine
+            .lock()
+            .expect("lock terminally fenced remote engine")
+            .get_root_inode(&ctx)
+            .unwrap_err(),
+        Errno::ESTALE
+    );
+
+    drop(remote_engine);
+    drop(remote_adapter);
+    let stop_error = owner
+        .stop()
+        .expect_err("expired owner deadline must stop the owner service");
+    assert!(stop_error.contains("mutation authority deadline has expired"));
+    drop(owner_adapter);
+}
+
+#[test]
 fn two_authenticated_adapter_engines_share_pool_owner_and_isolate_session_failure() {
     let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
     let client_identity = ProvisionedIdentity::new(CLIENT_NODE);
@@ -693,6 +897,7 @@ fn two_authenticated_adapter_engines_share_pool_owner_and_isolate_session_failur
         POOL_GUID,
         dataset_id,
         Arc::clone(&writer_fence),
+        live_authority_deadline(),
         owner_adapter.engine_handle(),
         Arc::clone(&shutdown),
     ))
@@ -945,6 +1150,7 @@ fn two_authenticated_adapter_engines_share_pool_owner_and_isolate_session_failur
         POOL_GUID,
         dataset_id,
         Arc::clone(&writer_fence),
+        live_authority_deadline(),
         owner_adapter.engine_handle(),
         Arc::clone(&shutdown),
     ))

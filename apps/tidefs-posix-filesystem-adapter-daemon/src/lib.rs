@@ -437,6 +437,7 @@ pub struct ClusterVfsRpcMountHandle {
     mountpoint: PathBuf,
     shutdown: Arc<AtomicBool>,
     authority_lost: Arc<AtomicBool>,
+    authority_client: cluster_vfs_rpc_client::ClusterVfsRpcClient,
     session: Option<fuser::BackgroundSession>,
 }
 
@@ -454,11 +455,21 @@ impl ClusterVfsRpcMountHandle {
             .is_none_or(|session| session.guard.is_finished())
     }
 
-    /// Report authenticated owner-authority movement that terminally fences
-    /// this old frontend.
+    /// Report authenticated owner-authority movement or expiry that terminally
+    /// fences this old frontend.
     #[must_use]
     pub fn authority_lost(&self) -> bool {
         self.authority_lost.load(Ordering::Acquire)
+    }
+
+    /// Refresh or expire mounted owner authority without waiting for a FUSE
+    /// request.
+    pub fn poll_authority(&self) {
+        let _ = self.authority_client.poll_authority();
+    }
+
+    fn authority_poll_wait(&self) -> Duration {
+        self.authority_client.authority_poll_wait()
     }
 
     pub fn request_shutdown(&self) {
@@ -876,6 +887,7 @@ impl MountAuthority {
                     authority.token.pool_guid,
                     tidefs_vfs_rpc::DatasetId::new(u128::from_le_bytes(*dataset_id.as_bytes())),
                     Arc::clone(&owner.writer_fence),
+                    authority.mutation_deadline.clone(),
                     engine,
                     shutdown,
                 )))
@@ -2023,6 +2035,7 @@ fn start_cluster_vfs_rpc_mount_with_shutdown(
         .with_authority_loss_signal(Arc::clone(&authority_lost)),
     )
     .map_err(|error| format!("authenticate remote Pool owner: {error}"))?;
+    let authority_client = client.clone();
     let engine: Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send> =
         Box::new(VfsDispatchEngineBridge::new(client));
     let adapter = fuse_vfs_adapter::FuseVfsAdapter::new(engine)
@@ -2076,6 +2089,7 @@ fn start_cluster_vfs_rpc_mount_with_shutdown(
         mountpoint,
         shutdown,
         authority_lost,
+        authority_client,
         session: Some(session),
     })
 }
@@ -2088,11 +2102,15 @@ pub fn run_cluster_vfs_rpc_mount(config: ClusterVfsRpcMountConfig) -> Result<(),
         .map_err(|error| format!("cluster client signal handler: {error}"))?;
     let mut mount = start_cluster_vfs_rpc_mount_with_shutdown(config, Arc::clone(&shutdown))?;
     while !shutdown.load(Ordering::Acquire) && !mount.authority_lost() && !mount.is_finished() {
-        std::thread::park_timeout(Duration::from_millis(100));
+        mount.poll_authority();
+        if mount.authority_lost() {
+            break;
+        }
+        std::thread::park_timeout(mount.authority_poll_wait().min(Duration::from_millis(100)));
     }
     let authority_lost = mount.authority_lost();
     if authority_lost {
-        eprintln!("cluster client owner authority moved; unmounting stale frontend");
+        eprintln!("cluster client owner authority lost or expired; unmounting stale frontend");
     }
     mount.stop();
     eprintln!(
@@ -2100,7 +2118,7 @@ pub fn run_cluster_vfs_rpc_mount(config: ClusterVfsRpcMountConfig) -> Result<(),
         mount.mountpoint().display()
     );
     if authority_lost {
-        Err("cluster client owner authority moved; stale frontend unmounted".to_string())
+        Err("cluster client owner authority lost or expired; stale frontend unmounted".to_string())
     } else {
         Ok(())
     }
