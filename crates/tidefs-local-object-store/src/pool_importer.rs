@@ -534,14 +534,34 @@ impl PoolImporter {
     /// - `epoch > EpochId(0)` must hold.
     /// - `lease_id > 0` must hold.
     /// - `pool_guid` in the token must match the resolved pool.
+    /// - the caller's process-local conservative validity must be non-zero.
     #[cfg(any(feature = "cluster-import", test))]
     pub fn import_pool_clustered(
         device_paths: &[PathBuf],
         pool_guid: Option<[u8; 16]>,
         lease_token: Option<tidefs_cluster::PoolLeaseToken>,
+        lease_valid_until: Option<std::time::Instant>,
     ) -> Result<CandidatePool, ImportError> {
         // Operator authorization boundary: pool import requires local execution.
         let _guard = LocalOnlyGuard::new("clustered pool import")?;
+        let token = lease_token
+            .as_ref()
+            .ok_or_else(|| ImportError::LeaseTokenInvalid {
+                detail: "clustered Pool import requires a Pool owner lease token".to_string(),
+            })?;
+        if !token.is_valid() || token.expiration_deadline_ms == 0 {
+            return Err(ImportError::LeaseTokenInvalid {
+                detail: format!(
+                    "token invalid: node_id={} epoch={:?} lease_id={} authority_deadline={}",
+                    token.node_id, token.epoch, token.lease_id, token.expiration_deadline_ms
+                ),
+            });
+        }
+        let lease_valid_until = lease_valid_until
+            .filter(|valid_until| *valid_until > std::time::Instant::now())
+            .ok_or_else(|| ImportError::LeaseTokenInvalid {
+                detail: "Pool owner lease has no remaining process-local validity".to_string(),
+            })?;
         let candidates = Self::scan_candidates(device_paths)?;
 
         let mut pool = match pool_guid {
@@ -561,22 +581,17 @@ impl PoolImporter {
             }
         };
 
-        // Verify lease token when present.
-        if let Some(ref token) = lease_token {
-            if !token.is_valid() {
-                return Err(ImportError::LeaseTokenInvalid {
-                    detail: format!(
-                        "token invalid: node_id={} epoch={:?} lease_id={}",
-                        token.node_id, token.epoch, token.lease_id
-                    ),
-                });
-            }
-            if !token.authorizes_pool(&pool.pool_guid) {
-                return Err(ImportError::LeaseTokenPoolMismatch {
-                    token_pool_guid: token.pool_guid,
-                    import_pool_guid: pool.pool_guid,
-                });
-            }
+        if !token.authorizes_pool(&pool.pool_guid) {
+            return Err(ImportError::LeaseTokenPoolMismatch {
+                token_pool_guid: token.pool_guid,
+                import_pool_guid: pool.pool_guid,
+            });
+        }
+        if std::time::Instant::now() >= lease_valid_until {
+            return Err(ImportError::LeaseTokenInvalid {
+                detail: "Pool owner lease local validity expired during import validation"
+                    .to_string(),
+            });
         }
 
         pool.cluster_authorized = true;

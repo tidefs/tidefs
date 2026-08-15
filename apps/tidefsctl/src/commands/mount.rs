@@ -15,11 +15,13 @@ use std::net::SocketAddr;
 #[cfg(feature = "cluster")]
 use tidefs_cluster::pool_lease_token::PoolLeaseToken;
 #[cfg(feature = "cluster")]
-use tidefs_cluster::pool_protocol::{ClusterPoolLeaseRequest, ClusterPoolMessage};
+use tidefs_cluster::pool_protocol::{
+    ClusterPoolLeaseAction, ClusterPoolLeaseRequest, ClusterPoolMessage,
+};
 use tidefs_encryption;
 use tidefs_local_filesystem::RootAuthenticationKey;
 #[cfg(feature = "cluster")]
-use tidefs_transport::{NodeInfo, Transport, TransportAddr};
+use tidefs_transport::{NodeInfo, SessionId, Transport, TransportAddr};
 use tidefs_vfs_engine::LivePoolAdminArg;
 
 /// Runtime semantics for the canonical local pool mount carrier.
@@ -174,16 +176,22 @@ pub struct PoolMountArgs {
     pub cluster: bool,
 
     #[cfg(feature = "cluster")]
-    /// Cluster storage-node address for lease acquisition and authority.
+    /// Transport address of the storage node that grants the Pool lease.
     /// Required when --cluster is set. Format: host:port.
-    #[arg(long = "cluster-node-addr")]
-    pub cluster_node_addr: Option<String>,
+    #[arg(long = "cluster-authority-addr", requires = "cluster")]
+    pub cluster_authority_addr: Option<String>,
 
     #[cfg(feature = "cluster")]
-    /// Node identifier for this cluster client (nonzero).
+    /// Committed member ID that will own and mount the Pool.
     /// Required when --cluster is set.
-    #[arg(long = "cluster-node-id")]
-    pub cluster_node_id: Option<u64>,
+    #[arg(long = "cluster-owner-node-id", requires = "cluster")]
+    pub cluster_owner_node_id: Option<u64>,
+
+    #[cfg(feature = "cluster")]
+    /// Committed member ID of the storage node granting the Pool lease.
+    /// Required when --cluster is set.
+    #[arg(long = "cluster-authority-node-id", requires = "cluster")]
+    pub cluster_authority_node_id: Option<u64>,
 }
 
 /// Find device-label files inside a pool backing directory.
@@ -213,6 +221,297 @@ fn find_device_files(backing_dir: &std::path::Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Debug)]
+struct TransportPoolLeaseSession {
+    transport: Transport,
+    session_id: SessionId,
+    authority_node_id: u64,
+    owner_node_id: u64,
+    pool_guid: [u8; 16],
+    next_request_id: u64,
+    lease_valid_until: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "cluster")]
+impl TransportPoolLeaseSession {
+    fn connect(
+        owner_node_id: u64,
+        authority_node_id: u64,
+        authority_addr: SocketAddr,
+        pool_guid: [u8; 16],
+    ) -> Result<Self, String> {
+        let mut transport = Transport::new(owner_node_id);
+        transport.add_node(NodeInfo::new(
+            authority_node_id,
+            vec![TransportAddr::Tcp(authority_addr)],
+            0,
+        ));
+        let session_id = transport
+            .connect(authority_node_id)
+            .map_err(|error| format!("connect to cluster authority {authority_addr}: {error:?}"))?;
+        transport.perform_handshake(session_id).map_err(|error| {
+            format!("handshake with cluster authority {authority_addr}: {error:?}")
+        })?;
+        Ok(Self {
+            transport,
+            session_id,
+            authority_node_id,
+            owner_node_id,
+            pool_guid,
+            next_request_id: 1,
+            lease_valid_until: None,
+        })
+    }
+
+    fn acquire(
+        &mut self,
+    ) -> Result<tidefs_posix_filesystem_adapter_daemon::ClusterLeaseGrant, String> {
+        self.exchange(ClusterPoolLeaseAction::Acquire)?
+            .ok_or_else(|| {
+                "cluster authority granted acquire without a Pool lease token".to_string()
+            })
+    }
+
+    fn exchange(
+        &mut self,
+        action: ClusterPoolLeaseAction,
+    ) -> Result<Option<tidefs_posix_filesystem_adapter_daemon::ClusterLeaseGrant>, String> {
+        let release_action = matches!(&action, ClusterPoolLeaseAction::Release { .. });
+        let request_started = std::time::Instant::now();
+        let response_deadline = match &action {
+            ClusterPoolLeaseAction::Renew { .. } => self
+                .lease_valid_until
+                .and_then(|deadline| deadline.checked_sub(std::time::Duration::from_millis(1)))
+                .ok_or_else(|| {
+                    "cluster Pool lease renewal has no live process-local deadline".to_string()
+                })?,
+            ClusterPoolLeaseAction::Acquire | ClusterPoolLeaseAction::Release { .. } => {
+                request_started
+                    .checked_add(std::time::Duration::from_secs(5))
+                    .ok_or_else(|| "cluster Pool lease response deadline overflowed".to_string())?
+            }
+        };
+        if response_deadline <= request_started {
+            return Err("cluster Pool lease request has no safe response window".to_string());
+        }
+
+        let request_id = self.next_request_id;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| "cluster Pool lease request ID space is exhausted".to_string())?;
+        let request = ClusterPoolMessage::LeaseRequest(ClusterPoolLeaseRequest {
+            request_id,
+            pool_guid: self.pool_guid,
+            requesting_node_id: self.owner_node_id,
+            action,
+        });
+        let encoded = request
+            .encode()
+            .map_err(|error| format!("encode cluster Pool lease request: {error:?}"))?;
+        let mut wire = Vec::with_capacity(4 + encoded.len());
+        wire.extend_from_slice(b"CP01");
+        wire.extend_from_slice(&encoded);
+        self.transport
+            .send_message(self.session_id, &wire)
+            .map_err(|error| format!("send cluster Pool lease request: {error:?}"))?;
+
+        let raw = loop {
+            match self.transport.recv_message(self.session_id) {
+                Ok(response) => break response,
+                Err(tidefs_transport::TransportError::WouldBlock(_)) => {
+                    let now = std::time::Instant::now();
+                    if now >= response_deadline {
+                        return Err(
+                            "cluster Pool lease authority did not respond before the safe deadline"
+                                .to_string(),
+                        );
+                    }
+                    std::thread::sleep(
+                        response_deadline
+                            .saturating_duration_since(now)
+                            .min(std::time::Duration::from_millis(10)),
+                    );
+                }
+                Err(error) => {
+                    return Err(format!("receive cluster Pool lease response: {error:?}"));
+                }
+            }
+        };
+        if raw.len() < 4 || &raw[..4] != b"CP01" {
+            return Err("cluster Pool lease response has invalid CP01 framing".to_string());
+        }
+        let response = ClusterPoolMessage::decode(&raw[4..])
+            .map_err(|error| format!("decode cluster Pool lease response: {error:?}"))?;
+        let ClusterPoolMessage::LeaseResponse(response) = response else {
+            return Err(format!(
+                "cluster Pool lease request received unexpected response: {response:?}"
+            ));
+        };
+        if response.request_id != request_id {
+            return Err(format!(
+                "cluster Pool lease response request ID mismatch: expected {request_id}, got {}",
+                response.request_id
+            ));
+        }
+        if response.node_id != self.authority_node_id {
+            return Err(format!(
+                "cluster Pool lease response authority mismatch: expected {}, got {}",
+                self.authority_node_id, response.node_id
+            ));
+        }
+        if response.pool_guid != self.pool_guid {
+            return Err("cluster Pool lease response Pool GUID mismatch".to_string());
+        }
+        if !response.success {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "cluster Pool lease request was refused".to_string()));
+        }
+
+        let token = response
+            .lease_token_bytes
+            .map(|bytes| {
+                bincode::deserialize::<PoolLeaseToken>(&bytes)
+                    .map_err(|error| format!("deserialize cluster Pool lease token: {error}"))
+            })
+            .transpose()?;
+        let mut response_error = if response.error.is_some() {
+            Some("successful cluster Pool lease response also carried an error".to_string())
+        } else if token.as_ref().is_some_and(|token| {
+            token.node_id != self.owner_node_id || token.pool_guid != self.pool_guid
+        }) {
+            Some("cluster Pool lease token owner or Pool GUID mismatch".to_string())
+        } else if release_action {
+            if token.is_some()
+                || response.lease_expiration_ms.is_some()
+                || response.lease_remaining_ms.is_some()
+            {
+                Some("cluster Pool lease release response carried grant material".to_string())
+            } else {
+                None
+            }
+        } else {
+            match (
+                token.as_ref(),
+                response.lease_expiration_ms,
+                response.lease_remaining_ms,
+            ) {
+                (Some(token), Some(authority_deadline), Some(_authority_remaining))
+                    if token.expiration_deadline_ms != authority_deadline =>
+                {
+                    Some(
+                        "cluster Pool lease response deadline disagrees with its token".to_string(),
+                    )
+                }
+                (Some(_), Some(authority_deadline), Some(authority_remaining))
+                    if authority_remaining == 0 || authority_remaining > authority_deadline =>
+                {
+                    Some(
+                        "cluster Pool lease response carried inconsistent remaining validity"
+                            .to_string(),
+                    )
+                }
+                (Some(_), Some(_), Some(_)) => None,
+                _ => Some(
+                    "cluster Pool lease grant omitted or mismatched token, deadline, and remaining validity"
+                        .to_string(),
+                ),
+            }
+        };
+
+        let mut valid_until = None;
+        if response_error.is_none() && !release_action {
+            let authority_remaining = std::time::Duration::from_millis(
+                response
+                    .lease_remaining_ms
+                    .expect("validated grant remaining validity"),
+            );
+            let validation_now = std::time::Instant::now();
+            let measured_round_trip = validation_now.saturating_duration_since(request_started);
+            let safety_margin = measured_round_trip
+                .checked_add(std::time::Duration::from_millis(1))
+                .unwrap_or(std::time::Duration::MAX);
+            match authority_remaining.checked_sub(safety_margin) {
+                Some(remaining) if !remaining.is_zero() => {
+                    match validation_now.checked_add(remaining) {
+                        Some(deadline) => valid_until = Some(deadline),
+                        None => {
+                            response_error =
+                                Some("cluster Pool lease local deadline overflowed".to_string())
+                        }
+                    }
+                }
+                _ => {
+                    response_error = Some(
+                        "cluster Pool lease grant had no safe process-local validity after transport delay"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        if let Some(error) = response_error {
+            if !release_action
+                && token.as_ref().is_some_and(|token| {
+                    token.node_id == self.owner_node_id && token.pool_guid == self.pool_guid
+                })
+            {
+                let token = token.expect("checked above");
+                let cleanup = self.exchange(ClusterPoolLeaseAction::Release { token });
+                return Err(match cleanup {
+                    Ok(None) => error,
+                    Ok(Some(_)) => {
+                        format!("{error}; rejected Pool lease cleanup returned another token")
+                    }
+                    Err(cleanup_error) => {
+                        format!("{error}; rejected Pool lease cleanup failed: {cleanup_error}")
+                    }
+                });
+            }
+            return Err(error);
+        }
+        if release_action {
+            self.lease_valid_until = None;
+            return Ok(None);
+        }
+
+        let valid_until = valid_until.expect("validated non-release local deadline");
+        self.lease_valid_until = Some(valid_until);
+        Ok(Some(
+            tidefs_posix_filesystem_adapter_daemon::ClusterLeaseGrant {
+                token: token.expect("validated non-release grant token"),
+                valid_until,
+            },
+        ))
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl tidefs_posix_filesystem_adapter_daemon::ClusterLeaseSession for TransportPoolLeaseSession {
+    fn renew(
+        &mut self,
+        token: &PoolLeaseToken,
+    ) -> Result<tidefs_posix_filesystem_adapter_daemon::ClusterLeaseGrant, String> {
+        self.exchange(ClusterPoolLeaseAction::Renew {
+            token: token.clone(),
+        })?
+        .ok_or_else(|| "cluster authority renewed without returning a Pool lease token".to_string())
+    }
+
+    fn release(&mut self, token: &PoolLeaseToken) -> Result<(), String> {
+        if self
+            .exchange(ClusterPoolLeaseAction::Release {
+                token: token.clone(),
+            })?
+            .is_some()
+        {
+            return Err("cluster authority returned a token for Pool lease release".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Try to import a pool from device-label files found in the backing
@@ -307,6 +606,82 @@ fn resolve_encryption_for_import(
     }
 }
 
+fn build_mount_runtime(
+    args: &PoolMountArgs,
+) -> Result<
+    (
+        tidefs_posix_filesystem_adapter_daemon::MountRuntimeOptions,
+        tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile,
+    ),
+    String,
+> {
+    let mut runtime = tidefs_posix_filesystem_adapter_daemon::MountRuntimeOptions::default();
+    runtime.fs_name = args.runtime.fs_name.clone();
+    if let Some(raw) = args.runtime.options.as_deref() {
+        runtime.mount_options =
+            tidefs_posix_filesystem_adapter_daemon::mount_options::MountOptions::parse(raw)
+                .map_err(|error| format!("invalid mount options: {error}"))?;
+    }
+    if args.relatime {
+        runtime.mount_options.timestamp_policy =
+            tidefs_posix_filesystem_adapter_daemon::mount_options::TimestampPolicy::RelativeAtime;
+    }
+    if args.runtime.sync {
+        runtime.mount_options.sync = true;
+    }
+    if let Some(bytes) = args.runtime.content_capacity_bytes {
+        if bytes == 0 {
+            return Err("--content-capacity-bytes must be greater than zero".to_string());
+        }
+        runtime.content_capacity_bytes = bytes;
+    }
+    if let Some(seconds) = args.runtime.writeback_cache_timeout_secs {
+        if seconds == 0 {
+            return Err("--writeback-cache-timeout must be greater than zero".to_string());
+        }
+        runtime.writeback_cache_timeout_secs = seconds;
+    }
+    if let Some(seconds) = args.runtime.drain_timeout_secs {
+        runtime.drain_timeout_secs = seconds;
+    }
+    if let Some(seconds) = args.runtime.background_scrub_interval_secs {
+        runtime.background_scrub_interval_secs = seconds;
+    }
+    runtime.enable_dedup = args.runtime.enable_dedup;
+    runtime.enable_reclaim = args.runtime.enable_reclaim;
+    runtime.enable_repair_writeback = args.runtime.enable_repair_writeback;
+    if let Some(raw) = args.runtime.compress_algo.as_deref() {
+        let algorithm = match raw.to_ascii_lowercase().as_str() {
+            "zstd" => tidefs_local_object_store::CompressionAlgorithm::Zstd,
+            "lz4" => tidefs_local_object_store::CompressionAlgorithm::Lz4,
+            "off" | "none" => tidefs_local_object_store::CompressionAlgorithm::Uncompressed,
+            _ => {
+                return Err(format!(
+                    "unknown compression algorithm `{raw}`; expected zstd, lz4, or off"
+                ));
+            }
+        };
+        runtime.compression = Some(tidefs_local_object_store::CompressionConfig {
+            algorithm,
+            level: if algorithm == tidefs_local_object_store::CompressionAlgorithm::Lz4 {
+                0
+            } else {
+                3
+            },
+            min_compress_bytes: 0,
+        });
+    }
+    let coherency_profile = args
+        .runtime
+        .coherency
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|error: String| format!("invalid coherency profile: {error}"))?
+        .unwrap_or_default();
+    Ok((runtime, coherency_profile))
+}
+
 /// Handle `tidefsctl pool mount`.
 ///
 /// 1. Import explicit `--devices` when starting a not-yet-imported pool.
@@ -329,12 +704,18 @@ pub fn handle_mount(args: PoolMountArgs) {
     // Cluster mount parameter validation: when --cluster is set,
     // refuse missing or invalid parameters before any pool work.
     if args.cluster {
-        if args.cluster_node_addr.is_none() {
-            eprintln!("tidefsctl pool mount: --cluster requires --cluster-node-addr");
+        if args.cluster_authority_addr.is_none() {
+            eprintln!("tidefsctl pool mount: --cluster requires --cluster-authority-addr");
             process::exit(1);
         }
-        if args.cluster_node_id.is_none() || args.cluster_node_id.unwrap() == 0 {
-            eprintln!("tidefsctl pool mount: --cluster requires --cluster-node-id (nonzero)");
+        if args.cluster_owner_node_id.is_none() || args.cluster_owner_node_id == Some(0) {
+            eprintln!("tidefsctl pool mount: --cluster requires --cluster-owner-node-id (nonzero)");
+            process::exit(1);
+        }
+        if args.cluster_authority_node_id.is_none() || args.cluster_authority_node_id == Some(0) {
+            eprintln!(
+                "tidefsctl pool mount: --cluster requires --cluster-authority-node-id (nonzero)"
+            );
             process::exit(1);
         }
     }
@@ -405,6 +786,14 @@ pub fn handle_mount(args: PoolMountArgs) {
         }
     }
 
+    // Validate every remaining fallible operator option before acquiring a
+    // Pool lease or importing the Pool, so no early-exit path can strand
+    // either authority.
+    let (runtime, coherency_profile) = build_mount_runtime(&args).unwrap_or_else(|error| {
+        eprintln!("tidefsctl pool mount: {error}");
+        process::exit(1);
+    });
+
     // --- FUSE daemon launch ---
     let mut mount_options = Vec::new();
     if args.relatime {
@@ -420,7 +809,7 @@ pub fn handle_mount(args: PoolMountArgs) {
     }
     // Cluster label validation and lease acquisition.
     #[cfg(feature = "cluster")]
-    let mount_authority = if args.cluster {
+    let mut mount_authority = if args.cluster {
         match validate_cluster_pool_labels(&backing_dir, &args.devices) {
             Ok(()) => {
                 println!("cluster: pool labels confirmed CLUSTER_POOL_INCOMPAT");
@@ -443,111 +832,71 @@ pub fn handle_mount(args: PoolMountArgs) {
             }
         };
 
-        let node_addr = args.cluster_node_addr.as_ref().unwrap();
-        let node_id = args.cluster_node_id.unwrap();
+        let authority_addr = args.cluster_authority_addr.as_ref().unwrap();
+        let owner_node_id = args.cluster_owner_node_id.unwrap();
+        let authority_node_id = args.cluster_authority_node_id.unwrap();
 
         println!(
-            "cluster: requesting pool lease from {} for pool {:02x?}...",
-            node_addr,
+            "cluster: owner node {} requesting Pool lease from authority node {} at {} for pool {:02x?}...",
+            owner_node_id,
+            authority_node_id,
+            authority_addr,
             &pool_guid[..4]
         );
 
-        // Acquire lease through a transport session instead of raw TCP.
-        // The raw-TCP ClusterLeaseClient path is incompatible with the
-        // server's transport handshake. Using a proper transport session
-        // ensures the lease request reaches the CP01 dispatch handler.
-        let addr: SocketAddr = node_addr.parse().unwrap_or_else(|e| {
+        let addr: SocketAddr = authority_addr.parse().unwrap_or_else(|error| {
             eprintln!(
-                "tidefsctl pool mount: invalid cluster-node-addr '{}': {e}",
-                node_addr
+                "tidefsctl pool mount: invalid --cluster-authority-addr '{authority_addr}': {error}"
             );
             process::exit(1);
         });
-        let operator_client_id = node_id.wrapping_add(10_000);
-        let mut transport = Transport::new(operator_client_id);
-        transport.add_node(NodeInfo::new(node_id, vec![TransportAddr::Tcp(addr)], 0));
-        let sid = transport.connect(node_id).unwrap_or_else(|e| {
-            eprintln!(
-                "tidefsctl pool mount: connect to cluster node {}: {e:?}",
-                node_addr
-            );
-            process::exit(1);
-        });
-        transport.perform_handshake(sid).unwrap_or_else(|e| {
-            eprintln!(
-                "tidefsctl pool mount: handshake with cluster node {}: {e:?}",
-                node_addr
-            );
-            process::exit(1);
-        });
-
-        // Build and send CP01-framed LeaseRequest.
-        let lease_req = ClusterPoolMessage::LeaseRequest(ClusterPoolLeaseRequest {
-            request_id: 1,
-            pool_guid,
-            requesting_node_id: operator_client_id,
-        });
-        let req_encoded = lease_req.encode().unwrap_or_else(|e| {
-            eprintln!("tidefsctl pool mount: encode lease request: {e:?}");
-            process::exit(1);
-        });
-        let mut wire = Vec::with_capacity(4 + req_encoded.len());
-        wire.extend_from_slice(b"CP01");
-        wire.extend_from_slice(&req_encoded);
-        transport.send_message(sid, &wire).unwrap_or_else(|e| {
-            eprintln!("tidefsctl pool mount: send lease request: {e:?}");
-            process::exit(1);
-        });
-
-        // Receive and decode CP01-framed LeaseResponse.
-        let raw = loop {
-            match transport.recv_message(sid) {
-                Ok(r) => break r,
-                Err(tidefs_transport::TransportError::WouldBlock(_)) => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("tidefsctl pool mount: recv lease response: {e:?}");
-                    process::exit(1);
-                }
-            }
-        };
-        if raw.len() < 4 || &raw[..4] != b"CP01" {
-            eprintln!("tidefsctl pool mount: invalid lease response framing");
-            process::exit(1);
-        }
-        let resp = ClusterPoolMessage::decode(&raw[4..]).unwrap_or_else(|e| {
-            eprintln!("tidefsctl pool mount: decode lease response: {e:?}");
-            process::exit(1);
-        });
-        let token: PoolLeaseToken = match resp {
-            ClusterPoolMessage::LeaseResponse(lease_resp) => {
-                if !lease_resp.success {
-                    eprintln!(
-                        "tidefsctl pool mount: lease refused: {:?}",
-                        lease_resp.error
-                    );
-                    process::exit(1);
-                }
-                let token_bytes = lease_resp.lease_token_bytes.unwrap_or_else(|| {
-                    eprintln!("tidefsctl pool mount: lease granted but no token bytes");
+        let mut lease_session =
+            TransportPoolLeaseSession::connect(owner_node_id, authority_node_id, addr, pool_guid)
+                .unwrap_or_else(|error| {
+                    eprintln!("tidefsctl pool mount: {error}");
                     process::exit(1);
                 });
-                bincode::deserialize(&token_bytes).unwrap_or_else(|e| {
-                    eprintln!("tidefsctl pool mount: deserialize lease token: {e}");
-                    process::exit(1);
-                })
-            }
-            other => {
-                eprintln!("tidefsctl pool mount: unexpected lease response: {other:?}");
+        let grant = lease_session.acquire().unwrap_or_else(|error| {
+            eprintln!("tidefsctl pool mount: Pool lease acquire failed: {error}");
+            process::exit(1);
+        });
+        let token = grant.token.clone();
+        if token.node_id != owner_node_id || token.pool_guid != pool_guid {
+            let release_error =
+                tidefs_posix_filesystem_adapter_daemon::ClusterLeaseSession::release(
+                    &mut lease_session,
+                    &token,
+                )
+                .err();
+            eprintln!(
+                "tidefsctl pool mount: authority returned a Pool lease for the wrong owner or Pool{}",
+                release_error
+                    .map(|error| format!("; release also failed: {error}"))
+                    .unwrap_or_default()
+            );
+            process::exit(1);
+        }
+
+        let mut authority =
+            tidefs_posix_filesystem_adapter_daemon::MountAuthority::renewable_cluster_lease(
+                pool_guid,
+                grant,
+                Box::new(lease_session),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("tidefsctl pool mount: {error}");
                 process::exit(1);
-            }
-        };
+            });
 
         println!(
-            "cluster: lease granted (node={}, epoch={}, lease_id={}, expires_ms={})",
-            token.node_id, token.epoch.0, token.lease_id, token.expiration_deadline_ms
+            "cluster: lease granted (node={}, epoch={}, lease_id={}, local_valid_for_ms={})",
+            token.node_id,
+            token.epoch.0,
+            token.lease_id,
+            authority
+                .cluster_lease_remaining()
+                .unwrap_or_default()
+                .as_millis()
         );
 
         // Validate cluster ownership via import_pool_clustered.
@@ -559,6 +908,7 @@ pub fn handle_mount(args: PoolMountArgs) {
             &device_paths,
             Some(pool_guid),
             Some(token.clone()),
+            authority.cluster_lease_valid_until(),
         ) {
             Ok(candidate) => {
                 println!(
@@ -567,20 +917,18 @@ pub fn handle_mount(args: PoolMountArgs) {
                     candidate.devices.len()
                 );
             }
-            Err(e) => {
-                eprintln!("tidefsctl pool mount: cluster pool import validation failed: {e}");
+            Err(error) => {
+                let release_error = authority.release_unmounted().err();
                 eprintln!(
-                    "tidefsctl pool mount: the lease token may not authorize this pool,                              or the pool labels may be stale"
+                    "tidefsctl pool mount: cluster pool import validation failed: {error}{}",
+                    release_error
+                        .map(|error| format!("; Pool lease release also failed: {error}"))
+                        .unwrap_or_default()
                 );
                 process::exit(1);
             }
         }
-
-        tidefs_posix_filesystem_adapter_daemon::MountAuthority::cluster_lease(pool_guid, token)
-            .unwrap_or_else(|err| {
-                eprintln!("tidefsctl pool mount: {err}");
-                process::exit(1);
-            })
+        authority
     } else {
         tidefs_posix_filesystem_adapter_daemon::MountAuthority::standalone()
     };
@@ -595,6 +943,13 @@ pub fn handle_mount(args: PoolMountArgs) {
     ) {
         Ok(owner) => owner,
         Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
+            #[cfg(feature = "cluster")]
+            if let Err(error) = mount_authority.release_unmounted() {
+                eprintln!(
+                    "tidefsctl pool mount: failed to release Pool lease before routing to existing owner: {error}"
+                );
+                process::exit(1);
+            }
             super::live_owner::route_imported_with_format_and_args(
                 "pool",
                 "mount",
@@ -605,10 +960,35 @@ pub fn handle_mount(args: PoolMountArgs) {
             )
         }
         Err(err) => {
+            #[cfg(feature = "cluster")]
+            if let Err(error) = mount_authority.release_unmounted() {
+                eprintln!(
+                    "tidefsctl pool mount: pool import failed: {err}; Pool lease release also failed: {error}"
+                );
+                process::exit(1);
+            }
             eprintln!("tidefsctl pool mount: pool import failed: {err}");
             process::exit(1);
         }
     };
+    #[cfg(feature = "cluster")]
+    if args.cluster && import_owner.imported().config.pool_uuid != existing_config.pool_uuid {
+        let imported_pool_uuid = import_owner.imported().config.pool_uuid;
+        let export_error = import_owner.export().err();
+        let release_error = mount_authority.release_unmounted().err();
+        eprintln!(
+            "tidefsctl pool mount: imported Pool GUID {} differs from cluster-authorized Pool GUID {}{}{}",
+            hex_uuid(&imported_pool_uuid),
+            hex_uuid(&existing_config.pool_uuid),
+            export_error
+                .map(|error| format!("; Pool export also failed: {error}"))
+                .unwrap_or_default(),
+            release_error
+                .map(|error| format!("; Pool lease release also failed: {error}"))
+                .unwrap_or_default(),
+        );
+        process::exit(1);
+    }
     let imported = import_owner.imported();
     let cfg = &imported.config;
     let stats = &imported.stats;
@@ -626,80 +1006,6 @@ pub fn handle_mount(args: PoolMountArgs) {
     if stats.read_only {
         println!("  read-only:   yes");
     }
-
-    let mut runtime = tidefs_posix_filesystem_adapter_daemon::MountRuntimeOptions::default();
-    runtime.fs_name = args.runtime.fs_name.clone();
-    if let Some(raw) = args.runtime.options.as_deref() {
-        runtime.mount_options =
-            tidefs_posix_filesystem_adapter_daemon::mount_options::MountOptions::parse(raw)
-                .unwrap_or_else(|error| {
-                    eprintln!("tidefsctl pool mount: invalid mount options: {error}");
-                    process::exit(1);
-                });
-    }
-    if args.relatime {
-        runtime.mount_options.timestamp_policy =
-            tidefs_posix_filesystem_adapter_daemon::mount_options::TimestampPolicy::RelativeAtime;
-    }
-    if args.runtime.sync {
-        runtime.mount_options.sync = true;
-    }
-    if let Some(bytes) = args.runtime.content_capacity_bytes {
-        if bytes == 0 {
-            eprintln!("tidefsctl pool mount: --content-capacity-bytes must be greater than zero");
-            process::exit(1);
-        }
-        runtime.content_capacity_bytes = bytes;
-    }
-    if let Some(seconds) = args.runtime.writeback_cache_timeout_secs {
-        if seconds == 0 {
-            eprintln!("tidefsctl pool mount: --writeback-cache-timeout must be greater than zero");
-            process::exit(1);
-        }
-        runtime.writeback_cache_timeout_secs = seconds;
-    }
-    if let Some(seconds) = args.runtime.drain_timeout_secs {
-        runtime.drain_timeout_secs = seconds;
-    }
-    if let Some(seconds) = args.runtime.background_scrub_interval_secs {
-        runtime.background_scrub_interval_secs = seconds;
-    }
-    runtime.enable_dedup = args.runtime.enable_dedup;
-    runtime.enable_reclaim = args.runtime.enable_reclaim;
-    runtime.enable_repair_writeback = args.runtime.enable_repair_writeback;
-    if let Some(raw) = args.runtime.compress_algo.as_deref() {
-        let algorithm = match raw.to_ascii_lowercase().as_str() {
-            "zstd" => tidefs_local_object_store::CompressionAlgorithm::Zstd,
-            "lz4" => tidefs_local_object_store::CompressionAlgorithm::Lz4,
-            "off" | "none" => tidefs_local_object_store::CompressionAlgorithm::Uncompressed,
-            _ => {
-                eprintln!(
-                    "tidefsctl pool mount: unknown compression algorithm `{raw}`; expected zstd, lz4, or off"
-                );
-                process::exit(1);
-            }
-        };
-        runtime.compression = Some(tidefs_local_object_store::CompressionConfig {
-            algorithm,
-            level: if algorithm == tidefs_local_object_store::CompressionAlgorithm::Lz4 {
-                0
-            } else {
-                3
-            },
-            min_compress_bytes: 0,
-        });
-    }
-    let coherency_profile = args
-        .runtime
-        .coherency
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .unwrap_or_else(|error: String| {
-            eprintln!("tidefsctl pool mount: invalid coherency profile: {error}");
-            process::exit(1);
-        })
-        .unwrap_or_default();
 
     let config = tidefs_posix_filesystem_adapter_daemon::MountConfig {
         backing_dir,
@@ -976,9 +1282,11 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster: false,
             #[cfg(feature = "cluster")]
-            cluster_node_addr: None,
+            cluster_authority_addr: None,
             #[cfg(feature = "cluster")]
-            cluster_node_id: None,
+            cluster_owner_node_id: None,
+            #[cfg(feature = "cluster")]
+            cluster_authority_node_id: None,
             pool_name: "testpool".into(),
             mount_point: PathBuf::from("/mnt/tidefs"),
             read_only: false,
@@ -1007,9 +1315,11 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster: false,
             #[cfg(feature = "cluster")]
-            cluster_node_addr: None,
+            cluster_authority_addr: None,
             #[cfg(feature = "cluster")]
-            cluster_node_id: None,
+            cluster_owner_node_id: None,
+            #[cfg(feature = "cluster")]
+            cluster_authority_node_id: None,
         };
         assert!(args.read_only);
     }
@@ -1030,9 +1340,11 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster: false,
             #[cfg(feature = "cluster")]
-            cluster_node_addr: None,
+            cluster_authority_addr: None,
             #[cfg(feature = "cluster")]
-            cluster_node_id: None,
+            cluster_owner_node_id: None,
+            #[cfg(feature = "cluster")]
+            cluster_authority_node_id: None,
         };
         assert!(args.relatime);
     }
@@ -1053,9 +1365,11 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster: false,
             #[cfg(feature = "cluster")]
-            cluster_node_addr: None,
+            cluster_authority_addr: None,
             #[cfg(feature = "cluster")]
-            cluster_node_id: None,
+            cluster_owner_node_id: None,
+            #[cfg(feature = "cluster")]
+            cluster_authority_node_id: None,
         };
         assert_eq!(args.pool_name, "full");
         assert_eq!(args.mount_point, PathBuf::from("/mnt/full"));

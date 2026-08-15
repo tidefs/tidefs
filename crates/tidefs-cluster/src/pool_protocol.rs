@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::pool_config::{
     ClusterPlacementPolicy, ClusterPoolConfig, ClusterRedundancy, FailureDomain, NodeDevice,
 };
+use crate::pool_lease_token::PoolLeaseToken;
 
 // ---------------------------------------------------------------------------
 // ProtocolError
@@ -206,11 +207,22 @@ pub struct ClusterPoolImportResponse {
 // ClusterPoolLeaseRequest
 // ---------------------------------------------------------------------------
 
-/// Request a pool lease token from the cluster authority (storage-node).
+/// Requested transition for one Pool owner lease.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClusterPoolLeaseAction {
+    /// Acquire the Pool's single-writer lease for the authenticated requester.
+    Acquire,
+    /// Extend the exact current lease without changing its write fence.
+    Renew { token: PoolLeaseToken },
+    /// Relinquish the exact current lease after carrier drain.
+    Release { token: PoolLeaseToken },
+}
+
+/// Request a Pool owner lease transition from the cluster authority.
 ///
-/// The requesting node sends this to a storage-node that holds the cluster
-/// lease runtime. On success, the response contains a [`PoolLeaseToken`]
-/// that authorizes clustered pool import and mount.
+/// The transport-authenticated requester identity must equal
+/// `requesting_node_id`. On acquire or renew success, the response contains a
+/// [`PoolLeaseToken`] authorizing clustered Pool import and mount.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterPoolLeaseRequest {
     /// Opaque request id for matching responses.
@@ -219,6 +231,8 @@ pub struct ClusterPoolLeaseRequest {
     pub pool_guid: [u8; 16],
     /// The node requesting the lease.
     pub requesting_node_id: u64,
+    /// Exact ownership transition requested by the mounted owner.
+    pub action: ClusterPoolLeaseAction,
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +248,7 @@ pub struct ClusterPoolLeaseRequest {
 pub struct ClusterPoolLeaseResponse {
     /// Matches the request_id from the corresponding [`ClusterPoolLeaseRequest`].
     pub request_id: u64,
-    /// The storage-node that granted (or denied) the lease.
+    /// The authority storage-node that handled the request.
     pub node_id: u64,
     /// Pool UUID for correlation.
     pub pool_guid: [u8; 16],
@@ -242,8 +256,12 @@ pub struct ClusterPoolLeaseResponse {
     pub success: bool,
     /// Bincode-serialized [`PoolLeaseToken`] on success.
     pub lease_token_bytes: Option<Vec<u8>>,
-    /// Lease expiration timestamp in milliseconds since epoch (on success).
+    /// Opaque expiration counter from the authority's monotonic clock.
     pub lease_expiration_ms: Option<u64>,
+    /// Authority-measured lease time remaining when this response was built.
+    /// A client subtracts its request round trip before converting this to a
+    /// process-local monotonic mutation deadline.
+    pub lease_remaining_ms: Option<u64>,
     /// Error message if the lease was denied.
     pub error: Option<String>,
 }
@@ -790,6 +808,7 @@ mod tests {
             request_id: 1,
             pool_guid: [0xAA; 16],
             requesting_node_id: 42,
+            action: ClusterPoolLeaseAction::Acquire,
         });
         let encoded = msg.encode().unwrap();
         let decoded = ClusterPoolMessage::decode(&encoded).unwrap();
@@ -806,6 +825,7 @@ mod tests {
             success: true,
             lease_token_bytes: Some(token_bytes.clone()),
             lease_expiration_ms: Some(60_000),
+            lease_remaining_ms: Some(30_000),
             error: None,
         });
         let encoded = msg.encode().unwrap();
@@ -825,6 +845,7 @@ mod tests {
             success: false,
             lease_token_bytes: None,
             lease_expiration_ms: None,
+            lease_remaining_ms: None,
             error: Some("pool not found".into()),
         });
         let encoded = msg.encode().unwrap();

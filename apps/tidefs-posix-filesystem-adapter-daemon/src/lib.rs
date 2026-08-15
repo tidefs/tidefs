@@ -131,6 +131,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "cluster")]
+use std::time::{Duration, Instant};
 
 use tidefs_background_scheduler::{
     BackgroundScheduler, BackgroundService, ServiceBudget, ServiceError, ServicePriority,
@@ -145,6 +147,10 @@ use tidefs_vfs_engine::{
 const MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 const MOUNT_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
 const MOUNT_FUSE_INIT_TIMEOUT_SECS: u64 = 5;
+#[cfg(feature = "cluster")]
+const CLUSTER_LEASE_MIN_RENEWAL_LEAD_MS: u64 = 250;
+#[cfg(feature = "cluster")]
+const CLUSTER_LEASE_MAX_RENEWAL_LEAD_MS: u64 = 10_000;
 // The selected local mount owns its bounded scrub work-per-tick policy.
 // Optional observations report this behavior but do not configure it.
 const MOUNT_SCRUB_MAX_RECORDS_PER_TICK: u64 = 1;
@@ -486,7 +492,7 @@ mod effective_mount_mode_tests {
 }
 
 /// Mount authority material accepted by the daemon admission boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum MountAuthority {
     /// Standalone/local mount with no cluster lease material.
     Standalone,
@@ -510,9 +516,56 @@ pub enum MountAuthorityWire<'a> {
 
 /// Validated cluster lease authority for a mounted pool.
 #[cfg(feature = "cluster")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClusterLeaseGrant {
+    /// Opaque authority token carrying owner, epoch, lease, and write fence.
+    pub token: tidefs_cluster::PoolLeaseToken,
+    /// Conservative process-local deadline measured after transport receipt.
+    pub valid_until: Instant,
+}
+
+#[cfg(feature = "cluster")]
+impl ClusterLeaseGrant {
+    fn remaining(&self) -> Duration {
+        self.valid_until.saturating_duration_since(Instant::now())
+    }
+}
+
+/// Live transport session for renewing and releasing one Pool lease.
+#[cfg(feature = "cluster")]
+pub trait ClusterLeaseSession: std::fmt::Debug + Send {
+    fn renew(
+        &mut self,
+        token: &tidefs_cluster::PoolLeaseToken,
+    ) -> Result<ClusterLeaseGrant, String>;
+
+    fn release(&mut self, token: &tidefs_cluster::PoolLeaseToken) -> Result<(), String>;
+}
+
+/// Validated authority plus the live session that keeps it renewable.
+#[cfg(feature = "cluster")]
 pub struct ClusterMountAuthority {
     token: tidefs_cluster::PoolLeaseToken,
+    session: Option<Box<dyn ClusterLeaseSession>>,
+    mutation_deadline: tidefs_local_filesystem::ExternalMutationDeadline,
+    next_renewal: Instant,
+    released: bool,
+}
+
+#[cfg(feature = "cluster")]
+impl std::fmt::Debug for ClusterMountAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClusterMountAuthority")
+            .field("token", &self.token)
+            .field("has_live_session", &self.session.is_some())
+            .field(
+                "next_renewal_in",
+                &self.next_renewal.saturating_duration_since(Instant::now()),
+            )
+            .field("released", &self.released)
+            .finish()
+    }
 }
 
 impl MountAuthority {
@@ -526,7 +579,41 @@ impl MountAuthority {
         token: tidefs_cluster::PoolLeaseToken,
     ) -> Result<Self, String> {
         validate_cluster_lease_token(&token, &expected_pool_guid)?;
-        Ok(Self::ClusterLease(ClusterMountAuthority { token }))
+        Ok(Self::ClusterLease(ClusterMountAuthority::new(
+            ClusterLeaseGrant {
+                token,
+                valid_until: Instant::now(),
+            },
+            None,
+        )))
+    }
+
+    #[cfg(feature = "cluster")]
+    pub fn renewable_cluster_lease(
+        expected_pool_guid: [u8; 16],
+        grant: ClusterLeaseGrant,
+        mut session: Box<dyn ClusterLeaseSession>,
+    ) -> Result<Self, String> {
+        let validation =
+            validate_cluster_lease_token(&grant.token, &expected_pool_guid).and_then(|()| {
+                if grant.remaining().is_zero() {
+                    Err("cluster mount: Pool lease has no remaining local validity".to_string())
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(validation_error) = validation {
+            return Err(match session.release(&grant.token) {
+                Ok(()) => validation_error,
+                Err(release_error) => format!(
+                    "{validation_error}; additionally failed to release rejected Pool lease: {release_error}"
+                ),
+            });
+        }
+        Ok(Self::ClusterLease(ClusterMountAuthority::new(
+            grant,
+            Some(session),
+        )))
     }
 
     #[cfg(feature = "cluster")]
@@ -572,6 +659,24 @@ impl MountAuthority {
         }
     }
 
+    /// Return the conservative process-local validity of a clustered grant.
+    #[cfg(feature = "cluster")]
+    pub fn cluster_lease_remaining(&self) -> Option<Duration> {
+        match self {
+            Self::Standalone => None,
+            Self::ClusterLease(authority) => Some(authority.mutation_deadline.remaining()),
+        }
+    }
+
+    /// Return the exact process-local deadline of a clustered grant.
+    #[cfg(feature = "cluster")]
+    pub fn cluster_lease_valid_until(&self) -> Option<Instant> {
+        match self {
+            Self::Standalone => None,
+            Self::ClusterLease(authority) => authority.mutation_deadline.valid_until(),
+        }
+    }
+
     #[cfg(feature = "cluster")]
     fn validate_for_pool(
         &self,
@@ -584,17 +689,154 @@ impl MountAuthority {
                     "cluster mount: pool UUID is required to validate lease authority".to_string()
                 })?;
                 validate_cluster_lease_token(&authority.token, expected_pool_guid)?;
+                if authority.session.is_some() && !authority.mutation_deadline.is_live() {
+                    return Err(
+                        "cluster mount: Pool lease local validity expired before admission"
+                            .to_string(),
+                    );
+                }
                 Ok(Some(&authority.token))
             }
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn external_mutation_deadline(
+        &self,
+    ) -> Option<tidefs_local_filesystem::ExternalMutationDeadline> {
+        match self {
+            Self::Standalone => None,
+            Self::ClusterLease(authority) => Some(authority.mutation_deadline.clone()),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn require_renewable_cluster_authority(&self) -> Result<(), String> {
+        match self {
+            Self::Standalone => Ok(()),
+            Self::ClusterLease(authority) if authority.session.is_some() => Ok(()),
+            Self::ClusterLease(_) => Err(
+                "cluster mount: lease admission has no live renewal session; refusing a one-shot mount authority"
+                    .to_string(),
+            ),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn renew_if_due(&mut self) -> Result<(), String> {
+        match self {
+            Self::Standalone => Ok(()),
+            Self::ClusterLease(authority) => authority.renew_if_due(),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn fence(&self) {
+        if let Self::ClusterLease(authority) = self {
+            authority.mutation_deadline.fence();
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    /// Release a retained cluster lease when no mounted carrier can still
+    /// mutate the Pool, including admission unwind before FUSE starts.
+    pub fn release_unmounted(&mut self) -> Result<(), String> {
+        match self {
+            Self::Standalone => Ok(()),
+            Self::ClusterLease(authority) => authority.release(),
         }
     }
 }
 
 #[cfg(feature = "cluster")]
 impl ClusterMountAuthority {
+    fn new(grant: ClusterLeaseGrant, session: Option<Box<dyn ClusterLeaseSession>>) -> Self {
+        let valid_until = grant.valid_until;
+        Self {
+            mutation_deadline: tidefs_local_filesystem::ExternalMutationDeadline::new_until(
+                valid_until,
+            ),
+            next_renewal: cluster_lease_renewal_at(valid_until),
+            token: grant.token,
+            session,
+            released: false,
+        }
+    }
+
     pub fn token(&self) -> &tidefs_cluster::PoolLeaseToken {
         &self.token
     }
+
+    fn renew_if_due(&mut self) -> Result<(), String> {
+        if self.released {
+            return Err("cluster mount: Pool lease has already been released".to_string());
+        }
+        if Instant::now() < self.next_renewal {
+            return Ok(());
+        }
+        let session = self.session.as_mut().ok_or_else(|| {
+            "cluster mount: Pool lease cannot renew without its live transport session".to_string()
+        })?;
+        let renewed = session.renew(&self.token)?;
+        validate_cluster_lease_token(&renewed.token, &self.token.pool_guid)?;
+        if renewed.remaining().is_zero() {
+            return Err("cluster mount: renewal has no remaining local validity".to_string());
+        }
+        if renewed.token.node_id != self.token.node_id
+            || renewed.token.epoch != self.token.epoch
+            || renewed.token.lease_id != self.token.lease_id
+            || renewed.token.slot != self.token.slot
+            || renewed.token.write_fence != self.token.write_fence
+        {
+            return Err(
+                "cluster mount: renewal changed Pool owner, lease identity, or write fence"
+                    .to_string(),
+            );
+        }
+        if renewed.token.expiration_deadline_ms <= self.token.expiration_deadline_ms {
+            return Err(
+                "cluster mount: renewal did not advance the Pool lease deadline".to_string(),
+            );
+        }
+        self.mutation_deadline.renew_until(renewed.valid_until);
+        if !self.mutation_deadline.is_live() {
+            return Err(
+                "cluster mount: renewal local validity expired before installation".to_string(),
+            );
+        }
+        self.next_renewal = cluster_lease_renewal_at(renewed.valid_until);
+        self.token = renewed.token;
+        Ok(())
+    }
+
+    fn release(&mut self) -> Result<(), String> {
+        if self.released {
+            return Ok(());
+        }
+        let session = self.session.as_mut().ok_or_else(|| {
+            "cluster mount: Pool lease cannot release without its live transport session"
+                .to_string()
+        })?;
+        session.release(&self.token)?;
+        self.released = true;
+        self.mutation_deadline.fence();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn cluster_lease_renewal_at(valid_until: Instant) -> Instant {
+    let now = Instant::now();
+    let valid_for = valid_until.saturating_duration_since(now);
+    let remaining_ms = u64::try_from(valid_for.as_millis()).unwrap_or(u64::MAX);
+    let lead_ms = (remaining_ms / 3)
+        .clamp(
+            CLUSTER_LEASE_MIN_RENEWAL_LEAD_MS,
+            CLUSTER_LEASE_MAX_RENEWAL_LEAD_MS,
+        )
+        .min((remaining_ms / 2).max(1));
+    now.checked_add(Duration::from_millis(remaining_ms.saturating_sub(lead_ms)))
+        .unwrap_or(now)
 }
 
 #[cfg(feature = "cluster")]
@@ -611,10 +853,172 @@ fn validate_cluster_lease_token(
     if token.lease_id == 0 {
         return Err("cluster mount: lease token has zero lease_id".to_string());
     }
+    if token.expiration_deadline_ms == 0 {
+        return Err("cluster mount: lease token has zero authority deadline".to_string());
+    }
     if !token.authorizes_pool(expected_pool_guid) {
         return Err("cluster mount: lease token pool GUID mismatch".to_string());
     }
     Ok(())
+}
+
+#[cfg(feature = "cluster")]
+struct ClusterLeaseRenewalWorker {
+    authority: Arc<Mutex<MountAuthority>>,
+    stop: Arc<AtomicBool>,
+    authority_lost: Arc<AtomicBool>,
+    authority_loss: Arc<Mutex<Option<String>>>,
+    shared_filesystem: tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "cluster")]
+impl ClusterLeaseRenewalWorker {
+    fn start(
+        authority: MountAuthority,
+        shared_filesystem: tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
+        let authority = Arc::new(Mutex::new(authority));
+        let stop = Arc::new(AtomicBool::new(false));
+        let authority_lost = Arc::new(AtomicBool::new(false));
+        let authority_loss = Arc::new(Mutex::new(None));
+
+        let thread_authority = Arc::clone(&authority);
+        let thread_stop = Arc::clone(&stop);
+        let thread_authority_lost = Arc::clone(&authority_lost);
+        let thread_authority_loss = Arc::clone(&authority_loss);
+        let thread_filesystem = shared_filesystem.clone();
+        let thread_shutdown = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                let renewal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    thread_authority
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .renew_if_due()
+                }));
+                match renewal {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        Self::record_authority_loss(
+                            &thread_authority,
+                            &thread_filesystem,
+                            &thread_shutdown,
+                            &thread_authority_lost,
+                            &thread_authority_loss,
+                            format!(
+                                "cluster Pool lease renewal lost; mutations fenced before unmount: {error}"
+                            ),
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        Self::record_authority_loss(
+                            &thread_authority,
+                            &thread_filesystem,
+                            &thread_shutdown,
+                            &thread_authority_lost,
+                            &thread_authority_loss,
+                            "cluster Pool lease renewal worker panicked; mutations fenced before unmount"
+                                .to_string(),
+                        );
+                        break;
+                    }
+                }
+                std::thread::park_timeout(std::time::Duration::from_millis(100));
+            }
+        });
+
+        Self {
+            authority,
+            stop,
+            authority_lost,
+            authority_loss,
+            shared_filesystem,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+
+    fn record_authority_loss(
+        authority: &Arc<Mutex<MountAuthority>>,
+        shared_filesystem: &tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem,
+        shutdown: &Arc<AtomicBool>,
+        authority_lost: &Arc<AtomicBool>,
+        authority_loss: &Arc<Mutex<Option<String>>>,
+        error: String,
+    ) {
+        authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fence();
+        shared_filesystem
+            .borrow_mut()
+            .fence_external_mutation_authority();
+        *authority_loss
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+        authority_lost.store(true, Ordering::Release);
+        shutdown.store(true, Ordering::Release);
+    }
+
+    fn check_health(&self) {
+        if !self.stop.load(Ordering::Acquire)
+            && !self.authority_lost.load(Ordering::Acquire)
+            && self
+                .handle
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            Self::record_authority_loss(
+                &self.authority,
+                &self.shared_filesystem,
+                &self.shutdown,
+                &self.authority_lost,
+                &self.authority_loss,
+                "cluster Pool lease renewal worker stopped unexpectedly; mutations fenced before unmount"
+                    .to_string(),
+            );
+        }
+    }
+
+    fn authority_lost(&self) -> bool {
+        self.authority_lost.load(Ordering::Acquire)
+    }
+
+    fn authority_loss(&self) -> Option<String> {
+        self.authority_loss
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            if handle.join().is_err() {
+                Self::record_authority_loss(
+                    &self.authority,
+                    &self.shared_filesystem,
+                    &self.shutdown,
+                    &self.authority_lost,
+                    &self.authority_loss,
+                    "cluster Pool lease renewal worker terminated unexpectedly; mutations fenced before release"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    fn release(&self) -> Result<(), String> {
+        self.authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .release_unmounted()
+    }
 }
 
 // A lazily detached FUSE mount can leave a directory entry that races
@@ -850,6 +1254,8 @@ struct StartedMount {
     queue_depth_engine: live_owner::LiveOwnerEngine,
     background_scheduler: Option<Arc<Mutex<Option<BackgroundScheduler>>>>,
     mmap_coherency: Arc<mmap_coherency::MmapCoherency>,
+    #[cfg(feature = "cluster")]
+    shared_filesystem: tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem,
 }
 
 fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
@@ -874,6 +1280,10 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     let cluster_lease_token = config
         .mount_authority
         .validate_for_pool(config.pool_uuid.as_ref())?;
+    #[cfg(feature = "cluster")]
+    config
+        .mount_authority
+        .require_renewable_cluster_authority()?;
     if !snapshot_export {
         fs::create_dir_all(&config.backing_dir)
             .map_err(|e| format!("create backing dir {}: {e}", config.backing_dir.display()))?;
@@ -1109,6 +1519,13 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         (engine, tracker, dataset_id)
     };
     let shared_filesystem = base_engine.shared_filesystem();
+    #[cfg(feature = "cluster")]
+    if let Some(deadline_ms) = config.mount_authority.external_mutation_deadline() {
+        shared_filesystem
+            .borrow_mut()
+            .install_external_mutation_deadline(deadline_ms)
+            .map_err(|error| format!("install clustered mutation deadline: {error}"))?;
+    }
 
     // When cluster-authorized, wrap the engine in a placement-recording layer.
     #[cfg(feature = "cluster")]
@@ -1302,6 +1719,8 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         queue_depth_engine,
         background_scheduler,
         mmap_coherency,
+        #[cfg(feature = "cluster")]
+        shared_filesystem,
     })
 }
 
@@ -1320,7 +1739,26 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
 /// startup-unwind, or clean-export failure.
 pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
     let import_owner = config.import_owner.take();
-    let _pid_guard = PidFileGuard::from_environment()?;
+    let _pid_guard = match PidFileGuard::from_environment() {
+        Ok(guard) => guard,
+        Err(primary_error) => {
+            let mut errors = vec![primary_error];
+            if let Some(owner) = import_owner {
+                if let Err(error) = owner.export() {
+                    errors.push(format!(
+                        "failed to unwind imported pool after PID-file admission failure: {error}"
+                    ));
+                }
+            }
+            #[cfg(feature = "cluster")]
+            if let Err(error) = config.mount_authority.release_unmounted() {
+                errors.push(format!(
+                    "failed to release Pool lease after PID-file admission failure: {error}"
+                ));
+            }
+            return Err(errors.join("; additionally "));
+        }
+    };
 
     let StartedMount {
         snapshot_export,
@@ -1330,21 +1768,29 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
         queue_depth_engine,
         background_scheduler,
         mmap_coherency,
+        #[cfg(feature = "cluster")]
+        shared_filesystem,
     } = match start_mount(&config) {
         Ok(started) => started,
         Err(primary_error) => {
-            return Err(match import_owner {
-                Some(owner) => match owner.export() {
+            let mut errors = vec![primary_error];
+            if let Some(owner) = import_owner {
+                match owner.export() {
                     Ok(()) => {
-                        eprintln!("tidefsctl: pool import unwound after mount startup failure");
-                        primary_error
+                        eprintln!("tidefsctl: pool import unwound after mount startup failure")
                     }
-                    Err(unwind_error) => format!(
-                        "{primary_error}; additionally failed to unwind imported pool: {unwind_error}"
-                    ),
-                },
-                None => primary_error,
-            });
+                    Err(error) => errors.push(format!(
+                        "failed to unwind imported pool after mount startup failure: {error}"
+                    )),
+                }
+            }
+            #[cfg(feature = "cluster")]
+            if let Err(error) = config.mount_authority.release_unmounted() {
+                errors.push(format!(
+                    "failed to release Pool lease after mount startup failure: {error}"
+                ));
+            }
+            return Err(errors.join("; additionally "));
         }
     };
 
@@ -1352,7 +1798,21 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
         eprintln!("tidefsctl: FUSE session active, Ctrl-C to stop");
     }
 
+    #[cfg(feature = "cluster")]
+    let mut cluster_lease_renewal = config.mount_authority.is_cluster_authorized().then(|| {
+        let authority =
+            std::mem::replace(&mut config.mount_authority, MountAuthority::standalone());
+        ClusterLeaseRenewalWorker::start(
+            authority,
+            shared_filesystem.clone(),
+            Arc::clone(&shutdown),
+        )
+    });
     while !shutdown.load(Ordering::Relaxed) {
+        #[cfg(feature = "cluster")]
+        if let Some(worker) = cluster_lease_renewal.as_ref() {
+            worker.check_health();
+        }
         let report = background_scheduler.as_ref().and_then(|scheduler| {
             let started = std::time::Instant::now();
             let report = scheduler
@@ -1376,14 +1836,34 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
         }
     }
 
-    if config.runtime.drain_timeout_secs > 0 {
+    #[cfg(feature = "cluster")]
+    let authority_lost = cluster_lease_renewal
+        .as_ref()
+        .is_some_and(ClusterLeaseRenewalWorker::authority_lost);
+    #[cfg(not(feature = "cluster"))]
+    let authority_lost = false;
+    if !authority_lost && config.runtime.drain_timeout_secs > 0 {
         eprintln!(
             "tidefsctl: draining in-flight requests for {}s",
             config.runtime.drain_timeout_secs
         );
-        std::thread::sleep(std::time::Duration::from_secs(
-            config.runtime.drain_timeout_secs,
-        ));
+        let drain_duration = std::time::Duration::from_secs(config.runtime.drain_timeout_secs);
+        #[cfg(feature = "cluster")]
+        {
+            let started = std::time::Instant::now();
+            while started.elapsed() < drain_duration {
+                if let Some(worker) = cluster_lease_renewal.as_ref() {
+                    worker.check_health();
+                    if worker.authority_lost() {
+                        break;
+                    }
+                }
+                let remaining = drain_duration.saturating_sub(started.elapsed());
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(100)));
+            }
+        }
+        #[cfg(not(feature = "cluster"))]
+        std::thread::sleep(drain_duration);
     }
     if let Some(scheduler) = background_scheduler {
         *scheduler.lock().unwrap() = None;
@@ -1404,6 +1884,29 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
             .map_err(|err| format!("clean pool export failed during unmount: {err}")),
         None => Ok(()),
     };
+    #[cfg(feature = "cluster")]
+    let (authority_loss, lease_release_result) = match cluster_lease_renewal.as_mut() {
+        Some(worker) => {
+            worker.stop();
+            (
+                worker.authority_loss(),
+                worker.release().map_err(|error| {
+                    format!("release clustered Pool lease after unmount: {error}")
+                }),
+            )
+        }
+        None => (
+            None,
+            config
+                .mount_authority
+                .release_unmounted()
+                .map_err(|error| format!("release clustered Pool lease after unmount: {error}")),
+        ),
+    };
+    #[cfg(not(feature = "cluster"))]
+    let lease_release_result: Result<(), String> = Ok(());
+    #[cfg(not(feature = "cluster"))]
+    let authority_loss: Option<String> = None;
     if export_result.is_ok() && !snapshot_export {
         if let Some(ref pool_name) = config.pool_name {
             eprintln!("tidefsctl: pool exported: {pool_name}");
@@ -1421,7 +1924,15 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
         );
     }
     let mut shutdown_errors = Vec::new();
-    for result in [&carrier_drain_result, &artifact_result, &export_result] {
+    if let Some(error) = authority_loss {
+        shutdown_errors.push(error);
+    }
+    for result in [
+        &carrier_drain_result,
+        &artifact_result,
+        &export_result,
+        &lease_release_result,
+    ] {
         if let Err(error) = result {
             shutdown_errors.push(error.clone());
         }
@@ -1684,6 +2195,7 @@ mod standalone_mount_authority_tests {
 #[cfg(all(test, feature = "cluster"))]
 mod cluster_mount_authority_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tidefs_cluster::{EpochId, PoolLeaseToken, WriteFence};
 
     const POOL_GUID: [u8; 16] = [0x42; 16];
@@ -1699,6 +2211,37 @@ mod cluster_mount_authority_tests {
             WriteFence::new(EpochId(epoch), 9),
             60_000,
         )
+    }
+
+    fn lease_grant(token: PoolLeaseToken) -> ClusterLeaseGrant {
+        ClusterLeaseGrant {
+            token,
+            valid_until: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockLeaseSession {
+        renewals: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+        fail_renewal: bool,
+    }
+
+    impl ClusterLeaseSession for MockLeaseSession {
+        fn renew(&mut self, token: &PoolLeaseToken) -> Result<ClusterLeaseGrant, String> {
+            self.renewals.fetch_add(1, AtomicOrdering::Relaxed);
+            if self.fail_renewal {
+                return Err("injected renewal loss".to_string());
+            }
+            let mut renewed = token.clone();
+            renewed.expiration_deadline_ms += 60_000;
+            Ok(lease_grant(renewed))
+        }
+
+        fn release(&mut self, _token: &PoolLeaseToken) -> Result<(), String> {
+            self.releases.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(())
+        }
     }
 
     fn token_bytes(token: &PoolLeaseToken) -> Vec<u8> {
@@ -1792,6 +2335,19 @@ mod cluster_mount_authority_tests {
     }
 
     #[test]
+    fn cluster_mount_authority_rejects_zero_authority_deadline() {
+        let mut token = lease_token(7, POOL_GUID, 2, 99);
+        token.expiration_deadline_ms = 0;
+
+        let error = MountAuthority::cluster_lease(POOL_GUID, token).unwrap_err();
+
+        assert!(
+            error.contains("zero authority deadline"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn cluster_wire_accepts_valid_lease_authority() {
         let token = lease_token(7, POOL_GUID, 2, 99);
         let bytes = token_bytes(&token);
@@ -1824,6 +2380,147 @@ mod cluster_mount_authority_tests {
         assert!(authority.is_cluster_authorized());
         assert_eq!(admitted.node_id, token.node_id);
         assert_eq!(admitted.epoch, token.epoch);
+    }
+
+    #[test]
+    fn cluster_mount_authority_renewal_updates_shared_deadline_and_releases() {
+        let token = lease_token(7, POOL_GUID, 2, 99);
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let session = MockLeaseSession {
+            renewals: Arc::clone(&renewals),
+            releases: Arc::clone(&releases),
+            fail_renewal: false,
+        };
+        let mut authority = MountAuthority::renewable_cluster_lease(
+            POOL_GUID,
+            lease_grant(token),
+            Box::new(session),
+        )
+        .unwrap();
+        let deadline = authority.external_mutation_deadline().unwrap();
+        let MountAuthority::ClusterLease(cluster) = &mut authority else {
+            unreachable!();
+        };
+        cluster.next_renewal = Instant::now();
+
+        authority.renew_if_due().unwrap();
+
+        assert_eq!(renewals.load(AtomicOrdering::Relaxed), 1);
+        assert!(deadline.is_live());
+        authority.release_unmounted().unwrap();
+        assert_eq!(releases.load(AtomicOrdering::Relaxed), 1);
+        assert!(!deadline.is_live());
+    }
+
+    #[test]
+    fn cluster_mount_authority_renewal_loss_arms_shared_deadline_fence() {
+        let token = lease_token(7, POOL_GUID, 2, 99);
+        let session = MockLeaseSession {
+            renewals: Arc::new(AtomicUsize::new(0)),
+            releases: Arc::new(AtomicUsize::new(0)),
+            fail_renewal: true,
+        };
+        let mut authority = MountAuthority::renewable_cluster_lease(
+            POOL_GUID,
+            lease_grant(token),
+            Box::new(session),
+        )
+        .unwrap();
+        let deadline = authority.external_mutation_deadline().unwrap();
+        let MountAuthority::ClusterLease(cluster) = &mut authority else {
+            unreachable!();
+        };
+        cluster.next_renewal = Instant::now();
+
+        let error = authority.renew_if_due().unwrap_err();
+        authority.fence();
+
+        assert!(error.contains("injected renewal loss"));
+        assert!(!deadline.is_live());
+    }
+
+    #[test]
+    fn cluster_mount_authority_does_not_restart_an_elapsed_grant_window() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let session = MockLeaseSession {
+            renewals: Arc::new(AtomicUsize::new(0)),
+            releases: Arc::clone(&releases),
+            fail_renewal: false,
+        };
+        let grant = ClusterLeaseGrant {
+            token: lease_token(7, POOL_GUID, 2, 99),
+            valid_until: Instant::now(),
+        };
+
+        let error = MountAuthority::renewable_cluster_lease(POOL_GUID, grant, Box::new(session))
+            .unwrap_err();
+
+        assert!(error.contains("no remaining local validity"));
+        assert_eq!(releases.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn cluster_renewal_worker_keeps_authority_live_through_clean_shutdown_drain() {
+        let token = lease_token(7, POOL_GUID, 2, 99);
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let session = MockLeaseSession {
+            renewals: Arc::clone(&renewals),
+            releases: Arc::clone(&releases),
+            fail_renewal: false,
+        };
+        let mut authority = MountAuthority::renewable_cluster_lease(
+            POOL_GUID,
+            lease_grant(token),
+            Box::new(session),
+        )
+        .unwrap();
+        let deadline = authority.external_mutation_deadline().unwrap();
+        let MountAuthority::ClusterLease(cluster) = &mut authority else {
+            unreachable!();
+        };
+        cluster.next_renewal = Instant::now();
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut filesystem =
+            tidefs_local_filesystem::LocalFileSystem::open_with_root_authentication_key(
+                root.path(),
+                tidefs_local_object_store::StoreOptions::default(),
+                tidefs_local_filesystem::RootAuthenticationKey::demo_key(),
+            )
+            .expect("open filesystem");
+        filesystem
+            .install_external_mutation_deadline(deadline)
+            .expect("install lease deadline");
+        let shared_filesystem =
+            tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem::new(filesystem);
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let mut worker =
+            ClusterLeaseRenewalWorker::start(authority, shared_filesystem, Arc::clone(&shutdown));
+
+        let started = std::time::Instant::now();
+        while renewals.load(AtomicOrdering::Acquire) == 0
+            && started.elapsed() < std::time::Duration::from_secs(1)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(renewals.load(AtomicOrdering::Acquire), 1);
+        assert!(!worker.authority_lost());
+        worker.stop();
+        worker.release().unwrap();
+        assert_eq!(releases.load(AtomicOrdering::Acquire), 1);
+    }
+
+    #[test]
+    fn cluster_mount_authority_refuses_one_shot_runtime_authority() {
+        let authority =
+            MountAuthority::cluster_lease(POOL_GUID, lease_token(7, POOL_GUID, 2, 99)).unwrap();
+
+        let error = authority.require_renewable_cluster_authority().unwrap_err();
+
+        assert!(error.contains("one-shot"), "unexpected error: {error}");
     }
 }
 

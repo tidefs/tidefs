@@ -1663,6 +1663,74 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cli_parse_cluster_pool_mount_accepts_explicit_owner_and_authority_surfaces() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--cluster",
+            "--cluster-owner-node-id",
+            "2",
+            "--cluster-authority-node-id",
+            "1",
+            "--cluster-authority-addr",
+            "127.0.0.1:7411",
+        ]);
+
+        assert!(
+            args.is_ok(),
+            "explicit cluster mount authority should parse"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cli_parse_cluster_pool_mount_rejects_retired_ambiguous_node_flags() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--cluster",
+            "--cluster-node-id",
+            "1",
+            "--cluster-node-addr",
+            "127.0.0.1:7411",
+        ]);
+
+        assert!(
+            args.is_err(),
+            "ambiguous cluster node flags must stay retired"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cli_parse_cluster_pool_mount_rejects_authority_without_cluster_mode() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--cluster-owner-node-id",
+            "2",
+        ]);
+
+        assert!(
+            args.is_err(),
+            "cluster authority flags must not be silently ignored by a local mount"
+        );
+    }
+
     #[test]
     fn cli_parse_pool_mount_read_only() {
         use clap::Parser;
