@@ -9,12 +9,14 @@
 //! with CP01-framed messages and ClusterLeaseRuntime.
 
 use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tidefs_auth::{NodeKeyStore, NodePrivateCredential, NodePublicIdentity};
 use tidefs_cluster::pool_config::{ClusterPlacementPolicy, ClusterRedundancy, FailureDomain};
@@ -25,12 +27,29 @@ use tidefs_cluster::pool_protocol::{
     CatalogQueryType, ClusterPoolCatalogDeltaRequest, ClusterPoolCatalogQueryRequest,
     ClusterPoolCreateRequest, ClusterPoolMessage, NodeDeviceSpec,
 };
-use tidefs_cluster::{ClusterLeaseConfig, LossEvent, PlacementHealCoordinator, PlacementMap};
+use tidefs_cluster::{
+    ClusterLeaseConfig, ClusterPoolLeaseAction, ClusterPoolLeaseResponse, LossEvent,
+    PlacementHealCoordinator, PlacementMap,
+};
+use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId as LifecycleDatasetId, SyncGuarantee};
+use tidefs_local_filesystem::{
+    human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem,
+    ExternalMutationDeadline, LocalFileSystem, LocalFileSystemOpenConfig,
+    LocalStorageAllocatorPolicy, RecoveryPolicy, RootAuthenticationKey,
+};
+use tidefs_local_object_store::pool::PoolRedundancyPolicy;
 use tidefs_membership_epoch::{HealthClass, MemberClass};
 use tidefs_membership_live::BackendDisclosure;
+use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_client::ClusterVfsRpcOwnerCandidate;
+use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_owner::{
+    ClusterVfsRpcOwnerConfig, ClusterVfsRpcOwnerHandle, ClusterVfsRpcWriterFence,
+};
+use tidefs_posix_filesystem_adapter_daemon::live_owner::LiveOwnerEngine;
+use tidefs_posix_filesystem_adapter_daemon::{run_cluster_vfs_rpc_mount, ClusterVfsRpcMountConfig};
 use tidefs_storage_node::authority_spine::RuntimeAuthority;
 use tidefs_storage_node::server::{MembershipPeerConfig, StorageNode, StorageNodeConfig};
 use tidefs_transport::EndpointFamily;
+use tidefs_vfs_rpc::DatasetId;
 
 const CLUSTER_POOL_MAGIC: &[u8; 4] = b"CP01";
 const TEST_DEVICE_BYTES: u64 = 2 * 1_048_576; // 2 MiB
@@ -294,6 +313,129 @@ fn send_cp01(
 ) {
     let wire = frame_cp01(msg);
     client.send_message(sid, &wire).expect("send CP01 message");
+}
+
+fn transact_pool_lease(
+    client: &mut tidefs_transport::Transport,
+    session_id: tidefs_transport::SessionId,
+    request_id: u64,
+    pool_guid: [u8; 16],
+    requesting_node_id: u64,
+    action: ClusterPoolLeaseAction,
+) -> ClusterPoolLeaseResponse {
+    send_cp01(
+        client,
+        session_id,
+        &ClusterPoolMessage::LeaseRequest(ClusterPoolLeaseRequest {
+            request_id,
+            pool_guid,
+            requesting_node_id,
+            action,
+        }),
+    );
+    match recv_cp01(client, session_id, 100) {
+        Some(ClusterPoolMessage::LeaseResponse(response)) => response,
+        other => panic!("unexpected Pool owner lease response: {other:?}"),
+    }
+}
+
+fn granted_pool_lease(response: ClusterPoolLeaseResponse, context: &str) -> (PoolLeaseToken, u64) {
+    assert!(response.success, "{context}: {:?}", response.error);
+    assert!(
+        response.error.is_none(),
+        "{context} returned success and error"
+    );
+    let remaining_ms = response
+        .lease_remaining_ms
+        .expect("successful Pool owner grant carries remaining lifetime");
+    let token = bincode::deserialize::<PoolLeaseToken>(
+        &response
+            .lease_token_bytes
+            .expect("successful Pool owner grant carries token"),
+    )
+    .expect("decode Pool owner lease token");
+    (token, remaining_ms)
+}
+
+fn open_clustered_filesystem(
+    metadata_dir: &Path,
+    member: &PathBuf,
+    pool_name: &str,
+    dataset_name: &str,
+) -> LocalFileSystem {
+    LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+        metadata_dir,
+        pool_name,
+        PoolRedundancyPolicy::default(),
+        dataset_name,
+        LocalFileSystemOpenConfig {
+            options: StoreOptions::default(),
+            allocator_policy: LocalStorageAllocatorPolicy::default(),
+            root_authentication_key: RootAuthenticationKey::demo_key(),
+            encryption: None,
+            compression: None,
+            log_device_device_path: None,
+            recovery_policy: RecoveryPolicy::default(),
+            block_devices: Some(std::slice::from_ref(member)),
+        },
+    )
+    .expect("open exact Pool-backed filesystem dataset from devices")
+}
+
+fn pool_backed_engine(filesystem: LocalFileSystem) -> LiveOwnerEngine {
+    Arc::new(Mutex::new(Box::new(VfsLocalFileSystem::new(filesystem))))
+}
+
+fn mount_is_present(mountpoint: &Path) -> bool {
+    fs::read_to_string("/proc/self/mountinfo").is_ok_and(|mountinfo| {
+        mountinfo.lines().any(|line| {
+            line.split_whitespace()
+                .nth(4)
+                .is_some_and(|path| Path::new(path) == mountpoint)
+        })
+    })
+}
+
+fn wait_for_mount(
+    mountpoint: &Path,
+    mount_thread: &thread::JoinHandle<Result<(), String>>,
+    context: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mount_is_present(mountpoint) {
+        assert!(
+            !mount_thread.is_finished(),
+            "{context} exited before the mount appeared"
+        );
+        assert!(Instant::now() < deadline, "{context} did not appear");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_terminal_unmount(
+    mountpoint: &Path,
+    mount_thread: thread::JoinHandle<Result<(), String>>,
+    timeout: Duration,
+    context: &str,
+) {
+    let deadline = Instant::now() + timeout;
+    while !mount_thread.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(mount_thread.is_finished(), "{context} did not terminate");
+    let error = mount_thread
+        .join()
+        .unwrap_or_else(|_| panic!("{context} thread panicked"))
+        .unwrap_err();
+    assert!(
+        error.contains("owner authority lost or expired")
+            && error.contains("stale frontend unmounted"),
+        "unexpected {context} error: {error}"
+    );
+    assert!(
+        !mount_is_present(mountpoint),
+        "{context} remained mounted after authority loss"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +883,15 @@ fn cluster_pool_owner_restart_quarantines_old_grant_before_newer_handoff() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store_paths = vec![dir.path().join("authority-store")];
     let checkpoint_dir = dir.path().join("membership-checkpoint");
+    let pool_guid = [0xD7; 16];
+    let authority_credential = NodePrivateCredential::generate(1).expect("authority credential");
+    let authority_identity = authority_credential.public_identity();
+    let owner2_credential = NodePrivateCredential::generate(2).expect("owner 2 credential");
+    let owner3_credential = NodePrivateCredential::generate(3).expect("owner 3 credential");
+    let trusted_owners = vec![
+        owner2_credential.public_identity(),
+        owner3_credential.public_identity(),
+    ];
     let peer2_membership_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port());
     let peer3_membership_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port());
     let _peer2 = TestServer::spawn_configured(
@@ -750,7 +901,13 @@ fn cluster_pool_owner_restart_quarantines_old_grant_before_newer_handoff() {
         None,
         Vec::new(),
         Some(peer2_membership_addr),
-        None,
+        Some((
+            duplicate_credential(&owner2_credential),
+            vec![
+                authority_identity.clone(),
+                owner3_credential.public_identity(),
+            ],
+        )),
         false,
     );
     let _peer3 = TestServer::spawn_configured(
@@ -760,7 +917,13 @@ fn cluster_pool_owner_restart_quarantines_old_grant_before_newer_handoff() {
         None,
         Vec::new(),
         Some(peer3_membership_addr),
-        None,
+        Some((
+            duplicate_credential(&owner3_credential),
+            vec![
+                authority_identity.clone(),
+                owner2_credential.public_identity(),
+            ],
+        )),
         false,
     );
     let membership_peers = vec![
@@ -785,16 +948,6 @@ fn cluster_pool_owner_restart_quarantines_old_grant_before_newer_handoff() {
         lease_term_ms,
         ..ClusterLeaseConfig::default()
     };
-    let pool_guid = [0xD7; 16];
-    let authority_credential = NodePrivateCredential::generate(1).expect("authority credential");
-    let authority_identity = authority_credential.public_identity();
-    let owner2_credential = NodePrivateCredential::generate(2).expect("owner 2 credential");
-    let owner3_credential = NodePrivateCredential::generate(3).expect("owner 3 credential");
-    let trusted_owners = vec![
-        owner2_credential.public_identity(),
-        owner3_credential.public_identity(),
-    ];
-
     let server = TestServer::spawn_configured(
         1,
         store_paths.clone(),
@@ -912,6 +1065,363 @@ fn cluster_pool_owner_restart_quarantines_old_grant_before_newer_handoff() {
     assert_eq!(new_token.node_id, 3);
     assert!(new_token.lease_id > old_token.lease_id);
     assert!(new_token.write_fence.is_later_than(&old_token.write_fence));
+}
+
+#[test]
+fn cluster_mount_recovers_after_unclean_owner_lease_expiry() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping unclean clustered-owner recovery: /dev/fuse is unavailable");
+        return;
+    }
+
+    const AUTHORITY_AND_OWNER_A_NODE: u64 = 1;
+    const OWNER_B_NODE: u64 = 2;
+    const CLIENT_NODE: u64 = 3;
+    const POOL_GUID: [u8; 16] = [0xD8; 16];
+    const POOL_NAME: &str = "tidefs-unclean-owner-expiry";
+    const DATASET_NAME: &str = "clustered";
+
+    let root = tempfile::tempdir().expect("create persistent test root");
+    let metadata_dir = root.path().join("metadata");
+    let member = root.path().join("member.img");
+    let mountpoint_a = root.path().join("owner-a-mount");
+    let mountpoint_b = root.path().join("owner-b-mount");
+    fs::create_dir_all(&metadata_dir).expect("create Pool metadata directory");
+    File::create(&member)
+        .expect("create regular-file Pool member")
+        .set_len(32 * 1024 * 1024)
+        .expect("size regular-file Pool member");
+
+    let mut root_filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        std::slice::from_ref(&member),
+        POOL_NAME,
+        PoolRedundancyPolicy::default(),
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::default(),
+    )
+    .expect("open regular-file Pool-backed root filesystem");
+    root_filesystem
+        .create_filesystem_dataset(
+            DATASET_NAME,
+            LifecycleDatasetId::from_bytes([0xD8; 16]),
+            Vec::new(),
+            DatasetFlags::default_create(),
+            SyncGuarantee::Local,
+        )
+        .expect("publish clustered filesystem dataset");
+    drop(root_filesystem);
+
+    let authority_credential =
+        NodePrivateCredential::generate(AUTHORITY_AND_OWNER_A_NODE).expect("authority credential");
+    let authority_identity = authority_credential.public_identity();
+    let owner_b_credential =
+        NodePrivateCredential::generate(OWNER_B_NODE).expect("owner B credential");
+    let owner_b_identity = owner_b_credential.public_identity();
+    let client_credential =
+        NodePrivateCredential::generate(CLIENT_NODE).expect("mount client credential");
+    let client_identity = client_credential.public_identity();
+
+    let peer2_membership_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port());
+    let peer3_membership_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port());
+    let _peer2 = TestServer::spawn_configured(
+        OWNER_B_NODE,
+        vec![root.path().join("peer2-store")],
+        None,
+        None,
+        Vec::new(),
+        Some(peer2_membership_addr),
+        Some((
+            duplicate_credential(&owner_b_credential),
+            vec![authority_identity.clone(), client_identity.clone()],
+        )),
+        false,
+    );
+    let _peer3 = TestServer::spawn_configured(
+        CLIENT_NODE,
+        vec![root.path().join("peer3-store")],
+        None,
+        None,
+        Vec::new(),
+        Some(peer3_membership_addr),
+        Some((
+            duplicate_credential(&client_credential),
+            vec![authority_identity.clone(), owner_b_identity.clone()],
+        )),
+        false,
+    );
+    let membership_peers = vec![
+        MembershipPeerConfig {
+            node_id: OWNER_B_NODE,
+            addr: peer2_membership_addr,
+            member_class: MemberClass::Voter,
+            failure_domain: 2,
+        },
+        MembershipPeerConfig {
+            node_id: CLIENT_NODE,
+            addr: peer3_membership_addr,
+            member_class: MemberClass::Voter,
+            failure_domain: 3,
+        },
+    ];
+
+    // The term is short enough to exercise real expiry, but leaves enough
+    // room for an authenticated FUSE startup and fsync on a loaded CI host.
+    let lease_term_ms = 8_000;
+    let lease_config = ClusterLeaseConfig {
+        lease_term_ms,
+        ..ClusterLeaseConfig::default()
+    };
+    let authority = TestServer::spawn_configured(
+        AUTHORITY_AND_OWNER_A_NODE,
+        vec![root.path().join("authority-store")],
+        Some(lease_config),
+        Some(root.path().join("membership-checkpoint")),
+        membership_peers,
+        None,
+        Some((
+            duplicate_credential(&authority_credential),
+            vec![owner_b_identity.clone(), client_identity.clone()],
+        )),
+        false,
+    );
+
+    let mut owner_a_lease_client = authenticated_client(
+        &authority_credential,
+        std::slice::from_ref(&authority_identity),
+    );
+    let owner_a_session = connect_client(
+        &mut owner_a_lease_client,
+        AUTHORITY_AND_OWNER_A_NODE,
+        authority.addr(),
+    );
+    let (owner_a_lease, owner_a_remaining_ms) = granted_pool_lease(
+        transact_pool_lease(
+            &mut owner_a_lease_client,
+            owner_a_session,
+            400,
+            POOL_GUID,
+            AUTHORITY_AND_OWNER_A_NODE,
+            ClusterPoolLeaseAction::Acquire,
+        ),
+        "grant owner A",
+    );
+
+    let filesystem_a = open_clustered_filesystem(&metadata_dir, &member, POOL_NAME, DATASET_NAME);
+    let dataset_id = DatasetId::new(u128::from_le_bytes(filesystem_a.mounted_dataset_id()));
+    let owner_a_deadline = ExternalMutationDeadline::new_until(
+        Instant::now() + Duration::from_millis(owner_a_remaining_ms),
+    );
+    let owner_a_shutdown = Arc::new(AtomicBool::new(false));
+    let mut owner_a = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        owner_a_lease.node_id,
+        Arc::new(duplicate_credential(&authority_credential)),
+        vec![client_identity.clone()],
+        owner_a_lease.pool_guid,
+        dataset_id,
+        Arc::new(Mutex::new(ClusterVfsRpcWriterFence::new(
+            owner_a_lease.node_id,
+            owner_a_lease.write_fence.generation,
+            owner_a_lease.epoch.0,
+        ))),
+        owner_a_deadline,
+        pool_backed_engine(filesystem_a),
+        owner_a_shutdown,
+    ))
+    .expect("start owner A's Pool-backed VFS_RPC service");
+    let owner_a_addr = owner_a.bound_addr();
+
+    let owner_b_listener =
+        TcpListener::bind("127.0.0.1:0").expect("reserve owner B VFS_RPC endpoint");
+    let owner_b_addr = owner_b_listener
+        .local_addr()
+        .expect("read reserved owner B endpoint");
+    let mount_config_a = ClusterVfsRpcMountConfig::new(
+        mountpoint_a.clone(),
+        authority.addr(),
+        POOL_GUID,
+        duplicate_credential(&client_credential),
+        authority_identity.clone(),
+        vec![
+            ClusterVfsRpcOwnerCandidate::new(owner_b_addr, owner_b_identity.clone()),
+            ClusterVfsRpcOwnerCandidate::new(owner_a_addr, authority_identity.clone()),
+        ],
+    );
+    let mount_thread_a = thread::spawn(move || run_cluster_vfs_rpc_mount(mount_config_a));
+    wait_for_mount(&mountpoint_a, &mount_thread_a, "owner A frontend");
+
+    let owner_a_bytes = b"owner A committed before unclean lease expiry";
+    let owner_a_file = mountpoint_a.join("owner-a-visible");
+    let mut file = File::create(&owner_a_file).expect("create owner A file through remote FUSE");
+    file.write_all(owner_a_bytes)
+        .expect("write owner A file through remote FUSE");
+    file.sync_all()
+        .expect("fsync owner A file through remote FUSE");
+    drop(file);
+    assert_eq!(
+        fs::read(&owner_a_file).expect("read owner A file through remote FUSE"),
+        owner_a_bytes
+    );
+
+    // Owner A disappears with its only engine and VFS_RPC service. Deliberately
+    // send no Release request: the storage-node's committed expiry is the sole
+    // authority that may admit a replacement writer.
+    owner_a
+        .stop()
+        .expect("stop owner A without releasing its lease");
+    drop(owner_a);
+    drop(owner_a_lease_client);
+
+    let mut owner_b_lease_client = authenticated_client(
+        &owner_b_credential,
+        std::slice::from_ref(&authority_identity),
+    );
+    let owner_b_session = connect_client(
+        &mut owner_b_lease_client,
+        AUTHORITY_AND_OWNER_A_NODE,
+        authority.addr(),
+    );
+    let early_handoff = transact_pool_lease(
+        &mut owner_b_lease_client,
+        owner_b_session,
+        401,
+        POOL_GUID,
+        OWNER_B_NODE,
+        ClusterPoolLeaseAction::Acquire,
+    );
+    assert!(
+        !early_handoff.success,
+        "storage-node admitted owner B before owner A's lease expired"
+    );
+    assert!(early_handoff.lease_token_bytes.is_none());
+
+    wait_for_terminal_unmount(
+        &mountpoint_a,
+        mount_thread_a,
+        Duration::from_millis(lease_term_ms + 10_000),
+        "owner A stale frontend",
+    );
+    // The frontend uses a conservative local deadline, so allow the actual
+    // authority clock to cross the committed deadline before asking again.
+    thread::sleep(Duration::from_millis(25));
+
+    let (owner_b_lease, owner_b_remaining_ms) = granted_pool_lease(
+        transact_pool_lease(
+            &mut owner_b_lease_client,
+            owner_b_session,
+            402,
+            POOL_GUID,
+            OWNER_B_NODE,
+            ClusterPoolLeaseAction::Acquire,
+        ),
+        "grant owner B after owner A expiry",
+    );
+    assert!(
+        owner_b_lease
+            .write_fence
+            .is_later_than(&owner_a_lease.write_fence),
+        "successor must receive a strictly higher write fence"
+    );
+
+    drop(owner_b_listener);
+    let filesystem_b = open_clustered_filesystem(&metadata_dir, &member, POOL_NAME, DATASET_NAME);
+    let successor_dataset_id =
+        DatasetId::new(u128::from_le_bytes(filesystem_b.mounted_dataset_id()));
+    assert_eq!(
+        successor_dataset_id, dataset_id,
+        "owner B must independently reopen the exact durable dataset"
+    );
+    let owner_b_deadline = ExternalMutationDeadline::new_until(
+        Instant::now() + Duration::from_millis(owner_b_remaining_ms),
+    );
+    let owner_b_shutdown = Arc::new(AtomicBool::new(false));
+    let mut owner_b = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
+        owner_b_addr,
+        owner_b_lease.node_id,
+        Arc::new(duplicate_credential(&owner_b_credential)),
+        vec![client_identity],
+        owner_b_lease.pool_guid,
+        successor_dataset_id,
+        Arc::new(Mutex::new(ClusterVfsRpcWriterFence::new(
+            owner_b_lease.node_id,
+            owner_b_lease.write_fence.generation,
+            owner_b_lease.epoch.0,
+        ))),
+        owner_b_deadline.clone(),
+        pool_backed_engine(filesystem_b),
+        owner_b_shutdown,
+    ))
+    .expect("start owner B from an independent device reopen");
+
+    let mount_config_b = ClusterVfsRpcMountConfig::new(
+        mountpoint_b.clone(),
+        authority.addr(),
+        POOL_GUID,
+        client_credential,
+        authority_identity.clone(),
+        vec![
+            ClusterVfsRpcOwnerCandidate::new(owner_a_addr, authority_identity),
+            ClusterVfsRpcOwnerCandidate::new(owner_b.bound_addr(), owner_b_identity),
+        ],
+    );
+    let mount_thread_b = thread::spawn(move || run_cluster_vfs_rpc_mount(mount_config_b));
+    wait_for_mount(&mountpoint_b, &mount_thread_b, "owner B frontend");
+    assert_eq!(
+        fs::read(mountpoint_b.join("owner-a-visible"))
+            .expect("owner B reads owner A's committed data after device reopen"),
+        owner_a_bytes
+    );
+    let owner_b_bytes = b"owner B committed after expiry-gated independent reopen";
+    let owner_b_file = mountpoint_b.join("owner-b-visible");
+    let mut file = File::create(&owner_b_file).expect("create owner B file through remote FUSE");
+    file.write_all(owner_b_bytes)
+        .expect("write owner B file through remote FUSE");
+    file.sync_all()
+        .expect("fsync owner B file through remote FUSE");
+    drop(file);
+
+    let release_b = transact_pool_lease(
+        &mut owner_b_lease_client,
+        owner_b_session,
+        403,
+        POOL_GUID,
+        OWNER_B_NODE,
+        ClusterPoolLeaseAction::Release {
+            token: owner_b_lease,
+        },
+    );
+    assert!(release_b.success, "release owner B: {:?}", release_b.error);
+    assert!(release_b.lease_token_bytes.is_none());
+    owner_b_deadline.fence();
+    if let Err(error) = owner_b.stop() {
+        assert!(error.contains("mutation authority deadline has expired"));
+    }
+    drop(owner_b);
+
+    wait_for_terminal_unmount(
+        &mountpoint_b,
+        mount_thread_b,
+        Duration::from_secs(10),
+        "owner B released frontend",
+    );
+    drop(owner_b_lease_client);
+
+    let final_filesystem =
+        open_clustered_filesystem(&metadata_dir, &member, POOL_NAME, DATASET_NAME);
+    assert_eq!(
+        final_filesystem
+            .read_file("/owner-a-visible")
+            .expect("read owner A data after final device reopen"),
+        owner_a_bytes
+    );
+    assert_eq!(
+        final_filesystem
+            .read_file("/owner-b-visible")
+            .expect("read owner B data after final device reopen"),
+        owner_b_bytes
+    );
 }
 
 /// Test that a storage node without cluster_lease_config serves or refuses

@@ -3581,6 +3581,7 @@ dependencies = [
  "tempfile",
  "tidefs-auth",
  "tidefs-cluster",
+ "tidefs-dataset-lifecycle",
  "tidefs-durability-layout",
  "tidefs-local-filesystem",
  "tidefs-local-object-store",
@@ -3591,6 +3592,7 @@ dependencies = [
  "tidefs-partition-runtime",
  "tidefs-pool-import",
  "tidefs-pool-scan",
+ "tidefs-posix-filesystem-adapter-daemon",
  "tidefs-rebuild-planner",
  "tidefs-rebuild-runtime",
  "tidefs-replicated-object-store",
@@ -3598,6 +3600,7 @@ dependencies = [
  "tidefs-send-stream",
  "tidefs-transport",
  "tidefs-types-pool-label-core",
+ "tidefs-vfs-rpc",
  "tokio",
 ]
 
