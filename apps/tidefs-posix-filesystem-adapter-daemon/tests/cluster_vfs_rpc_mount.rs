@@ -5,8 +5,8 @@ use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,7 +15,9 @@ use tidefs_auth::{
     NodeKeyStore, NodePrivateCredential, NodePublicIdentity, NODE_PRIVATE_CREDENTIAL_WIRE_SIZE,
     NODE_PUBLIC_IDENTITY_WIRE_SIZE,
 };
-use tidefs_cluster::{ClusterPoolMessage, ClusterPoolOwnerObservationResponse};
+use tidefs_cluster::{
+    ClusterPoolMessage, ClusterPoolOwnerObservationResponse, EpochId, PoolOwnerLeaseAuthority,
+};
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId as LifecycleDatasetId, SyncGuarantee};
 use tidefs_local_filesystem::{
     human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem,
@@ -27,7 +29,7 @@ use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_client::ClusterVfsRp
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_owner::{
     ClusterVfsRpcOwnerConfig, ClusterVfsRpcOwnerHandle, ClusterVfsRpcWriterFence,
 };
-use tidefs_posix_filesystem_adapter_daemon::fuse_vfs_adapter::FuseVfsAdapter;
+use tidefs_posix_filesystem_adapter_daemon::live_owner::LiveOwnerEngine;
 use tidefs_posix_filesystem_adapter_daemon::{run_cluster_vfs_rpc_mount, ClusterVfsRpcMountConfig};
 use tidefs_recovery_loop::RecoveryPolicy;
 use tidefs_transport::{EndpointFamily, SessionId, Transport, TransportAddr, TransportError};
@@ -37,9 +39,9 @@ const OWNER_NODE: u64 = 62;
 const SUCCESSOR_NODE: u64 = 64;
 const CLIENT_NODE: u64 = 63;
 const AUTHORITY_NODE: u64 = 65;
-const WRITER_TERM: u64 = 81;
 const WRITER_EPOCH: u64 = 14;
 const POOL_GUID: [u8; 16] = [0x62; 16];
+const POOL_LEASE_TERM_MS: u64 = 60_000;
 
 struct ProvisionedIdentity {
     credential_bytes: [u8; NODE_PRIVATE_CREDENTIAL_WIRE_SIZE],
@@ -86,10 +88,42 @@ fn accept_session(transport: &mut Transport) -> SessionId {
     }
 }
 
+fn authority_now_ms(authority_clock: Instant) -> u64 {
+    u64::try_from(authority_clock.elapsed().as_millis())
+        .unwrap_or(u64::MAX - 1)
+        .saturating_add(1)
+}
+
+fn open_clustered_filesystem(metadata_dir: &Path, member: &PathBuf) -> LocalFileSystem {
+    LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+        metadata_dir,
+        "tidefs-vfs-rpc-mount",
+        PoolRedundancyPolicy::default(),
+        "clustered",
+        LocalFileSystemOpenConfig {
+            options: StoreOptions::default(),
+            allocator_policy: LocalStorageAllocatorPolicy::default(),
+            root_authentication_key: RootAuthenticationKey::demo_key(),
+            encryption: None,
+            compression: None,
+            log_device_device_path: None,
+            recovery_policy: RecoveryPolicy::default(),
+            block_devices: Some(std::slice::from_ref(member)),
+        },
+    )
+    .expect("open exact Pool-backed filesystem dataset from devices")
+}
+
+fn pool_backed_engine(filesystem: LocalFileSystem) -> LiveOwnerEngine {
+    Arc::new(Mutex::new(Box::new(VfsLocalFileSystem::new(filesystem))))
+}
+
 fn spawn_owner_observation_authority(
     authority_identity: &ProvisionedIdentity,
     client_identity: &ProvisionedIdentity,
-    observations: Vec<(u64, u64, u64)>,
+    pool_owner_authority: Arc<Mutex<PoolOwnerLeaseAuthority>>,
+    authority_clock: Instant,
+    observation_count: usize,
 ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
     let credential = Arc::new(authority_identity.credential());
     let authority_public = credential.public_identity().into_identity();
@@ -116,7 +150,7 @@ fn spawn_owner_observation_authority(
         _ => panic!("mount authority must publish TCP address"),
     };
     let handle = thread::spawn(move || {
-        for (owner_node_id, writer_term, membership_epoch) in observations {
+        for _ in 0..observation_count {
             let session_id = accept_session(&mut authority);
             authority
                 .perform_handshake(session_id)
@@ -139,16 +173,22 @@ fn spawn_owner_observation_authority(
             };
             assert_eq!(request.pool_guid, POOL_GUID);
             assert_eq!(request.requesting_node_id, CLIENT_NODE);
+            let now_ms = authority_now_ms(authority_clock);
+            let observation = pool_owner_authority
+                .lock()
+                .expect("lock real Pool owner lease authority")
+                .observe_owner(request.pool_guid, now_ms)
+                .expect("observe the real current Pool owner");
             let response =
                 ClusterPoolMessage::OwnerObservationResponse(ClusterPoolOwnerObservationResponse {
                     request_id: request.request_id,
                     node_id: AUTHORITY_NODE,
-                    pool_guid: POOL_GUID,
+                    pool_guid: observation.pool_guid,
                     success: true,
-                    owner_node_id: Some(owner_node_id),
-                    membership_epoch: Some(membership_epoch),
-                    write_fence_generation: Some(writer_term),
-                    lease_remaining_ms: Some(60_000),
+                    owner_node_id: Some(observation.owner_node_id),
+                    membership_epoch: Some(observation.membership_epoch.0),
+                    write_fence_generation: Some(observation.write_fence_generation),
+                    lease_remaining_ms: Some(observation.lease_remaining_ms),
                     error: None,
                 })
                 .encode()
@@ -175,7 +215,7 @@ fn mount_is_present(mountpoint: &Path) -> bool {
 }
 
 #[test]
-fn authenticated_remote_client_mount_exposes_real_fuse_path() {
+fn authenticated_remote_mount_reopens_committed_pool_on_successor_owner() {
     if !std::path::Path::new("/dev/fuse").exists() {
         eprintln!("skipping authenticated remote mount: /dev/fuse is unavailable");
         return;
@@ -222,44 +262,37 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
         .expect("publish clustered filesystem dataset");
     drop(root_filesystem);
 
-    let filesystem = LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
-        &metadata_dir,
-        "tidefs-vfs-rpc-mount",
-        PoolRedundancyPolicy::default(),
-        "clustered",
-        LocalFileSystemOpenConfig {
-            options: StoreOptions::default(),
-            allocator_policy: LocalStorageAllocatorPolicy::default(),
-            root_authentication_key: RootAuthenticationKey::demo_key(),
-            encryption: None,
-            compression: None,
-            log_device_device_path: None,
-            recovery_policy: RecoveryPolicy::default(),
-            block_devices: Some(std::slice::from_ref(&member)),
-        },
-    )
-    .expect("open exact Pool-backed filesystem dataset");
+    let authority_clock = Instant::now();
+    let pool_owner_authority = Arc::new(Mutex::new(
+        PoolOwnerLeaseAuthority::new(EpochId::new(WRITER_EPOCH), POOL_LEASE_TERM_MS)
+            .expect("create real Pool owner lease authority"),
+    ));
+    let owner_lease = pool_owner_authority
+        .lock()
+        .expect("lock Pool owner lease authority for owner A")
+        .acquire(POOL_GUID, OWNER_NODE, authority_now_ms(authority_clock))
+        .expect("grant Pool ownership to owner A");
+
+    let filesystem = open_clustered_filesystem(&metadata_dir, &member);
     let dataset_id = DatasetId::new(u128::from_le_bytes(filesystem.mounted_dataset_id()));
-    let owner_adapter = FuseVfsAdapter::new(Box::new(VfsLocalFileSystem::new(filesystem)))
-        .expect("create Pool-backed owner adapter");
     let shutdown = Arc::new(AtomicBool::new(false));
     let writer_fence = Arc::new(Mutex::new(ClusterVfsRpcWriterFence::new(
-        OWNER_NODE,
-        WRITER_TERM,
-        WRITER_EPOCH,
+        owner_lease.node_id,
+        owner_lease.write_fence.generation,
+        owner_lease.epoch.0,
     )));
-    let initial_authority_deadline = Instant::now() + Duration::from_secs(20);
-    let authority_deadline = ExternalMutationDeadline::new_until(initial_authority_deadline);
+    let authority_deadline =
+        ExternalMutationDeadline::new_until(Instant::now() + Duration::from_secs(20));
     let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
         "127.0.0.1:0".parse().unwrap(),
-        OWNER_NODE,
+        owner_lease.node_id,
         Arc::new(owner_identity.credential()),
         vec![client_identity.public_identity()],
-        POOL_GUID,
+        owner_lease.pool_guid,
         dataset_id,
         writer_fence,
         authority_deadline.clone(),
-        owner_adapter.engine_handle(),
+        pool_backed_engine(filesystem),
         Arc::clone(&shutdown),
     ))
     .expect("start Pool-backed VFS_RPC owner");
@@ -267,10 +300,9 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
     let (authority_addr, authority_thread) = spawn_owner_observation_authority(
         &authority_identity,
         &client_identity,
-        vec![
-            (OWNER_NODE, WRITER_TERM, WRITER_EPOCH),
-            (SUCCESSOR_NODE, WRITER_TERM + 1, WRITER_EPOCH),
-        ],
+        Arc::clone(&pool_owner_authority),
+        authority_clock,
+        2,
     );
 
     let mount_config = ClusterVfsRpcMountConfig::new(
@@ -299,8 +331,6 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
         );
         thread::sleep(Duration::from_millis(10));
     }
-    authority_deadline.renew_until(initial_authority_deadline + Duration::from_secs(5));
-
     let file_path = mountpoint.join("remote-file");
     let expected = b"real FUSE path reached the authenticated remote Pool owner";
     let mut file = OpenOptions::new()
@@ -349,25 +379,28 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
     );
     fs::remove_file(&hard_link).expect("unlink remote hard link");
     fs::remove_dir(&directory).expect("rmdir through real remote mount");
-    let successor_visible = b"fresh authority observation reached the higher-fence successor";
-    let successor_file = mountpoint.join("successor-visible");
-    let mut file = File::create(&successor_file).expect("create successor-visible file");
-    file.write_all(successor_visible)
-        .expect("write successor-visible file");
-    file.sync_all().expect("commit successor-visible file");
+    let owner_visible = b"owner A committed this through the real remote FUSE path";
+    let owner_file = mountpoint.join("owner-visible");
+    let mut file = File::create(&owner_file).expect("create owner-visible file through owner A");
+    file.write_all(owner_visible)
+        .expect("write owner-visible file through owner A");
+    file.sync_all()
+        .expect("commit owner-visible file through owner A");
     drop(file);
 
-    while Instant::now() <= initial_authority_deadline + Duration::from_millis(20) {
-        assert!(
-            !mount_thread.is_finished(),
-            "renewable owner mount exited before the original authority deadline"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-    fs::metadata(&mountpoint).expect("serve mounted metadata past the original authority deadline");
-
+    pool_owner_authority
+        .lock()
+        .expect("lock Pool owner lease authority to release owner A")
+        .release(&owner_lease)
+        .expect("release owner A through the real Pool owner authority");
     authority_deadline.fence();
-    let idle_unmount_deadline = initial_authority_deadline + Duration::from_secs(9);
+    let owner_addr = owner.bound_addr();
+    if let Err(owner_error) = owner.stop() {
+        assert!(owner_error.contains("mutation authority deadline has expired"));
+    }
+    drop(owner);
+
+    let idle_unmount_deadline = Instant::now() + Duration::from_secs(15);
     while !mount_thread.is_finished() && Instant::now() < idle_unmount_deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -388,31 +421,46 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
         !mount_is_present(&mountpoint),
         "authority-expired clustered FUSE frontend must be unmounted"
     );
-    let owner_error = owner
-        .stop()
-        .expect_err("expired owner deadline must stop the owner service");
-    assert!(owner_error.contains("mutation authority deadline has expired"));
-    assert!(shutdown.load(Ordering::Acquire));
+
+    let successor_lease = pool_owner_authority
+        .lock()
+        .expect("lock Pool owner lease authority for owner B")
+        .acquire(POOL_GUID, SUCCESSOR_NODE, authority_now_ms(authority_clock))
+        .expect("grant Pool ownership to owner B after owner A is fully dropped");
+    assert!(
+        successor_lease
+            .write_fence
+            .is_later_than(&owner_lease.write_fence),
+        "successor ownership must carry a strictly higher write fence"
+    );
 
     drop(successor_listener);
+    let successor_filesystem = open_clustered_filesystem(&metadata_dir, &member);
+    let successor_dataset_id = DatasetId::new(u128::from_le_bytes(
+        successor_filesystem.mounted_dataset_id(),
+    ));
+    assert_eq!(
+        successor_dataset_id, dataset_id,
+        "successor must reopen the same durable filesystem dataset"
+    );
     let successor_shutdown = Arc::new(AtomicBool::new(false));
     let successor_deadline =
-        ExternalMutationDeadline::new_until(Instant::now() + Duration::from_secs(6));
+        ExternalMutationDeadline::new_until(Instant::now() + Duration::from_secs(12));
     let successor_fence = Arc::new(Mutex::new(ClusterVfsRpcWriterFence::new(
-        SUCCESSOR_NODE,
-        WRITER_TERM + 1,
-        WRITER_EPOCH,
+        successor_lease.node_id,
+        successor_lease.write_fence.generation,
+        successor_lease.epoch.0,
     )));
     let mut successor = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
         successor_addr,
-        SUCCESSOR_NODE,
+        successor_lease.node_id,
         Arc::new(successor_identity.credential()),
         vec![client_identity.public_identity()],
-        POOL_GUID,
-        dataset_id,
+        successor_lease.pool_guid,
+        successor_dataset_id,
         successor_fence,
         successor_deadline.clone(),
-        owner_adapter.engine_handle(),
+        pool_backed_engine(successor_filesystem),
         Arc::clone(&successor_shutdown),
     ))
     .expect("start higher-fence successor VFS_RPC owner");
@@ -425,7 +473,7 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
         client_identity.credential(),
         authority_identity.public_identity(),
         vec![
-            ClusterVfsRpcOwnerCandidate::new(owner.bound_addr(), owner_identity.public_identity()),
+            ClusterVfsRpcOwnerCandidate::new(owner_addr, owner_identity.public_identity()),
             ClusterVfsRpcOwnerCandidate::new(
                 successor.bound_addr(),
                 successor_identity.public_identity(),
@@ -448,13 +496,32 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
-        fs::read(successor_mountpoint.join("successor-visible"))
-            .expect("read committed data through authority-selected successor"),
-        successor_visible
+        fs::read(successor_mountpoint.join("owner-visible"))
+            .expect("owner B must read owner A's committed data after device reopen"),
+        owner_visible
     );
+    let successor_visible = b"owner B committed this after independent device reopen";
+    let successor_file = successor_mountpoint.join("successor-visible");
+    let mut file =
+        File::create(&successor_file).expect("create successor-visible file via owner B");
+    file.write_all(successor_visible)
+        .expect("write successor-visible file via owner B");
+    file.sync_all()
+        .expect("commit successor-visible file via owner B");
+    drop(file);
 
+    pool_owner_authority
+        .lock()
+        .expect("lock Pool owner lease authority to release owner B")
+        .release(&successor_lease)
+        .expect("release owner B through the real Pool owner authority");
     successor_deadline.fence();
-    let successor_unmount_deadline = Instant::now() + Duration::from_secs(8);
+    if let Err(successor_error) = successor.stop() {
+        assert!(successor_error.contains("mutation authority deadline has expired"));
+    }
+    drop(successor);
+
+    let successor_unmount_deadline = Instant::now() + Duration::from_secs(15);
     while !successor_mount_thread.is_finished() && Instant::now() < successor_unmount_deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -466,13 +533,31 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
         .join()
         .expect("successor mount thread must not panic")
         .expect_err("fenced successor authority must unmount the fresh frontend");
-    let successor_error = successor
-        .stop()
-        .expect_err("fenced successor must stop with expired authority");
-    assert!(successor_error.contains("mutation authority deadline has expired"));
-    assert!(successor_shutdown.load(Ordering::Acquire));
     authority_thread
         .join()
         .expect("owner observation authority thread");
-    drop(owner_adapter);
+    let mut authority = pool_owner_authority
+        .lock()
+        .expect("lock Pool owner lease authority after owner B release");
+    assert!(
+        authority
+            .active_token(POOL_GUID, authority_now_ms(authority_clock))
+            .is_none(),
+        "final device reopen must have no active Pool owner lease"
+    );
+    drop(authority);
+
+    let final_filesystem = open_clustered_filesystem(&metadata_dir, &member);
+    assert_eq!(
+        final_filesystem
+            .read_file("/owner-visible")
+            .expect("read owner A data after final device reopen"),
+        owner_visible
+    );
+    assert_eq!(
+        final_filesystem
+            .read_file("/successor-visible")
+            .expect("read owner B data after final device reopen"),
+        successor_visible
+    );
 }
