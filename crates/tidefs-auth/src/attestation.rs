@@ -83,6 +83,8 @@ impl std::fmt::Display for SessionClass {
 pub struct HelloMessage {
     pub client_identity: NodeIdentity,
     pub client_nonce: [u8; 32],
+    /// Fresh X25519 public share for this handshake only.
+    pub client_ephemeral_public: [u8; 32],
     pub supported_protocol_versions: Vec<u16>,
     pub proposed_session_class: SessionClass,
     pub proposed_epoch: u64,
@@ -97,6 +99,7 @@ impl HelloMessage {
     pub fn new(
         client_identity: NodeIdentity,
         signing_key: &Keypair,
+        client_ephemeral_public: [u8; 32],
         supported_versions: Vec<u16>,
         session_class: SessionClass,
         epoch: u64,
@@ -108,6 +111,7 @@ impl HelloMessage {
         let mut msg = Self {
             client_identity,
             client_nonce: nonce,
+            client_ephemeral_public,
             supported_protocol_versions: supported_versions,
             proposed_session_class: session_class,
             proposed_epoch: epoch,
@@ -124,6 +128,11 @@ impl HelloMessage {
 
     /// Verify the client's signature on this message.
     pub fn verify(&self) -> Result<(), AttestationError> {
+        if self.client_ephemeral_public == [0; 32] {
+            return Err(AttestationError::ChallengeFailed {
+                reason: "HELLO carried an all-zero X25519 key share".to_string(),
+            });
+        }
         let verifying_key = self.client_identity.verifying_key().map_err(|e| {
             AttestationError::SignatureVerificationFailed {
                 node_id: self.client_identity.node_id,
@@ -156,6 +165,7 @@ impl HelloMessage {
         buf.extend_from_slice(&self.client_identity.attested_at_millis.to_le_bytes());
         buf.extend_from_slice(&self.client_identity.identity_version.to_le_bytes());
         buf.extend_from_slice(&self.client_nonce);
+        buf.extend_from_slice(&self.client_ephemeral_public);
         for v in &self.supported_protocol_versions {
             buf.extend_from_slice(&v.to_le_bytes());
         }
@@ -183,7 +193,11 @@ pub struct HelloResponse {
     pub server_identity: NodeIdentity,
     pub server_nonce: [u8; 32],
     pub client_nonce_echo: [u8; 32],
-    /// Server signs (client_nonce || server_nonce) as a challenge
+    /// Echo of the initiator X25519 share, binding both directions to one transcript.
+    pub client_ephemeral_public_echo: [u8; 32],
+    /// Fresh responder X25519 public share for this handshake only.
+    pub server_ephemeral_public: [u8; 32],
+    /// Server signs both nonces and both ephemeral shares as a challenge.
     pub signed_challenge: Vec<u8>,
     pub accepted_protocol_version: u16,
     pub accepted_session_class: SessionClass,
@@ -201,6 +215,8 @@ impl HelloResponse {
         server_identity: NodeIdentity,
         signing_key: &Keypair,
         client_nonce: [u8; 32],
+        client_ephemeral_public: [u8; 32],
+        server_ephemeral_public: [u8; 32],
         accepted_version: u16,
         accepted_session_class: SessionClass,
         session_id: u64,
@@ -210,10 +226,12 @@ impl HelloResponse {
         let mut server_nonce = [0u8; 32];
         rng.fill(&mut server_nonce);
 
-        // Challenge: server signs (client_nonce || server_nonce)
+        // Challenge: server signs both nonces and both ephemeral shares.
         let mut challenge = Vec::new();
         challenge.extend_from_slice(&client_nonce);
         challenge.extend_from_slice(&server_nonce);
+        challenge.extend_from_slice(&client_ephemeral_public);
+        challenge.extend_from_slice(&server_ephemeral_public);
         let signed_challenge = signing_key.sign(&challenge).to_bytes().to_vec();
 
         let session_token = SessionToken::generate(session_id, 3_600_000); // 1 hour default
@@ -222,6 +240,8 @@ impl HelloResponse {
             server_identity,
             server_nonce,
             client_nonce_echo: client_nonce,
+            client_ephemeral_public_echo: client_ephemeral_public,
+            server_ephemeral_public,
             signed_challenge,
             accepted_protocol_version: accepted_version,
             accepted_session_class,
@@ -239,6 +259,13 @@ impl HelloResponse {
 
     /// Verify the server's signature on this response.
     pub fn verify(&self) -> Result<(), AttestationError> {
+        if self.server_ephemeral_public == [0; 32]
+            || self.client_ephemeral_public_echo == self.server_ephemeral_public
+        {
+            return Err(AttestationError::ChallengeFailed {
+                reason: "HELLO response carried an invalid X25519 key share".to_string(),
+            });
+        }
         let verifying_key = self.server_identity.verifying_key().map_err(|e| {
             AttestationError::SignatureVerificationFailed {
                 node_id: self.server_identity.node_id,
@@ -272,8 +299,16 @@ impl HelloResponse {
         buf.extend_from_slice(&self.server_identity.identity_version.to_le_bytes());
         buf.extend_from_slice(&self.server_nonce);
         buf.extend_from_slice(&self.client_nonce_echo);
+        buf.extend_from_slice(&self.client_ephemeral_public_echo);
+        buf.extend_from_slice(&self.server_ephemeral_public);
+        buf.extend_from_slice(&(self.signed_challenge.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&self.signed_challenge);
         buf.extend_from_slice(&self.accepted_protocol_version.to_le_bytes());
         buf.extend_from_slice(self.accepted_session_class.to_string().as_bytes());
+        buf.extend_from_slice(&self.session_token.session_id.to_le_bytes());
+        buf.extend_from_slice(&self.session_token.token_bytes);
+        buf.extend_from_slice(&self.session_token.issued_at_millis.to_le_bytes());
+        buf.extend_from_slice(&self.session_token.expires_at_millis.to_le_bytes());
         buf.extend_from_slice(&self.server_epoch.to_le_bytes());
         buf
     }
@@ -305,7 +340,7 @@ pub struct AttestationResult {
 /// 2. Verify server self-signature on identity
 /// 3. Verify client signature on HelloMessage
 /// 4. Verify server signature on HelloResponse
-/// 5. Verify server's signed challenge (client_nonce || server_nonce)
+/// 5. Verify the server's signed challenge over both nonces and key shares
 /// 6. Verify client nonce echo
 /// 7. Verify both identities are known to the key store
 pub fn verify_mutual_attestation(
@@ -315,6 +350,15 @@ pub fn verify_mutual_attestation(
     server_msg: &HelloResponse,
     known_keys: &NodeKeyStore,
 ) -> Result<AttestationResult, AttestationError> {
+    if client_msg.client_ephemeral_public == [0; 32]
+        || server_msg.server_ephemeral_public == [0; 32]
+        || client_msg.client_ephemeral_public == server_msg.server_ephemeral_public
+    {
+        return Err(AttestationError::ChallengeFailed {
+            reason: "invalid or reflected ephemeral X25519 key share".to_string(),
+        });
+    }
+
     // 1. Verify client self-signature
     client_msg
         .client_identity
@@ -339,7 +383,7 @@ pub fn verify_mutual_attestation(
     // 4. Verify server HelloResponse signature
     server_msg.verify()?;
 
-    // 5. Verify server's signed challenge: server signed (client_nonce || server_nonce)
+    // 5. Verify the signed challenge over both nonces and both key shares.
     let server_vk = server_msg.server_identity.verifying_key().map_err(|e| {
         AttestationError::SignatureVerificationFailed {
             node_id: server_msg.server_identity.node_id,
@@ -350,6 +394,8 @@ pub fn verify_mutual_attestation(
     let mut challenge = Vec::new();
     challenge.extend_from_slice(client_nonce);
     challenge.extend_from_slice(server_nonce);
+    challenge.extend_from_slice(&client_msg.client_ephemeral_public);
+    challenge.extend_from_slice(&server_msg.server_ephemeral_public);
 
     let challenge_sig = Signature::from_bytes(&server_msg.signed_challenge).map_err(|e| {
         AttestationError::ChallengeFailed {
@@ -367,18 +413,30 @@ pub fn verify_mutual_attestation(
     if server_msg.client_nonce_echo != *client_nonce {
         return Err(AttestationError::NonceMismatch);
     }
-
-    // 7. Verify identities against known keys
-    if !known_keys.contains(client_msg.client_identity.node_id) {
-        return Err(AttestationError::IdentityNotInEpoch {
-            node_id: client_msg.client_identity.node_id,
+    if server_msg.client_ephemeral_public_echo != client_msg.client_ephemeral_public {
+        return Err(AttestationError::ChallengeFailed {
+            reason: "server response echoed a different initiator key share".to_string(),
         });
     }
 
-    if !known_keys.contains(server_msg.server_identity.node_id) {
-        return Err(AttestationError::IdentityNotInEpoch {
-            node_id: server_msg.server_identity.node_id,
-        });
+    // 7. Verify the complete identities against the trusted epoch entries.
+    // A matching numeric node ID alone must not authorize a different key.
+    for identity in [&client_msg.client_identity, &server_msg.server_identity] {
+        match known_keys.identities.get(&identity.node_id) {
+            None => {
+                return Err(AttestationError::IdentityNotInEpoch {
+                    node_id: identity.node_id,
+                });
+            }
+            Some(trusted) if trusted != identity => {
+                return Err(AttestationError::SignatureVerificationFailed {
+                    node_id: identity.node_id,
+                    reason: "presented identity does not match the trusted epoch identity"
+                        .to_string(),
+                });
+            }
+            Some(_) => {}
+        }
     }
 
     if client_msg.proposed_epoch != server_msg.server_epoch {

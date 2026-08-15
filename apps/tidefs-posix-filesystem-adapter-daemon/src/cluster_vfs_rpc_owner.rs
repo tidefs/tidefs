@@ -78,7 +78,6 @@ pub struct ClusterVfsRpcOwnerConfig {
     writer_fence: Arc<Mutex<ClusterVfsRpcWriterFence>>,
     engine: LiveOwnerEngine,
     shutdown: Arc<AtomicBool>,
-    authenticated_session_key: Option<[u8; 32]>,
 }
 
 impl ClusterVfsRpcOwnerConfig {
@@ -100,16 +99,7 @@ impl ClusterVfsRpcOwnerConfig {
             writer_fence,
             engine,
             shutdown,
-            authenticated_session_key: None,
         }
-    }
-
-    /// Consume one session key supplied by the authenticated cluster session
-    /// authority. This service never generates, distributes, or reuses it.
-    #[must_use]
-    pub fn with_authenticated_session_key(mut self, key: [u8; 32]) -> Self {
-        self.authenticated_session_key = Some(key);
-        self
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -129,12 +119,6 @@ impl ClusterVfsRpcOwnerConfig {
         if fence.writer_node != self.local_owner_node || fence.term == 0 || fence.epoch == 0 {
             return Err(
                 "cluster VFS_RPC writer fence must name the local owner with nonzero term and epoch"
-                    .to_string(),
-            );
-        }
-        if self.authenticated_session_key.is_none() {
-            return Err(
-                "cluster VFS_RPC owner requires externally supplied authenticated session key material"
                     .to_string(),
             );
         }
@@ -249,7 +233,7 @@ impl Drop for ClusterVfsRpcOwnerHandle {
 
 fn run_owner(
     mut transport: Transport,
-    mut config: ClusterVfsRpcOwnerConfig,
+    config: ClusterVfsRpcOwnerConfig,
     stop: &AtomicBool,
 ) -> Result<(), String> {
     let initial_fence = *config
@@ -289,25 +273,6 @@ fn run_owner(
             continue;
         }
 
-        let Some(mut session_key) = config.authenticated_session_key.take() else {
-            let _ = transport.close_session(session_id, SessionCloseReason::AuthFailed);
-            eprintln!(
-                "cluster VFS_RPC: refused session {session_id}; fresh authenticated session key material is required"
-            );
-            continue;
-        };
-        let Some(session) = transport.sessions.get(&session_id) else {
-            session_key.fill(0);
-            return Err(format!(
-                "cluster VFS_RPC session {session_id} disappeared after authentication"
-            ));
-        };
-        let install_result = session
-            .lock()
-            .map_err(|_| format!("cluster VFS_RPC session {session_id} lock is poisoned"))
-            .map(|mut session| session.init_ciphers_from_key(&session_key, false));
-        session_key.fill(0);
-        install_result?;
         if !transport.session_has_authenticated_confidentiality(session_id) {
             let _ = transport.close_session(session_id, SessionCloseReason::AuthFailed);
             return Err(format!(

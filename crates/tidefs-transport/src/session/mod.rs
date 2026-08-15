@@ -420,7 +420,7 @@ impl Session {
     /// Initialize session encryption ciphers from a raw 32-byte session key.
     ///
     /// Convenience wrapper around [`init_ciphers`] for callers that already
-    /// have the session key bytes (e.g., the HMAC key from
+    /// have the session key bytes (e.g., the encryption key from
     /// [`tidefs_auth::HelloHandshakeResult`]).  The key MUST come from a
     /// real authenticated key agreement.  Do NOT pass the public
     /// [`NegotiationComplete`] token: it is derived from public transcript
@@ -429,13 +429,13 @@ impl Session {
     /// Production callers should prefer [`apply_auth_handshake`], which
     /// derives ciphers from the authenticated handshake result directly.
     pub fn init_ciphers_from_key(&mut self, session_key: &[u8; 32], as_initiator: bool) {
-        struct RawKeyMaterial([u8; 32]);
-        impl SessionKeyMaterial for RawKeyMaterial {
+        struct BorrowedKeyMaterial<'a>(&'a [u8; 32]);
+        impl SessionKeyMaterial for BorrowedKeyMaterial<'_> {
             fn shared_secret(&self) -> &[u8; 32] {
-                &self.0
+                self.0
             }
         }
-        self.init_ciphers(&RawKeyMaterial(*session_key), as_initiator)
+        self.init_ciphers(&BorrowedKeyMaterial(session_key), as_initiator)
     }
 
     /// Whether session encryption ciphers have been initialized.
@@ -455,35 +455,49 @@ impl Session {
     ///
     /// This wires the tidefs-auth [`HelloHandshakeResult`] into the session,
     /// storing peer identity, initializing encryption ciphers from the
-    /// HMAC session key, and binding the membership epoch.
+    /// negotiated encryption key, and binding the membership epoch.
     ///
-    /// Called after both sides have completed Steps 1-4 of the HELLO
-    /// handshake (identity verification and VERIFY exchange).
+    /// Called after both sides have verified the signed HELLO transcript and
+    /// completed its ephemeral key agreement.
     pub fn apply_auth_handshake(
         &mut self,
         result: &tidefs_auth::HelloHandshakeResult,
         as_initiator: bool,
-    ) {
-        // Store peer identity for authorization and audit.
-        self.peer_info = Some(PeerSessionInfo {
-            node_id: result.peer_identity.node_id,
-            identity: result.peer_identity.clone(),
-            supported_families: vec![crate::types::FamilyVersion::new(
-                result.accepted_protocol,
-                result.accepted_protocol,
-                0,
-            )],
-            cohort_membership: crate::types::CohortMembership::default(),
-            hlc_offset: 0,
-            endpoint_family: self.endpoint_family,
-            peer_epoch: result.session_token.session_id,
-        });
+    ) -> Result<(), String> {
+        let encryption_key = result.session_keys.encryption_key.as_ref().ok_or_else(|| {
+            "authenticated handshake did not derive an encryption key".to_string()
+        })?;
 
-        // Derive ciphers from the HMAC session key
-        self.init_ciphers_from_key(&result.session_keys.hmac_key, as_initiator);
+        self.bind_epoch(result.epoch)
+            .map_err(|error| error.to_string())?;
 
-        // Bind epoch from the session token's session_id (epoch tracking)
-        let _ = self.bind_epoch(result.session_token.session_id);
+        // Preserve the transport-negotiated peer metadata while replacing its
+        // unauthenticated identity and epoch with the verified values.
+        if let Some(ref mut peer_info) = self.peer_info {
+            peer_info.node_id = result.peer_identity.node_id;
+            peer_info.identity = result.peer_identity.clone();
+            peer_info.peer_epoch = result.epoch;
+        } else {
+            self.peer_info = Some(PeerSessionInfo {
+                node_id: result.peer_identity.node_id,
+                identity: result.peer_identity.clone(),
+                supported_families: vec![crate::types::FamilyVersion::new(
+                    result.accepted_protocol,
+                    result.accepted_protocol,
+                    0,
+                )],
+                cohort_membership: crate::types::CohortMembership::default(),
+                hlc_offset: 0,
+                endpoint_family: self.endpoint_family,
+                peer_epoch: result.epoch,
+            });
+        }
+
+        self.init_ciphers_from_key(encryption_key, as_initiator);
+        if !self.has_authenticated_confidentiality() {
+            return Err("authenticated handshake did not install session ciphers".to_string());
+        }
+        Ok(())
     }
 
     /// Establish a session from a completed parameter negotiation.

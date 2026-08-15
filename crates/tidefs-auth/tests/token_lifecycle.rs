@@ -6,6 +6,9 @@
 
 use tidefs_auth::*;
 
+const CLIENT_SHARE: [u8; 32] = [0x11; 32];
+const SERVER_SHARE: [u8; 32] = [0x22; 32];
+
 // ---------------------------------------------------------------------------
 // SessionToken: generation, expiry, field correctness
 // ---------------------------------------------------------------------------
@@ -268,8 +271,15 @@ fn hello_message_security_tlvs_attached() {
         HelloTlv::auth_mode(SecurityMode::PskHmac),
         HelloTlv::new(0x9999, vec![1, 2, 3]),
     ];
-    let msg = HelloMessage::new(client_id, &client_key, vec![1], SessionClass::FullMesh, 42)
-        .with_security_tlvs(tlvs);
+    let msg = HelloMessage::new(
+        client_id,
+        &client_key,
+        CLIENT_SHARE,
+        vec![1],
+        SessionClass::FullMesh,
+        42,
+    )
+    .with_security_tlvs(tlvs);
     assert_eq!(msg.security_tlvs.len(), 2);
     assert_eq!(msg.security_tlvs[0].tag, 0x0100); // TLV_AUTH_MODE
 }
@@ -280,6 +290,7 @@ fn hello_message_signature_covers_fields() {
     let msg1 = HelloMessage::new(
         client_id.clone(),
         &client_key,
+        CLIENT_SHARE,
         vec![1],
         SessionClass::FullMesh,
         42,
@@ -287,6 +298,7 @@ fn hello_message_signature_covers_fields() {
     let msg2 = HelloMessage::new(
         client_id,
         &client_key,
+        CLIENT_SHARE,
         vec![2], // different version → different signature
         SessionClass::FullMesh,
         42,
@@ -300,11 +312,19 @@ fn hello_message_different_epoch_different_signature() {
     let msg1 = HelloMessage::new(
         client_id.clone(),
         &client_key,
+        CLIENT_SHARE,
         vec![1],
         SessionClass::FullMesh,
         1,
     );
-    let msg2 = HelloMessage::new(client_id, &client_key, vec![1], SessionClass::FullMesh, 2);
+    let msg2 = HelloMessage::new(
+        client_id,
+        &client_key,
+        CLIENT_SHARE,
+        vec![1],
+        SessionClass::FullMesh,
+        2,
+    );
     assert_ne!(msg1.signature, msg2.signature);
 }
 
@@ -320,6 +340,8 @@ fn hello_response_nonce_echo_matches() {
         server_id,
         &server_key,
         client_nonce,
+        CLIENT_SHARE,
+        SERVER_SHARE,
         1,
         SessionClass::FullMesh,
         100,
@@ -336,6 +358,8 @@ fn hello_response_security_tlvs_attached() {
         server_id,
         &server_key,
         [0u8; 32],
+        CLIENT_SHARE,
+        SERVER_SHARE,
         1,
         SessionClass::Dedicated,
         100,
@@ -353,6 +377,8 @@ fn hello_response_different_nonce_different_signature() {
         server_id.clone(),
         &server_key,
         [0x01u8; 32],
+        CLIENT_SHARE,
+        SERVER_SHARE,
         1,
         SessionClass::FullMesh,
         100,
@@ -362,6 +388,8 @@ fn hello_response_different_nonce_different_signature() {
         server_id,
         &server_key,
         [0x02u8; 32],
+        CLIENT_SHARE,
+        SERVER_SHARE,
         1,
         SessionClass::FullMesh,
         100,

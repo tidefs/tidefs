@@ -29,7 +29,11 @@ use std::time::Duration;
 
 use blake3::Hasher;
 use ed25519_dalek::{Keypair, PublicKey, SecretKey, Signature, Signer, Verifier};
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use x25519_dalek::{
+    EphemeralSecret, PublicKey as X25519PublicKey, SharedSecret as X25519SharedSecret,
+};
 use zeroize::Zeroize;
 
 use crate::attestation::{HelloMessage, HelloResponse, SessionToken};
@@ -40,7 +44,7 @@ use crate::identity::NodeIdentity;
 // Handshake state enumeration
 // ---------------------------------------------------------------------------
 
-/// The 7 states of the mutual attestation handshake.
+/// States of the 7-step mutual attestation handshake.
 #[derive(Clone, PartialEq, Eq)]
 pub enum HandshakeState {
     /// Initial state before any messages are sent.
@@ -51,13 +55,6 @@ pub enum HandshakeState {
     AckReceived {
         hello: HelloMessage,
         response: HelloResponse,
-    },
-    /// Step 4 complete: VERIFY sent + accepted, session established.
-    Verified {
-        initiator_identity: NodeIdentity,
-        responder_identity: NodeIdentity,
-        session_token: SessionToken,
-        session_id: u64,
     },
     /// Steps 5-7 complete: keys derived, versions exchanged, transport ready.
     Established {
@@ -89,7 +86,6 @@ impl HandshakeState {
             Self::Init => "init",
             Self::HelloSent { .. } => "hello_sent",
             Self::AckReceived { .. } => "ack_received",
-            Self::Verified { .. } => "verified",
             Self::Established { .. } => "established",
             Self::Failed { .. } => "failed",
         }
@@ -107,11 +103,91 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 // Session keys derived after successful attestation (Step 5)
 // ---------------------------------------------------------------------------
 
-/// Session keys derived from the handshake nonces.
-///
-/// Produced via BLAKE3-based key derivation from the concatenated
-/// nonces and the session_id. The HMAC key is always derived; the
-/// ChaCha20-Poly1305 encryption key is optional.
+/// One-use X25519 key agreement for an authenticated HELLO transcript.
+pub struct EphemeralKeyAgreement {
+    secret: EphemeralSecret,
+    public: [u8; 32],
+}
+
+impl EphemeralKeyAgreement {
+    /// Generate a fresh one-use key share from the operating system RNG.
+    #[must_use]
+    pub fn generate() -> Self {
+        let secret = EphemeralSecret::new(OsRng);
+        let public = X25519PublicKey::from(&secret).to_bytes();
+        Self { secret, public }
+    }
+
+    /// Public share that must be covered by the node identity signature.
+    #[must_use]
+    pub const fn public_key(&self) -> [u8; 32] {
+        self.public
+    }
+
+    /// Consume this one-use secret and complete X25519 with the signed peer share.
+    pub fn complete(
+        self,
+        peer_public: [u8; 32],
+    ) -> Result<AuthenticatedSharedSecret, AttestationError> {
+        if peer_public == [0; 32] || peer_public == self.public {
+            return Err(AttestationError::ChallengeFailed {
+                reason: "invalid or reflected ephemeral X25519 key share".to_string(),
+            });
+        }
+        let shared = self
+            .secret
+            .diffie_hellman(&X25519PublicKey::from(peer_public));
+        if shared.as_bytes().iter().all(|byte| *byte == 0) {
+            return Err(AttestationError::ChallengeFailed {
+                reason: "X25519 peer share produced a non-contributory secret".to_string(),
+            });
+        }
+        Ok(AuthenticatedSharedSecret(shared))
+    }
+}
+
+impl std::fmt::Debug for EphemeralKeyAgreement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EphemeralKeyAgreement")
+            .field("secret", &"[REDACTED]")
+            .field("public", &self.public)
+            .finish()
+    }
+}
+
+/// X25519 shared secret that zeroizes itself when dropped.
+pub struct AuthenticatedSharedSecret(X25519SharedSecret);
+
+impl AuthenticatedSharedSecret {
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+}
+
+impl std::fmt::Debug for AuthenticatedSharedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthenticatedSharedSecret([REDACTED])")
+    }
+}
+
+/// Public transcript fields bound into session-key derivation.
+pub struct SessionKeyContext<'a> {
+    pub initiator_nonce: [u8; 32],
+    pub responder_nonce: [u8; 32],
+    pub initiator_ephemeral_public: [u8; 32],
+    pub responder_ephemeral_public: [u8; 32],
+    pub initiator_identity: &'a NodeIdentity,
+    pub responder_identity: &'a NodeIdentity,
+    pub session_id: u64,
+    pub initiator_endpoint_family: u32,
+    pub responder_endpoint_family: u32,
+    pub epoch: u64,
+    pub accepted_protocol: u16,
+    pub accepted_features: u64,
+}
+
+/// Session keys derived from authenticated X25519 and the signed transcript.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SessionKeys {
     /// HMAC-SHA256 key for per-message authentication (32 bytes).
@@ -210,47 +286,77 @@ impl VerifyMessage {
 // Key derivation (Step 5)
 // ---------------------------------------------------------------------------
 
-const SESSION_KEY_DOMAIN_HMAC: &str = "tidefs-auth-session-hmac-key-v1";
-const SESSION_KEY_DOMAIN_ENC: &str = "tidefs-auth-session-encryption-key-v1";
+const SESSION_KEY_DOMAIN_HMAC: &[u8] = b"tidefs-auth-session-hmac-key-v2";
+const SESSION_KEY_DOMAIN_ENC: &[u8] = b"tidefs-auth-session-encryption-key-v2";
+const SESSION_KEY_TRANSCRIPT_DOMAIN: &[u8] = b"tidefs-auth-key-agreement-transcript-v2";
 
-/// Derive session keys from the handshake nonces and session_id.
-///
-/// Uses BLAKE3 keyed derivation:
-///   hmac_key = derive_key("tidefs-auth-session-hmac-key-v1",
-///                         nonce_i || nonce_r || session_id)
-///   enc_key  = derive_key("tidefs-auth-session-encryption-key-v1",
-///                         nonce_i || nonce_r || session_id)
+/// Derive session keys from authenticated X25519 and the complete public transcript.
 pub fn derive_session_keys(
-    initiator_nonce: &[u8; 32],
-    responder_nonce: &[u8; 32],
-    session_id: u64,
+    shared_secret: &AuthenticatedSharedSecret,
+    context: &SessionKeyContext<'_>,
     derive_encryption: bool,
-) -> SessionKeys {
-    let mut key_material = Vec::with_capacity(72);
-    key_material.extend_from_slice(initiator_nonce);
-    key_material.extend_from_slice(responder_nonce);
-    key_material.extend_from_slice(&session_id.to_le_bytes());
+) -> Result<SessionKeys, AttestationError> {
+    if context.session_id == 0
+        || context.initiator_ephemeral_public == [0; 32]
+        || context.responder_ephemeral_public == [0; 32]
+        || context.initiator_ephemeral_public == context.responder_ephemeral_public
+        || context.initiator_identity.node_id == 0
+        || context.responder_identity.node_id == 0
+    {
+        return Err(AttestationError::ChallengeFailed {
+            reason: "session key context contains an invalid identity or key share".to_string(),
+        });
+    }
 
-    // HMAC key
-    let mut hmac_kdf = Hasher::new_derive_key(SESSION_KEY_DOMAIN_HMAC);
-    hmac_kdf.update(&key_material);
-    let hmac_key: [u8; 32] = hmac_kdf.finalize().into();
+    let mut transcript = Vec::with_capacity(320);
+    transcript.extend_from_slice(SESSION_KEY_TRANSCRIPT_DOMAIN);
+    transcript.extend_from_slice(&context.initiator_nonce);
+    transcript.extend_from_slice(&context.responder_nonce);
+    transcript.extend_from_slice(&context.initiator_ephemeral_public);
+    transcript.extend_from_slice(&context.responder_ephemeral_public);
+    append_identity_context(&mut transcript, context.initiator_identity);
+    append_identity_context(&mut transcript, context.responder_identity);
+    transcript.extend_from_slice(&context.session_id.to_le_bytes());
+    transcript.extend_from_slice(&context.initiator_endpoint_family.to_le_bytes());
+    transcript.extend_from_slice(&context.responder_endpoint_family.to_le_bytes());
+    transcript.extend_from_slice(&context.epoch.to_le_bytes());
+    transcript.extend_from_slice(&context.accepted_protocol.to_le_bytes());
+    transcript.extend_from_slice(&context.accepted_features.to_le_bytes());
 
-    // Optional encryption key
+    let hmac_key = derive_transcript_key(
+        shared_secret.as_bytes(),
+        SESSION_KEY_DOMAIN_HMAC,
+        &transcript,
+    );
     let encryption_key = if derive_encryption {
-        let mut enc_kdf = Hasher::new_derive_key(SESSION_KEY_DOMAIN_ENC);
-        enc_kdf.update(&key_material);
-        let ek: [u8; 32] = enc_kdf.finalize().into();
-        Some(ek)
+        Some(derive_transcript_key(
+            shared_secret.as_bytes(),
+            SESSION_KEY_DOMAIN_ENC,
+            &transcript,
+        ))
     } else {
         None
     };
 
-    SessionKeys {
+    Ok(SessionKeys {
         hmac_key,
         encryption_key,
-        session_id,
-    }
+        session_id: context.session_id,
+    })
+}
+
+fn derive_transcript_key(shared_secret: &[u8; 32], purpose: &[u8], transcript: &[u8]) -> [u8; 32] {
+    let mut kdf = Hasher::new_keyed(shared_secret);
+    kdf.update(purpose);
+    kdf.update(transcript);
+    kdf.finalize().into()
+}
+
+fn append_identity_context(out: &mut Vec<u8>, identity: &NodeIdentity) {
+    out.extend_from_slice(&identity.node_id.to_le_bytes());
+    out.extend_from_slice(&identity.verifying_key_bytes);
+    out.extend_from_slice(&identity.attested_at_millis.to_le_bytes());
+    out.extend_from_slice(&identity.identity_version.to_le_bytes());
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +371,7 @@ pub struct HelloHandshakeResult {
     pub peer_identity: NodeIdentity,
     pub accepted_protocol: u16,
     pub accepted_features: u64,
+    pub epoch: u64,
 }
 impl std::fmt::Debug for HelloHandshakeResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -274,6 +381,7 @@ impl std::fmt::Debug for HelloHandshakeResult {
             .field("peer_identity", &self.peer_identity)
             .field("accepted_protocol", &self.accepted_protocol)
             .field("accepted_features", &self.accepted_features)
+            .field("epoch", &self.epoch)
             .finish()
     }
 }
@@ -289,6 +397,7 @@ pub struct HelloHandshake {
     initiator_nonce: Option<[u8; 32]>,
     responder_nonce: Option<[u8; 32]>,
     session_id: Option<u64>,
+    initiator_key_agreement: Option<EphemeralKeyAgreement>,
 }
 
 impl Drop for HelloHandshake {
@@ -312,6 +421,7 @@ impl HelloHandshake {
             initiator_nonce: None,
             responder_nonce: None,
             session_id: None,
+            initiator_key_agreement: None,
         }
     }
 
@@ -331,9 +441,11 @@ impl HelloHandshake {
             }
         })?;
 
+        let key_agreement = EphemeralKeyAgreement::generate();
         let hello = HelloMessage::new(
             identity.clone(),
             signing_key,
+            key_agreement.public_key(),
             supported_versions,
             session_class,
             epoch,
@@ -342,6 +454,7 @@ impl HelloHandshake {
         self.initiator_identity = Some(identity);
         self.initiator_secret_bytes = Some(signing_key.secret.to_bytes());
         self.initiator_nonce = Some(hello.client_nonce);
+        self.initiator_key_agreement = Some(key_agreement);
 
         self.state = HandshakeState::HelloSent {
             hello: hello.clone(),
@@ -380,6 +493,12 @@ impl HelloHandshake {
 
         if response.client_nonce_echo != initiator_nonce {
             return Err(AttestationError::NonceMismatch);
+        }
+
+        if response.client_ephemeral_public_echo != hello.client_ephemeral_public {
+            return Err(AttestationError::ChallengeFailed {
+                reason: "HELLO response echoed a different initiator key share".to_string(),
+            });
         }
 
         if hello.proposed_epoch != response.server_epoch {
@@ -433,51 +552,34 @@ impl HelloHandshake {
         &mut self,
         accepted_protocol: u16,
         accepted_features: u64,
+        initiator_endpoint_family: u32,
+        responder_endpoint_family: u32,
         derive_encryption: bool,
     ) -> Result<HelloHandshakeResult, AttestationError> {
-        let (initiator_identity, responder_identity, session_token, session_id) = match &self.state
-        {
-            HandshakeState::AckReceived { hello: _, response } => {
+        let (hello, response, initiator_identity) = match &self.state {
+            HandshakeState::AckReceived { hello, response } => {
                 let initiator_identity = self.initiator_identity.clone().ok_or({
                     AttestationError::ChallengeFailed {
                         reason: "initiator identity not set".into(),
                     }
                 })?;
-                (
-                    initiator_identity,
-                    response.server_identity.clone(),
-                    response.session_token.clone(),
-                    response.session_token.session_id,
-                )
+                (hello.clone(), response.clone(), initiator_identity)
             }
-            HandshakeState::Verified {
-                initiator_identity,
-                responder_identity,
-                session_token,
-                session_id,
-            } => (
-                initiator_identity.clone(),
-                responder_identity.clone(),
-                session_token.clone(),
-                *session_id,
-            ),
             other => {
                 return Err(AttestationError::ChallengeFailed {
-                    reason: format!(
-                        "expected state AckReceived or Verified, got {}",
-                        other.as_str()
-                    ),
+                    reason: format!("expected state AckReceived, got {}", other.as_str()),
                 });
             }
         };
 
         self.finalize_establish(
+            hello,
+            response,
             initiator_identity,
-            responder_identity,
-            session_token,
-            session_id,
             accepted_protocol,
             accepted_features,
+            initiator_endpoint_family,
+            responder_endpoint_family,
             derive_encryption,
         )
     }
@@ -485,12 +587,13 @@ impl HelloHandshake {
     #[allow(clippy::too_many_arguments)]
     fn finalize_establish(
         &mut self,
+        hello: HelloMessage,
+        response: HelloResponse,
         initiator_identity: NodeIdentity,
-        responder_identity: NodeIdentity,
-        session_token: SessionToken,
-        session_id: u64,
         accepted_protocol: u16,
         accepted_features: u64,
+        initiator_endpoint_family: u32,
+        responder_endpoint_family: u32,
         derive_encryption: bool,
     ) -> Result<HelloHandshakeResult, AttestationError> {
         let initiator_nonce = self.initiator_nonce.ok_or({
@@ -504,12 +607,40 @@ impl HelloHandshake {
             }
         })?;
 
+        if response.accepted_protocol_version != accepted_protocol {
+            return Err(AttestationError::ChallengeFailed {
+                reason: "accepted protocol does not match the signed HELLO response".to_string(),
+            });
+        }
+
+        let key_agreement = self.initiator_key_agreement.take().ok_or({
+            AttestationError::ChallengeFailed {
+                reason: "initiator key agreement not set".into(),
+            }
+        })?;
+        let shared_secret = key_agreement.complete(response.server_ephemeral_public)?;
+        let responder_identity = response.server_identity.clone();
+        let session_token = response.session_token.clone();
+        let session_id = session_token.session_id;
+        let epoch = response.server_epoch;
         let session_keys = derive_session_keys(
-            &initiator_nonce,
-            &responder_nonce,
-            session_id,
+            &shared_secret,
+            &SessionKeyContext {
+                initiator_nonce,
+                responder_nonce,
+                initiator_ephemeral_public: hello.client_ephemeral_public,
+                responder_ephemeral_public: response.server_ephemeral_public,
+                initiator_identity: &initiator_identity,
+                responder_identity: &responder_identity,
+                session_id,
+                initiator_endpoint_family,
+                responder_endpoint_family,
+                epoch,
+                accepted_protocol,
+                accepted_features,
+            },
             derive_encryption,
-        );
+        )?;
 
         self.state = HandshakeState::Established {
             initiator_identity: initiator_identity.clone(),
@@ -526,6 +657,7 @@ impl HelloHandshake {
             peer_identity: responder_identity,
             accepted_protocol,
             accepted_features,
+            epoch,
         })
     }
 
@@ -561,6 +693,7 @@ impl HelloHandshake {
         responder_key: &Keypair,
         accepted_version: u16,
         accepted_session_class: crate::attestation::SessionClass,
+        responder_ephemeral_public: [u8; 32],
         session_id: u64,
         epoch: u64,
     ) -> Result<HelloResponse, AttestationError> {
@@ -580,10 +713,20 @@ impl HelloHandshake {
             });
         }
 
+        if responder_ephemeral_public == [0; 32]
+            || responder_ephemeral_public == hello.client_ephemeral_public
+        {
+            return Err(AttestationError::ChallengeFailed {
+                reason: "invalid or reflected responder X25519 key share".to_string(),
+            });
+        }
+
         let response = HelloResponse::new(
             responder_identity,
             responder_key,
             hello.client_nonce,
+            hello.client_ephemeral_public,
+            responder_ephemeral_public,
             accepted_version,
             accepted_session_class,
             session_id,
@@ -622,6 +765,38 @@ mod tests {
         NodeIdentity::generate(node_id).expect("generate identity")
     }
 
+    fn responder_share() -> [u8; 32] {
+        EphemeralKeyAgreement::generate().public_key()
+    }
+
+    fn derive_test_keys(session_id: u64, derive_encryption: bool) -> SessionKeys {
+        let initiator_agreement = EphemeralKeyAgreement::generate();
+        let responder_agreement = EphemeralKeyAgreement::generate();
+        let initiator_public = initiator_agreement.public_key();
+        let responder_public = responder_agreement.public_key();
+        let shared_secret = initiator_agreement
+            .complete(responder_public)
+            .expect("complete test key agreement");
+        let (initiator_identity, _) = make_node_identity(1);
+        let (responder_identity, _) = make_node_identity(2);
+        let context = SessionKeyContext {
+            initiator_nonce: [0xAA; 32],
+            responder_nonce: [0xBB; 32],
+            initiator_ephemeral_public: initiator_public,
+            responder_ephemeral_public: responder_public,
+            initiator_identity: &initiator_identity,
+            responder_identity: &responder_identity,
+            session_id,
+            initiator_endpoint_family: 1,
+            responder_endpoint_family: 1,
+            epoch: 7,
+            accepted_protocol: 1,
+            accepted_features: 0xF00D,
+        };
+        derive_session_keys(&shared_secret, &context, derive_encryption)
+            .expect("derive test session keys")
+    }
+
     #[test]
     fn full_seven_step_handshake_happy_path() {
         let (initiator_id, initiator_key) = make_node_identity(1);
@@ -646,6 +821,7 @@ mod tests {
             &responder_key,
             1,
             SessionClass::FullMesh,
+            responder_share(),
             session_id,
             7,
         )
@@ -657,7 +833,7 @@ mod tests {
         let initiator_public = initiator_id.verifying_key().expect("vk");
         HelloHandshake::handle_verify(&verify_msg, &initiator_public).expect("handle verify");
 
-        let result = hs.establish(1, 0xF00D, true).expect("establish");
+        let result = hs.establish(1, 0xF00D, 1, 1, true).expect("establish");
         assert!(hs.is_established());
         assert_eq!(result.peer_identity.node_id, 2);
         assert_eq!(result.accepted_protocol, 1);
@@ -696,6 +872,7 @@ mod tests {
             &responder_key,
             1,
             SessionClass::FullMesh,
+            responder_share(),
             42,
             1,
         );
@@ -726,6 +903,7 @@ mod tests {
             &responder_key,
             1,
             SessionClass::FullMesh,
+            responder_share(),
             42,
             1,
         );
@@ -755,6 +933,7 @@ mod tests {
             &responder_key,
             1,
             SessionClass::FullMesh,
+            responder_share(),
             42,
             1,
         )
@@ -788,6 +967,7 @@ mod tests {
             &responder_key,
             1,
             SessionClass::FullMesh,
+            responder_share(),
             42,
             1,
         )
@@ -827,6 +1007,7 @@ mod tests {
             &responder_key,
             1,
             SessionClass::FullMesh,
+            responder_share(),
             42,
             1,
         )
@@ -860,6 +1041,7 @@ mod tests {
             &responder_key,
             1,
             SessionClass::FullMesh,
+            responder_share(),
             42,
             99,
         );
@@ -872,12 +1054,35 @@ mod tests {
 
     #[test]
     fn session_key_derivation_deterministic() {
-        let nonce_i = [0xAA; 32];
-        let nonce_r = [0xBB; 32];
-        let session_id: u64 = 42;
+        let initiator_agreement = EphemeralKeyAgreement::generate();
+        let responder_agreement = EphemeralKeyAgreement::generate();
+        let initiator_public = initiator_agreement.public_key();
+        let responder_public = responder_agreement.public_key();
+        let initiator_secret = initiator_agreement
+            .complete(responder_public)
+            .expect("initiator agreement");
+        let responder_secret = responder_agreement
+            .complete(initiator_public)
+            .expect("responder agreement");
+        let (initiator_identity, _) = make_node_identity(1);
+        let (responder_identity, _) = make_node_identity(2);
+        let context = SessionKeyContext {
+            initiator_nonce: [0xAA; 32],
+            responder_nonce: [0xBB; 32],
+            initiator_ephemeral_public: initiator_public,
+            responder_ephemeral_public: responder_public,
+            initiator_identity: &initiator_identity,
+            responder_identity: &responder_identity,
+            session_id: 42,
+            initiator_endpoint_family: 1,
+            responder_endpoint_family: 1,
+            epoch: 7,
+            accepted_protocol: 1,
+            accepted_features: 0xF00D,
+        };
 
-        let keys1 = derive_session_keys(&nonce_i, &nonce_r, session_id, true);
-        let keys2 = derive_session_keys(&nonce_i, &nonce_r, session_id, true);
+        let keys1 = derive_session_keys(&initiator_secret, &context, true).unwrap();
+        let keys2 = derive_session_keys(&responder_secret, &context, true).unwrap();
 
         assert_eq!(keys1.hmac_key, keys2.hmac_key);
         assert_eq!(keys1.encryption_key, keys2.encryption_key);
@@ -886,20 +1091,49 @@ mod tests {
 
     #[test]
     fn session_key_derivation_different_inputs_different_keys() {
-        let nonce_i = [0xAA; 32];
-        let nonce_r = [0xBB; 32];
-        let keys1 = derive_session_keys(&nonce_i, &nonce_r, 1, true);
-        let keys2 = derive_session_keys(&nonce_i, &nonce_r, 2, true);
+        let initiator_agreement = EphemeralKeyAgreement::generate();
+        let responder_agreement = EphemeralKeyAgreement::generate();
+        let initiator_public = initiator_agreement.public_key();
+        let responder_public = responder_agreement.public_key();
+        let shared_secret = initiator_agreement.complete(responder_public).unwrap();
+        let (initiator_identity, _) = make_node_identity(1);
+        let (responder_identity, _) = make_node_identity(2);
+        let context = |session_id| SessionKeyContext {
+            initiator_nonce: [0xAA; 32],
+            responder_nonce: [0xBB; 32],
+            initiator_ephemeral_public: initiator_public,
+            responder_ephemeral_public: responder_public,
+            initiator_identity: &initiator_identity,
+            responder_identity: &responder_identity,
+            session_id,
+            initiator_endpoint_family: 1,
+            responder_endpoint_family: 1,
+            epoch: 7,
+            accepted_protocol: 1,
+            accepted_features: 0xF00D,
+        };
+        let keys1 = derive_session_keys(&shared_secret, &context(1), true).unwrap();
+        let keys2 = derive_session_keys(&shared_secret, &context(2), true).unwrap();
         assert_ne!(keys1.hmac_key, keys2.hmac_key);
         assert_ne!(keys1.encryption_key, keys2.encryption_key);
     }
 
     #[test]
     fn session_key_no_encryption_when_disabled() {
-        let nonce_i = [0xAA; 32];
-        let nonce_r = [0xBB; 32];
-        let keys = derive_session_keys(&nonce_i, &nonce_r, 1, false);
+        let keys = derive_test_keys(1, false);
         assert!(keys.encryption_key.is_none());
+    }
+
+    #[test]
+    fn reflected_and_non_contributory_key_shares_are_rejected() {
+        let reflected = EphemeralKeyAgreement::generate();
+        let reflected_public = reflected.public_key();
+        assert!(reflected.complete(reflected_public).is_err());
+
+        let low_order = EphemeralKeyAgreement::generate();
+        let mut low_order_public = [0u8; 32];
+        low_order_public[0] = 1;
+        assert!(low_order.complete(low_order_public).is_err());
     }
 
     #[test]
@@ -945,6 +1179,8 @@ mod tests {
             make_node_identity(2).0,
             &responder_key,
             [0u8; 32],
+            responder_share(),
+            responder_share(),
             1,
             SessionClass::FullMesh,
             1,
@@ -957,7 +1193,7 @@ mod tests {
     #[test]
     fn establish_from_init_fails() {
         let mut hs = HelloHandshake::new();
-        let result = hs.establish(1, 0, false);
+        let result = hs.establish(1, 0, 1, 1, false);
         assert!(result.is_err());
     }
 
@@ -1018,20 +1254,37 @@ mod tests {
         let hello1 = hs1
             .initiate(id1.clone(), &k1, vec![1], SessionClass::FullMesh, 1)
             .unwrap();
-        let resp1 =
-            HelloHandshake::respond(&hello1, rid.clone(), &rk, 1, SessionClass::FullMesh, 100, 1)
-                .unwrap();
+        let resp1 = HelloHandshake::respond(
+            &hello1,
+            rid.clone(),
+            &rk,
+            1,
+            SessionClass::FullMesh,
+            responder_share(),
+            100,
+            1,
+        )
+        .unwrap();
         hs1.handle_hello_ack(resp1).unwrap();
-        let r1 = hs1.establish(1, 0, true).unwrap();
+        let r1 = hs1.establish(1, 0, 1, 1, true).unwrap();
 
         let mut hs2 = HelloHandshake::new();
         let hello2 = hs2
             .initiate(id2, &k2, vec![1], SessionClass::FullMesh, 1)
             .unwrap();
-        let resp2 =
-            HelloHandshake::respond(&hello2, rid, &rk, 1, SessionClass::FullMesh, 200, 1).unwrap();
+        let resp2 = HelloHandshake::respond(
+            &hello2,
+            rid,
+            &rk,
+            1,
+            SessionClass::FullMesh,
+            responder_share(),
+            200,
+            1,
+        )
+        .unwrap();
         hs2.handle_hello_ack(resp2).unwrap();
-        let r2 = hs2.establish(1, 0, true).unwrap();
+        let r2 = hs2.establish(1, 0, 1, 1, true).unwrap();
 
         assert_ne!(r1.session_keys.hmac_key, r2.session_keys.hmac_key);
         assert_ne!(r1.session_keys.session_id, r2.session_keys.session_id);
@@ -1061,15 +1314,23 @@ mod tests {
         let hello = hs
             .initiate(id1.clone(), &k1, vec![1], SessionClass::FullMesh, 1)
             .unwrap();
-        let resp =
-            HelloHandshake::respond(&hello, rid.clone(), &rk, 1, SessionClass::FullMesh, 42, 1)
-                .unwrap();
+        let resp = HelloHandshake::respond(
+            &hello,
+            rid.clone(),
+            &rk,
+            1,
+            SessionClass::FullMesh,
+            responder_share(),
+            42,
+            1,
+        )
+        .unwrap();
         let verify_msg = hs.handle_hello_ack(resp.clone()).unwrap();
 
         let initiator_public = id1.verifying_key().unwrap();
         HelloHandshake::handle_verify(&verify_msg, &initiator_public).unwrap();
 
-        let result = hs.establish(1, 0xABCD, false).unwrap();
+        let result = hs.establish(1, 0xABCD, 1, 1, false).unwrap();
         assert!(hs.is_established());
         assert_eq!(result.accepted_features, 0xABCD);
         assert!(result.session_keys.encryption_key.is_none());
@@ -1084,30 +1345,56 @@ mod tests {
         let hello = hs
             .initiate(id1, &k1, vec![1, 2, 3], SessionClass::FullMesh, 1)
             .unwrap();
-        let resp =
-            HelloHandshake::respond(&hello, rid, &rk, 2, SessionClass::FullMesh, 42, 1).unwrap();
+        let resp = HelloHandshake::respond(
+            &hello,
+            rid,
+            &rk,
+            2,
+            SessionClass::FullMesh,
+            responder_share(),
+            42,
+            1,
+        )
+        .unwrap();
         hs.handle_hello_ack(resp).unwrap();
 
-        let result = hs.establish(2, 0xCAFE, false).unwrap();
+        let result = hs.establish(2, 0xCAFE, 1, 1, false).unwrap();
         assert_eq!(result.accepted_protocol, 2);
         assert_eq!(result.accepted_features, 0xCAFE);
     }
 
     fn make_dummy_hello() -> HelloMessage {
         let (id, key) = make_node_identity(1);
-        HelloMessage::new(id, &key, vec![1], SessionClass::FullMesh, 1)
+        HelloMessage::new(
+            id,
+            &key,
+            responder_share(),
+            vec![1],
+            SessionClass::FullMesh,
+            1,
+        )
     }
 
     fn make_dummy_response() -> HelloResponse {
         let (id, key) = make_node_identity(2);
-        HelloResponse::new(id, &key, [0u8; 32], 1, SessionClass::FullMesh, 1, 1)
+        HelloResponse::new(
+            id,
+            &key,
+            [0u8; 32],
+            responder_share(),
+            responder_share(),
+            1,
+            SessionClass::FullMesh,
+            1,
+            1,
+        )
     }
 
     // ── Zeroization verification tests (NEXT-SEC-008) ─────────────────
 
     #[test]
     fn zeroization_session_keys_explicit_zeroize() {
-        let mut keys = derive_session_keys(&[0xAAu8; 32], &[0xBBu8; 32], 1, true);
+        let mut keys = derive_test_keys(1, true);
         assert_ne!(keys.hmac_key, [0u8; 32], "HMAC key must be non-zero");
 
         keys.zeroize();
@@ -1127,7 +1414,7 @@ mod tests {
 
     #[test]
     fn zeroization_session_keys_debug_does_not_leak_key_bytes() {
-        let keys = derive_session_keys(&[0xAAu8; 32], &[0xBBu8; 32], 42, true);
+        let keys = derive_test_keys(42, true);
         let debug_str = format!("{keys:?}");
 
         assert!(
@@ -1148,10 +1435,19 @@ mod tests {
             .initiate(id.clone(), &key, vec![1], SessionClass::FullMesh, 1)
             .unwrap();
         let (rid, rk) = make_node_identity(2);
-        let resp =
-            HelloHandshake::respond(&hello, rid, &rk, 2, SessionClass::FullMesh, 42, 1).unwrap();
+        let resp = HelloHandshake::respond(
+            &hello,
+            rid,
+            &rk,
+            1,
+            SessionClass::FullMesh,
+            responder_share(),
+            42,
+            1,
+        )
+        .unwrap();
         hs.handle_hello_ack(resp).unwrap();
-        let result = hs.establish(1, 0, false).unwrap();
+        let result = hs.establish(1, 0, 1, 1, false).unwrap();
 
         let debug_str = format!("{result:?}");
         assert!(
@@ -1178,7 +1474,7 @@ mod tests {
 
     #[test]
     fn zeroization_clone_then_zeroize_both_independent() {
-        let keys = derive_session_keys(&[1u8; 32], &[2u8; 32], 1, true);
+        let keys = derive_test_keys(1, true);
         let mut clone = keys.clone();
 
         assert_eq!(keys.hmac_key, clone.hmac_key);
