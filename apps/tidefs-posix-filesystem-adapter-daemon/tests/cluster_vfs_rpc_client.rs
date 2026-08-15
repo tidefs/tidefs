@@ -6,6 +6,10 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tidefs_auth::{
+    NodeKeyStore, NodePrivateCredential, NodePublicIdentity, NODE_PRIVATE_CREDENTIAL_WIRE_SIZE,
+    NODE_PUBLIC_IDENTITY_WIRE_SIZE,
+};
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId as LifecycleDatasetId, SyncGuarantee};
 use tidefs_local_filesystem::{
     human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem,
@@ -24,7 +28,9 @@ use tidefs_posix_filesystem_adapter_daemon::clustered_mount::{
 };
 use tidefs_posix_filesystem_adapter_daemon::fuse_vfs_adapter::FuseVfsAdapter;
 use tidefs_recovery_loop::RecoveryPolicy;
-use tidefs_transport::{EndpointFamily, NodeInfo, SessionId, Transport, TransportAddr};
+use tidefs_transport::{
+    EndpointFamily, NodeInfo, SessionId, Transport, TransportAddr, TransportError,
+};
 use tidefs_types_vfs_core::{Errno, RequestCtx, ROOT_INODE_ID};
 use tidefs_vfs_engine::dispatch::VfsDispatchEngineBridge;
 use tidefs_vfs_engine::VfsEngine;
@@ -35,25 +41,80 @@ const CLIENT_NODE: u64 = 1;
 const WRITER_TERM: u64 = 77;
 const WRITER_EPOCH: u64 = 9;
 
-fn connect(owner_addr: SocketAddr) -> (Transport, SessionId) {
-    let mut transport = Transport::new(CLIENT_NODE);
+struct ProvisionedIdentity {
+    credential_bytes: [u8; NODE_PRIVATE_CREDENTIAL_WIRE_SIZE],
+    public_bytes: [u8; NODE_PUBLIC_IDENTITY_WIRE_SIZE],
+}
+
+impl Drop for ProvisionedIdentity {
+    fn drop(&mut self) {
+        self.credential_bytes.fill(0);
+    }
+}
+
+impl ProvisionedIdentity {
+    fn new(node_id: u64) -> Self {
+        let credential = NodePrivateCredential::generate(node_id).expect("provision test identity");
+        Self {
+            credential_bytes: credential.encode_fixed(),
+            public_bytes: credential.public_identity().encode_fixed(),
+        }
+    }
+
+    fn credential(&self) -> Arc<NodePrivateCredential> {
+        Arc::new(
+            NodePrivateCredential::decode_fixed(&self.credential_bytes)
+                .expect("decode provisioned test credential"),
+        )
+    }
+
+    fn public_identity(&self) -> NodePublicIdentity {
+        NodePublicIdentity::decode_fixed(&self.public_bytes)
+            .expect("decode provisioned test public identity")
+    }
+}
+
+fn connect(
+    owner_addr: SocketAddr,
+    client_identity: &ProvisionedIdentity,
+    owner_identity: &ProvisionedIdentity,
+) -> (Transport, SessionId) {
+    connect_result(owner_addr, client_identity, owner_identity)
+        .expect("authenticate exact provisioned owner transport")
+}
+
+fn connect_result(
+    owner_addr: SocketAddr,
+    client_identity: &ProvisionedIdentity,
+    owner_identity: &ProvisionedIdentity,
+) -> Result<(Transport, SessionId), TransportError> {
+    let credential = client_identity.credential();
+    let local_public = credential.public_identity().into_identity();
+    let mut known_identities = NodeKeyStore::new();
+    known_identities
+        .register(local_public.clone())
+        .expect("register local test identity");
+    known_identities
+        .register(owner_identity.public_identity().into_identity())
+        .expect("register exact owner test identity");
+    let mut transport = Transport::new(CLIENT_NODE)
+        .with_attestation(
+            credential.keypair().expect("load test credential"),
+            local_public,
+        )
+        .with_known_identities(known_identities)
+        .with_epoch(WRITER_EPOCH);
     transport.set_endpoint_family(EndpointFamily::Control);
-    transport
-        .configure_generated_attestation(true)
-        .expect("configure generated client attestation");
+    transport.set_attestation_bootstrap_from_handshake(false);
     transport.add_node(NodeInfo::new(
         OWNER_NODE,
         vec![TransportAddr::Tcp(owner_addr)],
         0,
     ));
-    let session_id = transport
-        .connect(OWNER_NODE)
-        .expect("connect owner transport");
-    transport
-        .perform_handshake(session_id)
-        .expect("authenticate owner transport");
+    let session_id = transport.connect(OWNER_NODE)?;
+    transport.perform_handshake(session_id)?;
     assert!(transport.session_has_authenticated_confidentiality(session_id));
-    (transport, session_id)
+    Ok((transport, session_id))
 }
 
 fn runtime(
@@ -90,8 +151,10 @@ fn assert_get_root_refused(
     owner_addr: SocketAddr,
     authority: ClusteredPosixMountRuntime,
     expected: Errno,
+    client_identity: &ProvisionedIdentity,
+    owner_identity: &ProvisionedIdentity,
 ) {
-    let (transport, session_id) = connect(owner_addr);
+    let (transport, session_id) = connect(owner_addr, client_identity, owner_identity);
     let client = ClusterVfsRpcClient::new(transport, session_id, authority)
         .expect("construct authenticated cluster VFS_RPC client");
     let bridge = VfsDispatchEngineBridge::new(client);
@@ -105,6 +168,8 @@ fn assert_get_root_refused(
 
 #[test]
 fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
+    let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
+    let client_identity = ProvisionedIdentity::new(CLIENT_NODE);
     let root = tempfile::tempdir().expect("create persistent test root");
     let metadata_dir = root.path().join("metadata");
     let member = root.path().join("member.img");
@@ -171,6 +236,8 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
         "127.0.0.1:0".parse().unwrap(),
         OWNER_NODE,
         CLIENT_NODE,
+        owner_identity.credential(),
+        client_identity.public_identity(),
         dataset_id,
         Arc::clone(&writer_fence),
         owner_adapter.engine_handle(),
@@ -178,7 +245,7 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
     ))
     .expect("start Pool-backed VFS_RPC owner");
 
-    let (transport, session_id) = connect(owner.bound_addr());
+    let (transport, session_id) = connect(owner.bound_addr(), &client_identity, &owner_identity);
     let client = ClusterVfsRpcClient::new(
         transport,
         session_id,
@@ -271,12 +338,38 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
         "127.0.0.1:0".parse().unwrap(),
         OWNER_NODE,
         CLIENT_NODE,
+        owner_identity.credential(),
+        client_identity.public_identity(),
         dataset_id,
         Arc::clone(&writer_fence),
         owner_adapter.engine_handle(),
         Arc::clone(&shutdown),
     ))
     .expect("restart Pool-backed VFS_RPC owner with fresh session authority");
+
+    let untrusted_same_node = ProvisionedIdentity::new(CLIENT_NODE);
+    assert!(
+        connect_result(owner.bound_addr(), &untrusted_same_node, &owner_identity,).is_err(),
+        "a different key for the admitted numeric peer ID must fail the real handshake"
+    );
+    owner
+        .check_health()
+        .expect("owner must remain healthy after refusing the untrusted key");
+    owner
+        .stop()
+        .expect("stop owner after the deliberate authentication refusal");
+    let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        OWNER_NODE,
+        CLIENT_NODE,
+        owner_identity.credential(),
+        client_identity.public_identity(),
+        dataset_id,
+        Arc::clone(&writer_fence),
+        owner_adapter.engine_handle(),
+        Arc::clone(&shutdown),
+    ))
+    .expect("restart exact-trust owner after the negative handshake proof");
 
     assert_get_root_refused(
         owner.bound_addr(),
@@ -287,9 +380,12 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
             WRITER_EPOCH,
         ),
         Errno::ESTALE,
+        &client_identity,
+        &owner_identity,
     );
 
-    let (wrong_writer_transport, wrong_writer_session) = connect(owner.bound_addr());
+    let (wrong_writer_transport, wrong_writer_session) =
+        connect(owner.bound_addr(), &client_identity, &owner_identity);
     match ClusterVfsRpcClient::new(
         wrong_writer_transport,
         wrong_writer_session,
@@ -306,7 +402,8 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
         Ok(_) => panic!("wrong VFS writer must fail closed"),
     }
 
-    let (wrong_session_transport, _actual_session) = connect(owner.bound_addr());
+    let (wrong_session_transport, _actual_session) =
+        connect(owner.bound_addr(), &client_identity, &owner_identity);
     let missing_session = SessionId::new(u64::MAX);
     match ClusterVfsRpcClient::new(
         wrong_session_transport,

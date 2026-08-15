@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use tidefs_auth::{
+    NodeKeyStore, NodePrivateCredential, NodePublicIdentity, NODE_PRIVATE_CREDENTIAL_WIRE_SIZE,
+    NODE_PUBLIC_IDENTITY_WIRE_SIZE,
+};
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId as LifecycleDatasetId, SyncGuarantee};
 use tidefs_local_filesystem::{
     human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem,
@@ -36,6 +40,39 @@ const CLIENT_NODE: u64 = 1;
 const WRITER_TERM: u64 = 77;
 const WRITER_EPOCH: u64 = 9;
 
+struct ProvisionedIdentity {
+    credential_bytes: [u8; NODE_PRIVATE_CREDENTIAL_WIRE_SIZE],
+    public_bytes: [u8; NODE_PUBLIC_IDENTITY_WIRE_SIZE],
+}
+
+impl Drop for ProvisionedIdentity {
+    fn drop(&mut self) {
+        self.credential_bytes.fill(0);
+    }
+}
+
+impl ProvisionedIdentity {
+    fn new(node_id: u64) -> Self {
+        let credential = NodePrivateCredential::generate(node_id).expect("provision test identity");
+        Self {
+            credential_bytes: credential.encode_fixed(),
+            public_bytes: credential.public_identity().encode_fixed(),
+        }
+    }
+
+    fn credential(&self) -> Arc<NodePrivateCredential> {
+        Arc::new(
+            NodePrivateCredential::decode_fixed(&self.credential_bytes)
+                .expect("decode provisioned test credential"),
+        )
+    }
+
+    fn public_identity(&self) -> NodePublicIdentity {
+        NodePublicIdentity::decode_fixed(&self.public_bytes)
+            .expect("decode provisioned test public identity")
+    }
+}
+
 struct RpcClient {
     transport: Transport,
     session_id: SessionId,
@@ -46,12 +83,32 @@ struct RpcClient {
 }
 
 impl RpcClient {
-    fn connect(local_node: u64, owner_addr: SocketAddr, dataset_id: DatasetId) -> Self {
-        let mut transport = Transport::new(local_node);
+    fn connect(
+        local_node: u64,
+        owner_addr: SocketAddr,
+        dataset_id: DatasetId,
+        local_identity: &ProvisionedIdentity,
+        owner_identity: &ProvisionedIdentity,
+    ) -> Self {
+        let credential = local_identity.credential();
+        assert_eq!(credential.node_id(), local_node);
+        let local_public = credential.public_identity().into_identity();
+        let mut known_identities = NodeKeyStore::new();
+        known_identities
+            .register(local_public.clone())
+            .expect("register local test identity");
+        known_identities
+            .register(owner_identity.public_identity().into_identity())
+            .expect("register exact owner test identity");
+        let mut transport = Transport::new(local_node)
+            .with_attestation(
+                credential.keypair().expect("load test credential"),
+                local_public,
+            )
+            .with_known_identities(known_identities)
+            .with_epoch(WRITER_EPOCH);
         transport.set_endpoint_family(EndpointFamily::Control);
-        transport
-            .configure_generated_attestation(true)
-            .expect("configure generated client attestation");
+        transport.set_attestation_bootstrap_from_handshake(false);
         transport.add_node(NodeInfo::new(
             OWNER_NODE,
             vec![TransportAddr::Tcp(owner_addr)],
@@ -188,6 +245,8 @@ impl RpcClient {
 
 #[test]
 fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
+    let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
+    let client_identity = ProvisionedIdentity::new(CLIENT_NODE);
     let root = tempfile::tempdir().expect("create persistent test root");
     let metadata_dir = root.path().join("metadata");
     let member = root.path().join("member.img");
@@ -252,6 +311,8 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
         "127.0.0.1:0".parse().unwrap(),
         OWNER_NODE,
         CLIENT_NODE,
+        owner_identity.credential(),
+        client_identity.public_identity(),
         DatasetId::new(0),
         Arc::clone(&writer_fence),
         Arc::clone(&engine),
@@ -268,13 +329,21 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
         "127.0.0.1:0".parse().unwrap(),
         OWNER_NODE,
         CLIENT_NODE,
+        owner_identity.credential(),
+        client_identity.public_identity(),
         dataset_id,
         writer_fence,
         engine,
         Arc::clone(&shutdown),
     ))
     .expect("start Pool-backed VFS_RPC owner");
-    let mut client = RpcClient::connect(CLIENT_NODE, owner.bound_addr(), dataset_id);
+    let mut client = RpcClient::connect(
+        CLIENT_NODE,
+        owner.bound_addr(),
+        dataset_id,
+        &client_identity,
+        &owner_identity,
+    );
 
     let create = client.new_request(
         WRITER_TERM,

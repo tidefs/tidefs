@@ -1682,11 +1682,49 @@ mod tests {
             "127.0.0.1:7411",
             "--cluster-vfs-rpc-bind",
             "127.0.0.1:7412",
+            "--cluster-node-credential",
+            "/etc/tidefs/node.credential",
+            "--cluster-trusted-vfs-rpc-peer-identity",
+            "/etc/tidefs/peer.identity",
         ]);
 
         assert!(
             args.is_ok(),
             "explicit cluster mount authority should parse"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cli_parse_cluster_identity_create_requires_separate_paths() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "cluster",
+            "identity",
+            "create",
+            "--node-id",
+            "2",
+            "--credential",
+            "/etc/tidefs/node.credential",
+            "--public-identity",
+            "/etc/tidefs/node.identity",
+        ]);
+        assert!(args.is_ok(), "cluster identity creation should parse");
+
+        let missing_public = Cli::try_parse_from([
+            "tidefsctl",
+            "cluster",
+            "identity",
+            "create",
+            "--node-id",
+            "2",
+            "--credential",
+            "/etc/tidefs/node.credential",
+        ]);
+        assert!(
+            missing_public.is_err(),
+            "cluster identity creation must require the public output path"
         );
     }
 
@@ -1707,11 +1745,41 @@ mod tests {
             "1",
             "--cluster-authority-addr",
             "127.0.0.1:7411",
+            "--cluster-node-credential",
+            "/etc/tidefs/node.credential",
+            "--cluster-trusted-vfs-rpc-peer-identity",
+            "/etc/tidefs/peer.identity",
         ]);
 
         assert!(
             args.is_err(),
             "cluster mount must not parse without a Pool-backed VFS_RPC owner bind"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cli_parse_cluster_pool_mount_requires_node_trust_records() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--cluster",
+            "--cluster-owner-node-id",
+            "2",
+            "--cluster-authority-node-id",
+            "1",
+            "--cluster-authority-addr",
+            "127.0.0.1:7411",
+            "--cluster-vfs-rpc-bind",
+            "127.0.0.1:7412",
+        ]);
+        assert!(
+            args.is_err(),
+            "cluster mount must require local credential and trusted peer identity paths"
         );
     }
 

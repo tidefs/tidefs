@@ -68,8 +68,9 @@ pub use identity::{
     resolve_principal_from_presented_credential_chain, revoke_identity_with_grace,
     validate_credential_binding_and_time_health, CompromiseRecoveryRecord,
     GracePeriodRevocationRecord, GracePeriodRevocationSet, IdentityRevocationRecord,
-    KeyLifecycleStats, KeyRotationRecord, NodeIdentity, NodeKeyStore, RevocationReason,
-    RevocationSet,
+    KeyLifecycleStats, KeyRotationRecord, NodeCredentialError, NodeIdentity, NodeKeyStore,
+    NodePrivateCredential, NodePublicIdentity, RevocationReason, RevocationSet,
+    NODE_PRIVATE_CREDENTIAL_WIRE_SIZE, NODE_PUBLIC_IDENTITY_WIRE_SIZE,
 };
 pub use override_mechanism::{
     consume_override_ticket_and_bind_it_to_action, determine_override_requirement_or_sufficiency,

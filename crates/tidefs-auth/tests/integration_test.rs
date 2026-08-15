@@ -45,6 +45,83 @@ fn test_node_key_store() {
 }
 
 #[test]
+fn node_credential_fixed_records_round_trip_and_match() {
+    let credential = NodePrivateCredential::generate(42).expect("generate node credential");
+    let public_identity = credential.public_identity();
+
+    let credential_bytes = credential.encode_fixed();
+    let public_bytes = public_identity.encode_fixed();
+    assert_eq!(credential_bytes.len(), NODE_PRIVATE_CREDENTIAL_WIRE_SIZE);
+    assert_eq!(public_bytes.len(), NODE_PUBLIC_IDENTITY_WIRE_SIZE);
+
+    let decoded_credential =
+        NodePrivateCredential::decode_fixed(&credential_bytes).expect("decode node credential");
+    let decoded_public =
+        NodePublicIdentity::decode_fixed(&public_bytes).expect("decode public identity");
+    assert_eq!(decoded_credential.node_id(), 42);
+    assert_eq!(decoded_credential.identity(), decoded_public.identity());
+    assert_eq!(
+        decoded_credential
+            .keypair()
+            .expect("restore keypair")
+            .public
+            .to_bytes(),
+        decoded_public.identity().verifying_key_bytes
+    );
+    assert!(format!("{decoded_credential:?}").contains("<redacted>"));
+    assert!(!format!("{decoded_credential:?}").contains("keypair_bytes"));
+}
+
+#[test]
+fn node_credential_fixed_records_reject_invalid_headers_and_zero_node() {
+    let credential = NodePrivateCredential::generate(7).expect("generate node credential");
+    let mut bytes = credential.encode_fixed();
+    bytes[0] ^= 0xff;
+    assert!(matches!(
+        NodePrivateCredential::decode_fixed(&bytes),
+        Err(NodeCredentialError::InvalidMagic { .. })
+    ));
+
+    let mut bytes = credential.encode_fixed();
+    bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    assert!(matches!(
+        NodePrivateCredential::decode_fixed(&bytes),
+        Err(NodeCredentialError::UnsupportedVersion { version: 2, .. })
+    ));
+
+    let bytes = credential.encode_fixed();
+    assert!(matches!(
+        NodePrivateCredential::decode_fixed(&bytes[..bytes.len() - 1]),
+        Err(NodeCredentialError::InvalidLength { .. })
+    ));
+
+    assert!(matches!(
+        NodePrivateCredential::generate(0),
+        Err(NodeCredentialError::ZeroNodeId)
+    ));
+}
+
+#[test]
+fn node_credential_fixed_records_reject_tampering_and_key_mismatch() {
+    let credential = NodePrivateCredential::generate(7).expect("generate node credential");
+    let mut public_bytes = credential.public_identity().encode_fixed();
+    public_bytes[24] ^= 0x80;
+    assert!(matches!(
+        NodePublicIdentity::decode_fixed(&public_bytes),
+        Err(NodeCredentialError::InvalidIdentity { .. })
+    ));
+
+    let other = NodePrivateCredential::generate(8).expect("generate second credential");
+    let mut credential_bytes = credential.encode_fixed();
+    credential_bytes[NODE_PUBLIC_IDENTITY_WIRE_SIZE..]
+        .copy_from_slice(&other.encode_fixed()[NODE_PUBLIC_IDENTITY_WIRE_SIZE..]);
+    assert!(matches!(
+        NodePrivateCredential::decode_fixed(&credential_bytes),
+        Err(NodeCredentialError::PublicKeyMismatch)
+    ));
+}
+
+#[test]
 fn test_hello_message_sign_and_verify() {
     let (client_id, client_key) = NodeIdentity::generate(1).expect("generate failed");
     let msg = HelloMessage::new(

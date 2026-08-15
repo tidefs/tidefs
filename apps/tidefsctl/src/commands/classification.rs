@@ -693,6 +693,13 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
     },
     #[cfg(feature = "cluster")]
     CommandSurface {
+        path: "cluster identity create",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::NoLivePoolState,
+        summary: "create a host-local node credential and separate shareable public identity",
+    },
+    #[cfg(feature = "cluster")]
+    CommandSurface {
         path: "cluster pool create",
         class: CommandClass::Prototype,
         routing: RoutingSemantics::PrototypeOnly,

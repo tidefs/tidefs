@@ -3,6 +3,7 @@ use ed25519_dalek::{Keypair, PublicKey, Signature, Signer, Verifier};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use zeroize::Zeroize;
 
 use crate::error::IdentityError;
 
@@ -182,6 +183,320 @@ impl NodeIdentity {
 
         Ok((new_identity, new_signing_key, recovery_record))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Operator-provisioned node credential records
+// ---------------------------------------------------------------------------
+
+const NODE_RECORD_HEADER_SIZE: usize = 16;
+const NODE_IDENTITY_PAYLOAD_SIZE: usize = 120;
+const NODE_IDENTITY_PAYLOAD_OFFSET: usize = NODE_RECORD_HEADER_SIZE;
+const NODE_KEYPAIR_SIZE: usize = 64;
+const NODE_CREDENTIAL_MAGIC: [u8; 8] = *b"TIDENCR1";
+const NODE_PUBLIC_IDENTITY_MAGIC: [u8; 8] = *b"TIDENID1";
+const NODE_RECORD_VERSION: u16 = 1;
+
+/// Exact size of a version-1 private node credential record.
+pub const NODE_PRIVATE_CREDENTIAL_WIRE_SIZE: usize =
+    NODE_RECORD_HEADER_SIZE + NODE_IDENTITY_PAYLOAD_SIZE + NODE_KEYPAIR_SIZE;
+
+/// Exact size of a version-1 shareable public node identity record.
+pub const NODE_PUBLIC_IDENTITY_WIRE_SIZE: usize =
+    NODE_RECORD_HEADER_SIZE + NODE_IDENTITY_PAYLOAD_SIZE;
+
+/// Strict decode/validation error for provisioned node identity records.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum NodeCredentialError {
+    #[error("{record} record length is {actual} bytes; expected {expected}")]
+    InvalidLength {
+        record: &'static str,
+        actual: usize,
+        expected: usize,
+    },
+    #[error("invalid {record} record magic")]
+    InvalidMagic { record: &'static str },
+    #[error("unsupported {record} record version {version}")]
+    UnsupportedVersion { record: &'static str, version: u16 },
+    #[error("invalid {record} record header")]
+    InvalidHeader { record: &'static str },
+    #[error("node credential identity must be nonzero")]
+    ZeroNodeId,
+    #[error("invalid node identity: {reason}")]
+    InvalidIdentity { reason: String },
+    #[error("invalid Ed25519 private credential: {reason}")]
+    InvalidKeypair { reason: String },
+    #[error("private credential does not match its public node identity")]
+    PublicKeyMismatch,
+}
+
+/// Host-local Ed25519 node credential.
+///
+/// The keypair bytes are never exposed directly and are redacted from debug
+/// output. Callers can reconstruct a validated keypair for transport setup.
+pub struct NodePrivateCredential {
+    identity: NodeIdentity,
+    keypair_bytes: [u8; NODE_KEYPAIR_SIZE],
+}
+
+impl std::fmt::Debug for NodePrivateCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NodePrivateCredential")
+            .field("identity", &self.identity)
+            .field("keypair", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for NodePrivateCredential {
+    fn drop(&mut self) {
+        self.keypair_bytes.zeroize();
+    }
+}
+
+impl NodePrivateCredential {
+    /// Generate an operator-provisionable identity using the operating system RNG.
+    pub fn generate(node_id: u64) -> Result<Self, NodeCredentialError> {
+        if node_id == 0 {
+            return Err(NodeCredentialError::ZeroNodeId);
+        }
+        let (identity, keypair) = NodeIdentity::generate(node_id).map_err(|error| {
+            NodeCredentialError::InvalidKeypair {
+                reason: error.to_string(),
+            }
+        })?;
+        Self::from_parts(identity, keypair)
+    }
+
+    /// Bind an existing identity to its exact Ed25519 keypair.
+    pub fn from_parts(
+        identity: NodeIdentity,
+        keypair: Keypair,
+    ) -> Result<Self, NodeCredentialError> {
+        validate_public_identity(&identity)?;
+        validate_keypair_matches_identity(&keypair, &identity)?;
+        Ok(Self {
+            identity,
+            keypair_bytes: keypair.to_bytes(),
+        })
+    }
+
+    #[must_use]
+    pub const fn node_id(&self) -> u64 {
+        self.identity.node_id
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> &NodeIdentity {
+        &self.identity
+    }
+
+    /// Return the separately shareable public record for this credential.
+    #[must_use]
+    pub fn public_identity(&self) -> NodePublicIdentity {
+        NodePublicIdentity {
+            identity: self.identity.clone(),
+        }
+    }
+
+    /// Reconstruct the validated signing key without exposing raw secret bytes.
+    pub fn keypair(&self) -> Result<Keypair, NodeCredentialError> {
+        let keypair = Keypair::from_bytes(&self.keypair_bytes).map_err(|error| {
+            NodeCredentialError::InvalidKeypair {
+                reason: error.to_string(),
+            }
+        })?;
+        validate_keypair_matches_identity(&keypair, &self.identity)?;
+        Ok(keypair)
+    }
+
+    /// Encode the credential as the sole accepted fixed-binary format.
+    #[must_use]
+    pub fn encode_fixed(&self) -> [u8; NODE_PRIVATE_CREDENTIAL_WIRE_SIZE] {
+        let mut out = [0_u8; NODE_PRIVATE_CREDENTIAL_WIRE_SIZE];
+        encode_record_header(&mut out, NODE_CREDENTIAL_MAGIC);
+        encode_identity_payload(&mut out, &self.identity);
+        out[NODE_PUBLIC_IDENTITY_WIRE_SIZE..].copy_from_slice(&self.keypair_bytes);
+        out
+    }
+
+    /// Decode and fully validate one fixed-binary private credential record.
+    pub fn decode_fixed(bytes: &[u8]) -> Result<Self, NodeCredentialError> {
+        validate_record_header(
+            bytes,
+            "private credential",
+            NODE_CREDENTIAL_MAGIC,
+            NODE_PRIVATE_CREDENTIAL_WIRE_SIZE,
+        )?;
+        let identity = decode_identity_payload(bytes)?;
+        let mut keypair_bytes = [0_u8; NODE_KEYPAIR_SIZE];
+        keypair_bytes.copy_from_slice(&bytes[NODE_PUBLIC_IDENTITY_WIRE_SIZE..]);
+        let keypair = match Keypair::from_bytes(&keypair_bytes) {
+            Ok(keypair) => keypair,
+            Err(error) => {
+                keypair_bytes.zeroize();
+                return Err(NodeCredentialError::InvalidKeypair {
+                    reason: error.to_string(),
+                });
+            }
+        };
+        if let Err(error) = validate_keypair_matches_identity(&keypair, &identity) {
+            keypair_bytes.zeroize();
+            return Err(error);
+        }
+        Ok(Self {
+            identity,
+            keypair_bytes,
+        })
+    }
+}
+
+/// Shareable, self-signed public node identity record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodePublicIdentity {
+    identity: NodeIdentity,
+}
+
+impl NodePublicIdentity {
+    pub fn from_identity(identity: NodeIdentity) -> Result<Self, NodeCredentialError> {
+        validate_public_identity(&identity)?;
+        Ok(Self { identity })
+    }
+
+    #[must_use]
+    pub const fn node_id(&self) -> u64 {
+        self.identity.node_id
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> &NodeIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub fn into_identity(self) -> NodeIdentity {
+        self.identity
+    }
+
+    /// Encode the public identity as the sole accepted fixed-binary format.
+    #[must_use]
+    pub fn encode_fixed(&self) -> [u8; NODE_PUBLIC_IDENTITY_WIRE_SIZE] {
+        let mut out = [0_u8; NODE_PUBLIC_IDENTITY_WIRE_SIZE];
+        encode_record_header(&mut out, NODE_PUBLIC_IDENTITY_MAGIC);
+        encode_identity_payload(&mut out, &self.identity);
+        out
+    }
+
+    /// Decode and fully validate one fixed-binary public identity record.
+    pub fn decode_fixed(bytes: &[u8]) -> Result<Self, NodeCredentialError> {
+        validate_record_header(
+            bytes,
+            "public identity",
+            NODE_PUBLIC_IDENTITY_MAGIC,
+            NODE_PUBLIC_IDENTITY_WIRE_SIZE,
+        )?;
+        Self::from_identity(decode_identity_payload(bytes)?)
+    }
+}
+
+fn encode_record_header<const N: usize>(out: &mut [u8; N], magic: [u8; 8]) {
+    out[..8].copy_from_slice(&magic);
+    out[8..10].copy_from_slice(&NODE_RECORD_VERSION.to_le_bytes());
+    out[10..12].copy_from_slice(&0_u16.to_le_bytes());
+    out[12..16].copy_from_slice(&(N as u32).to_le_bytes());
+}
+
+fn validate_record_header(
+    bytes: &[u8],
+    record: &'static str,
+    magic: [u8; 8],
+    expected_len: usize,
+) -> Result<(), NodeCredentialError> {
+    if bytes.len() != expected_len {
+        return Err(NodeCredentialError::InvalidLength {
+            record,
+            actual: bytes.len(),
+            expected: expected_len,
+        });
+    }
+    if bytes[..8] != magic {
+        return Err(NodeCredentialError::InvalidMagic { record });
+    }
+    let version = u16::from_le_bytes(bytes[8..10].try_into().expect("fixed header slice"));
+    if version != NODE_RECORD_VERSION {
+        return Err(NodeCredentialError::UnsupportedVersion { record, version });
+    }
+    let reserved = u16::from_le_bytes(bytes[10..12].try_into().expect("fixed header slice"));
+    let declared_len =
+        u32::from_le_bytes(bytes[12..16].try_into().expect("fixed header slice")) as usize;
+    if reserved != 0 || declared_len != expected_len {
+        return Err(NodeCredentialError::InvalidHeader { record });
+    }
+    Ok(())
+}
+
+fn encode_identity_payload<const N: usize>(out: &mut [u8; N], identity: &NodeIdentity) {
+    let mut offset = NODE_IDENTITY_PAYLOAD_OFFSET;
+    out[offset..offset + 8].copy_from_slice(&identity.node_id.to_le_bytes());
+    offset += 8;
+    out[offset..offset + 32].copy_from_slice(&identity.verifying_key_bytes);
+    offset += 32;
+    out[offset..offset + 8].copy_from_slice(&identity.attested_at_millis.to_le_bytes());
+    offset += 8;
+    out[offset..offset + 8].copy_from_slice(&identity.identity_version.to_le_bytes());
+    offset += 8;
+    debug_assert_eq!(identity.self_signature.len(), 64);
+    out[offset..offset + 64].copy_from_slice(&identity.self_signature);
+}
+
+fn decode_identity_payload(bytes: &[u8]) -> Result<NodeIdentity, NodeCredentialError> {
+    let mut offset = NODE_IDENTITY_PAYLOAD_OFFSET;
+    let node_id = u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed payload"));
+    offset += 8;
+    let mut verifying_key_bytes = [0_u8; 32];
+    verifying_key_bytes.copy_from_slice(&bytes[offset..offset + 32]);
+    offset += 32;
+    let attested_at_millis =
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed payload"));
+    offset += 8;
+    let identity_version =
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed payload"));
+    offset += 8;
+    let self_signature = bytes[offset..offset + 64].to_vec();
+    let identity = NodeIdentity {
+        node_id,
+        verifying_key_bytes,
+        attested_at_millis,
+        identity_version,
+        self_signature,
+    };
+    validate_public_identity(&identity)?;
+    Ok(identity)
+}
+
+fn validate_public_identity(identity: &NodeIdentity) -> Result<(), NodeCredentialError> {
+    if identity.node_id == 0 {
+        return Err(NodeCredentialError::ZeroNodeId);
+    }
+    identity
+        .verify_self_signature()
+        .map_err(|error| NodeCredentialError::InvalidIdentity {
+            reason: error.to_string(),
+        })
+}
+
+fn validate_keypair_matches_identity(
+    keypair: &Keypair,
+    identity: &NodeIdentity,
+) -> Result<(), NodeCredentialError> {
+    let derived_public = PublicKey::from(&keypair.secret);
+    if keypair.public.to_bytes() != identity.verifying_key_bytes
+        || derived_public.to_bytes() != identity.verifying_key_bytes
+    {
+        return Err(NodeCredentialError::PublicKeyMismatch);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
