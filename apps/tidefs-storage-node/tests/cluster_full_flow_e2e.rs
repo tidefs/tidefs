@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use tidefs_auth::{NodeKeyStore, NodePrivateCredential, NodePublicIdentity};
 use tidefs_cluster::pool_config::{ClusterPlacementPolicy, ClusterRedundancy, FailureDomain};
 use tidefs_cluster::pool_lease_client::ClusterLeaseClient;
 use tidefs_cluster::pool_lease_token::PoolLeaseToken;
@@ -26,7 +27,10 @@ use tidefs_cluster::pool_protocol::{
 };
 use tidefs_cluster::{ClusterLeaseConfig, LossEvent, PlacementHealCoordinator, PlacementMap};
 use tidefs_membership_epoch::{HealthClass, MemberClass};
+use tidefs_membership_live::BackendDisclosure;
+use tidefs_storage_node::authority_spine::RuntimeAuthority;
 use tidefs_storage_node::server::{MembershipPeerConfig, StorageNode, StorageNodeConfig};
+use tidefs_transport::EndpointFamily;
 
 const CLUSTER_POOL_MAGIC: &[u8; 4] = b"CP01";
 const TEST_DEVICE_BYTES: u64 = 2 * 1_048_576; // 2 MiB
@@ -62,6 +66,35 @@ fn frame_cp01(msg: &ClusterPoolMessage) -> Vec<u8> {
     wire
 }
 
+fn duplicate_credential(credential: &NodePrivateCredential) -> NodePrivateCredential {
+    NodePrivateCredential::decode_fixed(&credential.encode_fixed()).expect("duplicate credential")
+}
+
+fn authenticated_client(
+    credential: &NodePrivateCredential,
+    trusted_peers: &[NodePublicIdentity],
+) -> tidefs_transport::Transport {
+    let local_identity = credential.public_identity().into_identity();
+    let mut exact_trust = NodeKeyStore::new();
+    exact_trust
+        .register(local_identity.clone())
+        .expect("register local test identity");
+    for peer in trusted_peers {
+        exact_trust
+            .register(peer.identity().clone())
+            .expect("register exact test peer");
+    }
+    let mut transport = tidefs_transport::Transport::new(credential.node_id())
+        .with_attestation(
+            credential.keypair().expect("load test keypair"),
+            local_identity,
+        )
+        .with_known_identities(exact_trust);
+    transport.set_endpoint_family(EndpointFamily::Control);
+    transport.set_attestation_bootstrap_from_handshake(false);
+    transport
+}
+
 struct TestServer {
     #[allow(dead_code)]
     addr: SocketAddr,
@@ -70,21 +103,39 @@ struct TestServer {
 }
 
 impl TestServer {
-    fn spawn(node_id: u64, store_paths: Vec<PathBuf>, with_lease: bool) -> Self {
-        let membership_checkpoint_dir = with_lease.then(|| {
-            store_paths
-                .first()
-                .and_then(|path| path.parent())
-                .expect("scratch store has parent")
-                .join("membership-checkpoint")
-        });
+    fn spawn(node_id: u64, store_paths: Vec<PathBuf>) -> Self {
         Self::spawn_configured(
             node_id,
             store_paths,
-            with_lease.then(ClusterLeaseConfig::default),
-            membership_checkpoint_dir,
+            None,
+            None,
             Vec::new(),
             None,
+            None,
+            false,
+        )
+    }
+
+    fn spawn_authenticated(
+        node_id: u64,
+        store_paths: Vec<PathBuf>,
+        credential: NodePrivateCredential,
+        trusted_peers: Vec<NodePublicIdentity>,
+    ) -> Self {
+        let membership_checkpoint_dir = store_paths
+            .first()
+            .and_then(|path| path.parent())
+            .expect("scratch store has parent")
+            .join("membership-checkpoint");
+        Self::spawn_configured(
+            node_id,
+            store_paths,
+            Some(ClusterLeaseConfig::default()),
+            Some(membership_checkpoint_dir),
+            Vec::new(),
+            None,
+            Some((credential, trusted_peers)),
+            true,
         )
     }
 
@@ -95,9 +146,21 @@ impl TestServer {
         membership_checkpoint_dir: Option<PathBuf>,
         membership_peers: Vec<MembershipPeerConfig>,
         membership_bind_addr: Option<SocketAddr>,
+        transport_identity: Option<(NodePrivateCredential, Vec<NodePublicIdentity>)>,
+        live_replication_backend: bool,
     ) -> Self {
         let port = pick_port();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let authority = transport_identity.map(|(credential, trusted_peers)| {
+            let disclosure = if live_replication_backend {
+                BackendDisclosure::Tcp(addr)
+            } else {
+                BackendDisclosure::Loopback
+            };
+            RuntimeAuthority::build(disclosure, node_id, None, None, 1)
+                .and_then(|authority| authority.with_transport_identity(credential, trusted_peers))
+                .expect("build exact test transport authority")
+        });
         let config = StorageNodeConfig {
             bind_addr: addr,
             node_id,
@@ -112,7 +175,7 @@ impl TestServer {
             pool_device_paths: Vec::new(),
             pool_lock_dir: None,
             node_identity: None,
-            authority: None,
+            authority,
             ready_file: None,
             drain_timeout_secs: 30,
             cluster_lease_config,
@@ -178,6 +241,22 @@ fn connect_client(
     sid
 }
 
+fn try_connect_client(
+    client: &mut tidefs_transport::Transport,
+    server_node_id: u64,
+    server_addr: SocketAddr,
+) -> Result<tidefs_transport::SessionId, tidefs_transport::TransportError> {
+    use tidefs_transport::{NodeInfo, TransportAddr};
+    client.add_node(NodeInfo::new(
+        server_node_id,
+        vec![TransportAddr::Tcp(server_addr)],
+        0,
+    ));
+    let session_id = client.connect(server_node_id)?;
+    client.perform_handshake(session_id)?;
+    Ok(session_id)
+}
+
 fn recv_cp01(
     client: &mut tidefs_transport::Transport,
     sid: tidefs_transport::SessionId,
@@ -221,6 +300,86 @@ fn send_cp01(
 // Tests
 // ---------------------------------------------------------------------------
 
+#[test]
+fn cluster_full_flow_refuses_wrong_keys_plaintext_and_bootstrap() {
+    // Wrong owner key: the presented node ID is right, but the authority has
+    // provisioned a different exact public identity for that owner.
+    let authority_credential = NodePrivateCredential::generate(1).expect("authority credential");
+    let authority_identity = authority_credential.public_identity();
+    let expected_owner = NodePrivateCredential::generate(2).expect("expected owner credential");
+    let wrong_owner = NodePrivateCredential::generate(2).expect("wrong owner credential");
+    let server = TestServer::spawn_authenticated(
+        1,
+        scratch_store_paths("auth-wrong-owner", 1),
+        authority_credential,
+        vec![expected_owner.public_identity()],
+    );
+    let mut client = authenticated_client(&wrong_owner, &[authority_identity]);
+    assert!(
+        try_connect_client(&mut client, 1, server.addr()).is_err(),
+        "same numeric owner ID with the wrong key must be refused"
+    );
+    drop(client);
+    drop(server);
+
+    // Wrong authority key: the owner trusts a different key for the exact
+    // authority node ID than the live storage node presents.
+    let authority_credential = NodePrivateCredential::generate(1).expect("authority credential");
+    let wrong_authority = NodePrivateCredential::generate(1).expect("wrong authority credential");
+    let owner_credential = NodePrivateCredential::generate(2).expect("owner credential");
+    let server = TestServer::spawn_authenticated(
+        1,
+        scratch_store_paths("auth-wrong-authority", 1),
+        authority_credential,
+        vec![owner_credential.public_identity()],
+    );
+    let mut client = authenticated_client(&owner_credential, &[wrong_authority.public_identity()]);
+    assert!(
+        try_connect_client(&mut client, 1, server.addr()).is_err(),
+        "same numeric authority ID with the wrong key must be refused"
+    );
+    drop(client);
+    drop(server);
+
+    // Plaintext cannot enter a non-local Control endpoint.
+    let authority_credential = NodePrivateCredential::generate(1).expect("authority credential");
+    let expected_owner = NodePrivateCredential::generate(2).expect("expected owner credential");
+    let server = TestServer::spawn_authenticated(
+        1,
+        scratch_store_paths("auth-plaintext", 1),
+        authority_credential,
+        vec![expected_owner.public_identity()],
+    );
+    let mut plaintext = tidefs_transport::Transport::new(2);
+    plaintext.set_endpoint_family(EndpointFamily::Control);
+    assert!(
+        try_connect_client(&mut plaintext, 1, server.addr()).is_err(),
+        "plaintext Control session must be refused"
+    );
+    drop(plaintext);
+    drop(server);
+
+    // Handshake identity bootstrap on the initiator cannot make an
+    // unprovisioned key acceptable to the exact-trust authority.
+    let authority_credential = NodePrivateCredential::generate(1).expect("authority credential");
+    let expected_owner = NodePrivateCredential::generate(2).expect("expected owner credential");
+    let server = TestServer::spawn_authenticated(
+        1,
+        scratch_store_paths("auth-bootstrap", 1),
+        authority_credential,
+        vec![expected_owner.public_identity()],
+    );
+    let mut bootstrap = tidefs_transport::Transport::new(2);
+    bootstrap
+        .configure_generated_attestation(true)
+        .expect("configure bootstrap identity");
+    bootstrap.set_endpoint_family(EndpointFamily::Control);
+    assert!(
+        try_connect_client(&mut bootstrap, 1, server.addr()).is_err(),
+        "handshake-bootstrap identity must not bypass exact authority trust"
+    );
+}
+
 /// Full clustered pool create with lease acquisition, catalog operations,
 /// and placement heal exercise.
 #[test]
@@ -232,13 +391,29 @@ fn cluster_full_flow_create_lease_catalog_heal() {
     let pool_guid: [u8; 16] = [0xC1; 16];
     let pool_name = "fullflow-pool";
 
-    // Start two storage nodes with lease runtime enabled.
-    let server1 = TestServer::spawn(1, scratch_store_paths("cff-s1", 1), true);
-    let server2 = TestServer::spawn(2, scratch_store_paths("cff-s2", 1), true);
+    // Start two storage nodes with exact provisioned identities and trust.
+    let server1_credential = NodePrivateCredential::generate(1).expect("server 1 credential");
+    let server2_credential = NodePrivateCredential::generate(2).expect("server 2 credential");
+    let owner_credential = duplicate_credential(&server1_credential);
+    let owner_identity = owner_credential.public_identity();
+    let server1_identity = server1_credential.public_identity();
+    let server2_identity = server2_credential.public_identity();
+    let server1 = TestServer::spawn_authenticated(
+        1,
+        scratch_store_paths("cff-s1", 1),
+        server1_credential,
+        vec![owner_identity.clone()],
+    );
+    let server2 = TestServer::spawn_authenticated(
+        2,
+        scratch_store_paths("cff-s2", 1),
+        server2_credential,
+        vec![owner_identity],
+    );
 
     // Node 1 acts as the authenticated Pool owner and connects to both
     // storage-node transports.
-    let mut client = tidefs_transport::Transport::new(1);
+    let mut client = authenticated_client(&owner_credential, &[server1_identity, server2_identity]);
     let sid1 = connect_client(&mut client, 1, server1.addr());
     let sid2 = connect_client(&mut client, 2, server2.addr());
 
@@ -575,6 +750,8 @@ fn cluster_pool_owner_restart_quarantines_old_grant_before_newer_handoff() {
         None,
         Vec::new(),
         Some(peer2_membership_addr),
+        None,
+        false,
     );
     let _peer3 = TestServer::spawn_configured(
         3,
@@ -583,6 +760,8 @@ fn cluster_pool_owner_restart_quarantines_old_grant_before_newer_handoff() {
         None,
         Vec::new(),
         Some(peer3_membership_addr),
+        None,
+        false,
     );
     let membership_peers = vec![
         MembershipPeerConfig {
@@ -598,12 +777,23 @@ fn cluster_pool_owner_restart_quarantines_old_grant_before_newer_handoff() {
             failure_domain: 3,
         },
     ];
-    let lease_term_ms = 400;
+    // Exact mutual attestation and membership startup can exceed the old
+    // sub-second term on a loaded test host. Keep the quarantine comfortably
+    // live through the immediate handoff refusal.
+    let lease_term_ms = 2_000;
     let lease_config = ClusterLeaseConfig {
         lease_term_ms,
         ..ClusterLeaseConfig::default()
     };
     let pool_guid = [0xD7; 16];
+    let authority_credential = NodePrivateCredential::generate(1).expect("authority credential");
+    let authority_identity = authority_credential.public_identity();
+    let owner2_credential = NodePrivateCredential::generate(2).expect("owner 2 credential");
+    let owner3_credential = NodePrivateCredential::generate(3).expect("owner 3 credential");
+    let trusted_owners = vec![
+        owner2_credential.public_identity(),
+        owner3_credential.public_identity(),
+    ];
 
     let server = TestServer::spawn_configured(
         1,
@@ -612,8 +802,13 @@ fn cluster_pool_owner_restart_quarantines_old_grant_before_newer_handoff() {
         Some(checkpoint_dir.clone()),
         membership_peers.clone(),
         None,
+        Some((
+            duplicate_credential(&authority_credential),
+            trusted_owners.clone(),
+        )),
+        false,
     );
-    let mut owner2 = tidefs_transport::Transport::new(2);
+    let mut owner2 = authenticated_client(&owner2_credential, &[authority_identity.clone()]);
     let owner2_session = connect_client(&mut owner2, 1, server.addr());
     send_cp01(
         &mut owner2,
@@ -651,9 +846,11 @@ fn cluster_pool_owner_restart_quarantines_old_grant_before_newer_handoff() {
         Some(checkpoint_dir),
         membership_peers,
         None,
+        Some((authority_credential, trusted_owners)),
+        false,
     );
 
-    let mut owner2 = tidefs_transport::Transport::new(2);
+    let mut owner2 = authenticated_client(&owner2_credential, &[authority_identity.clone()]);
     let owner2_session = connect_client(&mut owner2, 1, restarted.addr());
     send_cp01(
         &mut owner2,
@@ -675,7 +872,7 @@ fn cluster_pool_owner_restart_quarantines_old_grant_before_newer_handoff() {
         other => panic!("unexpected stale-renew response: {other:?}"),
     }
 
-    let mut owner3 = tidefs_transport::Transport::new(3);
+    let mut owner3 = authenticated_client(&owner3_credential, &[authority_identity]);
     let owner3_session = connect_client(&mut owner3, 1, restarted.addr());
     let acquire = |request_id| {
         ClusterPoolMessage::LeaseRequest(ClusterPoolLeaseRequest {
@@ -726,7 +923,7 @@ fn cluster_no_lease_config_lifecycle() {
     let pool_guid: [u8; 16] = [0xD1; 16];
 
     // Server without lease config.
-    let server = TestServer::spawn(1, scratch_store_paths("cnlc-s1", 1), false);
+    let server = TestServer::spawn(1, scratch_store_paths("cnlc-s1", 1));
 
     let mut client = tidefs_transport::Transport::new(9980);
     let sid = connect_client(&mut client, 1, server.addr());
@@ -795,12 +992,37 @@ fn cluster_full_flow_mirror_create_and_verify() {
     let pool_guid: [u8; 16] = [0xE1; 16];
     let pool_name = "mirror-pool";
 
-    // Start 3 servers.
-    let server1 = TestServer::spawn(1, scratch_store_paths("cfm-s1", 1), true);
-    let server2 = TestServer::spawn(2, scratch_store_paths("cfm-s2", 1), true);
-    let server3 = TestServer::spawn(3, scratch_store_paths("cfm-s3", 1), true);
+    // Start 3 servers with one exact admitted client identity.
+    let client_credential = NodePrivateCredential::generate(9970).expect("client credential");
+    let client_identity = client_credential.public_identity();
+    let server1_credential = NodePrivateCredential::generate(1).expect("server 1 credential");
+    let server2_credential = NodePrivateCredential::generate(2).expect("server 2 credential");
+    let server3_credential = NodePrivateCredential::generate(3).expect("server 3 credential");
+    let server_identities = [
+        server1_credential.public_identity(),
+        server2_credential.public_identity(),
+        server3_credential.public_identity(),
+    ];
+    let server1 = TestServer::spawn_authenticated(
+        1,
+        scratch_store_paths("cfm-s1", 1),
+        server1_credential,
+        vec![client_identity.clone()],
+    );
+    let server2 = TestServer::spawn_authenticated(
+        2,
+        scratch_store_paths("cfm-s2", 1),
+        server2_credential,
+        vec![client_identity.clone()],
+    );
+    let server3 = TestServer::spawn_authenticated(
+        3,
+        scratch_store_paths("cfm-s3", 1),
+        server3_credential,
+        vec![client_identity],
+    );
 
-    let mut client = tidefs_transport::Transport::new(9970);
+    let mut client = authenticated_client(&client_credential, &server_identities);
     let sid1 = connect_client(&mut client, 1, server1.addr());
     let sid2 = connect_client(&mut client, 2, server2.addr());
     let sid3 = connect_client(&mut client, 3, server3.addr());
@@ -886,9 +1108,27 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
     let dev_pre = make_test_device(dir.path(), "pf-pre-dev0", TEST_DEVICE_BYTES);
     let _dev_during = make_test_device(dir.path(), "pf-during-dev0", TEST_DEVICE_BYTES);
     let dev_post = make_test_device(dir.path(), "pf-post-dev0", TEST_DEVICE_BYTES);
+    let authority_credential = NodePrivateCredential::generate(1).expect("authority credential");
+    let authority_identity = authority_credential.public_identity();
+    let client1_credential = NodePrivateCredential::generate(9940).expect("client 1 credential");
+    let client2_credential = NodePrivateCredential::generate(9930).expect("client 2 credential");
+    let client3_credential = NodePrivateCredential::generate(9920).expect("client 3 credential");
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port());
+    let authority = RuntimeAuthority::build(BackendDisclosure::Tcp(bind_addr), 1, None, None, 1)
+        .and_then(|authority| {
+            authority.with_transport_identity(
+                authority_credential,
+                vec![
+                    client1_credential.public_identity(),
+                    client2_credential.public_identity(),
+                    client3_credential.public_identity(),
+                ],
+            )
+        })
+        .expect("build partition test authority");
 
     let config = StorageNodeConfig {
-        bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port()),
+        bind_addr,
         node_id: 1,
         store_paths: scratch_store_paths("pfr-s1", 1),
         fs_root: None,
@@ -901,7 +1141,7 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
         pool_device_paths: Vec::new(),
         pool_lock_dir: None,
         node_identity: None,
-        authority: None,
+        authority: Some(authority),
         ready_file: None,
         drain_timeout_secs: 30,
         cluster_lease_config: Some(ClusterLeaseConfig::default()),
@@ -934,7 +1174,7 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
     thread::sleep(Duration::from_millis(100));
 
     // Connect and send create request.
-    let mut client = tidefs_transport::Transport::new(9940);
+    let mut client = authenticated_client(&client1_credential, &[authority_identity.clone()]);
     let sid = connect_client(&mut client, 1, addr);
 
     let pool_guid: [u8; 16] = [0xFD; 16];
@@ -1001,7 +1241,7 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
     thread::sleep(Duration::from_millis(100));
 
     // Connect and try create — must fail with minority-fenced.
-    let mut client2 = tidefs_transport::Transport::new(9930);
+    let mut client2 = authenticated_client(&client2_credential, &[authority_identity.clone()]);
     let sid2 = connect_client(&mut client2, 1, addr);
 
     let create_req2 = ClusterPoolCreateRequest {
@@ -1063,7 +1303,7 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
     });
     thread::sleep(Duration::from_millis(100));
 
-    let mut client3 = tidefs_transport::Transport::new(9920);
+    let mut client3 = authenticated_client(&client3_credential, &[authority_identity]);
     let sid3 = connect_client(&mut client3, 1, addr);
 
     let create_req3 = ClusterPoolCreateRequest {

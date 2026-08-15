@@ -237,16 +237,6 @@ pub enum PoolCommand {
         cluster_authority_addr: Option<String>,
 
         #[cfg(feature = "cluster")]
-        /// Committed member ID that will own and mount the Pool.
-        #[arg(long = "cluster-owner-node-id", requires = "cluster")]
-        cluster_owner_node_id: Option<u64>,
-
-        #[cfg(feature = "cluster")]
-        /// Committed member ID of the storage node granting the Pool lease.
-        #[arg(long = "cluster-authority-node-id", requires = "cluster")]
-        cluster_authority_node_id: Option<u64>,
-
-        #[cfg(feature = "cluster")]
         /// Local authenticated Control endpoint for Pool-backed inline VFS_RPC.
         #[arg(
             long = "cluster-vfs-rpc-bind",
@@ -263,6 +253,16 @@ pub enum PoolCommand {
             required_if_eq_any([("cluster", "true"), ("cluster_client", "true")])
         )]
         cluster_node_credential: Option<PathBuf>,
+
+        #[cfg(feature = "cluster")]
+        /// Exact storage-node identity trusted to grant the renewable Pool lease.
+        #[arg(
+            long = "cluster-trusted-authority-identity",
+            value_name = "PATH",
+            requires = "cluster",
+            required_if_eq("cluster", "true")
+        )]
+        cluster_trusted_authority_identity: Option<PathBuf>,
 
         #[cfg(feature = "cluster")]
         /// Shareable public identity trusted for the VFS_RPC peer.
@@ -441,13 +441,11 @@ pub fn handle_pool(cmd: PoolCommand) {
             #[cfg(feature = "cluster")]
             cluster_authority_addr,
             #[cfg(feature = "cluster")]
-            cluster_owner_node_id,
-            #[cfg(feature = "cluster")]
-            cluster_authority_node_id,
-            #[cfg(feature = "cluster")]
             cluster_vfs_rpc_bind,
             #[cfg(feature = "cluster")]
             cluster_node_credential,
+            #[cfg(feature = "cluster")]
+            cluster_trusted_authority_identity,
             #[cfg(feature = "cluster")]
             cluster_trusted_vfs_rpc_peer_identity,
         } => {
@@ -473,13 +471,11 @@ pub fn handle_pool(cmd: PoolCommand) {
                 #[cfg(feature = "cluster")]
                 cluster_authority_addr,
                 #[cfg(feature = "cluster")]
-                cluster_owner_node_id,
-                #[cfg(feature = "cluster")]
-                cluster_authority_node_id,
-                #[cfg(feature = "cluster")]
                 cluster_vfs_rpc_bind,
                 #[cfg(feature = "cluster")]
                 cluster_node_credential,
+                #[cfg(feature = "cluster")]
+                cluster_trusted_authority_identity,
                 #[cfg(feature = "cluster")]
                 cluster_trusted_vfs_rpc_peer_identity,
             });

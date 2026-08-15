@@ -3579,6 +3579,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tidefs-auth",
  "tidefs-cluster",
  "tidefs-durability-layout",
  "tidefs-local-filesystem",
