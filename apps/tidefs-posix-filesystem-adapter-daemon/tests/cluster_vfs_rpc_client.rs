@@ -24,13 +24,21 @@ use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_owner::{
     ClusterVfsRpcOwnerConfig, ClusterVfsRpcOwnerHandle, ClusterVfsRpcWriterFence,
 };
 use tidefs_posix_filesystem_adapter_daemon::fuse_vfs_adapter::FuseVfsAdapter;
+use tidefs_posix_filesystem_adapter_daemon::live_owner::LiveOwnerEngine;
 use tidefs_recovery_loop::RecoveryPolicy;
 use tidefs_transport::{
-    EndpointFamily, NodeInfo, SessionId, Transport, TransportAddr, TransportError,
+    EndpointFamily, NodeInfo, SessionCloseReason, SessionId, Transport, TransportAddr,
+    TransportError, TransportSessionSet,
 };
 use tidefs_types_vfs_core::{Errno, RequestCtx, ROOT_INODE_ID};
-use tidefs_vfs_engine::dispatch::VfsDispatchEngineBridge;
-use tidefs_vfs_rpc::DatasetId;
+use tidefs_vfs_engine::dispatch::{VfsDispatchEngineBridge, VfsEngineDispatchBridge};
+use tidefs_vfs_engine::{VfsDispatch, VfsOperation, VfsResponse};
+use tidefs_vfs_rpc::transport_adapter::{
+    VfsRpcEnvelopeContext, VfsRpcInboundFrame, VfsRpcSessionAuthority, VfsRpcTransportAdapter,
+    VfsRpcTransportAdapterConfig,
+};
+use tidefs_vfs_rpc::vfs_engine_bridge::{VfsEngineBridge, VfsEngineBridgeWriter};
+use tidefs_vfs_rpc::{DatasetId, PeerId, VfsRpcRequest, VfsRpcResponse, RESP_FLAG_DEDUP_REPLAY};
 
 const OWNER_NODE: u64 = 2;
 const CLIENT_NODE: u64 = 1;
@@ -127,6 +135,133 @@ fn request_ctx() -> RequestCtx {
     }
 }
 
+struct PoolBackedTestDispatch {
+    engine: LiveOwnerEngine,
+}
+
+impl VfsDispatch for PoolBackedTestDispatch {
+    fn dispatch(&self, operation: VfsOperation) -> Result<VfsResponse, Errno> {
+        let engine = self.engine.lock().map_err(|_| Errno::EIO)?;
+        VfsEngineDispatchBridge::new(engine.as_ref()).dispatch(operation)
+    }
+}
+
+fn bind_test_owner(
+    owner_identity: &ProvisionedIdentity,
+    client_identity: &ProvisionedIdentity,
+) -> (Transport, SocketAddr) {
+    let credential = owner_identity.credential();
+    let owner_public = credential.public_identity().into_identity();
+    let mut known_identities = NodeKeyStore::new();
+    known_identities
+        .register(owner_public.clone())
+        .expect("register faulting owner identity");
+    known_identities
+        .register(client_identity.public_identity().into_identity())
+        .expect("register faulting owner client identity");
+    let mut transport = Transport::new(OWNER_NODE)
+        .with_attestation(
+            credential.keypair().expect("load faulting owner keypair"),
+            owner_public,
+        )
+        .with_known_identities(known_identities)
+        .with_epoch(WRITER_EPOCH);
+    transport.set_endpoint_family(EndpointFamily::Control);
+    transport.set_attestation_bootstrap_from_handshake(false);
+    transport
+        .bind(TransportAddr::Tcp("127.0.0.1:0".parse().unwrap()))
+        .expect("bind faulting owner");
+    let bound_addr = match transport.bind_addr {
+        Some(TransportAddr::Tcp(addr)) => addr,
+        _ => panic!("faulting owner must publish its TCP address"),
+    };
+    (transport, bound_addr)
+}
+
+fn accept_test_session(transport: &mut Transport) -> SessionId {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match transport.accept_incoming() {
+            Ok(session_id) => return session_id,
+            Err(TransportError::Generic(message)) if message == "no pending connections" => {
+                assert!(Instant::now() < deadline, "faulting owner accept timed out");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("faulting owner accept failed: {error}"),
+        }
+    }
+}
+
+fn admit_test_session(
+    transport: &mut Transport,
+    authority: VfsRpcSessionAuthority,
+) -> (SessionId, VfsRpcTransportAdapter) {
+    let session_id = accept_test_session(transport);
+    transport
+        .perform_handshake(session_id)
+        .expect("authenticate faulting owner session");
+    assert_eq!(transport.peer_node(session_id), Some(CLIENT_NODE));
+    assert!(transport.session_has_authenticated_confidentiality(session_id));
+    let mut sessions = TransportSessionSet::new();
+    sessions.add_binding_with_epoch(CLIENT_NODE, session_id, authority.epoch());
+    sessions.mark_healthy(session_id);
+    let adapter = VfsRpcTransportAdapter::new(VfsRpcTransportAdapterConfig::default(), sessions);
+    let (mut envelope, payload) = adapter
+        .wrap_session_authority_for_session(
+            session_id,
+            &authority,
+            VfsRpcEnvelopeContext {
+                sequence_number: 0,
+                ..VfsRpcEnvelopeContext::default()
+            },
+        )
+        .expect("wrap faulting owner authority");
+    transport
+        .send_envelope(&mut envelope, &payload)
+        .expect("send faulting owner authority");
+    (session_id, adapter)
+}
+
+fn receive_test_request(
+    transport: &mut Transport,
+    session_id: SessionId,
+    adapter: &mut VfsRpcTransportAdapter,
+) -> VfsRpcRequest {
+    let (envelope, payload) = transport
+        .recv_envelope(session_id)
+        .expect("receive faulting owner request");
+    match adapter
+        .unwrap_inbound(Instant::now(), session_id, &envelope, &payload)
+        .expect("unwrap faulting owner request")
+    {
+        VfsRpcInboundFrame::Request { request, .. } => request,
+        VfsRpcInboundFrame::Response { .. } => panic!("faulting owner received a response"),
+    }
+}
+
+fn send_test_response(
+    transport: &mut Transport,
+    session_id: SessionId,
+    adapter: &VfsRpcTransportAdapter,
+    response: &VfsRpcResponse,
+    sequence_number: u64,
+) {
+    let mut outbound = adapter
+        .wrap_response_for_session(
+            PeerId(CLIENT_NODE),
+            session_id,
+            response,
+            VfsRpcEnvelopeContext {
+                sequence_number,
+                ..VfsRpcEnvelopeContext::default()
+            },
+        )
+        .expect("wrap faulting owner response");
+    transport
+        .send_envelope(&mut outbound.envelope, &outbound.payload)
+        .expect("send faulting owner response");
+}
+
 #[test]
 fn connector_refuses_owner_epoch_movement_before_authority() {
     let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
@@ -214,6 +349,244 @@ fn connector_refuses_owner_epoch_movement_before_authority() {
         Ok(_) => panic!("epoch movement must fail before client construction"),
     }
     owner_handle.join().expect("epoch-moving owner thread");
+}
+
+#[test]
+fn client_replays_one_mutation_after_authenticated_reconnect_and_fences_term_movement() {
+    let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
+    let client_identity = ProvisionedIdentity::new(CLIENT_NODE);
+    let root = tempfile::tempdir().expect("create reconnect test root");
+    let metadata_dir = root.path().join("metadata");
+    let member = root.path().join("member.img");
+    fs::create_dir_all(&metadata_dir).expect("create reconnect Pool metadata directory");
+    File::create(&member)
+        .expect("create reconnect Pool member")
+        .set_len(32 * 1024 * 1024)
+        .expect("size reconnect Pool member");
+
+    let mut root_filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        std::slice::from_ref(&member),
+        "tidefs-vfs-rpc-reconnect",
+        PoolRedundancyPolicy::default(),
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::default(),
+    )
+    .expect("open reconnect Pool-backed root filesystem");
+    let canonical_dataset_id = LifecycleDatasetId::from_bytes([0x51; 16]);
+    root_filesystem
+        .create_filesystem_dataset(
+            "clustered",
+            canonical_dataset_id,
+            Vec::new(),
+            DatasetFlags::default_create(),
+            SyncGuarantee::Local,
+        )
+        .expect("publish reconnect filesystem dataset");
+    drop(root_filesystem);
+
+    let filesystem = LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+        &metadata_dir,
+        "tidefs-vfs-rpc-reconnect",
+        PoolRedundancyPolicy::default(),
+        "clustered",
+        LocalFileSystemOpenConfig {
+            options: StoreOptions::default(),
+            allocator_policy: LocalStorageAllocatorPolicy::default(),
+            root_authentication_key: RootAuthenticationKey::demo_key(),
+            encryption: None,
+            compression: None,
+            log_device_device_path: None,
+            recovery_policy: RecoveryPolicy::default(),
+            block_devices: Some(std::slice::from_ref(&member)),
+        },
+    )
+    .expect("open exact reconnect filesystem dataset");
+    let dataset_id = DatasetId::new(u128::from_le_bytes(filesystem.mounted_dataset_id()));
+    let owner_adapter = FuseVfsAdapter::new(Box::new(VfsLocalFileSystem::new(filesystem)))
+        .expect("create reconnect Pool-backed owner adapter");
+    let target = PoolBackedTestDispatch {
+        engine: owner_adapter.engine_handle(),
+    };
+    let (mut owner_transport, owner_addr) = bind_test_owner(&owner_identity, &client_identity);
+
+    let owner_thread = std::thread::spawn(move || {
+        let discovery = accept_test_session(&mut owner_transport);
+        assert!(matches!(
+            owner_transport.perform_handshake(discovery),
+            Err(TransportError::AttestedEpochMismatch {
+                authenticated_peer: CLIENT_NODE,
+                proposed_epoch: 0,
+                required_epoch: WRITER_EPOCH,
+                ..
+            })
+        ));
+
+        let authority = VfsRpcSessionAuthority::new(
+            POOL_GUID,
+            dataset_id,
+            OWNER_NODE,
+            WRITER_TERM,
+            WRITER_EPOCH,
+        )
+        .expect("build reconnect authority");
+        let mut bridge = VfsEngineBridge::new(VfsEngineBridgeWriter::new(
+            OWNER_NODE,
+            dataset_id,
+            WRITER_TERM,
+            WRITER_EPOCH,
+        ));
+
+        let (first_session, mut first_adapter) =
+            admit_test_session(&mut owner_transport, authority);
+        let bootstrap_request =
+            receive_test_request(&mut owner_transport, first_session, &mut first_adapter);
+        assert!(matches!(
+            bootstrap_request.payload,
+            tidefs_vfs_rpc::VfsRpcRequestPayload::GetRoot
+        ));
+        let bootstrap_response = bridge
+            .dispatch(PeerId(CLIENT_NODE), &bootstrap_request, &target)
+            .expect("dispatch adapter root bootstrap");
+        send_test_response(
+            &mut owner_transport,
+            first_session,
+            &first_adapter,
+            &bootstrap_response,
+            1,
+        );
+        let first_request =
+            receive_test_request(&mut owner_transport, first_session, &mut first_adapter);
+        assert!(matches!(
+            &first_request.payload,
+            tidefs_vfs_rpc::VfsRpcRequestPayload::Mkdir { name, .. }
+                if name == b"replayed"
+        ));
+        let first_response = bridge
+            .dispatch(PeerId(CLIENT_NODE), &first_request, &target)
+            .expect("dispatch mutation before dropping its response");
+        assert_eq!(first_response.header.errno, Errno::SUCCESS);
+        owner_transport
+            .close_session(first_session, SessionCloseReason::TransportError)
+            .expect("drop first response connection");
+
+        let (replay_session, mut replay_adapter) =
+            admit_test_session(&mut owner_transport, authority);
+        let replay_request =
+            receive_test_request(&mut owner_transport, replay_session, &mut replay_adapter);
+        assert_eq!(replay_request, first_request);
+        let replay_response = bridge
+            .dispatch(PeerId(CLIENT_NODE), &replay_request, &target)
+            .expect("replay mutation against retained owner state");
+        assert_ne!(replay_response.header.flags & RESP_FLAG_DEDUP_REPLAY, 0);
+        assert_eq!(replay_response.payload, first_response.payload);
+        send_test_response(
+            &mut owner_transport,
+            replay_session,
+            &replay_adapter,
+            &replay_response,
+            1,
+        );
+
+        let following_request =
+            receive_test_request(&mut owner_transport, replay_session, &mut replay_adapter);
+        assert!(matches!(
+            &following_request.payload,
+            tidefs_vfs_rpc::VfsRpcRequestPayload::Lookup { name, .. }
+                if name == b"replayed"
+        ));
+        let following_response = bridge
+            .dispatch(PeerId(CLIENT_NODE), &following_request, &target)
+            .expect("dispatch operation after reconnect");
+        send_test_response(
+            &mut owner_transport,
+            replay_session,
+            &replay_adapter,
+            &following_response,
+            2,
+        );
+
+        let moved_request =
+            receive_test_request(&mut owner_transport, replay_session, &mut replay_adapter);
+        assert!(matches!(
+            &moved_request.payload,
+            tidefs_vfs_rpc::VfsRpcRequestPayload::Mkdir { name, .. }
+                if name == b"authority-moved"
+        ));
+        owner_transport
+            .close_session(replay_session, SessionCloseReason::TransportError)
+            .expect("drop request before authority movement");
+
+        let moved_authority = VfsRpcSessionAuthority::new(
+            POOL_GUID,
+            dataset_id,
+            OWNER_NODE,
+            WRITER_TERM + 1,
+            WRITER_EPOCH,
+        )
+        .expect("build moved reconnect authority");
+        let (moved_session, _) = admit_test_session(&mut owner_transport, moved_authority);
+        let _ = owner_transport.close_session(moved_session, SessionCloseReason::LocalShutdown);
+
+        (
+            first_request.header.op_id,
+            following_request.header.op_id,
+            moved_request.header.op_id,
+        )
+    });
+
+    let client = ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+        owner_addr,
+        POOL_GUID,
+        client_identity.private_credential(),
+        owner_identity.public_identity(),
+    ))
+    .expect("construct reconnecting cluster VFS_RPC client");
+    let remote_adapter = FuseVfsAdapter::new(Box::new(VfsDispatchEngineBridge::new(client)))
+        .expect("construct reconnecting adapter engine");
+    let remote_engine = remote_adapter.engine_handle();
+    let ctx = request_ctx();
+    {
+        let engine = remote_engine.lock().expect("lock reconnecting engine");
+        let created = engine
+            .mkdir(ROOT_INODE_ID, b"replayed", 0o755, &ctx)
+            .expect("return replayed mkdir success after response loss");
+        assert_eq!(
+            engine
+                .lookup(ROOT_INODE_ID, b"replayed", &ctx)
+                .expect("serve lookup after authenticated reconnect")
+                .inode_id,
+            created.inode_id
+        );
+        assert_eq!(
+            engine
+                .mkdir(ROOT_INODE_ID, b"authority-moved", 0o755, &ctx)
+                .unwrap_err(),
+            Errno::ESTALE
+        );
+    }
+    drop(remote_engine);
+    drop(remote_adapter);
+
+    let (first_op, following_op, moved_op) = owner_thread.join().expect("faulting owner thread");
+    assert_ne!(first_op.0, 0);
+    assert_eq!(following_op.0, first_op.0.wrapping_add(1).max(1));
+    assert_eq!(moved_op.0, following_op.0.wrapping_add(1).max(1));
+
+    let local_engine = owner_adapter.engine_handle();
+    let engine = local_engine
+        .lock()
+        .expect("lock owner engine after reconnect");
+    engine
+        .lookup(ROOT_INODE_ID, b"replayed", &ctx)
+        .expect("replayed mutation exists exactly once");
+    assert_eq!(
+        engine
+            .lookup(ROOT_INODE_ID, b"authority-moved", &ctx)
+            .unwrap_err(),
+        Errno::ENOENT
+    );
 }
 
 #[test]

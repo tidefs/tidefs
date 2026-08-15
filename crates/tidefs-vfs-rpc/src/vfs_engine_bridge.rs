@@ -1035,7 +1035,12 @@ fn dedup_eligible(payload: &VfsRpcRequestPayload) -> bool {
             | VfsRpcRequestPayload::Create { .. }
             | VfsRpcRequestPayload::Setattr { .. }
             | VfsRpcRequestPayload::Open { .. }
+            | VfsRpcRequestPayload::Close { .. }
+            | VfsRpcRequestPayload::Release { .. }
             | VfsRpcRequestPayload::Opendir { .. }
+            | VfsRpcRequestPayload::Closedir { .. }
+            | VfsRpcRequestPayload::Releasedir { .. }
+            | VfsRpcRequestPayload::Flush { .. }
             | VfsRpcRequestPayload::Write { .. }
             | VfsRpcRequestPayload::Fsync { .. }
             | VfsRpcRequestPayload::Fallocate { .. }
@@ -1223,6 +1228,7 @@ mod tests {
         writes: RefCell<Vec<Vec<u8>>>,
         last_ctx: RefCell<Option<RequestCtx>>,
         releases: Cell<u32>,
+        flushes: Cell<u32>,
         reads: Cell<u32>,
         links: Cell<u32>,
         symlinks: Cell<u32>,
@@ -1234,6 +1240,7 @@ mod tests {
                 writes: RefCell::new(Vec::new()),
                 last_ctx: RefCell::new(None),
                 releases: Cell::new(0),
+                flushes: Cell::new(0),
                 reads: Cell::new(0),
                 links: Cell::new(0),
                 symlinks: Cell::new(0),
@@ -1326,6 +1333,10 @@ mod tests {
                 }
                 VfsOperation::Release(_) => {
                     self.releases.set(self.releases.get() + 1);
+                    Ok(VfsResponse::Unit(engine_op::UnitResponse))
+                }
+                VfsOperation::Flush(_) => {
+                    self.flushes.set(self.flushes.get() + 1);
                     Ok(VfsResponse::Unit(engine_op::UnitResponse))
                 }
                 VfsOperation::OpenDir(req) => {
@@ -1705,7 +1716,7 @@ mod tests {
     }
 
     #[test]
-    fn release_removes_handle_and_retry_misses_registry() {
+    fn release_removes_handle_and_replays_completed_response() {
         let mut bridge = bridge();
         let target = RecordingDispatch::new();
         let handle = create_handle(&mut bridge, &target);
@@ -1715,8 +1726,32 @@ mod tests {
         let second = bridge.dispatch(PEER, &release, &target).unwrap();
 
         assert_eq!(first.header.errno, Errno::SUCCESS);
-        assert_eq!(second.header.errno, Errno::EBADF);
+        assert_eq!(second.header.errno, Errno::SUCCESS);
+        assert_ne!(second.header.flags & RESP_FLAG_DEDUP_REPLAY, 0);
         assert_eq!(target.releases.get(), 1);
+    }
+
+    #[test]
+    fn flush_replays_completed_response_without_reexecuting_engine() {
+        let mut bridge = bridge();
+        let target = RecordingDispatch::new();
+        let handle = create_handle(&mut bridge, &target);
+        let flush = request(
+            2,
+            0,
+            VfsRpcRequestPayload::Flush {
+                handle,
+                lock_owner: 9,
+            },
+        );
+
+        let first = bridge.dispatch(PEER, &flush, &target).unwrap();
+        let second = bridge.dispatch(PEER, &flush, &target).unwrap();
+
+        assert_eq!(first.header.errno, Errno::SUCCESS);
+        assert_eq!(second.header.errno, Errno::SUCCESS);
+        assert_ne!(second.header.flags & RESP_FLAG_DEDUP_REPLAY, 0);
+        assert_eq!(target.flushes.get(), 1);
     }
 
     #[test]

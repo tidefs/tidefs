@@ -5,9 +5,14 @@
 //! trusted owner identity. It performs one refused epoch-zero discovery
 //! exchange, retries once with the authenticated owner epoch, and derives all
 //! writer/dataset/term/epoch authority from the owner-issued preface.
+//! If one inline request loses its transport before the response arrives, the
+//! client opens one fresh mutually authenticated session and replays the exact
+//! request and operation ID only when the full owner authority is unchanged.
+//! Any Pool, dataset, writer, term, or epoch movement fails closed.
 
-use std::collections::BTreeMap;
+use std::collections::{hash_map::RandomState, BTreeMap};
 use std::fmt;
+use std::hash::{BuildHasher, Hasher};
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::thread;
@@ -25,17 +30,19 @@ use tidefs_vfs_engine::operation as engine_op;
 use tidefs_vfs_engine::{VfsDispatch, VfsOperation, VfsResponse};
 use tidefs_vfs_rpc::transport_adapter::{
     decode_session_authority_frame, VfsRpcEnvelopeContext, VfsRpcInboundFrame,
-    VfsRpcSessionAuthorityError, VfsRpcTransportAdapter, VfsRpcTransportAdapterConfig,
+    VfsRpcSessionAuthority, VfsRpcSessionAuthorityError, VfsRpcTransportAdapter,
+    VfsRpcTransportAdapterConfig,
 };
 use tidefs_vfs_rpc::{
-    DatasetId, InlineOrBulk, PeerId, VfsRpcClient, VfsRpcCredentials, VfsRpcHandle,
-    VfsRpcHandleType, VfsRpcRequestPayload, VfsRpcResponse, VfsRpcResponsePayload,
+    DatasetId, InlineOrBulk, OpId, PeerId, VfsRpcClient, VfsRpcCredentials, VfsRpcHandle,
+    VfsRpcHandleType, VfsRpcRequest, VfsRpcRequestPayload, VfsRpcResponse, VfsRpcResponsePayload,
     DEFAULT_INLINE_THRESHOLD,
 };
 
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+const CLIENT_RECONNECT_ATTEMPTS: usize = 1;
 
 /// Operator-provisioned inputs for one authenticated remote owner connection.
 ///
@@ -261,7 +268,12 @@ impl ClusterVfsRpcClient {
 
         let (mut transport, session_id) = connect_transport(&config, owner_epoch)?;
         match transport.perform_handshake(session_id) {
-            Ok(()) => Self::new(transport, session_id, config.expected_pool_guid),
+            Ok(()) => Self::from_authenticated_transport(
+                transport,
+                session_id,
+                config.expected_pool_guid,
+                Some(config),
+            ),
             Err(TransportError::AttestedEpochMismatch {
                 authenticated_peer,
                 proposed_epoch,
@@ -279,9 +291,18 @@ impl ClusterVfsRpcClient {
     /// Consume an already-authenticated Control transport/session and derive
     /// request authority from its owner-issued preface.
     pub fn new(
+        transport: Transport,
+        session_id: SessionId,
+        expected_pool_guid: [u8; 16],
+    ) -> Result<Self, ClusterVfsRpcClientError> {
+        Self::from_authenticated_transport(transport, session_id, expected_pool_guid, None)
+    }
+
+    fn from_authenticated_transport(
         mut transport: Transport,
         session_id: SessionId,
         expected_pool_guid: [u8; 16],
+        reconnect_config: Option<ClusterVfsRpcClientConfig>,
     ) -> Result<Self, ClusterVfsRpcClientError> {
         let authenticated_peer = validate_construction_session(&transport, session_id)?;
         transport
@@ -306,11 +327,12 @@ impl ClusterVfsRpcClient {
                 local_node,
                 writer,
                 dataset_id,
-                rpc: VfsRpcClient::new(
+                rpc: VfsRpcClient::new_with_initial_op_id(
                     writer,
                     dataset_id,
                     authority.term(),
                     authority.epoch(),
+                    randomized_operation_id(local_node, authority),
                     1,
                     Duration::from_millis(250),
                 ),
@@ -325,6 +347,8 @@ impl ClusterVfsRpcClient {
                 files: BTreeMap::new(),
                 directories: BTreeMap::new(),
                 closed: false,
+                authority,
+                reconnect_config,
             }),
         })
     }
@@ -376,6 +400,26 @@ fn connect_transport(
     Ok((transport, session_id))
 }
 
+fn randomized_operation_id(local_node: u64, authority: VfsRpcSessionAuthority) -> OpId {
+    let randomized = RandomState::new();
+    let mut attempt = 0_u64;
+    loop {
+        let mut hasher = randomized.build_hasher();
+        hasher.write(b"tidefs-vfs-rpc-op-incarnation-v1");
+        hasher.write_u64(local_node);
+        hasher.write_u64(authority.writer_node());
+        hasher.write(&authority.dataset_id().0.to_le_bytes());
+        hasher.write_u64(authority.term());
+        hasher.write_u64(authority.epoch());
+        hasher.write_u64(attempt);
+        let op_id = hasher.finish();
+        if op_id != 0 {
+            return OpId(op_id);
+        }
+        attempt = attempt.wrapping_add(1);
+    }
+}
+
 impl VfsDispatch for ClusterVfsRpcClient {
     fn dispatch(&self, operation: VfsOperation) -> Result<VfsResponse, Errno> {
         self.state
@@ -411,6 +455,8 @@ struct ClientState {
     files: BTreeMap<FileHandleId, FileHandleRecord>,
     directories: BTreeMap<DirHandleId, DirHandleRecord>,
     closed: bool,
+    authority: VfsRpcSessionAuthority,
+    reconnect_config: Option<ClusterVfsRpcClientConfig>,
 }
 
 impl ClientState {
@@ -749,12 +795,85 @@ impl ClientState {
         payload: VfsRpcRequestPayload,
         credentials: VfsRpcCredentials,
     ) -> Result<VfsRpcResponsePayload, Errno> {
-        self.validate_live_session()?;
+        if self.closed {
+            return Err(Errno::ESTALE);
+        }
+        if let Err(error) = self.validate_live_session() {
+            if self.reconnect_config.is_none() {
+                return Err(error);
+            }
+            self.reconnect_exact()?;
+        }
         let now = Instant::now();
         let request = self
             .rpc
             .begin_request(now, 0, payload, Some(credentials))
             .map_err(|_| Errno::EPROTO)?;
+        let op_id = request.header.op_id;
+        let result = self.call_pending(&request).and_then(response_payload);
+        if self.rpc.abandon_request(op_id).is_some() {
+            self.reset_adapter_for_current_session();
+        }
+        result
+    }
+
+    fn call_pending(&mut self, request: &VfsRpcRequest) -> Result<VfsRpcResponse, Errno> {
+        let mut reconnect_attempts = 0;
+
+        'transmit: loop {
+            if let Err(error) = self.send_pending(request) {
+                if error.reconnectable && reconnect_attempts < CLIENT_RECONNECT_ATTEMPTS {
+                    self.reconnect_exact()?;
+                    reconnect_attempts += 1;
+                    continue;
+                }
+                return Err(error.errno);
+            }
+
+            let deadline = Instant::now() + CLIENT_REQUEST_TIMEOUT;
+            loop {
+                let (envelope, payload) = match self.transport.recv_envelope(self.session_id) {
+                    Ok(frame) => frame,
+                    Err(TransportError::WouldBlock(_)) if Instant::now() < deadline => {
+                        thread::sleep(CLIENT_RETRY_INTERVAL);
+                        continue;
+                    }
+                    Err(TransportError::WouldBlock(_)) => {
+                        if reconnect_attempts < CLIENT_RECONNECT_ATTEMPTS {
+                            self.reconnect_exact()?;
+                            reconnect_attempts += 1;
+                            continue 'transmit;
+                        }
+                        return Err(Errno::EIO);
+                    }
+                    Err(error) => {
+                        let failure = classify_transport_error(error);
+                        if failure.reconnectable && reconnect_attempts < CLIENT_RECONNECT_ATTEMPTS {
+                            self.reconnect_exact()?;
+                            reconnect_attempts += 1;
+                            continue 'transmit;
+                        }
+                        return Err(failure.errno);
+                    }
+                };
+                let received_at = Instant::now();
+                let inbound = self
+                    .adapter
+                    .unwrap_inbound(received_at, self.session_id, &envelope, &payload)
+                    .map_err(|error| error.errno())?;
+                let VfsRpcInboundFrame::Response { response, .. } = inbound else {
+                    return Err(Errno::EPROTO);
+                };
+                self.rpc
+                    .complete_response(received_at, &response)
+                    .map_err(|_| Errno::EPROTO)?;
+                return Ok(response);
+            }
+        }
+    }
+
+    fn send_pending(&mut self, request: &VfsRpcRequest) -> Result<(), TransportFailure> {
+        let now = Instant::now();
         let context = VfsRpcEnvelopeContext {
             sequence_number: self.next_sequence,
             ..VfsRpcEnvelopeContext::default()
@@ -762,40 +881,62 @@ impl ClientState {
         self.next_sequence = self.next_sequence.saturating_add(1);
         let mut outbound = self
             .adapter
-            .begin_request(PeerId(self.writer), &request, now, context)
-            .map_err(|error| error.errno())?;
+            .begin_request(PeerId(self.writer), request, now, context)
+            .map_err(|error| TransportFailure {
+                errno: error.errno(),
+                reconnectable: error.is_retryable(),
+            })?;
         self.transport
             .send_envelope(&mut outbound.envelope, &outbound.payload)
-            .map_err(map_transport_error)?;
+            .map_err(classify_transport_error)
+    }
 
-        let deadline = now + CLIENT_REQUEST_TIMEOUT;
-        loop {
-            let (envelope, payload) = match self.transport.recv_envelope(self.session_id) {
-                Ok(frame) => frame,
-                Err(TransportError::WouldBlock(_)) if Instant::now() < deadline => {
-                    thread::sleep(CLIENT_RETRY_INTERVAL);
-                    continue;
-                }
-                Err(TransportError::WouldBlock(_)) => {
-                    let _ = self.close();
-                    return Err(Errno::EIO);
-                }
-                Err(error) => return Err(map_transport_error(error)),
-            };
-            let received_at = Instant::now();
-            let inbound = self
-                .adapter
-                .unwrap_inbound(received_at, self.session_id, &envelope, &payload)
-                .map_err(|error| error.errno())?;
-            let VfsRpcInboundFrame::Response { response, .. } = inbound else {
-                return Err(Errno::EPROTO);
-            };
-            self.rpc
-                .complete_response(received_at, &response)
-                .map_err(|_| Errno::EPROTO)?;
-            self.validate_live_session()?;
-            return response_payload(response);
+    fn reconnect_exact(&mut self) -> Result<(), Errno> {
+        let config = self.reconnect_config.as_ref().ok_or(Errno::EIO)?;
+        let (mut replacement, replacement_session) =
+            connect_transport(config, self.authority.epoch()).map_err(|_| Errno::EIO)?;
+        match replacement.perform_handshake(replacement_session) {
+            Ok(()) => {}
+            Err(TransportError::AttestedEpochMismatch { .. }) => return Err(Errno::ESTALE),
+            Err(_) => return Err(Errno::EIO),
         }
+        let authenticated_peer = validate_construction_session(&replacement, replacement_session)
+            .map_err(|_| Errno::EIO)?;
+        replacement.set_nonblocking(true).map_err(|_| Errno::EIO)?;
+        let replacement_authority =
+            receive_session_authority(&mut replacement, replacement_session)
+                .map_err(|_| Errno::EIO)?;
+        if replacement_authority
+            .validate_for_client(config.expected_pool_guid, authenticated_peer)
+            .is_err()
+            || replacement_authority != self.authority
+        {
+            let _ =
+                replacement.close_session(replacement_session, SessionCloseReason::TransportError);
+            return Err(Errno::ESTALE);
+        }
+
+        let old_session = self.session_id;
+        let mut old_transport = std::mem::replace(&mut self.transport, replacement);
+        self.session_id = replacement_session;
+        self.next_sequence = 0;
+        self.closed = false;
+        self.reset_adapter_for_current_session();
+        let _ = old_transport.close_session(old_session, SessionCloseReason::TransportError);
+        Ok(())
+    }
+
+    fn reset_adapter_for_current_session(&mut self) {
+        let mut sessions = TransportSessionSet::new();
+        sessions.add_binding_with_epoch(self.writer, self.session_id, self.authority.epoch());
+        sessions.mark_healthy(self.session_id);
+        self.adapter = VfsRpcTransportAdapter::new(
+            VfsRpcTransportAdapterConfig {
+                request_timeout: CLIENT_REQUEST_TIMEOUT,
+                ..VfsRpcTransportAdapterConfig::default()
+            },
+            sessions,
+        );
     }
 
     fn register_file(
@@ -1041,12 +1182,30 @@ fn expect_empty(payload: VfsRpcResponsePayload) -> Result<(), Errno> {
     }
 }
 
-fn map_transport_error(error: TransportError) -> Errno {
-    match error {
+#[derive(Clone, Copy)]
+struct TransportFailure {
+    errno: Errno,
+    reconnectable: bool,
+}
+
+fn classify_transport_error(error: TransportError) -> TransportFailure {
+    let reconnectable = matches!(
+        &error,
+        TransportError::SessionNotFound { .. }
+            | TransportError::SessionInWrongState { .. }
+            | TransportError::Io { .. }
+            | TransportError::SendBufferShutdown { .. }
+            | TransportError::Generic(_)
+    );
+    let errno = match error {
         TransportError::WouldBlock(_) | TransportError::SendBufferFull { .. } => Errno::EAGAIN,
         TransportError::SessionNotFound { .. }
         | TransportError::SessionInWrongState { .. }
         | TransportError::SendBufferShutdown { .. } => Errno::ESTALE,
         _ => Errno::EIO,
+    };
+    TransportFailure {
+        errno,
+        reconnectable,
     }
 }
