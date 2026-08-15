@@ -1771,12 +1771,14 @@ mod tests {
             "--cluster-trusted-authority-identity",
             "/etc/tidefs/authority.identity",
             "--cluster-trusted-vfs-rpc-peer-identity",
-            "/etc/tidefs/peer.identity",
+            "/etc/tidefs/peer-a.identity",
+            "--cluster-trusted-vfs-rpc-peer-identity",
+            "/etc/tidefs/peer-b.identity",
         ]);
 
         assert!(
             args.is_ok(),
-            "explicit cluster mount authority should parse"
+            "cluster owner mount should accept repeated trusted peer identities"
         );
     }
 

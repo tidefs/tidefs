@@ -265,13 +265,15 @@ pub enum PoolCommand {
         cluster_trusted_authority_identity: Option<PathBuf>,
 
         #[cfg(feature = "cluster")]
-        /// Shareable public identity trusted for the VFS_RPC peer.
+        /// Shareable public identity trusted for a VFS_RPC peer. Repeat for
+        /// each admitted peer on a cluster owner; clients require exactly one.
         #[arg(
             long = "cluster-trusted-vfs-rpc-peer-identity",
             value_name = "PATH",
+            action = clap::ArgAction::Append,
             required_if_eq_any([("cluster", "true"), ("cluster_client", "true")])
         )]
-        cluster_trusted_vfs_rpc_peer_identity: Option<PathBuf>,
+        cluster_trusted_vfs_rpc_peer_identity: Vec<PathBuf>,
     },
 
     /// Run an integrity check through the live owner, or offline with explicit devices

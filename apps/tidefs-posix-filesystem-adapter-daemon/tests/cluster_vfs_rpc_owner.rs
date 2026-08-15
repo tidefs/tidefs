@@ -38,6 +38,7 @@ use tidefs_vfs_rpc::{
 
 const OWNER_NODE: u64 = 2;
 const CLIENT_NODE: u64 = 1;
+const CLIENT_B_NODE: u64 = 3;
 const WRITER_TERM: u64 = 77;
 const WRITER_EPOCH: u64 = 9;
 const POOL_GUID: [u8; 16] = [0x47; 16];
@@ -72,6 +73,19 @@ impl ProvisionedIdentity {
     fn public_identity(&self) -> NodePublicIdentity {
         NodePublicIdentity::decode_fixed(&self.public_bytes)
             .expect("decode provisioned test public identity")
+    }
+}
+
+fn assert_owner_start_refused(config: ClusterVfsRpcOwnerConfig, expected: &str) {
+    match ClusterVfsRpcOwnerHandle::start(config) {
+        Err(error) => assert!(
+            error.contains(expected),
+            "unexpected owner-start refusal: {error}"
+        ),
+        Ok(mut unexpected_owner) => {
+            let _ = unexpected_owner.stop();
+            panic!("owner startup unexpectedly admitted invalid peer configuration");
+        }
     }
 }
 
@@ -266,6 +280,7 @@ impl RpcClient {
 fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
     let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
     let client_identity = ProvisionedIdentity::new(CLIENT_NODE);
+    let client_b_identity = ProvisionedIdentity::new(CLIENT_B_NODE);
     let root = tempfile::tempdir().expect("create persistent test root");
     let metadata_dir = root.path().join("metadata");
     let member = root.path().join("member.img");
@@ -329,9 +344,11 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
     let zero_dataset = ClusterVfsRpcOwnerConfig::new(
         "127.0.0.1:0".parse().unwrap(),
         OWNER_NODE,
-        CLIENT_NODE,
         owner_identity.credential(),
-        client_identity.public_identity(),
+        vec![
+            client_identity.public_identity(),
+            client_b_identity.public_identity(),
+        ],
         POOL_GUID,
         DatasetId::new(0),
         Arc::clone(&writer_fence),
@@ -345,12 +362,60 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
             panic!("zero VFS dataset identity must fail closed");
         }
     }
+    assert_owner_start_refused(
+        ClusterVfsRpcOwnerConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            OWNER_NODE,
+            owner_identity.credential(),
+            Vec::new(),
+            POOL_GUID,
+            dataset_id,
+            Arc::clone(&writer_fence),
+            Arc::clone(&engine),
+            Arc::clone(&shutdown),
+        ),
+        "at least one trusted peer identity",
+    );
+    let conflicting_client_identity = ProvisionedIdentity::new(CLIENT_NODE);
+    assert_owner_start_refused(
+        ClusterVfsRpcOwnerConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            OWNER_NODE,
+            owner_identity.credential(),
+            vec![
+                client_identity.public_identity(),
+                conflicting_client_identity.public_identity(),
+            ],
+            POOL_GUID,
+            dataset_id,
+            Arc::clone(&writer_fence),
+            Arc::clone(&engine),
+            Arc::clone(&shutdown),
+        ),
+        "more than one trusted identity for node 1",
+    );
+    assert_owner_start_refused(
+        ClusterVfsRpcOwnerConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            OWNER_NODE,
+            owner_identity.credential(),
+            vec![owner_identity.public_identity()],
+            POOL_GUID,
+            dataset_id,
+            Arc::clone(&writer_fence),
+            Arc::clone(&engine),
+            Arc::clone(&shutdown),
+        ),
+        "trusted peer node 2 conflicts with the local owner node",
+    );
     let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
         "127.0.0.1:0".parse().unwrap(),
         OWNER_NODE,
-        CLIENT_NODE,
         owner_identity.credential(),
-        client_identity.public_identity(),
+        vec![
+            client_identity.public_identity(),
+            client_b_identity.public_identity(),
+        ],
         POOL_GUID,
         dataset_id,
         writer_fence,
@@ -488,6 +553,13 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
         Errno::EOPNOTSUPP
     );
 
+    let mut client_b = RpcClient::connect(
+        CLIENT_B_NODE,
+        owner.bound_addr(),
+        &client_b_identity,
+        &owner_identity,
+    );
+
     let mismatched_credentials = client.new_request(
         WRITER_TERM,
         WRITER_EPOCH,
@@ -516,6 +588,24 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
         client.transport.recv_envelope(client.session_id).is_err(),
         "the owner must close a transport whose VFS_RPC credentials name another peer"
     );
+
+    let peer_b_root = client_b.new_request(
+        WRITER_TERM,
+        WRITER_EPOCH,
+        0,
+        VfsRpcRequestPayload::GetRoot,
+        Some(VfsRpcCredentials::root(PeerId(CLIENT_B_NODE))),
+    );
+    let peer_b_response = client_b.round_trip(&peer_b_root);
+    assert_eq!(peer_b_response.header.errno, Errno::SUCCESS);
+    assert_eq!(
+        peer_b_response.payload,
+        VfsRpcResponsePayload::RootInode(ROOT_INODE_ID),
+        "a protocol failure on peer A must not kill peer B"
+    );
+    owner
+        .check_health()
+        .expect("per-session protocol failure must not kill the owner");
 
     owner.stop().expect("stop Pool-backed VFS_RPC owner");
     assert!(!shutdown.load(Ordering::Acquire));
