@@ -590,19 +590,16 @@ pub fn pool_destroy(device_paths: &[PathBuf], zero_superblock: bool) -> Result<(
     let config = tidefs_pool_scan::PoolAssembler::assemble(&entries, None)
         .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
 
-    let mut devices: Vec<DeviceHandle> = Vec::new();
+    let mut devices: Vec<PreparedDestroyDevice> = Vec::new();
     let leaves = collect_leaves(&config.device_tree);
     for leaf in &leaves {
-        let handle = DeviceHandle::open_rw(&leaf.device_path, leaf.device_index)?
+        let mut handle = DeviceHandle::open_rw(&leaf.device_path, leaf.device_index)?
             .with_label_offset(label_offsets.get(&leaf.device_path).copied().unwrap_or(0));
-        devices.push(handle);
-    }
-
-    for device in &mut devices {
-        let old_buf = device.read_label_bytes()?;
+        let copy_offsets = handle.redundant_label_copy_offsets()?;
+        let old_buf = handle.read_label_bytes()?;
         let old_label =
             tidefs_types_pool_label_core::decode_label(&old_buf).map_err(|e| ImportError::Io {
-                device_path: Some(device.device_path.clone()),
+                device_path: Some(handle.device_path.clone()),
                 msg: format!("decode label: {e}"),
             })?;
 
@@ -612,18 +609,109 @@ pub fn pool_destroy(device_paths: &[PathBuf], zero_superblock: bool) -> Result<(
         let out_buf = encode_label_update_preserving_device_layout(
             new_label,
             &old_buf,
-            &device.device_path,
+            &handle.device_path,
             "destroy",
         )?;
-
-        device.write_label_bytes(&out_buf)?;
-
-        if zero_superblock {
-            let zeroes = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
-            device.write_label_bytes(&zeroes)?;
-        }
+        devices.push(PreparedDestroyDevice {
+            handle,
+            copy_offsets,
+            destroyed_label: out_buf,
+        });
     }
 
+    // Publish a complete terminal backup family before replacing the primary
+    // family. An interruption before backup completion leaves the predecessor
+    // primary family complete; after backup completion, DESTROYED is terminal.
+    write_and_verify_destroyed_label_family(&mut devices, DestroyLabelCopy::Backup)?;
+    write_and_verify_destroyed_label_family(&mut devices, DestroyLabelCopy::Primary)?;
+
+    if zero_superblock {
+        // Zero the backup family first so the complete primary tombstone
+        // remains authoritative until the final zeroing stage begins.
+        zero_and_verify_destroyed_label_family(&mut devices, DestroyLabelCopy::Backup)?;
+        zero_and_verify_destroyed_label_family(&mut devices, DestroyLabelCopy::Primary)?;
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum DestroyLabelCopy {
+    Primary,
+    Backup,
+}
+
+#[derive(Clone, Copy)]
+struct RedundantLabelCopyOffsets {
+    primary: u64,
+    backup: Option<u64>,
+}
+
+impl RedundantLabelCopyOffsets {
+    fn get(self, target: DestroyLabelCopy) -> Option<u64> {
+        match target {
+            DestroyLabelCopy::Primary => Some(self.primary),
+            DestroyLabelCopy::Backup => self.backup,
+        }
+    }
+}
+
+struct PreparedDestroyDevice {
+    handle: DeviceHandle,
+    copy_offsets: RedundantLabelCopyOffsets,
+    destroyed_label: Vec<u8>,
+}
+
+fn write_and_verify_destroyed_label_family(
+    devices: &mut [PreparedDestroyDevice],
+    target: DestroyLabelCopy,
+) -> Result<(), ImportError> {
+    for device in devices.iter_mut() {
+        if let Some(offset) = device.copy_offsets.get(target) {
+            device
+                .handle
+                .write_label_bytes_at(offset, &device.destroyed_label)?;
+        }
+    }
+    sync_destroy_label_family(devices, target)?;
+    for device in devices.iter_mut() {
+        if let Some(offset) = device.copy_offsets.get(target) {
+            device
+                .handle
+                .verify_label_bytes_at(offset, &device.destroyed_label)?;
+        }
+    }
+    Ok(())
+}
+
+fn zero_and_verify_destroyed_label_family(
+    devices: &mut [PreparedDestroyDevice],
+    target: DestroyLabelCopy,
+) -> Result<(), ImportError> {
+    let zeroes = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
+    for device in devices.iter_mut() {
+        if let Some(offset) = device.copy_offsets.get(target) {
+            device.handle.write_label_bytes_at(offset, &zeroes)?;
+        }
+    }
+    sync_destroy_label_family(devices, target)?;
+    for device in devices.iter_mut() {
+        if let Some(offset) = device.copy_offsets.get(target) {
+            device.handle.verify_label_bytes_at(offset, &zeroes)?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_destroy_label_family(
+    devices: &mut [PreparedDestroyDevice],
+    target: DestroyLabelCopy,
+) -> Result<(), ImportError> {
+    for device in devices.iter_mut() {
+        if device.copy_offsets.get(target).is_some() {
+            device.handle.sync_label_writes()?;
+        }
+    }
     Ok(())
 }
 
@@ -679,6 +767,30 @@ impl DeviceHandle {
     fn with_label_offset(mut self, label_offset: u64) -> Self {
         self.label_offset = label_offset;
         self
+    }
+
+    fn redundant_label_copy_offsets(&mut self) -> Result<RedundantLabelCopyOffsets, ImportError> {
+        let size = self
+            .file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| ImportError::Io {
+                device_path: Some(self.device_path.clone()),
+                msg: format!("measure device for redundant labels: {e}"),
+            })?;
+        let label_size = tidefs_types_pool_label_core::POOL_LABEL_SIZE as u64;
+        if size < label_size {
+            return Err(ImportError::Io {
+                device_path: Some(self.device_path.clone()),
+                msg: format!(
+                    "device is too small for a Pool label: {size} bytes, need {label_size}"
+                ),
+            });
+        }
+        let backup = size - label_size;
+        Ok(RedundantLabelCopyOffsets {
+            primary: 0,
+            backup: (backup != 0).then_some(backup),
+        })
     }
 
     /// Read the selected `POOL_LABEL_SIZE` bytes from this device.
@@ -740,6 +852,10 @@ impl DeviceHandle {
     /// Rewrite the selected encoded pool label without clobbering the
     /// reserved commit-record/system area that shares its label region.
     fn write_label_bytes(&mut self, buf: &[u8]) -> Result<(), ImportError> {
+        self.write_label_bytes_at(self.label_offset, buf)
+    }
+
+    fn label_write_len(&self, buf: &[u8]) -> Result<usize, ImportError> {
         debug_assert_eq!(buf.len(), tidefs_types_pool_label_core::POOL_LABEL_SIZE);
         let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
         let has_device_layout =
@@ -790,18 +906,44 @@ impl DeviceHandle {
         } else {
             tidefs_types_pool_label_core::POOL_LABEL_V1_EXT_WIRE_SIZE
         };
+        Ok(write_len)
+    }
+
+    fn write_label_bytes_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), ImportError> {
+        let write_len = self.label_write_len(buf)?;
         self.file
-            .seek(SeekFrom::Start(self.label_offset))
+            .seek(SeekFrom::Start(offset))
             .map_err(|e| ImportError::Io {
                 device_path: Some(self.device_path.clone()),
-                msg: format!("seek to selected label at {}: {e}", self.label_offset),
+                msg: format!("seek to label at {offset}: {e}"),
             })?;
         self.file
             .write_all(&buf[..write_len])
             .map_err(|e| ImportError::Io {
                 device_path: Some(self.device_path.clone()),
-                msg: format!("write selected label at {}: {e}", self.label_offset),
+                msg: format!("write label at {offset}: {e}"),
             })
+    }
+
+    fn verify_label_bytes_at(&mut self, offset: u64, expected: &[u8]) -> Result<(), ImportError> {
+        let verify_len = self.label_write_len(expected)?;
+        let actual = self.read_bytes_at(offset, verify_len as u64)?;
+        if actual != expected[..verify_len] {
+            return Err(ImportError::Io {
+                device_path: Some(self.device_path.clone()),
+                msg: format!(
+                    "label verification mismatch at {offset}: expected {verify_len} exact bytes"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn sync_label_writes(&self) -> Result<(), ImportError> {
+        self.file.sync_all().map_err(|e| ImportError::Io {
+            device_path: Some(self.device_path.clone()),
+            msg: format!("sync redundant Pool label writes: {e}"),
+        })
     }
 }
 
@@ -2444,7 +2586,7 @@ fn replay_intent_log_data(data: &[u8], recovery_txg: u64) -> Result<u64, String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use tidefs_local_object_store::device_layout::{encode_device_layout_v1, DeviceLayoutPolicy};
     use tidefs_pool_scan::DeviceHealth;
     use tidefs_types_pool_label_core::{
@@ -2550,6 +2692,28 @@ mod tests {
             0,
             0,
         );
+    }
+
+    fn write_test_redundant_labels(path: &Path, pool_name: &str) -> u64 {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        write_test_label(&mut file, pool_name);
+
+        let mut primary = vec![0u8; POOL_LABEL_SIZE];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut primary).unwrap();
+        let device_size = (3 * POOL_LABEL_SIZE) as u64;
+        let backup_offset = device_size - POOL_LABEL_SIZE as u64;
+        file.set_len(device_size).unwrap();
+        file.seek(SeekFrom::Start(backup_offset)).unwrap();
+        file.write_all(&primary).unwrap();
+        file.sync_all().unwrap();
+        backup_offset
     }
 
     fn write_test_label_for_device(
@@ -4363,23 +4527,97 @@ mod tests {
     }
 
     #[test]
-    fn pool_destroy_zero_superblock_zeroes_label() {
+    fn pool_destroy_transitions_both_redundant_labels_to_destroyed() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("redundant-device0");
+        let backup_offset = write_test_redundant_labels(&dev_path, "destroy_both");
+
+        pool_destroy(&[dev_path.clone()], false).unwrap();
+
+        let mut file = File::open(&dev_path).unwrap();
+        for offset in [0, backup_offset] {
+            let mut buf = vec![0u8; POOL_LABEL_SIZE];
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.read_exact(&mut buf).unwrap();
+            let label = tidefs_types_pool_label_core::decode_label(&buf).unwrap();
+            assert_eq!(label.pool_state, PoolState::Destroyed);
+            assert_eq!(label.pool_guid, [0xAA; 16]);
+            assert_eq!(label.device_guid, [0x01; 16]);
+        }
+
+        let lock_dir = dir.path().join("locks");
+        let error = pool_import(&[dev_path], &lock_dir, false, None, None).unwrap_err();
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("destroyed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pool_destroy_preserves_selected_lifecycle_in_both_tombstone_families() {
+        let dir = tempfile::tempdir().unwrap();
+        let (device_paths, backup_offset, expected_payload) =
+            create_backup_lifecycle_pool(dir.path(), "destroy-selected-lifecycle");
+
+        pool_destroy(&device_paths, false).unwrap();
+
+        for path in &device_paths {
+            for offset in [0, backup_offset] {
+                let bytes = read_label_bytes_at(path, offset);
+                let label = tidefs_types_pool_label_core::decode_label(&bytes).unwrap();
+                let roster = tidefs_types_pool_label_core::decode_topology_roster_v1(&bytes)
+                    .unwrap()
+                    .unwrap();
+                let lifecycle = decode_pool_lifecycle_v1(&bytes).unwrap().unwrap();
+                assert_eq!(label.pool_state, PoolState::Destroyed);
+                assert_eq!(label.pool_guid, [0xC7; 16]);
+                assert_eq!(label.topology_generation, 2);
+                assert_eq!(roster.topology_generation(), 2);
+                assert_eq!(lifecycle.sequence(), 9);
+                assert_eq!(lifecycle.kind(), PoolLifecycleKindV1::DeviceReplacement);
+                assert_eq!(lifecycle.payload(), expected_payload);
+            }
+        }
+    }
+
+    #[test]
+    fn pool_destroy_zero_superblock_zeroes_both_redundant_labels() {
         let dir = tempfile::tempdir().unwrap();
         let dev_path = dir.path().join("device0");
-        {
-            let mut f = File::create(&dev_path).unwrap();
-            write_test_label(&mut f, "zero_me");
-        }
+        let backup_offset = write_test_redundant_labels(&dev_path, "zero_me");
+        let sentinel_offset = POOL_LABEL_SIZE as u64 + 4096;
+        let sentinel = b"data-region-is-not-label-hygiene";
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dev_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(sentinel_offset)).unwrap();
+        file.write_all(sentinel).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
 
         pool_destroy(&[dev_path.clone()], true).unwrap();
 
-        // After zero_superblock, the label area should be all zeros.
-        let mut handle = DeviceHandle::open_ro(&dev_path, 0).unwrap();
-        let buf = handle.read_label_bytes().unwrap();
-        assert!(
-            buf.iter().all(|&b| b == 0),
-            "label area must be zeroed after pool_destroy with zero_superblock"
-        );
+        let mut file = File::open(&dev_path).unwrap();
+        for offset in [0, backup_offset] {
+            let mut buf = vec![0u8; POOL_LABEL_SIZE];
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.read_exact(&mut buf).unwrap();
+            assert!(
+                buf.iter().all(|&b| b == 0),
+                "label area at {offset} must be zeroed after pool_destroy"
+            );
+        }
+        let mut actual_sentinel = vec![0u8; sentinel.len()];
+        file.seek(SeekFrom::Start(sentinel_offset)).unwrap();
+        file.read_exact(&mut actual_sentinel).unwrap();
+        assert_eq!(actual_sentinel, sentinel);
+
+        let entries = tidefs_pool_scan::scan_labels(std::slice::from_ref(&dev_path)).unwrap();
+        assert!(!entries[0].has_tidefs_label);
+        let lock_dir = dir.path().join("locks");
+        assert!(pool_import(&[dev_path], &lock_dir, false, None, None).is_err());
     }
 
     // ── decode_vrbt tests ────────────────────────────────────────

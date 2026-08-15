@@ -1681,13 +1681,21 @@ fn handle_pool_destroy(
                     "pool_name": pool_name,
                     "device_count": devices.len(),
                     "zero_superblock": zero_superblock,
+                    "redundant_label_areas_zeroed": zero_superblock,
+                    "media_privacy_claimed": false,
+                    "secure_erase_claimed": false,
+                    "sanitization_claimed": false,
+                    "decommissioning_claimed": false,
                 });
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {
                 println!("pool destroyed: {pool_name}");
                 if zero_superblock {
-                    println!("  superblock zeroed: yes");
+                    println!("  redundant label areas zeroed and verified: yes");
                 }
+                println!(
+                    "  media privacy, secure erase, sanitization, and decommissioning: not claimed"
+                );
             }
         }
         Err(err) => {
