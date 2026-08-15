@@ -4,6 +4,7 @@
 //! plus send/receive backed by a LocalFileSystem at a configured fs_root.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +20,7 @@ use tidefs_cluster::pool_protocol::{
 };
 use tidefs_cluster::{
     ClusterLeaseConfig, ClusterLeaseRuntime, FenceAuthority, FenceValidator, PlacementMap,
-    PoolOwnerLeaseAuthority, RebuildFlowCommitPlacementPublication,
+    PoolLeaseToken, PoolOwnerLeaseAuthority, RebuildFlowCommitPlacementPublication,
     RebuildHealCompletionPublication,
 };
 use tidefs_cluster::{ClusterPlacementPolicy, ClusterRedundancy};
@@ -93,6 +94,115 @@ use crate::snapshot_barrier::{SnapshotBarrierConfig, SnapshotCoordinator};
 
 /// Magic prefix for cluster pool protocol messages (CP01 = Cluster Pool v1).
 const CLUSTER_POOL_MESSAGE_MAGIC: &[u8; 4] = b"CP01";
+const POOL_OWNER_LEASE_CHECKPOINT_DIR: &str = "pool-owner-lease";
+const POOL_OWNER_LEASE_CHECKPOINT_FILE: &str = "authority.checkpoint";
+const POOL_OWNER_LEASE_CHECKPOINT_TEMP_FILE: &str = "authority.checkpoint.tmp";
+
+#[derive(Debug)]
+struct PoolOwnerLeaseCheckpointStore {
+    directory: PathBuf,
+    checkpoint_path: PathBuf,
+    temporary_path: PathBuf,
+}
+
+impl PoolOwnerLeaseCheckpointStore {
+    fn open(membership_checkpoint_root: &Path) -> Result<Self, String> {
+        let directory = membership_checkpoint_root.join(POOL_OWNER_LEASE_CHECKPOINT_DIR);
+        std::fs::create_dir_all(&directory).map_err(|error| {
+            format!(
+                "create Pool owner lease checkpoint directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        std::fs::File::open(membership_checkpoint_root)
+            .and_then(|root| root.sync_all())
+            .map_err(|error| {
+                format!(
+                    "sync membership checkpoint root {} after creating Pool owner lease directory: {error}",
+                    membership_checkpoint_root.display()
+                )
+            })?;
+        Ok(Self {
+            checkpoint_path: directory.join(POOL_OWNER_LEASE_CHECKPOINT_FILE),
+            temporary_path: directory.join(POOL_OWNER_LEASE_CHECKPOINT_TEMP_FILE),
+            directory,
+        })
+    }
+
+    fn load_or_initialize(
+        &self,
+        epoch: EpochId,
+        lease_term_ms: u64,
+        restart_now_ms: u64,
+    ) -> Result<PoolOwnerLeaseAuthority, String> {
+        let authority = match std::fs::read(&self.checkpoint_path) {
+            Ok(encoded) => {
+                PoolOwnerLeaseAuthority::recover_checkpoint(&encoded, lease_term_ms, restart_now_ms)
+                    .map_err(|error| {
+                        format!(
+                            "recover Pool owner lease checkpoint {}: {error}",
+                            self.checkpoint_path.display()
+                        )
+                    })?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                PoolOwnerLeaseAuthority::new(epoch, lease_term_ms)
+                    .map_err(|error| format!("initialize Pool owner lease authority: {error}"))?
+            }
+            Err(error) => {
+                return Err(format!(
+                    "read Pool owner lease checkpoint {}: {error}",
+                    self.checkpoint_path.display()
+                ));
+            }
+        };
+        self.persist(&authority)?;
+        Ok(authority)
+    }
+
+    fn persist(&self, authority: &PoolOwnerLeaseAuthority) -> Result<(), String> {
+        let encoded = authority
+            .encode_checkpoint()
+            .map_err(|error| format!("encode Pool owner lease checkpoint: {error}"))?;
+        let mut temporary = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&self.temporary_path)
+            .map_err(|error| {
+                format!(
+                    "open temporary Pool owner lease checkpoint {}: {error}",
+                    self.temporary_path.display()
+                )
+            })?;
+        temporary.write_all(&encoded).map_err(|error| {
+            format!(
+                "write temporary Pool owner lease checkpoint {}: {error}",
+                self.temporary_path.display()
+            )
+        })?;
+        temporary.sync_all().map_err(|error| {
+            format!(
+                "sync temporary Pool owner lease checkpoint {}: {error}",
+                self.temporary_path.display()
+            )
+        })?;
+        std::fs::rename(&self.temporary_path, &self.checkpoint_path).map_err(|error| {
+            format!(
+                "publish Pool owner lease checkpoint {}: {error}",
+                self.checkpoint_path.display()
+            )
+        })?;
+        std::fs::File::open(&self.directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!(
+                    "sync Pool owner lease checkpoint directory {}: {error}",
+                    self.directory.display()
+                )
+            })
+    }
+}
 
 /// Active store backend, selected by the runtime authority spine.
 ///
@@ -2836,6 +2946,8 @@ struct SessionContext {
     lease_runtime: Option<std::sync::Arc<std::sync::Mutex<ClusterLeaseRuntime>>>,
     /// Requester-bound live writer leases for mounted Pool owners.
     pool_owner_leases: Option<Arc<Mutex<PoolOwnerLeaseAuthority>>>,
+    /// Durable state committed before a Pool-owner lease response is visible.
+    pool_owner_lease_checkpoint: Option<Arc<PoolOwnerLeaseCheckpointStore>>,
     /// Split-brain guard for partition-based fencing of write operations.
     /// When set and the node is on the minority side of a partition,
     /// write-gating operations (import, catalog mutations, lease grants)
@@ -2884,6 +2996,8 @@ pub struct StorageNode {
     cluster_lease_runtime: Option<Arc<Mutex<ClusterLeaseRuntime>>>,
     /// Requester-bound live writer leases for mounted Pool owners.
     pool_owner_leases: Option<Arc<Mutex<PoolOwnerLeaseAuthority>>>,
+    /// Durable state committed before a Pool-owner lease response is visible.
+    pool_owner_lease_checkpoint: Option<Arc<PoolOwnerLeaseCheckpointStore>>,
     /// Write-fence validator for transport-layer write gating.
     /// Extracted from the FenceAuthority in ClusterLeaseRuntime.
     fence_validator: Option<FenceValidator>,
@@ -3481,6 +3595,13 @@ fn open_imported_pool_backend(imported: &ImportedPool, lock_dir: &Path) -> Resul
 impl StorageNode {
     /// Create and start a storage node.
     pub fn start(config: StorageNodeConfig) -> Result<Self, String> {
+        if config.cluster_lease_config.is_some() && config.membership_checkpoint_dir.is_none() {
+            return Err(
+                "cluster lease authority requires membership_checkpoint_dir for durable Pool owner fencing"
+                    .to_string(),
+            );
+        }
+
         // ── Extract the runtime authority spine ──────────────────────
         let authority = config.authority.clone();
 
@@ -3781,16 +3902,23 @@ impl StorageNode {
             } else {
                 (None, None)
             };
-        let pool_owner_leases = config
-            .cluster_lease_config
-            .as_ref()
-            .map(|lease_config| {
+        let (pool_owner_leases, pool_owner_lease_checkpoint) =
+            if let Some(lease_config) = config.cluster_lease_config.as_ref() {
                 let epoch = membership.lock().unwrap().view().epoch;
-                PoolOwnerLeaseAuthority::new(epoch, lease_config.lease_term_ms)
-                    .map(|authority| Arc::new(Mutex::new(authority)))
-                    .map_err(|error| format!("initialize Pool owner lease authority: {error}"))
-            })
-            .transpose()?;
+                let checkpoint_root = config
+                    .membership_checkpoint_dir
+                    .as_deref()
+                    .expect("cluster lease checkpoint root checked above");
+                let checkpoint = Arc::new(PoolOwnerLeaseCheckpointStore::open(checkpoint_root)?);
+                let authority = checkpoint.load_or_initialize(
+                    epoch,
+                    lease_config.lease_term_ms,
+                    monotonic_time_millis(),
+                )?;
+                (Some(Arc::new(Mutex::new(authority))), Some(checkpoint))
+            } else {
+                (None, None)
+            };
 
         Ok(Self {
             transport: storage_transport,
@@ -3815,6 +3943,7 @@ impl StorageNode {
             stop: Arc::new(AtomicBool::new(false)),
             cluster_lease_runtime,
             pool_owner_leases,
+            pool_owner_lease_checkpoint,
             fence_validator,
             split_brain_guard,
         })
@@ -4068,6 +4197,7 @@ impl StorageNode {
             fence_validator: self.fence_validator.clone(),
             lease_runtime: self.cluster_lease_runtime.as_ref().map(Arc::clone),
             pool_owner_leases: self.pool_owner_leases.as_ref().map(Arc::clone),
+            pool_owner_lease_checkpoint: self.pool_owner_lease_checkpoint.as_ref().map(Arc::clone),
         };
 
         thread::spawn(move || {
@@ -4636,6 +4766,63 @@ fn admitted_pool_owner_epoch_from_view(
     Ok(view.epoch)
 }
 
+fn commit_pool_owner_lease_transition(
+    committed: &Arc<Mutex<PoolOwnerLeaseAuthority>>,
+    checkpoint: &PoolOwnerLeaseCheckpointStore,
+    epoch: EpochId,
+    now_ms: u64,
+    pool_guid: [u8; 16],
+    requesting_node_id: u64,
+    action: &ClusterPoolLeaseAction,
+) -> Result<Option<PoolLeaseToken>, String> {
+    let mut committed = committed.lock().unwrap();
+    let mut candidate = committed.clone();
+    candidate
+        .advance_epoch(epoch, now_ms)
+        .map_err(|error| error.to_string())?;
+
+    let outcome = match action {
+        ClusterPoolLeaseAction::Acquire => candidate
+            .acquire(pool_guid, requesting_node_id, now_ms)
+            .map(Some),
+        ClusterPoolLeaseAction::Renew { token } => {
+            if token.node_id != requesting_node_id || token.pool_guid != pool_guid {
+                Err(tidefs_cluster::PoolOwnerLeaseError::StaleToken)
+            } else {
+                candidate.renew(token.clone(), now_ms).map(Some)
+            }
+        }
+        ClusterPoolLeaseAction::Release { token } => {
+            if token.node_id != requesting_node_id || token.pool_guid != pool_guid {
+                Err(tidefs_cluster::PoolOwnerLeaseError::StaleToken)
+            } else {
+                candidate.release(token).map(|()| None)
+            }
+        }
+    };
+
+    match outcome {
+        Ok(token) => {
+            checkpoint
+                .persist(&candidate)
+                .map_err(|error| format!("persist Pool owner lease authority: {error}"))?;
+            *committed = candidate;
+            Ok(token)
+        }
+        Err(action_error) => {
+            // Epoch advancement and expiry cleanup can be real committed
+            // transitions even when the requested action itself is refused.
+            if candidate != *committed {
+                checkpoint
+                    .persist(&candidate)
+                    .map_err(|error| format!("persist Pool owner lease authority: {error}"))?;
+                *committed = candidate;
+            }
+            Err(action_error.to_string())
+        }
+    }
+}
+
 fn handle_cluster_pool_message(
     session_id: tidefs_transport::SessionId,
     peer_node_id: Option<u64>,
@@ -4875,33 +5062,22 @@ fn handle_cluster_pool_message(
             let Some(ref authority) = ctx.pool_owner_leases else {
                 return refusal("Pool owner lease authority is not configured".to_string());
             };
-            let mut authority = authority.lock().unwrap();
-            if let Err(error) = authority.advance_epoch(epoch, now_ms) {
-                return refusal(error.to_string());
-            }
-
-            let token = match &req.action {
-                ClusterPoolLeaseAction::Acquire => authority
-                    .acquire(req.pool_guid, req.requesting_node_id, now_ms)
-                    .map(Some),
-                ClusterPoolLeaseAction::Renew { token } => {
-                    if token.node_id != req.requesting_node_id || token.pool_guid != req.pool_guid {
-                        Err(tidefs_cluster::PoolOwnerLeaseError::StaleToken)
-                    } else {
-                        authority.renew(token.clone(), now_ms).map(Some)
-                    }
-                }
-                ClusterPoolLeaseAction::Release { token } => {
-                    if token.node_id != req.requesting_node_id || token.pool_guid != req.pool_guid {
-                        Err(tidefs_cluster::PoolOwnerLeaseError::StaleToken)
-                    } else {
-                        authority.release(token).map(|()| None)
-                    }
-                }
+            let Some(ref checkpoint) = ctx.pool_owner_lease_checkpoint else {
+                return refusal(
+                    "Pool owner lease durable checkpoint is not configured".to_string(),
+                );
             };
-            let token = match token {
+            let token = match commit_pool_owner_lease_transition(
+                authority,
+                checkpoint,
+                epoch,
+                now_ms,
+                req.pool_guid,
+                req.requesting_node_id,
+                &req.action,
+            ) {
                 Ok(token) => token,
-                Err(error) => return refusal(error.to_string()),
+                Err(error) => return refusal(error),
             };
             let (lease_token_bytes, lease_expiration_ms, lease_remaining_ms) = match token {
                 Some(token) => match bincode::serialize(&token) {
@@ -6417,6 +6593,7 @@ mod cluster_pool_handler_tests {
             fence_validator: None,
             lease_runtime: None,
             pool_owner_leases: None,
+            pool_owner_lease_checkpoint: None,
             split_brain_guard: None,
         }
     }
@@ -6507,6 +6684,21 @@ mod cluster_pool_handler_tests {
         token
     }
 
+    fn configure_pool_owner_authority(
+        ctx: &mut SessionContext,
+        epoch: EpochId,
+        lease_term_ms: u64,
+    ) -> tempfile::TempDir {
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let checkpoint =
+            Arc::new(PoolOwnerLeaseCheckpointStore::open(checkpoint_root.path()).unwrap());
+        let authority = PoolOwnerLeaseAuthority::new(epoch, lease_term_ms).unwrap();
+        checkpoint.persist(&authority).unwrap();
+        ctx.pool_owner_leases = Some(Arc::new(Mutex::new(authority)));
+        ctx.pool_owner_lease_checkpoint = Some(checkpoint);
+        checkpoint_root
+    }
+
     #[test]
     fn cluster_pool_handler_lease_acquire_renew_release_handoff() {
         let (_store_dir, store) = frame_local_store();
@@ -6516,9 +6708,7 @@ mod cluster_pool_handler_tests {
             membership.add_peer(MemberId::new(2), MemberClass::Voter, 2);
             membership.add_peer(MemberId::new(3), MemberClass::Voter, 3);
         }
-        ctx.pool_owner_leases = Some(Arc::new(Mutex::new(
-            PoolOwnerLeaseAuthority::new(EpochId::new(1), 30_000).unwrap(),
-        )));
+        let _checkpoint_root = configure_pool_owner_authority(&mut ctx, EpochId::new(1), 30_000);
         let pool_guid = [0xA7; 16];
         let request = |request_id, requesting_node_id, action| {
             ClusterPoolMessage::LeaseRequest(
@@ -6603,6 +6793,115 @@ mod cluster_pool_handler_tests {
         );
         assert_eq!(handed_off.node_id, 3);
         assert!(handed_off.write_fence.generation > first.write_fence.generation);
+    }
+
+    #[test]
+    fn cluster_lease_startup_requires_durable_checkpoint_root() {
+        let mut config = minimal_config();
+        config.cluster_lease_config = Some(ClusterLeaseConfig::default());
+
+        let error = match StorageNode::start(config) {
+            Ok(_) => panic!("cluster lease startup without durable root must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("requires membership_checkpoint_dir"));
+    }
+
+    #[test]
+    fn pool_owner_checkpoint_store_refuses_corrupt_committed_state() {
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let checkpoint = PoolOwnerLeaseCheckpointStore::open(checkpoint_root.path()).unwrap();
+        std::fs::write(&checkpoint.checkpoint_path, b"corrupt checkpoint").unwrap();
+
+        let error = checkpoint
+            .load_or_initialize(EpochId::new(1), 30_000, 10_000)
+            .unwrap_err();
+        assert!(error.contains("recover Pool owner lease checkpoint"));
+    }
+
+    #[test]
+    fn pool_owner_persistence_failure_keeps_committed_authority_unchanged() {
+        let (_store_dir, store) = frame_local_store();
+        let mut ctx = frame_test_context(store);
+        ctx.membership
+            .lock()
+            .unwrap()
+            .add_peer(MemberId::new(2), MemberClass::Voter, 2);
+        let _checkpoint_root = configure_pool_owner_authority(&mut ctx, EpochId::new(1), 30_000);
+        let checkpoint = Arc::clone(ctx.pool_owner_lease_checkpoint.as_ref().unwrap());
+        let before = ctx
+            .pool_owner_leases
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clone();
+
+        std::fs::remove_dir_all(&checkpoint.directory).unwrap();
+        File::create(&checkpoint.directory).unwrap();
+
+        let request = ClusterPoolMessage::LeaseRequest(
+            tidefs_cluster::pool_protocol::ClusterPoolLeaseRequest {
+                request_id: 77,
+                pool_guid: [0xB7; 16],
+                requesting_node_id: 2,
+                action: ClusterPoolLeaseAction::Acquire,
+            },
+        );
+        let response = handle_cluster_pool_message(
+            tidefs_transport::SessionId::new(20),
+            Some(2),
+            &request,
+            &ctx,
+        )
+        .expect("persistence refusal response");
+        let ClusterPoolMessage::LeaseResponse(response) = response else {
+            panic!("expected Pool lease response");
+        };
+        assert!(!response.success);
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("persist Pool owner lease authority")));
+        assert_eq!(
+            &*ctx.pool_owner_leases.as_ref().unwrap().lock().unwrap(),
+            &before
+        );
+    }
+
+    #[test]
+    fn refused_action_still_commits_epoch_handoff_before_response() {
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let checkpoint =
+            Arc::new(PoolOwnerLeaseCheckpointStore::open(checkpoint_root.path()).unwrap());
+        let pool_guid = [0xC7; 16];
+        let mut initial = PoolOwnerLeaseAuthority::new(EpochId::new(1), 30_000).unwrap();
+        initial.acquire(pool_guid, 2, 1_000).unwrap();
+        checkpoint.persist(&initial).unwrap();
+        let committed = Arc::new(Mutex::new(initial));
+
+        let error = commit_pool_owner_lease_transition(
+            &committed,
+            &checkpoint,
+            EpochId::new(2),
+            2_000,
+            pool_guid,
+            3,
+            &ClusterPoolLeaseAction::Acquire,
+        )
+        .unwrap_err();
+        assert!(error.contains("membership handoff is fenced"));
+        assert_eq!(committed.lock().unwrap().current_epoch(), EpochId::new(2));
+
+        let encoded = std::fs::read(&checkpoint.checkpoint_path).unwrap();
+        let restart_now_ms = 50_000;
+        let mut recovered =
+            PoolOwnerLeaseAuthority::recover_checkpoint(&encoded, 30_000, restart_now_ms).unwrap();
+        assert_eq!(recovered.current_epoch(), EpochId::new(2));
+        assert!(matches!(
+            recovered.acquire(pool_guid, 3, restart_now_ms + 29_999),
+            Err(tidefs_cluster::PoolOwnerLeaseError::EpochHandoffPending { .. })
+        ));
     }
 
     fn frame_local_store() -> (tempfile::TempDir, Arc<Mutex<StoreBackend>>) {

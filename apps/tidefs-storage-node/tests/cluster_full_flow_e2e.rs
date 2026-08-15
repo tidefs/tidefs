@@ -25,8 +25,8 @@ use tidefs_cluster::pool_protocol::{
     ClusterPoolCreateRequest, ClusterPoolMessage, NodeDeviceSpec,
 };
 use tidefs_cluster::{ClusterLeaseConfig, LossEvent, PlacementHealCoordinator, PlacementMap};
-use tidefs_membership_epoch::HealthClass;
-use tidefs_storage_node::server::{StorageNode, StorageNodeConfig};
+use tidefs_membership_epoch::{HealthClass, MemberClass};
+use tidefs_storage_node::server::{MembershipPeerConfig, StorageNode, StorageNodeConfig};
 
 const CLUSTER_POOL_MAGIC: &[u8; 4] = b"CP01";
 const TEST_DEVICE_BYTES: u64 = 2 * 1_048_576; // 2 MiB
@@ -71,6 +71,31 @@ struct TestServer {
 
 impl TestServer {
     fn spawn(node_id: u64, store_paths: Vec<PathBuf>, with_lease: bool) -> Self {
+        let membership_checkpoint_dir = with_lease.then(|| {
+            store_paths
+                .first()
+                .and_then(|path| path.parent())
+                .expect("scratch store has parent")
+                .join("membership-checkpoint")
+        });
+        Self::spawn_configured(
+            node_id,
+            store_paths,
+            with_lease.then(ClusterLeaseConfig::default),
+            membership_checkpoint_dir,
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn spawn_configured(
+        node_id: u64,
+        store_paths: Vec<PathBuf>,
+        cluster_lease_config: Option<ClusterLeaseConfig>,
+        membership_checkpoint_dir: Option<PathBuf>,
+        membership_peers: Vec<MembershipPeerConfig>,
+        membership_bind_addr: Option<SocketAddr>,
+    ) -> Self {
         let port = pick_port();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let config = StorageNodeConfig {
@@ -81,8 +106,8 @@ impl TestServer {
             root_auth_key: None,
             member_class: None,
             failure_domain: None,
-            membership_bind_addr: None,
-            membership_peers: vec![],
+            membership_bind_addr,
+            membership_peers,
             replica_peers: vec![],
             pool_device_paths: Vec::new(),
             pool_lock_dir: None,
@@ -90,12 +115,8 @@ impl TestServer {
             authority: None,
             ready_file: None,
             drain_timeout_secs: 30,
-            cluster_lease_config: if with_lease {
-                Some(ClusterLeaseConfig::default())
-            } else {
-                None
-            },
-            membership_checkpoint_dir: None,
+            cluster_lease_config,
+            membership_checkpoint_dir,
             rdma: false,
             carrier_policy: None,
         };
@@ -540,6 +561,162 @@ fn cluster_full_flow_create_lease_catalog_heal() {
     server2.stop.store(true, Ordering::Relaxed);
 }
 
+#[test]
+fn cluster_pool_owner_restart_quarantines_old_grant_before_newer_handoff() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store_paths = vec![dir.path().join("authority-store")];
+    let checkpoint_dir = dir.path().join("membership-checkpoint");
+    let peer2_membership_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port());
+    let peer3_membership_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port());
+    let _peer2 = TestServer::spawn_configured(
+        2,
+        vec![dir.path().join("peer2-store")],
+        None,
+        None,
+        Vec::new(),
+        Some(peer2_membership_addr),
+    );
+    let _peer3 = TestServer::spawn_configured(
+        3,
+        vec![dir.path().join("peer3-store")],
+        None,
+        None,
+        Vec::new(),
+        Some(peer3_membership_addr),
+    );
+    let membership_peers = vec![
+        MembershipPeerConfig {
+            node_id: 2,
+            addr: peer2_membership_addr,
+            member_class: MemberClass::Voter,
+            failure_domain: 2,
+        },
+        MembershipPeerConfig {
+            node_id: 3,
+            addr: peer3_membership_addr,
+            member_class: MemberClass::Voter,
+            failure_domain: 3,
+        },
+    ];
+    let lease_term_ms = 400;
+    let lease_config = ClusterLeaseConfig {
+        lease_term_ms,
+        ..ClusterLeaseConfig::default()
+    };
+    let pool_guid = [0xD7; 16];
+
+    let server = TestServer::spawn_configured(
+        1,
+        store_paths.clone(),
+        Some(lease_config.clone()),
+        Some(checkpoint_dir.clone()),
+        membership_peers.clone(),
+        None,
+    );
+    let mut owner2 = tidefs_transport::Transport::new(2);
+    let owner2_session = connect_client(&mut owner2, 1, server.addr());
+    send_cp01(
+        &mut owner2,
+        owner2_session,
+        &ClusterPoolMessage::LeaseRequest(ClusterPoolLeaseRequest {
+            request_id: 300,
+            pool_guid,
+            requesting_node_id: 2,
+            action: tidefs_cluster::ClusterPoolLeaseAction::Acquire,
+        }),
+    );
+    let old_token = match recv_cp01(&mut owner2, owner2_session, 100) {
+        Some(ClusterPoolMessage::LeaseResponse(response)) => {
+            assert!(
+                response.success,
+                "initial lease refused: {:?}",
+                response.error
+            );
+            bincode::deserialize::<PoolLeaseToken>(
+                &response
+                    .lease_token_bytes
+                    .expect("initial acquire returns token"),
+            )
+            .expect("decode initial Pool owner token")
+        }
+        other => panic!("unexpected initial lease response: {other:?}"),
+    };
+    drop(owner2);
+    drop(server);
+
+    let restarted = TestServer::spawn_configured(
+        1,
+        store_paths,
+        Some(lease_config),
+        Some(checkpoint_dir),
+        membership_peers,
+        None,
+    );
+
+    let mut owner2 = tidefs_transport::Transport::new(2);
+    let owner2_session = connect_client(&mut owner2, 1, restarted.addr());
+    send_cp01(
+        &mut owner2,
+        owner2_session,
+        &ClusterPoolMessage::LeaseRequest(ClusterPoolLeaseRequest {
+            request_id: 301,
+            pool_guid,
+            requesting_node_id: 2,
+            action: tidefs_cluster::ClusterPoolLeaseAction::Renew {
+                token: old_token.clone(),
+            },
+        }),
+    );
+    match recv_cp01(&mut owner2, owner2_session, 100) {
+        Some(ClusterPoolMessage::LeaseResponse(response)) => {
+            assert!(!response.success, "pre-restart token must be stale");
+            assert!(response.lease_token_bytes.is_none());
+        }
+        other => panic!("unexpected stale-renew response: {other:?}"),
+    }
+
+    let mut owner3 = tidefs_transport::Transport::new(3);
+    let owner3_session = connect_client(&mut owner3, 1, restarted.addr());
+    let acquire = |request_id| {
+        ClusterPoolMessage::LeaseRequest(ClusterPoolLeaseRequest {
+            request_id,
+            pool_guid,
+            requesting_node_id: 3,
+            action: tidefs_cluster::ClusterPoolLeaseAction::Acquire,
+        })
+    };
+    send_cp01(&mut owner3, owner3_session, &acquire(302));
+    match recv_cp01(&mut owner3, owner3_session, 100) {
+        Some(ClusterPoolMessage::LeaseResponse(response)) => {
+            assert!(!response.success, "restart quarantine admitted owner 3");
+            assert!(response.lease_token_bytes.is_none());
+        }
+        other => panic!("unexpected quarantine response: {other:?}"),
+    }
+
+    thread::sleep(Duration::from_millis(lease_term_ms + 75));
+    send_cp01(&mut owner3, owner3_session, &acquire(303));
+    let new_token = match recv_cp01(&mut owner3, owner3_session, 100) {
+        Some(ClusterPoolMessage::LeaseResponse(response)) => {
+            assert!(
+                response.success,
+                "post-quarantine handoff refused: {:?}",
+                response.error
+            );
+            bincode::deserialize::<PoolLeaseToken>(
+                &response
+                    .lease_token_bytes
+                    .expect("post-quarantine acquire returns token"),
+            )
+            .expect("decode post-restart Pool owner token")
+        }
+        other => panic!("unexpected post-quarantine response: {other:?}"),
+    };
+    assert_eq!(new_token.node_id, 3);
+    assert!(new_token.lease_id > old_token.lease_id);
+    assert!(new_token.write_fence.is_later_than(&old_token.write_fence));
+}
+
 /// Test that a storage node without cluster_lease_config serves or refuses
 /// lease requests correctly (ensures the feature gate works).
 #[test]
@@ -728,7 +905,7 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
         ready_file: None,
         drain_timeout_secs: 30,
         cluster_lease_config: Some(ClusterLeaseConfig::default()),
-        membership_checkpoint_dir: None,
+        membership_checkpoint_dir: Some(dir.path().join("membership-checkpoint")),
         rdma: false,
         carrier_policy: None,
     };

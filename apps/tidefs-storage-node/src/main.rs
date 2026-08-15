@@ -154,7 +154,11 @@ struct ServerArgs {
     /// When set, the node creates a ClusterLeaseRuntime with a FenceAuthority,
     /// acquires a membership lease, and issues write fences. Required for
     /// clustered pool mount (--cluster) and multi-node pool operations.
-    #[arg(long = "cluster-lease", default_value_t = false)]
+    #[arg(
+        long = "cluster-lease",
+        default_value_t = false,
+        requires = "membership_checkpoint_dir"
+    )]
     cluster_lease: bool,
 }
 
@@ -515,6 +519,36 @@ mod tests {
         assert!(args.pool_devices.is_empty());
         assert!(args.node_identity.is_none());
         assert_eq!(args.replication_factor, 1);
+    }
+
+    #[test]
+    fn cli_cluster_lease_requires_membership_checkpoint_dir() {
+        let argv = make_argv(
+            "server",
+            &[
+                "--node-id",
+                "1",
+                "--bind",
+                "127.0.0.1:9000",
+                "--cluster-lease",
+            ],
+        );
+        assert!(Cli::try_parse_from(argv).is_err());
+
+        let args = parse_server(&[
+            "--node-id",
+            "1",
+            "--bind",
+            "127.0.0.1:9000",
+            "--cluster-lease",
+            "--membership-checkpoint-dir",
+            "/var/lib/tidefs/membership",
+        ]);
+        assert!(args.cluster_lease);
+        assert_eq!(
+            args.membership_checkpoint_dir,
+            Some(PathBuf::from("/var/lib/tidefs/membership"))
+        );
     }
 
     #[test]
