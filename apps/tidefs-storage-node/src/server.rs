@@ -3288,7 +3288,7 @@ fn dispatch_inbound_membership_msg(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64;
-                SwimAck {
+                let mut ack = SwimAck {
                     ping_seq_no: ping.seq_no,
                     acker: runtime.my_id,
                     acker_epoch: runtime.current_epoch(),
@@ -3297,7 +3297,9 @@ fn dispatch_inbound_membership_msg(
                     membership_delta: vec![],
                     acked_at_millis: now,
                     signature: vec![],
-                }
+                };
+                ack.sign(&runtime.signing_key);
+                ack
             };
             let mut transport = membership_transport.lock().unwrap();
             let ack_msg = MembershipWireMessage::Ack(ack);
@@ -3770,6 +3772,12 @@ impl StorageNode {
         let membership_config = MembershipConfig::default();
         let membership_period =
             Duration::from_millis((membership_config.ping_interval_ms / 4).max(1));
+        let provisioned_membership_signing_key = authority
+            .as_ref()
+            .and_then(RuntimeAuthority::transport_identity)
+            .map(|identity| identity.local_credential().keypair())
+            .transpose()
+            .map_err(|error| format!("load provisioned membership signing key: {error}"))?;
         let mut membership = if let Some(ref checkpoint_dir) = config.membership_checkpoint_dir {
             // Cold-start recovery: open checkpoint persistence and load latest
             // epoch snapshot plus transition journal so the runtime recovers
@@ -3785,22 +3793,58 @@ impl StorageNode {
             })?;
             let journal =
                 tidefs_membership_epoch::transition_journal::MembershipTransitionJournal::new();
-            MembershipRuntime::load_from_checkpoint_store(
-                Box::new(checkpoint_store),
-                journal,
-                membership_config,
-                MemberId::new(config.node_id),
-                member_class,
-                failure_domain,
-            )
+            match provisioned_membership_signing_key {
+                Some(signing_key) => {
+                    MembershipRuntime::load_from_checkpoint_store_with_signing_key(
+                        Box::new(checkpoint_store),
+                        journal,
+                        membership_config,
+                        MemberId::new(config.node_id),
+                        member_class,
+                        failure_domain,
+                        signing_key,
+                    )
+                }
+                None => MembershipRuntime::load_from_checkpoint_store(
+                    Box::new(checkpoint_store),
+                    journal,
+                    membership_config,
+                    MemberId::new(config.node_id),
+                    member_class,
+                    failure_domain,
+                ),
+            }
         } else {
-            MembershipRuntime::new(
-                membership_config,
-                MemberId::new(config.node_id),
-                member_class,
-                failure_domain,
-            )
+            match provisioned_membership_signing_key {
+                Some(signing_key) => MembershipRuntime::new_with_signing_key(
+                    membership_config,
+                    MemberId::new(config.node_id),
+                    member_class,
+                    failure_domain,
+                    signing_key,
+                ),
+                None => MembershipRuntime::new(
+                    membership_config,
+                    MemberId::new(config.node_id),
+                    member_class,
+                    failure_domain,
+                ),
+            }
         };
+        if let Some(identity) = authority
+            .as_ref()
+            .and_then(RuntimeAuthority::transport_identity)
+        {
+            for peer in identity.trusted_peers() {
+                let verifying_key = peer.identity().verifying_key().map_err(|error| {
+                    format!(
+                        "load provisioned membership peer {} verifying key: {error}",
+                        peer.node_id()
+                    )
+                })?;
+                membership.register_key(MemberId::new(peer.node_id()), verifying_key);
+            }
+        }
         for peer in &config.membership_peers {
             membership.add_peer(
                 MemberId::new(peer.node_id),

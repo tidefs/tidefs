@@ -270,10 +270,32 @@ impl MembershipRuntime {
     ) -> Self {
         let mut csprng = OsRng;
         let signing_key = Keypair::generate(&mut csprng);
+        Self::new_with_signing_key(
+            config,
+            my_id,
+            my_member_class,
+            my_failure_domain,
+            signing_key,
+        )
+    }
+
+    /// Create a membership runtime bound to an already provisioned node key.
+    ///
+    /// Direct and indirect membership messages use this same identity so
+    /// bootstrap peers can validate liveness with the configured trust set.
+    pub fn new_with_signing_key(
+        config: MembershipConfig,
+        my_id: MemberId,
+        my_member_class: MemberClass,
+        my_failure_domain: u64,
+        signing_key: Keypair,
+    ) -> Self {
         let verifying_key = signing_key.public;
 
         let epoch_engine = EpochTransitionEngine::new(EpochId::new(1));
-        let mut detector = FailureDetector::new(config.clone(), Keypair::generate(&mut csprng));
+        let detector_signing_key = Keypair::from_bytes(&signing_key.to_bytes())
+            .expect("duplicate validated membership signing key");
+        let mut detector = FailureDetector::new(config.clone(), detector_signing_key);
 
         // Register self
         detector.register_peer(my_id, my_member_class, my_failure_domain, EpochId::new(1));
@@ -401,6 +423,28 @@ impl MembershipRuntime {
     ) -> Self {
         let mut csprng = OsRng;
         let signing_key = Keypair::generate(&mut csprng);
+        Self::load_from_checkpoint_store_with_signing_key(
+            store,
+            journal,
+            config,
+            my_id,
+            my_member_class,
+            my_failure_domain,
+            signing_key,
+        )
+    }
+
+    /// Recover membership state while retaining one provisioned node signing
+    /// identity across process restarts.
+    pub fn load_from_checkpoint_store_with_signing_key(
+        store: Box<dyn EpochSnapshotStore>,
+        journal: MembershipTransitionJournal,
+        config: MembershipConfig,
+        my_id: MemberId,
+        my_member_class: MemberClass,
+        my_failure_domain: u64,
+        signing_key: Keypair,
+    ) -> Self {
         let verifying_key = signing_key.public;
 
         let mut verifying_keys = BTreeMap::new();
@@ -449,7 +493,9 @@ impl MembershipRuntime {
         };
 
         let epoch_engine = EpochTransitionEngine::new(start_epoch);
-        let mut detector = FailureDetector::new(config.clone(), Keypair::generate(&mut csprng));
+        let detector_signing_key = Keypair::from_bytes(&signing_key.to_bytes())
+            .expect("duplicate validated membership signing key");
+        let mut detector = FailureDetector::new(config.clone(), detector_signing_key);
 
         // Register all recovered members in the failure detector.
         for &mid in &start_members {
