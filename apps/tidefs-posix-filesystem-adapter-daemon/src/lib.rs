@@ -388,6 +388,90 @@ impl Default for MountRuntimeOptions {
     }
 }
 
+/// Inputs for the authenticated remote clustered-filesystem carrier.
+///
+/// This configuration deliberately has no local Pool path, device list,
+/// dataset selector, writer, term, membership epoch, or lease token. The
+/// remote owner supplies mounted authority only after mutual attestation.
+#[cfg(feature = "cluster")]
+#[derive(Debug)]
+pub struct ClusterVfsRpcMountConfig {
+    mountpoint: PathBuf,
+    owner_addr: std::net::SocketAddr,
+    expected_pool_guid: [u8; 16],
+    local_credential: tidefs_auth::NodePrivateCredential,
+    trusted_owner_identity: tidefs_auth::NodePublicIdentity,
+    debug: bool,
+}
+
+#[cfg(feature = "cluster")]
+impl ClusterVfsRpcMountConfig {
+    #[must_use]
+    pub const fn new(
+        mountpoint: PathBuf,
+        owner_addr: std::net::SocketAddr,
+        expected_pool_guid: [u8; 16],
+        local_credential: tidefs_auth::NodePrivateCredential,
+        trusted_owner_identity: tidefs_auth::NodePublicIdentity,
+    ) -> Self {
+        Self {
+            mountpoint,
+            owner_addr,
+            expected_pool_guid,
+            local_credential,
+            trusted_owner_identity,
+            debug: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_debug(mut self, debug: bool) -> Self {
+        self.debug = debug;
+        self
+    }
+}
+
+/// Running authenticated remote FUSE mount.
+#[cfg(feature = "cluster")]
+pub struct ClusterVfsRpcMountHandle {
+    mountpoint: PathBuf,
+    shutdown: Arc<AtomicBool>,
+    session: Option<fuser::BackgroundSession>,
+}
+
+#[cfg(feature = "cluster")]
+impl ClusterVfsRpcMountHandle {
+    #[must_use]
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_none_or(|session| session.guard.is_finished())
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    pub fn stop(&mut self) {
+        self.request_shutdown();
+        if let Some(session) = self.session.take() {
+            session.join();
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl Drop for ClusterVfsRpcMountHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EffectiveMountMode {
     read_only: bool,
@@ -1896,6 +1980,116 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         #[cfg(feature = "cluster")]
         cluster_vfs_rpc_owner,
     })
+}
+
+/// Start the real FUSE carrier over one authenticated remote Pool owner.
+#[cfg(feature = "cluster")]
+pub fn start_cluster_vfs_rpc_mount(
+    config: ClusterVfsRpcMountConfig,
+) -> Result<ClusterVfsRpcMountHandle, String> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    start_cluster_vfs_rpc_mount_with_shutdown(config, shutdown)
+}
+
+#[cfg(feature = "cluster")]
+fn start_cluster_vfs_rpc_mount_with_shutdown(
+    config: ClusterVfsRpcMountConfig,
+    shutdown: Arc<AtomicBool>,
+) -> Result<ClusterVfsRpcMountHandle, String> {
+    use tidefs_vfs_engine::dispatch::VfsDispatchEngineBridge;
+
+    let ClusterVfsRpcMountConfig {
+        mountpoint,
+        owner_addr,
+        expected_pool_guid,
+        local_credential,
+        trusted_owner_identity,
+        debug,
+    } = config;
+    prepare_mountpoint_directory(&mountpoint)
+        .map_err(|error| format!("create mountpoint {}: {error}", mountpoint.display()))?;
+
+    let client = cluster_vfs_rpc_client::ClusterVfsRpcClient::connect(
+        cluster_vfs_rpc_client::ClusterVfsRpcClientConfig::new(
+            owner_addr,
+            expected_pool_guid,
+            local_credential,
+            trusted_owner_identity,
+        ),
+    )
+    .map_err(|error| format!("authenticate remote Pool owner: {error}"))?;
+    let engine: Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send> =
+        Box::new(VfsDispatchEngineBridge::new(client));
+    let adapter = fuse_vfs_adapter::FuseVfsAdapter::new(engine)
+        .map_err(|error| format!("cluster client adapter init: {error:?}"))?
+        .with_coherency_profile(coherency_profile::CoherencyProfile::Strict)
+        .with_writeback_cache_disabled()
+        .with_timestamp_policy(mount_options::TimestampPolicy::NoAtime);
+    let options = [
+        fuser::MountOption::RW,
+        fuser::MountOption::FSName("tidefs-cluster".to_string()),
+        fuser::MountOption::NoAtime,
+    ];
+    let session = fuser::spawn_mount2(adapter, &mountpoint, &options)
+        .map_err(|error| format!("cluster client FUSE mount: {error}"))?;
+    if session.guard.is_finished() {
+        return Err(
+            "cluster client FUSE session exited during mount; refusing a hung mountpoint"
+                .to_string(),
+        );
+    }
+    let initialized = session
+        .wait_until_initialized(Duration::from_secs(MOUNT_FUSE_INIT_TIMEOUT_SECS))
+        .map_err(|error| format!("wait for cluster client FUSE INIT: {error}"))?;
+    if !initialized {
+        return Err(format!(
+            "cluster client FUSE kernel initialization did not complete within {MOUNT_FUSE_INIT_TIMEOUT_SECS}s"
+        ));
+    }
+    if session.guard.is_finished() {
+        return Err(
+            "cluster client FUSE session exited during kernel initialization; refusing a hung mountpoint"
+                .to_string(),
+        );
+    }
+    if let Err(error) = check_idmapped_mount(&mountpoint) {
+        session.join();
+        return Err(error);
+    }
+    if debug {
+        eprintln!(
+            "cluster: authenticated remote Pool owner at {owner_addr} for {:02x?}",
+            &expected_pool_guid[..4]
+        );
+    }
+    eprintln!(
+        "Mounted TideFS clustered client at {} (RW, strict coherency)",
+        mountpoint.display()
+    );
+
+    Ok(ClusterVfsRpcMountHandle {
+        mountpoint,
+        shutdown,
+        session: Some(session),
+    })
+}
+
+/// Run the authenticated remote FUSE carrier until signal or unmount.
+#[cfg(feature = "cluster")]
+pub fn run_cluster_vfs_rpc_mount(config: ClusterVfsRpcMountConfig) -> Result<(), String> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    install_signal_handlers(Arc::clone(&shutdown))
+        .map_err(|error| format!("cluster client signal handler: {error}"))?;
+    let mut mount = start_cluster_vfs_rpc_mount_with_shutdown(config, Arc::clone(&shutdown))?;
+    while !shutdown.load(Ordering::Acquire) && !mount.is_finished() {
+        std::thread::park_timeout(Duration::from_millis(100));
+    }
+    mount.stop();
+    eprintln!(
+        "tidefsctl: clustered filesystem unmounted from {}",
+        mount.mountpoint().display()
+    );
+    Ok(())
 }
 
 /// Bootstrap the TideFS FUSE mount lifecycle.

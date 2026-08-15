@@ -1665,6 +1665,94 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[test]
+    fn cluster_client_pool_mount_requires_exact_remote_inputs() {
+        use clap::Parser;
+
+        let valid = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--cluster-client",
+            "--cluster-vfs-rpc-addr",
+            "127.0.0.1:7412",
+            "--cluster-pool-guid",
+            "00112233445566778899aabbccddeeff",
+            "--cluster-node-credential",
+            "/etc/tidefs/client.credential",
+            "--cluster-trusted-vfs-rpc-peer-identity",
+            "/etc/tidefs/owner.identity",
+        ]);
+        assert!(valid.is_ok(), "complete cluster-client mount should parse");
+
+        let missing_pool = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--cluster-client",
+            "--cluster-vfs-rpc-addr",
+            "127.0.0.1:7412",
+            "--cluster-node-credential",
+            "/etc/tidefs/client.credential",
+            "--cluster-trusted-vfs-rpc-peer-identity",
+            "/etc/tidefs/owner.identity",
+        ]);
+        assert!(
+            missing_pool.is_err(),
+            "cluster-client mount must require an expected Pool GUID"
+        );
+
+        let local_devices = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--cluster-client",
+            "--cluster-vfs-rpc-addr",
+            "127.0.0.1:7412",
+            "--cluster-pool-guid",
+            "00112233445566778899aabbccddeeff",
+            "--cluster-node-credential",
+            "/etc/tidefs/client.credential",
+            "--cluster-trusted-vfs-rpc-peer-identity",
+            "/etc/tidefs/owner.identity",
+            "--devices",
+            "/dev/loop0",
+        ]);
+        assert!(
+            local_devices.is_err(),
+            "cluster-client mount must conflict with local devices"
+        );
+
+        let owner_mode = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--cluster-client",
+            "--cluster",
+            "--cluster-vfs-rpc-addr",
+            "127.0.0.1:7412",
+            "--cluster-pool-guid",
+            "00112233445566778899aabbccddeeff",
+            "--cluster-node-credential",
+            "/etc/tidefs/client.credential",
+            "--cluster-trusted-vfs-rpc-peer-identity",
+            "/etc/tidefs/owner.identity",
+        ]);
+        assert!(
+            owner_mode.is_err(),
+            "cluster-client and cluster-owner mount modes must conflict"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
     fn cli_parse_cluster_pool_mount_accepts_explicit_owner_and_authority_surfaces() {
         use clap::Parser;
         let args = Cli::try_parse_from([

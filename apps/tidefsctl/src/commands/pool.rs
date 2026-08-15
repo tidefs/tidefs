@@ -200,6 +200,33 @@ pub enum PoolCommand {
         runtime: crate::commands::mount::PoolMountRuntimeArgs,
 
         #[cfg(feature = "cluster")]
+        /// Mount as an authenticated remote client of the exact Pool owner.
+        #[arg(
+            long = "cluster-client",
+            default_value_t = false,
+            conflicts_with_all = ["cluster", "devices"]
+        )]
+        cluster_client: bool,
+
+        #[cfg(feature = "cluster")]
+        /// Authenticated owner VFS_RPC address.
+        #[arg(
+            long = "cluster-vfs-rpc-addr",
+            requires = "cluster_client",
+            required_if_eq("cluster_client", "true")
+        )]
+        cluster_vfs_rpc_addr: Option<String>,
+
+        #[cfg(feature = "cluster")]
+        /// Expected Pool GUID as exactly 32 hexadecimal digits.
+        #[arg(
+            long = "cluster-pool-guid",
+            requires = "cluster_client",
+            required_if_eq("cluster_client", "true")
+        )]
+        cluster_pool_guid: Option<String>,
+
+        #[cfg(feature = "cluster")]
         /// Request a cluster-authoritative mount.
         #[arg(long = "cluster", default_value_t = false)]
         cluster: bool,
@@ -233,8 +260,7 @@ pub enum PoolCommand {
         #[arg(
             long = "cluster-node-credential",
             value_name = "PATH",
-            requires = "cluster",
-            required_if_eq("cluster", "true")
+            required_if_eq_any([("cluster", "true"), ("cluster_client", "true")])
         )]
         cluster_node_credential: Option<PathBuf>,
 
@@ -243,8 +269,7 @@ pub enum PoolCommand {
         #[arg(
             long = "cluster-trusted-vfs-rpc-peer-identity",
             value_name = "PATH",
-            requires = "cluster",
-            required_if_eq("cluster", "true")
+            required_if_eq_any([("cluster", "true"), ("cluster_client", "true")])
         )]
         cluster_trusted_vfs_rpc_peer_identity: Option<PathBuf>,
     },
@@ -406,6 +431,12 @@ pub fn handle_pool(cmd: PoolCommand) {
             encryption_salt,
             runtime,
             #[cfg(feature = "cluster")]
+            cluster_client,
+            #[cfg(feature = "cluster")]
+            cluster_vfs_rpc_addr,
+            #[cfg(feature = "cluster")]
+            cluster_pool_guid,
+            #[cfg(feature = "cluster")]
             cluster,
             #[cfg(feature = "cluster")]
             cluster_authority_addr,
@@ -431,6 +462,12 @@ pub fn handle_pool(cmd: PoolCommand) {
                 encryption_passphrase,
                 encryption_salt,
                 runtime,
+                #[cfg(feature = "cluster")]
+                cluster_client,
+                #[cfg(feature = "cluster")]
+                cluster_vfs_rpc_addr,
+                #[cfg(feature = "cluster")]
+                cluster_pool_guid,
                 #[cfg(feature = "cluster")]
                 cluster,
                 #[cfg(feature = "cluster")]

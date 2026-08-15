@@ -169,6 +169,33 @@ pub struct PoolMountArgs {
     pub runtime: PoolMountRuntimeArgs,
 
     #[cfg(feature = "cluster")]
+    /// Mount as an authenticated remote client of the exact Pool owner.
+    #[arg(
+        long = "cluster-client",
+        default_value_t = false,
+        conflicts_with_all = ["cluster", "devices"]
+    )]
+    pub cluster_client: bool,
+
+    #[cfg(feature = "cluster")]
+    /// Authenticated owner VFS_RPC address. Required for --cluster-client.
+    #[arg(
+        long = "cluster-vfs-rpc-addr",
+        requires = "cluster_client",
+        required_if_eq("cluster_client", "true")
+    )]
+    pub cluster_vfs_rpc_addr: Option<String>,
+
+    #[cfg(feature = "cluster")]
+    /// Expected Pool GUID as exactly 32 hexadecimal digits.
+    #[arg(
+        long = "cluster-pool-guid",
+        requires = "cluster_client",
+        required_if_eq("cluster_client", "true")
+    )]
+    pub cluster_pool_guid: Option<String>,
+
+    #[cfg(feature = "cluster")]
     /// Request cluster-authoritative mount. When set, the pool must have
     /// CLUSTER_POOL_INCOMPAT labels and the mount must go through cluster
     /// authority instead of offline local storage.
@@ -208,8 +235,7 @@ pub struct PoolMountArgs {
     #[arg(
         long = "cluster-node-credential",
         value_name = "PATH",
-        requires = "cluster",
-        required_if_eq("cluster", "true")
+        required_if_eq_any([("cluster", "true"), ("cluster_client", "true")])
     )]
     pub cluster_node_credential: Option<PathBuf>,
 
@@ -218,8 +244,7 @@ pub struct PoolMountArgs {
     #[arg(
         long = "cluster-trusted-vfs-rpc-peer-identity",
         value_name = "PATH",
-        requires = "cluster",
-        required_if_eq("cluster", "true")
+        required_if_eq_any([("cluster", "true"), ("cluster_client", "true")])
     )]
     pub cluster_trusted_vfs_rpc_peer_identity: Option<PathBuf>,
 }
@@ -712,12 +737,156 @@ fn build_mount_runtime(
     Ok((runtime, coherency_profile))
 }
 
+#[cfg(feature = "cluster")]
+fn parse_cluster_pool_guid(raw: &str) -> Result<[u8; 16], String> {
+    let raw = raw.as_bytes();
+    if raw.len() != 32 {
+        return Err("--cluster-pool-guid must contain exactly 32 hexadecimal digits".to_string());
+    }
+    let mut guid = [0_u8; 16];
+    for (index, byte) in guid.iter_mut().enumerate() {
+        let offset = index * 2;
+        let decode_nibble = |value| match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        };
+        let high = decode_nibble(raw[offset]);
+        let low = decode_nibble(raw[offset + 1]);
+        *byte = high
+            .zip(low)
+            .map(|(high, low)| high << 4 | low)
+            .ok_or_else(|| {
+                "--cluster-pool-guid must contain exactly 32 hexadecimal digits".to_string()
+            })?;
+    }
+    if guid == [0; 16] {
+        return Err("--cluster-pool-guid must be nonzero".to_string());
+    }
+    Ok(guid)
+}
+
+#[cfg(feature = "cluster")]
+fn cluster_client_uses_local_mount_inputs(args: &PoolMountArgs) -> bool {
+    args.read_only
+        || args.devices.is_some()
+        || args.relatime
+        || args.dataset != "root"
+        || args.encryption_envelope.is_some()
+        || args.encryption_passphrase.is_some()
+        || args.encryption_salt.is_some()
+        || args.runtime.fs_name != "tidefs"
+        || args.runtime.writeback_cache
+        || args.runtime.options.is_some()
+        || args.runtime.sync
+        || args.runtime.content_capacity_bytes.is_some()
+        || args.runtime.writeback_cache_timeout_secs.is_some()
+        || args.runtime.drain_timeout_secs.is_some()
+        || args.runtime.background_scrub_interval_secs.is_some()
+        || args.runtime.coherency.is_some()
+        || args.runtime.compress_algo.is_some()
+        || args.runtime.enable_dedup
+        || args.runtime.enable_reclaim
+        || args.runtime.enable_repair_writeback
+        || args.runtime.snapshot.is_some()
+}
+
+#[cfg(feature = "cluster")]
+fn build_cluster_client_mount(
+    args: &PoolMountArgs,
+) -> Result<tidefs_posix_filesystem_adapter_daemon::ClusterVfsRpcMountConfig, String> {
+    if args.cluster {
+        return Err("--cluster-client conflicts with owner mode --cluster".to_string());
+    }
+    if args.cluster_authority_addr.is_some()
+        || args.cluster_owner_node_id.is_some()
+        || args.cluster_authority_node_id.is_some()
+        || args.cluster_vfs_rpc_bind.is_some()
+    {
+        return Err(
+            "--cluster-client refuses owner-mode lease, node-id, and VFS_RPC bind arguments"
+                .to_string(),
+        );
+    }
+    if cluster_client_uses_local_mount_inputs(args) {
+        return Err(
+            "--cluster-client refuses local devices, local dataset/encryption inputs, read-only mode, and local mount runtime tuning"
+                .to_string(),
+        );
+    }
+
+    let owner_addr: SocketAddr = args
+        .cluster_vfs_rpc_addr
+        .as_deref()
+        .ok_or_else(|| "--cluster-client requires --cluster-vfs-rpc-addr".to_string())?
+        .parse()
+        .map_err(|error| format!("invalid --cluster-vfs-rpc-addr: {error}"))?;
+    let pool_guid = parse_cluster_pool_guid(
+        args.cluster_pool_guid
+            .as_deref()
+            .ok_or_else(|| "--cluster-client requires --cluster-pool-guid".to_string())?,
+    )?;
+    let local_credential = load_cluster_node_credential(
+        args.cluster_node_credential
+            .as_deref()
+            .ok_or_else(|| "--cluster-client requires --cluster-node-credential".to_string())?,
+    )?;
+    let trusted_owner_identity = load_cluster_public_identity(
+        args.cluster_trusted_vfs_rpc_peer_identity
+            .as_deref()
+            .ok_or_else(|| {
+                "--cluster-client requires --cluster-trusted-vfs-rpc-peer-identity".to_string()
+            })?,
+    )?;
+
+    Ok(
+        tidefs_posix_filesystem_adapter_daemon::ClusterVfsRpcMountConfig::new(
+            args.mount_point.clone(),
+            owner_addr,
+            pool_guid,
+            local_credential,
+            trusted_owner_identity,
+        ),
+    )
+}
+
 /// Handle `tidefsctl pool mount`.
 ///
 /// 1. Import explicit `--devices` when starting a not-yet-imported pool.
 /// 2. Launch the FUSE daemon on the runtime metadata directory.
 /// 3. Route already-imported pools through the live runtime owner.
 pub fn handle_mount(args: PoolMountArgs) {
+    #[cfg(feature = "cluster")]
+    if args.cluster_client {
+        let config = build_cluster_client_mount(&args).unwrap_or_else(|error| {
+            eprintln!("tidefsctl pool mount: {error}");
+            process::exit(1);
+        });
+        println!(
+            "mounting authenticated clustered Pool client at {}",
+            args.mount_point.display()
+        );
+        if let Err(error) =
+            tidefs_posix_filesystem_adapter_daemon::run_cluster_vfs_rpc_mount(config)
+        {
+            eprintln!("tidefsctl pool mount: {error}");
+            process::exit(1);
+        }
+        return;
+    }
+
+    #[cfg(feature = "cluster")]
+    if !args.cluster
+        && (args.cluster_node_credential.is_some()
+            || args.cluster_trusted_vfs_rpc_peer_identity.is_some())
+    {
+        eprintln!(
+            "tidefsctl pool mount: cluster trust records require --cluster or --cluster-client"
+        );
+        process::exit(1);
+    }
+
     let mountpoint = args.mount_point.clone();
     let lock_dir = std::path::PathBuf::from("/run/tidefs/import");
     let live_args = super::live_owner::live_admin_args([
@@ -1415,6 +1584,46 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[test]
+    fn cluster_client_pool_mount_refuses_local_inputs_before_pool_work() {
+        assert_eq!(
+            parse_cluster_pool_guid("00112233445566778899aabbccddeeff").unwrap(),
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ]
+        );
+        assert!(parse_cluster_pool_guid("00").is_err());
+        assert!(parse_cluster_pool_guid(&"é".repeat(16)).is_err());
+        assert!(parse_cluster_pool_guid("00000000000000000000000000000000").is_err());
+
+        let args = PoolMountArgs {
+            pool_name: "remote".into(),
+            mount_point: PathBuf::from("/mnt/remote"),
+            read_only: true,
+            devices: None,
+            relatime: false,
+            dataset: "root".into(),
+            encryption_envelope: None,
+            encryption_passphrase: None,
+            encryption_salt: None,
+            runtime: PoolMountRuntimeArgs::default(),
+            cluster_client: true,
+            cluster_vfs_rpc_addr: Some("127.0.0.1:7412".into()),
+            cluster_pool_guid: Some("00112233445566778899aabbccddeeff".into()),
+            cluster: false,
+            cluster_authority_addr: None,
+            cluster_owner_node_id: None,
+            cluster_authority_node_id: None,
+            cluster_vfs_rpc_bind: None,
+            cluster_node_credential: None,
+            cluster_trusted_vfs_rpc_peer_identity: None,
+        };
+        let error = build_cluster_client_mount(&args).unwrap_err();
+        assert!(error.contains("refuses local devices"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
     fn cluster_identity_mount_records_load_fail_closed() {
         use std::fs::OpenOptions;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -1469,6 +1678,12 @@ mod tests {
             encryption_salt: None,
             runtime: PoolMountRuntimeArgs::default(),
             #[cfg(feature = "cluster")]
+            cluster_client: false,
+            #[cfg(feature = "cluster")]
+            cluster_vfs_rpc_addr: None,
+            #[cfg(feature = "cluster")]
+            cluster_pool_guid: None,
+            #[cfg(feature = "cluster")]
             cluster: false,
             #[cfg(feature = "cluster")]
             cluster_authority_addr: None,
@@ -1506,6 +1721,12 @@ mod tests {
             encryption_passphrase: None,
             encryption_salt: None,
             runtime: PoolMountRuntimeArgs::default(),
+            #[cfg(feature = "cluster")]
+            cluster_client: false,
+            #[cfg(feature = "cluster")]
+            cluster_vfs_rpc_addr: None,
+            #[cfg(feature = "cluster")]
+            cluster_pool_guid: None,
             dataset: "root".into(),
             #[cfg(feature = "cluster")]
             cluster: false,
@@ -1539,6 +1760,12 @@ mod tests {
             encryption_salt: None,
             runtime: PoolMountRuntimeArgs::default(),
             #[cfg(feature = "cluster")]
+            cluster_client: false,
+            #[cfg(feature = "cluster")]
+            cluster_vfs_rpc_addr: None,
+            #[cfg(feature = "cluster")]
+            cluster_pool_guid: None,
+            #[cfg(feature = "cluster")]
             cluster: false,
             #[cfg(feature = "cluster")]
             cluster_authority_addr: None,
@@ -1569,6 +1796,12 @@ mod tests {
             encryption_passphrase: None,
             encryption_salt: None,
             runtime: PoolMountRuntimeArgs::default(),
+            #[cfg(feature = "cluster")]
+            cluster_client: false,
+            #[cfg(feature = "cluster")]
+            cluster_vfs_rpc_addr: None,
+            #[cfg(feature = "cluster")]
+            cluster_pool_guid: None,
             #[cfg(feature = "cluster")]
             cluster: false,
             #[cfg(feature = "cluster")]
