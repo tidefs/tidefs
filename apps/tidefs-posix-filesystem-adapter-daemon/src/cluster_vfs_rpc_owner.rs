@@ -390,7 +390,8 @@ fn serve_session(
         };
         response_sequence = response_sequence.saturating_add(1);
 
-        let inbound = match adapter.unwrap_inbound(Instant::now(), &envelope, &payload) {
+        let inbound = match adapter.unwrap_inbound(Instant::now(), session_id, &envelope, &payload)
+        {
             Ok(inbound) => inbound,
             Err(VfsRpcTransportAdapterError::BulkUnsupported {
                 op_id,

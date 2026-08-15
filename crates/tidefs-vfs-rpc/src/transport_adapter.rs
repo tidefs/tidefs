@@ -85,6 +85,9 @@ pub struct VfsRpcOutboundFrame {
 }
 
 /// Decoded inbound VFS_RPC frame.
+///
+/// `session_id` is the receiver's authenticated local transport session, not
+/// the sender-local session number carried in the wire envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VfsRpcInboundFrame {
     Request {
@@ -388,14 +391,19 @@ impl VfsRpcTransportAdapter {
     }
 
     /// Decode an inbound control-lane payload and validate peer/session state.
+    ///
+    /// `receive_session_id` must be the local session from which the transport
+    /// received the envelope. The envelope's session number is endpoint-local
+    /// to its sender and is not receive-side authority.
     pub fn unwrap_inbound(
         &mut self,
         now: Instant,
+        receive_session_id: SessionId,
         envelope: &TransportEnvelope,
         payload: &[u8],
     ) -> Result<VfsRpcInboundFrame, VfsRpcTransportAdapterError> {
         self.check_envelope(envelope, payload.len())?;
-        let peer = self.peer_for_session(envelope.session_id)?;
+        let peer = self.peer_for_session(receive_session_id)?;
         let service_frame = ControlServiceFrame::decode(payload)
             .map_err(VfsRpcTransportAdapterError::ControlService)?;
         let rpc_frame = VfsRpcTransportFrame {
@@ -411,17 +419,17 @@ impl VfsRpcTransportAdapter {
                 reject_request_bulk(&request)?;
                 Ok(VfsRpcInboundFrame::Request {
                     peer,
-                    session_id: envelope.session_id,
+                    session_id: receive_session_id,
                     request,
                 })
             }
             VfsRpcMessageKind::Response => {
                 let response = rpc_frame.decode_response()?;
                 reject_response_bulk(&response)?;
-                self.complete_response(now, peer, envelope.session_id, &response)?;
+                self.complete_response(now, peer, receive_session_id, &response)?;
                 Ok(VfsRpcInboundFrame::Response {
                     peer,
-                    session_id: envelope.session_id,
+                    session_id: receive_session_id,
                     response,
                 })
             }
@@ -433,12 +441,13 @@ impl VfsRpcTransportAdapter {
     pub fn unwrap_inbound_with_bulk(
         &mut self,
         now: Instant,
+        receive_session_id: SessionId,
         envelope: &TransportEnvelope,
         payload: &[u8],
         bulk_service: &BulkService,
     ) -> Result<VfsRpcInboundFrame, VfsRpcTransportAdapterError> {
         self.check_envelope(envelope, payload.len())?;
-        let peer = self.peer_for_session(envelope.session_id)?;
+        let peer = self.peer_for_session(receive_session_id)?;
         let service_frame = ControlServiceFrame::decode(payload)
             .map_err(VfsRpcTransportAdapterError::ControlService)?;
         let rpc_frame = VfsRpcTransportFrame {
@@ -451,10 +460,10 @@ impl VfsRpcTransportAdapter {
             VfsRpcMessageKind::Request => {
                 let request = rpc_frame.decode_request()?;
                 check_request_peer(peer, &request)?;
-                self.admit_request_bulk(peer, envelope.session_id, &request, bulk_service)?;
+                self.admit_request_bulk(peer, receive_session_id, &request, bulk_service)?;
                 Ok(VfsRpcInboundFrame::Request {
                     peer,
-                    session_id: envelope.session_id,
+                    session_id: receive_session_id,
                     request,
                 })
             }
@@ -462,17 +471,17 @@ impl VfsRpcTransportAdapter {
                 let response = rpc_frame.decode_response()?;
                 let has_bulk = self.admit_response_bulk(
                     peer,
-                    envelope.session_id,
+                    receive_session_id,
                     &response,
                     bulk_service,
                     true,
                 )?;
                 if !has_bulk {
-                    self.complete_response(now, peer, envelope.session_id, &response)?;
+                    self.complete_response(now, peer, receive_session_id, &response)?;
                 }
                 Ok(VfsRpcInboundFrame::Response {
                     peer,
-                    session_id: envelope.session_id,
+                    session_id: receive_session_id,
                     response,
                 })
             }
@@ -1437,7 +1446,12 @@ mod tests {
         assert_eq!(service_frame.body, original_body);
 
         let inbound = adapter
-            .unwrap_inbound(Instant::now(), &outbound.envelope, &outbound.payload)
+            .unwrap_inbound(
+                Instant::now(),
+                session_id,
+                &outbound.envelope,
+                &outbound.payload,
+            )
             .expect("unwrap request");
         match inbound {
             VfsRpcInboundFrame::Request {
@@ -1447,6 +1461,65 @@ mod tests {
             } => {
                 assert_eq!(got_peer, peer);
                 assert_eq!(got_session, session_id);
+                assert_eq!(decoded, request);
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbound_session_authority_comes_from_local_receive_path() {
+        let peer = PeerId(9);
+        let local_session = SessionId::new(33);
+        let sender_local_session = SessionId::new(71);
+        let unknown_local_session = SessionId::new(99);
+        let mut adapter = VfsRpcTransportAdapter::new(
+            VfsRpcTransportAdapterConfig::default(),
+            healthy_sessions(peer, local_session),
+        );
+        let request = sample_request();
+        let mut outbound = adapter
+            .wrap_request_for_session(
+                peer,
+                local_session,
+                &request,
+                VfsRpcEnvelopeContext::default(),
+            )
+            .expect("wrap request");
+        outbound.envelope.session_id = sender_local_session;
+
+        let error = adapter
+            .unwrap_inbound(
+                Instant::now(),
+                unknown_local_session,
+                &outbound.envelope,
+                &outbound.payload,
+            )
+            .expect_err("unknown local receive session");
+        assert_eq!(
+            error,
+            VfsRpcTransportAdapterError::SessionClosed {
+                session_id: unknown_local_session,
+            }
+        );
+
+        match adapter
+            .unwrap_inbound(
+                Instant::now(),
+                local_session,
+                &outbound.envelope,
+                &outbound.payload,
+            )
+            .expect("unwrap through authenticated local receive session")
+        {
+            VfsRpcInboundFrame::Request {
+                peer: got_peer,
+                session_id,
+                request: decoded,
+            } => {
+                assert_eq!(got_peer, peer);
+                assert_eq!(session_id, local_session);
+                assert_ne!(session_id, outbound.envelope.session_id);
                 assert_eq!(decoded, request);
             }
             other => panic!("expected request, got {other:?}"),
@@ -1470,7 +1543,7 @@ mod tests {
 
         let response =
             VfsRpcResponse::error(OpId(7), VfsRpcMethod::Lookup, Errno::ENOENT).expect("response");
-        let outbound = adapter
+        let mut outbound = adapter
             .wrap_response_for_session(
                 peer,
                 session_id,
@@ -1478,18 +1551,21 @@ mod tests {
                 VfsRpcEnvelopeContext::default(),
             )
             .expect("wrap response");
+        outbound.envelope.session_id = SessionId::new(72);
 
         let inbound = adapter
-            .unwrap_inbound(now, &outbound.envelope, &outbound.payload)
+            .unwrap_inbound(now, session_id, &outbound.envelope, &outbound.payload)
             .expect("unwrap response");
 
         match inbound {
             VfsRpcInboundFrame::Response {
                 peer: got_peer,
+                session_id: got_session,
                 response: decoded,
-                ..
             } => {
                 assert_eq!(got_peer, peer);
+                assert_eq!(got_session, session_id);
+                assert_ne!(got_session, outbound.envelope.session_id);
                 assert_eq!(decoded, response);
             }
             other => panic!("expected response, got {other:?}"),
@@ -1543,7 +1619,7 @@ mod tests {
             )
             .expect("wrap peer a response");
         adapter
-            .unwrap_inbound(now, &outbound_a.envelope, &outbound_a.payload)
+            .unwrap_inbound(now, session_a, &outbound_a.envelope, &outbound_a.payload)
             .expect("unwrap peer a response");
         assert_eq!(adapter.pending_len(), 1);
 
@@ -1556,7 +1632,7 @@ mod tests {
             )
             .expect("wrap peer b response");
         adapter
-            .unwrap_inbound(now, &outbound_b.envelope, &outbound_b.payload)
+            .unwrap_inbound(now, session_b, &outbound_b.envelope, &outbound_b.payload)
             .expect("unwrap peer b response");
         assert_eq!(adapter.pending_len(), 0);
     }
@@ -1590,7 +1666,7 @@ mod tests {
             .expect("wrap response");
 
         let err = adapter
-            .unwrap_inbound(now, &outbound.envelope, &outbound.payload)
+            .unwrap_inbound(now, other_session, &outbound.envelope, &outbound.payload)
             .expect_err("peer mismatch");
 
         assert_eq!(err.errno(), Errno::EPROTO);
@@ -1782,10 +1858,11 @@ mod tests {
             }),
         )
         .expect("bulk response");
-        let (envelope, payload) = encode_response_payload(&response);
+        let (mut envelope, payload) = encode_response_payload(&response);
+        envelope.session_id = SessionId::new(73);
 
         adapter
-            .unwrap_inbound_with_bulk(now, &envelope, &payload, &bulk)
+            .unwrap_inbound_with_bulk(now, session_id, &envelope, &payload, &bulk)
             .expect("bulk response admitted");
         assert_eq!(adapter.pending_len(), 1);
         assert_eq!(adapter.pending_bulk_len(), 1);
@@ -2200,7 +2277,12 @@ mod tests {
             .expect("wrap");
 
         let err = adapter
-            .unwrap_inbound(Instant::now(), &outbound.envelope, &outbound.payload)
+            .unwrap_inbound(
+                Instant::now(),
+                session_id,
+                &outbound.envelope,
+                &outbound.payload,
+            )
             .expect_err("credential mismatch");
         assert_eq!(err.errno(), Errno::EACCES);
         let response = err.response_for_request(&request).expect("error response");

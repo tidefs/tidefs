@@ -188,7 +188,7 @@ impl RpcClient {
             .expect("receive VFS_RPC response envelope");
         match self
             .adapter
-            .unwrap_inbound(Instant::now(), &envelope, &payload)
+            .unwrap_inbound(Instant::now(), self.session_id, &envelope, &payload)
             .expect("unwrap VFS_RPC response")
         {
             VfsRpcInboundFrame::Response { response, .. } => response,
@@ -234,7 +234,7 @@ impl RpcClient {
             .expect("receive explicit BULK refusal");
         match self
             .adapter
-            .unwrap_inbound(Instant::now(), &envelope, &payload)
+            .unwrap_inbound(Instant::now(), self.session_id, &envelope, &payload)
             .expect("unwrap explicit BULK refusal")
         {
             VfsRpcInboundFrame::Response { response, .. } => response,
