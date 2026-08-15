@@ -24,7 +24,7 @@ use tidefs_transport::{
 use tidefs_types_vfs_core::Errno;
 
 use crate::{
-    InlineOrBulk, OpId, PeerId, VfsRpcError, VfsRpcMessageKind, VfsRpcRequest,
+    DatasetId, InlineOrBulk, OpId, PeerId, VfsRpcError, VfsRpcMessageKind, VfsRpcRequest,
     VfsRpcRequestPayload, VfsRpcResponse, VfsRpcResponsePayload, VfsRpcTransportFrame,
     REQ_FLAG_BULK_PENDING, RESP_FLAG_BULK,
 };
@@ -35,6 +35,319 @@ pub const VFS_RPC_CONTROL_ENDPOINT_FAMILY: EndpointFamily = CONTROL_SERVICE_ENDP
 pub const VFS_RPC_CONTROL_MESSAGE_FAMILY: MessageFamily = CONTROL_SERVICE_MESSAGE_FAMILY;
 /// Lane selected by [`VFS_RPC_CONTROL_MESSAGE_FAMILY`].
 pub const VFS_RPC_CONTROL_LANE: LaneClass = CONTROL_SERVICE_LANE;
+/// Control-service message type carrying the owner-issued session authority.
+pub const VFS_RPC_SESSION_AUTHORITY_MESSAGE_TYPE: u8 = 0xff;
+/// Exact byte length of a VFS_RPC session-authority record.
+pub const VFS_RPC_SESSION_AUTHORITY_WIRE_SIZE: usize = 64;
+
+const VFS_RPC_SESSION_AUTHORITY_MAGIC: [u8; 4] = *b"TVSA";
+const VFS_RPC_SESSION_AUTHORITY_VERSION: u16 = 1;
+
+/// Owner-issued authority for requests on one authenticated VFS_RPC session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VfsRpcSessionAuthority {
+    pool_guid: [u8; 16],
+    dataset_id: DatasetId,
+    writer_node: u64,
+    term: u64,
+    epoch: u64,
+}
+
+impl VfsRpcSessionAuthority {
+    pub fn new(
+        pool_guid: [u8; 16],
+        dataset_id: DatasetId,
+        writer_node: u64,
+        term: u64,
+        epoch: u64,
+    ) -> Result<Self, VfsRpcSessionAuthorityError> {
+        let authority = Self {
+            pool_guid,
+            dataset_id,
+            writer_node,
+            term,
+            epoch,
+        };
+        authority.validate_nonzero()?;
+        Ok(authority)
+    }
+
+    #[must_use]
+    pub const fn pool_guid(&self) -> [u8; 16] {
+        self.pool_guid
+    }
+
+    #[must_use]
+    pub const fn dataset_id(&self) -> DatasetId {
+        self.dataset_id
+    }
+
+    #[must_use]
+    pub const fn writer_node(&self) -> u64 {
+        self.writer_node
+    }
+
+    #[must_use]
+    pub const fn term(&self) -> u64 {
+        self.term
+    }
+
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Encode the strict fixed-width little-endian authority record.
+    #[must_use]
+    pub fn encode_fixed(&self) -> [u8; VFS_RPC_SESSION_AUTHORITY_WIRE_SIZE] {
+        let mut bytes = [0_u8; VFS_RPC_SESSION_AUTHORITY_WIRE_SIZE];
+        bytes[0..4].copy_from_slice(&VFS_RPC_SESSION_AUTHORITY_MAGIC);
+        bytes[4..6].copy_from_slice(&VFS_RPC_SESSION_AUTHORITY_VERSION.to_le_bytes());
+        bytes[6..8].copy_from_slice(&(VFS_RPC_SESSION_AUTHORITY_WIRE_SIZE as u16).to_le_bytes());
+        bytes[8..24].copy_from_slice(&self.pool_guid);
+        bytes[24..40].copy_from_slice(&self.dataset_id.0.to_le_bytes());
+        bytes[40..48].copy_from_slice(&self.writer_node.to_le_bytes());
+        bytes[48..56].copy_from_slice(&self.term.to_le_bytes());
+        bytes[56..64].copy_from_slice(&self.epoch.to_le_bytes());
+        bytes
+    }
+
+    /// Decode only the current exact authority record; no fallback format is
+    /// accepted for this unreleased internal protocol.
+    pub fn decode_fixed(bytes: &[u8]) -> Result<Self, VfsRpcSessionAuthorityError> {
+        if bytes.len() != VFS_RPC_SESSION_AUTHORITY_WIRE_SIZE {
+            return Err(VfsRpcSessionAuthorityError::WrongLength {
+                expected: VFS_RPC_SESSION_AUTHORITY_WIRE_SIZE,
+                actual: bytes.len(),
+            });
+        }
+        let magic: [u8; 4] = bytes[0..4]
+            .try_into()
+            .expect("fixed authority record has four magic bytes");
+        if magic != VFS_RPC_SESSION_AUTHORITY_MAGIC {
+            return Err(VfsRpcSessionAuthorityError::BadMagic(magic));
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != VFS_RPC_SESSION_AUTHORITY_VERSION {
+            return Err(VfsRpcSessionAuthorityError::UnsupportedVersion(version));
+        }
+        let declared_length = u16::from_le_bytes([bytes[6], bytes[7]]);
+        if usize::from(declared_length) != VFS_RPC_SESSION_AUTHORITY_WIRE_SIZE {
+            return Err(VfsRpcSessionAuthorityError::DeclaredLength {
+                declared: declared_length,
+                actual: bytes.len(),
+            });
+        }
+        let authority = Self {
+            pool_guid: bytes[8..24]
+                .try_into()
+                .expect("fixed authority record has sixteen Pool GUID bytes"),
+            dataset_id: DatasetId(u128::from_le_bytes(
+                bytes[24..40]
+                    .try_into()
+                    .expect("fixed authority record has sixteen dataset bytes"),
+            )),
+            writer_node: u64::from_le_bytes(
+                bytes[40..48]
+                    .try_into()
+                    .expect("fixed authority record has eight writer bytes"),
+            ),
+            term: u64::from_le_bytes(
+                bytes[48..56]
+                    .try_into()
+                    .expect("fixed authority record has eight term bytes"),
+            ),
+            epoch: u64::from_le_bytes(
+                bytes[56..64]
+                    .try_into()
+                    .expect("fixed authority record has eight epoch bytes"),
+            ),
+        };
+        authority.validate_nonzero()?;
+        Ok(authority)
+    }
+
+    /// Bind the decoded record to the Pool selected by the caller and the
+    /// writer identity established by mutual transport attestation.
+    pub fn validate_for_client(
+        &self,
+        expected_pool_guid: [u8; 16],
+        authenticated_peer: u64,
+    ) -> Result<(), VfsRpcSessionAuthorityError> {
+        if expected_pool_guid == [0; 16] {
+            return Err(VfsRpcSessionAuthorityError::ZeroExpectedPoolGuid);
+        }
+        if self.pool_guid != expected_pool_guid {
+            return Err(VfsRpcSessionAuthorityError::WrongPoolGuid {
+                expected: expected_pool_guid,
+                found: self.pool_guid,
+            });
+        }
+        if self.writer_node != authenticated_peer {
+            return Err(VfsRpcSessionAuthorityError::WrongWriter {
+                expected: self.writer_node,
+                authenticated_peer,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_nonzero(&self) -> Result<(), VfsRpcSessionAuthorityError> {
+        if self.pool_guid == [0; 16] {
+            return Err(VfsRpcSessionAuthorityError::ZeroPoolGuid);
+        }
+        if self.dataset_id.0 == 0 {
+            return Err(VfsRpcSessionAuthorityError::ZeroDatasetId);
+        }
+        if self.writer_node == 0 {
+            return Err(VfsRpcSessionAuthorityError::ZeroWriterNode);
+        }
+        if self.term == 0 {
+            return Err(VfsRpcSessionAuthorityError::ZeroTerm);
+        }
+        if self.epoch == 0 {
+            return Err(VfsRpcSessionAuthorityError::ZeroEpoch);
+        }
+        Ok(())
+    }
+}
+
+/// Strict session-authority codec or admission failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VfsRpcSessionAuthorityError {
+    ControlService(tidefs_transport::ControlServiceDispatchError),
+    WrongMessageFamily {
+        found: MessageFamily,
+    },
+    WrongLane {
+        found: LaneClass,
+    },
+    WrongSequence {
+        found: u64,
+    },
+    WrongServiceId {
+        found: u8,
+    },
+    WrongMessageType {
+        found: u8,
+    },
+    WrongLength {
+        expected: usize,
+        actual: usize,
+    },
+    BadMagic([u8; 4]),
+    UnsupportedVersion(u16),
+    DeclaredLength {
+        declared: u16,
+        actual: usize,
+    },
+    ZeroPoolGuid,
+    ZeroExpectedPoolGuid,
+    ZeroDatasetId,
+    ZeroWriterNode,
+    ZeroTerm,
+    ZeroEpoch,
+    WrongPoolGuid {
+        expected: [u8; 16],
+        found: [u8; 16],
+    },
+    WrongWriter {
+        expected: u64,
+        authenticated_peer: u64,
+    },
+}
+
+impl fmt::Display for VfsRpcSessionAuthorityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ControlService(error) => write!(f, "{error}"),
+            Self::WrongMessageFamily { found } => {
+                write!(f, "VFS_RPC authority received on wrong transport family {found}")
+            }
+            Self::WrongLane { found } => {
+                write!(f, "VFS_RPC authority received on wrong lane {found:?}")
+            }
+            Self::WrongSequence { found } => {
+                write!(f, "VFS_RPC authority has sequence {found}, expected 0")
+            }
+            Self::WrongServiceId { found } => {
+                write!(f, "VFS_RPC authority has wrong service id {found:#04x}")
+            }
+            Self::WrongMessageType { found } => {
+                write!(f, "VFS_RPC authority has wrong message type {found:#04x}")
+            }
+            Self::WrongLength { expected, actual } => write!(
+                f,
+                "VFS_RPC authority length {actual} does not equal {expected}"
+            ),
+            Self::BadMagic(found) => write!(f, "VFS_RPC authority has bad magic {found:?}"),
+            Self::UnsupportedVersion(version) => {
+                write!(f, "VFS_RPC authority version {version} is unsupported")
+            }
+            Self::DeclaredLength { declared, actual } => write!(
+                f,
+                "VFS_RPC authority declares length {declared}, actual {actual}"
+            ),
+            Self::ZeroPoolGuid => write!(f, "VFS_RPC authority Pool GUID must be nonzero"),
+            Self::ZeroExpectedPoolGuid => {
+                write!(f, "expected VFS_RPC authority Pool GUID must be nonzero")
+            }
+            Self::ZeroDatasetId => write!(f, "VFS_RPC authority dataset must be nonzero"),
+            Self::ZeroWriterNode => write!(f, "VFS_RPC authority writer must be nonzero"),
+            Self::ZeroTerm => write!(f, "VFS_RPC authority term must be nonzero"),
+            Self::ZeroEpoch => write!(f, "VFS_RPC authority epoch must be nonzero"),
+            Self::WrongPoolGuid { expected, found } => write!(
+                f,
+                "VFS_RPC authority Pool GUID {found:02x?} does not match expected {expected:02x?}"
+            ),
+            Self::WrongWriter {
+                expected,
+                authenticated_peer,
+            } => write!(
+                f,
+                "VFS_RPC authority writer {expected} does not match authenticated peer {authenticated_peer}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VfsRpcSessionAuthorityError {}
+
+/// Decode an owner-issued session authority from one authenticated receive
+/// path's Control envelope.
+pub fn decode_session_authority_frame(
+    envelope: &TransportEnvelope,
+    payload: &[u8],
+) -> Result<VfsRpcSessionAuthority, VfsRpcSessionAuthorityError> {
+    if envelope.message_family != VFS_RPC_CONTROL_MESSAGE_FAMILY {
+        return Err(VfsRpcSessionAuthorityError::WrongMessageFamily {
+            found: envelope.message_family,
+        });
+    }
+    if envelope.lane_class != VFS_RPC_CONTROL_LANE {
+        return Err(VfsRpcSessionAuthorityError::WrongLane {
+            found: envelope.lane_class,
+        });
+    }
+    if envelope.sequence_number != 0 {
+        return Err(VfsRpcSessionAuthorityError::WrongSequence {
+            found: envelope.sequence_number,
+        });
+    }
+    let frame = ControlServiceFrame::decode(payload)
+        .map_err(VfsRpcSessionAuthorityError::ControlService)?;
+    if frame.service_id != crate::VFS_RPC_SERVICE_ID {
+        return Err(VfsRpcSessionAuthorityError::WrongServiceId {
+            found: frame.service_id,
+        });
+    }
+    if frame.message_type != VFS_RPC_SESSION_AUTHORITY_MESSAGE_TYPE {
+        return Err(VfsRpcSessionAuthorityError::WrongMessageType {
+            found: frame.message_type,
+        });
+    }
+    VfsRpcSessionAuthority::decode_fixed(&frame.body)
+}
 
 /// Adapter configuration for frame bounds and retry timing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -233,6 +546,25 @@ impl VfsRpcTransportAdapter {
     #[must_use]
     pub fn pending_bulk_len(&self) -> usize {
         self.pending_bulk.len()
+    }
+
+    /// Wrap the owner-issued authority preface for one already-authenticated
+    /// local transport session. This does not create request-correlation state.
+    pub fn wrap_session_authority_for_session(
+        &self,
+        session_id: SessionId,
+        authority: &VfsRpcSessionAuthority,
+        context: VfsRpcEnvelopeContext,
+    ) -> Result<(TransportEnvelope, Vec<u8>), VfsRpcTransportAdapterError> {
+        let payload = ControlServiceFrame::new(
+            crate::VFS_RPC_SERVICE_ID,
+            VFS_RPC_SESSION_AUTHORITY_MESSAGE_TYPE,
+            authority.encode_fixed().to_vec(),
+        )
+        .encode()
+        .map_err(VfsRpcTransportAdapterError::ControlService)?;
+        let envelope = self.envelope_for(session_id, context, payload.len())?;
+        Ok((envelope, payload))
     }
 
     /// Wrap an outbound request and record its `op_id` for response correlation.
@@ -1406,6 +1738,119 @@ mod tests {
             VisibilityClass::Internal,
         );
         (envelope, payload)
+    }
+
+    fn sample_session_authority() -> VfsRpcSessionAuthority {
+        VfsRpcSessionAuthority::new([0x41; 16], DatasetId::new(0x52), 9, 7, 3)
+            .expect("valid session authority")
+    }
+
+    #[test]
+    fn session_authority_roundtrips_as_one_strict_control_frame() {
+        let authority = sample_session_authority();
+        let session_id = SessionId::new(33);
+        let adapter = VfsRpcTransportAdapter::new(
+            VfsRpcTransportAdapterConfig::default(),
+            healthy_sessions(PeerId(9), session_id),
+        );
+        let (envelope, payload) = adapter
+            .wrap_session_authority_for_session(
+                session_id,
+                &authority,
+                VfsRpcEnvelopeContext {
+                    sequence_number: 0,
+                    ..VfsRpcEnvelopeContext::default()
+                },
+            )
+            .expect("wrap authority preface");
+
+        assert_eq!(envelope.sequence_number, 0);
+        assert_eq!(envelope.session_id, session_id);
+        let frame = ControlServiceFrame::decode(&payload).expect("decode control frame");
+        assert_eq!(frame.service_id, VFS_RPC_SERVICE_ID);
+        assert_eq!(frame.message_type, VFS_RPC_SESSION_AUTHORITY_MESSAGE_TYPE);
+        assert_eq!(frame.body.len(), VFS_RPC_SESSION_AUTHORITY_WIRE_SIZE);
+        assert_eq!(
+            decode_session_authority_frame(&envelope, &payload),
+            Ok(authority)
+        );
+        let mut late_envelope = envelope;
+        late_envelope.sequence_number = 1;
+        assert_eq!(
+            decode_session_authority_frame(&late_envelope, &payload),
+            Err(VfsRpcSessionAuthorityError::WrongSequence { found: 1 })
+        );
+    }
+
+    #[test]
+    fn session_authority_decoder_rejects_noncanonical_records() {
+        let encoded = sample_session_authority().encode_fixed();
+
+        assert!(matches!(
+            VfsRpcSessionAuthority::decode_fixed(&encoded[..encoded.len() - 1]),
+            Err(VfsRpcSessionAuthorityError::WrongLength { .. })
+        ));
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            VfsRpcSessionAuthority::decode_fixed(&trailing),
+            Err(VfsRpcSessionAuthorityError::WrongLength { .. })
+        ));
+
+        let mut bad_magic = encoded;
+        bad_magic[0] ^= 0xff;
+        assert!(matches!(
+            VfsRpcSessionAuthority::decode_fixed(&bad_magic),
+            Err(VfsRpcSessionAuthorityError::BadMagic(_))
+        ));
+        let mut bad_version = encoded;
+        bad_version[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(
+            VfsRpcSessionAuthority::decode_fixed(&bad_version),
+            Err(VfsRpcSessionAuthorityError::UnsupportedVersion(2))
+        );
+        let mut bad_declared_length = encoded;
+        bad_declared_length[6..8].copy_from_slice(&63_u16.to_le_bytes());
+        assert_eq!(
+            VfsRpcSessionAuthority::decode_fixed(&bad_declared_length),
+            Err(VfsRpcSessionAuthorityError::DeclaredLength {
+                declared: 63,
+                actual: VFS_RPC_SESSION_AUTHORITY_WIRE_SIZE,
+            })
+        );
+
+        for (range, expected) in [
+            (8..24, VfsRpcSessionAuthorityError::ZeroPoolGuid),
+            (24..40, VfsRpcSessionAuthorityError::ZeroDatasetId),
+            (40..48, VfsRpcSessionAuthorityError::ZeroWriterNode),
+            (48..56, VfsRpcSessionAuthorityError::ZeroTerm),
+            (56..64, VfsRpcSessionAuthorityError::ZeroEpoch),
+        ] {
+            let mut zeroed = encoded;
+            zeroed[range].fill(0);
+            assert_eq!(VfsRpcSessionAuthority::decode_fixed(&zeroed), Err(expected));
+        }
+    }
+
+    #[test]
+    fn session_authority_binds_expected_pool_and_authenticated_writer() {
+        let authority = sample_session_authority();
+        assert_eq!(authority.validate_for_client([0x41; 16], 9), Ok(()));
+        assert!(matches!(
+            authority.validate_for_client([0x42; 16], 9),
+            Err(VfsRpcSessionAuthorityError::WrongPoolGuid { .. })
+        ));
+        assert_eq!(
+            authority.validate_for_client([0x41; 16], 10),
+            Err(VfsRpcSessionAuthorityError::WrongWriter {
+                expected: 9,
+                authenticated_peer: 10,
+            })
+        );
+        assert_eq!(
+            authority.validate_for_client([0; 16], 9),
+            Err(VfsRpcSessionAuthorityError::ZeroExpectedPoolGuid)
+        );
     }
 
     #[test]

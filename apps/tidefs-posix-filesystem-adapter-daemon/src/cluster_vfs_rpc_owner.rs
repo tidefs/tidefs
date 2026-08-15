@@ -19,8 +19,8 @@ use tidefs_transport::{
 use tidefs_vfs_engine::dispatch::VfsEngineDispatchBridge;
 use tidefs_vfs_engine::{VfsDispatch, VfsOperation, VfsResponse};
 use tidefs_vfs_rpc::transport_adapter::{
-    VfsRpcEnvelopeContext, VfsRpcFrameDirection, VfsRpcInboundFrame, VfsRpcTransportAdapter,
-    VfsRpcTransportAdapterConfig, VfsRpcTransportAdapterError,
+    VfsRpcEnvelopeContext, VfsRpcFrameDirection, VfsRpcInboundFrame, VfsRpcSessionAuthority,
+    VfsRpcTransportAdapter, VfsRpcTransportAdapterConfig, VfsRpcTransportAdapterError,
 };
 use tidefs_vfs_rpc::vfs_engine_bridge::{VfsEngineBridge, VfsEngineBridgeWriter};
 use tidefs_vfs_rpc::{DatasetId, PeerId, VfsRpcResponse};
@@ -77,6 +77,7 @@ pub struct ClusterVfsRpcOwnerConfig {
     admitted_peer_node: u64,
     local_credential: Arc<NodePrivateCredential>,
     trusted_peer_identity: NodePublicIdentity,
+    pool_guid: [u8; 16],
     dataset_id: DatasetId,
     writer_fence: Arc<Mutex<ClusterVfsRpcWriterFence>>,
     engine: LiveOwnerEngine,
@@ -91,6 +92,7 @@ impl ClusterVfsRpcOwnerConfig {
         admitted_peer_node: u64,
         local_credential: Arc<NodePrivateCredential>,
         trusted_peer_identity: NodePublicIdentity,
+        pool_guid: [u8; 16],
         dataset_id: DatasetId,
         writer_fence: Arc<Mutex<ClusterVfsRpcWriterFence>>,
         engine: LiveOwnerEngine,
@@ -102,6 +104,7 @@ impl ClusterVfsRpcOwnerConfig {
             admitted_peer_node,
             local_credential,
             trusted_peer_identity,
+            pool_guid,
             dataset_id,
             writer_fence,
             engine,
@@ -142,6 +145,9 @@ impl ClusterVfsRpcOwnerConfig {
         self.local_credential
             .keypair()
             .map_err(|error| format!("cluster VFS_RPC local credential is invalid: {error}"))?;
+        if self.pool_guid == [0; 16] {
+            return Err("cluster VFS_RPC Pool GUID must be nonzero".to_string());
+        }
         if self.dataset_id.0 == 0 {
             return Err("cluster VFS_RPC dataset identity must be nonzero".to_string());
         }
@@ -368,7 +374,28 @@ fn serve_session(
     sessions.mark_healthy(session_id);
     let mut adapter =
         VfsRpcTransportAdapter::new(VfsRpcTransportAdapterConfig::default(), sessions);
-    let mut response_sequence = 0_u64;
+    let authority = VfsRpcSessionAuthority::new(
+        config.pool_guid,
+        config.dataset_id,
+        fence.writer_node,
+        fence.term,
+        fence.epoch,
+    )
+    .map_err(|error| format!("build cluster VFS_RPC session authority: {error}"))?;
+    let (mut authority_envelope, authority_payload) = adapter
+        .wrap_session_authority_for_session(
+            session_id,
+            &authority,
+            VfsRpcEnvelopeContext {
+                sequence_number: 0,
+                ..VfsRpcEnvelopeContext::default()
+            },
+        )
+        .map_err(|error| format!("wrap cluster VFS_RPC session authority: {error}"))?;
+    transport
+        .send_envelope(&mut authority_envelope, &authority_payload)
+        .map_err(|error| format!("send cluster VFS_RPC session authority: {error}"))?;
+    let mut response_sequence = 1_u64;
     let dispatch = PoolBackedEngineDispatch {
         engine: Arc::clone(&config.engine),
     };
