@@ -194,7 +194,10 @@ impl From<LabelError> for PoolImportError {
             LabelError::BadTopologyRoster
             | LabelError::UnsupportedTopologyRosterVersion(_)
             | LabelError::DuplicateTopologyRosterGuid
-            | LabelError::TopologyRosterChecksumMismatch => Self::ChecksumMismatch,
+            | LabelError::TopologyRosterChecksumMismatch
+            | LabelError::BadPoolLifecycle
+            | LabelError::UnsupportedPoolLifecycleVersion(_)
+            | LabelError::PoolLifecycleChecksumMismatch => Self::ChecksumMismatch,
             LabelError::LastDevice => Self::LabelInvalid {
                 detail: {
                     use core::fmt::Write;
@@ -1384,6 +1387,20 @@ mod tests {
             LabelError::UnsupportedTopologyRosterVersion(2),
             LabelError::DuplicateTopologyRosterGuid,
             LabelError::TopologyRosterChecksumMismatch,
+        ] {
+            assert_eq!(
+                PoolImportError::from(error),
+                PoolImportError::ChecksumMismatch
+            );
+        }
+    }
+
+    #[test]
+    fn pool_lifecycle_label_errors_map_to_corrupt() {
+        for error in [
+            LabelError::BadPoolLifecycle,
+            LabelError::UnsupportedPoolLifecycleVersion(2),
+            LabelError::PoolLifecycleChecksumMismatch,
         ] {
             assert_eq!(
                 PoolImportError::from(error),
