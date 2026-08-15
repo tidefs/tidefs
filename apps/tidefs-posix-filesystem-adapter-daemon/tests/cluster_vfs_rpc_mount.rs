@@ -135,9 +135,8 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
     let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
         "127.0.0.1:0".parse().unwrap(),
         OWNER_NODE,
-        CLIENT_NODE,
         Arc::new(owner_identity.credential()),
-        client_identity.public_identity(),
+        vec![client_identity.public_identity()],
         POOL_GUID,
         dataset_id,
         writer_fence,

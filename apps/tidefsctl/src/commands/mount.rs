@@ -240,13 +240,15 @@ pub struct PoolMountArgs {
     pub cluster_trusted_authority_identity: Option<PathBuf>,
 
     #[cfg(feature = "cluster")]
-    /// Shareable public identity trusted for the VFS_RPC peer.
+    /// Shareable public identity trusted for a VFS_RPC peer. Repeat for each
+    /// admitted peer on a cluster owner; cluster clients require exactly one.
     #[arg(
         long = "cluster-trusted-vfs-rpc-peer-identity",
         value_name = "PATH",
+        action = clap::ArgAction::Append,
         required_if_eq_any([("cluster", "true"), ("cluster_client", "true")])
     )]
-    pub cluster_trusted_vfs_rpc_peer_identity: Option<PathBuf>,
+    pub cluster_trusted_vfs_rpc_peer_identity: Vec<PathBuf>,
 }
 
 /// Find device-label files inside a pool backing directory.
@@ -869,18 +871,26 @@ fn build_cluster_client_mount(
             .as_deref()
             .ok_or_else(|| "--cluster-client requires --cluster-pool-guid".to_string())?,
     )?;
+    let trusted_owner_path = match args.cluster_trusted_vfs_rpc_peer_identity.as_slice() {
+        [path] => path,
+        [] => {
+            return Err(
+                "--cluster-client requires --cluster-trusted-vfs-rpc-peer-identity".to_string(),
+            );
+        }
+        _ => {
+            return Err(
+                "--cluster-client requires exactly one --cluster-trusted-vfs-rpc-peer-identity"
+                    .to_string(),
+            );
+        }
+    };
     let local_credential = load_cluster_node_credential(
         args.cluster_node_credential
             .as_deref()
             .ok_or_else(|| "--cluster-client requires --cluster-node-credential".to_string())?,
     )?;
-    let trusted_owner_identity = load_cluster_public_identity(
-        args.cluster_trusted_vfs_rpc_peer_identity
-            .as_deref()
-            .ok_or_else(|| {
-                "--cluster-client requires --cluster-trusted-vfs-rpc-peer-identity".to_string()
-            })?,
-    )?;
+    let trusted_owner_identity = load_cluster_public_identity(trusted_owner_path)?;
 
     Ok(
         tidefs_posix_filesystem_adapter_daemon::ClusterVfsRpcMountConfig::new(
@@ -922,7 +932,7 @@ pub fn handle_mount(args: PoolMountArgs) {
     if !args.cluster
         && (args.cluster_node_credential.is_some()
             || args.cluster_trusted_authority_identity.is_some()
-            || args.cluster_trusted_vfs_rpc_peer_identity.is_some())
+            || !args.cluster_trusted_vfs_rpc_peer_identity.is_empty())
     {
         eprintln!(
             "tidefsctl pool mount: cluster trust records require --cluster or --cluster-client"
@@ -1082,31 +1092,31 @@ pub fn handle_mount(args: PoolMountArgs) {
             eprintln!("tidefsctl pool mount: {error}");
             process::exit(1);
         });
-        let trusted_vfs_rpc_peer_identity = load_cluster_public_identity(
-            args.cluster_trusted_vfs_rpc_peer_identity
-                .as_deref()
-                .unwrap(),
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("tidefsctl pool mount: {error}");
-            process::exit(1);
-        });
+        let trusted_vfs_rpc_peer_identities = args
+            .cluster_trusted_vfs_rpc_peer_identity
+            .iter()
+            .map(|path| load_cluster_public_identity(path))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| {
+                eprintln!("tidefsctl pool mount: {error}");
+                process::exit(1);
+            });
         let owner_node_id = local_credential.node_id();
         let authority_node_id = trusted_authority_identity.node_id();
-        let admitted_vfs_rpc_peer_node_id = trusted_vfs_rpc_peer_identity.node_id();
         let local_public_identity = local_credential.public_identity();
-        validate_cluster_identity_consistency(&[
+        let mut cluster_identities = vec![
             ("Pool owner credential", local_public_identity.identity()),
             (
                 "trusted Pool lease authority",
                 trusted_authority_identity.identity(),
             ),
-            (
-                "trusted VFS_RPC peer",
-                trusted_vfs_rpc_peer_identity.identity(),
-            ),
-        ])
-        .unwrap_or_else(|error| {
+        ];
+        cluster_identities.extend(
+            trusted_vfs_rpc_peer_identities
+                .iter()
+                .map(|identity| ("trusted VFS_RPC peer", identity.identity())),
+        );
+        validate_cluster_identity_consistency(&cluster_identities).unwrap_or_else(|error| {
             eprintln!("tidefsctl pool mount: {error}");
             process::exit(1);
         });
@@ -1180,9 +1190,8 @@ pub fn handle_mount(args: PoolMountArgs) {
             });
         if let Err(error) = authority.configure_cluster_vfs_rpc_owner(
             vfs_rpc_bind,
-            admitted_vfs_rpc_peer_node_id,
             local_credential,
-            trusted_vfs_rpc_peer_identity,
+            trusted_vfs_rpc_peer_identities,
         ) {
             let release_error = authority.release_unmounted().err();
             eprintln!(
@@ -1668,10 +1677,46 @@ mod tests {
             cluster_vfs_rpc_bind: None,
             cluster_node_credential: None,
             cluster_trusted_authority_identity: None,
-            cluster_trusted_vfs_rpc_peer_identity: None,
+            cluster_trusted_vfs_rpc_peer_identity: Vec::new(),
         };
         let error = build_cluster_client_mount(&args).unwrap_err();
         assert!(error.contains("refuses local devices"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cluster_client_pool_mount_requires_exactly_one_owner_identity() {
+        let make_args = |trusted_owner_identities| PoolMountArgs {
+            pool_name: "remote".into(),
+            mount_point: PathBuf::from("/mnt/remote"),
+            read_only: false,
+            devices: None,
+            relatime: false,
+            dataset: "root".into(),
+            encryption_envelope: None,
+            encryption_passphrase: None,
+            encryption_salt: None,
+            runtime: PoolMountRuntimeArgs::default(),
+            cluster_client: true,
+            cluster_vfs_rpc_addr: Some("127.0.0.1:7412".into()),
+            cluster_pool_guid: Some("00112233445566778899aabbccddeeff".into()),
+            cluster: false,
+            cluster_authority_addr: None,
+            cluster_vfs_rpc_bind: None,
+            cluster_node_credential: Some(PathBuf::from("/unused/client.credential")),
+            cluster_trusted_authority_identity: None,
+            cluster_trusted_vfs_rpc_peer_identity: trusted_owner_identities,
+        };
+
+        let missing = build_cluster_client_mount(&make_args(Vec::new())).unwrap_err();
+        assert!(missing.contains("requires --cluster-trusted-vfs-rpc-peer-identity"));
+
+        let repeated = build_cluster_client_mount(&make_args(vec![
+            PathBuf::from("/unused/owner-a.identity"),
+            PathBuf::from("/unused/owner-b.identity"),
+        ]))
+        .unwrap_err();
+        assert!(repeated.contains("requires exactly one"));
     }
 
     #[cfg(feature = "cluster")]
@@ -1825,7 +1870,7 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster_trusted_authority_identity: None,
             #[cfg(feature = "cluster")]
-            cluster_trusted_vfs_rpc_peer_identity: None,
+            cluster_trusted_vfs_rpc_peer_identity: Vec::new(),
             pool_name: "testpool".into(),
             mount_point: PathBuf::from("/mnt/tidefs"),
             read_only: false,
@@ -1868,7 +1913,7 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster_trusted_authority_identity: None,
             #[cfg(feature = "cluster")]
-            cluster_trusted_vfs_rpc_peer_identity: None,
+            cluster_trusted_vfs_rpc_peer_identity: Vec::new(),
         };
         assert!(args.read_only);
     }
@@ -1903,7 +1948,7 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster_trusted_authority_identity: None,
             #[cfg(feature = "cluster")]
-            cluster_trusted_vfs_rpc_peer_identity: None,
+            cluster_trusted_vfs_rpc_peer_identity: Vec::new(),
         };
         assert!(args.relatime);
     }
@@ -1938,7 +1983,7 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster_trusted_authority_identity: None,
             #[cfg(feature = "cluster")]
-            cluster_trusted_vfs_rpc_peer_identity: None,
+            cluster_trusted_vfs_rpc_peer_identity: Vec::new(),
         };
         assert_eq!(args.pool_name, "full");
         assert_eq!(args.mount_point, PathBuf::from("/mnt/full"));

@@ -34,6 +34,7 @@ use tidefs_vfs_rpc::DatasetId;
 
 const OWNER_NODE: u64 = 2;
 const CLIENT_NODE: u64 = 1;
+const CLIENT_B_NODE: u64 = 3;
 const WRITER_TERM: u64 = 77;
 const WRITER_EPOCH: u64 = 9;
 const POOL_GUID: [u8; 16] = [0x49; 16];
@@ -216,9 +217,10 @@ fn connector_refuses_owner_epoch_movement_before_authority() {
 }
 
 #[test]
-fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
+fn two_authenticated_adapter_engines_share_pool_owner_and_isolate_session_failure() {
     let owner_identity = ProvisionedIdentity::new(OWNER_NODE);
     let client_identity = ProvisionedIdentity::new(CLIENT_NODE);
+    let client_b_identity = ProvisionedIdentity::new(CLIENT_B_NODE);
     let root = tempfile::tempdir().expect("create persistent test root");
     let metadata_dir = root.path().join("metadata");
     let member = root.path().join("member.img");
@@ -284,9 +286,11 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
     let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
         "127.0.0.1:0".parse().unwrap(),
         OWNER_NODE,
-        CLIENT_NODE,
         owner_identity.credential(),
-        client_identity.public_identity(),
+        vec![
+            client_identity.public_identity(),
+            client_b_identity.public_identity(),
+        ],
         POOL_GUID,
         dataset_id,
         Arc::clone(&writer_fence),
@@ -307,7 +311,8 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
     let remote_engine = remote_adapter.engine_handle();
     let ctx = request_ctx();
 
-    {
+    let expected = b"Pool receipts reached through the adapter-held remote engine";
+    let created_inode = {
         let engine = remote_engine.lock().expect("lock remote adapter engine");
         let root_inode = engine.get_root_inode(&ctx).expect("remote typed GetRoot");
         assert_eq!(root_inode, ROOT_INODE_ID);
@@ -337,7 +342,6 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
             created.inode_id
         );
 
-        let expected = b"Pool receipts reached through the adapter-held remote engine";
         assert_eq!(
             engine
                 .write(&created_handle, 0, expected, &ctx)
@@ -368,9 +372,56 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
             .expect("release reopened remote handle");
         assert!(engine.statfs(&ctx).expect("remote statfs").block_size > 0);
 
+        created.inode_id
+    };
+
+    let client_b = ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+        owner.bound_addr(),
+        POOL_GUID,
+        client_b_identity.private_credential(),
+        owner_identity.public_identity(),
+    ))
+    .expect("connect second independently authenticated cluster VFS_RPC client");
+    let remote_adapter_b = FuseVfsAdapter::new(Box::new(VfsDispatchEngineBridge::new(client_b)))
+        .expect("construct second FUSE adapter over authenticated cluster VFS_RPC");
+    let remote_engine_b = remote_adapter_b.engine_handle();
+    let peer_b_suffix = b"; peer B committed this suffix";
+    let directory_inode = {
+        let engine = remote_engine_b
+            .lock()
+            .expect("lock second remote adapter engine");
+        let root_inode = engine
+            .get_root_inode(&ctx)
+            .expect("second peer typed GetRoot");
+        let found = engine
+            .lookup(root_inode, b"remote-file", &ctx)
+            .expect("second peer observes first peer namespace commit");
+        assert_eq!(found.inode_id, created_inode);
+        let handle = engine
+            .open(created_inode, libc::O_RDWR as u32, &ctx)
+            .expect("second peer opens first peer file");
+        assert_eq!(
+            engine
+                .read(&handle, 0, expected.len() as u32, &ctx)
+                .expect("second peer reads first peer data"),
+            expected
+        );
+        assert_eq!(
+            engine
+                .write(&handle, expected.len() as u64, peer_b_suffix, &ctx)
+                .expect("second peer mutates first peer file"),
+            peer_b_suffix.len() as u32
+        );
+        engine
+            .fsync(&handle, false, &ctx)
+            .expect("second peer commits its mutation");
+        engine
+            .release(&handle)
+            .expect("second peer releases shared file");
+
         let directory = engine
             .mkdir(root_inode, b"remote-dir", 0o777, &ctx)
-            .expect("mkdir through remote adapter engine");
+            .expect("second peer creates shared directory");
         engine
             .rename(
                 root_inode,
@@ -380,36 +431,81 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
                 0,
                 &ctx,
             )
-            .expect("rename through remote adapter engine");
-        let linked = engine
-            .link(created.inode_id, directory.inode_id, b"hard-link", &ctx)
-            .expect("hard-link through remote adapter engine");
-        assert_eq!(linked.inode_id, created.inode_id);
+            .expect("second peer renames first peer file");
+
+        directory.inode_id
+    };
+
+    let untrusted_same_node = ProvisionedIdentity::new(CLIENT_NODE);
+    assert!(
+        ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
+            owner.bound_addr(),
+            POOL_GUID,
+            untrusted_same_node.private_credential(),
+            owner_identity.public_identity(),
+        ))
+        .is_err(),
+        "a different key for an admitted numeric peer ID must fail the live handshake"
+    );
+    owner
+        .check_health()
+        .expect("untrusted peer refusal must not kill the owner");
+
+    {
+        let engine = remote_engine.lock().expect("relock first remote engine");
+        let root_inode = engine
+            .get_root_inode(&ctx)
+            .expect("first peer remains usable after second and untrusted connections");
+        let directory = engine
+            .lookup(root_inode, b"remote-dir", &ctx)
+            .expect("first peer observes second peer directory mutation");
+        assert_eq!(directory.inode_id, directory_inode);
+        let renamed = engine
+            .lookup(directory_inode, b"renamed", &ctx)
+            .expect("first peer observes second peer rename");
+        assert_eq!(renamed.inode_id, created_inode);
+        let reopened = engine
+            .open(created_inode, libc::O_RDONLY as u32, &ctx)
+            .expect("first peer reopens second peer mutation");
+        let combined = [expected.as_slice(), peer_b_suffix.as_slice()].concat();
         assert_eq!(
             engine
-                .lookup(directory.inode_id, b"renamed", &ctx)
-                .expect("lookup renamed remote file")
-                .inode_id,
-            created.inode_id
-        );
-        assert_eq!(
-            engine
-                .lookup(directory.inode_id, b"hard-link", &ctx)
-                .expect("lookup remote hard link")
-                .inode_id,
-            created.inode_id
+                .read(&reopened, 0, combined.len() as u32, &ctx)
+                .expect("first peer reads second peer mutation"),
+            combined
         );
         engine
-            .unlink(directory.inode_id, b"renamed", &ctx)
+            .release(&reopened)
+            .expect("first peer releases reopened shared file");
+        let linked = engine
+            .link(created_inode, directory_inode, b"hard-link", &ctx)
+            .expect("hard-link through remote adapter engine");
+        assert_eq!(linked.inode_id, created_inode);
+        assert_eq!(
+            engine
+                .lookup(directory_inode, b"renamed", &ctx)
+                .expect("lookup renamed remote file")
+                .inode_id,
+            created_inode
+        );
+        assert_eq!(
+            engine
+                .lookup(directory_inode, b"hard-link", &ctx)
+                .expect("lookup remote hard link")
+                .inode_id,
+            created_inode
+        );
+        engine
+            .unlink(directory_inode, b"renamed", &ctx)
             .expect("unlink renamed remote file");
         assert_eq!(
             engine
-                .lookup(directory.inode_id, b"renamed", &ctx)
+                .lookup(directory_inode, b"renamed", &ctx)
                 .unwrap_err(),
             Errno::ENOENT
         );
         engine
-            .unlink(directory.inode_id, b"hard-link", &ctx)
+            .unlink(directory_inode, b"hard-link", &ctx)
             .expect("unlink remote hard link");
         engine
             .rmdir(root_inode, b"remote-dir", &ctx)
@@ -425,8 +521,19 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
             ClusterVfsRpcWriterFence::new(OWNER_NODE, WRITER_TERM, WRITER_EPOCH);
     }
 
+    assert_eq!(
+        remote_engine_b
+            .lock()
+            .expect("relock second remote engine")
+            .get_root_inode(&ctx)
+            .expect("second peer remains usable after first peer activity"),
+        ROOT_INODE_ID
+    );
+
     drop(remote_engine);
     drop(remote_adapter);
+    drop(remote_engine_b);
+    drop(remote_adapter_b);
     owner
         .stop()
         .expect("stop primary Pool-backed VFS_RPC owner");
@@ -434,9 +541,8 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
     let mut owner = ClusterVfsRpcOwnerHandle::start(ClusterVfsRpcOwnerConfig::new(
         "127.0.0.1:0".parse().unwrap(),
         OWNER_NODE,
-        CLIENT_NODE,
         owner_identity.credential(),
-        client_identity.public_identity(),
+        vec![client_identity.public_identity()],
         POOL_GUID,
         dataset_id,
         Arc::clone(&writer_fence),
@@ -444,21 +550,6 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
         Arc::clone(&shutdown),
     ))
     .expect("restart Pool-backed VFS_RPC owner with fresh session authority");
-
-    let untrusted_same_node = ProvisionedIdentity::new(CLIENT_NODE);
-    assert!(
-        ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
-            owner.bound_addr(),
-            POOL_GUID,
-            untrusted_same_node.private_credential(),
-            owner_identity.public_identity(),
-        ))
-        .is_err(),
-        "a different key for the admitted numeric peer ID must fail the real handshake"
-    );
-    owner
-        .check_health()
-        .expect("owner must remain healthy after refusing the untrusted key");
 
     match ClusterVfsRpcClient::connect(ClusterVfsRpcClientConfig::new(
         owner.bound_addr(),

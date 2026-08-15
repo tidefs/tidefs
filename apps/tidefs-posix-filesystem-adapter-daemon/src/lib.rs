@@ -654,9 +654,8 @@ pub struct ClusterMountAuthority {
 #[derive(Debug)]
 struct ClusterVfsRpcOwnerAuthority {
     bind_addr: std::net::SocketAddr,
-    admitted_peer_node: u64,
     local_credential: Arc<tidefs_auth::NodePrivateCredential>,
-    trusted_peer_identity: tidefs_auth::NodePublicIdentity,
+    trusted_peer_identities: Vec<tidefs_auth::NodePublicIdentity>,
     writer_fence: Arc<Mutex<cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence>>,
 }
 
@@ -778,9 +777,8 @@ impl MountAuthority {
     pub fn configure_cluster_vfs_rpc_owner(
         &mut self,
         bind_addr: std::net::SocketAddr,
-        admitted_peer_node: u64,
         local_credential: tidefs_auth::NodePrivateCredential,
-        trusted_peer_identity: tidefs_auth::NodePublicIdentity,
+        trusted_peer_identities: Vec<tidefs_auth::NodePublicIdentity>,
     ) -> Result<(), String> {
         match self {
             Self::Standalone => {
@@ -788,9 +786,8 @@ impl MountAuthority {
             }
             Self::ClusterLease(authority) => authority.configure_vfs_rpc_owner(
                 bind_addr,
-                admitted_peer_node,
                 local_credential,
-                trusted_peer_identity,
+                trusted_peer_identities,
             ),
         }
     }
@@ -866,9 +863,8 @@ impl MountAuthority {
                 Ok(Some(cluster_vfs_rpc_owner::ClusterVfsRpcOwnerConfig::new(
                     owner.bind_addr,
                     authority.token.node_id,
-                    owner.admitted_peer_node,
                     Arc::clone(&owner.local_credential),
-                    owner.trusted_peer_identity.clone(),
+                    owner.trusted_peer_identities.clone(),
                     authority.token.pool_guid,
                     tidefs_vfs_rpc::DatasetId::new(u128::from_le_bytes(*dataset_id.as_bytes())),
                     Arc::clone(&owner.writer_fence),
@@ -940,13 +936,9 @@ impl ClusterMountAuthority {
     fn configure_vfs_rpc_owner(
         &mut self,
         bind_addr: std::net::SocketAddr,
-        admitted_peer_node: u64,
         local_credential: tidefs_auth::NodePrivateCredential,
-        trusted_peer_identity: tidefs_auth::NodePublicIdentity,
+        trusted_peer_identities: Vec<tidefs_auth::NodePublicIdentity>,
     ) -> Result<(), String> {
-        if admitted_peer_node == 0 {
-            return Err("cluster VFS_RPC admitted peer node must be nonzero".to_string());
-        }
         if self.vfs_rpc_owner.is_some() {
             return Err("cluster VFS_RPC owner is already configured".to_string());
         }
@@ -957,27 +949,30 @@ impl ClusterMountAuthority {
                 self.token.node_id
             ));
         }
-        if trusted_peer_identity.node_id() != admitted_peer_node {
-            return Err(format!(
-                "cluster VFS_RPC trusted identity names node {}, expected admitted peer node {}",
-                trusted_peer_identity.node_id(),
-                admitted_peer_node
-            ));
+        if trusted_peer_identities.is_empty() {
+            return Err("cluster VFS_RPC requires at least one trusted peer identity".to_string());
         }
-        if local_credential.node_id() == trusted_peer_identity.node_id()
-            && local_credential.identity().verifying_key_bytes
-                != trusted_peer_identity.identity().verifying_key_bytes
-        {
-            return Err(
-                "cluster VFS_RPC refuses different keys for the same numeric node identity"
-                    .to_string(),
-            );
+        let mut peer_nodes = std::collections::BTreeSet::new();
+        for trusted_peer_identity in &trusted_peer_identities {
+            let peer_node = trusted_peer_identity.node_id();
+            if peer_node == 0 {
+                return Err("cluster VFS_RPC trusted peer node must be nonzero".to_string());
+            }
+            if !peer_nodes.insert(peer_node) {
+                return Err(format!(
+                    "cluster VFS_RPC has more than one trusted identity for node {peer_node}"
+                ));
+            }
+            if local_credential.node_id() == peer_node {
+                return Err(format!(
+                    "cluster VFS_RPC trusted peer node {peer_node} conflicts with the local owner node"
+                ));
+            }
         }
         self.vfs_rpc_owner = Some(ClusterVfsRpcOwnerAuthority {
             bind_addr,
-            admitted_peer_node,
             local_credential: Arc::new(local_credential),
-            trusted_peer_identity,
+            trusted_peer_identities,
             writer_fence: Arc::new(Mutex::new(
                 cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence::new(
                     self.token.node_id,
@@ -2800,9 +2795,8 @@ mod cluster_mount_authority_tests {
         authority
             .configure_cluster_vfs_rpc_owner(
                 "127.0.0.1:0".parse().unwrap(),
-                11,
                 local_credential,
-                trusted_peer_identity,
+                vec![trusted_peer_identity],
             )
             .unwrap();
         let rpc_writer_fence = match &authority {
@@ -2961,33 +2955,61 @@ mod cluster_mount_authority_tests {
         authority
             .configure_cluster_vfs_rpc_owner(
                 "127.0.0.1:0".parse().unwrap(),
-                11,
                 local_credential,
-                trusted_peer_identity,
+                vec![trusted_peer_identity],
             )
             .unwrap();
         require_real_cluster_data_carrier(&authority).unwrap();
     }
 
     #[test]
-    fn cluster_mount_refuses_same_node_with_different_trusted_key() {
+    fn cluster_mount_refuses_empty_and_duplicate_trusted_peer_sets() {
         let mut authority =
             MountAuthority::cluster_lease(POOL_GUID, lease_token(7, POOL_GUID, 2, 99)).unwrap();
         let local_credential = tidefs_auth::NodePrivateCredential::generate(7).unwrap();
-        let different_identity = tidefs_auth::NodePrivateCredential::generate(7)
+
+        let empty_error = authority
+            .configure_cluster_vfs_rpc_owner(
+                "127.0.0.1:0".parse().unwrap(),
+                local_credential,
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert!(empty_error.contains("at least one trusted peer identity"));
+
+        let local_credential = tidefs_auth::NodePrivateCredential::generate(7).unwrap();
+        let first_identity = tidefs_auth::NodePrivateCredential::generate(11)
             .unwrap()
             .public_identity();
+        let conflicting_identity = tidefs_auth::NodePrivateCredential::generate(11)
+            .unwrap()
+            .public_identity();
+        let duplicate_error = authority
+            .configure_cluster_vfs_rpc_owner(
+                "127.0.0.1:0".parse().unwrap(),
+                local_credential,
+                vec![first_identity, conflicting_identity],
+            )
+            .unwrap_err();
+        assert!(duplicate_error.contains("more than one trusted identity for node 11"));
+    }
+
+    #[test]
+    fn cluster_mount_refuses_owner_identity_as_trusted_peer() {
+        let mut authority =
+            MountAuthority::cluster_lease(POOL_GUID, lease_token(7, POOL_GUID, 2, 99)).unwrap();
+        let local_credential = tidefs_auth::NodePrivateCredential::generate(7).unwrap();
+        let owner_identity = local_credential.public_identity();
 
         let error = authority
             .configure_cluster_vfs_rpc_owner(
                 "127.0.0.1:0".parse().unwrap(),
-                7,
                 local_credential,
-                different_identity,
+                vec![owner_identity],
             )
             .unwrap_err();
 
-        assert!(error.contains("different keys for the same numeric node identity"));
+        assert!(error.contains("trusted peer node 7 conflicts with the local owner node"));
     }
 }
 
