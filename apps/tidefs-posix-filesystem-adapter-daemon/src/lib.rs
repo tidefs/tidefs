@@ -118,8 +118,6 @@ pub mod clustered_mount;
 pub mod fusewire;
 pub mod ingress;
 pub mod maintenance;
-#[cfg(feature = "cluster")]
-pub mod placement_recorder;
 pub mod reply;
 pub mod runtime;
 pub mod scheduler;
@@ -404,6 +402,17 @@ fn effective_mount_mode(config: &MountConfig) -> EffectiveMountMode {
             config.runtime.background_scrub_interval_secs
         },
     }
+}
+
+#[cfg(feature = "cluster")]
+fn require_real_cluster_data_carrier(authority: &MountAuthority) -> Result<(), String> {
+    if authority.is_cluster_authorized() {
+        return Err(
+            "cluster mount has no Pool-backed distributed data carrier; refusing the local-only filesystem path because synthetic placement sidecars are not storage authority"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1277,13 +1286,15 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         return Err("queue-depth artifacts are not supported for snapshot export mounts".into());
     }
     #[cfg(feature = "cluster")]
-    let cluster_lease_token = config
-        .mount_authority
-        .validate_for_pool(config.pool_uuid.as_ref())?;
-    #[cfg(feature = "cluster")]
-    config
-        .mount_authority
-        .require_renewable_cluster_authority()?;
+    {
+        config
+            .mount_authority
+            .validate_for_pool(config.pool_uuid.as_ref())?;
+        config
+            .mount_authority
+            .require_renewable_cluster_authority()?;
+        require_real_cluster_data_carrier(&config.mount_authority)?;
+    }
     if !snapshot_export {
         fs::create_dir_all(&config.backing_dir)
             .map_err(|e| format!("create backing dir {}: {e}", config.backing_dir.display()))?;
@@ -1527,23 +1538,6 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             .map_err(|error| format!("install clustered mutation deadline: {error}"))?;
     }
 
-    // When cluster-authorized, wrap the engine in a placement-recording layer.
-    #[cfg(feature = "cluster")]
-    let vfs_engine: Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send> =
-        if let Some(token) = cluster_lease_token {
-            let member_id = token.node_id;
-            let epoch = token.epoch.0;
-            let cluster_engine = crate::placement_recorder::ClusterPlacementVfsEngine::new(
-                base_engine,
-                config.backing_dir.clone(),
-                member_id,
-                epoch,
-            );
-            Box::new(cluster_engine)
-        } else {
-            Box::new(base_engine)
-        };
-    #[cfg(not(feature = "cluster"))]
     let vfs_engine: Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send> = Box::new(base_engine);
     let mut adapter = fuse_vfs_adapter::FuseVfsAdapter::new(vfs_engine)
         .map_err(|e| format!("adapter init: {e:?}"))?
@@ -2521,6 +2515,17 @@ mod cluster_mount_authority_tests {
         let error = authority.require_renewable_cluster_authority().unwrap_err();
 
         assert!(error.contains("one-shot"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn cluster_mount_refuses_local_only_data_path() {
+        let authority =
+            MountAuthority::cluster_lease(POOL_GUID, lease_token(7, POOL_GUID, 2, 99)).unwrap();
+
+        let error = require_real_cluster_data_carrier(&authority).unwrap_err();
+
+        assert!(error.contains("Pool-backed distributed data carrier"));
+        assert!(error.contains("synthetic placement sidecars are not storage authority"));
     }
 }
 
