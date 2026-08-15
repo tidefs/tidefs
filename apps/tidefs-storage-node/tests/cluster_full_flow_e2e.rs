@@ -19,6 +19,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tidefs_auth::{NodeKeyStore, NodePrivateCredential, NodePublicIdentity};
+use tidefs_block_volume_adapter_daemon::storage_backend::{
+    BackendError, BlockVolumeStorageBackend, PoolVolumeBackend,
+};
 use tidefs_cluster::pool_config::{ClusterPlacementPolicy, ClusterRedundancy, FailureDomain};
 use tidefs_cluster::pool_lease_client::ClusterLeaseClient;
 use tidefs_cluster::pool_lease_token::PoolLeaseToken;
@@ -40,6 +43,7 @@ use tidefs_local_filesystem::{
 use tidefs_local_object_store::pool::PoolRedundancyPolicy;
 use tidefs_membership_epoch::{HealthClass, MemberClass};
 use tidefs_membership_live::BackendDisclosure;
+use tidefs_pool_runtime::PoolRuntime;
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_client::ClusterVfsRpcOwnerCandidate;
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_owner::{
     ClusterVfsRpcOwnerConfig, ClusterVfsRpcOwnerHandle, ClusterVfsRpcWriterFence,
@@ -1421,6 +1425,280 @@ fn cluster_mount_recovers_after_unclean_owner_lease_expiry() {
             .read_file("/owner-b-visible")
             .expect("read owner B data after final device reopen"),
         owner_b_bytes
+    );
+}
+
+#[test]
+fn clustered_block_recovers_after_unclean_owner_lease_expiry() {
+    const AUTHORITY_AND_OWNER_A_NODE: u64 = 1;
+    const OWNER_B_NODE: u64 = 2;
+    const POOL_NAME: &str = "tidefs-clustered-block-expiry";
+    const VOLUME_NAME: &str = "clustered-volume";
+
+    let root = tempfile::tempdir().expect("create persistent test root");
+    let metadata_dir = root.path().join("metadata");
+    let member = root.path().join("member.img");
+    fs::create_dir_all(&metadata_dir).expect("create Pool metadata directory");
+    File::create(&member)
+        .expect("create regular-file Pool member")
+        .set_len(64 * 1024 * 1024)
+        .expect("size regular-file Pool member");
+
+    let mut initial_runtime = PoolRuntime::open_block_devices(
+        &metadata_dir,
+        std::slice::from_ref(&member),
+        POOL_NAME,
+        PoolRedundancyPolicy::default(),
+        &StoreOptions::default(),
+    )
+    .expect("open initial Pool runtime");
+    initial_runtime
+        .create_volume(
+            VOLUME_NAME,
+            LifecycleDatasetId::from_bytes([0xB2; 16]),
+            4 * 1024 * 1024,
+            Vec::new(),
+            DatasetFlags::NONE,
+            SyncGuarantee::Local,
+        )
+        .expect("publish named Pool volume");
+    let pool_guid = initial_runtime.pool().pool_guid();
+    drop(initial_runtime);
+
+    let authority_credential =
+        NodePrivateCredential::generate(AUTHORITY_AND_OWNER_A_NODE).expect("authority credential");
+    let authority_identity = authority_credential.public_identity();
+    let owner_b_credential =
+        NodePrivateCredential::generate(OWNER_B_NODE).expect("owner B credential");
+    let owner_b_identity = owner_b_credential.public_identity();
+
+    let owner_b_membership_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port());
+    let _owner_b_member = TestServer::spawn_configured(
+        OWNER_B_NODE,
+        vec![root.path().join("owner-b-store")],
+        None,
+        None,
+        Vec::new(),
+        Some(owner_b_membership_addr),
+        Some((
+            duplicate_credential(&owner_b_credential),
+            vec![authority_identity.clone()],
+        )),
+        false,
+    );
+    let membership_peers = vec![MembershipPeerConfig {
+        node_id: OWNER_B_NODE,
+        addr: owner_b_membership_addr,
+        member_class: MemberClass::Voter,
+        failure_domain: OWNER_B_NODE,
+    }];
+    let lease_term_ms = 2_000;
+    let authority = TestServer::spawn_configured(
+        AUTHORITY_AND_OWNER_A_NODE,
+        vec![root.path().join("authority-store")],
+        Some(ClusterLeaseConfig {
+            lease_term_ms,
+            ..ClusterLeaseConfig::default()
+        }),
+        Some(root.path().join("membership-checkpoint")),
+        membership_peers,
+        None,
+        Some((
+            duplicate_credential(&authority_credential),
+            vec![owner_b_identity.clone()],
+        )),
+        false,
+    );
+
+    let mut owner_a_client = authenticated_client(
+        &authority_credential,
+        std::slice::from_ref(&authority_identity),
+    );
+    let owner_a_session = connect_client(
+        &mut owner_a_client,
+        AUTHORITY_AND_OWNER_A_NODE,
+        authority.addr(),
+    );
+    let (owner_a_lease, owner_a_remaining_ms) = granted_pool_lease(
+        transact_pool_lease(
+            &mut owner_a_client,
+            owner_a_session,
+            500,
+            pool_guid,
+            AUTHORITY_AND_OWNER_A_NODE,
+            ClusterPoolLeaseAction::Acquire,
+        ),
+        "grant clustered block owner A",
+    );
+    let owner_a_valid_until = Instant::now()
+        .checked_add(Duration::from_millis(owner_a_remaining_ms))
+        .expect("owner A lease fits local monotonic clock");
+
+    let owner_a_runtime = PoolRuntime::open_block_devices(
+        &metadata_dir,
+        std::slice::from_ref(&member),
+        POOL_NAME,
+        PoolRedundancyPolicy::default(),
+        &StoreOptions::default(),
+    )
+    .expect("owner A reopens named Pool volume");
+    let mut owner_a_backend = PoolVolumeBackend::open_clustered(
+        owner_a_runtime,
+        VOLUME_NAME,
+        false,
+        owner_a_lease.clone(),
+        owner_a_valid_until,
+    )
+    .expect("bind owner A block backend to committed lease");
+    owner_a_backend
+        .write_blocks(0, &[0xA1; 4096], 4096)
+        .expect("owner A writes through Pool volume backend");
+    owner_a_backend
+        .flush()
+        .expect("owner A flushes canonical Pool volume root");
+    assert_eq!(
+        owner_a_backend
+            .read_blocks(0, 1, 4096)
+            .expect("owner A reads committed block")
+            .payload
+            .expect("owner A read payload"),
+        vec![0xA1; 4096]
+    );
+
+    // Owner A disappears from the authority channel without a Release. Its
+    // already-open block backend remains as the stale predecessor that must
+    // self-fence at the exact committed lease deadline.
+    drop(owner_a_client);
+
+    let mut owner_b_client = authenticated_client(
+        &owner_b_credential,
+        std::slice::from_ref(&authority_identity),
+    );
+    let owner_b_session = connect_client(
+        &mut owner_b_client,
+        AUTHORITY_AND_OWNER_A_NODE,
+        authority.addr(),
+    );
+    let early_handoff = transact_pool_lease(
+        &mut owner_b_client,
+        owner_b_session,
+        501,
+        pool_guid,
+        OWNER_B_NODE,
+        ClusterPoolLeaseAction::Acquire,
+    );
+    assert!(
+        !early_handoff.success,
+        "storage-node admitted owner B before owner A expiry"
+    );
+    assert!(early_handoff.lease_token_bytes.is_none());
+
+    thread::sleep(
+        owner_a_valid_until.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
+    );
+    assert!(matches!(
+        owner_a_backend.read_blocks(0, 1, 4096),
+        Err(BackendError::ClusterAuthorityExpired)
+    ));
+    assert!(matches!(
+        owner_a_backend.write_blocks(1, &[0xEE; 4096], 4096),
+        Err(BackendError::ClusterAuthorityExpired)
+    ));
+    assert!(matches!(
+        owner_a_backend.flush(),
+        Err(BackendError::ClusterAuthorityExpired)
+    ));
+    drop(owner_a_backend);
+
+    let (owner_b_lease, owner_b_remaining_ms) = granted_pool_lease(
+        transact_pool_lease(
+            &mut owner_b_client,
+            owner_b_session,
+            502,
+            pool_guid,
+            OWNER_B_NODE,
+            ClusterPoolLeaseAction::Acquire,
+        ),
+        "grant clustered block owner B after expiry",
+    );
+    let owner_b_valid_until = Instant::now()
+        .checked_add(Duration::from_millis(owner_b_remaining_ms))
+        .expect("owner B lease fits local monotonic clock");
+    assert!(
+        owner_b_lease
+            .write_fence
+            .is_later_than(&owner_a_lease.write_fence),
+        "successor block owner must receive a higher write fence"
+    );
+
+    let owner_b_runtime = PoolRuntime::open_block_devices(
+        &metadata_dir,
+        std::slice::from_ref(&member),
+        POOL_NAME,
+        PoolRedundancyPolicy::default(),
+        &StoreOptions::default(),
+    )
+    .expect("owner B independently reopens Pool runtime");
+    let mut owner_b_backend = PoolVolumeBackend::open_clustered(
+        owner_b_runtime,
+        VOLUME_NAME,
+        false,
+        owner_b_lease.clone(),
+        owner_b_valid_until,
+    )
+    .expect("bind owner B block backend to successor lease");
+    assert_eq!(
+        owner_b_backend
+            .read_blocks(0, 1, 4096)
+            .expect("owner B reads owner A commit after reopen")
+            .payload
+            .expect("owner B predecessor payload"),
+        vec![0xA1; 4096]
+    );
+    owner_b_backend
+        .write_blocks(1, &[0xB2; 4096], 4096)
+        .expect("owner B writes successor block");
+    owner_b_backend
+        .flush()
+        .expect("owner B flushes successor canonical root");
+
+    let released = transact_pool_lease(
+        &mut owner_b_client,
+        owner_b_session,
+        503,
+        pool_guid,
+        OWNER_B_NODE,
+        ClusterPoolLeaseAction::Release {
+            token: owner_b_lease,
+        },
+    );
+    assert!(released.success, "release owner B: {:?}", released.error);
+    owner_b_backend
+        .fence_clustered_authority()
+        .expect("fence released owner B backend");
+    assert!(matches!(
+        owner_b_backend.write_blocks(2, &[0xEF; 4096], 4096),
+        Err(BackendError::ClusterAuthorityExpired)
+    ));
+    drop(owner_b_backend);
+    drop(owner_b_client);
+
+    let final_runtime = PoolRuntime::open_block_devices(
+        &metadata_dir,
+        &[member],
+        POOL_NAME,
+        PoolRedundancyPolicy::default(),
+        &StoreOptions::default(),
+    )
+    .expect("final independent Pool reopen");
+    let final_volume = final_runtime
+        .open_volume(VOLUME_NAME)
+        .expect("open final named volume");
+    assert_eq!(
+        final_volume
+            .read_blocks(&final_runtime, 0, 2)
+            .expect("read predecessor and successor blocks"),
+        [vec![0xA1; 4096], vec![0xB2; 4096]].concat()
     );
 }
 

@@ -12,6 +12,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tidefs_dataset_catalog::{
     CatalogError, DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
@@ -63,6 +66,9 @@ pub enum PoolRuntimeError {
     StaleVolumeHandle(DatasetId),
     PublicationOutcomeUncertain(StoreError),
     PublicationRequiresReopen,
+    ExternalMutationAuthorityExpired {
+        operation: &'static str,
+    },
     Bounds,
     Io {
         operation: &'static str,
@@ -99,6 +105,10 @@ impl fmt::Display for PoolRuntimeError {
             Self::PublicationRequiresReopen => f.write_str(
                 "canonical Pool publication outcome is uncertain; reopen before mutation",
             ),
+            Self::ExternalMutationAuthorityExpired { operation } => write!(
+                f,
+                "external mutation authority expired before {operation}; reopen with current authority"
+            ),
             Self::Bounds => f.write_str("volume I/O is outside committed capacity"),
             Self::Io {
                 operation,
@@ -132,6 +142,107 @@ impl From<CatalogError> for PoolRuntimeError {
 }
 
 pub type Result<T> = std::result::Result<T, PoolRuntimeError>;
+
+/// Process-local monotonic deadline shared with an external writer authority.
+///
+/// The authority source supplies the remaining validity after authenticating
+/// its grant. Sharing this gate with each dataset engine prevents time spent
+/// validating or transferring that grant from restarting the lease window.
+#[derive(Clone, Debug)]
+pub struct ExternalMutationDeadline {
+    state: Arc<ExternalMutationDeadlineState>,
+}
+
+#[derive(Debug)]
+struct ExternalMutationDeadlineState {
+    origin: Instant,
+    deadline_elapsed_ms: AtomicU64,
+}
+
+impl ExternalMutationDeadline {
+    /// Construct from one process-local absolute deadline without restarting
+    /// the caller's already-elapsing validity window.
+    #[must_use]
+    pub fn new_until(valid_until: Instant) -> Self {
+        let origin = Instant::now();
+        let remaining_ms = u64::try_from(
+            valid_until
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        Self {
+            state: Arc::new(ExternalMutationDeadlineState {
+                origin,
+                deadline_elapsed_ms: AtomicU64::new(remaining_ms),
+            }),
+        }
+    }
+
+    /// Advance to one process-local absolute deadline without extending it by
+    /// time spent validating or transferring the renewed grant. Returns false
+    /// instead of reviving a deadline that is already expired or fenced.
+    pub fn renew_until(&self, valid_until: Instant) -> bool {
+        let elapsed_ms = u64::try_from(self.state.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let remaining_ms = u64::try_from(
+            valid_until
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        if remaining_ms == 0 {
+            return false;
+        }
+        let deadline = elapsed_ms.saturating_add(remaining_ms).max(1);
+        let mut current = self.state.deadline_elapsed_ms.load(Ordering::Acquire);
+        loop {
+            let observed_elapsed_ms =
+                u64::try_from(self.state.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if current == 0 || current <= observed_elapsed_ms {
+                return false;
+            }
+            match self.state.deadline_elapsed_ms.compare_exchange_weak(
+                current,
+                deadline,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Expire the shared authority immediately.
+    pub fn fence(&self) {
+        self.state.deadline_elapsed_ms.store(0, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        !self.remaining().is_zero()
+    }
+
+    /// Conservative process-local validity still available to a caller.
+    #[must_use]
+    pub fn remaining(&self) -> Duration {
+        let deadline_ms = self.state.deadline_elapsed_ms.load(Ordering::Acquire);
+        Duration::from_millis(deadline_ms).saturating_sub(self.state.origin.elapsed())
+    }
+
+    /// Exact process-local deadline represented by this gate.
+    #[must_use]
+    pub fn valid_until(&self) -> Option<Instant> {
+        let deadline_ms = self.state.deadline_elapsed_ms.load(Ordering::Acquire);
+        if deadline_ms == 0 {
+            None
+        } else {
+            self.state
+                .origin
+                .checked_add(Duration::from_millis(deadline_ms))
+        }
+    }
+}
 
 /// Semantic engine selected by a typed dataset-root reference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,6 +327,7 @@ pub struct PoolRuntime {
     root: CanonicalPoolRoot,
     pending_metadata: Option<PoolMetadataCandidate>,
     publication_requires_reopen: bool,
+    external_mutation_deadline: Option<ExternalMutationDeadline>,
     last_volume_reclaim: VolumeReclaimOutcome,
 }
 
@@ -242,6 +354,7 @@ impl PoolRuntime {
             root,
             pending_metadata: None,
             publication_requires_reopen: false,
+            external_mutation_deadline: None,
             last_volume_reclaim: VolumeReclaimOutcome::default(),
         };
         runtime.root.catalog.validate_published_lineage()?;
@@ -315,6 +428,43 @@ impl PoolRuntime {
     #[must_use]
     pub fn publication_requires_reopen(&self) -> bool {
         self.publication_requires_reopen
+    }
+
+    /// Attach the renewable deadline of an externally committed writer lease.
+    pub fn install_external_mutation_deadline(
+        &mut self,
+        deadline: ExternalMutationDeadline,
+    ) -> Result<()> {
+        if !deadline.is_live() {
+            return Err(PoolRuntimeError::ExternalMutationAuthorityExpired {
+                operation: "install external mutation authority",
+            });
+        }
+        self.ensure_publishable()?;
+        self.external_mutation_deadline = Some(deadline);
+        Ok(())
+    }
+
+    /// Refuse an operation after the external writer authority has expired.
+    /// Local owners have no installed deadline and remain independent of
+    /// membership or lease services.
+    pub fn ensure_external_mutation_authority(&self, operation: &'static str) -> Result<()> {
+        if self
+            .external_mutation_deadline
+            .as_ref()
+            .is_some_and(|deadline| !deadline.is_live())
+        {
+            Err(PoolRuntimeError::ExternalMutationAuthorityExpired { operation })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Synchronously expire the installed writer authority.
+    pub fn fence_external_mutation_authority(&self) {
+        if let Some(deadline) = &self.external_mutation_deadline {
+            deadline.fence();
+        }
     }
 
     #[must_use]
@@ -1553,10 +1703,9 @@ impl PoolRuntime {
 
     fn ensure_publishable(&self) -> Result<()> {
         if self.publication_requires_reopen {
-            Err(PoolRuntimeError::PublicationRequiresReopen)
-        } else {
-            Ok(())
+            return Err(PoolRuntimeError::PublicationRequiresReopen);
         }
+        self.ensure_external_mutation_authority("canonical Pool publication")
     }
 
     fn validate_snapshot_roots(&self) -> Result<()> {
@@ -1887,6 +2036,7 @@ impl PoolVolume {
         start_block: u64,
         payload: &[u8],
     ) -> Result<()> {
+        runtime.ensure_external_mutation_authority("volume write")?;
         let block_size = usize::try_from(self.root.geometry.block_size_bytes)
             .map_err(|_| PoolRuntimeError::Bounds)?;
         if payload.is_empty() || payload.len() % block_size != 0 {
@@ -1924,6 +2074,7 @@ impl PoolVolume {
         start_block: u64,
         block_count: u64,
     ) -> Result<()> {
+        runtime.ensure_external_mutation_authority("volume zero or discard")?;
         self.check_range(start_block, block_count)?;
         let block_size = usize::try_from(self.root.geometry.block_size_bytes)
             .map_err(|_| PoolRuntimeError::Bounds)?;
@@ -1959,6 +2110,7 @@ impl PoolVolume {
     /// Commit dirty chunks, immutable map nodes, the volume root, then the
     /// canonical Pool root. A stale handle is refused before it writes.
     pub fn flush(&mut self, runtime: &mut PoolRuntime) -> Result<()> {
+        runtime.ensure_external_mutation_authority("volume flush")?;
         let current = runtime
             .dataset_root(self.dataset_id)
             .ok_or(PoolRuntimeError::MissingRoot(self.dataset_id))?;
@@ -3079,6 +3231,46 @@ mod tests {
         );
         owner.publish_root(next).unwrap();
         candidates
+    }
+
+    #[test]
+    fn external_mutation_deadline_fences_volume_mutation_and_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        create_volume(&mut owner, "vol", 77);
+        let deadline =
+            ExternalMutationDeadline::new_until(Instant::now() + Duration::from_secs(60));
+        owner
+            .install_external_mutation_deadline(deadline.clone())
+            .unwrap();
+
+        let mut volume = owner.open_volume("vol").unwrap();
+        volume.write_blocks(&owner, 0, &[0x4d; 4096]).unwrap();
+        deadline.fence();
+        assert!(!deadline.renew_until(Instant::now() + Duration::from_secs(60)));
+        assert!(!deadline.is_live());
+
+        assert!(matches!(
+            volume.write_blocks(&owner, 1, &[0x4e; 4096]),
+            Err(PoolRuntimeError::ExternalMutationAuthorityExpired {
+                operation: "volume write"
+            })
+        ));
+        assert!(matches!(
+            volume.flush(&mut owner),
+            Err(PoolRuntimeError::ExternalMutationAuthorityExpired {
+                operation: "volume flush"
+            })
+        ));
+
+        drop(volume);
+        let reopened = reopen(owner);
+        let volume = reopened.open_volume("vol").unwrap();
+        assert_eq!(
+            volume.read_blocks(&reopened, 0, 1).unwrap(),
+            vec![0; 4096],
+            "staged predecessor bytes must not become durable after fencing"
+        );
     }
 
     #[test]

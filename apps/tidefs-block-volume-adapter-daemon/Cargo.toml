@@ -19,6 +19,7 @@ io-uring = "0.7.12"
 tidefs-block-volume-adapter-core = { workspace = true }
 tidefs-block-volume-adapter-ublk-control-runtime = { workspace = true }
 tidefs-ublk-abi = { workspace = true }
+tidefs-cluster = { workspace = true }
 tidefs-pool-runtime = { workspace = true }
 tidefs-local-filesystem = { workspace = true }
 tidefs-local-object-store = { workspace = true }

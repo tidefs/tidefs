@@ -374,91 +374,6 @@ use std::time::{Duration, Instant};
 
 static NEXT_LOCAL_DATASET_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Process-local monotonic deadline shared with an external writer authority.
-#[derive(Clone, Debug)]
-pub struct ExternalMutationDeadline {
-    state: Arc<ExternalMutationDeadlineState>,
-}
-
-#[derive(Debug)]
-struct ExternalMutationDeadlineState {
-    origin: Instant,
-    deadline_elapsed_ms: AtomicU64,
-}
-
-impl ExternalMutationDeadline {
-    /// Construct from one process-local absolute deadline without restarting
-    /// the caller's already-elapsing validity window.
-    #[must_use]
-    pub fn new_until(valid_until: Instant) -> Self {
-        let origin = Instant::now();
-        let remaining_ms = u64::try_from(
-            valid_until
-                .saturating_duration_since(Instant::now())
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX);
-        Self {
-            state: Arc::new(ExternalMutationDeadlineState {
-                origin,
-                deadline_elapsed_ms: AtomicU64::new(remaining_ms),
-            }),
-        }
-    }
-
-    /// Advance to one process-local absolute deadline without extending it
-    /// by time spent validating or transferring the grant.
-    pub fn renew_until(&self, valid_until: Instant) {
-        // Measure origin elapsed first and remaining validity second. Any
-        // scheduling delay between these reads shortens, rather than extends,
-        // the installed authority window.
-        let elapsed_ms = u64::try_from(self.state.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let remaining_ms = u64::try_from(
-            valid_until
-                .saturating_duration_since(Instant::now())
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX);
-        let deadline = if remaining_ms == 0 {
-            0
-        } else {
-            elapsed_ms.saturating_add(remaining_ms).max(1)
-        };
-        self.state
-            .deadline_elapsed_ms
-            .store(deadline, Ordering::Release);
-    }
-
-    pub fn fence(&self) {
-        self.state.deadline_elapsed_ms.store(0, Ordering::Release);
-    }
-
-    #[must_use]
-    pub fn is_live(&self) -> bool {
-        !self.remaining().is_zero()
-    }
-
-    /// Conservative process-local validity still available to a caller.
-    #[must_use]
-    pub fn remaining(&self) -> Duration {
-        let deadline_ms = self.state.deadline_elapsed_ms.load(Ordering::Acquire);
-        Duration::from_millis(deadline_ms).saturating_sub(self.state.origin.elapsed())
-    }
-
-    /// Return the exact process-local deadline represented by this gate.
-    #[must_use]
-    pub fn valid_until(&self) -> Option<Instant> {
-        let deadline_ms = self.state.deadline_elapsed_ms.load(Ordering::Acquire);
-        if deadline_ms == 0 {
-            None
-        } else {
-            self.state
-                .origin
-                .checked_add(Duration::from_millis(deadline_ms))
-        }
-    }
-}
-
 use crate::ack_receipt::{
     LocalAckOperation, LocalAckReceipt, LocalAckReceiptLedger, LocalAckReceiptTarget,
 };
@@ -489,6 +404,7 @@ use tidefs_local_object_store::{
     DEFAULT_MAX_SEGMENT_BYTES, FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME, RECORD_OVERHEAD_BYTES,
 };
 use tidefs_orphan_index::OrphanIndex;
+pub use tidefs_pool_runtime::ExternalMutationDeadline;
 use tidefs_pool_runtime::{DatasetRootKind, PoolRuntime};
 #[cfg(feature = "quorum-write")]
 use tidefs_quorum_write_runtime::{QuorumConfig, QuorumObjectStore};
@@ -2113,10 +2029,6 @@ pub struct LocalFileSystem {
     /// Armed when this mounted instance cannot determine whether its latest
     /// root publication became durable. Only reopen may clear this fence.
     mutation_requires_reopen: bool,
-    /// Optional externally owned deadline for clustered writer authority.
-    /// Every mounted mutation consults this shared value before it may alter
-    /// filesystem or Pool state; renewal advances it atomically.
-    external_mutation_deadline: Option<ExternalMutationDeadline>,
     #[allow(dead_code)]
     // INTENT: kept for planned architecture; callers in test modules or pending wiring into FUSE dispatch
     state_before_transaction: Option<FileSystemState>,
@@ -4780,7 +4692,6 @@ impl LocalFileSystem {
             max_uncommitted_mutations: DEFAULT_MAX_UNCOMMITTED_MUTATIONS,
             in_transaction: false,
             mutation_requires_reopen: false,
-            external_mutation_deadline: None,
             mutation_delta: None,
             mutation_recorded_commit_group_write: false,
             domain_registry: SpaceDomainRegistry::new(),
@@ -14600,12 +14511,9 @@ impl LocalFileSystem {
         if self.mutation_requires_reopen {
             return Err(FileSystemError::MutationRequiresReopen { operation });
         }
-        if let Some(deadline) = &self.external_mutation_deadline {
-            if !deadline.is_live() {
-                return Err(FileSystemError::MutationRequiresReopen { operation });
-            }
-        }
-        Ok(())
+        self.store
+            .ensure_external_mutation_authority(operation)
+            .map_err(|_| FileSystemError::MutationRequiresReopen { operation })
     }
 
     /// Attach the renewable deadline of an external clustered writer lease.
@@ -14619,13 +14527,17 @@ impl LocalFileSystem {
             });
         }
         self.ensure_mutation_allowed("install external mutation authority")?;
-        self.external_mutation_deadline = Some(deadline);
-        Ok(())
+        self.store
+            .install_external_mutation_deadline(deadline)
+            .map_err(|_| FileSystemError::MutationRequiresReopen {
+                operation: "install external mutation authority",
+            })
     }
 
     /// Synchronously quarantine this live instance after external authority
     /// loss. Only a full Pool/filesystem reopen may clear the fence.
     pub fn fence_external_mutation_authority(&mut self) {
+        self.store.fence_external_mutation_authority();
         self.arm_mutation_reopen_fence();
     }
 

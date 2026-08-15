@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use tidefs_block_volume_adapter_core::{
     BlockRangeRecord, BlockVolumeCompletionClass, BlockVolumeFileImage, BlockVolumeFileImageError,
     BlockVolumeGeometryRecord,
 };
+use tidefs_cluster::PoolLeaseToken;
+use tidefs_pool_runtime::ExternalMutationDeadline;
 
 /// Geometry consumed by the Linux block carrier.
 ///
@@ -97,6 +100,8 @@ pub enum BackendError {
     PayloadTooShort,
     NoSpace,
     ReadOnly,
+    InvalidClusterAuthority(&'static str),
+    ClusterAuthorityExpired,
     Other(String),
 }
 
@@ -110,6 +115,15 @@ impl fmt::Display for BackendError {
             Self::PayloadTooShort => write!(f, "payload too short"),
             Self::NoSpace => write!(f, "no space left on device"),
             Self::ReadOnly => write!(f, "read-only block volume"),
+            Self::InvalidClusterAuthority(reason) => {
+                write!(f, "invalid clustered block authority: {reason}")
+            }
+            Self::ClusterAuthorityExpired => {
+                write!(
+                    f,
+                    "clustered block writer authority expired; reopen required"
+                )
+            }
             Self::Other(msg) => write!(f, "{msg}"),
         }
     }
@@ -304,6 +318,12 @@ enum PoolVolumeOwner {
     Mounted(tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem),
 }
 
+#[derive(Clone, Debug)]
+struct ClusteredPoolVolumeAuthority {
+    lease: PoolLeaseToken,
+    deadline: ExternalMutationDeadline,
+}
+
 /// Real named-volume backend over the canonical Pool runtime.
 ///
 /// Standalone exports own the runtime directly. A mounted export shares the
@@ -314,6 +334,7 @@ pub struct PoolVolumeBackend {
     volume: tidefs_pool_runtime::PoolVolume,
     geometry: BlockDeviceGeometry,
     read_only: bool,
+    clustered_authority: Option<ClusteredPoolVolumeAuthority>,
 }
 
 impl PoolVolumeBackend {
@@ -323,6 +344,27 @@ impl PoolVolumeBackend {
         read_only: bool,
     ) -> Result<Self, BackendError> {
         Self::open_shared(Arc::new(Mutex::new(runtime)), path, read_only)
+    }
+
+    /// Open a named Pool volume under one authenticated clustered writer
+    /// lease. The caller derives `valid_until` immediately from the remaining
+    /// lifetime reported with the committed grant, so later validation and
+    /// Pool reopen work cannot restart that already-elapsing window.
+    pub fn open_clustered(
+        mut runtime: tidefs_pool_runtime::PoolRuntime,
+        path: &str,
+        read_only: bool,
+        lease: PoolLeaseToken,
+        valid_until: Instant,
+    ) -> Result<Self, BackendError> {
+        validate_clustered_lease(&runtime, &lease, valid_until)?;
+        let deadline = ExternalMutationDeadline::new_until(valid_until);
+        runtime
+            .install_external_mutation_deadline(deadline.clone())
+            .map_err(map_pool_runtime_error)?;
+        let mut backend = Self::open_standalone(runtime, path, read_only)?;
+        backend.clustered_authority = Some(ClusteredPoolVolumeAuthority { lease, deadline });
+        Ok(backend)
     }
 
     /// Open a named volume through a shared neutral Pool owner.
@@ -344,6 +386,7 @@ impl PoolVolumeBackend {
             volume,
             geometry,
             read_only,
+            clustered_authority: None,
         })
     }
 
@@ -362,7 +405,78 @@ impl PoolVolumeBackend {
             volume,
             geometry,
             read_only,
+            clustered_authority: None,
         })
+    }
+
+    /// Renew the process-local gate only with the same committed writer,
+    /// lease, epoch, and fence. Ownership transfer requires a full Pool reopen
+    /// so a stale backend can never be retargeted to a successor lease.
+    pub fn renew_clustered_authority(
+        &mut self,
+        lease: PoolLeaseToken,
+        valid_until: Instant,
+    ) -> Result<(), BackendError> {
+        let authority =
+            self.clustered_authority
+                .as_mut()
+                .ok_or(BackendError::InvalidClusterAuthority(
+                    "backend is not a clustered export",
+                ))?;
+        if !authority.deadline.is_live() {
+            return Err(BackendError::ClusterAuthorityExpired);
+        }
+        if !lease.is_valid()
+            || lease.pool_guid != authority.lease.pool_guid
+            || lease.node_id != authority.lease.node_id
+            || lease.epoch != authority.lease.epoch
+            || lease.lease_id != authority.lease.lease_id
+            || lease.slot != authority.lease.slot
+            || lease.write_fence != authority.lease.write_fence
+            || lease.expiration_deadline_ms <= authority.lease.expiration_deadline_ms
+        {
+            return Err(BackendError::InvalidClusterAuthority(
+                "renewal does not extend the same writer lease and fence",
+            ));
+        }
+        if authority
+            .deadline
+            .valid_until()
+            .is_none_or(|current| valid_until <= current)
+        {
+            return Err(BackendError::InvalidClusterAuthority(
+                "renewal does not advance the process-local deadline",
+            ));
+        }
+        if !authority.deadline.renew_until(valid_until) {
+            return Err(BackendError::ClusterAuthorityExpired);
+        }
+        authority.lease = lease;
+        Ok(())
+    }
+
+    /// Quarantine this backend immediately after release or authority loss.
+    pub fn fence_clustered_authority(&self) -> Result<(), BackendError> {
+        let authority =
+            self.clustered_authority
+                .as_ref()
+                .ok_or(BackendError::InvalidClusterAuthority(
+                    "backend is not a clustered export",
+                ))?;
+        authority.deadline.fence();
+        Ok(())
+    }
+
+    fn ensure_clustered_authority(&self) -> Result<(), BackendError> {
+        if self
+            .clustered_authority
+            .as_ref()
+            .is_some_and(|authority| !authority.deadline.is_live())
+        {
+            Err(BackendError::ClusterAuthorityExpired)
+        } else {
+            Ok(())
+        }
     }
 
     fn zero_blocks(
@@ -371,6 +485,7 @@ impl PoolVolumeBackend {
         block_count: usize,
         block_size_bytes: usize,
     ) -> Result<(), BackendError> {
+        self.ensure_clustered_authority()?;
         if self.read_only {
             return Err(BackendError::ReadOnly);
         }
@@ -401,6 +516,7 @@ impl BlockVolumeStorageBackend for PoolVolumeBackend {
         block_count: usize,
         block_size_bytes: usize,
     ) -> Result<BackendReadResult, BackendError> {
+        self.ensure_clustered_authority()?;
         if block_size_bytes != self.geometry.block_size_bytes {
             return Err(BackendError::MisalignedRange);
         }
@@ -430,6 +546,7 @@ impl BlockVolumeStorageBackend for PoolVolumeBackend {
         payload: &[u8],
         block_size_bytes: usize,
     ) -> Result<BackendWriteResult, BackendError> {
+        self.ensure_clustered_authority()?;
         if self.read_only {
             return Err(BackendError::ReadOnly);
         }
@@ -457,6 +574,7 @@ impl BlockVolumeStorageBackend for PoolVolumeBackend {
     }
 
     fn flush(&mut self) -> Result<(), BackendError> {
+        self.ensure_clustered_authority()?;
         if self.read_only {
             return Err(BackendError::ReadOnly);
         }
@@ -507,12 +625,41 @@ fn lock_pool_runtime(
         .map_err(|_| BackendError::Other("shared Pool runtime lock poisoned".into()))
 }
 
+fn validate_clustered_lease(
+    runtime: &tidefs_pool_runtime::PoolRuntime,
+    lease: &PoolLeaseToken,
+    valid_until: Instant,
+) -> Result<(), BackendError> {
+    if !lease.is_valid() {
+        return Err(BackendError::InvalidClusterAuthority(
+            "lease identity is incomplete",
+        ));
+    }
+    if lease.write_fence.epoch != lease.epoch || lease.write_fence.generation == 0 {
+        return Err(BackendError::InvalidClusterAuthority(
+            "write fence does not match the lease epoch",
+        ));
+    }
+    if !lease.authorizes_pool(&runtime.pool().pool_guid()) {
+        return Err(BackendError::InvalidClusterAuthority(
+            "lease Pool GUID does not match the opened Pool",
+        ));
+    }
+    if valid_until <= Instant::now() {
+        return Err(BackendError::ClusterAuthorityExpired);
+    }
+    Ok(())
+}
+
 fn map_pool_runtime_error(error: tidefs_pool_runtime::PoolRuntimeError) -> BackendError {
     match error {
         tidefs_pool_runtime::PoolRuntimeError::Bounds => BackendError::OutOfBounds,
         tidefs_pool_runtime::PoolRuntimeError::Store(
             tidefs_local_object_store::StoreError::NoSpace,
         ) => BackendError::NoSpace,
+        tidefs_pool_runtime::PoolRuntimeError::ExternalMutationAuthorityExpired { .. } => {
+            BackendError::ClusterAuthorityExpired
+        }
         other => BackendError::Other(other.to_string()),
     }
 }

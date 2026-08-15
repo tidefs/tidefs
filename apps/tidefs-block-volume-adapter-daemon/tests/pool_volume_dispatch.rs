@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 
 use std::fs::OpenOptions;
+use std::time::{Duration, Instant};
 
 use tidefs_block_volume_adapter_daemon::storage_backend::{
     BackendError, BlockVolumeStorageBackend, PoolVolumeBackend,
 };
 use tidefs_block_volume_adapter_daemon::DataQueueWorker;
+use tidefs_cluster::{EpochId, PoolLeaseToken, WriteFence};
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, SyncGuarantee};
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 use tidefs_pool_runtime::PoolRuntime;
@@ -45,6 +47,19 @@ fn create_volume(runtime: &mut PoolRuntime, name: &str, identity_byte: u8) {
         .expect("create Pool volume");
 }
 
+fn clustered_lease(runtime: &PoolRuntime, pool_guid: [u8; 16]) -> PoolLeaseToken {
+    assert_eq!(runtime.pool().pool_guid(), pool_guid);
+    PoolLeaseToken::new(
+        7,
+        pool_guid,
+        EpochId(3),
+        11,
+        0,
+        WriteFence::new(EpochId(3), 5),
+        60_000,
+    )
+}
+
 fn descriptor(op: u8, start_sector: u64, sector_count: u32, address: u64) -> UblkSrvIoDesc {
     UblkSrvIoDesc {
         op_flags: u32::from(op),
@@ -82,6 +97,136 @@ fn pool_volume_backend_flushes_and_reopens_committed_data() {
         .read_blocks(2, 1, 4096)
         .expect("read reopened volume block");
     assert_eq!(read.payload.expect("read payload"), vec![0x5a; 4096]);
+}
+
+#[test]
+fn clustered_pool_volume_backend_fences_every_io_operation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut runtime, _device) = runtime(&dir);
+    create_volume(&mut runtime, "vol", 8);
+    let pool_guid = runtime.pool().pool_guid();
+    let lease = clustered_lease(&runtime, pool_guid);
+    let mut backend = PoolVolumeBackend::open_clustered(
+        runtime,
+        "vol",
+        false,
+        lease.clone(),
+        Instant::now() + Duration::from_secs(60),
+    )
+    .expect("open clustered Pool volume backend");
+
+    backend
+        .write_blocks(0, &[0x58; 4096], 4096)
+        .expect("stage predecessor write");
+    backend
+        .fence_clustered_authority()
+        .expect("fence clustered authority");
+
+    assert!(matches!(
+        backend.read_blocks(0, 1, 4096),
+        Err(BackendError::ClusterAuthorityExpired)
+    ));
+    assert!(matches!(
+        backend.write_blocks(1, &[0x59; 4096], 4096),
+        Err(BackendError::ClusterAuthorityExpired)
+    ));
+    assert!(matches!(
+        backend.flush(),
+        Err(BackendError::ClusterAuthorityExpired)
+    ));
+    assert!(matches!(
+        backend.discard_blocks(0, 1, 4096),
+        Err(BackendError::ClusterAuthorityExpired)
+    ));
+    assert!(matches!(
+        backend.write_zeroes(0, 1, 4096),
+        Err(BackendError::ClusterAuthorityExpired)
+    ));
+    let mut captured_renewal = lease;
+    captured_renewal.expiration_deadline_ms += 60_000;
+    assert!(matches!(
+        backend
+            .renew_clustered_authority(captured_renewal, Instant::now() + Duration::from_secs(60),),
+        Err(BackendError::ClusterAuthorityExpired)
+    ));
+}
+
+#[test]
+fn clustered_pool_volume_backend_refuses_wrong_pool_lease() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut runtime, _device) = runtime(&dir);
+    create_volume(&mut runtime, "vol", 9);
+    let wrong_guid = [0x99; 16];
+    let lease = PoolLeaseToken::new(
+        7,
+        wrong_guid,
+        EpochId(3),
+        11,
+        0,
+        WriteFence::new(EpochId(3), 5),
+        60_000,
+    );
+
+    assert!(matches!(
+        PoolVolumeBackend::open_clustered(
+            runtime,
+            "vol",
+            false,
+            lease,
+            Instant::now() + Duration::from_secs(60),
+        ),
+        Err(BackendError::InvalidClusterAuthority(
+            "lease Pool GUID does not match the opened Pool"
+        ))
+    ));
+}
+
+#[test]
+fn clustered_pool_volume_backend_renews_only_the_same_extended_grant() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut runtime, _device) = runtime(&dir);
+    create_volume(&mut runtime, "vol", 10);
+    let pool_guid = runtime.pool().pool_guid();
+    let lease = clustered_lease(&runtime, pool_guid);
+    let initial_valid_until = Instant::now() + Duration::from_secs(60);
+    let mut backend = PoolVolumeBackend::open_clustered(
+        runtime,
+        "vol",
+        false,
+        lease.clone(),
+        initial_valid_until,
+    )
+    .expect("open clustered Pool volume backend");
+
+    assert!(matches!(
+        backend.renew_clustered_authority(
+            lease.clone(),
+            initial_valid_until + Duration::from_secs(60),
+        ),
+        Err(BackendError::InvalidClusterAuthority(
+            "renewal does not extend the same writer lease and fence"
+        ))
+    ));
+
+    let mut wrong_slot = lease.clone();
+    wrong_slot.slot += 1;
+    wrong_slot.expiration_deadline_ms += 60_000;
+    assert!(matches!(
+        backend
+            .renew_clustered_authority(wrong_slot, initial_valid_until + Duration::from_secs(60),),
+        Err(BackendError::InvalidClusterAuthority(
+            "renewal does not extend the same writer lease and fence"
+        ))
+    ));
+
+    let mut renewed = lease;
+    renewed.expiration_deadline_ms += 60_000;
+    backend
+        .renew_clustered_authority(renewed, initial_valid_until + Duration::from_secs(60))
+        .expect("renew the same committed owner lease");
+    backend
+        .read_blocks(0, 1, 4096)
+        .expect("renewed authority keeps the backend live");
 }
 
 #[test]

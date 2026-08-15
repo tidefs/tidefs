@@ -43,7 +43,9 @@ tidefs-durability-layout = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tidefs-block-volume-adapter-daemon = { workspace = true }
 tidefs-dataset-lifecycle = { workspace = true }
+tidefs-pool-runtime = { workspace = true }
 tidefs-posix-filesystem-adapter-daemon = { workspace = true, features = ["cluster"] }
 tidefs-vfs-rpc = { workspace = true }
 
