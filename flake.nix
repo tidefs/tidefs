@@ -3198,14 +3198,6 @@ EOF
             linuxKernel_7_0 = linuxKernel_7_0;
             tidefsPackage = tidefsFuseRuntime;
           }).fuseFioBaseline;
-
-
-
-          clusterE2EValidation = import ./nix/vm/cluster-e2e-validation.nix {
-            inherit pkgs;
-            tidefsPackage = default;
-          };
-
           rdmaTwoNodeValidation = import ./nix/vm/rdma-two-node-validation.nix {
             inherit pkgs;
             tidefsPackage = tidefsStorageNode;
@@ -3669,18 +3661,6 @@ EOF
               self.packages.${system}.multiNodeCluster
             }"
           '';
-
-
-          "cluster-e2e-validation" = script "tidefs-cluster-e2e-validation" [
-              self.packages.${system}.clusterE2EValidation
-          ] ''
-            if [ "$#" -ne 0 ]; then
-              echo "tidefs-cluster-e2e-validation takes no arguments; use nix build .#packages.${system}.clusterE2EValidation -L for direct Nix options" >&2
-              exit 2
-            fi
-            echo "cluster_e2e_validation.result=${self.packages.${system}.clusterE2EValidation}"
-          '';
-
           "rdma-two-node-validation" = script "tidefs-rdma-two-node-validation" [
               self.packages.${system}.rdmaTwoNodeValidation
           ] ''
