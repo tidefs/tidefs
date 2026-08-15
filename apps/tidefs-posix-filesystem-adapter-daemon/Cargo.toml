@@ -45,6 +45,8 @@ tidefs-types-posix-filesystem-adapter-core = { workspace = true }
 tidefs-types-vfs-core = { workspace = true }
 tidefs-types-dataset-feature-flags-core = { workspace = true }
 tidefs-vfs-engine = { workspace = true }
+tidefs-transport = { workspace = true, optional = true }
+tidefs-vfs-rpc = { workspace = true, optional = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tidefs-cluster = { workspace = true, optional = true }
@@ -57,7 +59,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 [features]
 default = []
 block-volume = ["dep:tidefs-block-volume-adapter-daemon"]
-cluster = ["dep:bincode", "dep:tidefs-cluster", "dep:tidefs-lock-service"]
+cluster = [
+    "dep:bincode",
+    "dep:tidefs-cluster",
+    "dep:tidefs-lock-service",
+    "dep:tidefs-transport",
+    "dep:tidefs-vfs-rpc",
+]
 data-policy = ["tidefs-local-filesystem/data-policy"]
 receipt-demo = [
     "tidefs-types-posix-filesystem-adapter-core/wake-receipt",

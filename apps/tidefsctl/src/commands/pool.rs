@@ -218,6 +218,15 @@ pub enum PoolCommand {
         /// Committed member ID of the storage node granting the Pool lease.
         #[arg(long = "cluster-authority-node-id", requires = "cluster")]
         cluster_authority_node_id: Option<u64>,
+
+        #[cfg(feature = "cluster")]
+        /// Local authenticated Control endpoint for Pool-backed inline VFS_RPC.
+        #[arg(
+            long = "cluster-vfs-rpc-bind",
+            requires = "cluster",
+            required_if_eq("cluster", "true")
+        )]
+        cluster_vfs_rpc_bind: Option<String>,
     },
 
     /// Run an integrity check through the live owner, or offline with explicit devices
@@ -384,6 +393,8 @@ pub fn handle_pool(cmd: PoolCommand) {
             cluster_owner_node_id,
             #[cfg(feature = "cluster")]
             cluster_authority_node_id,
+            #[cfg(feature = "cluster")]
+            cluster_vfs_rpc_bind,
         } => {
             crate::commands::mount::handle_mount(crate::commands::mount::PoolMountArgs {
                 pool_name,
@@ -404,6 +415,8 @@ pub fn handle_pool(cmd: PoolCommand) {
                 cluster_owner_node_id,
                 #[cfg(feature = "cluster")]
                 cluster_authority_node_id,
+                #[cfg(feature = "cluster")]
+                cluster_vfs_rpc_bind,
             });
         }
         PoolCommand::IntegrityCheck {

@@ -1680,11 +1680,38 @@ mod tests {
             "1",
             "--cluster-authority-addr",
             "127.0.0.1:7411",
+            "--cluster-vfs-rpc-bind",
+            "127.0.0.1:7412",
         ]);
 
         assert!(
             args.is_ok(),
             "explicit cluster mount authority should parse"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cli_parse_cluster_pool_mount_requires_vfs_rpc_owner_bind() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--cluster",
+            "--cluster-owner-node-id",
+            "2",
+            "--cluster-authority-node-id",
+            "1",
+            "--cluster-authority-addr",
+            "127.0.0.1:7411",
+        ]);
+
+        assert!(
+            args.is_err(),
+            "cluster mount must not parse without a Pool-backed VFS_RPC owner bind"
         );
     }
 
