@@ -357,9 +357,23 @@ impl VfsEngineBridge {
                 ),
                 |()| Ok(VfsRpcResponsePayload::Empty),
             ),
-            VfsRpcRequestPayload::Link { .. } => {
-                error_response(request, BRIDGE_FORWARDING_UNSUPPORTED)
-            }
+            VfsRpcRequestPayload::Link {
+                inode,
+                new_parent,
+                new_name,
+            } => response_for(
+                request,
+                dispatch_attr(
+                    target,
+                    VfsOperation::Link(engine_op::LinkRequest {
+                        target: *inode,
+                        new_parent: *new_parent,
+                        new_name: new_name.clone(),
+                        ctx: ctx.clone(),
+                    }),
+                ),
+                |attr| Ok(VfsRpcResponsePayload::Attr(attr)),
+            ),
             VfsRpcRequestPayload::Getxattr { inode, name, size } => response_for(
                 request,
                 dispatch_bytes(
@@ -1558,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_attr_returning_methods_fail_before_side_effect() {
+    fn symlink_fails_before_side_effect_while_link_reaches_dispatch() {
         let mut bridge = bridge();
         let target = RecordingDispatch::new();
 
@@ -1594,9 +1608,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(symlink.header.errno, BRIDGE_FORWARDING_UNSUPPORTED);
-        assert_eq!(link.header.errno, BRIDGE_FORWARDING_UNSUPPORTED);
+        assert_eq!(link.header.errno, Errno::SUCCESS);
+        assert_eq!(
+            link.payload,
+            VfsRpcResponsePayload::Attr(RecordingDispatch::attr(100, NodeKind::File))
+        );
         assert_eq!(target.symlinks.get(), 0);
-        assert_eq!(target.links.get(), 0);
+        assert_eq!(target.links.get(), 1);
     }
 
     #[test]

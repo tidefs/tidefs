@@ -1381,7 +1381,8 @@ impl VfsRpcResponsePayload {
             VfsRpcMethod::Mknod
             | VfsRpcMethod::Mkdir
             | VfsRpcMethod::Getattr
-            | VfsRpcMethod::Setattr => Self::Attr(cursor.inode_attr()?),
+            | VfsRpcMethod::Setattr
+            | VfsRpcMethod::Link => Self::Attr(cursor.inode_attr()?),
             VfsRpcMethod::Create => Self::Created {
                 inode: cursor.inode()?,
                 attr: cursor.inode_attr()?,
@@ -2682,6 +2683,20 @@ mod tests {
         let frame = VfsRpcTransportFrame::from_response(&response).unwrap();
         let decoded = frame.decode_response().unwrap();
         assert_eq!(decoded.payload, VfsRpcResponsePayload::Attr(attr));
+
+        let link_attr = sample_attr(44);
+        let link_response = VfsRpcResponse::ok(
+            OpId(2),
+            VfsRpcMethod::Link,
+            0,
+            VfsRpcResponsePayload::Attr(link_attr),
+        )
+        .unwrap();
+        let link_frame = VfsRpcTransportFrame::from_response(&link_response).unwrap();
+        assert_eq!(
+            link_frame.decode_response().unwrap().payload,
+            VfsRpcResponsePayload::Attr(link_attr)
+        );
 
         let mut signed_attr = sample_attr(43);
         signed_attr.posix.atime_ns = -1;

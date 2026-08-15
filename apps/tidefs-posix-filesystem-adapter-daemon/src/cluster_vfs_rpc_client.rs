@@ -474,6 +474,74 @@ impl ClientState {
                 request.flags,
                 request.ctx,
             ),
+            VfsOperation::Mkdir(request) => {
+                let payload = self.call(
+                    VfsRpcRequestPayload::Mkdir {
+                        parent: request.parent,
+                        name: request.name,
+                        mode: request.mode,
+                    },
+                    credentials(self.local_node, &request.ctx),
+                )?;
+                match payload {
+                    VfsRpcResponsePayload::Attr(attr) if attr.inode_id.get() != 0 => {
+                        Ok(VfsResponse::InodeAttr(InodeAttrResponse { attr }))
+                    }
+                    _ => Err(Errno::EPROTO),
+                }
+            }
+            VfsOperation::Unlink(request) => {
+                let payload = self.call(
+                    VfsRpcRequestPayload::Unlink {
+                        parent: request.parent,
+                        name: request.name,
+                    },
+                    credentials(self.local_node, &request.ctx),
+                )?;
+                expect_empty(payload)?;
+                Ok(VfsResponse::Unit(UnitResponse))
+            }
+            VfsOperation::Rmdir(request) => {
+                let payload = self.call(
+                    VfsRpcRequestPayload::Rmdir {
+                        parent: request.parent,
+                        name: request.name,
+                    },
+                    credentials(self.local_node, &request.ctx),
+                )?;
+                expect_empty(payload)?;
+                Ok(VfsResponse::Unit(UnitResponse))
+            }
+            VfsOperation::Rename(request) => {
+                let payload = self.call(
+                    VfsRpcRequestPayload::Rename {
+                        old_parent: request.old_parent,
+                        old_name: request.old_name,
+                        new_parent: request.new_parent,
+                        new_name: request.new_name,
+                        flags: request.flags,
+                    },
+                    credentials(self.local_node, &request.ctx),
+                )?;
+                expect_empty(payload)?;
+                Ok(VfsResponse::Unit(UnitResponse))
+            }
+            VfsOperation::Link(request) => {
+                let payload = self.call(
+                    VfsRpcRequestPayload::Link {
+                        inode: request.target,
+                        new_parent: request.new_parent,
+                        new_name: request.new_name,
+                    },
+                    credentials(self.local_node, &request.ctx),
+                )?;
+                match payload {
+                    VfsRpcResponsePayload::Attr(attr) if attr.inode_id == request.target => {
+                        Ok(VfsResponse::InodeAttr(InodeAttrResponse { attr }))
+                    }
+                    _ => Err(Errno::EPROTO),
+                }
+            }
             VfsOperation::Open(request) => {
                 let caller = credentials(self.local_node, &request.ctx);
                 let payload = self.call(

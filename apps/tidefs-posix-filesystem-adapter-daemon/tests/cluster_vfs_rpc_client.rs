@@ -368,6 +368,53 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
             .expect("release reopened remote handle");
         assert!(engine.statfs(&ctx).expect("remote statfs").block_size > 0);
 
+        let directory = engine
+            .mkdir(root_inode, b"remote-dir", 0o777, &ctx)
+            .expect("mkdir through remote adapter engine");
+        engine
+            .rename(
+                root_inode,
+                b"remote-file",
+                directory.inode_id,
+                b"renamed",
+                0,
+                &ctx,
+            )
+            .expect("rename through remote adapter engine");
+        let linked = engine
+            .link(created.inode_id, directory.inode_id, b"hard-link", &ctx)
+            .expect("hard-link through remote adapter engine");
+        assert_eq!(linked.inode_id, created.inode_id);
+        assert_eq!(
+            engine
+                .lookup(directory.inode_id, b"renamed", &ctx)
+                .expect("lookup renamed remote file")
+                .inode_id,
+            created.inode_id
+        );
+        assert_eq!(
+            engine
+                .lookup(directory.inode_id, b"hard-link", &ctx)
+                .expect("lookup remote hard link")
+                .inode_id,
+            created.inode_id
+        );
+        engine
+            .unlink(directory.inode_id, b"renamed", &ctx)
+            .expect("unlink renamed remote file");
+        assert_eq!(
+            engine
+                .lookup(directory.inode_id, b"renamed", &ctx)
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        engine
+            .unlink(directory.inode_id, b"hard-link", &ctx)
+            .expect("unlink remote hard link");
+        engine
+            .rmdir(root_inode, b"remote-dir", &ctx)
+            .expect("rmdir through remote adapter engine");
+
         *writer_fence.lock().expect("lock writer fence") =
             ClusterVfsRpcWriterFence::new(OWNER_NODE, WRITER_TERM + 1, WRITER_EPOCH);
         assert_eq!(engine.get_root_inode(&ctx).unwrap_err(), Errno::ESTALE);

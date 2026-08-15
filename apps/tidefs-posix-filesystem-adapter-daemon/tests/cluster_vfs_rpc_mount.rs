@@ -182,6 +182,28 @@ fn authenticated_remote_client_mount_exposes_real_fuse_path() {
     assert_eq!(unsafe { libc::statvfs(path.as_ptr(), &mut stat) }, 0);
     assert!(stat.f_bsize > 0, "remote statfs must report a block size");
 
+    let directory = mountpoint.join("remote-dir");
+    let renamed = directory.join("renamed");
+    let hard_link = directory.join("hard-link");
+    fs::create_dir(&directory).expect("mkdir through real remote mount");
+    fs::rename(&file_path, &renamed).expect("rename through real remote mount");
+    fs::hard_link(&renamed, &hard_link).expect("hard-link through real remote mount");
+    assert_eq!(
+        fs::read(&renamed).expect("read renamed remote file"),
+        expected
+    );
+    assert_eq!(
+        fs::read(&hard_link).expect("read remote hard link"),
+        expected
+    );
+    fs::remove_file(&renamed).expect("unlink renamed remote file");
+    assert_eq!(
+        fs::read(&hard_link).expect("hard link survives first unlink"),
+        expected
+    );
+    fs::remove_file(&hard_link).expect("unlink remote hard link");
+    fs::remove_dir(&directory).expect("rmdir through real remote mount");
+
     mount.stop();
     owner.stop().expect("stop Pool-backed VFS_RPC owner");
     assert!(!shutdown.load(Ordering::Acquire));
