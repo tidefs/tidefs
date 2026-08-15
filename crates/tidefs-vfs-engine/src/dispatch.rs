@@ -10,6 +10,7 @@
 //! and route operations through it without monomorphization.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use crate::{
     operation::{
@@ -22,7 +23,8 @@ use crate::{
         SymlinkRequest, SyncFsRequest, TmpfileRequest, UnlinkRequest, WriteRequest,
     },
     operation::{VfsOperation, VfsResponse},
-    Errno,
+    DirEntry, EngineDirHandle, EngineFileHandle, Errno, InodeAttr, InodeId, LockSpec, RequestCtx,
+    SetAttr, StatFs, ROOT_INODE_ID,
 };
 
 /// Canonical dispatch interface for VFS operations.
@@ -255,6 +257,614 @@ impl<T: VfsDispatch + ?Sized> VfsDispatch for Box<T> {
     }
 }
 
+/// Bridge that adapts an owned [`VfsDispatch`] backend into the canonical
+/// [`crate::VfsEngine`] and [`crate::VfsEngineStatFs`] traits.
+///
+/// This is the reverse of [`VfsEngineDispatchBridge`]. It is useful for
+/// authenticated remote dispatchers that already speak typed
+/// [`VfsOperation`] / [`VfsResponse`] but must be installed behind an adapter
+/// that consumes `VfsEngineStatFs`.
+pub struct VfsDispatchEngineBridge<D> {
+    dispatch: D,
+}
+
+impl<D> VfsDispatchEngineBridge<D> {
+    #[must_use]
+    pub const fn new(dispatch: D) -> Self {
+        Self { dispatch }
+    }
+
+    #[must_use]
+    pub const fn dispatch_ref(&self) -> &D {
+        &self.dispatch
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> D {
+        self.dispatch
+    }
+}
+
+impl<D: VfsDispatch> crate::VfsEngine for VfsDispatchEngineBridge<D> {
+    fn get_root_inode(&self, ctx: &RequestCtx) -> Result<InodeId, Errno> {
+        expect_root(
+            self.dispatch
+                .dispatch(VfsOperation::GetRootInode(GetRootInodeRequest {
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn lookup(&self, parent: InodeId, name: &[u8], ctx: &RequestCtx) -> Result<InodeAttr, Errno> {
+        expect_attr(self.dispatch.dispatch(VfsOperation::Lookup(LookupRequest {
+            parent,
+            name: name.to_vec(),
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn getattr(
+        &self,
+        inode: InodeId,
+        handle: Option<&EngineFileHandle>,
+        ctx: &RequestCtx,
+    ) -> Result<InodeAttr, Errno> {
+        expect_attr(
+            self.dispatch
+                .dispatch(VfsOperation::GetAttr(GetAttrRequest {
+                    inode,
+                    handle: handle.copied(),
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn setattr(
+        &self,
+        inode: InodeId,
+        attr: &SetAttr,
+        handle: Option<&EngineFileHandle>,
+        ctx: &RequestCtx,
+    ) -> Result<InodeAttr, Errno> {
+        expect_attr(
+            self.dispatch
+                .dispatch(VfsOperation::SetAttr(SetAttrRequest {
+                    inode,
+                    attr: *attr,
+                    handle: handle.copied(),
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn mkdir(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        mode: u32,
+        ctx: &RequestCtx,
+    ) -> Result<InodeAttr, Errno> {
+        expect_attr(self.dispatch.dispatch(VfsOperation::Mkdir(MkdirRequest {
+            parent,
+            name: name.to_vec(),
+            mode,
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn create(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        mode: u32,
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> Result<(InodeAttr, EngineFileHandle), Errno> {
+        expect_create(self.dispatch.dispatch(VfsOperation::Create(CreateRequest {
+            parent,
+            name: name.to_vec(),
+            mode,
+            flags,
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn create_excl(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        mode: u32,
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> Result<(InodeAttr, EngineFileHandle), Errno> {
+        expect_create(
+            self.dispatch
+                .dispatch(VfsOperation::CreateExcl(CreateExclRequest {
+                    parent,
+                    name: name.to_vec(),
+                    mode,
+                    flags,
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn tmpfile(
+        &self,
+        parent: InodeId,
+        mode: u32,
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> Result<(InodeAttr, EngineFileHandle), Errno> {
+        expect_create(
+            self.dispatch
+                .dispatch(VfsOperation::Tmpfile(TmpfileRequest {
+                    parent,
+                    mode,
+                    flags,
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn unlink(&self, parent: InodeId, name: &[u8], ctx: &RequestCtx) -> Result<(), Errno> {
+        expect_unit(self.dispatch.dispatch(VfsOperation::Unlink(UnlinkRequest {
+            parent,
+            name: name.to_vec(),
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn rmdir(&self, parent: InodeId, name: &[u8], ctx: &RequestCtx) -> Result<(), Errno> {
+        expect_unit(self.dispatch.dispatch(VfsOperation::Rmdir(RmdirRequest {
+            parent,
+            name: name.to_vec(),
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn rename(
+        &self,
+        old_parent: InodeId,
+        old_name: &[u8],
+        new_parent: InodeId,
+        new_name: &[u8],
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> Result<(), Errno> {
+        expect_unit(self.dispatch.dispatch(VfsOperation::Rename(RenameRequest {
+            old_parent,
+            old_name: old_name.to_vec(),
+            new_parent,
+            new_name: new_name.to_vec(),
+            flags,
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn link(
+        &self,
+        target: InodeId,
+        new_parent: InodeId,
+        new_name: &[u8],
+        ctx: &RequestCtx,
+    ) -> Result<InodeAttr, Errno> {
+        expect_attr(self.dispatch.dispatch(VfsOperation::Link(LinkRequest {
+            target,
+            new_parent,
+            new_name: new_name.to_vec(),
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn symlink(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        target: &[u8],
+        ctx: &RequestCtx,
+    ) -> Result<InodeAttr, Errno> {
+        expect_attr(
+            self.dispatch
+                .dispatch(VfsOperation::Symlink(SymlinkRequest {
+                    parent,
+                    name: name.to_vec(),
+                    target: target.to_vec(),
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn readlink(&self, inode: InodeId, ctx: &RequestCtx) -> Result<Vec<u8>, Errno> {
+        expect_bytes(
+            self.dispatch
+                .dispatch(VfsOperation::ReadLink(ReadLinkRequest {
+                    inode,
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn mknod(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        mode: u32,
+        rdev: u32,
+        ctx: &RequestCtx,
+    ) -> Result<InodeAttr, Errno> {
+        expect_attr(self.dispatch.dispatch(VfsOperation::Mknod(MknodRequest {
+            parent,
+            name: name.to_vec(),
+            mode,
+            rdev,
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn open(
+        &self,
+        inode: InodeId,
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> Result<EngineFileHandle, Errno> {
+        expect_open(self.dispatch.dispatch(VfsOperation::Open(OpenRequest {
+            inode,
+            flags,
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn release(&self, fh: &EngineFileHandle) -> Result<(), Errno> {
+        expect_unit(
+            self.dispatch
+                .dispatch(VfsOperation::Release(ReleaseRequest { fh: *fh })),
+        )
+    }
+
+    fn read(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        size: u32,
+        ctx: &RequestCtx,
+    ) -> Result<Vec<u8>, Errno> {
+        expect_read(self.dispatch.dispatch(VfsOperation::Read(ReadRequest {
+            fh: *fh,
+            offset,
+            size,
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn write(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        data: &[u8],
+        ctx: &RequestCtx,
+    ) -> Result<u32, Errno> {
+        expect_write(self.dispatch.dispatch(VfsOperation::Write(WriteRequest {
+            fh: *fh,
+            offset,
+            data: data.to_vec(),
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn copy_file_range(
+        &self,
+        source_fh: &EngineFileHandle,
+        offset_in: u64,
+        dest_fh: &EngineFileHandle,
+        offset_out: u64,
+        length: u64,
+        ctx: &RequestCtx,
+    ) -> Result<u32, Errno> {
+        expect_copy(
+            self.dispatch
+                .dispatch(VfsOperation::CopyFileRange(CopyFileRangeRequest {
+                    source_fh: *source_fh,
+                    offset_in,
+                    dest_fh: *dest_fh,
+                    offset_out,
+                    length,
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn flush(&self, fh: &EngineFileHandle, ctx: &RequestCtx) -> Result<(), Errno> {
+        expect_unit(self.dispatch.dispatch(VfsOperation::Flush(FlushRequest {
+            fh: *fh,
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn fsync(&self, fh: &EngineFileHandle, datasync: bool, ctx: &RequestCtx) -> Result<(), Errno> {
+        expect_unit(self.dispatch.dispatch(VfsOperation::Fsync(FsyncRequest {
+            fh: *fh,
+            datasync,
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn fallocate(
+        &self,
+        fh: &EngineFileHandle,
+        mode: u32,
+        offset: u64,
+        length: u64,
+        ctx: &RequestCtx,
+    ) -> Result<(), Errno> {
+        expect_unit(
+            self.dispatch
+                .dispatch(VfsOperation::Fallocate(FallocateRequest {
+                    fh: *fh,
+                    mode,
+                    offset,
+                    length,
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn opendir(&self, inode: InodeId, ctx: &RequestCtx) -> Result<EngineDirHandle, Errno> {
+        expect_open_dir(
+            self.dispatch
+                .dispatch(VfsOperation::OpenDir(OpenDirRequest {
+                    inode,
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn releasedir(&self, dh: &EngineDirHandle) -> Result<(), Errno> {
+        expect_unit(
+            self.dispatch
+                .dispatch(VfsOperation::ReleaseDir(ReleaseDirRequest { dh: *dh })),
+        )
+    }
+
+    fn readdir(
+        &self,
+        dh: &EngineDirHandle,
+        offset: u64,
+        ctx: &RequestCtx,
+    ) -> Result<(Vec<DirEntry>, bool), Errno> {
+        expect_readdir(
+            self.dispatch
+                .dispatch(VfsOperation::ReadDir(ReadDirRequest {
+                    dh: *dh,
+                    offset,
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn fsyncdir(
+        &self,
+        dh: &EngineDirHandle,
+        datasync: bool,
+        ctx: &RequestCtx,
+    ) -> Result<(), Errno> {
+        expect_unit(
+            self.dispatch
+                .dispatch(VfsOperation::FsyncDir(FsyncDirRequest {
+                    dh: *dh,
+                    datasync,
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn fdatasync_inode(
+        &self,
+        fh: &EngineFileHandle,
+        datasync: bool,
+        ctx: &RequestCtx,
+    ) -> Result<(), Errno> {
+        self.fsync(fh, datasync, ctx)
+    }
+
+    fn syncfs(&self, ctx: &RequestCtx) -> Result<(), Errno> {
+        expect_unit(
+            self.dispatch
+                .dispatch(VfsOperation::SyncFs(SyncFsRequest { ctx: ctx.clone() })),
+        )
+    }
+
+    fn getxattr(&self, inode: InodeId, name: &[u8], ctx: &RequestCtx) -> Result<Vec<u8>, Errno> {
+        expect_bytes(
+            self.dispatch
+                .dispatch(VfsOperation::GetXattr(GetXattrRequest {
+                    inode,
+                    name: name.to_vec(),
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn setxattr(
+        &self,
+        inode: InodeId,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> Result<(), Errno> {
+        expect_unit(
+            self.dispatch
+                .dispatch(VfsOperation::SetXattr(SetXattrRequest {
+                    inode,
+                    name: name.to_vec(),
+                    value: value.to_vec(),
+                    flags,
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn listxattr(&self, inode: InodeId, ctx: &RequestCtx) -> Result<Vec<u8>, Errno> {
+        expect_bytes(
+            self.dispatch
+                .dispatch(VfsOperation::ListXattr(ListXattrRequest {
+                    inode,
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn removexattr(&self, inode: InodeId, name: &[u8], ctx: &RequestCtx) -> Result<(), Errno> {
+        expect_unit(
+            self.dispatch
+                .dispatch(VfsOperation::RemoveXattr(RemoveXattrRequest {
+                    inode,
+                    name: name.to_vec(),
+                    ctx: ctx.clone(),
+                })),
+        )
+    }
+
+    fn getlk(
+        &self,
+        inode: InodeId,
+        lock: &LockSpec,
+        ctx: &RequestCtx,
+    ) -> Result<Option<LockSpec>, Errno> {
+        expect_getlk(self.dispatch.dispatch(VfsOperation::GetLk(GetLkRequest {
+            inode,
+            lock: *lock,
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn setlk(&self, inode: InodeId, lock: &LockSpec, ctx: &RequestCtx) -> Result<(), Errno> {
+        expect_unit(self.dispatch.dispatch(VfsOperation::SetLk(SetLkRequest {
+            inode,
+            lock: *lock,
+            ctx: ctx.clone(),
+        })))
+    }
+
+    fn setlkw(&self, inode: InodeId, lock: &LockSpec, ctx: &RequestCtx) -> Result<(), Errno> {
+        expect_unit(self.dispatch.dispatch(VfsOperation::SetLkw(SetLkwRequest {
+            inode,
+            lock: *lock,
+            ctx: ctx.clone(),
+        })))
+    }
+}
+
+impl<D: VfsDispatch> crate::VfsEngineStatFs for VfsDispatchEngineBridge<D> {
+    fn statfs(&self, ctx: &RequestCtx) -> Result<StatFs, Errno> {
+        expect_statfs(self.dispatch.dispatch(VfsOperation::StatFs(StatFsRequest {
+            inode: ROOT_INODE_ID,
+            ctx: ctx.clone(),
+        })))
+    }
+}
+
+fn normalize_engine_response(result: Result<VfsResponse, Errno>) -> Result<VfsResponse, Errno> {
+    match result {
+        Ok(VfsResponse::Err(errno)) => Err(errno),
+        other => other,
+    }
+}
+
+fn expect_root(result: Result<VfsResponse, Errno>) -> Result<InodeId, Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::GetRootInode(response) => Ok(response.inode),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
+fn expect_attr(result: Result<VfsResponse, Errno>) -> Result<InodeAttr, Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::InodeAttr(response) => Ok(response.attr),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
+fn expect_create(
+    result: Result<VfsResponse, Errno>,
+) -> Result<(InodeAttr, EngineFileHandle), Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::Create(response) => Ok((response.attr, response.fh)),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
+fn expect_open(result: Result<VfsResponse, Errno>) -> Result<EngineFileHandle, Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::Open(response) => Ok(response.fh),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
+fn expect_unit(result: Result<VfsResponse, Errno>) -> Result<(), Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::Unit(_) => Ok(()),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
+fn expect_read(result: Result<VfsResponse, Errno>) -> Result<Vec<u8>, Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::Read(response) => Ok(response.data),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
+fn expect_write(result: Result<VfsResponse, Errno>) -> Result<u32, Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::Write(response) => Ok(response.written),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
+fn expect_copy(result: Result<VfsResponse, Errno>) -> Result<u32, Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::CopyFileRange(response) => Ok(response.copied),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
+fn expect_bytes(result: Result<VfsResponse, Errno>) -> Result<Vec<u8>, Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::BytePayload(response) => Ok(response.data),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
+fn expect_open_dir(result: Result<VfsResponse, Errno>) -> Result<EngineDirHandle, Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::OpenDir(response) => Ok(response.dh),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
+fn expect_readdir(result: Result<VfsResponse, Errno>) -> Result<(Vec<DirEntry>, bool), Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::ReadDir(response) => Ok((response.entries, response.has_more)),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
+fn expect_getlk(result: Result<VfsResponse, Errno>) -> Result<Option<LockSpec>, Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::GetLk(response) => Ok(response.conflict),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
+fn expect_statfs(result: Result<VfsResponse, Errno>) -> Result<StatFs, Errno> {
+    match normalize_engine_response(result)? {
+        VfsResponse::StatFs(response) => Ok(response.stat),
+        _ => Err(Errno::EPROTO),
+    }
+}
+
 /// Bridge that adapts any [`VfsEngine`] implementor into a [`VfsDispatch`].
 ///
 /// Wraps a reference to a VFS engine and dispatches each
@@ -467,7 +1077,7 @@ mod tests {
     use super::*;
     use crate::{
         DirEntry, DirHandleId, EngineDirHandle, EngineFileHandle, FileHandleId, Generation,
-        InodeAttr, InodeFlags, InodeId, LockSpec, NodeKind, PosixAttrs, RequestCtx,
+        InodeAttr, InodeFlags, InodeId, LockSpec, NodeKind, PosixAttrs, RequestCtx, VfsEngine,
     };
 
     fn test_ctx() -> RequestCtx {
@@ -1580,5 +2190,49 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    struct ReverseDispatch;
+
+    impl VfsDispatch for ReverseDispatch {
+        fn dispatch(&self, operation: VfsOperation) -> Result<VfsResponse, Errno> {
+            use crate::operation::{GetRootInodeResponse, UnitResponse};
+
+            match operation {
+                VfsOperation::GetRootInode(_) => {
+                    Ok(VfsResponse::GetRootInode(GetRootInodeResponse {
+                        inode: InodeId::new(7),
+                    }))
+                }
+                VfsOperation::Lookup(_) => Ok(VfsResponse::Err(Errno::ENOENT)),
+                VfsOperation::GetAttr(_) => Ok(VfsResponse::Unit(UnitResponse)),
+                _ => Ok(VfsResponse::Err(Errno::ENOSYS)),
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_engine_bridge_maps_typed_response_and_normalizes_errno() {
+        let engine = super::VfsDispatchEngineBridge::new(ReverseDispatch);
+
+        assert_eq!(engine.get_root_inode(&test_ctx()).unwrap(), InodeId::new(7));
+        assert_eq!(
+            engine
+                .lookup(InodeId::new(7), b"missing", &test_ctx())
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn dispatch_engine_bridge_rejects_wrong_response_variant() {
+        let engine = super::VfsDispatchEngineBridge::new(ReverseDispatch);
+
+        assert_eq!(
+            engine
+                .getattr(InodeId::new(7), None, &test_ctx())
+                .unwrap_err(),
+            Errno::EPROTO
+        );
     }
 }

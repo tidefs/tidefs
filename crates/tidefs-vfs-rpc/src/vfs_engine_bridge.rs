@@ -58,7 +58,10 @@ impl VfsEngineBridgeWriter {
 
     #[must_use]
     pub fn matches_request(self, request: &VfsRpcRequest) -> bool {
-        request.header.term == self.term && request.header.epoch == self.epoch
+        request.header.writer_node == self.writer_node
+            && request.header.dataset_id == self.dataset_id
+            && request.header.term == self.term
+            && request.header.epoch == self.epoch
     }
 }
 
@@ -147,7 +150,7 @@ impl VfsEngineBridge {
             return error_response(request, errno);
         }
 
-        if requires_fence(&request.payload) && !self.config.writer.matches_request(request) {
+        if !self.config.writer.matches_request(request) {
             return error_response(request, Errno::ESTALE);
         }
 
@@ -195,6 +198,8 @@ impl VfsEngineBridge {
 
         let inline_request = VfsRpcRequest::new(
             request.header.op_id,
+            request.header.writer_node,
+            request.header.dataset_id,
             request.header.term,
             request.header.epoch,
             request.header.flags & !REQ_FLAG_BULK_PENDING,
@@ -236,6 +241,14 @@ impl VfsEngineBridge {
         ctx: &RequestCtx,
     ) -> Result<VfsRpcResponse, VfsRpcError> {
         match &request.payload {
+            VfsRpcRequestPayload::GetRoot => response_for(
+                request,
+                dispatch_root(
+                    target,
+                    VfsOperation::GetRootInode(engine_op::GetRootInodeRequest { ctx: ctx.clone() }),
+                ),
+                |inode| Ok(VfsRpcResponsePayload::RootInode(inode)),
+            ),
             VfsRpcRequestPayload::Lookup { parent, name } => response_for(
                 request,
                 dispatch_attr(
@@ -968,12 +981,13 @@ fn request_context(peer: PeerId, request: &VfsRpcRequest) -> Result<RequestCtx, 
 }
 
 fn ctx_from_credentials(credentials: &VfsRpcCredentials) -> RequestCtx {
-    let groups = if credentials.groups.is_empty() {
-        vec![credentials.gid]
-    } else {
-        credentials.groups.clone()
-    };
-    RequestCtx::new(credentials.uid, credentials.gid, 0, 0, groups)
+    RequestCtx::new(
+        credentials.uid,
+        credentials.gid,
+        credentials.pid,
+        credentials.umask,
+        credentials.groups.clone(),
+    )
 }
 
 fn reject_bulk_request(request: &VfsRpcRequest) -> Result<(), Errno> {
@@ -990,36 +1004,6 @@ fn reject_bulk_request(request: &VfsRpcRequest) -> Result<(), Errno> {
         return Err(Errno::EOPNOTSUPP);
     }
     Ok(())
-}
-
-fn requires_fence(payload: &VfsRpcRequestPayload) -> bool {
-    matches!(
-        payload,
-        VfsRpcRequestPayload::Mknod { .. }
-            | VfsRpcRequestPayload::Mkdir { .. }
-            | VfsRpcRequestPayload::Unlink { .. }
-            | VfsRpcRequestPayload::Rmdir { .. }
-            | VfsRpcRequestPayload::Symlink { .. }
-            | VfsRpcRequestPayload::Rename { .. }
-            | VfsRpcRequestPayload::Link { .. }
-            | VfsRpcRequestPayload::Setxattr { .. }
-            | VfsRpcRequestPayload::Removexattr { .. }
-            | VfsRpcRequestPayload::Create { .. }
-            | VfsRpcRequestPayload::Setattr { .. }
-            | VfsRpcRequestPayload::Open { .. }
-            | VfsRpcRequestPayload::Close { .. }
-            | VfsRpcRequestPayload::Opendir { .. }
-            | VfsRpcRequestPayload::Closedir { .. }
-            | VfsRpcRequestPayload::Flush { .. }
-            | VfsRpcRequestPayload::Release { .. }
-            | VfsRpcRequestPayload::Releasedir { .. }
-            | VfsRpcRequestPayload::Write { .. }
-            | VfsRpcRequestPayload::Fsync { .. }
-            | VfsRpcRequestPayload::Fallocate { .. }
-            | VfsRpcRequestPayload::Truncate { .. }
-            | VfsRpcRequestPayload::CopyFileRange { .. }
-            | VfsRpcRequestPayload::LockSet { .. }
-    )
 }
 
 fn dedup_eligible(payload: &VfsRpcRequestPayload) -> bool {
@@ -1077,6 +1061,13 @@ fn normalize_dispatch(result: Result<VfsResponse, Errno>) -> Result<VfsResponse,
     match result {
         Ok(VfsResponse::Err(errno)) => Err(errno),
         other => other,
+    }
+}
+
+fn dispatch_root(target: &VfsEngineDispatchTarget, op: VfsOperation) -> Result<InodeId, Errno> {
+    match normalize_dispatch(target.dispatch(op))? {
+        VfsResponse::GetRootInode(response) => Ok(response.inode),
+        _ => Err(Errno::EPROTO),
     }
 }
 
@@ -1216,6 +1207,7 @@ mod tests {
 
     struct RecordingDispatch {
         writes: RefCell<Vec<Vec<u8>>>,
+        last_ctx: RefCell<Option<RequestCtx>>,
         releases: Cell<u32>,
         reads: Cell<u32>,
         links: Cell<u32>,
@@ -1226,6 +1218,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 writes: RefCell::new(Vec::new()),
+                last_ctx: RefCell::new(None),
                 releases: Cell::new(0),
                 reads: Cell::new(0),
                 links: Cell::new(0),
@@ -1265,6 +1258,12 @@ mod tests {
     impl VfsDispatch for RecordingDispatch {
         fn dispatch(&self, op: VfsOperation) -> Result<VfsResponse, Errno> {
             match op {
+                VfsOperation::GetRootInode(req) => {
+                    *self.last_ctx.borrow_mut() = Some(req.ctx);
+                    Ok(VfsResponse::GetRootInode(engine_op::GetRootInodeResponse {
+                        inode: InodeId::new(1),
+                    }))
+                }
                 VfsOperation::Lookup(_) => {
                     Ok(VfsResponse::InodeAttr(engine_op::InodeAttrResponse {
                         attr: Self::attr(100, NodeKind::File),
@@ -1343,12 +1342,24 @@ mod tests {
             auth_tag: [0; 16],
             uid: 1000,
             gid: 1000,
+            pid: 44,
+            umask: 0o027,
             groups: vec![1000, 1001],
         }
     }
 
     fn request(op_id: u64, flags: u16, payload: VfsRpcRequestPayload) -> VfsRpcRequest {
-        VfsRpcRequest::new(OpId(op_id), 3, 5, flags, payload, Some(creds(PEER))).unwrap()
+        VfsRpcRequest::new(
+            OpId(op_id),
+            42,
+            DatasetId::new(99),
+            3,
+            5,
+            flags,
+            payload,
+            Some(creds(PEER)),
+        )
+        .unwrap()
     }
 
     fn create_handle(bridge: &mut VfsEngineBridge, target: &RecordingDispatch) -> VfsRpcHandle {
@@ -1392,6 +1403,52 @@ mod tests {
         assert_eq!(response.header.op_id, request.header.op_id);
         assert_eq!(response.header.errno, Errno::ENOSYS);
         assert_eq!(response.payload, VfsRpcResponsePayload::Empty);
+    }
+
+    #[test]
+    fn get_root_uses_typed_response_and_preserves_credentials() {
+        let mut bridge = bridge();
+        let target = RecordingDispatch::new();
+        let response = bridge
+            .dispatch(PEER, &request(1, 0, VfsRpcRequestPayload::GetRoot), &target)
+            .unwrap();
+
+        assert_eq!(response.header.errno, Errno::SUCCESS);
+        assert_eq!(
+            response.payload,
+            VfsRpcResponsePayload::RootInode(InodeId::new(1))
+        );
+        assert_eq!(
+            target.last_ctx.borrow().as_ref(),
+            Some(&RequestCtx::new(1000, 1000, 44, 0o027, vec![1000, 1001]))
+        );
+    }
+
+    #[test]
+    fn request_identity_mismatch_is_refused_before_dispatch() {
+        let mut bridge = bridge();
+        let target = RecordingDispatch::new();
+
+        for (op_id, writer, dataset_id) in
+            [(1, 43, DatasetId::new(99)), (2, 42, DatasetId::new(100))]
+        {
+            let request = VfsRpcRequest::new(
+                OpId(op_id),
+                writer,
+                dataset_id,
+                3,
+                5,
+                0,
+                VfsRpcRequestPayload::GetRoot,
+                Some(creds(PEER)),
+            )
+            .unwrap();
+
+            let response = bridge.dispatch(PEER, &request, &target).unwrap();
+            assert_eq!(response.header.errno, Errno::ESTALE);
+            assert_eq!(response.payload, VfsRpcResponsePayload::Empty);
+        }
+        assert!(target.last_ctx.borrow().is_none());
     }
 
     #[test]
@@ -1452,7 +1509,17 @@ mod tests {
             data: InlineOrBulk::Inline(b"abc".to_vec()),
         };
         let current = request(2, 0, payload.clone());
-        let stale = VfsRpcRequest::new(OpId(2), 2, 5, 0, payload, Some(creds(PEER))).unwrap();
+        let stale = VfsRpcRequest::new(
+            OpId(2),
+            42,
+            DatasetId::new(99),
+            2,
+            5,
+            0,
+            payload,
+            Some(creds(PEER)),
+        )
+        .unwrap();
 
         let first = bridge.dispatch(PEER, &current, &target).unwrap();
         let second = bridge.dispatch(PEER, &stale, &target).unwrap();
@@ -1469,6 +1536,8 @@ mod tests {
         let target = RecordingDispatch::new();
         let stale = VfsRpcRequest::new(
             OpId(7),
+            42,
+            DatasetId::new(99),
             2,
             5,
             0,
@@ -1536,6 +1605,8 @@ mod tests {
         let target = RecordingDispatch::new();
         let bad = VfsRpcRequest::new(
             OpId(1),
+            42,
+            DatasetId::new(99),
             3,
             5,
             0,
@@ -1598,6 +1669,8 @@ mod tests {
 
         let other_peer = VfsRpcRequest::new(
             OpId(4),
+            42,
+            DatasetId::new(99),
             3,
             5,
             0,
@@ -1737,12 +1810,14 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_reads_do_not_require_current_term_epoch() {
+    fn forwarded_reads_require_current_identity_and_fence() {
         let mut bridge = bridge();
         let target = RecordingDispatch::new();
         let handle = create_handle(&mut bridge, &target);
         let read = VfsRpcRequest::new(
             OpId(9),
+            42,
+            DatasetId::new(99),
             1,
             1,
             0,
@@ -1757,11 +1832,8 @@ mod tests {
 
         let response = bridge.dispatch(PEER, &read, &target).unwrap();
 
-        assert_eq!(response.header.errno, Errno::SUCCESS);
-        assert_eq!(
-            response.payload,
-            VfsRpcResponsePayload::Data(InlineOrBulk::Inline(vec![b'r', b'r']))
-        );
-        assert_eq!(target.reads.get(), 1);
+        assert_eq!(response.header.errno, Errno::ESTALE);
+        assert_eq!(response.payload, VfsRpcResponsePayload::Empty);
+        assert_eq!(target.reads.get(), 0);
     }
 }

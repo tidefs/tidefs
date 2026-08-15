@@ -660,6 +660,7 @@ mod tests {
     use tidefs_lock_service::{
         ConflictInfo, DatasetMountIdentity, EpochId, GetlkAck, QueuedLockFrameSink,
     };
+    use tidefs_vfs_rpc::DatasetId as VfsDatasetId;
 
     fn test_runtime() -> ClusteredPosixMountRuntime {
         let identity = DatasetMountIdentity {
@@ -671,6 +672,8 @@ mod tests {
             current_epoch: EpochId::new(5),
             current_term: 7,
             lock_leader: MemberId::new(3),
+            vfs_dataset_id: VfsDatasetId::new(44),
+            vfs_writer: MemberId::new(4),
             admission_generation: 11,
         };
         ClusteredPosixMountRuntime::open_committed_mount(identity, authority).unwrap()
@@ -734,6 +737,8 @@ mod tests {
                 current_epoch: EpochId::new(5),
                 current_term: 7,
                 lock_leader: MemberId::new(3),
+                vfs_dataset_id: VfsDatasetId::new(44),
+                vfs_writer: MemberId::new(4),
                 admission_generation: 11,
             },
         )
@@ -764,6 +769,8 @@ mod tests {
                 current_epoch: EpochId::new(5),
                 current_term: 7,
                 lock_leader: MemberId::new(3),
+                vfs_dataset_id: VfsDatasetId::new(44),
+                vfs_writer: MemberId::new(4),
                 admission_generation: 11,
             },
         )
@@ -779,6 +786,8 @@ mod tests {
                 current_epoch: EpochId::new(5),
                 current_term: 7,
                 lock_leader: MemberId::new(3),
+                vfs_dataset_id: VfsDatasetId::new(44),
+                vfs_writer: MemberId::new(4),
                 admission_generation: 11,
             },
         )
@@ -825,6 +834,8 @@ mod tests {
             current_epoch: EpochId::new(5), // behind committed_epoch=10
             current_term: 7,
             lock_leader: MemberId::new(3),
+            vfs_dataset_id: VfsDatasetId::new(44),
+            vfs_writer: MemberId::new(4),
             admission_generation: 11,
         };
         let err =
@@ -843,6 +854,8 @@ mod tests {
             current_epoch: EpochId::new(5),
             current_term: 0,
             lock_leader: MemberId::new(3),
+            vfs_dataset_id: VfsDatasetId::new(44),
+            vfs_writer: MemberId::new(4),
             admission_generation: 11,
         };
         let err =
@@ -861,6 +874,8 @@ mod tests {
             current_epoch: EpochId::new(5),
             current_term: 7,
             lock_leader: MemberId::new(0),
+            vfs_dataset_id: VfsDatasetId::new(44),
+            vfs_writer: MemberId::new(4),
             admission_generation: 11,
         };
         let err =

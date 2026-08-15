@@ -15,6 +15,7 @@
 //! [`DaemonLockDispatch`]: crate::lock_dispatch::DaemonLockDispatch
 
 use tidefs_lock_service::{DatasetMountIdentity, EpochId, MemberId};
+use tidefs_vfs_rpc::DatasetId;
 
 /// Error returned when clustered POSIX mount admission fails.
 ///
@@ -35,6 +36,10 @@ pub enum ClusteredPosixMountAdmissionError {
     MissingAuthorityTerm,
     /// The current LOCK leader or routed authority endpoint is zero.
     MissingLockAuthorityEndpoint,
+    /// The exact VFS_RPC dataset identity is zero.
+    MissingVfsDatasetIdentity,
+    /// The current VFS writer endpoint is zero.
+    MissingVfsWriter,
     /// The admission/session binding generation is zero.
     MissingAdmissionGeneration,
 }
@@ -50,12 +55,14 @@ impl ClusteredPosixMountAdmissionError {
             Self::StaleAuthorityEpoch => "stale_authority_epoch",
             Self::MissingAuthorityTerm => "missing_authority_term",
             Self::MissingLockAuthorityEndpoint => "missing_lock_authority_endpoint",
+            Self::MissingVfsDatasetIdentity => "missing_vfs_dataset_identity",
+            Self::MissingVfsWriter => "missing_vfs_writer",
             Self::MissingAdmissionGeneration => "missing_admission_generation",
         }
     }
 }
 
-/// Current clustered LOCK authority evidence for a mounted POSIX runtime.
+/// Current clustered LOCK and VFS authority evidence for a mounted POSIX runtime.
 ///
 /// The clustered mount boundary receives this snapshot from the current
 /// membership, lease, and LOCK authority sources used by clustered requests.
@@ -67,6 +74,11 @@ pub struct ClusteredPosixAuthoritySnapshot {
     pub current_term: u64,
     /// Current LOCK leader or equivalent routed authority endpoint.
     pub lock_leader: MemberId,
+    /// Exact 128-bit dataset identity used by the mounted VFS engine and
+    /// VFS_RPC transferable handles.
+    pub vfs_dataset_id: DatasetId,
+    /// Current VFS writer, independent of LOCK routing.
+    pub vfs_writer: MemberId,
     /// Admission/session binding generation proving the cached identity still
     /// belongs to this mounted clustered dataset.
     pub admission_generation: u64,
@@ -113,6 +125,12 @@ impl ClusteredPosixMountRuntime {
         if authority.lock_leader.0 == 0 {
             return Err(ClusteredPosixMountAdmissionError::MissingLockAuthorityEndpoint);
         }
+        if authority.vfs_dataset_id.0 == 0 {
+            return Err(ClusteredPosixMountAdmissionError::MissingVfsDatasetIdentity);
+        }
+        if authority.vfs_writer.0 == 0 {
+            return Err(ClusteredPosixMountAdmissionError::MissingVfsWriter);
+        }
         if authority.admission_generation == 0 {
             return Err(ClusteredPosixMountAdmissionError::MissingAdmissionGeneration);
         }
@@ -153,6 +171,18 @@ impl ClusteredPosixMountRuntime {
         self.authority.lock_leader
     }
 
+    /// Exact mounted VFS dataset identity.
+    #[must_use]
+    pub const fn vfs_dataset_id(&self) -> DatasetId {
+        self.authority.vfs_dataset_id
+    }
+
+    /// Current VFS writer, independent of the LOCK leader.
+    #[must_use]
+    pub const fn vfs_writer(&self) -> MemberId {
+        self.authority.vfs_writer
+    }
+
     /// Admission/session binding generation for the mounted dataset identity.
     #[must_use]
     pub const fn admission_generation(&self) -> u64 {
@@ -178,6 +208,8 @@ mod tests {
             current_epoch: EpochId::new(current_epoch),
             current_term,
             lock_leader: MemberId::new(lock_leader),
+            vfs_dataset_id: DatasetId::new(44),
+            vfs_writer: MemberId::new(4),
             admission_generation,
         }
     }
@@ -194,6 +226,8 @@ mod tests {
         assert_eq!(runtime.current_epoch(), EpochId::new(5));
         assert_eq!(runtime.current_term(), 7);
         assert_eq!(runtime.lock_leader(), MemberId::new(3));
+        assert_eq!(runtime.vfs_dataset_id(), DatasetId::new(44));
+        assert_eq!(runtime.vfs_writer(), MemberId::new(4));
         assert_eq!(runtime.admission_generation(), 11);
     }
 
@@ -303,6 +337,30 @@ mod tests {
     }
 
     #[test]
+    fn refuses_zero_vfs_dataset_identity() {
+        let mut snapshot = authority(5, 7, 3, 11);
+        snapshot.vfs_dataset_id = DatasetId::new(0);
+
+        assert_eq!(
+            ClusteredPosixMountRuntime::open_committed_mount(identity(1, 2, 5), snapshot)
+                .unwrap_err(),
+            ClusteredPosixMountAdmissionError::MissingVfsDatasetIdentity
+        );
+    }
+
+    #[test]
+    fn refuses_zero_vfs_writer() {
+        let mut snapshot = authority(5, 7, 3, 11);
+        snapshot.vfs_writer = MemberId::new(0);
+
+        assert_eq!(
+            ClusteredPosixMountRuntime::open_committed_mount(identity(1, 2, 5), snapshot)
+                .unwrap_err(),
+            ClusteredPosixMountAdmissionError::MissingVfsWriter
+        );
+    }
+
+    #[test]
     fn as_str_returns_stable_labels() {
         assert_eq!(
             ClusteredPosixMountAdmissionError::MissingIdentity.as_str(),
@@ -331,6 +389,14 @@ mod tests {
         assert_eq!(
             ClusteredPosixMountAdmissionError::MissingAdmissionGeneration.as_str(),
             "missing_admission_generation"
+        );
+        assert_eq!(
+            ClusteredPosixMountAdmissionError::MissingVfsDatasetIdentity.as_str(),
+            "missing_vfs_dataset_identity"
+        );
+        assert_eq!(
+            ClusteredPosixMountAdmissionError::MissingVfsWriter.as_str(),
+            "missing_vfs_writer"
         );
     }
 }
