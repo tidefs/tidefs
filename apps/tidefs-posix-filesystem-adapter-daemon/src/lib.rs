@@ -112,6 +112,8 @@ pub mod xfstests_harness;
 
 pub mod capacity;
 #[cfg(feature = "cluster")]
+pub mod cluster_vfs_rpc_owner;
+#[cfg(feature = "cluster")]
 pub mod clustered_lock_forwarder;
 #[cfg(feature = "cluster")]
 pub mod clustered_mount;
@@ -406,9 +408,9 @@ fn effective_mount_mode(config: &MountConfig) -> EffectiveMountMode {
 
 #[cfg(feature = "cluster")]
 fn require_real_cluster_data_carrier(authority: &MountAuthority) -> Result<(), String> {
-    if authority.is_cluster_authorized() {
+    if authority.is_cluster_authorized() && !authority.has_cluster_vfs_rpc_owner() {
         return Err(
-            "cluster mount has no Pool-backed distributed data carrier; refusing the local-only filesystem path because synthetic placement sidecars are not storage authority"
+            "cluster mount has no configured Pool-backed distributed data carrier (VFS_RPC owner); refusing the local-only filesystem path because synthetic placement sidecars are not storage authority"
                 .to_string(),
         );
     }
@@ -558,7 +560,16 @@ pub struct ClusterMountAuthority {
     session: Option<Box<dyn ClusterLeaseSession>>,
     mutation_deadline: tidefs_local_filesystem::ExternalMutationDeadline,
     next_renewal: Instant,
+    vfs_rpc_owner: Option<ClusterVfsRpcOwnerAuthority>,
     released: bool,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Debug)]
+struct ClusterVfsRpcOwnerAuthority {
+    bind_addr: std::net::SocketAddr,
+    admitted_peer_node: u64,
+    writer_fence: Arc<Mutex<cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence>>,
 }
 
 #[cfg(feature = "cluster")]
@@ -572,6 +583,7 @@ impl std::fmt::Debug for ClusterMountAuthority {
                 "next_renewal_in",
                 &self.next_renewal.saturating_duration_since(Instant::now()),
             )
+            .field("vfs_rpc_owner", &self.vfs_rpc_owner)
             .field("released", &self.released)
             .finish()
     }
@@ -668,6 +680,28 @@ impl MountAuthority {
         }
     }
 
+    #[cfg(feature = "cluster")]
+    fn has_cluster_vfs_rpc_owner(&self) -> bool {
+        matches!(self, Self::ClusterLease(authority) if authority.vfs_rpc_owner.is_some())
+    }
+
+    /// Configure the authenticated owner-side VFS_RPC Control endpoint.
+    #[cfg(feature = "cluster")]
+    pub fn configure_cluster_vfs_rpc_owner(
+        &mut self,
+        bind_addr: std::net::SocketAddr,
+        admitted_peer_node: u64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Standalone => {
+                Err("standalone mount cannot configure a cluster VFS_RPC owner".to_string())
+            }
+            Self::ClusterLease(authority) => {
+                authority.configure_vfs_rpc_owner(bind_addr, admitted_peer_node)
+            }
+        }
+    }
+
     /// Return the conservative process-local validity of a clustered grant.
     #[cfg(feature = "cluster")]
     pub fn cluster_lease_remaining(&self) -> Option<Duration> {
@@ -720,6 +754,36 @@ impl MountAuthority {
     }
 
     #[cfg(feature = "cluster")]
+    fn cluster_vfs_rpc_owner_config(
+        &self,
+        dataset_id: Option<tidefs_dataset_lifecycle::DatasetId>,
+        engine: live_owner::LiveOwnerEngine,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<Option<cluster_vfs_rpc_owner::ClusterVfsRpcOwnerConfig>, String> {
+        match self {
+            Self::Standalone => Ok(None),
+            Self::ClusterLease(authority) => {
+                let owner = authority.vfs_rpc_owner.as_ref().ok_or_else(|| {
+                    "cluster mount has no configured Pool-backed VFS_RPC owner".to_string()
+                })?;
+                let dataset_id = dataset_id.ok_or_else(|| {
+                    "cluster VFS_RPC owner requires a canonical mounted dataset identity"
+                        .to_string()
+                })?;
+                Ok(Some(cluster_vfs_rpc_owner::ClusterVfsRpcOwnerConfig::new(
+                    owner.bind_addr,
+                    authority.token.node_id,
+                    owner.admitted_peer_node,
+                    tidefs_vfs_rpc::DatasetId::new(u128::from_le_bytes(*dataset_id.as_bytes())),
+                    Arc::clone(&owner.writer_fence),
+                    engine,
+                    shutdown,
+                )))
+            }
+        }
+    }
+
+    #[cfg(feature = "cluster")]
     fn require_renewable_cluster_authority(&self) -> Result<(), String> {
         match self {
             Self::Standalone => Ok(()),
@@ -768,12 +832,38 @@ impl ClusterMountAuthority {
             next_renewal: cluster_lease_renewal_at(valid_until),
             token: grant.token,
             session,
+            vfs_rpc_owner: None,
             released: false,
         }
     }
 
     pub fn token(&self) -> &tidefs_cluster::PoolLeaseToken {
         &self.token
+    }
+
+    fn configure_vfs_rpc_owner(
+        &mut self,
+        bind_addr: std::net::SocketAddr,
+        admitted_peer_node: u64,
+    ) -> Result<(), String> {
+        if admitted_peer_node == 0 {
+            return Err("cluster VFS_RPC admitted peer node must be nonzero".to_string());
+        }
+        if self.vfs_rpc_owner.is_some() {
+            return Err("cluster VFS_RPC owner is already configured".to_string());
+        }
+        self.vfs_rpc_owner = Some(ClusterVfsRpcOwnerAuthority {
+            bind_addr,
+            admitted_peer_node,
+            writer_fence: Arc::new(Mutex::new(
+                cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence::new(
+                    self.token.node_id,
+                    self.token.lease_id,
+                    self.token.epoch.0,
+                ),
+            )),
+        });
+        Ok(())
     }
 
     fn renew_if_due(&mut self) -> Result<(), String> {
@@ -815,6 +905,17 @@ impl ClusterMountAuthority {
         }
         self.next_renewal = cluster_lease_renewal_at(renewed.valid_until);
         self.token = renewed.token;
+        if let Some(vfs_rpc_owner) = &self.vfs_rpc_owner {
+            *vfs_rpc_owner
+                .writer_fence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence::new(
+                    self.token.node_id,
+                    self.token.lease_id,
+                    self.token.epoch.0,
+                );
+        }
         Ok(())
     }
 
@@ -1265,6 +1366,8 @@ struct StartedMount {
     mmap_coherency: Arc<mmap_coherency::MmapCoherency>,
     #[cfg(feature = "cluster")]
     shared_filesystem: tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem,
+    #[cfg(feature = "cluster")]
+    cluster_vfs_rpc_owner: Option<cluster_vfs_rpc_owner::ClusterVfsRpcOwnerHandle>,
 }
 
 fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
@@ -1672,6 +1775,32 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         session.join();
         return Err(err);
     }
+    #[cfg(feature = "cluster")]
+    let mut cluster_vfs_rpc_owner = match config
+        .mount_authority
+        .cluster_vfs_rpc_owner_config(
+            dataset_id,
+            Arc::clone(&live_owner_engine),
+            Arc::clone(&shutdown),
+        )
+        .and_then(|owner| {
+            owner
+                .map(cluster_vfs_rpc_owner::ClusterVfsRpcOwnerHandle::start)
+                .transpose()
+        }) {
+        Ok(owner) => owner,
+        Err(error) => {
+            session.join();
+            return Err(error);
+        }
+    };
+    #[cfg(feature = "cluster")]
+    if let Some(owner) = cluster_vfs_rpc_owner.as_ref() {
+        eprintln!(
+            "cluster: Pool-backed inline VFS_RPC owner listening at {}",
+            owner.bound_addr()
+        );
+    }
     let live_owner = if snapshot_export {
         None
     } else {
@@ -1695,7 +1824,17 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                 ) {
                     Ok(owner) => owner,
                     Err(err) => {
+                        #[cfg(feature = "cluster")]
+                        let vfs_rpc_stop_error = cluster_vfs_rpc_owner
+                            .as_mut()
+                            .and_then(|owner| owner.stop().err());
                         session.join();
+                        #[cfg(feature = "cluster")]
+                        if let Some(stop_error) = vfs_rpc_stop_error {
+                            return Err(format!(
+                                "{err}; additionally failed to stop cluster VFS_RPC owner: {stop_error}"
+                            ));
+                        }
                         return Err(err);
                     }
                 };
@@ -1715,6 +1854,8 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         mmap_coherency,
         #[cfg(feature = "cluster")]
         shared_filesystem,
+        #[cfg(feature = "cluster")]
+        cluster_vfs_rpc_owner,
     })
 }
 
@@ -1764,6 +1905,8 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
         mmap_coherency,
         #[cfg(feature = "cluster")]
         shared_filesystem,
+        #[cfg(feature = "cluster")]
+        mut cluster_vfs_rpc_owner,
     } = match start_mount(&config) {
         Ok(started) => started,
         Err(primary_error) => {
@@ -1806,6 +1949,13 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
         #[cfg(feature = "cluster")]
         if let Some(worker) = cluster_lease_renewal.as_ref() {
             worker.check_health();
+        }
+        #[cfg(feature = "cluster")]
+        if let Some(owner) = cluster_vfs_rpc_owner.as_ref() {
+            if let Err(error) = owner.check_health() {
+                eprintln!("cluster VFS_RPC owner failed; unmounting before Pool export: {error}");
+                shutdown.store(true, Ordering::Release);
+            }
         }
         let report = background_scheduler.as_ref().and_then(|scheduler| {
             let started = std::time::Instant::now();
@@ -1867,6 +2017,14 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
     let carrier_drain_result = live_owner
         .as_ref()
         .map_or(Ok(()), live_owner::LiveOwnerHandle::drain_carriers);
+    #[cfg(feature = "cluster")]
+    let cluster_vfs_rpc_owner_result = cluster_vfs_rpc_owner.as_mut().map_or(Ok(()), |owner| {
+        owner
+            .stop()
+            .map_err(|error| format!("stop cluster VFS_RPC owner before Pool export: {error}"))
+    });
+    #[cfg(not(feature = "cluster"))]
+    let cluster_vfs_rpc_owner_result: Result<(), String> = Ok(());
     session.join();
     let artifact_result = match config.runtime.queue_depth_artifact.as_deref() {
         Some(path) => write_queue_depth_runtime_artifact(&queue_depth_engine, path),
@@ -1923,6 +2081,7 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
     }
     for result in [
         &carrier_drain_result,
+        &cluster_vfs_rpc_owner_result,
         &artifact_result,
         &export_result,
         &lease_release_result,
@@ -2392,6 +2551,23 @@ mod cluster_mount_authority_tests {
             Box::new(session),
         )
         .unwrap();
+        authority
+            .configure_cluster_vfs_rpc_owner("127.0.0.1:0".parse().unwrap(), 11)
+            .unwrap();
+        let rpc_writer_fence = match &authority {
+            MountAuthority::ClusterLease(cluster) => Arc::clone(
+                &cluster
+                    .vfs_rpc_owner
+                    .as_ref()
+                    .expect("configured VFS_RPC owner")
+                    .writer_fence,
+            ),
+            MountAuthority::Standalone => unreachable!(),
+        };
+        assert_eq!(
+            *rpc_writer_fence.lock().unwrap(),
+            cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence::new(7, 99, 2)
+        );
         let deadline = authority.external_mutation_deadline().unwrap();
         let MountAuthority::ClusterLease(cluster) = &mut authority else {
             unreachable!();
@@ -2402,6 +2578,10 @@ mod cluster_mount_authority_tests {
 
         assert_eq!(renewals.load(AtomicOrdering::Relaxed), 1);
         assert!(deadline.is_live());
+        assert_eq!(
+            *rpc_writer_fence.lock().unwrap(),
+            cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence::new(7, 99, 2)
+        );
         authority.release_unmounted().unwrap();
         assert_eq!(releases.load(AtomicOrdering::Relaxed), 1);
         assert!(!deadline.is_live());
@@ -2518,14 +2698,18 @@ mod cluster_mount_authority_tests {
     }
 
     #[test]
-    fn cluster_mount_refuses_local_only_data_path() {
-        let authority =
+    fn cluster_mount_requires_configured_pool_backed_data_carrier() {
+        let mut authority =
             MountAuthority::cluster_lease(POOL_GUID, lease_token(7, POOL_GUID, 2, 99)).unwrap();
 
         let error = require_real_cluster_data_carrier(&authority).unwrap_err();
 
         assert!(error.contains("Pool-backed distributed data carrier"));
         assert!(error.contains("synthetic placement sidecars are not storage authority"));
+        authority
+            .configure_cluster_vfs_rpc_owner("127.0.0.1:0".parse().unwrap(), 11)
+            .unwrap();
+        require_real_cluster_data_carrier(&authority).unwrap();
     }
 }
 

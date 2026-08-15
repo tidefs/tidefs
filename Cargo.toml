@@ -344,6 +344,7 @@ tidefs-ublk-abi = { path = "crates/tidefs-ublk-abi" }
 tidefs-validation = { path = "crates/tidefs-validation", default-features = false }
 tidefs-verification-engine = { path = "crates/tidefs-verification-engine" }
 tidefs-vfs-engine = { path = "crates/tidefs-vfs-engine" }
+tidefs-vfs-rpc = { path = "crates/tidefs-vfs-rpc" }
 tidefs-witness-set = { path = "crates/tidefs-witness-set" }
 tidefs-workload = { path = "crates/tidefs-workload" }
 tidefs-xattr-storage = { path = "crates/tidefs-xattr-storage" }

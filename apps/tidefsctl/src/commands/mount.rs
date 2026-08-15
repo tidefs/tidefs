@@ -192,6 +192,16 @@ pub struct PoolMountArgs {
     /// Required when --cluster is set.
     #[arg(long = "cluster-authority-node-id", requires = "cluster")]
     pub cluster_authority_node_id: Option<u64>,
+
+    #[cfg(feature = "cluster")]
+    /// Local authenticated Control endpoint that serves Pool-backed inline
+    /// VFS_RPC for this cluster owner. Required when --cluster is set.
+    #[arg(
+        long = "cluster-vfs-rpc-bind",
+        requires = "cluster",
+        required_if_eq("cluster", "true")
+    )]
+    pub cluster_vfs_rpc_bind: Option<String>,
 }
 
 /// Find device-label files inside a pool backing directory.
@@ -718,6 +728,10 @@ pub fn handle_mount(args: PoolMountArgs) {
             );
             process::exit(1);
         }
+        if args.cluster_vfs_rpc_bind.is_none() {
+            eprintln!("tidefsctl pool mount: --cluster requires --cluster-vfs-rpc-bind");
+            process::exit(1);
+        }
     }
 
     let devices = match args.devices.as_ref() {
@@ -835,6 +849,18 @@ pub fn handle_mount(args: PoolMountArgs) {
         let authority_addr = args.cluster_authority_addr.as_ref().unwrap();
         let owner_node_id = args.cluster_owner_node_id.unwrap();
         let authority_node_id = args.cluster_authority_node_id.unwrap();
+        let vfs_rpc_bind: SocketAddr = args
+            .cluster_vfs_rpc_bind
+            .as_deref()
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "tidefsctl pool mount: invalid --cluster-vfs-rpc-bind '{}': {error}",
+                    args.cluster_vfs_rpc_bind.as_deref().unwrap()
+                );
+                process::exit(1);
+            });
 
         println!(
             "cluster: owner node {} requesting Pool lease from authority node {} at {} for pool {:02x?}...",
@@ -887,6 +913,18 @@ pub fn handle_mount(args: PoolMountArgs) {
                 eprintln!("tidefsctl pool mount: {error}");
                 process::exit(1);
             });
+        if let Err(error) =
+            authority.configure_cluster_vfs_rpc_owner(vfs_rpc_bind, authority_node_id)
+        {
+            let release_error = authority.release_unmounted().err();
+            eprintln!(
+                "tidefsctl pool mount: {error}{}",
+                release_error
+                    .map(|error| format!("; Pool lease release also failed: {error}"))
+                    .unwrap_or_default()
+            );
+            process::exit(1);
+        }
 
         println!(
             "cluster: lease granted (node={}, epoch={}, lease_id={}, local_valid_for_ms={})",
@@ -1287,6 +1325,8 @@ mod tests {
             cluster_owner_node_id: None,
             #[cfg(feature = "cluster")]
             cluster_authority_node_id: None,
+            #[cfg(feature = "cluster")]
+            cluster_vfs_rpc_bind: None,
             pool_name: "testpool".into(),
             mount_point: PathBuf::from("/mnt/tidefs"),
             read_only: false,
@@ -1320,6 +1360,8 @@ mod tests {
             cluster_owner_node_id: None,
             #[cfg(feature = "cluster")]
             cluster_authority_node_id: None,
+            #[cfg(feature = "cluster")]
+            cluster_vfs_rpc_bind: None,
         };
         assert!(args.read_only);
     }
@@ -1345,6 +1387,8 @@ mod tests {
             cluster_owner_node_id: None,
             #[cfg(feature = "cluster")]
             cluster_authority_node_id: None,
+            #[cfg(feature = "cluster")]
+            cluster_vfs_rpc_bind: None,
         };
         assert!(args.relatime);
     }
@@ -1370,6 +1414,8 @@ mod tests {
             cluster_owner_node_id: None,
             #[cfg(feature = "cluster")]
             cluster_authority_node_id: None,
+            #[cfg(feature = "cluster")]
+            cluster_vfs_rpc_bind: None,
         };
         assert_eq!(args.pool_name, "full");
         assert_eq!(args.mount_point, PathBuf::from("/mnt/full"));
