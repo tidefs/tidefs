@@ -785,6 +785,7 @@ impl MountAuthority {
                     owner.admitted_peer_node,
                     Arc::clone(&owner.local_credential),
                     owner.trusted_peer_identity.clone(),
+                    authority.token.pool_guid,
                     tidefs_vfs_rpc::DatasetId::new(u128::from_le_bytes(*dataset_id.as_bytes())),
                     Arc::clone(&owner.writer_fence),
                     engine,

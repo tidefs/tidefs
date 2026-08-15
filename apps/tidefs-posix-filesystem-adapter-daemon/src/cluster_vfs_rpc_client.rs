@@ -3,7 +3,8 @@
 //!
 //! The client consumes an already-configured [`Transport`] and an established
 //! Control session. It does not generate keys, configure attestation, connect,
-//! or infer writer/dataset authority from an endpoint or command-line value.
+//! or accept writer/dataset/lease authority from an endpoint or command-line
+//! value; those values come from the authenticated owner-issued preface.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -21,7 +22,8 @@ use tidefs_types_vfs_core::{
 use tidefs_vfs_engine::operation as engine_op;
 use tidefs_vfs_engine::{VfsDispatch, VfsOperation, VfsResponse};
 use tidefs_vfs_rpc::transport_adapter::{
-    VfsRpcEnvelopeContext, VfsRpcInboundFrame, VfsRpcTransportAdapter, VfsRpcTransportAdapterConfig,
+    decode_session_authority_frame, VfsRpcEnvelopeContext, VfsRpcInboundFrame,
+    VfsRpcSessionAuthorityError, VfsRpcTransportAdapter, VfsRpcTransportAdapterConfig,
 };
 use tidefs_vfs_rpc::{
     DatasetId, InlineOrBulk, PeerId, VfsRpcClient, VfsRpcCredentials, VfsRpcHandle,
@@ -29,9 +31,8 @@ use tidefs_vfs_rpc::{
     DEFAULT_INLINE_THRESHOLD,
 };
 
-use crate::clustered_mount::ClusteredPosixMountRuntime;
-
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CLIENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Construction or explicit-teardown failure at the authenticated client
@@ -51,8 +52,17 @@ pub enum ClusterVfsRpcClientError {
         expected_writer: u64,
         authenticated_peer: u64,
     },
+    WrongPool {
+        expected: [u8; 16],
+        found: [u8; 16],
+    },
+    ExpectedPoolGuidZero,
     MissingActiveConnection(SessionId),
     UnauthenticatedSession(SessionId),
+    ConfigureNonblocking(String),
+    AuthorityTimeout(SessionId),
+    AuthorityTransport(String),
+    MalformedAuthority(VfsRpcSessionAuthorityError),
     CloseFailed(String),
 }
 
@@ -86,6 +96,13 @@ impl fmt::Display for ClusterVfsRpcClientError {
                 f,
                 "cluster VFS_RPC authenticated peer {authenticated_peer} is not admitted writer {expected_writer}"
             ),
+            Self::WrongPool { expected, found } => write!(
+                f,
+                "cluster VFS_RPC owner Pool GUID {found:02x?} does not match expected {expected:02x?}"
+            ),
+            Self::ExpectedPoolGuidZero => {
+                write!(f, "cluster VFS_RPC expected Pool GUID must be nonzero")
+            }
             Self::MissingActiveConnection(session) => write!(
                 f,
                 "cluster VFS_RPC session {session} has no active transport connection"
@@ -94,6 +111,19 @@ impl fmt::Display for ClusterVfsRpcClientError {
                 f,
                 "cluster VFS_RPC session {session} lacks authenticated confidentiality"
             ),
+            Self::ConfigureNonblocking(error) => {
+                write!(f, "configure bounded cluster VFS_RPC receive: {error}")
+            }
+            Self::AuthorityTimeout(session) => write!(
+                f,
+                "cluster VFS_RPC session {session} timed out waiting for owner authority"
+            ),
+            Self::AuthorityTransport(error) => {
+                write!(f, "receive cluster VFS_RPC owner authority: {error}")
+            }
+            Self::MalformedAuthority(error) => {
+                write!(f, "refuse cluster VFS_RPC owner authority: {error}")
+            }
             Self::CloseFailed(error) => write!(f, "close cluster VFS_RPC client: {error}"),
         }
     }
@@ -109,20 +139,27 @@ pub struct ClusterVfsRpcClient {
 }
 
 impl ClusterVfsRpcClient {
-    /// Consume an already-authenticated Control transport/session and bind it
-    /// to the admitted VFS writer and exact dataset identity.
+    /// Consume an already-authenticated Control transport/session and derive
+    /// request authority from its owner-issued preface.
     pub fn new(
-        transport: Transport,
+        mut transport: Transport,
         session_id: SessionId,
-        runtime: ClusteredPosixMountRuntime,
+        expected_pool_guid: [u8; 16],
     ) -> Result<Self, ClusterVfsRpcClientError> {
-        validate_construction_session(&transport, session_id, runtime)?;
+        let authenticated_peer = validate_construction_session(&transport, session_id)?;
+        transport
+            .set_nonblocking(true)
+            .map_err(|error| ClusterVfsRpcClientError::ConfigureNonblocking(error.to_string()))?;
+        let authority = receive_session_authority(&mut transport, session_id)?;
+        authority
+            .validate_for_client(expected_pool_guid, authenticated_peer)
+            .map_err(map_session_authority_error)?;
 
-        let writer = runtime.vfs_writer().0;
-        let dataset_id = runtime.vfs_dataset_id();
+        let writer = authority.writer_node();
+        let dataset_id = authority.dataset_id();
         let local_node = transport.local_node_id;
         let mut sessions = TransportSessionSet::new();
-        sessions.add_binding_with_epoch(writer, session_id, runtime.current_epoch().0);
+        sessions.add_binding_with_epoch(writer, session_id, authority.epoch());
         sessions.mark_healthy(session_id);
 
         Ok(Self {
@@ -135,8 +172,8 @@ impl ClusterVfsRpcClient {
                 rpc: VfsRpcClient::new(
                     writer,
                     dataset_id,
-                    runtime.current_term(),
-                    runtime.current_epoch().0,
+                    authority.term(),
+                    authority.epoch(),
                     1,
                     Duration::from_millis(250),
                 ),
@@ -634,17 +671,11 @@ impl Drop for ClientState {
 fn validate_construction_session(
     transport: &Transport,
     session_id: SessionId,
-    runtime: ClusteredPosixMountRuntime,
-) -> Result<(), ClusterVfsRpcClientError> {
+) -> Result<u64, ClusterVfsRpcClientError> {
     if transport.endpoint_family != EndpointFamily::Control {
         return Err(ClusterVfsRpcClientError::NonControlTransport);
     }
-    validate_active_session(
-        transport,
-        session_id,
-        transport.local_node_id,
-        runtime.vfs_writer().0,
-    )
+    authenticated_session_peer(transport, session_id, transport.local_node_id)
 }
 
 fn validate_active_session(
@@ -653,6 +684,21 @@ fn validate_active_session(
     local_node: u64,
     expected_writer: u64,
 ) -> Result<(), ClusterVfsRpcClientError> {
+    let authenticated_peer = authenticated_session_peer(transport, session_id, local_node)?;
+    if authenticated_peer != expected_writer {
+        return Err(ClusterVfsRpcClientError::WrongPeer {
+            expected_writer,
+            authenticated_peer,
+        });
+    }
+    Ok(())
+}
+
+fn authenticated_session_peer(
+    transport: &Transport,
+    session_id: SessionId,
+    local_node: u64,
+) -> Result<u64, ClusterVfsRpcClientError> {
     let session = transport
         .sessions
         .get(&session_id)
@@ -671,12 +717,7 @@ fn validate_active_session(
             session_node: session.local_node,
         });
     }
-    if session.peer_node != expected_writer {
-        return Err(ClusterVfsRpcClientError::WrongPeer {
-            expected_writer,
-            authenticated_peer: session.peer_node,
-        });
-    }
+    let authenticated_peer = session.peer_node;
     drop(session);
     if !transport.active_connections.contains_key(&session_id) {
         return Err(ClusterVfsRpcClientError::MissingActiveConnection(
@@ -686,7 +727,52 @@ fn validate_active_session(
     if !transport.session_has_authenticated_confidentiality(session_id) {
         return Err(ClusterVfsRpcClientError::UnauthenticatedSession(session_id));
     }
-    Ok(())
+    Ok(authenticated_peer)
+}
+
+fn receive_session_authority(
+    transport: &mut Transport,
+    session_id: SessionId,
+) -> Result<tidefs_vfs_rpc::transport_adapter::VfsRpcSessionAuthority, ClusterVfsRpcClientError> {
+    let deadline = Instant::now() + CLIENT_AUTHORITY_TIMEOUT;
+    loop {
+        match transport.recv_envelope(session_id) {
+            Ok((envelope, payload)) => {
+                return decode_session_authority_frame(&envelope, &payload)
+                    .map_err(map_session_authority_error);
+            }
+            Err(TransportError::WouldBlock(_)) if Instant::now() < deadline => {
+                thread::sleep(CLIENT_RETRY_INTERVAL);
+            }
+            Err(TransportError::WouldBlock(_)) => {
+                return Err(ClusterVfsRpcClientError::AuthorityTimeout(session_id));
+            }
+            Err(error) => {
+                return Err(ClusterVfsRpcClientError::AuthorityTransport(
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+}
+
+fn map_session_authority_error(error: VfsRpcSessionAuthorityError) -> ClusterVfsRpcClientError {
+    match error {
+        VfsRpcSessionAuthorityError::WrongPoolGuid { expected, found } => {
+            ClusterVfsRpcClientError::WrongPool { expected, found }
+        }
+        VfsRpcSessionAuthorityError::WrongWriter {
+            expected,
+            authenticated_peer,
+        } => ClusterVfsRpcClientError::WrongPeer {
+            expected_writer: expected,
+            authenticated_peer,
+        },
+        VfsRpcSessionAuthorityError::ZeroExpectedPoolGuid => {
+            ClusterVfsRpcClientError::ExpectedPoolGuidZero
+        }
+        other => ClusterVfsRpcClientError::MalformedAuthority(other),
+    }
 }
 
 fn credentials(local_node: u64, ctx: &RequestCtx) -> VfsRpcCredentials {

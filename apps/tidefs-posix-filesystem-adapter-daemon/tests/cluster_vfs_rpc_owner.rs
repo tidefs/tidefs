@@ -28,7 +28,8 @@ use tidefs_transport::{
 };
 use tidefs_types_vfs_core::{Errno, ROOT_INODE_ID};
 use tidefs_vfs_rpc::transport_adapter::{
-    VfsRpcEnvelopeContext, VfsRpcInboundFrame, VfsRpcTransportAdapter, VfsRpcTransportAdapterConfig,
+    decode_session_authority_frame, VfsRpcEnvelopeContext, VfsRpcInboundFrame,
+    VfsRpcTransportAdapter, VfsRpcTransportAdapterConfig,
 };
 use tidefs_vfs_rpc::{
     DatasetId, InlineOrBulk, OpId, PeerId, VfsRpcCredentials, VfsRpcRequest, VfsRpcRequestPayload,
@@ -39,6 +40,7 @@ const OWNER_NODE: u64 = 2;
 const CLIENT_NODE: u64 = 1;
 const WRITER_TERM: u64 = 77;
 const WRITER_EPOCH: u64 = 9;
+const POOL_GUID: [u8; 16] = [0x47; 16];
 
 struct ProvisionedIdentity {
     credential_bytes: [u8; NODE_PRIVATE_CREDENTIAL_WIRE_SIZE],
@@ -80,13 +82,13 @@ struct RpcClient {
     dataset_id: DatasetId,
     next_op_id: u64,
     next_sequence: u64,
+    next_response_sequence: u64,
 }
 
 impl RpcClient {
     fn connect(
         local_node: u64,
         owner_addr: SocketAddr,
-        dataset_id: DatasetId,
         local_identity: &ProvisionedIdentity,
         owner_identity: &ProvisionedIdentity,
     ) -> Self {
@@ -121,17 +123,30 @@ impl RpcClient {
             .perform_handshake(session_id)
             .expect("authenticate owner transport");
         assert!(transport.session_has_authenticated_confidentiality(session_id));
+        let (authority_envelope, authority_payload) = transport
+            .recv_envelope(session_id)
+            .expect("receive owner-issued session authority");
+        assert_eq!(authority_envelope.sequence_number, 0);
+        let authority = decode_session_authority_frame(&authority_envelope, &authority_payload)
+            .expect("decode owner-issued session authority");
+        authority
+            .validate_for_client(POOL_GUID, OWNER_NODE)
+            .expect("bind authority to expected Pool and authenticated owner");
+        assert_eq!(authority.writer_node(), OWNER_NODE);
+        assert_eq!(authority.term(), WRITER_TERM);
+        assert_eq!(authority.epoch(), WRITER_EPOCH);
 
         let mut sessions = TransportSessionSet::new();
-        sessions.add_binding_with_epoch(OWNER_NODE, session_id, WRITER_EPOCH);
+        sessions.add_binding_with_epoch(OWNER_NODE, session_id, authority.epoch());
         sessions.mark_healthy(session_id);
         Self {
             transport,
             session_id,
             adapter: VfsRpcTransportAdapter::new(VfsRpcTransportAdapterConfig::default(), sessions),
-            dataset_id,
+            dataset_id: authority.dataset_id(),
             next_op_id: 1,
             next_sequence: 0,
+            next_response_sequence: 1,
         }
     }
 
@@ -186,6 +201,8 @@ impl RpcClient {
             .transport
             .recv_envelope(self.session_id)
             .expect("receive VFS_RPC response envelope");
+        assert_eq!(envelope.sequence_number, self.next_response_sequence);
+        self.next_response_sequence = self.next_response_sequence.saturating_add(1);
         match self
             .adapter
             .unwrap_inbound(Instant::now(), self.session_id, &envelope, &payload)
@@ -232,6 +249,8 @@ impl RpcClient {
             .transport
             .recv_envelope(self.session_id)
             .expect("receive explicit BULK refusal");
+        assert_eq!(envelope.sequence_number, self.next_response_sequence);
+        self.next_response_sequence = self.next_response_sequence.saturating_add(1);
         match self
             .adapter
             .unwrap_inbound(Instant::now(), self.session_id, &envelope, &payload)
@@ -313,6 +332,7 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
         CLIENT_NODE,
         owner_identity.credential(),
         client_identity.public_identity(),
+        POOL_GUID,
         DatasetId::new(0),
         Arc::clone(&writer_fence),
         Arc::clone(&engine),
@@ -331,6 +351,7 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
         CLIENT_NODE,
         owner_identity.credential(),
         client_identity.public_identity(),
+        POOL_GUID,
         dataset_id,
         writer_fence,
         engine,
@@ -340,7 +361,6 @@ fn pool_backed_owner_serves_inline_and_refuses_unowned_bulk() {
     let mut client = RpcClient::connect(
         CLIENT_NODE,
         owner.bound_addr(),
-        dataset_id,
         &client_identity,
         &owner_identity,
     );

@@ -16,15 +16,11 @@ use tidefs_local_filesystem::{
     LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy, RootAuthenticationKey,
 };
 use tidefs_local_object_store::pool::PoolRedundancyPolicy;
-use tidefs_lock_service::{DatasetMountIdentity, EpochId, MemberId};
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_client::{
     ClusterVfsRpcClient, ClusterVfsRpcClientError,
 };
 use tidefs_posix_filesystem_adapter_daemon::cluster_vfs_rpc_owner::{
     ClusterVfsRpcOwnerConfig, ClusterVfsRpcOwnerHandle, ClusterVfsRpcWriterFence,
-};
-use tidefs_posix_filesystem_adapter_daemon::clustered_mount::{
-    ClusteredPosixAuthoritySnapshot, ClusteredPosixMountRuntime,
 };
 use tidefs_posix_filesystem_adapter_daemon::fuse_vfs_adapter::FuseVfsAdapter;
 use tidefs_recovery_loop::RecoveryPolicy;
@@ -33,13 +29,13 @@ use tidefs_transport::{
 };
 use tidefs_types_vfs_core::{Errno, RequestCtx, ROOT_INODE_ID};
 use tidefs_vfs_engine::dispatch::VfsDispatchEngineBridge;
-use tidefs_vfs_engine::VfsEngine;
 use tidefs_vfs_rpc::DatasetId;
 
 const OWNER_NODE: u64 = 2;
 const CLIENT_NODE: u64 = 1;
 const WRITER_TERM: u64 = 77;
 const WRITER_EPOCH: u64 = 9;
+const POOL_GUID: [u8; 16] = [0x49; 16];
 
 struct ProvisionedIdentity {
     credential_bytes: [u8; NODE_PRIVATE_CREDENTIAL_WIRE_SIZE],
@@ -117,26 +113,6 @@ fn connect_result(
     Ok((transport, session_id))
 }
 
-fn runtime(
-    dataset_id: DatasetId,
-    writer: u64,
-    term: u64,
-    epoch: u64,
-) -> ClusteredPosixMountRuntime {
-    ClusteredPosixMountRuntime::open_committed_mount(
-        DatasetMountIdentity::new(11, 12, epoch),
-        ClusteredPosixAuthoritySnapshot {
-            current_epoch: EpochId::new(epoch),
-            current_term: term,
-            lock_leader: MemberId::new(OWNER_NODE),
-            vfs_dataset_id: dataset_id,
-            vfs_writer: MemberId::new(writer),
-            admission_generation: 1,
-        },
-    )
-    .expect("admit committed clustered mount authority")
-}
-
 fn request_ctx() -> RequestCtx {
     RequestCtx {
         uid: 0,
@@ -145,25 +121,6 @@ fn request_ctx() -> RequestCtx {
         umask: 0o027,
         groups: vec![4242, 4343],
     }
-}
-
-fn assert_get_root_refused(
-    owner_addr: SocketAddr,
-    authority: ClusteredPosixMountRuntime,
-    expected: Errno,
-    client_identity: &ProvisionedIdentity,
-    owner_identity: &ProvisionedIdentity,
-) {
-    let (transport, session_id) = connect(owner_addr, client_identity, owner_identity);
-    let client = ClusterVfsRpcClient::new(transport, session_id, authority)
-        .expect("construct authenticated cluster VFS_RPC client");
-    let bridge = VfsDispatchEngineBridge::new(client);
-
-    assert_eq!(bridge.get_root_inode(&request_ctx()).unwrap_err(), expected);
-    bridge
-        .dispatch_ref()
-        .close()
-        .expect("close refused cluster VFS_RPC client");
 }
 
 #[test]
@@ -238,6 +195,7 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
         CLIENT_NODE,
         owner_identity.credential(),
         client_identity.public_identity(),
+        POOL_GUID,
         dataset_id,
         Arc::clone(&writer_fence),
         owner_adapter.engine_handle(),
@@ -246,12 +204,8 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
     .expect("start Pool-backed VFS_RPC owner");
 
     let (transport, session_id) = connect(owner.bound_addr(), &client_identity, &owner_identity);
-    let client = ClusterVfsRpcClient::new(
-        transport,
-        session_id,
-        runtime(dataset_id, OWNER_NODE, WRITER_TERM, WRITER_EPOCH),
-    )
-    .expect("construct admitted cluster VFS_RPC client");
+    let client = ClusterVfsRpcClient::new(transport, session_id, POOL_GUID)
+        .expect("construct admitted cluster VFS_RPC client");
     let remote_adapter = FuseVfsAdapter::new(Box::new(VfsDispatchEngineBridge::new(client)))
         .expect("construct FUSE adapter over authenticated cluster VFS_RPC");
     let remote_engine = remote_adapter.engine_handle();
@@ -340,6 +294,7 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
         CLIENT_NODE,
         owner_identity.credential(),
         client_identity.public_identity(),
+        POOL_GUID,
         dataset_id,
         Arc::clone(&writer_fence),
         owner_adapter.engine_handle(),
@@ -356,45 +311,21 @@ fn adapter_engine_drives_pool_owner_and_refuses_stale_authority() {
         .check_health()
         .expect("owner must remain healthy after refusing the untrusted key");
 
-    assert_get_root_refused(
-        owner.bound_addr(),
-        runtime(
-            DatasetId::new(if dataset_id.0 == 1 { 2 } else { 1 }),
-            OWNER_NODE,
-            WRITER_TERM,
-            WRITER_EPOCH,
-        ),
-        Errno::ESTALE,
-        &client_identity,
-        &owner_identity,
-    );
-
-    let (wrong_writer_transport, wrong_writer_session) =
+    let (wrong_pool_transport, wrong_pool_session) =
         connect(owner.bound_addr(), &client_identity, &owner_identity);
-    match ClusterVfsRpcClient::new(
-        wrong_writer_transport,
-        wrong_writer_session,
-        runtime(dataset_id, OWNER_NODE + 1, WRITER_TERM, WRITER_EPOCH),
-    ) {
-        Err(ClusterVfsRpcClientError::WrongPeer {
-            expected_writer,
-            authenticated_peer,
-        }) => {
-            assert_eq!(expected_writer, OWNER_NODE + 1);
-            assert_eq!(authenticated_peer, OWNER_NODE);
+    match ClusterVfsRpcClient::new(wrong_pool_transport, wrong_pool_session, [0x50; 16]) {
+        Err(ClusterVfsRpcClientError::WrongPool { expected, found }) => {
+            assert_eq!(expected, [0x50; 16]);
+            assert_eq!(found, POOL_GUID);
         }
-        Err(other) => panic!("unexpected wrong-writer refusal: {other}"),
-        Ok(_) => panic!("wrong VFS writer must fail closed"),
+        Err(other) => panic!("unexpected wrong-Pool refusal: {other}"),
+        Ok(_) => panic!("wrong expected Pool must fail closed"),
     }
 
     let (wrong_session_transport, _actual_session) =
         connect(owner.bound_addr(), &client_identity, &owner_identity);
     let missing_session = SessionId::new(u64::MAX);
-    match ClusterVfsRpcClient::new(
-        wrong_session_transport,
-        missing_session,
-        runtime(dataset_id, OWNER_NODE, WRITER_TERM, WRITER_EPOCH),
-    ) {
+    match ClusterVfsRpcClient::new(wrong_session_transport, missing_session, POOL_GUID) {
         Err(ClusterVfsRpcClientError::MissingSession(found)) => {
             assert_eq!(found, missing_session);
         }
