@@ -14,7 +14,8 @@ use std::collections::{hash_map::RandomState, BTreeMap};
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -55,11 +56,12 @@ pub struct ClusterVfsRpcClientConfig {
     expected_pool_guid: [u8; 16],
     local_credential: NodePrivateCredential,
     trusted_owner_identity: NodePublicIdentity,
+    authority_lost: Arc<AtomicBool>,
 }
 
 impl ClusterVfsRpcClientConfig {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         owner_addr: SocketAddr,
         expected_pool_guid: [u8; 16],
         local_credential: NodePrivateCredential,
@@ -70,7 +72,15 @@ impl ClusterVfsRpcClientConfig {
             expected_pool_guid,
             local_credential,
             trusted_owner_identity,
+            authority_lost: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Install the terminal signal owned by the clustered FUSE mount.
+    #[must_use]
+    pub fn with_authority_loss_signal(mut self, authority_lost: Arc<AtomicBool>) -> Self {
+        self.authority_lost = authority_lost;
+        self
     }
 }
 
@@ -316,6 +326,10 @@ impl ClusterVfsRpcClient {
         let writer = authority.writer_node();
         let dataset_id = authority.dataset_id();
         let local_node = transport.local_node_id;
+        let authority_lost = reconnect_config
+            .as_ref()
+            .map(|config| Arc::clone(&config.authority_lost))
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let mut sessions = TransportSessionSet::new();
         sessions.add_binding_with_epoch(writer, session_id, authority.epoch());
         sessions.mark_healthy(session_id);
@@ -349,6 +363,7 @@ impl ClusterVfsRpcClient {
                 closed: false,
                 authority,
                 reconnect_config,
+                authority_lost,
             }),
         })
     }
@@ -457,10 +472,14 @@ struct ClientState {
     closed: bool,
     authority: VfsRpcSessionAuthority,
     reconnect_config: Option<ClusterVfsRpcClientConfig>,
+    authority_lost: Arc<AtomicBool>,
 }
 
 impl ClientState {
     fn dispatch(&mut self, operation: VfsOperation) -> Result<VfsResponse, Errno> {
+        if self.authority_lost.load(Ordering::Acquire) {
+            return Err(Errno::ESTALE);
+        }
         use engine_op::{
             GetRootInodeResponse, InodeAttrResponse, OpenDirResponse, OpenResponse,
             ReadDirResponse, ReadResponse, StatFsResponse, UnitResponse, WriteResponse,
@@ -795,6 +814,9 @@ impl ClientState {
         payload: VfsRpcRequestPayload,
         credentials: VfsRpcCredentials,
     ) -> Result<VfsRpcResponsePayload, Errno> {
+        if self.authority_lost.load(Ordering::Acquire) {
+            return Err(Errno::ESTALE);
+        }
         if self.closed {
             return Err(Errno::ESTALE);
         }
@@ -812,7 +834,11 @@ impl ClientState {
         let op_id = request.header.op_id;
         let result = self.call_pending(&request).and_then(response_payload);
         if self.rpc.abandon_request(op_id).is_some() {
-            self.reset_adapter_for_current_session();
+            if self.authority_lost.load(Ordering::Acquire) {
+                self.retire_adapter();
+            } else {
+                self.reset_adapter_for_current_session();
+            }
         }
         result
     }
@@ -897,7 +923,12 @@ impl ClientState {
             connect_transport(config, self.authority.epoch()).map_err(|_| Errno::EIO)?;
         match replacement.perform_handshake(replacement_session) {
             Ok(()) => {}
-            Err(TransportError::AttestedEpochMismatch { .. }) => return Err(Errno::ESTALE),
+            Err(TransportError::AttestedEpochMismatch { .. }) => {
+                let _ = replacement
+                    .close_session(replacement_session, SessionCloseReason::TransportError);
+                self.fence_authority_loss();
+                return Err(Errno::ESTALE);
+            }
             Err(_) => return Err(Errno::EIO),
         }
         let authenticated_peer = validate_construction_session(&replacement, replacement_session)
@@ -913,6 +944,7 @@ impl ClientState {
         {
             let _ =
                 replacement.close_session(replacement_session, SessionCloseReason::TransportError);
+            self.fence_authority_loss();
             return Err(Errno::ESTALE);
         }
 
@@ -924,6 +956,27 @@ impl ClientState {
         self.reset_adapter_for_current_session();
         let _ = old_transport.close_session(old_session, SessionCloseReason::TransportError);
         Ok(())
+    }
+
+    fn fence_authority_loss(&mut self) {
+        let _ = self
+            .transport
+            .close_session(self.session_id, SessionCloseReason::TransportError);
+        self.files.clear();
+        self.directories.clear();
+        self.retire_adapter();
+        self.closed = true;
+        self.authority_lost.store(true, Ordering::Release);
+    }
+
+    fn retire_adapter(&mut self) {
+        self.adapter = VfsRpcTransportAdapter::new(
+            VfsRpcTransportAdapterConfig {
+                request_timeout: CLIENT_REQUEST_TIMEOUT,
+                ..VfsRpcTransportAdapterConfig::default()
+            },
+            TransportSessionSet::new(),
+        );
     }
 
     fn reset_adapter_for_current_session(&mut self) {
