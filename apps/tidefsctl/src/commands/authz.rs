@@ -124,6 +124,8 @@ const LOCAL_ONLY_COMMANDS: &[&str] = &[
     "dataset set",
     "storage-intent policy set",
     "storage-intent policy clear",
+    #[cfg(feature = "cluster")]
+    "cluster identity create",
     "defrag",
 ];
 

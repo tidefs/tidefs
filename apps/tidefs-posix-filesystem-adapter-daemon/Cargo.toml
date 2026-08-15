@@ -45,6 +45,7 @@ tidefs-types-posix-filesystem-adapter-core = { workspace = true }
 tidefs-types-vfs-core = { workspace = true }
 tidefs-types-dataset-feature-flags-core = { workspace = true }
 tidefs-vfs-engine = { workspace = true }
+tidefs-auth = { workspace = true, optional = true }
 tidefs-transport = { workspace = true, optional = true }
 tidefs-vfs-rpc = { workspace = true, optional = true }
 tracing = { workspace = true }
@@ -61,6 +62,7 @@ default = []
 block-volume = ["dep:tidefs-block-volume-adapter-daemon"]
 cluster = [
     "dep:bincode",
+    "dep:tidefs-auth",
     "dep:tidefs-cluster",
     "dep:tidefs-lock-service",
     "dep:tidefs-transport",

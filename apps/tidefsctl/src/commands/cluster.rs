@@ -13,7 +13,10 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::SocketAddr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process;
 use std::time::Duration;
@@ -44,6 +47,12 @@ const CLUSTER_EXERCISE_PRODUCT_RECOVERY_CLOSURE: bool = false;
 
 #[derive(Subcommand, Debug)]
 pub enum ClusterCommand {
+    /// Provision host-local node credentials and shareable peer identities
+    Identity {
+        #[command(subcommand)]
+        cmd: ClusterIdentityCommand,
+    },
+
     /// Manage prototype clustered pools
     Pool {
         #[command(subcommand)]
@@ -70,6 +79,24 @@ pub enum ClusterCommand {
         /// Output as JSON
         #[arg(long = "json")]
         json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ClusterIdentityCommand {
+    /// Create a fresh host-local Ed25519 credential and public identity
+    Create {
+        /// Nonzero committed node ID represented by this credential
+        #[arg(long = "node-id")]
+        node_id: u64,
+
+        /// New owner-only private credential path
+        #[arg(long = "credential", value_name = "PATH")]
+        credential_path: PathBuf,
+
+        /// New shareable public identity path
+        #[arg(long = "public-identity", value_name = "PATH")]
+        public_identity_path: PathBuf,
     },
 }
 
@@ -155,11 +182,133 @@ pub enum ClusterHealCommand {
 
 pub fn handle_cluster(cmd: ClusterCommand) {
     match cmd {
+        ClusterCommand::Identity { cmd } => handle_cluster_identity(cmd),
         ClusterCommand::Pool { cmd } => handle_cluster_pool(cmd),
         ClusterCommand::Placement { cmd } => handle_cluster_placement(cmd),
         ClusterCommand::Heal { cmd } => handle_cluster_heal(cmd),
         ClusterCommand::Status { pool_name, json } => handle_cluster_status(pool_name, json),
     }
+}
+
+fn handle_cluster_identity(cmd: ClusterIdentityCommand) {
+    match cmd {
+        ClusterIdentityCommand::Create {
+            node_id,
+            credential_path,
+            public_identity_path,
+        } => {
+            let _guard = super::authz::require_local_only("cluster identity create");
+            match create_cluster_identity_files(node_id, &credential_path, &public_identity_path) {
+                Ok(identity) => {
+                    println!("created TideFS node identity {}", identity.node_id());
+                    println!("  private credential: {}", credential_path.display());
+                    println!("  public identity:    {}", public_identity_path.display());
+                }
+                Err(error) => {
+                    eprintln!("tidefsctl cluster identity create: {error}");
+                    process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+fn create_cluster_identity_files(
+    node_id: u64,
+    credential_path: &std::path::Path,
+    public_identity_path: &std::path::Path,
+) -> Result<tidefs_auth::NodePublicIdentity, String> {
+    if credential_path == public_identity_path {
+        return Err("private credential and public identity paths must be distinct".to_string());
+    }
+
+    let credential = tidefs_auth::NodePrivateCredential::generate(node_id)
+        .map_err(|error| format!("generate node credential: {error}"))?;
+    let public_identity = credential.public_identity();
+    let public_identity_bytes = public_identity.encode_fixed();
+
+    let mut credential_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(credential_path)
+        .map_err(|error| {
+            format!(
+                "create new private credential {}: {error}",
+                credential_path.display()
+            )
+        })?;
+
+    let mut public_identity_file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(public_identity_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            drop(credential_file);
+            let cleanup = std::fs::remove_file(credential_path).err();
+            return Err(format!(
+                "create new public identity {}: {error}{}",
+                public_identity_path.display(),
+                cleanup
+                    .map(|cleanup_error| format!(
+                        "; remove newly created private credential {}: {cleanup_error}",
+                        credential_path.display()
+                    ))
+                    .unwrap_or_default()
+            ));
+        }
+    };
+
+    let mut credential_bytes = credential.encode_fixed();
+    let write_result: Result<(), String> = (|| {
+        credential_file
+            .write_all(&credential_bytes)
+            .and_then(|()| credential_file.sync_all())
+            .map_err(|error| {
+                format!(
+                    "write private credential {}: {error}",
+                    credential_path.display()
+                )
+            })?;
+        public_identity_file
+            .write_all(&public_identity_bytes)
+            .and_then(|()| public_identity_file.sync_all())
+            .map_err(|error| {
+                format!(
+                    "write public identity {}: {error}",
+                    public_identity_path.display()
+                )
+            })?;
+        Ok(())
+    })();
+    credential_bytes.fill(0);
+
+    if let Err(error) = write_result {
+        drop(credential_file);
+        drop(public_identity_file);
+        let credential_cleanup = std::fs::remove_file(credential_path).err();
+        let public_cleanup = std::fs::remove_file(public_identity_path).err();
+        return Err(format!(
+            "{error}{}{}",
+            credential_cleanup
+                .map(|cleanup_error| format!(
+                    "; remove incomplete private credential {}: {cleanup_error}",
+                    credential_path.display()
+                ))
+                .unwrap_or_default(),
+            public_cleanup
+                .map(|cleanup_error| format!(
+                    "; remove incomplete public identity {}: {cleanup_error}",
+                    public_identity_path.display()
+                ))
+                .unwrap_or_default()
+        ));
+    }
+
+    Ok(public_identity)
 }
 
 fn handle_cluster_pool(cmd: ClusterPoolCommand) {
@@ -1149,6 +1298,57 @@ mod tests {
     struct TestClusterCli {
         #[command(subcommand)]
         cmd: ClusterCommand,
+    }
+
+    #[test]
+    fn cluster_identity_create_writes_strict_records_without_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("create identity test directory");
+        let credential_path = root.path().join("node.credential");
+        let public_identity_path = root.path().join("node.identity");
+        let identity = create_cluster_identity_files(42, &credential_path, &public_identity_path)
+            .expect("create provisioned node identity");
+        assert_eq!(identity.node_id(), 42);
+
+        let credential_bytes = std::fs::read(&credential_path).expect("read private credential");
+        let public_identity_bytes =
+            std::fs::read(&public_identity_path).expect("read public identity");
+        let credential = tidefs_auth::NodePrivateCredential::decode_fixed(&credential_bytes)
+            .expect("decode private credential");
+        let public_identity = tidefs_auth::NodePublicIdentity::decode_fixed(&public_identity_bytes)
+            .expect("decode public identity");
+        assert_eq!(credential.identity(), public_identity.identity());
+        assert_eq!(
+            std::fs::metadata(&credential_path)
+                .expect("credential metadata")
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "private credential must not grant group or other permissions"
+        );
+
+        let error = create_cluster_identity_files(42, &credential_path, &public_identity_path)
+            .expect_err("existing credential must never be overwritten");
+        assert!(error.contains("create new private credential"));
+        assert_eq!(
+            std::fs::read(&credential_path).expect("reread credential"),
+            credential_bytes
+        );
+        assert_eq!(
+            std::fs::read(&public_identity_path).expect("reread public identity"),
+            public_identity_bytes
+        );
+    }
+
+    #[test]
+    fn cluster_identity_create_rejects_zero_id_and_aliasing_paths() {
+        let root = tempfile::tempdir().expect("create identity test directory");
+        let path = root.path().join("node.identity");
+        assert!(create_cluster_identity_files(0, &path, &root.path().join("public")).is_err());
+        assert!(create_cluster_identity_files(1, &path, &path).is_err());
+        assert!(!path.exists());
     }
 
     // -- parse_node_device_pairs tests --

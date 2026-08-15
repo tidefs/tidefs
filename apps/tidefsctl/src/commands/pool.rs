@@ -227,6 +227,26 @@ pub enum PoolCommand {
             required_if_eq("cluster", "true")
         )]
         cluster_vfs_rpc_bind: Option<String>,
+
+        #[cfg(feature = "cluster")]
+        /// Host-local private credential for the Pool owner node.
+        #[arg(
+            long = "cluster-node-credential",
+            value_name = "PATH",
+            requires = "cluster",
+            required_if_eq("cluster", "true")
+        )]
+        cluster_node_credential: Option<PathBuf>,
+
+        #[cfg(feature = "cluster")]
+        /// Shareable public identity trusted for the VFS_RPC peer.
+        #[arg(
+            long = "cluster-trusted-vfs-rpc-peer-identity",
+            value_name = "PATH",
+            requires = "cluster",
+            required_if_eq("cluster", "true")
+        )]
+        cluster_trusted_vfs_rpc_peer_identity: Option<PathBuf>,
     },
 
     /// Run an integrity check through the live owner, or offline with explicit devices
@@ -395,6 +415,10 @@ pub fn handle_pool(cmd: PoolCommand) {
             cluster_authority_node_id,
             #[cfg(feature = "cluster")]
             cluster_vfs_rpc_bind,
+            #[cfg(feature = "cluster")]
+            cluster_node_credential,
+            #[cfg(feature = "cluster")]
+            cluster_trusted_vfs_rpc_peer_identity,
         } => {
             crate::commands::mount::handle_mount(crate::commands::mount::PoolMountArgs {
                 pool_name,
@@ -417,6 +441,10 @@ pub fn handle_pool(cmd: PoolCommand) {
                 cluster_authority_node_id,
                 #[cfg(feature = "cluster")]
                 cluster_vfs_rpc_bind,
+                #[cfg(feature = "cluster")]
+                cluster_node_credential,
+                #[cfg(feature = "cluster")]
+                cluster_trusted_vfs_rpc_peer_identity,
             });
         }
         PoolCommand::IntegrityCheck {

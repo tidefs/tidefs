@@ -571,6 +571,8 @@ pub struct ClusterMountAuthority {
 struct ClusterVfsRpcOwnerAuthority {
     bind_addr: std::net::SocketAddr,
     admitted_peer_node: u64,
+    local_credential: Arc<tidefs_auth::NodePrivateCredential>,
+    trusted_peer_identity: tidefs_auth::NodePublicIdentity,
     writer_fence: Arc<Mutex<cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence>>,
 }
 
@@ -693,14 +695,19 @@ impl MountAuthority {
         &mut self,
         bind_addr: std::net::SocketAddr,
         admitted_peer_node: u64,
+        local_credential: tidefs_auth::NodePrivateCredential,
+        trusted_peer_identity: tidefs_auth::NodePublicIdentity,
     ) -> Result<(), String> {
         match self {
             Self::Standalone => {
                 Err("standalone mount cannot configure a cluster VFS_RPC owner".to_string())
             }
-            Self::ClusterLease(authority) => {
-                authority.configure_vfs_rpc_owner(bind_addr, admitted_peer_node)
-            }
+            Self::ClusterLease(authority) => authority.configure_vfs_rpc_owner(
+                bind_addr,
+                admitted_peer_node,
+                local_credential,
+                trusted_peer_identity,
+            ),
         }
     }
 
@@ -776,6 +783,8 @@ impl MountAuthority {
                     owner.bind_addr,
                     authority.token.node_id,
                     owner.admitted_peer_node,
+                    Arc::clone(&owner.local_credential),
+                    owner.trusted_peer_identity.clone(),
                     tidefs_vfs_rpc::DatasetId::new(u128::from_le_bytes(*dataset_id.as_bytes())),
                     Arc::clone(&owner.writer_fence),
                     engine,
@@ -847,6 +856,8 @@ impl ClusterMountAuthority {
         &mut self,
         bind_addr: std::net::SocketAddr,
         admitted_peer_node: u64,
+        local_credential: tidefs_auth::NodePrivateCredential,
+        trusted_peer_identity: tidefs_auth::NodePublicIdentity,
     ) -> Result<(), String> {
         if admitted_peer_node == 0 {
             return Err("cluster VFS_RPC admitted peer node must be nonzero".to_string());
@@ -854,9 +865,34 @@ impl ClusterMountAuthority {
         if self.vfs_rpc_owner.is_some() {
             return Err("cluster VFS_RPC owner is already configured".to_string());
         }
+        if local_credential.node_id() != self.token.node_id {
+            return Err(format!(
+                "cluster VFS_RPC local credential names node {}, expected admitted Pool owner node {}",
+                local_credential.node_id(),
+                self.token.node_id
+            ));
+        }
+        if trusted_peer_identity.node_id() != admitted_peer_node {
+            return Err(format!(
+                "cluster VFS_RPC trusted identity names node {}, expected admitted peer node {}",
+                trusted_peer_identity.node_id(),
+                admitted_peer_node
+            ));
+        }
+        if local_credential.node_id() == trusted_peer_identity.node_id()
+            && local_credential.identity().verifying_key_bytes
+                != trusted_peer_identity.identity().verifying_key_bytes
+        {
+            return Err(
+                "cluster VFS_RPC refuses different keys for the same numeric node identity"
+                    .to_string(),
+            );
+        }
         self.vfs_rpc_owner = Some(ClusterVfsRpcOwnerAuthority {
             bind_addr,
             admitted_peer_node,
+            local_credential: Arc::new(local_credential),
+            trusted_peer_identity,
             writer_fence: Arc::new(Mutex::new(
                 cluster_vfs_rpc_owner::ClusterVfsRpcWriterFence::new(
                     self.token.node_id,
@@ -2375,6 +2411,18 @@ mod cluster_mount_authority_tests {
         }
     }
 
+    fn vfs_rpc_identities(
+        owner_node: u64,
+        peer_node: u64,
+    ) -> (
+        tidefs_auth::NodePrivateCredential,
+        tidefs_auth::NodePublicIdentity,
+    ) {
+        let owner = tidefs_auth::NodePrivateCredential::generate(owner_node).unwrap();
+        let peer = tidefs_auth::NodePrivateCredential::generate(peer_node).unwrap();
+        (owner, peer.public_identity())
+    }
+
     #[derive(Debug)]
     struct MockLeaseSession {
         renewals: Arc<AtomicUsize>,
@@ -2553,8 +2601,14 @@ mod cluster_mount_authority_tests {
             Box::new(session),
         )
         .unwrap();
+        let (local_credential, trusted_peer_identity) = vfs_rpc_identities(7, 11);
         authority
-            .configure_cluster_vfs_rpc_owner("127.0.0.1:0".parse().unwrap(), 11)
+            .configure_cluster_vfs_rpc_owner(
+                "127.0.0.1:0".parse().unwrap(),
+                11,
+                local_credential,
+                trusted_peer_identity,
+            )
             .unwrap();
         let rpc_writer_fence = match &authority {
             MountAuthority::ClusterLease(cluster) => Arc::clone(
@@ -2708,10 +2762,37 @@ mod cluster_mount_authority_tests {
 
         assert!(error.contains("Pool-backed distributed data carrier"));
         assert!(error.contains("synthetic placement sidecars are not storage authority"));
+        let (local_credential, trusted_peer_identity) = vfs_rpc_identities(7, 11);
         authority
-            .configure_cluster_vfs_rpc_owner("127.0.0.1:0".parse().unwrap(), 11)
+            .configure_cluster_vfs_rpc_owner(
+                "127.0.0.1:0".parse().unwrap(),
+                11,
+                local_credential,
+                trusted_peer_identity,
+            )
             .unwrap();
         require_real_cluster_data_carrier(&authority).unwrap();
+    }
+
+    #[test]
+    fn cluster_mount_refuses_same_node_with_different_trusted_key() {
+        let mut authority =
+            MountAuthority::cluster_lease(POOL_GUID, lease_token(7, POOL_GUID, 2, 99)).unwrap();
+        let local_credential = tidefs_auth::NodePrivateCredential::generate(7).unwrap();
+        let different_identity = tidefs_auth::NodePrivateCredential::generate(7)
+            .unwrap()
+            .public_identity();
+
+        let error = authority
+            .configure_cluster_vfs_rpc_owner(
+                "127.0.0.1:0".parse().unwrap(),
+                7,
+                local_credential,
+                different_identity,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("different keys for the same numeric node identity"));
     }
 }
 

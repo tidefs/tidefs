@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use tidefs_auth::{NodeKeyStore, NodePrivateCredential, NodePublicIdentity};
 use tidefs_transport::{
     EndpointFamily, SessionCloseReason, SessionId, Transport, TransportAddr, TransportError,
     TransportSessionSet,
@@ -74,6 +75,8 @@ pub struct ClusterVfsRpcOwnerConfig {
     bind_addr: SocketAddr,
     local_owner_node: u64,
     admitted_peer_node: u64,
+    local_credential: Arc<NodePrivateCredential>,
+    trusted_peer_identity: NodePublicIdentity,
     dataset_id: DatasetId,
     writer_fence: Arc<Mutex<ClusterVfsRpcWriterFence>>,
     engine: LiveOwnerEngine,
@@ -86,6 +89,8 @@ impl ClusterVfsRpcOwnerConfig {
         bind_addr: SocketAddr,
         local_owner_node: u64,
         admitted_peer_node: u64,
+        local_credential: Arc<NodePrivateCredential>,
+        trusted_peer_identity: NodePublicIdentity,
         dataset_id: DatasetId,
         writer_fence: Arc<Mutex<ClusterVfsRpcWriterFence>>,
         engine: LiveOwnerEngine,
@@ -95,6 +100,8 @@ impl ClusterVfsRpcOwnerConfig {
             bind_addr,
             local_owner_node,
             admitted_peer_node,
+            local_credential,
+            trusted_peer_identity,
             dataset_id,
             writer_fence,
             engine,
@@ -109,6 +116,32 @@ impl ClusterVfsRpcOwnerConfig {
         if self.admitted_peer_node == 0 {
             return Err("cluster VFS_RPC admitted peer node must be nonzero".to_string());
         }
+        if self.local_credential.node_id() != self.local_owner_node {
+            return Err(format!(
+                "cluster VFS_RPC local credential names node {}, expected owner node {}",
+                self.local_credential.node_id(),
+                self.local_owner_node
+            ));
+        }
+        if self.trusted_peer_identity.node_id() != self.admitted_peer_node {
+            return Err(format!(
+                "cluster VFS_RPC trusted identity names node {}, expected admitted peer node {}",
+                self.trusted_peer_identity.node_id(),
+                self.admitted_peer_node
+            ));
+        }
+        if self.local_owner_node == self.admitted_peer_node
+            && self.local_credential.identity().verifying_key_bytes
+                != self.trusted_peer_identity.identity().verifying_key_bytes
+        {
+            return Err(
+                "cluster VFS_RPC refuses different keys for the same numeric node identity"
+                    .to_string(),
+            );
+        }
+        self.local_credential
+            .keypair()
+            .map_err(|error| format!("cluster VFS_RPC local credential is invalid: {error}"))?;
         if self.dataset_id.0 == 0 {
             return Err("cluster VFS_RPC dataset identity must be nonzero".to_string());
         }
@@ -140,11 +173,29 @@ impl ClusterVfsRpcOwnerHandle {
     pub fn start(config: ClusterVfsRpcOwnerConfig) -> Result<Self, String> {
         config.validate()?;
 
-        let mut transport = Transport::new(config.local_owner_node);
+        let local_identity = config.local_credential.public_identity().into_identity();
+        let local_keypair = config
+            .local_credential
+            .keypair()
+            .map_err(|error| format!("load cluster VFS_RPC local credential: {error}"))?;
+        let mut known_identities = NodeKeyStore::new();
+        known_identities
+            .register(local_identity.clone())
+            .map_err(|error| format!("register cluster VFS_RPC local identity: {error}"))?;
+        known_identities
+            .register(config.trusted_peer_identity.identity().clone())
+            .map_err(|error| format!("register trusted cluster VFS_RPC peer: {error}"))?;
+        let lease_epoch = config
+            .writer_fence
+            .lock()
+            .map_err(|_| "cluster VFS_RPC writer fence lock is poisoned".to_string())?
+            .epoch;
+        let mut transport = Transport::new(config.local_owner_node)
+            .with_attestation(local_keypair, local_identity)
+            .with_known_identities(known_identities)
+            .with_epoch(lease_epoch);
         transport.set_endpoint_family(EndpointFamily::Control);
-        transport
-            .configure_generated_attestation(true)
-            .map_err(|error| format!("configure cluster VFS_RPC attestation: {error}"))?;
+        transport.set_attestation_bootstrap_from_handshake(false);
         transport
             .bind(TransportAddr::Tcp(config.bind_addr))
             .map_err(|error| {
