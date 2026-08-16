@@ -14,7 +14,7 @@ use tidefs_types_vfs_core::InodeId;
 
 use crate::{FileSystemError, LocalFileSystem};
 
-// Xattr limits (mirrors tidefs-inode-table constants)
+// Xattr limits shared with the inode-attribute contract.
 const MAX_XATTR_VALUE_LEN: usize = 64 * 1024;
 const MAX_XATTR_NAME_LEN: usize = 255;
 const MAX_XATTR_COUNT: usize = 256;

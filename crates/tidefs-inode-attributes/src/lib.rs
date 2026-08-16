@@ -10,7 +10,7 @@
 //! [`MemInodeAttributeStore`], a default in-memory implementation backed
 //! by `HashMap` + `RwLock`.
 //!
-//! The trait is designed so callers (inode-table, namespace, FUSE adapter)
+//! The trait is designed so callers (local filesystem, VFS, FUSE adapter)
 //! can swap in a persistent store without changing the attribute contract.
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,9 +23,11 @@ pub use tidefs_types_vfs_core::{
 };
 pub mod obj_xattr_store;
 pub mod posix_acl;
-pub mod table_store;
 pub mod timestamp;
 pub mod xattr;
+
+/// Maximum hard-link count per inode (POSIX `LINK_MAX`).
+pub const LINK_MAX: u32 = 65_000;
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -84,32 +86,28 @@ pub trait InodeAttributeStore: Send + Sync {
     /// zero before the decrement.
     fn drop_link(&self, ino: u64) -> Result<u32, AttrError>;
     /// Get the value of an extended attribute for `ino` by `name`.
-    fn get_xattr(&self, ino: u64, name: &[u8]) -> Result<Vec<u8>, tidefs_inode_table::XattrError>;
+    fn get_xattr(&self, ino: u64, name: &[u8]) -> Result<Vec<u8>, crate::xattr::XattrError>;
     /// Return the size of an extended attribute value for `ino`.
-    fn get_xattr_size(
-        &self,
-        ino: u64,
-        name: &[u8],
-    ) -> Result<usize, tidefs_inode_table::XattrError>;
+    fn get_xattr_size(&self, ino: u64, name: &[u8]) -> Result<usize, crate::xattr::XattrError>;
     /// Set an extended attribute on `ino`.
     ///
     /// `flags` is one of: 0 (create or replace),
-    /// [`tidefs_inode_table::XATTR_CREATE`], or
-    /// [`tidefs_inode_table::XATTR_REPLACE`].
+    /// [`crate::xattr::XATTR_CREATE`], or
+    /// [`crate::xattr::XATTR_REPLACE`].
     fn set_xattr(
         &self,
         ino: u64,
         name: &[u8],
         value: &[u8],
         flags: u32,
-    ) -> Result<(), tidefs_inode_table::XattrError>;
+    ) -> Result<(), crate::xattr::XattrError>;
     /// List all extended attribute names for `ino`, returning them
     /// null-separated with a trailing null (Linux convention).
-    fn list_xattr(&self, ino: u64) -> Result<Vec<u8>, tidefs_inode_table::XattrError>;
+    fn list_xattr(&self, ino: u64) -> Result<Vec<u8>, crate::xattr::XattrError>;
     /// Return the total size needed to hold the list_xattr output.
-    fn list_xattr_size(&self, ino: u64) -> Result<usize, tidefs_inode_table::XattrError>;
+    fn list_xattr_size(&self, ino: u64) -> Result<usize, crate::xattr::XattrError>;
     /// Remove an extended attribute from `ino`.
-    fn remove_xattr(&self, ino: u64, name: &[u8]) -> Result<(), tidefs_inode_table::XattrError>;
+    fn remove_xattr(&self, ino: u64, name: &[u8]) -> Result<(), crate::xattr::XattrError>;
     /// Translate the stored attributes for `ino` into a POSIX `libc::stat`.
     fn to_stat(&self, ino: u64) -> Result<libc::stat, AttrError> {
         let attrs = self.getattr(ino)?;
@@ -463,7 +461,7 @@ impl InodeAttributeStore for MemInodeAttributeStore {
     fn bump_link(&self, ino: u64) -> Result<u32, AttrError> {
         let mut map = self.inner.write().expect("RwLock poisoned");
         let attrs = map.get_mut(&ino).ok_or(AttrError::InoNotFound)?;
-        if attrs.posix.nlink >= tidefs_inode_table::LINK_MAX {
+        if attrs.posix.nlink >= LINK_MAX {
             return Err(AttrError::LinkOverflow);
         }
         attrs.posix.nlink += 1;
@@ -480,8 +478,8 @@ impl InodeAttributeStore for MemInodeAttributeStore {
         attrs.posix.ctime_ns = now_ns();
         Ok(attrs.posix.nlink)
     }
-    fn get_xattr(&self, ino: u64, name: &[u8]) -> Result<Vec<u8>, tidefs_inode_table::XattrError> {
-        use tidefs_inode_table::XattrError;
+    fn get_xattr(&self, ino: u64, name: &[u8]) -> Result<Vec<u8>, crate::xattr::XattrError> {
+        use crate::xattr::XattrError;
         if name.is_empty() || name.contains(&0) {
             return Err(XattrError::InvalidName);
         }
@@ -492,12 +490,8 @@ impl InodeAttributeStore for MemInodeAttributeStore {
         let per_inode = map.get(&ino).ok_or(XattrError::AttrNotFound)?;
         per_inode.get(name).cloned().ok_or(XattrError::AttrNotFound)
     }
-    fn get_xattr_size(
-        &self,
-        ino: u64,
-        name: &[u8],
-    ) -> Result<usize, tidefs_inode_table::XattrError> {
-        use tidefs_inode_table::XattrError;
+    fn get_xattr_size(&self, ino: u64, name: &[u8]) -> Result<usize, crate::xattr::XattrError> {
+        use crate::xattr::XattrError;
         if name.is_empty() || name.contains(&0) {
             return Err(XattrError::InvalidName);
         }
@@ -517,8 +511,8 @@ impl InodeAttributeStore for MemInodeAttributeStore {
         name: &[u8],
         value: &[u8],
         flags: u32,
-    ) -> Result<(), tidefs_inode_table::XattrError> {
-        use tidefs_inode_table::{
+    ) -> Result<(), crate::xattr::XattrError> {
+        use crate::xattr::{
             XattrError, MAX_XATTR_COUNT, MAX_XATTR_VALUE_LEN, XATTR_CREATE, XATTR_REPLACE,
         };
         if name.is_empty() || name.contains(&0) {
@@ -565,7 +559,7 @@ impl InodeAttributeStore for MemInodeAttributeStore {
         per_inode.insert(name.to_vec(), value.to_vec());
         Ok(())
     }
-    fn list_xattr(&self, ino: u64) -> Result<Vec<u8>, tidefs_inode_table::XattrError> {
+    fn list_xattr(&self, ino: u64) -> Result<Vec<u8>, crate::xattr::XattrError> {
         let map = self.xattrs.read().expect("RwLock poisoned");
         let per_inode = match map.get(&ino) {
             Some(p) => p,
@@ -578,7 +572,7 @@ impl InodeAttributeStore for MemInodeAttributeStore {
         }
         Ok(buf)
     }
-    fn list_xattr_size(&self, ino: u64) -> Result<usize, tidefs_inode_table::XattrError> {
+    fn list_xattr_size(&self, ino: u64) -> Result<usize, crate::xattr::XattrError> {
         let map = self.xattrs.read().expect("RwLock poisoned");
         let per_inode = match map.get(&ino) {
             Some(p) => p,
@@ -589,8 +583,8 @@ impl InodeAttributeStore for MemInodeAttributeStore {
         }
         Ok(per_inode.keys().map(|k| k.len() + 1).sum())
     }
-    fn remove_xattr(&self, ino: u64, name: &[u8]) -> Result<(), tidefs_inode_table::XattrError> {
-        use tidefs_inode_table::XattrError;
+    fn remove_xattr(&self, ino: u64, name: &[u8]) -> Result<(), crate::xattr::XattrError> {
+        use crate::xattr::XattrError;
         if name.is_empty() || name.contains(&0) {
             return Err(XattrError::InvalidName);
         }
@@ -2001,22 +1995,19 @@ mod tests {
     fn bump_link_overflow_at_link_max() {
         let store = MemInodeAttributeStore::new();
         let mut attrs = dummy_attrs(1);
-        attrs.posix.nlink = tidefs_inode_table::LINK_MAX;
+        attrs.posix.nlink = LINK_MAX;
         store.insert(1, attrs);
         assert_eq!(store.bump_link(1), Err(AttrError::LinkOverflow));
-        assert_eq!(
-            store.getattr(1).unwrap().posix.nlink,
-            tidefs_inode_table::LINK_MAX
-        );
+        assert_eq!(store.getattr(1).unwrap().posix.nlink, LINK_MAX);
     }
     #[test]
     fn bump_link_succeeds_at_link_max_minus_1() {
         let store = MemInodeAttributeStore::new();
         let mut attrs = dummy_attrs(1);
-        attrs.posix.nlink = tidefs_inode_table::LINK_MAX - 1;
+        attrs.posix.nlink = LINK_MAX - 1;
         store.insert(1, attrs);
         let n = store.bump_link(1).unwrap();
-        assert_eq!(n, tidefs_inode_table::LINK_MAX);
+        assert_eq!(n, LINK_MAX);
         assert_eq!(store.bump_link(1), Err(AttrError::LinkOverflow));
     }
     #[test]
@@ -2124,7 +2115,7 @@ mod tests {
         store.insert(1, dummy_attrs(1));
         store.set_xattr(1, b"user.dup", b"first", 0).unwrap();
         let err = store.set_xattr(1, b"user.dup", b"second", 1).unwrap_err();
-        assert_eq!(err, tidefs_inode_table::XattrError::AttrExists);
+        assert_eq!(err, crate::xattr::XattrError::AttrExists);
     }
     #[test]
     fn xattr_set_with_replace_flag_succeeds_on_existing() {
@@ -2142,7 +2133,7 @@ mod tests {
         let store = MemInodeAttributeStore::new();
         store.insert(1, dummy_attrs(1));
         let err = store.set_xattr(1, b"user.missing", b"val", 2).unwrap_err();
-        assert_eq!(err, tidefs_inode_table::XattrError::AttrNotFound);
+        assert_eq!(err, crate::xattr::XattrError::AttrNotFound);
     }
     #[test]
     fn xattr_remove_existing() {
@@ -2152,7 +2143,7 @@ mod tests {
         assert_eq!(store.remove_xattr(1, b"user.del"), Ok(()));
         assert_eq!(
             store.get_xattr(1, b"user.del"),
-            Err(tidefs_inode_table::XattrError::AttrNotFound)
+            Err(crate::xattr::XattrError::AttrNotFound)
         );
     }
     #[test]
@@ -2160,13 +2151,13 @@ mod tests {
         let store = MemInodeAttributeStore::new();
         store.insert(1, dummy_attrs(1));
         let err = store.remove_xattr(1, b"user.missing").unwrap_err();
-        assert_eq!(err, tidefs_inode_table::XattrError::AttrNotFound);
+        assert_eq!(err, crate::xattr::XattrError::AttrNotFound);
     }
     #[test]
     fn xattr_remove_missing_inode_returns_not_found() {
         let store = MemInodeAttributeStore::new();
         let err = store.remove_xattr(42, b"user.any").unwrap_err();
-        assert_eq!(err, tidefs_inode_table::XattrError::AttrNotFound);
+        assert_eq!(err, crate::xattr::XattrError::AttrNotFound);
     }
     #[test]
     fn xattr_list_returns_all_keys() {
@@ -2191,7 +2182,7 @@ mod tests {
     fn xattr_per_inode_count_limit_enforced() {
         let store = MemInodeAttributeStore::new();
         store.insert(1, dummy_attrs(1));
-        use tidefs_inode_table::MAX_XATTR_COUNT;
+        use crate::xattr::MAX_XATTR_COUNT;
         // Fill up to the limit
         for i in 0..MAX_XATTR_COUNT {
             let name = format!("user.key{i}");
@@ -2201,16 +2192,16 @@ mod tests {
         let err = store
             .set_xattr(1, b"user.overlimit", b"val", 0)
             .unwrap_err();
-        assert_eq!(err, tidefs_inode_table::XattrError::InodeXattrLimit);
+        assert_eq!(err, crate::xattr::XattrError::InodeXattrLimit);
     }
     #[test]
     fn xattr_per_value_size_limit_enforced() {
         let store = MemInodeAttributeStore::new();
         store.insert(1, dummy_attrs(1));
-        use tidefs_inode_table::MAX_XATTR_VALUE_LEN;
+        use crate::xattr::MAX_XATTR_VALUE_LEN;
         let big = vec![0xCC; MAX_XATTR_VALUE_LEN + 1];
         let err = store.set_xattr(1, b"user.big", &big, 0).unwrap_err();
-        assert_eq!(err, tidefs_inode_table::XattrError::ValueTooLarge);
+        assert_eq!(err, crate::xattr::XattrError::ValueTooLarge);
     }
     #[test]
     fn xattr_get_size_returns_correct_size() {
@@ -2226,7 +2217,7 @@ mod tests {
     fn xattr_get_missing_inode_returns_not_found() {
         let store = MemInodeAttributeStore::new();
         let err = store.get_xattr(42, b"user.any").unwrap_err();
-        assert_eq!(err, tidefs_inode_table::XattrError::AttrNotFound);
+        assert_eq!(err, crate::xattr::XattrError::AttrNotFound);
     }
     #[test]
     fn xattr_invalid_name_rejected() {
@@ -2234,14 +2225,14 @@ mod tests {
         store.insert(1, dummy_attrs(1));
         assert_eq!(
             store.set_xattr(1, b"", b"val", 0).unwrap_err(),
-            tidefs_inode_table::XattrError::InvalidName
+            crate::xattr::XattrError::InvalidName
         );
         // NUL in name rejected
         assert_eq!(
             store
                 .set_xattr(1, b"user.bad\0byte", b"val", 0)
                 .unwrap_err(),
-            tidefs_inode_table::XattrError::InvalidName
+            crate::xattr::XattrError::InvalidName
         );
         // Arbitrary prefix is fine at this level; namespace filtering is done
         // at the FUSE dispatch boundary.
@@ -2258,11 +2249,11 @@ mod tests {
         assert_eq!(store.get_xattr(2, b"user.inode2").unwrap(), b"b");
         assert_eq!(
             store.get_xattr(1, b"user.inode2"),
-            Err(tidefs_inode_table::XattrError::AttrNotFound)
+            Err(crate::xattr::XattrError::AttrNotFound)
         );
         assert_eq!(
             store.get_xattr(2, b"user.inode1"),
-            Err(tidefs_inode_table::XattrError::AttrNotFound)
+            Err(crate::xattr::XattrError::AttrNotFound)
         );
     }
     #[test]
@@ -2295,7 +2286,7 @@ mod tests {
         let store = MemInodeAttributeStore::new();
         store.insert(1, dummy_attrs(1));
         let err = store.get_xattr_size(1, b"user.missing").unwrap_err();
-        assert_eq!(err, tidefs_inode_table::XattrError::AttrNotFound);
+        assert_eq!(err, crate::xattr::XattrError::AttrNotFound);
     }
     #[test]
     fn xattr_list_xattr_size_matches_list_xattr_len() {

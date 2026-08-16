@@ -73,9 +73,10 @@ mirrors.
   `crates/tidefs-local-filesystem/src/dedup_refcount.rs`: own dedup identity,
   canonical locator/refcount state, and reclaim obligations for canonical
   objects. They are delta producers, not mounted capacity authorities.
-- `crates/tidefs-inode-table/`: owns inode-number records, slot allocation,
-  generation, and free-list state. Capacity code may consume inode counts for
-  `statfs.files`/`statfs.ffree`, but it must not own inode lifetime.
+- The former `crates/tidefs-inode-table/` owned a detached slot allocator,
+  generation, and free-list model but supplied no mounted `statfs` input; it
+  was removed by #2536. Mounted inode lifetime and counts remain with the
+  local-filesystem dataset authority.
 - `crates/tidefs-local-filesystem/`: contains `CapacityAuthority`,
   `LocalFileSystem::statfs()`, `statvfs()`, `commit_space_delta()`,
   quota-table checks, allocator reports, object-store `SpaceBook` sync, and
@@ -174,8 +175,6 @@ The projection/consumer/input crates are:
   evidence producers.
 - `crates/tidefs-dedup` and local dedup refcount code: dedup identity,
   refcount, and reclaim obligation producers.
-- `crates/tidefs-inode-table`: inode slot authority and statfs inode-count
-  input.
 - `apps/tidefs-posix-filesystem-adapter-daemon`: FUSE adapter/reply consumer.
 - `apps/tidefsctl`: operator reporting consumer.
 

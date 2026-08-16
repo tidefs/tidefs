@@ -508,8 +508,8 @@ pub fn check_search(
 /// Trait for types that expose the POSIX ownership and mode metadata
 /// needed for discretionary access control.
 ///
-/// Implementations are expected in crates such as `tidefs-inode-table`
-/// (`IN-001`) that hold per-inode `uid`, `gid`, and `mode`.
+/// Implementations are expected in metadata owners that hold per-inode `uid`,
+/// `gid`, and `mode`.
 pub trait InodeAttr {
     /// Owner user id.
     fn uid(&self) -> u32;

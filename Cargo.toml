@@ -123,7 +123,6 @@ members = [
   "crates/tidefs-storage-intent-prefetch-feedback",
   "crates/tidefs-storage-intent-satisfaction",
   "crates/tidefs-storage-intent-scheduler",
-  "crates/tidefs-inode-table",
   "crates/tidefs-xattr-storage",
   "crates/tidefs-types-polymorphic-xattr-core",
   "crates/tidefs-types-extent-map-core",
@@ -245,7 +244,6 @@ tidefs-frame = { path = "crates/tidefs-frame" }
 tidefs-gc-pin-set = { path = "crates/tidefs-gc-pin-set" }
 tidefs-incremental-job-core = { path = "crates/tidefs-incremental-job-core", default-features = false, features = ["alloc"] }
 tidefs-inode-attributes = { path = "crates/tidefs-inode-attributes" }
-tidefs-inode-table = { path = "crates/tidefs-inode-table" }
 tidefs-intent-log = { path = "crates/tidefs-intent-log" }
 tidefs-invalidation-feed = { path = "crates/tidefs-invalidation-feed" }
 tidefs-kernel-storage-io = { path = "crates/tidefs-kernel-storage-io", default-features = false, features = ["alloc"] }

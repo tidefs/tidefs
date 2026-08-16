@@ -6,7 +6,7 @@
 //! [`MemXattrStore`], a default in-memory implementation backed
 //! by `BTreeMap` + `RwLock`.
 //!
-//! The trait is designed so callers (inode-table, namespace, FUSE adapter)
+//! The trait is designed so callers (attribute stores, local filesystem, FUSE adapter)
 //! can swap in a persistent on-disk store without changing the attribute
 //! contract.
 
@@ -317,7 +317,7 @@ pub const XATTR_REPLACE: u32 = 2;
 pub const MAX_XATTR_COUNT: usize = 256;
 
 /// Maximum size of a single extended attribute value in bytes (64 KiB, Linux limit).
-pub const MAX_XATTR_VALUE_LEN: usize = 64 * 1024;
+pub const MAX_XATTR_VALUE_LEN: usize = XattrValue::MAX_VALUE_LEN;
 
 // ---------------------------------------------------------------------------
 // Default in-memory implementation

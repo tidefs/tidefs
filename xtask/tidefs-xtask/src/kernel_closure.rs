@@ -34,7 +34,6 @@ const KERNEL_PORTABLE_CORE: &[&str] = &[
     "tidefs-types-space-accounting-core",
     "tidefs-types-extent-map-core",
     "tidefs-vfs-engine",
-    "tidefs-inode-table",
     "tidefs-inode-attributes",
     "tidefs-block-allocator",
     "tidefs-local-object-store",

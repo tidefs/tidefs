@@ -3,7 +3,7 @@
 //!
 //! Wires committed-root/object/extent/inode/intent contracts into one
 //! mounted POSIX kmod readback path.  Under cargo the module uses the
-//! child library crates (tidefs-inode-table, tidefs-extent-map,
+//! child library crates (inode metadata, tidefs-extent-map,
 //! tidefs-intent-log) directly.  Under Kbuild those crates are not yet
 //! linked into the kernel module (see #6257-#6263), so the Kbuild path
 //! uses conservative stubs.

@@ -2504,22 +2504,8 @@ dependencies = [
  "parking_lot",
  "proptest",
  "tempfile",
- "tidefs-inode-table",
  "tidefs-local-object-store",
  "tidefs-posix-acl",
- "tidefs-types-vfs-core",
-]
-
-[[package]]
-name = "tidefs-inode-table"
-version = "0.421.0"
-dependencies = [
- "libc",
- "parking_lot",
- "proptest",
- "tempfile",
- "tidefs-kernel-storage-io",
- "tidefs-local-object-store",
  "tidefs-types-vfs-core",
 ]
 
@@ -3834,7 +3820,6 @@ dependencies = [
  "tidefs-extent-map",
  "tidefs-frame",
  "tidefs-inode-attributes",
- "tidefs-inode-table",
  "tidefs-intent-log",
  "tidefs-local-filesystem",
  "tidefs-local-object-store",

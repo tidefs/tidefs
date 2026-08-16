@@ -1053,19 +1053,9 @@ version = "0.421.0"
 dependencies = [
  "libc",
  "parking_lot",
- "tidefs-inode-table",
  "tidefs-local-object-store",
  "tidefs-posix-acl",
  "tidefs-types-vfs-core",
-]
-
-[[package]]
-name = "tidefs-inode-table"
-version = "0.421.0"
-dependencies = [
- "libc",
- "parking_lot",
- "tidefs-local-object-store",
 ]
 
 [[package]]
@@ -1122,7 +1112,6 @@ dependencies = [
  "tidefs-erasure-coding",
  "tidefs-extent-map",
  "tidefs-inode-attributes",
- "tidefs-inode-table",
  "tidefs-intent-log",
  "tidefs-local-object-store",
  "tidefs-orphan-index",

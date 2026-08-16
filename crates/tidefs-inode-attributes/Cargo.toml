@@ -18,7 +18,6 @@ for replacement with a persistent store.
 
 [dependencies]
 tidefs-posix-acl = { workspace = true }
-tidefs-inode-table = { workspace = true }
 parking_lot = "0.12"
 tidefs-types-vfs-core = { workspace = true }
 libc = "0.2"

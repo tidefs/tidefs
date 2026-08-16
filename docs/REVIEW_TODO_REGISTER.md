@@ -8,7 +8,7 @@ OpenZFS/Ceph-class claims.
 | --- | --- | --- | --- |
 | TFR-002 | Workspace authority | Product code, harness code, historical scaffolding, and non-workspace packages are still interleaved. | Classify every package as product, harness, third-party, or delete candidate; remove ambiguous scaffolding. |
 | TFR-003 | Todo hygiene | Debt was previously scattered through docs, comments, and issue-era markers. | Keep all durable debt here; convert inline notes to register pointers only. |
-| TFR-004 | Dataset/inode authority | Dataset/mount identity and inode ownership need deep review; earlier audit suspected root-level inode list behavior. | Use `docs/INODE_NAMESPACE_AUTHORITY.md`: a dedicated dataset-scoped inode authority owns allocation, persisted IDs, root identity, and recovery seeding. Closed issues #664 through #667 established the boundary; #2397 removed the selected-carrier namespace and inode-table projections, and #2534 retired the unattached duplicate namespace package. |
+| TFR-004 | Dataset/inode authority | Dataset/mount identity and inode ownership needed deep review; earlier audit suspected root-level inode list behavior. | Closed: `docs/INODE_NAMESPACE_AUTHORITY.md` assigns allocation, persisted IDs, root identity, and recovery seeding to the dataset-scoped authority. Issues #664 through #667 established the boundary; #2397 removed selected-carrier projections, #2534 retired the duplicate namespace package, and #2536 retired the detached inode-table allocator/persistence model while preserving live attribute contracts. |
 | TFR-005 | Timestamp/revision/on-disk format | POSIX timestamps, storage version fields, content object keys, scrub identity, replay ticks, rename metadata stamps, and serialized format fields are coupled. | Use `docs/TIMESTAMP_GENERATION_AUTHORITY.md` as the top-level authority model and section 9 closeout/delegation map, with the delegated companion authorities in `docs/CONTENT_OBJECT_VERSION_AUTHORITY.md`, `docs/SCRUB_IDENTITY_AUTHORITY.md`, `docs/SEND_RECEIVE_VERSION_AUTHORITY.md`, source-owned format/version constants, and `docs/UNRELEASED_AUTHORITY_POLICY.md` for pre-release compatibility boundaries. Keep TFR-005 open until delegated live families, conditional future-only ABI/coverage rows, and product-claim evidence support closure. |
 | TFR-006 | Compression/encryption | Compression and encryption paths may bypass or duplicate raw object-store authority. | Use `docs/TRANSFORM_PIPELINE_AUTHORITY.md` as the #1063 boundary decision and close its non-overlapping follow-up map before claiming runtime conformance. |
 | TFR-007 | Capacity/accounting | Allocation, quotas, statfs, reserves, and logical/physical accounting are split across crates. | Use `docs/CAPACITY_ACCOUNTING_AUTHORITY.md` as the boundary decision and close the linked follow-up issue map. |
@@ -27,19 +27,20 @@ OpenZFS/Ceph-class claims.
 ## Current State
 
 ### TFR-002: Workspace authority
-Still open. Issues #276, #513, #681 removed scaffold-transitional crate roots and established retired-role enforcement; check-workspace-policy validates all 168 current workspace and excluded package roots with zero scaffold-transitional rows. Imported docs and xtask gates still carry stale package assumptions that need separate classification. #681 mapped the package-classification authority to product/harness/third-party/delete categories.
+Still open. Issues #276, #513, #681 removed scaffold-transitional crate roots and established retired-role enforcement; check-workspace-policy validates all 167 current workspace and excluded package roots with zero scaffold-transitional rows. Imported docs and xtask gates still carry stale package assumptions that need separate classification. #681 mapped the package-classification authority to product/harness/third-party/delete categories.
 
 ### TFR-003: Todo hygiene
 Still open. Inline comments use register-backed TFR markers; anonymous TODOs have been converted. Remaining debt lives in this register only.
 
 ### TFR-004: Dataset/inode authority
-Still open. #655 added `docs/INODE_NAMESPACE_AUTHORITY.md` as the design
+Closed. #655 added `docs/INODE_NAMESPACE_AUTHORITY.md` as the design
 decision artifact; closed issues #664 through #667 established allocation,
 lookup-reference, old-catalog, and special-node replay ownership. #2397 removed
 the residual mounted namespace, inode-table, and fallback projections. #2534
-retired the unattached namespace package and its validation-only self-smoke;
-final closeout still requires disposition of the distinct non-carrier
-inode-table projection.
+retired the unattached namespace package and its validation-only self-smoke.
+#2536 retired the distinct non-carrier inode-table projection and its duplicate
+persistence pipeline while moving the live xattr/link contract into
+`tidefs-inode-attributes`.
 
 ### TFR-005: Timestamp/revision/on-disk format
 Still open. Delegated to `docs/TIMESTAMP_GENERATION_AUTHORITY.md` section 9 closeout map with companion authorities in `docs/CONTENT_OBJECT_VERSION_AUTHORITY.md`, `docs/SCRUB_IDENTITY_AUTHORITY.md`, and `docs/SEND_RECEIVE_VERSION_AUTHORITY.md`. Closed slices: #325, #330, #331, #348 (POSIX timestamp separation), #499 (comprehensive authority doc), #694 (intent-log replay/recovery), #688, #994 (namespace-revision coupling), #742 (scrub identity), #695, #1002 (VFSSEND1 guard), #746 (content-object version), #696 (format-golden/codec gate). Remains open until delegated live runtime families and product-claim evidence.
