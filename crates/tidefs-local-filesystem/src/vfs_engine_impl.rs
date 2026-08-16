@@ -1324,12 +1324,6 @@ impl VfsLocalFileSystem {
                     LivePoolAdminCommand::SnapshotSend => {
                         self.live_snapshot_send(&args, wants_json)
                     }
-                    LivePoolAdminCommand::PoolGet => self.live_pool_get(&args),
-                    LivePoolAdminCommand::PoolSet => self.live_pool_set(&args),
-                    LivePoolAdminCommand::PoolListProps => self.live_pool_list_props(&args),
-                    LivePoolAdminCommand::PoolIntegrityCheck => {
-                        self.live_pool_integrity_check(pool, &args, wants_json)
-                    }
                     command => {
                         let (command_name, operation) = command.parts();
                         live_admin_typed_error(LivePoolAdminError::unsupported_command(
@@ -1348,7 +1342,6 @@ impl VfsLocalFileSystem {
             | LivePoolAdminCommand::PoolMount
             | LivePoolAdminCommand::PoolExport
             | LivePoolAdminCommand::PoolDestroy
-            | LivePoolAdminCommand::PoolSet
             | LivePoolAdminCommand::DatasetCreate
             | LivePoolAdminCommand::DatasetResize
             | LivePoolAdminCommand::DatasetRename
@@ -1373,6 +1366,7 @@ impl VfsLocalFileSystem {
             ),
             LivePoolAdminCommand::PoolStatus
             | LivePoolAdminCommand::PoolGet
+            | LivePoolAdminCommand::PoolSet
             | LivePoolAdminCommand::PoolListProps
             | LivePoolAdminCommand::PoolIntegrityCheck
             | LivePoolAdminCommand::DatasetList
@@ -2930,7 +2924,9 @@ impl VfsLocalFileSystem {
             ))
         }
     }
+}
 
+impl SharedLocalFileSystem {
     fn live_pool_get(&self, args: &Value) -> LivePoolAdminResponse {
         let property = match live_admin_arg(args, "property") {
             Ok(value) => value,
@@ -2941,7 +2937,7 @@ impl VfsLocalFileSystem {
         let Some(def) = tidefs_dataset_properties::lookup_property(&registry, &key) else {
             return live_admin_error(1, format!("pool get: unknown property '{property}'"));
         };
-        let fs = self.fs.borrow();
+        let fs = self.borrow();
         match fs.pool_properties().get(&key) {
             Some(entry) => live_admin_ok_text(format!(
                 "property:  {property}\nvalue:     {}\nsource:    {}",
@@ -2987,7 +2983,7 @@ impl VfsLocalFileSystem {
             tidefs_dataset_properties::PropertySet::parse_value_from_str(prop_val_str)
         };
 
-        let mut fs = self.fs.borrow_mut();
+        let mut fs = self.borrow_mut();
         if let Err(err) =
             tidefs_dataset_properties::validate_set(&key, &value, def, fs.pool_properties())
         {
@@ -3023,7 +3019,7 @@ impl VfsLocalFileSystem {
 
     fn live_pool_list_props(&self, args: &Value) -> LivePoolAdminResponse {
         let family = live_admin_optional_arg(args, "family");
-        let fs = self.fs.borrow();
+        let fs = self.borrow();
         live_property_table("pool list-props", fs.pool_properties(), family)
     }
 
@@ -3047,7 +3043,7 @@ impl VfsLocalFileSystem {
             })
             .unwrap_or(0);
 
-        let mut fs = self.fs.borrow_mut();
+        let mut fs = self.borrow_mut();
         let verifier = match fs.online_verifier_report() {
             Ok(report) => report,
             Err(err) => {
@@ -3242,12 +3238,9 @@ impl VfsLocalFileSystem {
         }
         live_admin_ok_text(out)
     }
-}
-
-impl SharedLocalFileSystem {
-    /// Serve bounded device administration through the one already-open
-    /// mounted Pool owner, without routing through VFS semantics.
-    pub fn handle_live_device_admin_request(
+    /// Serve bounded Pool-wide administration through the one already-open
+    /// mounted owner, without routing through VFS semantics.
+    pub fn handle_live_pool_owner_admin_request(
         &self,
         request: &LivePoolAdminRequest,
     ) -> LivePoolAdminResponse {
@@ -3258,6 +3251,12 @@ impl SharedLocalFileSystem {
         let args = live_admin_args_to_json(&request.args);
         let wants_json = request.output.wants_json();
         match request.command {
+            LivePoolAdminCommand::PoolGet => self.live_pool_get(&args),
+            LivePoolAdminCommand::PoolSet => self.live_pool_set(&args),
+            LivePoolAdminCommand::PoolListProps => self.live_pool_list_props(&args),
+            LivePoolAdminCommand::PoolIntegrityCheck => {
+                self.live_pool_integrity_check(&request.pool, &args, wants_json)
+            }
             LivePoolAdminCommand::DeviceStatus => self.live_device_status(wants_json),
             LivePoolAdminCommand::DeviceRemove => self.live_device_remove(&args, wants_json),
             LivePoolAdminCommand::DeviceReplace => self.live_device_replace(&args, wants_json),
@@ -7871,7 +7870,7 @@ mod tests {
         request.args = live_admin_args_from_json(args);
         let response = engine
             .shared_filesystem()
-            .handle_live_device_admin_request(&request);
+            .handle_live_pool_owner_admin_request(&request);
         live_admin_response_to_assertion_json(response)
     }
 
@@ -7881,7 +7880,19 @@ mod tests {
         args: Value,
         wants_json: bool,
     ) -> Value {
-        live_admin(engine, "pool", operation, args, wants_json)
+        let command = LivePoolAdminCommand::from_parts("pool", operation)
+            .expect("test live Pool admin command");
+        let mut request = LivePoolAdminRequest::new(command, "tank");
+        request.output = if wants_json {
+            LivePoolAdminOutput::MachineJson
+        } else {
+            LivePoolAdminOutput::Human
+        };
+        request.args = live_admin_args_from_json(args);
+        let response = engine
+            .shared_filesystem()
+            .handle_live_pool_owner_admin_request(&request);
+        live_admin_response_to_assertion_json(response)
     }
 
     fn live_admin(
@@ -8092,6 +8103,68 @@ mod tests {
     }
 
     #[test]
+    fn live_pool_admin_uses_shared_owner_not_vfs_dispatch() {
+        let (engine, _td) = temp_fs();
+
+        for (command, operation) in [
+            (LivePoolAdminCommand::PoolGet, "get"),
+            (LivePoolAdminCommand::PoolSet, "set"),
+            (LivePoolAdminCommand::PoolListProps, "list-props"),
+            (LivePoolAdminCommand::PoolIntegrityCheck, "integrity-check"),
+        ] {
+            let request = LivePoolAdminRequest::new(command, "tank");
+            let vfs_response = engine
+                .handle_live_pool_admin_request(&request)
+                .expect("dispatch through VFS");
+            let vfs_value = live_admin_response_to_assertion_json(vfs_response);
+            assert_eq!(vfs_value["ok"], false);
+            assert_eq!(vfs_value["json"]["kind"], "unsupported_command");
+            assert_eq!(vfs_value["json"]["command"], "pool");
+            assert_eq!(vfs_value["json"]["operation"], operation);
+        }
+
+        let request = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolListProps, "tank");
+        let owner_response = engine
+            .shared_filesystem()
+            .handle_live_pool_owner_admin_request(&request);
+        let owner_value = live_admin_response_to_assertion_json(owner_response);
+        assert_eq!(owner_value["ok"], true);
+        assert!(owner_value["text"]
+            .as_str()
+            .is_some_and(|output| output.contains("PROPERTY")));
+    }
+
+    #[test]
+    fn live_pool_properties_use_shared_owner() {
+        let (engine, _td) = temp_fs();
+
+        let set = live_pool_admin(
+            &engine,
+            "set",
+            json!({ "assignment": "access.readonly=on" }),
+            false,
+        );
+        assert_eq!(set["ok"], true, "set response: {set}");
+
+        let get = live_pool_admin(
+            &engine,
+            "get",
+            json!({ "property": "access.readonly" }),
+            false,
+        );
+        assert_eq!(get["ok"], true, "get response: {get}");
+        assert!(get["text"]
+            .as_str()
+            .is_some_and(|output| output.contains("value:     on")));
+
+        let listed = live_pool_admin(&engine, "list-props", json!({}), false);
+        assert_eq!(listed["ok"], true, "list response: {listed}");
+        assert!(listed["text"]
+            .as_str()
+            .is_some_and(|output| output.contains("access.readonly")));
+    }
+
+    #[test]
     fn live_device_admin_uses_shared_owner_not_vfs_dispatch() {
         let (engine, _td) = temp_fs();
 
@@ -8114,7 +8187,7 @@ mod tests {
         let request = LivePoolAdminRequest::new(LivePoolAdminCommand::DeviceStatus, "tank");
         let owner_response = engine
             .shared_filesystem()
-            .handle_live_device_admin_request(&request);
+            .handle_live_pool_owner_admin_request(&request);
         let owner_value = live_admin_response_to_assertion_json(owner_response);
         assert_eq!(owner_value["ok"], true);
         assert!(owner_value["text"]
