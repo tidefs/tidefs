@@ -323,7 +323,7 @@ pub type PoolVolumeSnapshotSummary = tidefs_pool_runtime::VolumeSnapshotSummary;
 
 enum PoolVolumeOwner {
     Standalone(SharedPoolRuntime),
-    Mounted(tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem),
+    Mounted(tidefs_local_filesystem::SharedPoolDatasetOwner),
 }
 
 #[derive(Debug)]
@@ -476,14 +476,15 @@ impl PoolVolumeBackend {
     }
 
     pub fn open_mounted(
-        owner: tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem,
+        owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
         path: &str,
         read_only: bool,
     ) -> Result<Self, BackendError> {
         let volume = owner
             .borrow()
-            .open_volume_dataset(path)
-            .map_err(map_filesystem_error)?;
+            .pool_runtime()
+            .open_volume(path)
+            .map_err(map_pool_runtime_error)?;
         let geometry = BlockDeviceGeometry::from_pool(volume.geometry())?;
         Ok(Self {
             owner: PoolVolumeOwner::Mounted(owner),
@@ -661,10 +662,15 @@ impl PoolVolumeBackend {
                     .zero_blocks(&runtime, start_block, block_count)
                     .map_err(map_pool_runtime_error)
             }
-            (PoolVolumeOwner::Mounted(owner), volume) => owner
-                .borrow()
-                .zero_volume_blocks(volume, start_block, block_count)
-                .map_err(map_filesystem_error),
+            (PoolVolumeOwner::Mounted(owner), volume) => {
+                let owner = owner.borrow();
+                owner
+                    .ensure_mutation_allowed("zero Pool volume blocks")
+                    .map_err(map_filesystem_error)?;
+                volume
+                    .zero_blocks(owner.pool_runtime(), start_block, block_count)
+                    .map_err(map_pool_runtime_error)
+            }
         }
     }
 }
@@ -693,10 +699,12 @@ impl BlockVolumeStorageBackend for PoolVolumeBackend {
                     .read_blocks(&runtime, start_block, block_count)
                     .map_err(map_pool_runtime_error)?
             }
-            PoolVolumeOwner::Mounted(owner) => owner
-                .borrow()
-                .read_volume_blocks(&self.volume, start_block, block_count)
-                .map_err(map_filesystem_error)?,
+            PoolVolumeOwner::Mounted(owner) => {
+                let owner = owner.borrow();
+                self.volume
+                    .read_blocks(owner.pool_runtime(), start_block, block_count)
+                    .map_err(map_pool_runtime_error)?
+            }
         };
         Ok(BackendReadResult {
             completion_class: BlockVolumeCompletionClass::Completed,
@@ -727,10 +735,15 @@ impl BlockVolumeStorageBackend for PoolVolumeBackend {
                     .write_blocks(&runtime, start_block, payload)
                     .map_err(map_pool_runtime_error)?
             }
-            (PoolVolumeOwner::Mounted(owner), volume) => owner
-                .borrow()
-                .write_volume_blocks(volume, start_block, payload)
-                .map_err(map_filesystem_error)?,
+            (PoolVolumeOwner::Mounted(owner), volume) => {
+                let owner = owner.borrow();
+                owner
+                    .ensure_mutation_allowed("write Pool volume blocks")
+                    .map_err(map_filesystem_error)?;
+                volume
+                    .write_blocks(owner.pool_runtime(), start_block, payload)
+                    .map_err(map_pool_runtime_error)?;
+            }
         }
         Ok(BackendWriteResult {
             completion_class: BlockVolumeCompletionClass::Completed,
@@ -747,10 +760,13 @@ impl BlockVolumeStorageBackend for PoolVolumeBackend {
                 let mut runtime = lock_pool_runtime(runtime)?;
                 volume.flush(&mut runtime).map_err(map_pool_runtime_error)
             }
-            (PoolVolumeOwner::Mounted(owner), volume) => owner
-                .borrow_mut()
-                .flush_volume(volume)
-                .map_err(map_filesystem_error),
+            (PoolVolumeOwner::Mounted(owner), volume) => {
+                let mut owner = owner.borrow_mut();
+                let runtime = owner
+                    .pool_runtime_mut("flush Pool volume")
+                    .map_err(map_filesystem_error)?;
+                volume.flush(runtime).map_err(map_pool_runtime_error)
+            }
         }
     }
 

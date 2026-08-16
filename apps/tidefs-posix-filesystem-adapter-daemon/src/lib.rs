@@ -5,11 +5,11 @@
 //! TideFS POSIX Filesystem Adapter Daemon
 //!
 //! FUSE-backed daemon that mounts a TideFS filesystem via the Linux FUSE
-//! kernel interface.  The crate links a [`LocalFileSystem`] store through
+//! kernel interface.  The crate links a [`PoolDatasetOwner`] store through
 //! a [`VfsEngine`] trait implementation and serves every supported FUSE
 //! operation to the kernel on behalf of userspace processes.
 //!
-//! [`LocalFileSystem`]: tidefs_local_filesystem::LocalFileSystem
+//! [`PoolDatasetOwner`]: tidefs_local_filesystem::PoolDatasetOwner
 //! [`VfsEngine`]: tidefs_vfs_engine::VfsEngine
 //!
 //! # FUSE request lifecycle
@@ -244,7 +244,7 @@ mod root_authentication_tests {
     }
 }
 
-/// Configuration for `run_mount`: boots a LocalFileSystem and mounts it via FUSE.
+/// Configuration for `run_mount`: boots a PoolDatasetOwner and mounts it via FUSE.
 #[derive(Debug)]
 pub struct MountConfig {
     /// Optional per-object encryption configuration for the pool.
@@ -1077,7 +1077,7 @@ struct ClusterLeaseRenewalWorker {
     stop: Arc<AtomicBool>,
     authority_lost: Arc<AtomicBool>,
     authority_loss: Arc<Mutex<Option<String>>>,
-    shared_filesystem: tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem,
+    shared_pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
     shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -1086,7 +1086,7 @@ struct ClusterLeaseRenewalWorker {
 impl ClusterLeaseRenewalWorker {
     fn start(
         authority: MountAuthority,
-        shared_filesystem: tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem,
+        shared_pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         let authority = Arc::new(Mutex::new(authority));
@@ -1098,7 +1098,7 @@ impl ClusterLeaseRenewalWorker {
         let thread_stop = Arc::clone(&stop);
         let thread_authority_lost = Arc::clone(&authority_lost);
         let thread_authority_loss = Arc::clone(&authority_loss);
-        let thread_filesystem = shared_filesystem.clone();
+        let thread_pool_owner = shared_pool_owner.clone();
         let thread_shutdown = Arc::clone(&shutdown);
         let handle = std::thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
@@ -1113,7 +1113,7 @@ impl ClusterLeaseRenewalWorker {
                     Ok(Err(error)) => {
                         Self::record_authority_loss(
                             &thread_authority,
-                            &thread_filesystem,
+                            &thread_pool_owner,
                             &thread_shutdown,
                             &thread_authority_lost,
                             &thread_authority_loss,
@@ -1126,7 +1126,7 @@ impl ClusterLeaseRenewalWorker {
                     Err(_) => {
                         Self::record_authority_loss(
                             &thread_authority,
-                            &thread_filesystem,
+                            &thread_pool_owner,
                             &thread_shutdown,
                             &thread_authority_lost,
                             &thread_authority_loss,
@@ -1145,7 +1145,7 @@ impl ClusterLeaseRenewalWorker {
             stop,
             authority_lost,
             authority_loss,
-            shared_filesystem,
+            shared_pool_owner,
             shutdown,
             handle: Some(handle),
         }
@@ -1153,7 +1153,7 @@ impl ClusterLeaseRenewalWorker {
 
     fn record_authority_loss(
         authority: &Arc<Mutex<MountAuthority>>,
-        shared_filesystem: &tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem,
+        shared_pool_owner: &tidefs_local_filesystem::SharedPoolDatasetOwner,
         shutdown: &Arc<AtomicBool>,
         authority_lost: &Arc<AtomicBool>,
         authority_loss: &Arc<Mutex<Option<String>>>,
@@ -1163,7 +1163,7 @@ impl ClusterLeaseRenewalWorker {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .fence();
-        shared_filesystem
+        shared_pool_owner
             .borrow_mut()
             .fence_external_mutation_authority();
         *authority_loss
@@ -1183,7 +1183,7 @@ impl ClusterLeaseRenewalWorker {
         {
             Self::record_authority_loss(
                 &self.authority,
-                &self.shared_filesystem,
+                &self.shared_pool_owner,
                 &self.shutdown,
                 &self.authority_lost,
                 &self.authority_loss,
@@ -1211,7 +1211,7 @@ impl ClusterLeaseRenewalWorker {
             if handle.join().is_err() {
                 Self::record_authority_loss(
                     &self.authority,
-                    &self.shared_filesystem,
+                    &self.shared_pool_owner,
                     &self.shutdown,
                     &self.authority_lost,
                     &self.authority_loss,
@@ -1464,7 +1464,7 @@ struct StartedMount {
     background_scheduler: Option<Arc<Mutex<Option<BackgroundScheduler>>>>,
     mmap_coherency: Arc<mmap_coherency::MmapCoherency>,
     #[cfg(feature = "cluster")]
-    shared_filesystem: tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem,
+    shared_pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
     #[cfg(feature = "cluster")]
     cluster_vfs_rpc_owner: Option<cluster_vfs_rpc_owner::ClusterVfsRpcOwnerHandle>,
 }
@@ -1475,7 +1475,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     use tidefs_dataset_lifecycle::DatasetId;
     use tidefs_local_filesystem::human::local_filesystem::StoreOptions;
     use tidefs_local_filesystem::vfs_engine_impl::VfsLocalFileSystem;
-    use tidefs_local_filesystem::LocalFileSystem;
+    use tidefs_local_filesystem::PoolDatasetOwner;
 
     let snapshot_export = config.snapshot_name.is_some();
     let effective_mode = effective_mount_mode(config);
@@ -1547,7 +1547,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             block_devices: config.block_devices.as_deref(),
         };
         let session =
-            LocalFileSystem::open_snapshot_export(&config.backing_dir, snapshot_name, open_config)
+            PoolDatasetOwner::open_snapshot_export(&config.backing_dir, snapshot_name, open_config)
                 .map_err(|e| format!("open snapshot export `{snapshot_name}`: {e}"))?;
         let summary = session.summary().clone();
         eprintln!(
@@ -1599,7 +1599,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             ..StoreOptions::default()
         };
         let selected_dataset_path = config.dataset_path.as_deref().unwrap_or("root");
-        let mut lfs = LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+        let mut lfs = PoolDatasetOwner::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
                 &config.backing_dir,
                 config.pool_name.as_deref().unwrap_or("tidefs"),
                 config.pool_redundancy_policy,
@@ -1706,7 +1706,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             config.runtime.sync_guarantee
         };
 
-        // The LocalFileSystem already owns the exact typed dataset root.
+        // The PoolDatasetOwner already owns the exact typed dataset root.
         let mut engine = VfsLocalFileSystem::new(lfs).with_sync_guarantee(sync_guarantee);
         if effective_mode.read_only {
             engine
@@ -1731,10 +1731,10 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         }
         (engine, tracker, dataset_id)
     };
-    let shared_filesystem = base_engine.shared_filesystem();
+    let shared_pool_owner = base_engine.shared_pool_owner();
     #[cfg(feature = "cluster")]
     if let Some(deadline_ms) = config.mount_authority.external_mutation_deadline() {
-        shared_filesystem
+        shared_pool_owner
             .borrow_mut()
             .install_external_mutation_deadline(deadline_ms)
             .map_err(|error| format!("install clustered mutation deadline: {error}"))?;
@@ -1918,7 +1918,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                     owner_config,
                     Arc::clone(&live_owner_engine),
                     dataset_replacement.clone(),
-                    shared_filesystem.clone(),
+                    shared_pool_owner.clone(),
                     Arc::clone(&shutdown),
                 ) {
                     Ok(owner) => owner,
@@ -1952,7 +1952,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         background_scheduler,
         mmap_coherency,
         #[cfg(feature = "cluster")]
-        shared_filesystem,
+        shared_pool_owner,
         #[cfg(feature = "cluster")]
         cluster_vfs_rpc_owner,
     })
@@ -2089,7 +2089,7 @@ pub fn run_cluster_vfs_rpc_mount(config: ClusterVfsRpcMountConfig) -> Result<(),
 
 /// Bootstrap the TideFS FUSE mount lifecycle.
 ///
-/// Creates a `LocalFileSystem` rooted at `config.backing_dir`, wraps it in
+/// Creates a `PoolDatasetOwner` rooted at `config.backing_dir`, wraps it in
 /// the `VfsLocalFileSystem` adapter, and mounts a FUSE session at
 /// `config.mountpoint`. The calling thread is parked until the process
 /// receives SIGINT or SIGTERM; shutdown joins the FUSE session so clean
@@ -2132,7 +2132,7 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
         background_scheduler,
         mmap_coherency,
         #[cfg(feature = "cluster")]
-        shared_filesystem,
+        shared_pool_owner,
         #[cfg(feature = "cluster")]
         mut cluster_vfs_rpc_owner,
     } = match start_mount(&config) {
@@ -2169,7 +2169,7 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
             std::mem::replace(&mut config.mount_authority, MountAuthority::standalone());
         ClusterLeaseRenewalWorker::start(
             authority,
-            shared_filesystem.clone(),
+            shared_pool_owner.clone(),
             Arc::clone(&shutdown),
         )
     });
@@ -2903,7 +2903,7 @@ mod cluster_mount_authority_tests {
 
         let root = tempfile::tempdir().expect("tempdir");
         let mut filesystem =
-            tidefs_local_filesystem::LocalFileSystem::open_with_root_authentication_key(
+            tidefs_local_filesystem::PoolDatasetOwner::open_with_root_authentication_key(
                 root.path(),
                 tidefs_local_object_store::StoreOptions::default(),
                 tidefs_local_filesystem::RootAuthenticationKey::demo_key(),
@@ -2912,11 +2912,10 @@ mod cluster_mount_authority_tests {
         filesystem
             .install_external_mutation_deadline(deadline)
             .expect("install lease deadline");
-        let shared_filesystem =
-            tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem::new(filesystem);
+        let shared_pool_owner = tidefs_local_filesystem::SharedPoolDatasetOwner::new(filesystem);
         let shutdown = Arc::new(AtomicBool::new(true));
         let mut worker =
-            ClusterLeaseRenewalWorker::start(authority, shared_filesystem, Arc::clone(&shutdown));
+            ClusterLeaseRenewalWorker::start(authority, shared_pool_owner, Arc::clone(&shutdown));
 
         let started = std::time::Instant::now();
         while renewals.load(AtomicOrdering::Acquire) == 0
@@ -3027,17 +3026,17 @@ mod cluster_mount_authority_tests {
 mod dataset_mount_lookup_tests {
     use tidefs_dataset_catalog::{DatasetFlags, DatasetId, LifecycleState, SyncGuarantee};
     use tidefs_local_filesystem::human::local_filesystem::StoreOptions;
-    use tidefs_local_filesystem::{LocalFileSystem, RootAuthenticationKey};
+    use tidefs_local_filesystem::{PoolDatasetOwner, RootAuthenticationKey};
 
-    /// Helper: create a fresh `LocalFileSystem` in a temp directory.
-    fn open_temp_fs(dir: &std::path::Path) -> LocalFileSystem {
+    /// Helper: create a fresh `PoolDatasetOwner` in a temp directory.
+    fn open_temp_fs(dir: &std::path::Path) -> PoolDatasetOwner {
         std::fs::create_dir_all(dir).unwrap();
-        LocalFileSystem::open_with_root_authentication_key(
+        PoolDatasetOwner::open_with_root_authentication_key(
             dir,
             StoreOptions::default(),
             RootAuthenticationKey::demo_key(),
         )
-        .expect("open LocalFileSystem")
+        .expect("open PoolDatasetOwner")
     }
 
     #[test]

@@ -27,7 +27,7 @@ use tidefs_block_volume_adapter_daemon::storage_backend::{
 };
 #[cfg(feature = "block-volume")]
 use tidefs_block_volume_adapter_daemon::ublk_control_open::run_ublk_live_device;
-use tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem;
+use tidefs_local_filesystem::SharedPoolDatasetOwner;
 use tidefs_local_object_store::pool::{PoolHealth, PoolTopologyStatus};
 use tidefs_types_vfs_core::RequestCtx;
 use tidefs_vfs_engine::{
@@ -44,7 +44,7 @@ enum LiveOwnerAdmin {
     Fuse {
         engine: LiveOwnerEngine,
         dataset_replacement: crate::fuse_vfs_adapter::DatasetReplacementHandle,
-        filesystem: SharedLocalFileSystem,
+        pool_owner: SharedPoolDatasetOwner,
     },
     #[cfg(feature = "block-volume")]
     StandaloneBlock { runtime: SharedPoolRuntime },
@@ -191,7 +191,7 @@ pub fn start_fuse_owner(
     config: LiveOwnerConfig,
     engine: LiveOwnerEngine,
     dataset_replacement: crate::fuse_vfs_adapter::DatasetReplacementHandle,
-    filesystem: SharedLocalFileSystem,
+    pool_owner: SharedPoolDatasetOwner,
     shutdown: Arc<AtomicBool>,
 ) -> Result<LiveOwnerHandle, String> {
     start_owner(
@@ -200,7 +200,7 @@ pub fn start_fuse_owner(
         LiveOwnerAdmin::Fuse {
             engine,
             dataset_replacement,
-            filesystem,
+            pool_owner,
         },
         None,
         shutdown,
@@ -578,18 +578,18 @@ fn dispatch_request(
         | LivePoolAdminCommand::DeviceStatus
         | LivePoolAdminCommand::DeviceRemove
         | LivePoolAdminCommand::DeviceReplace => match admin {
-            LiveOwnerAdmin::Fuse { filesystem, .. } => {
-                filesystem.handle_live_pool_owner_admin_request(&request)
+            LiveOwnerAdmin::Fuse { pool_owner, .. } => {
+                pool_owner.handle_live_pool_owner_admin_request(&request)
             }
             #[cfg(feature = "block-volume")]
             LiveOwnerAdmin::StandaloneBlock { .. } => unsupported_admin_command_response(&request),
         },
         #[cfg(feature = "block-volume")]
         LivePoolAdminCommand::BlockAttach => match admin {
-            LiveOwnerAdmin::Fuse { filesystem, .. } => block_attach(
+            LiveOwnerAdmin::Fuse { pool_owner, .. } => block_attach(
                 &request,
                 manifest,
-                filesystem,
+                pool_owner,
                 block_export,
                 disconnect_monitor,
                 shutdown,
@@ -866,7 +866,7 @@ fn wait_for_block_export_stop(block_export: &SharedBlockExport) -> Result<(), St
 fn block_attach(
     request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
-    filesystem: &SharedLocalFileSystem,
+    pool_owner: &SharedPoolDatasetOwner,
     block_export: &SharedBlockExport,
     disconnect_monitor: Option<UnixStream>,
     owner_shutdown: &Arc<AtomicBool>,
@@ -891,7 +891,7 @@ fn block_attach(
         return LivePoolAdminResponse::error(1, message);
     }
     let mut backend =
-        match PoolVolumeBackend::open_mounted(filesystem.clone(), volume, manifest.read_only) {
+        match PoolVolumeBackend::open_mounted(pool_owner.clone(), volume, manifest.read_only) {
             Ok(backend) => backend,
             Err(err) => {
                 clear_block_export(block_export, volume, &export_shutdown, None);
@@ -1551,7 +1551,7 @@ fn pool_status(
     };
 
     let topology = match admin {
-        LiveOwnerAdmin::Fuse { filesystem, .. } => filesystem.borrow().pool_topology_status(),
+        LiveOwnerAdmin::Fuse { pool_owner, .. } => pool_owner.borrow().pool_topology_status(),
         #[cfg(feature = "block-volume")]
         LiveOwnerAdmin::StandaloneBlock { runtime } => match runtime.lock() {
             Ok(runtime) => runtime.pool().topology_status(),

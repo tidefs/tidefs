@@ -44,13 +44,13 @@ fn prepare_volume_lifecycle_graph(
         )
         .expect("create Pool-owned volume for device lifecycle");
     let mut volume = filesystem
-        .open_volume_dataset("volume")
+        .open_pool_volume("volume")
         .expect("open Pool-owned volume");
     filesystem
-        .write_volume_blocks(&mut volume, 0, &vec![committed_byte; 4096])
+        .write_pool_volume_blocks(&mut volume, 0, &vec![committed_byte; 4096])
         .expect("stage committed source volume block");
     filesystem
-        .flush_volume(&mut volume)
+        .flush_pool_volume(&mut volume)
         .expect("commit source volume block");
     filesystem
         .create_volume_snapshot_dataset("volume@before")
@@ -59,20 +59,20 @@ fn prepare_volume_lifecycle_graph(
         .create_volume_clone_dataset("clone", "volume@before")
         .expect("create Pool-owned volume clone");
     let mut clone = filesystem
-        .open_volume_dataset("clone")
+        .open_pool_volume("clone")
         .expect("open Pool-owned volume clone");
     filesystem
-        .write_volume_blocks(&mut clone, 0, &vec![clone_byte; 4096])
+        .write_pool_volume_blocks(&mut clone, 0, &vec![clone_byte; 4096])
         .expect("stage clone block");
     filesystem
-        .flush_volume(&mut clone)
+        .flush_pool_volume(&mut clone)
         .expect("commit clone block");
 
     let mut active = filesystem
-        .open_volume_dataset("volume")
+        .open_pool_volume("volume")
         .expect("open active volume handle");
     filesystem
-        .write_volume_blocks(&mut active, 1, &vec![staged_byte; 4096])
+        .write_pool_volume_blocks(&mut active, 1, &vec![staged_byte; 4096])
         .expect("stage private block across topology mutation");
     active
 }
@@ -88,21 +88,21 @@ fn assert_and_flush_live_volume_graph(
     expected_source.extend(vec![staged_byte; 4096]);
     assert_eq!(
         filesystem
-            .read_volume_blocks(active, 0, 2)
+            .read_pool_volume_blocks(active, 0, 2)
             .expect("read active volume after topology mutation"),
         expected_source,
         "active handle must retain committed and private staged blocks"
     );
     filesystem
-        .flush_volume(active)
+        .flush_pool_volume(active)
         .expect("flush staged block through the new topology");
 
     let clone = filesystem
-        .open_volume_dataset("clone")
+        .open_pool_volume("clone")
         .expect("open clone after topology mutation");
     assert_eq!(
         filesystem
-            .read_volume_blocks(&clone, 0, 1)
+            .read_pool_volume_blocks(&clone, 0, 1)
             .expect("read clone after topology mutation"),
         vec![clone_byte; 4096]
     );
@@ -120,23 +120,23 @@ fn assert_reimported_volume_graph(
     staged_byte: u8,
 ) {
     let source = filesystem
-        .open_volume_dataset("volume")
+        .open_pool_volume("volume")
         .expect("open source volume after reimport");
     let mut expected_source = vec![committed_byte; 4096];
     expected_source.extend(vec![staged_byte; 4096]);
     assert_eq!(
         filesystem
-            .read_volume_blocks(&source, 0, 2)
+            .read_pool_volume_blocks(&source, 0, 2)
             .expect("read source volume after reimport"),
         expected_source
     );
 
     let clone = filesystem
-        .open_volume_dataset("clone")
+        .open_pool_volume("clone")
         .expect("open clone after reimport");
     assert_eq!(
         filesystem
-            .read_volume_blocks(&clone, 0, 1)
+            .read_pool_volume_blocks(&clone, 0, 1)
             .expect("read clone after reimport"),
         vec![clone_byte; 4096]
     );
@@ -150,13 +150,13 @@ fn assert_reimported_volume_graph(
         .create_volume_clone_dataset("snapshot-check", "volume@before")
         .expect("clone retained snapshot after reimport");
     let snapshot_check = filesystem
-        .open_volume_dataset("snapshot-check")
+        .open_pool_volume("snapshot-check")
         .expect("open verification clone after reimport");
     let mut expected_snapshot = vec![committed_byte; 4096];
     expected_snapshot.extend(vec![0; 4096]);
     assert_eq!(
         filesystem
-            .read_volume_blocks(&snapshot_check, 0, 2)
+            .read_pool_volume_blocks(&snapshot_check, 0, 2)
             .expect("read exact retained snapshot bytes after reimport"),
         expected_snapshot
     );
@@ -539,7 +539,7 @@ fn live_degraded_pool_status_reports_durable_member_identity() {
     assert!(topology.members[1].present);
 
     let engine = VfsLocalFileSystem::new(filesystem).with_read_only();
-    let shared_filesystem = engine.shared_filesystem();
+    let shared_pool_owner = engine.shared_pool_owner();
     let adapter = FuseVfsAdapter::new(Box::new(engine))
         .expect("create live-owner adapter")
         .with_read_only();
@@ -561,7 +561,7 @@ fn live_degraded_pool_status_reports_durable_member_identity() {
         },
         adapter.engine_handle(),
         adapter.dataset_replacement_handle(),
-        shared_filesystem,
+        shared_pool_owner,
         Arc::clone(&shutdown),
     )
     .expect("start live owner for degraded Pool");
@@ -774,7 +774,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
     assert_eq!(scanned[1].pool_guid, Some(pool_uuid));
 
     let engine = VfsLocalFileSystem::new(filesystem);
-    let shared_filesystem = engine.shared_filesystem();
+    let shared_pool_owner = engine.shared_pool_owner();
     let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create live-owner adapter");
     let runtime_dir = PathBuf::from("/run/tidefs/pools").join(hex_guid(&pool_uuid));
     assert!(
@@ -794,7 +794,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
         },
         adapter.engine_handle(),
         adapter.dataset_replacement_handle(),
-        shared_filesystem.clone(),
+        shared_pool_owner.clone(),
         Arc::clone(&shutdown),
     )
     .expect("start live owner for device removal");
@@ -832,7 +832,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
     assert_legacy_device_lifecycle_files_absent(&metadata_dir);
 
     {
-        let mut filesystem = shared_filesystem.borrow_mut();
+        let mut filesystem = shared_pool_owner.borrow_mut();
         assert_eq!(filesystem.pool_topology_status().members.len(), 1);
         for (path, expected) in &expected_files {
             assert_eq!(
@@ -847,7 +847,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
     }
 
     owner.stop();
-    drop(shared_filesystem);
+    drop(shared_pool_owner);
     drop(adapter);
     fs::remove_dir(&runtime_dir).expect("remove empty test Pool runtime directory");
     remove_legacy_device_lifecycle_files(&metadata_dir);
@@ -966,7 +966,7 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
     assert_eq!(scanned[1].pool_guid, Some(pool_uuid));
 
     let engine = VfsLocalFileSystem::new(filesystem);
-    let shared_filesystem = engine.shared_filesystem();
+    let shared_pool_owner = engine.shared_pool_owner();
     let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create live-owner adapter");
     let runtime_dir = PathBuf::from("/run/tidefs/pools").join(hex_guid(&pool_uuid));
     assert!(
@@ -986,7 +986,7 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
         },
         adapter.engine_handle(),
         adapter.dataset_replacement_handle(),
-        shared_filesystem.clone(),
+        shared_pool_owner.clone(),
         Arc::clone(&shutdown),
     )
     .expect("start live owner for device replacement");
@@ -1029,7 +1029,7 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
     assert_eq!(status["replacement"]["old_device_detach_allowed"], true);
 
     {
-        let mut filesystem = shared_filesystem.borrow_mut();
+        let mut filesystem = shared_pool_owner.borrow_mut();
         assert_eq!(filesystem.pool_topology_status().members.len(), 2);
         for (path, expected) in &expected_files {
             assert_eq!(
@@ -1044,7 +1044,7 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
     }
 
     owner.stop();
-    drop(shared_filesystem);
+    drop(shared_pool_owner);
     drop(adapter);
     fs::remove_dir(&runtime_dir).expect("remove empty test Pool runtime directory");
     remove_legacy_device_lifecycle_files(&metadata_dir);
