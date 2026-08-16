@@ -3629,8 +3629,10 @@ impl VfsLocalFileSystem {
 }
 
 struct DeviceLifecycleFilesystemState {
+    dataset_path: String,
     state: FileSystemState,
     root: RootCommitRecord,
+    snapshots: Vec<DeviceLifecycleSnapshotState>,
 }
 
 struct DeviceLifecycleSnapshotState {
@@ -3849,40 +3851,46 @@ impl LocalFileSystem {
                         dataset_id,
                         self.root_authentication_key,
                     )?;
-                    if state
-                        .snapshots
-                        .values()
-                        .any(crate::snapshot::snapshot_record_retains_data)
-                    {
-                        return Err(FileSystemError::Unsupported {
-                            operation,
-                            reason: "an independently rooted filesystem has data-retaining snapshots or clones that require their own atomic receipt reconciliation row",
-                        });
-                    }
-                    unmounted_filesystems.push(DeviceLifecycleFilesystemState { state, root });
+                    let snapshots = self.load_unmounted_device_lifecycle_snapshot_states(
+                        &state, &path, dataset_id,
+                    )?;
+                    unmounted_filesystems.push(DeviceLifecycleFilesystemState {
+                        dataset_path: path,
+                        state,
+                        root,
+                        snapshots,
+                    });
                 }
-                DatasetType::Snapshot => {
-                    let source_dataset_id =
-                        self.dataset_catalog().lineage_parent(&path).map_err(|_| {
-                            FileSystemError::CorruptState {
-                                reason: "device lifecycle could not inspect snapshot lineage",
-                            }
-                        })?;
-                    if source_dataset_id == Some(mounted_dataset_id) {
-                        continue;
-                    }
-                    let snapshot = self.store.load_snapshot_root(dataset_id)?;
-                    if snapshot.source_reference.kind
-                        != tidefs_pool_runtime::DatasetRootKind::Volume
-                    {
-                        return Err(FileSystemError::Unsupported {
-                            operation,
-                            reason: "another dataset in the Pool has a filesystem-sourced snapshot root and requires its own mounted owner to join atomic receipt reconciliation",
-                        });
-                    }
-                    has_pool_owned_volume_roots = true;
-                }
+                DatasetType::Snapshot => {}
             }
+        }
+
+        let admitted_filesystem_ids = unmounted_filesystems
+            .iter()
+            .map(|filesystem| filesystem.state.dataset_id())
+            .collect::<BTreeSet<_>>();
+        for (path, dataset_id, dataset_type, _, _, _) in self.dataset_catalog().list_all() {
+            if dataset_type != DatasetType::Snapshot {
+                continue;
+            }
+            let source_dataset_id = self.dataset_catalog().lineage_parent(&path).map_err(|_| {
+                FileSystemError::CorruptState {
+                    reason: "device lifecycle could not inspect snapshot lineage",
+                }
+            })?;
+            if source_dataset_id == Some(mounted_dataset_id)
+                || source_dataset_id.is_some_and(|id| admitted_filesystem_ids.contains(&id))
+            {
+                continue;
+            }
+            let snapshot = self.store.load_snapshot_root(dataset_id)?;
+            if snapshot.source_reference.kind != tidefs_pool_runtime::DatasetRootKind::Volume {
+                return Err(FileSystemError::Unsupported {
+                    operation,
+                    reason: "a filesystem-sourced snapshot root belongs to a non-active or independently mounted dataset",
+                });
+            }
+            has_pool_owned_volume_roots = true;
         }
 
         if has_pool_owned_volume_roots {
@@ -3897,6 +3905,77 @@ impl LocalFileSystem {
             unmounted_filesystems,
             mounted_snapshots,
         })
+    }
+
+    fn load_unmounted_device_lifecycle_snapshot_states(
+        &self,
+        state: &FileSystemState,
+        dataset_path: &str,
+        dataset_id: DatasetId,
+    ) -> crate::Result<Vec<DeviceLifecycleSnapshotState>> {
+        let mut snapshots = Vec::new();
+        let mut expected_catalog_names = BTreeSet::new();
+        for record in state
+            .snapshots
+            .values()
+            .filter(|record| crate::snapshot::snapshot_record_retains_data(record))
+        {
+            if !crate::snapshot::snapshot_catalog_entry_matches(
+                self.dataset_catalog(),
+                record,
+                dataset_path,
+                dataset_id,
+            ) {
+                return Err(FileSystemError::CorruptState {
+                    reason: "independent filesystem snapshot catalog entry does not match snapshot state",
+                });
+            }
+            let snapshot_dataset_id =
+                crate::snapshot::snapshot_record_dataset_id_for_dataset(record, dataset_id);
+            let previous_typed_root = self.store.load_snapshot_root(snapshot_dataset_id)?;
+            let expected_typed_root =
+                crate::snapshot::snapshot_record_typed_root_for_dataset(record, dataset_id)?;
+            if previous_typed_root != expected_typed_root {
+                return Err(FileSystemError::CorruptState {
+                    reason:
+                        "independent filesystem typed snapshot root does not match snapshot state",
+                });
+            }
+            let _ = crate::snapshot::snapshot_record_traversal_root(record)?;
+            let captured_root = crate::root_commit_from_summary(&record.root);
+            let captured_state = crate::load_state_from_transaction_pool_for_dataset(
+                self.store.pool(),
+                dataset_id,
+                &captured_root,
+                self.root_authentication_key,
+            )?;
+            expected_catalog_names.insert(
+                crate::snapshot::snapshot_record_catalog_name_for_dataset(record, dataset_path),
+            );
+            snapshots.push(DeviceLifecycleSnapshotState {
+                name: record.name.clone(),
+                dataset_id: snapshot_dataset_id,
+                previous_typed_root,
+                captured_state,
+                captured_root,
+            });
+        }
+
+        for (path, _, dataset_type, _, _, _) in self.dataset_catalog().list_all() {
+            if dataset_type == DatasetType::Snapshot
+                && self.dataset_catalog().lineage_parent(&path).map_err(|_| {
+                    FileSystemError::CorruptState {
+                        reason: "device lifecycle could not inspect independent snapshot lineage",
+                    }
+                })? == Some(dataset_id)
+                && !expected_catalog_names.contains(&path)
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "independent filesystem catalog contains an orphan snapshot entry",
+                });
+            }
+        }
+        Ok(snapshots)
     }
 
     fn reconcile_mounted_snapshot_receipts(
@@ -4051,43 +4130,178 @@ impl LocalFileSystem {
     ) -> crate::Result<u64> {
         let mut total_replacements = 0_u64;
         for filesystem in filesystems {
+            let reconcile = (|| {
+                let (snapshot_rewrites, snapshot_replacements) =
+                    self.reconcile_unmounted_filesystem_snapshot_receipts(filesystem)?;
+                let (current_replacements, obsolete_manifests) =
+                    Self::reconcile_relocated_content_receipts_for_state(
+                        self.store.pool_mut(),
+                        &mut filesystem.state,
+                    )?;
+                if current_replacements > 0 {
+                    // Queue predecessor manifests before publishing the
+                    // successor root. The current canonical root keeps them
+                    // protected if a crash occurs here; after publication the
+                    // durable queue owns the exact now-unreachable objects.
+                    self.persist_device_lifecycle_reclaim_queue(
+                        filesystem.state.dataset_id(),
+                        &obsolete_manifests,
+                    )?;
+                }
+                if current_replacements == 0 && snapshot_rewrites.is_empty() {
+                    return Ok(0);
+                }
+
+                let transaction_id = crate::next_mounted_commit_transaction_id(
+                    filesystem.state.generation,
+                    &filesystem.root.summary(),
+                )?;
+                filesystem.root =
+                    crate::persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
+                        &mut self.store,
+                        &filesystem.state,
+                        transaction_id,
+                        self.root_authentication_key,
+                        &snapshot_rewrites,
+                    )?;
+                self.store.pool_mut().sync_all()?;
+                let _ = crate::load_canonical_committed_state_for_dataset(
+                    &self.store,
+                    filesystem.state.dataset_id(),
+                    self.root_authentication_key,
+                )?;
+                Ok(current_replacements.saturating_add(snapshot_replacements))
+            })();
+            match reconcile {
+                Ok(replacements) => {
+                    total_replacements = total_replacements.saturating_add(replacements);
+                }
+                Err(error) => {
+                    self.store.discard_metadata_candidate();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(total_replacements)
+    }
+
+    fn reconcile_unmounted_filesystem_snapshot_receipts(
+        &mut self,
+        filesystem: &mut DeviceLifecycleFilesystemState,
+    ) -> crate::Result<(BTreeMap<DatasetId, tidefs_pool_runtime::SnapshotRoot>, u64)> {
+        let mut migrated = Vec::new();
+        let mut total_replacements = 0_u64;
+        for snapshot in &mut filesystem.snapshots {
             let (replacement_count, obsolete_manifests) =
                 Self::reconcile_relocated_content_receipts_for_state(
                     self.store.pool_mut(),
-                    &mut filesystem.state,
+                    &mut snapshot.captured_state,
                 )?;
             if replacement_count == 0 {
                 continue;
             }
 
-            // Queue predecessor manifests before publishing the successor
-            // root. The current canonical root keeps them protected if a
-            // crash occurs here; after publication the durable queue owns the
-            // exact now-unreachable objects. No second filesystem or Pool
-            // owner is opened for this transition.
             self.persist_device_lifecycle_reclaim_queue(
-                filesystem.state.dataset_id(),
+                snapshot.captured_state.dataset_id(),
                 &obsolete_manifests,
             )?;
             let transaction_id = crate::next_mounted_commit_transaction_id(
-                filesystem.state.generation,
-                &filesystem.root.summary(),
+                snapshot.captured_state.generation,
+                &snapshot.captured_root.summary(),
             )?;
-            filesystem.root = crate::persist_state_with_runtime_at_transaction(
-                &mut self.store,
-                &filesystem.state,
+            let signed_root = crate::prepare_state_with_pool_at_transaction(
+                self.store.pool_mut(),
+                &snapshot.captured_state,
                 transaction_id,
                 self.root_authentication_key,
             )?;
-            self.store.pool_mut().sync_all()?;
-            let _ = crate::load_canonical_committed_state_for_dataset(
-                &self.store,
-                filesystem.state.dataset_id(),
-                self.root_authentication_key,
+            let root_bytes = crate::encoding::encode_root_commit(&signed_root);
+            let source_reference = self.store.prepare_snapshot_source_root(
+                snapshot.captured_state.dataset_id(),
+                tidefs_pool_runtime::DatasetRootKind::Filesystem,
+                signed_root.generation,
+                &root_bytes,
             )?;
+            let next_typed_root = tidefs_pool_runtime::SnapshotRoot::new(
+                snapshot.previous_typed_root.snapshot_generation,
+                source_reference,
+            )?;
+            migrated.push((
+                snapshot.name.clone(),
+                snapshot.dataset_id,
+                snapshot.previous_typed_root,
+                snapshot.captured_root.summary(),
+                signed_root.summary(),
+                next_typed_root,
+            ));
             total_replacements = total_replacements.saturating_add(replacement_count);
         }
-        Ok(total_replacements)
+
+        if migrated.is_empty() {
+            return Ok((BTreeMap::new(), 0));
+        }
+
+        filesystem.state.generation = filesystem.state.generation.saturating_add(1).max(1);
+        let source_dataset_id = filesystem.state.dataset_id();
+        let mut rewrites = BTreeMap::new();
+        for (
+            name,
+            snapshot_dataset_id,
+            previous_typed_root,
+            previous_source_root,
+            next_source_root,
+            next_typed_root,
+        ) in migrated
+        {
+            let previous_record = filesystem.state.snapshots.get(&name).cloned().ok_or(
+                FileSystemError::CorruptState {
+                    reason: "independent filesystem snapshot record disappeared after preflight",
+                },
+            )?;
+            if previous_record.root != previous_source_root
+                || crate::snapshot::snapshot_record_dataset_id_for_dataset(
+                    &previous_record,
+                    source_dataset_id,
+                ) != snapshot_dataset_id
+                || crate::snapshot::snapshot_record_typed_root_for_dataset(
+                    &previous_record,
+                    source_dataset_id,
+                )? != previous_typed_root
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "independent filesystem snapshot authority changed after preflight",
+                });
+            }
+            let mut next_record = previous_record;
+            next_record.root = next_source_root;
+            if crate::snapshot::snapshot_record_typed_root_for_dataset(
+                &next_record,
+                source_dataset_id,
+            )? != next_typed_root
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "independent filesystem snapshot successor changed before publication",
+                });
+            }
+            crate::snapshot::reconcile_snapshot_record_catalog_entry(
+                self.dataset_catalog_mut()?,
+                &next_record,
+                &filesystem.dataset_path,
+                source_dataset_id,
+            )?;
+            filesystem.state.snapshots.insert(name, next_record);
+            if rewrites
+                .insert(snapshot_dataset_id, previous_typed_root)
+                .is_some()
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "independent filesystem snapshot predecessor was duplicated",
+                });
+            }
+        }
+        filesystem.state.dirty_inodes.insert(ROOT_INODE_ID);
+        filesystem.state.dirty_dirs.insert(ROOT_INODE_ID);
+        Ok((rewrites, total_replacements))
     }
 
     fn plan_relocated_content_receipts(
@@ -9522,6 +9736,91 @@ mod tests {
             .pool()
             .pending_device_removal_path()
             .expect("inspect removal marker")
+            .is_none());
+    }
+
+    #[test]
+    fn live_device_remove_refuses_corrupt_independent_snapshot_before_topology_mutation() {
+        let (engine, root, devices) = temp_fs_with_block_devices(2);
+        let independent_dataset_id = DatasetId::from_bytes([0xD6; 16]);
+        engine
+            .fs
+            .borrow_mut()
+            .create_filesystem_dataset(
+                "other",
+                independent_dataset_id,
+                Vec::new(),
+                DatasetFlags::default_create(),
+                SyncGuarantee::Local,
+            )
+            .expect("create independent snapshot corruption filesystem");
+        drop(engine);
+
+        let metadata = root.path().join("metadata");
+        let mut independent = open_named_test_filesystem(
+            &metadata,
+            &devices,
+            "tidefs",
+            tidefs_local_object_store::pool::PoolRedundancyPolicy::default(),
+            "other",
+        );
+        independent
+            .create_snapshot("corrupt-independent")
+            .expect("create independent snapshot corruption fixture");
+        let record = independent
+            .state
+            .snapshots
+            .get(b"corrupt-independent".as_slice())
+            .expect("independent snapshot record exists");
+        let snapshot_dataset_id =
+            crate::snapshot::snapshot_record_dataset_id_for_dataset(record, independent_dataset_id);
+        drop(independent);
+
+        let filesystem = LocalFileSystem::open_with_block_devices(
+            &metadata,
+            &devices,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("reopen root owner before independent snapshot corruption");
+        let engine = VfsLocalFileSystem::new(filesystem);
+        {
+            let mut filesystem = engine.fs.borrow_mut();
+            let typed_root_key = filesystem
+                .store
+                .dataset_root(snapshot_dataset_id)
+                .expect("independent snapshot has canonical typed root")
+                .object_key;
+            assert!(filesystem
+                .store
+                .pool_mut()
+                .delete(DeviceIoClass::Data, typed_root_key)
+                .expect("delete independent snapshot typed-root fixture object"));
+            filesystem
+                .store
+                .pool_mut()
+                .sync_all()
+                .expect("sync corrupt independent snapshot fixture");
+        }
+
+        let refusal = live_device_admin(
+            &engine,
+            "remove",
+            json!({
+                "device_path": devices[1].display().to_string(),
+                "force": false,
+            }),
+            true,
+        );
+        assert_eq!(refusal["ok"], false, "{refusal}");
+        assert_eq!(engine.fs.borrow().store.pool().stats().device_count, 2);
+        assert!(engine
+            .fs
+            .borrow()
+            .store
+            .pool()
+            .pending_device_removal_path()
+            .expect("inspect independent corruption removal marker")
             .is_none());
     }
 
