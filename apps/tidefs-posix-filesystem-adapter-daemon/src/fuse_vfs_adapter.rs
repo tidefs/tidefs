@@ -5107,7 +5107,14 @@ impl FuseVfsAdapter {
         // record_free for shrinkage).
         drop(e);
         if let Some((offset, length)) = data_invalidation_range {
-            self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
+            // This path runs inside the kernel's FUSE SETATTR request.  For a
+            // mapped truncate the kernel still owns the affected page-cache
+            // pages until it receives this reply.  A same-request
+            // FUSE_NOTIFY_INVAL_INODE can therefore wait on those pages and
+            // strand both the notification and the truncate.  Refresh the
+            // daemon mirrors here; the successful SETATTR reply owns the
+            // kernel size and page-cache transition.
+            self.invalidate_daemon_caches_after_engine_data_mutation(ino, offset, length);
         } else {
             self.invalidate_inode_metadata_after_engine_write(ino);
         }
