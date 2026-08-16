@@ -26,7 +26,6 @@ block ordinary implementation work.
 |---|---|
 | `apps/tidefs-posix-filesystem-adapter-daemon` | Selected local FUSE carrier library; the binary retains only development test orchestration and has no local mount runtime. |
 | `apps/tidefsctl` | Selected local operator lifecycle and status carrier. |
-| `apps/tidefs-scrub` | Scrub tool whose useful operator behavior is to consolidate into `tidefsctl`. |
 | `apps/tidefs-block-volume-adapter-daemon` | Retained ublk transport and development backends. It is not a second storage engine or operator lifecycle authority. |
 | `apps/tidefs-storage-node` | Retained cluster transport and ownership substrate. It must consume the shared Pool-backed runtime; its current directory roots and side files are not a clustered storage format. |
 
@@ -516,7 +515,7 @@ tidefs-xattr-storage
 tidefsctl
 ```
 
-### Consolidate: 52 Workspace Packages
+### Consolidate: 51 Workspace Packages
 
 The behavior may be useful to the selected carrier, but it is not an
 independent durable authority. Absorb it into the nearest kept owner, make it a
@@ -558,7 +557,6 @@ tidefs-relocation-governor
 tidefs-relocation-planner
 tidefs-reserve-ledger
 tidefs-schema-codec-posix-filesystem-adapter
-tidefs-scrub
 tidefs-storage-intent-core
 tidefs-storage-intent-read-serving
 tidefs-types-cache-lattice-core

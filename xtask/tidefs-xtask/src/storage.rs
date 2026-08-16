@@ -3116,65 +3116,6 @@ pub fn check_integrity_pipeline_current_workspace() -> Result<(), StorageCheckEr
         })
     }
 }
-/// Verify that the tidefs-scrub object-store data integrity tool exists,
-/// compiles, and is implementation-tracked non-release in the workspace.
-pub fn check_scrub_tool_current_workspace() -> Result<(), StorageCheckError> {
-    let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "#1009 tidefs-scrub tool source check",
-        missing: vec!["could not locate workspace root Cargo.toml".to_string()],
-    })?;
-    let mut missing = Vec::new();
-    for rel in [
-        "apps/tidefs-scrub/Cargo.toml",
-        "apps/tidefs-scrub/src/main.rs",
-    ] {
-        check_required_file(&root, rel, &mut missing);
-    }
-    check_source_markers(
-        &root,
-        "apps/tidefs-scrub/src/main.rs",
-        &[
-            "tidefs-scrub",
-            "checksum64",
-            "check_compression_frame",
-            "ObjectOutcome",
-            "ScrubReport",
-            "print_report",
-            "store_root",
-        ],
-        &mut missing,
-    );
-    check_source_markers(&root, "Cargo.toml", &["apps/tidefs-scrub"], &mut missing);
-
-    // Verify BackgroundOrphanReclamation registration at mount.
-    check_required_file(
-        &root,
-        "crates/tidefs-local-filesystem/src/background_orphan_reclamation.rs",
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "crates/tidefs-local-filesystem/src/lib.rs",
-        &[
-            "mod background_orphan_reclamation",
-            "BackgroundOrphanReclamation",
-            "orphan_index: Arc<Mutex<OrphanIndex>>",
-            "pending_orphan_deletions: Arc<Mutex<Vec<u64>>>",
-            "register(Box::new(orphan_reclamation))",
-        ],
-        &mut missing,
-    );
-    if missing.is_empty() {
-        println!("#1009 tidefs-scrub tool ok: implementation-tracked non-release and workspace-integrated");
-        Ok(())
-    } else {
-        Err(StorageCheckError {
-            title: "#1009 tidefs-scrub tool source check",
-            missing,
-        })
-    }
-}
-
 /// Validate the source-owned spacemap allocator API and invariants.
 pub fn check_spacemap_allocator_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {

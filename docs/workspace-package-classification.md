@@ -1,6 +1,6 @@
 # Workspace Package Classification
 
-Updated from current Cargo metadata, on-disk manifest discovery, and harness-consumer audit for issue #1974 on 2026-07-12.
+Updated from current Cargo metadata, on-disk manifest discovery, and consumer audit for issue #2540 on 2026-08-16.
 This document is the package-role authority for TideFS workspace selection and TFR-002/TFR-019 reduction.
 It is enforced by `cargo run -p tidefs-xtask -- check-workspace-policy`.
 
@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 163 |
+| Workspace packages | 162 |
 | Explicitly excluded package roots | 4 |
-| Discovered package manifests | 167 |
-| Classified package roots | 167 |
+| Discovered package manifests | 166 |
+| Classified package roots | 166 |
 
 ## TFR-002 Category Mapping
 
@@ -25,7 +25,7 @@ root.
 
 | TFR-002 category | Current roles | Count | Boundary |
 | --- | --- | ---: | --- |
-| `product` | `product-code`, `adapter-operator` | 144 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
+| `product` | `product-code`, `adapter-operator` | 143 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
 | `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 22 | Repo policy tooling, CI/developer support, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
 | `third-party` | `vendored-third-party` | 1 | Vendored or forked upstream code carried with separate provenance. |
 | `delete` | `scaffold-transitional`, `archive-delete-candidate` | 0 | No current package root is classified for deletion. Both roles are retired and rejected by `check-workspace-policy`; any future dead-scaffolding candidate must reference TFR-002/TFR-013 evidence and an issue-backed delete/archive plan. |
@@ -53,7 +53,7 @@ holding area.
 | Role | Count |
 | --- | ---: |
 | `product-code` | 130 |
-| `adapter-operator` | 14 |
+| `adapter-operator` | 13 |
 | `policy-tooling` | 8 |
 | `proof-harness` | 10 |
 | `vendored-third-party` | 1 |
@@ -72,7 +72,6 @@ one-line justification. The table keeps the five machine-checked columns so
 | --- | --- | --- | --- | --- |
 | `apps/tidefs-block-volume-adapter-daemon` | `tidefs-block-volume-adapter-daemon` | `workspace-member` | `adapter-operator` | operator entrypoint for the ublk adapter; live runtime validation required before release claims. |
 | `apps/tidefs-posix-filesystem-adapter-daemon` | `tidefs-posix-filesystem-adapter-daemon` | `workspace-member` | `adapter-operator` | operator entrypoint and FUSE validation harness; preview mount surface only. |
-| `apps/tidefs-scrub` | `tidefs-scrub` | `workspace-member` | `adapter-operator` | operator entrypoint for scrub/repair plumbing; not release proof by itself. |
 | `apps/tidefs-storage-node` | `tidefs-storage-node` | `workspace-member` | `adapter-operator` | operator entrypoint for storage-node experiments; cluster authority remains TFR-017. |
 | `apps/tidefsctl` | `tidefsctl` | `workspace-member` | `adapter-operator` | operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open. |
 | `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `workspace-member` | `product-code` | live entrypoint for anti-entropy audit admission; issue #815 evidence covers Merkle proof validation, comparison-history accounting, repair-trigger receipts, SuspectLog feeding, and scrub admission while release claims remain limited by the review register. |
@@ -244,7 +243,6 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 
 | Package root | Package | Role | Disposition |
 | --- | --- | --- | --- |
-| `apps/tidefs-scrub` | `tidefs-scrub` | `adapter-operator` | operator entrypoint for scrub/repair plumbing; not release proof by itself. |
 | `apps/tidefs-storage-node` | `tidefs-storage-node` | `adapter-operator` | operator entrypoint for storage-node experiments; cluster authority remains TFR-017. |
 | `apps/tidefsctl` | `tidefsctl` | `adapter-operator` | operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open. |
 | `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `product-code` | live entrypoint for anti-entropy audit admission; zero reverse dependencies reflect service-integration boundaries, not placeholder status; issue #815 records focused Merkle-to-repair validation evidence. |

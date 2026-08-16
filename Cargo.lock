@@ -3322,22 +3322,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tidefs-scrub"
-version = "0.421.0"
-dependencies = [
- "lz4_flex",
- "serde",
- "serde_json",
- "tempfile",
- "tidefs-checksum-tree",
- "tidefs-compression",
- "tidefs-local-filesystem",
- "tidefs-local-object-store",
- "tidefs-scrub-core",
- "zstd",
-]
-
-[[package]]
 name = "tidefs-scrub-core"
 version = "0.421.0"
 dependencies = [

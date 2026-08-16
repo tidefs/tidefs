@@ -253,7 +253,7 @@ non-overlapping GitHub issues:
   `crates/tidefs-transport`;
 - #675 owns local read, degraded-read, scrub, repair, and rebuild consumers:
   `crates/tidefs-local-filesystem`, `crates/tidefs-scrub-core`,
-  `apps/tidefs-scrub`, and `crates/tidefs-rebuild-planner`;
+  and `crates/tidefs-rebuild-planner`;
 - #676 owns rebake/reclaim trim gating and replay:
   `crates/tidefs-local-object-store`, `crates/tidefs-reclaim`, and
   `crates/tidefs-reclaim-queue-core`.

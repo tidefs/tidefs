@@ -1268,12 +1268,6 @@ fn main() {
                 process::exit(1);
             }
         }
-        Some("check-scrub-tool" | "check-object-store-scrub") => {
-            if let Err(err) = storage::check_scrub_tool_current_workspace() {
-                eprintln!("{err}");
-                process::exit(1);
-            }
-        }
         Some("check-spacemap-allocator" | "check-spacemap") => {
             if let Err(err) = storage::check_spacemap_allocator_current_workspace() {
                 eprintln!("{err}");
@@ -2339,7 +2333,6 @@ fn print_summary() {
     println!("transaction_model_check_command=check-transaction-model");
     println!("integrity_pipeline_check_command=check-integrity-pipeline");
     println!("posix_scoreboard_check_command=check-posix-scoreboard");
-    println!("scrub_tool_check_command=check-scrub-tool");
     println!("spacemap_allocator_check_command=check-spacemap-allocator");
     println!("orphan_index_check_command=check-orphan-index");
     println!("posix_acl_check_command=check-posix-acl");

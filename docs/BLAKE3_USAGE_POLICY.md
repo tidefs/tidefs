@@ -73,8 +73,8 @@ Where a scrub path verifies BLAKE3-256 production-integrity trailers, it must us
 the same domain-separated digest rules as the write/read path. This is not a
 scrub self-heal or repair guarantee.
 
-Relevant surfaces: `apps/tidefs-scrub`, `tidefs-scrub-core`,
-`tidefs-compaction`.
+Relevant surfaces: `apps/tidefsctl`, `tidefs-local-filesystem`,
+`tidefs-local-object-store`, `tidefs-scrub-core`, `tidefs-compaction`.
 
 ### 2.5 Erasure-Coded Shard Verification
 
