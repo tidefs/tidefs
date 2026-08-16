@@ -48,14 +48,11 @@ pub struct Statvfs {
 // ---------------------------------------------------------------------------
 
 impl LocalFileSystem {
-    /// Compute POSIX filesystem statistics from the capacity authority.
+    /// Compute POSIX filesystem statistics from dataset and Pool capacity.
     ///
-    /// Derives block counters from [`CapacityAuthority::derive_statfs`]
-    /// which is the single production source for used/free/reserved/pending
-    /// byte counters. Lower physical-pool free, reclaimable, and watermark
-    /// fields are not POSIX statvfs availability claims; mounted statvfs
-    /// observes the sanitized authority projection. Inode counts are sourced
-    /// from the pool object count and the allocator policy inode ceiling.
+    /// Derives logical block counters from the filesystem dataset projection,
+    /// then clamps them to the live Pool-owned physical capacity. Inode counts
+    /// come from the same live Pool view and the dataset inode ceiling.
     ///
     /// # Errors
     ///
@@ -64,8 +61,8 @@ impl LocalFileSystem {
     pub fn statvfs(&self) -> crate::Result<Statvfs> {
         // Pool object count for inode statistics (the authority does not
         // own inode accounting; that belongs to the inode table).
-        let pool = self.store.pool().pool_stats();
-        let inode_total = pool.object_count;
+        let physical = self.pool_runtime().physical_capacity()?;
+        let inode_total = physical.object_count;
         let inode_cap = self.allocator_policy.inode_capacity;
         let inode_free = if inode_cap > 0 {
             inode_cap.saturating_sub(inode_total)
@@ -74,17 +71,23 @@ impl LocalFileSystem {
         };
 
         let cs =
-            self.capacity_authority()
+            self.dataset_capacity()
                 .derive_statfs(inode_cap, inode_free, MAX_NAME_BYTES as u32);
 
         let block_size = u64::from(cs.block_size);
-        let pool_capacity_bytes = if pool.total_capacity_bytes > 0 {
-            pool.total_capacity_bytes
+        let physical_free_blocks = if block_size == 0 {
+            0
         } else {
-            self.capacity_authority().total_bytes()
+            physical.available_bytes / block_size
         };
-        let (blocks, bfree, bavail) =
-            self.clamp_statfs_blocks(cs, pool_capacity_bytes, cs.free_blocks, cs.avail_blocks);
+        let (blocks, bfree, bavail) = self.clamp_statfs_blocks(
+            cs,
+            self.dataset_capacity()
+                .total_bytes()
+                .min(physical.total_bytes),
+            cs.free_blocks.min(physical_free_blocks),
+            cs.avail_blocks.min(physical_free_blocks),
+        );
         Ok(Statvfs {
             bsize: block_size,
             frsize: block_size,

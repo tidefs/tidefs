@@ -69,6 +69,15 @@ pub enum PoolRuntimeError {
     ExternalMutationAuthorityExpired {
         operation: &'static str,
     },
+    PhysicalNoSpace {
+        requested_bytes: u64,
+        available_bytes: u64,
+    },
+    InvalidCapacityGeometry {
+        total_bytes: u64,
+        used_bytes: u64,
+        available_bytes: u64,
+    },
     Bounds,
     Io {
         operation: &'static str,
@@ -109,6 +118,21 @@ impl fmt::Display for PoolRuntimeError {
                 f,
                 "external mutation authority expired before {operation}; reopen with current authority"
             ),
+            Self::PhysicalNoSpace {
+                requested_bytes,
+                available_bytes,
+            } => write!(
+                f,
+                "Pool has {available_bytes} physical bytes available for a {requested_bytes}-byte allocation"
+            ),
+            Self::InvalidCapacityGeometry {
+                total_bytes,
+                used_bytes,
+                available_bytes,
+            } => write!(
+                f,
+                "Pool capacity geometry is invalid: total={total_bytes}, used={used_bytes}, available={available_bytes}"
+            ),
             Self::Bounds => f.write_str("volume I/O is outside committed capacity"),
             Self::Io {
                 operation,
@@ -142,6 +166,18 @@ impl From<CatalogError> for PoolRuntimeError {
 }
 
 pub type Result<T> = std::result::Result<T, PoolRuntimeError>;
+
+/// Caller-neutral live physical capacity of the opened Pool.
+///
+/// This is a read-only view of the allocator-owned counters. It is not a
+/// second ledger: every call is reconstructed directly from [`Pool`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PoolPhysicalCapacity {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    pub object_count: u64,
+}
 
 /// Process-local monotonic deadline shared with an external writer authority.
 ///
@@ -583,6 +619,58 @@ impl PoolRuntime {
     #[must_use]
     pub fn pool(&self) -> &Pool {
         &self.pool
+    }
+
+    /// Return the current physical capacity owned by the opened Pool.
+    ///
+    /// Filesystem and volume carriers sharing this runtime therefore observe
+    /// the same allocator state without copying counters into either dataset
+    /// engine.
+    pub fn physical_capacity(&self) -> Result<PoolPhysicalCapacity> {
+        let stats = self.pool.pool_stats();
+        if stats.used_bytes > stats.total_capacity_bytes
+            || stats.available_bytes != stats.total_capacity_bytes.saturating_sub(stats.used_bytes)
+        {
+            return Err(PoolRuntimeError::InvalidCapacityGeometry {
+                total_bytes: stats.total_capacity_bytes,
+                used_bytes: stats.used_bytes,
+                available_bytes: stats.available_bytes,
+            });
+        }
+        Ok(PoolPhysicalCapacity {
+            total_bytes: stats.total_capacity_bytes,
+            used_bytes: stats.used_bytes,
+            available_bytes: stats.available_bytes,
+            object_count: stats.object_count,
+        })
+    }
+
+    /// Refuse a physical allocation against the same Pool that will perform
+    /// it. The shared mounted owner serializes callers, so no parallel
+    /// reservation counter is needed between this check and the bounded Pool
+    /// operation. The Pool write path remains the final exact allocator gate.
+    pub fn ensure_physical_capacity(&self, requested_bytes: u64) -> Result<()> {
+        let capacity = self.physical_capacity()?;
+        if requested_bytes == 0 {
+            return Ok(());
+        }
+        if requested_bytes > capacity.available_bytes {
+            return Err(PoolRuntimeError::PhysicalNoSpace {
+                requested_bytes,
+                available_bytes: capacity.available_bytes,
+            });
+        }
+        match self
+            .pool
+            .check_write_admission(DeviceIoClass::Data, requested_bytes)
+        {
+            Ok(()) => Ok(()),
+            Err(StoreError::NoSpace) => Err(PoolRuntimeError::PhysicalNoSpace {
+                requested_bytes,
+                available_bytes: capacity.available_bytes,
+            }),
+            Err(error) => Err(PoolRuntimeError::Store(error)),
+        }
     }
 
     /// Mutable raw Pool access for dataset-owned objects. Callers must publish
@@ -2047,6 +2135,9 @@ impl PoolVolume {
         let block_count =
             u64::try_from(payload.len() / block_size).map_err(|_| PoolRuntimeError::Bounds)?;
         self.check_range(start_block, block_count)?;
+        runtime.ensure_physical_capacity(
+            u64::try_from(payload.len()).map_err(|_| PoolRuntimeError::Bounds)?,
+        )?;
         let byte_offset = usize::try_from(start_block)
             .ok()
             .and_then(|block| block.checked_mul(block_size))
@@ -2121,6 +2212,17 @@ impl PoolVolume {
             runtime.pool_mut().sync_all()?;
             return Ok(());
         }
+
+        let staged_data_bytes = self
+            .dirty_chunks
+            .values()
+            .try_fold(0_u64, |total, staged| {
+                let bytes = staged
+                    .as_ref()
+                    .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                total.checked_add(bytes).ok_or(PoolRuntimeError::Bounds)
+            })?;
+        runtime.ensure_physical_capacity(staged_data_bytes)?;
 
         let next_volume_generation = next_generation(self.root.generation)?;
         let mut map_root = self.root.map_root;
@@ -3203,6 +3305,52 @@ mod tests {
             )
             .unwrap();
         id
+    }
+
+    #[test]
+    fn pool_capacity_tracks_volume_publication_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        create_volume(&mut owner, "vol", 61);
+        let before = owner.physical_capacity().unwrap();
+
+        let mut volume = owner.open_volume("vol").unwrap();
+        volume
+            .write_blocks(&owner, 0, &vec![0x5a; 2 * VOLUME_CHUNK_SIZE])
+            .unwrap();
+        volume.flush(&mut owner).unwrap();
+
+        let committed = owner.physical_capacity().unwrap();
+        assert_eq!(committed.total_bytes, before.total_bytes);
+        assert!(committed.used_bytes > before.used_bytes);
+        assert!(committed.available_bytes < before.available_bytes);
+
+        let reopened = reopen(owner);
+        assert_eq!(reopened.physical_capacity().unwrap(), committed);
+    }
+
+    #[test]
+    fn pool_capacity_refusal_is_typed_and_preserves_root_and_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        let volume_id = create_volume(&mut owner, "vol", 62);
+        let root_before = *owner.dataset_root(volume_id).unwrap();
+        let capacity_before = owner.physical_capacity().unwrap();
+        owner.pool_mut().set_low_watermark_bytes(u64::MAX);
+        owner.ensure_physical_capacity(0).unwrap();
+
+        let mut volume = owner.open_volume("vol").unwrap();
+        assert!(matches!(
+            volume.write_blocks(&owner, 0, &[0x6b; 4096]),
+            Err(PoolRuntimeError::PhysicalNoSpace {
+                requested_bytes: 4096,
+                ..
+            })
+        ));
+
+        assert_eq!(*owner.dataset_root(volume_id).unwrap(), root_before);
+        assert_eq!(owner.physical_capacity().unwrap(), capacity_before);
+        assert_eq!(volume.read_blocks(&owner, 0, 1).unwrap(), vec![0; 4096]);
     }
 
     fn reopen(runtime: PoolRuntime) -> PoolRuntime {

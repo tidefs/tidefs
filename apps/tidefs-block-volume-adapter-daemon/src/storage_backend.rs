@@ -834,6 +834,7 @@ fn validate_clustered_lease(
 fn map_pool_runtime_error(error: tidefs_pool_runtime::PoolRuntimeError) -> BackendError {
     match error {
         tidefs_pool_runtime::PoolRuntimeError::Bounds => BackendError::OutOfBounds,
+        tidefs_pool_runtime::PoolRuntimeError::PhysicalNoSpace { .. } => BackendError::NoSpace,
         tidefs_pool_runtime::PoolRuntimeError::Store(
             tidefs_local_object_store::StoreError::NoSpace,
         ) => BackendError::NoSpace,

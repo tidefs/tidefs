@@ -450,7 +450,7 @@ fn open_with_capacity_sizes_hidden_regular_file_dev_backing() {
 }
 
 #[test]
-fn mounted_capacity_projection_consumes_committed_accounting_not_pool_free_claims() {
+fn mounted_capacity_combines_dataset_accounting_with_live_pool_capacity() {
     let root = temp_root("mounted-capacity-projection");
     let chunk = content_chunk_size() as u64;
     let capacity = chunk * 8;
@@ -474,17 +474,17 @@ fn mounted_capacity_projection_consumes_committed_accounting_not_pool_free_claim
         consumed > 0,
         "test setup must commit consumed bytes through SpaceAccounting"
     );
-    let authority_free = fs.capacity_authority().free_bytes();
-    let projection = fs.derive_pool_physical_counters();
+    let dataset_free = fs.dataset_capacity().free_bytes();
+    let projection = fs.derive_dataset_capacity_counters();
 
     assert_eq!(projection.phys_total_bytes, capacity);
     assert_eq!(
         projection.phys_free_bytes, capacity,
-        "physical input uses the admitted capacity ceiling, not a free-space mirror"
+        "dataset accounting input uses its logical capacity ceiling"
     );
     assert_ne!(
-        projection.phys_free_bytes, authority_free,
-        "non-empty committed consumption must keep phys_free_bytes from mirroring mounted free"
+        projection.phys_free_bytes, dataset_free,
+        "committed dataset consumption must keep the ceiling from mirroring logical free"
     );
     assert_eq!(
         projection.phys_free_segments,
@@ -515,9 +515,22 @@ fn mounted_capacity_projection_consumes_committed_accounting_not_pool_free_claim
         .pool_mut()
         .statfs_for_dataset(ROOT_DATASET_ID)
         .expect("committed root dataset projection");
-    assert_eq!(store_projection.blocks, mounted_after.blocks);
-    assert_eq!(store_projection.blocks_free, mounted_after.bfree);
-    assert_eq!(store_projection.blocks_avail, mounted_after.bavail);
+    let physical = fs
+        .pool_runtime()
+        .physical_capacity()
+        .expect("live Pool physical capacity");
+    assert_eq!(
+        mounted_after.blocks,
+        capacity / StatfsResult::DEFAULT_BLOCK_SIZE
+    );
+    assert!(
+        mounted_after.bfree <= physical.available_bytes / StatfsResult::DEFAULT_BLOCK_SIZE,
+        "mounted free space must never exceed live Pool availability"
+    );
+    assert!(
+        store_projection.blocks >= mounted_after.blocks,
+        "the Pool projection may exceed the more restrictive dataset ceiling"
+    );
 
     cleanup(&root);
 }

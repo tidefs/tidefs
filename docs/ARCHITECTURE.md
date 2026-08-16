@@ -102,24 +102,28 @@ The selected dependency and authority direction is:
    topology, import-lock, activation, and export admission. They do not select
    dataset roots, replay dataset transactions, or serve data.
 2. `tidefs-local-object-store::Pool` owns physical device/object I/O,
-   placement, receipts, allocation, integrity, and durable sync. It remains
-   unaware of filesystem paths, inodes, volume geometry, FUSE, ublk, or cluster
-   membership semantics.
+   placement, receipts, allocation, live physical capacity/admission, integrity,
+   and durable sync. It remains unaware of filesystem paths, inodes, volume
+   geometry, FUSE, ublk, or cluster membership semantics.
 3. One shared Pool-backed dataset runtime owns the opened `Pool`, pool identity
    and properties, the canonical `DatasetCatalog`, the table of typed dataset
-   roots, pool-wide capacity/reserve state, transaction publication, replay
-   frontier, pin/drain state, and orderly close. This boundary is factored from
-   the proven Pool-backed publication and recovery machinery currently
-   concentrated in `tidefs-local-filesystem`; it is not a parallel engine.
+   roots, a caller-neutral live view of the Pool-owned capacity, transaction
+   publication, replay frontier, pin/drain state, and orderly close. It does not
+   copy the Pool allocator counters into a second ledger. This boundary is
+   factored from the proven Pool-backed publication and recovery machinery; it
+   is not a parallel engine.
 4. `FilesystemDatasetEngine` owns inode, directory, extent, POSIX metadata,
-   and filesystem snapshot semantics for one `DatasetId`. It is physically
+   filesystem logical capacity/quota/reserve/statfs projection, and filesystem
+   snapshot semantics for one `DatasetId`. Physical admission and visible free
+   space are bounded by the live `PoolRuntime` view. The engine is physically
    separate from `PoolRuntime` inside `PoolDatasetOwner`; `VfsLocalFileSystem`
    and FUSE remain projections of that engine.
-5. A volume dataset engine owns exact logical capacity, logical and physical
-   block geometry, sparse block extents, read/write, flush/FUA ordering,
-   discard, resize, and volume snapshot semantics for one `DatasetId`. It uses
-   the same Pool transaction/root authority as filesystem datasets. ublk and a
-   future kernel block front end remain projections.
+5. A volume dataset engine owns exact logical capacity, block geometry, sparse
+   block extents, read/write, flush/FUA ordering, discard, resize, and volume
+   snapshot semantics for one `DatasetId`. Its immutable writes and publication
+   use the same Pool physical allocator and transaction/root authority as
+   filesystem datasets. ublk and a future kernel block front end remain
+   projections.
 6. Local mode invokes the shared runtime directly and has no membership,
    remote lease, remote leader, or network dependency. Clustered mode wraps
    the same catalog and dataset engines with committed membership, ownership
@@ -283,8 +287,10 @@ flush/FUA continuity.
   runtime consumers.
 - **Consolidate:** keep catalog persistence and pool-wide properties in
   `PoolRuntime`, and keep mounted live-owner and block routing on the one
-  `SharedPoolDatasetOwner`; continue consolidating capacity, pin, reclaim,
-  transaction, and teardown decisions duplicated by front ends. Any future clustered dataset
+  `SharedPoolDatasetOwner`; expose the one Pool-owned physical capacity through
+  that runtime while retaining only dataset-specific quota/statfs projections;
+  continue consolidating pin, reclaim, transaction, and teardown decisions
+  duplicated by front ends. Any future clustered dataset
   lifecycle must mutate the real durable `PoolRuntime` catalog under committed
   lease and fence authority; clustered mode must not introduce a mirror or an
   opaque membership payload as a second catalog authority.
@@ -327,6 +333,7 @@ device launch, or second directory/file backend does not satisfy the slice.
 | Import for mount | `apps/tidefsctl/src/commands/mount.rs`, `crates/tidefs-pool-import/src/lib.rs` | Selects the highest complete redundant label family, validates exact topology-roster and lifecycle agreement plus feature, encryption, and pool-state agreement; acquires the exact import lock; opens devices at the selected copy offsets; activates writable ownership without dropping label extensions; reports removal state; and retains matching export/release. It does not select a fixed-region root, apply `min_epoch`, replay transactions, mount a placeholder namespace, or initialize VRBT. | Keep as mounted device admission only. Pool-backed filesystem root selection and replay belong below `run_mount`; full explicit `pool_import` retains its separate recovery behavior. |
 | Carrier open | `apps/tidefs-posix-filesystem-adapter-daemon/src/lib.rs::run_mount` | Opens `PoolDatasetOwner` on the runtime metadata directory plus the devices, resolves the filesystem dataset, applies the selected sync, timestamp, capacity, writeback, maintenance, transform, and validation controls, shares it through one `SharedPoolDatasetOwner`, wraps the filesystem projection in the one VFS/FUSE session, and publishes that same owner live. | This is the only local mount runtime implementation. |
 | Object authority | `crates/tidefs-local-object-store/src/pool/mod.rs` | Opens the same labeled devices as a `Pool`, owns placement/device I/O, and persists object records and pool labels. | Keep as the only object/device I/O authority. |
+| Capacity | `Pool::pool_stats`, `PoolRuntime::physical_capacity`, filesystem dataset capacity projection | The opened `Pool` owns exact live physical use and final write refusal across filesystem and volume objects. `PoolRuntime` exposes that state without another counter ledger. Filesystem statfs, quota, and admission use the restrictive combination of their logical dataset projection and the live Pool view. Mounted filesystem and volume operations serialize through `SharedPoolDatasetOwner`, so a committed volume write is visible to the next filesystem decision. | Keep one physical owner at Pool; never reconstruct physical free space from filesystem logical counters. |
 | Filesystem root/recovery | `crates/tidefs-local-filesystem/src/{lib,recovery}.rs` | Selects Pool-backed root-slot records, validates content through Pool receipts, replays intent and commit-group state, and constructs live filesystem state. | Keep and focus as the single mounted transaction/root/recovery authority. |
 | Dataset/inode/namespace | `FilesystemDatasetEngine`, `FileSystemState`, `DatasetInodeAuthority`, FUSE maps | The filesystem engine owns durable dataset, root, inode, and directory state beside the neutral `PoolRuntime`. `VfsLocalFileSystem` has no second inode projection, and the selected adapter has no second namespace attachment. FUSE lookup/forget references remain adapter-local maps. The former standalone namespace and inode-table packages plus their validation-only or duplicate persistence tests had no mounted consumer and were removed. | Keep every durable decision in the dataset authority; keep kernel-reference state as an adapter-local derived projection. |
 | VFS/FUSE | `vfs_engine_impl.rs`, `fuse_vfs_adapter.rs` | VFS calls local-filesystem for lookup and mutation semantics. The adapter projects engine results, handles, lookup references, caches, replies, and FUSE lifecycle without another namespace owner, merged directory view, or mutation fallback. | Keep VFS as the semantic owner and FUSE as a derived kernel transport projection. |
