@@ -56,6 +56,7 @@ pub mod placement_heal;
 pub mod pool_config;
 pub mod pool_label_bridge;
 pub mod pool_lease_client;
+pub mod pool_lease_session;
 pub mod pool_lease_token;
 pub mod pool_orchestrator;
 pub mod pool_owner_lease;
@@ -107,6 +108,7 @@ pub use pool_config::{
     ClusterPlacementPolicy, ClusterPoolConfig, ClusterRedundancy, FailureDomain, NodeDevice,
 };
 pub use pool_label_bridge::{BridgeError, CLUSTER_POOL_COMPAT, CLUSTER_POOL_INCOMPAT};
+pub use pool_lease_session::{cluster_lease_renewal_at, ClusterLeaseGrant, ClusterLeaseSession};
 pub use pool_lease_token::PoolLeaseToken;
 pub use pool_orchestrator::{
     ClusterPoolOrchestrator, CreateOutcome, ImportOutcome, NodeCreateResult, NodeImportResult,

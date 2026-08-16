@@ -247,16 +247,20 @@ cluster admission, and reopen boundary. It does not translate one format into
 another. Cluster loss or ownership transfer must fence old front ends before a
 new owner serves either dataset type.
 
-The first bounded clustered-block carrier step reuses that same ownership
-boundary: `PoolVolumeBackend::open_clustered` consumes the real committed
-`PoolLeaseToken` and the authority-reported remaining lifetime, verifies the
-exact opened Pool GUID, and installs one process-local monotonic mutation
-deadline in the shared `PoolRuntime`. Volume write, discard/zero, flush, and
-canonical-root publication fail closed after expiry; the block backend also
-refuses reads so a stale projected front end becomes unusable. A successor
-must obtain a higher write fence and independently reopen the named Pool
-volume. This does not yet establish a remote block protocol, ublk failover,
-placement/replication, reserve escrow, or cross-node flush/FUA continuity.
+The bounded clustered-block carrier reuses that same ownership boundary.
+`tidefsctl block attach --cluster` authenticates to the provisioned Pool lease
+authority before import, validates the committed clustered Pool and exact
+owner grant, and opens the named `PoolVolumeBackend` under the
+authority-reported remaining lifetime. The real ublk service loop periodically
+renews that same owner, epoch, lease id, membership slot, and write fence,
+including while clean shutdown drains requests. Renewal loss or expiry fences
+read, write, discard/zero, flush, and canonical-root publication before ublk
+STOP/DEL teardown. Clean shutdown drains and flushes first; both paths fence
+and release the retained lease only after the ublk device can no longer issue
+I/O. A successor must obtain a higher write fence and independently reopen the
+named Pool volume. This does not yet establish a remote block protocol,
+automated ublk failover, placement/replication, reserve escrow, or cross-node
+flush/FUA continuity.
 
 ### Existing Source Disposition For This Architecture
 

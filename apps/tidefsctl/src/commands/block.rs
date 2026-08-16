@@ -20,6 +20,31 @@ use std::sync::Arc;
 use clap::Subcommand;
 use tidefs_vfs_engine::LivePoolAdminArg;
 
+#[cfg(feature = "cluster")]
+use super::cluster_lease::{
+    load_cluster_node_credential, load_cluster_public_identity, TransportPoolLeaseSession,
+};
+#[cfg(feature = "cluster")]
+use tidefs_cluster::{ClusterLeaseGrant, ClusterLeaseSession};
+
+#[cfg(feature = "cluster")]
+#[derive(Debug)]
+struct PendingClusterLease {
+    grant: ClusterLeaseGrant,
+    session: Box<dyn ClusterLeaseSession>,
+}
+
+#[cfg(feature = "cluster")]
+impl PendingClusterLease {
+    fn release(&mut self) -> Result<(), String> {
+        self.session.release(&self.grant.token)
+    }
+
+    fn into_parts(self) -> (ClusterLeaseGrant, Box<dyn ClusterLeaseSession>) {
+        (self.grant, self.session)
+    }
+}
+
 /// Subcommands for the `tidefsctl block` group.
 #[derive(Subcommand, Debug)]
 pub enum BlockCommand {
@@ -43,6 +68,36 @@ pub enum BlockCommand {
         /// Drain deadline in seconds for graceful shutdown
         #[arg(long, default_value_t = 30)]
         drain_deadline_secs: u64,
+
+        /// Acquire and maintain authenticated clustered Pool ownership.
+        #[cfg(feature = "cluster")]
+        #[arg(long, default_value_t = false, requires = "devices")]
+        cluster: bool,
+
+        /// Transport address of the Pool lease authority.
+        #[cfg(feature = "cluster")]
+        #[arg(long, requires = "cluster", required_if_eq("cluster", "true"))]
+        cluster_authority_addr: Option<String>,
+
+        /// Host-local private credential for this block owner node.
+        #[cfg(feature = "cluster")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "cluster",
+            required_if_eq("cluster", "true")
+        )]
+        cluster_node_credential: Option<PathBuf>,
+
+        /// Exact public identity trusted as Pool lease authority.
+        #[cfg(feature = "cluster")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "cluster",
+            required_if_eq("cluster", "true")
+        )]
+        cluster_trusted_authority_identity: Option<PathBuf>,
     },
 
     /// Detach a ublk block device by its numeric device ID
@@ -64,6 +119,14 @@ pub fn handle_block(cmd: BlockCommand) {
             nr_hw_queues,
             queue_depth,
             drain_deadline_secs,
+            #[cfg(feature = "cluster")]
+            cluster,
+            #[cfg(feature = "cluster")]
+            cluster_authority_addr,
+            #[cfg(feature = "cluster")]
+            cluster_node_credential,
+            #[cfg(feature = "cluster")]
+            cluster_trusted_authority_identity,
         } => {
             if let Err(err) = handle_attach(
                 &target,
@@ -71,6 +134,14 @@ pub fn handle_block(cmd: BlockCommand) {
                 nr_hw_queues,
                 queue_depth,
                 drain_deadline_secs,
+                #[cfg(feature = "cluster")]
+                cluster,
+                #[cfg(feature = "cluster")]
+                cluster_authority_addr.as_deref(),
+                #[cfg(feature = "cluster")]
+                cluster_node_credential.as_deref(),
+                #[cfg(feature = "cluster")]
+                cluster_trusted_authority_identity.as_deref(),
             ) {
                 eprintln!("tidefsctl block attach: {err}");
                 process::exit(1);
@@ -96,9 +167,36 @@ fn handle_attach(
     nr_hw_queues: u16,
     queue_depth: u16,
     drain_deadline_secs: u64,
+    #[cfg(feature = "cluster")] cluster: bool,
+    #[cfg(feature = "cluster")] cluster_authority_addr: Option<&str>,
+    #[cfg(feature = "cluster")] cluster_node_credential: Option<&Path>,
+    #[cfg(feature = "cluster")] cluster_trusted_authority_identity: Option<&Path>,
 ) -> Result<(), String> {
     let _guard = super::authz::require_local_only("block attach");
     let target = crate::parser::parse_dataset_target(raw_target)?;
+
+    #[cfg(feature = "cluster")]
+    {
+        if cluster && devices.is_empty() {
+            return Err("--cluster requires explicit --devices Pool media".to_string());
+        }
+        if cluster && cluster_authority_addr.is_none() {
+            return Err("--cluster requires --cluster-authority-addr".to_string());
+        }
+        if cluster && cluster_node_credential.is_none() {
+            return Err("--cluster requires --cluster-node-credential".to_string());
+        }
+        if cluster && cluster_trusted_authority_identity.is_none() {
+            return Err("--cluster requires --cluster-trusted-authority-identity".to_string());
+        }
+        if !cluster
+            && (cluster_authority_addr.is_some()
+                || cluster_node_credential.is_some()
+                || cluster_trusted_authority_identity.is_some())
+        {
+            return Err("cluster trust inputs require --cluster".to_string());
+        }
+    }
 
     let live_args = super::live_owner::live_admin_args([
         ("volume", LivePoolAdminArg::String(target.dataset.clone())),
@@ -124,6 +222,18 @@ fn handle_attach(
             config.pool_name, target.pool
         ));
     }
+    #[cfg(feature = "cluster")]
+    if !cluster {
+        super::live_owner::route_or_refuse_active_for_uuid_with_args(
+            "block",
+            "attach",
+            &target.pool,
+            config.pool_uuid,
+            config.state == tidefs_types_pool_label_core::PoolState::Active,
+            live_args,
+        );
+    }
+    #[cfg(not(feature = "cluster"))]
     super::live_owner::route_or_refuse_active_for_uuid_with_args(
         "block",
         "attach",
@@ -140,9 +250,36 @@ fn handle_attach(
     use tidefs_pool_runtime::PoolRuntime;
     use tidefs_posix_filesystem_adapter_daemon::live_owner::{start_block_owner, LiveOwnerConfig};
 
+    #[cfg(feature = "cluster")]
+    let mut pending_cluster_lease = if cluster {
+        Some(acquire_clustered_block_lease(
+            devices,
+            config.pool_uuid,
+            cluster_authority_addr
+                .ok_or_else(|| "--cluster requires --cluster-authority-addr".to_string())?,
+            cluster_node_credential
+                .ok_or_else(|| "--cluster requires --cluster-node-credential".to_string())?,
+            cluster_trusted_authority_identity.ok_or_else(|| {
+                "--cluster requires --cluster-trusted-authority-identity".to_string()
+            })?,
+        )?)
+    } else {
+        None
+    };
+
     let lock_dir = PathBuf::from("/run/tidefs/import");
-    let import_owner = tidefs_pool_import::pool_import_owned(devices, &lock_dir, false, None)
-        .map_err(|err| format!("import Pool: {err}"))?;
+    let import_owner = match tidefs_pool_import::pool_import_owned(devices, &lock_dir, false, None)
+    {
+        Ok(owner) => owner,
+        Err(error) => {
+            let mut error = format!("import Pool: {error}");
+            #[cfg(feature = "cluster")]
+            if let Some(lease) = pending_cluster_lease.as_mut() {
+                error = append_lease_release_error(error, lease.release());
+            }
+            return Err(error);
+        }
+    };
     let metadata_dir = super::offline_pool::metadata_dir("block", "attach", &config.pool_uuid);
     let runtime = match PoolRuntime::open_block_devices(
         &metadata_dir,
@@ -155,24 +292,42 @@ fn handle_attach(
     ) {
         Ok(runtime) => runtime,
         Err(error) => {
+            let mut error = format!("open canonical Pool runtime: {error}");
+            #[cfg(feature = "cluster")]
+            if let Some(lease) = pending_cluster_lease.as_mut() {
+                error = append_lease_release_error(error, lease.release());
+            }
+            return Err(combine_export_error(error, import_owner.export()));
+        }
+    };
+    let runtime = SharedPoolRuntime::new(std::sync::Mutex::new(runtime));
+    #[cfg(feature = "cluster")]
+    let backend_result = match pending_cluster_lease.take() {
+        Some(lease) => {
+            let (grant, session) = lease.into_parts();
+            PoolVolumeBackend::open_renewable_clustered_shared(
+                Arc::clone(&runtime),
+                &target.dataset,
+                false,
+                grant,
+                session,
+            )
+        }
+        None => PoolVolumeBackend::open_shared(Arc::clone(&runtime), &target.dataset, false),
+    };
+    #[cfg(not(feature = "cluster"))]
+    let backend_result =
+        PoolVolumeBackend::open_shared(Arc::clone(&runtime), &target.dataset, false);
+    let mut backend = match backend_result {
+        Ok(backend) => backend,
+        Err(error) => {
+            drop(runtime);
             return Err(combine_export_error(
-                format!("open canonical Pool runtime: {error}"),
+                format!("open Pool volume '{}': {error}", target.dataset),
                 import_owner.export(),
             ));
         }
     };
-    let runtime = SharedPoolRuntime::new(std::sync::Mutex::new(runtime));
-    let mut backend =
-        match PoolVolumeBackend::open_shared(Arc::clone(&runtime), &target.dataset, false) {
-            Ok(backend) => backend,
-            Err(error) => {
-                drop(runtime);
-                return Err(combine_export_error(
-                    format!("open Pool volume '{}': {error}", target.dataset),
-                    import_owner.export(),
-                ));
-            }
-        };
 
     eprintln!(
         "tidefsctl block attach: launching ublk live device (queues={nr_hw_queues} depth={queue_depth})"
@@ -186,9 +341,22 @@ fn handle_attach(
         ) {
             Ok(signal_thread) => signal_thread,
             Err(error) => {
+                #[cfg(feature = "cluster")]
+                let lease_release = if cluster {
+                    backend
+                        .release_clustered_authority()
+                        .map_err(|error| error.to_string())
+                } else {
+                    Ok(())
+                };
+                #[cfg(not(feature = "cluster"))]
+                let lease_release: Result<(), String> = Ok(());
                 drop(backend);
                 drop(runtime);
-                return Err(combine_export_error(error, import_owner.export()));
+                return Err(combine_export_error(
+                    append_lease_release_error(error, lease_release),
+                    import_owner.export(),
+                ));
             }
         };
     let runtime_dir = PathBuf::from("/run/tidefs/pools").join(hex_uuid(&config.pool_uuid));
@@ -209,10 +377,23 @@ fn handle_attach(
         Ok(owner) => owner,
         Err(error) => {
             signal_thread.finish();
+            #[cfg(feature = "cluster")]
+            let lease_release = if cluster {
+                backend
+                    .release_clustered_authority()
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(())
+            };
+            #[cfg(not(feature = "cluster"))]
+            let lease_release: Result<(), String> = Ok(());
             drop(backend);
             drop(runtime);
             return Err(combine_export_error(
-                format!("start ublk live owner: {error}"),
+                append_lease_release_error(
+                    format!("start ublk live owner: {error}"),
+                    lease_release,
+                ),
                 import_owner.export(),
             ));
         }
@@ -235,25 +416,107 @@ fn handle_attach(
             .map(|_| ())
             .map_err(|error| error.clone()),
     );
+    #[cfg(feature = "cluster")]
+    let lease_release_result = if cluster {
+        backend
+            .release_clustered_authority()
+            .map_err(|error| error.to_string())
+    } else {
+        Ok(())
+    };
+    #[cfg(not(feature = "cluster"))]
+    let lease_release_result: Result<(), String> = Ok(());
     drop(backend);
     drop(runtime);
     let export_result = import_owner
         .export()
         .map_err(|error| format!("export Pool after block attach: {error}"));
-    let completion = match (&carrier_result, &export_result) {
-        (Ok(_), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error.clone()),
-        (Err(error), Err(export_error)) => Err(format!("{error}; additionally {export_error}")),
+    let mut completion_errors = Vec::new();
+    if let Err(error) = &carrier_result {
+        completion_errors.push(error.clone());
+    }
+    if let Err(error) = &lease_release_result {
+        completion_errors.push(error.clone());
+    }
+    if let Err(error) = &export_result {
+        completion_errors.push(error.clone());
+    }
+    let completion = if completion_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(completion_errors.join("; additionally "))
     };
     live_owner.complete_export(completion);
     live_owner.stop();
-    match (carrier_result, export_result) {
-        (Ok(report), Ok(())) => {
-            report.print();
-            Ok(())
+    if completion_errors.is_empty() {
+        carrier_result
+            .expect("successful completion retained ublk report")
+            .print();
+        Ok(())
+    } else {
+        Err(completion_errors.join("; additionally "))
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn acquire_clustered_block_lease(
+    devices: &[PathBuf],
+    pool_guid: [u8; 16],
+    authority_addr: &str,
+    node_credential: &Path,
+    trusted_authority_identity: &Path,
+) -> Result<PendingClusterLease, String> {
+    let local_credential = load_cluster_node_credential(node_credential)?;
+    let trusted_authority_identity = load_cluster_public_identity(trusted_authority_identity)?;
+    let authority_addr = authority_addr
+        .parse()
+        .map_err(|error| format!("invalid --cluster-authority-addr: {error}"))?;
+    let mut session = TransportPoolLeaseSession::connect(
+        authority_addr,
+        pool_guid,
+        &local_credential,
+        &trusted_authority_identity,
+    )?;
+    let grant = session
+        .acquire()
+        .map_err(|error| format!("Pool lease acquire failed: {error}"))?;
+    if grant.token.node_id != local_credential.node_id() || grant.token.pool_guid != pool_guid {
+        let release_error = ClusterLeaseSession::release(&mut session, &grant.token).err();
+        return Err(format!(
+            "authority returned a Pool lease for the wrong owner or Pool{}",
+            release_error
+                .map(|error| format!("; release also failed: {error}"))
+                .unwrap_or_default()
+        ));
+    }
+    if let Err(error) =
+        tidefs_local_object_store::pool_importer::PoolImporter::import_pool_clustered(
+            devices,
+            Some(pool_guid),
+            Some(grant.token.clone()),
+            Some(grant.valid_until),
+        )
+    {
+        let release_error = ClusterLeaseSession::release(&mut session, &grant.token).err();
+        return Err(format!(
+            "clustered Pool import validation failed: {error}{}",
+            release_error
+                .map(|error| format!("; release also failed: {error}"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(PendingClusterLease {
+        grant,
+        session: Box::new(session),
+    })
+}
+
+fn append_lease_release_error(error: String, release: Result<(), String>) -> String {
+    match release {
+        Ok(()) => error,
+        Err(release_error) => {
+            format!("{error}; additionally failed to release clustered Pool lease: {release_error}")
         }
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(export_error)) => Err(format!("{error}; additionally {export_error}")),
     }
 }
 
@@ -355,9 +618,57 @@ mod block_path_tests {
 
     #[test]
     fn block_attach_requires_named_volume_target() {
-        let result = handle_attach("mypool", &[], 4, 64, 30);
+        let result = handle_attach(
+            "mypool",
+            &[],
+            4,
+            64,
+            30,
+            #[cfg(feature = "cluster")]
+            false,
+            #[cfg(feature = "cluster")]
+            None,
+            #[cfg(feature = "cluster")]
+            None,
+            #[cfg(feature = "cluster")]
+            None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("<pool>/<name>"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cluster_block_attach_refuses_trust_inputs_without_cluster_mode() {
+        let result = handle_attach(
+            "mypool/vol",
+            &[],
+            1,
+            64,
+            30,
+            false,
+            Some("127.0.0.1:7411"),
+            Some(Path::new("/unused/owner.credential")),
+            Some(Path::new("/unused/authority.identity")),
+        );
+        assert!(result.unwrap_err().contains("require --cluster"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cluster_block_attach_refuses_missing_trust_before_pool_work() {
+        let result = handle_attach(
+            "mypool/vol",
+            &[PathBuf::from("/unused/pool-device")],
+            1,
+            64,
+            30,
+            true,
+            None,
+            None,
+            None,
+        );
+        assert!(result.unwrap_err().contains("--cluster-authority-addr"));
     }
 
     #[test]

@@ -5,6 +5,8 @@ pub mod block;
 pub mod classification;
 #[cfg(feature = "cluster")]
 pub mod cluster;
+#[cfg(feature = "cluster")]
+pub(crate) mod cluster_lease;
 pub mod dataset;
 pub mod defrag;
 pub mod device;

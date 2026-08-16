@@ -7,7 +7,9 @@ use tidefs_block_volume_adapter_core::{
     BlockRangeRecord, BlockVolumeCompletionClass, BlockVolumeFileImage, BlockVolumeFileImageError,
     BlockVolumeGeometryRecord,
 };
-use tidefs_cluster::PoolLeaseToken;
+use tidefs_cluster::{
+    cluster_lease_renewal_at, ClusterLeaseGrant, ClusterLeaseSession, PoolLeaseToken,
+};
 use tidefs_pool_runtime::ExternalMutationDeadline;
 
 /// Geometry consumed by the Linux block carrier.
@@ -140,6 +142,12 @@ impl From<std::io::Error> for BackendError {
 /// The backend translates block-number ranges into reads and writes against
 /// the concrete storage layer (file image, object store, or future backends).
 pub trait BlockVolumeStorageBackend {
+    /// Maintain any external writer authority while the ublk owner is live.
+    /// Implementations must fence their data path before returning an error.
+    fn maintain_writer_authority(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Read one or more blocks starting at `start_block`.
     fn read_blocks(
         &self,
@@ -318,10 +326,13 @@ enum PoolVolumeOwner {
     Mounted(tidefs_local_filesystem::vfs_engine_impl::SharedLocalFileSystem),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ClusteredPoolVolumeAuthority {
     lease: PoolLeaseToken,
     deadline: ExternalMutationDeadline,
+    session: Option<Box<dyn ClusterLeaseSession>>,
+    next_renewal: Option<Instant>,
+    released: bool,
 }
 
 /// Real named-volume backend over the canonical Pool runtime.
@@ -351,19 +362,93 @@ impl PoolVolumeBackend {
     /// lifetime reported with the committed grant, so later validation and
     /// Pool reopen work cannot restart that already-elapsing window.
     pub fn open_clustered(
-        mut runtime: tidefs_pool_runtime::PoolRuntime,
+        runtime: tidefs_pool_runtime::PoolRuntime,
         path: &str,
         read_only: bool,
         lease: PoolLeaseToken,
         valid_until: Instant,
     ) -> Result<Self, BackendError> {
-        validate_clustered_lease(&runtime, &lease, valid_until)?;
+        Self::open_clustered_shared(
+            Arc::new(Mutex::new(runtime)),
+            path,
+            read_only,
+            lease,
+            valid_until,
+        )
+    }
+
+    pub fn open_clustered_shared(
+        runtime: SharedPoolRuntime,
+        path: &str,
+        read_only: bool,
+        lease: PoolLeaseToken,
+        valid_until: Instant,
+    ) -> Result<Self, BackendError> {
         let deadline = ExternalMutationDeadline::new_until(valid_until);
-        runtime
-            .install_external_mutation_deadline(deadline.clone())
-            .map_err(map_pool_runtime_error)?;
-        let mut backend = Self::open_standalone(runtime, path, read_only)?;
-        backend.clustered_authority = Some(ClusteredPoolVolumeAuthority { lease, deadline });
+        {
+            let mut runtime = lock_pool_runtime(&runtime)?;
+            validate_clustered_lease(&runtime, &lease, valid_until)?;
+            runtime
+                .install_external_mutation_deadline(deadline.clone())
+                .map_err(map_pool_runtime_error)?;
+        }
+        let mut backend = Self::open_shared(runtime, path, read_only)?;
+        backend.clustered_authority = Some(ClusteredPoolVolumeAuthority {
+            lease,
+            deadline,
+            session: None,
+            next_renewal: None,
+            released: false,
+        });
+        Ok(backend)
+    }
+
+    /// Open the real clustered carrier with the live session required to
+    /// renew and release its authenticated Pool lease.
+    pub fn open_renewable_clustered(
+        runtime: tidefs_pool_runtime::PoolRuntime,
+        path: &str,
+        read_only: bool,
+        grant: ClusterLeaseGrant,
+        session: Box<dyn ClusterLeaseSession>,
+    ) -> Result<Self, BackendError> {
+        Self::open_renewable_clustered_shared(
+            Arc::new(Mutex::new(runtime)),
+            path,
+            read_only,
+            grant,
+            session,
+        )
+    }
+
+    pub fn open_renewable_clustered_shared(
+        runtime: SharedPoolRuntime,
+        path: &str,
+        read_only: bool,
+        grant: ClusterLeaseGrant,
+        mut session: Box<dyn ClusterLeaseSession>,
+    ) -> Result<Self, BackendError> {
+        let token = grant.token.clone();
+        let valid_until = grant.valid_until;
+        let opened =
+            Self::open_clustered_shared(runtime, path, read_only, token.clone(), valid_until);
+        let mut backend = match opened {
+            Ok(backend) => backend,
+            Err(error) => {
+                return Err(match session.release(&token) {
+                    Ok(()) => error,
+                    Err(release_error) => BackendError::Other(format!(
+                        "{error}; additionally failed to release rejected clustered Pool lease: {release_error}"
+                    )),
+                });
+            }
+        };
+        let authority = backend
+            .clustered_authority
+            .as_mut()
+            .expect("open_clustered installed clustered authority");
+        authority.next_renewal = Some(cluster_lease_renewal_at(valid_until));
+        authority.session = Some(session);
         Ok(backend)
     }
 
@@ -451,7 +536,82 @@ impl PoolVolumeBackend {
         if !authority.deadline.renew_until(valid_until) {
             return Err(BackendError::ClusterAuthorityExpired);
         }
+        if authority.session.is_some() {
+            authority.next_renewal = Some(cluster_lease_renewal_at(valid_until));
+        }
         authority.lease = lease;
+        Ok(())
+    }
+
+    /// Renew the live carrier authority when due. Every failure first fences
+    /// the backend, so the caller can safely tear down ublk without admitting
+    /// another Pool operation.
+    pub fn maintain_clustered_authority(&mut self) -> Result<(), BackendError> {
+        let Some(authority) = self.clustered_authority.as_mut() else {
+            return Ok(());
+        };
+        if authority.released || !authority.deadline.is_live() {
+            authority.deadline.fence();
+            return Err(BackendError::ClusterAuthorityExpired);
+        }
+        let next_renewal = match authority.next_renewal {
+            Some(next_renewal) => next_renewal,
+            None => {
+                authority.deadline.fence();
+                return Err(BackendError::InvalidClusterAuthority(
+                    "live carrier has no renewal schedule",
+                ));
+            }
+        };
+        if Instant::now() < next_renewal {
+            return Ok(());
+        }
+        let token = authority.lease.clone();
+        let Some(session) = authority.session.as_mut() else {
+            authority.deadline.fence();
+            return Err(BackendError::InvalidClusterAuthority(
+                "live carrier has no renewal session",
+            ));
+        };
+        let renewed = match session.renew(&token) {
+            Ok(renewed) => renewed,
+            Err(error) => {
+                authority.deadline.fence();
+                return Err(BackendError::Other(format!(
+                    "clustered Pool lease renewal failed: {error}"
+                )));
+            }
+        };
+        if let Err(error) = self.renew_clustered_authority(renewed.token, renewed.valid_until) {
+            self.fence_clustered_authority()?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Fence first, then release the retained lease after the ublk device has
+    /// stopped and can no longer issue Pool I/O.
+    pub fn release_clustered_authority(&mut self) -> Result<(), BackendError> {
+        let authority =
+            self.clustered_authority
+                .as_mut()
+                .ok_or(BackendError::InvalidClusterAuthority(
+                    "backend is not a clustered export",
+                ))?;
+        if authority.released {
+            return Ok(());
+        }
+        authority.deadline.fence();
+        let session = authority
+            .session
+            .as_mut()
+            .ok_or(BackendError::InvalidClusterAuthority(
+                "clustered export has no live release session",
+            ))?;
+        session.release(&authority.lease).map_err(|error| {
+            BackendError::Other(format!("release clustered Pool lease: {error}"))
+        })?;
+        authority.released = true;
         Ok(())
     }
 
@@ -510,6 +670,10 @@ impl PoolVolumeBackend {
 }
 
 impl BlockVolumeStorageBackend for PoolVolumeBackend {
+    fn maintain_writer_authority(&mut self) -> Result<(), BackendError> {
+        self.maintain_clustered_authority()
+    }
+
     fn read_blocks(
         &self,
         start_block: usize,
