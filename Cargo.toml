@@ -123,7 +123,6 @@ members = [
   "crates/tidefs-storage-intent-prefetch-feedback",
   "crates/tidefs-storage-intent-satisfaction",
   "crates/tidefs-storage-intent-scheduler",
-  "crates/tidefs-namespace",
   "crates/tidefs-inode-table",
   "crates/tidefs-xattr-storage",
   "crates/tidefs-types-polymorphic-xattr-core",
@@ -261,7 +260,6 @@ tidefs-membership-epoch = { path = "crates/tidefs-membership-epoch" }
 tidefs-membership-live = { path = "crates/tidefs-membership-live" }
 tidefs-membership-types = { path = "crates/tidefs-membership-types" }
 tidefs-model-core = { path = "crates/tidefs-model-core" }
-tidefs-namespace = { path = "crates/tidefs-namespace" }
 tidefs-node-drain = { path = "crates/tidefs-node-drain" }
 tidefs-node-join = { path = "crates/tidefs-node-join" }
 tidefs-object-io = { path = "crates/tidefs-object-io" }

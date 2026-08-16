@@ -47,8 +47,8 @@ pub trait InodeTableCommit {
 
 /// Trait abstracting the namespace operations needed by the commit path.
 ///
-/// This is a narrow interface; the full `tidefs-namespace` crate (issue
-/// #2505) will implement it once ready.
+/// This narrow interface does not own mounted directory state; its
+/// implementation must consume the selected dataset authority.
 pub trait NamespaceCommit {
     /// Apply a link operation.
     fn apply_link(

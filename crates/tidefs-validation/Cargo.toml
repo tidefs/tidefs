@@ -96,7 +96,6 @@ fuse = [
     "dep:tidefs-local-filesystem",
     "dep:tidefs-intent-log",
     "dep:tidefs-reclaim",
-    "dep:tidefs-namespace",
     "dep:tidefs-inode-attributes",
     "dep:tidefs-inode-table",
     "dep:tidefs-commit_group",
@@ -158,7 +157,6 @@ tidefs-reclaim = { workspace = true, optional = true }
 tidefs-reclaim-queue-core = { workspace = true }
 tidefs-segment-cleaner = { workspace = true, optional = true }
 tidefs-types-reclaim-queue-core = { workspace = true }
-tidefs-namespace = { workspace = true, optional = true }
 tidefs-inode-attributes = { workspace = true, optional = true }
 tidefs-inode-table = { workspace = true, optional = true }
 tidefs-commit_group = { workspace = true, optional = true }

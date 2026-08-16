@@ -193,19 +193,6 @@ Affected code:
 integrity envelope covers the payload. For compression frames, CRC32C on the
 compressed payload is sufficient to detect framing errors before decompression.
 
-### 3.5 Namespace In-Memory Hashing
-
-Namespace entry hashing for in-memory lookup structures is a performance
-optimization, not a durability guarantee. Use a non-cryptographic hash.
-
-Affected code:
-- `crates/tidefs-namespace/src/entry.rs` — `blake3::Hasher::new()` without
-  domain separation
-
-**Fix**: Replace with `rustc-hash` or `ahash`. If the entries are later
-persisted through the local filesystem's BLAKE3-verified records, the storage
-layer provides integrity.
-
 ## 4. Enforcement
 
 New uses of `blake3::` outside the crates listed in SS2 must be justified in

@@ -6,9 +6,9 @@
 //!
 //! # Design
 //!
-//! TideFS internal error types (e.g. `tidefs_namespace::NamespaceError`,
-//! `tidefs_xattr_storage::XattrSetPlanError`) live in layer crates that
-//! the `fuser` library does not depend on.  This module bridges the gap
+//! TideFS internal error types (e.g. namespace-operation errors from the VFS
+//! engine and `tidefs_xattr_storage::XattrSetPlanError`) live in layer crates
+//! that the `fuser` library does not depend on.  This module bridges the gap
 //! by defining a crate-local [`ErrorKind`] enum whose variants mirror
 //! the standard POSIX error categories, plus a mapping function
 //! [`to_errno`] that converts each kind to the correct `libc::c_int`.
@@ -20,7 +20,7 @@
 //! # Coverage
 //!
 //! The mapping was audited against:
-//! - `tidefs_namespace::NamespaceError` (13 variants)
+//! - mounted namespace-operation errors from the VFS engine
 //! - `tidefs_xattr_storage::XattrSetPlanError` (5 variants)
 //! - `tidefs_xattr_storage::XattrNameValidationError` (3 variants)
 //! - `tidefs_xattr_storage::XattrStoreError` (1 variant)
@@ -74,7 +74,7 @@ pub use libc::EOPNOTSUPP;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum ErrorKind {
-    /// Entry or inode not found (e.g. `NamespaceError::NotFound`,
+    /// Entry or inode not found (e.g. a namespace lookup miss,
     /// `XattrStoreError::EntryNotFound` for non-xattr paths).
     NotFound,
 
@@ -260,9 +260,9 @@ pub const fn to_errno(kind: ErrorKind) -> c_int {
 /// # Example
 ///
 /// ```rust,ignore
-/// let errno = fuser::errno::map_namespace_like(|e| match e {
-///     tidefs_namespace::NamespaceError::NotFound => ErrorKind::NotFound,
-///     tidefs_namespace::NamespaceError::AlreadyExists => ErrorKind::AlreadyExists,
+/// let errno = fuser::errno::map_errno(|| match vfs_error {
+///     VfsError::NotFound => ErrorKind::NotFound,
+///     VfsError::AlreadyExists => ErrorKind::AlreadyExists,
 ///     _ => ErrorKind::InternalIo,
 /// });
 /// ```

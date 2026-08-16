@@ -146,10 +146,6 @@ pub mod xattr_storage;
 #[cfg(feature = "fuse")]
 pub mod reclaim;
 
-// ── namespace smoke ───────────────────────────────────────────────────────
-#[cfg(feature = "fuse")]
-pub mod namespace;
-
 // ── permission smoke ───────────────────────────────────────────────────────
 #[cfg(feature = "fuse")]
 pub mod permission;

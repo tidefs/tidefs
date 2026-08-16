@@ -16,8 +16,9 @@
 //! - Time source: a [`TimeSource`] trait provides `now()` for testability;
 //!   the default [`SystemTimeSource`] uses `std::time::SystemTime`.
 //!
-//! Review debt TFR-004: this table is another inode allocation/state authority
-//! alongside `tidefs-namespace` and `tidefs-local-filesystem`.
+//! Review debt TFR-004: this table remains a non-carrier inode
+//! allocation/state projection beside the mounted dataset authority in
+//! `tidefs-local-filesystem`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;

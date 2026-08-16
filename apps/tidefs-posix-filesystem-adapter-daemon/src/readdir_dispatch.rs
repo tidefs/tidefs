@@ -189,10 +189,8 @@ pub fn iter_dir_entries(
 
 /// Map a `DirIndex` entry `kind` to a VFS [`NodeKind`].
 fn dir_entry_kind_to_node_kind(kind: u32) -> NodeKind {
-    // The DirIndex stores kind using the same constants as the namespace
-    // (e.g. KIND_DIR, KIND_FILE, KIND_SYMLINK).  Map them.
-    // These constants come from tidefs_namespace but we avoid the crate dep
-    // by using the raw values.
+    // DirIndex entry kinds use the on-record POSIX file-type bits. Map those
+    // values directly instead of depending on another namespace owner.
     match kind {
         0o040000 => NodeKind::Dir,
         0o120000 => NodeKind::Symlink,
