@@ -454,10 +454,6 @@ int tidefs_posix_vfs_kernel_replay_mount(
 	int recovery_mode,
 	struct tidefs_posix_vfs_replay_mount_out *out);
 
-unsigned long long tidefs_posix_vfs_engine_get_vrbt_intent_tail(
-	const void *superblock_buf, unsigned long superblock_len,
-	unsigned int block_size);
-
 int tidefs_posix_vfs_engine_fill_super(const char *mount_opts,
 				       unsigned long long committed_txg);
 int tidefs_posix_vfs_engine_fill_super_label(
@@ -701,8 +697,6 @@ struct tidefs_posix_vfs_kernel_pool_core {
 #define TIDEFS_KERNEL_POOL_STATE_RECORD_REGION_BYTES (128ULL * 1024ULL)
 #define TIDEFS_KERNEL_POOL_STATE_BLOCK_OFFSET 0ULL
 #define TIDEFS_KERNEL_POOL_STATE_DATA_OFFSET TIDEFS_KERNEL_POOL_STATE_RECORD_REGION_BYTES
-#define TIDEFS_KERNEL_POOL_ENGINE_DATA_OFFSET (1024ULL * 1024ULL)
-#define TIDEFS_KERNEL_POOL_ENGINE_INTENT_LOG_OFFSET 4096ULL
 #define TIDEFS_KERNEL_POOL_COMMITTED_LEDGER_MIN_SIZE (12U + 80U + 32U)
 #define TIDEFS_KERNEL_POOL_VRBT_WIRE_SIZE 88U
 #define TIDEFS_KERNEL_POOL_VCRP_RECORD_SIZE 96U
@@ -7396,105 +7390,23 @@ static int tidefs_posix_vfs_fill_super_bdev(struct super_block *sb,
 		}
 	}
 
-	/* ── Phase 3.5: Check for persisted intent-log records ───────── */
+	/* ── Phase 3.5: Select the committed-root replay boundary ───── */
 	{
-		unsigned int block_size = sb->s_blocksize;
-		unsigned long long data_area_offset;
-		unsigned long long intent_tail;
-		void *intent_buf = NULL;
-		unsigned long intent_len = 0;
-		int recovery_mode = 0;
+		bool explicit_recovery = tidefs_fc ? tidefs_fc->recovery_mode : false;
+		int recovery_mode = explicit_recovery ? 1 : 0;
 
 		/*
-		 * Mount option logic for read-only / recovery-mode control:
-		 *
-		 * - read-only mount (-o ro) without explicit -o recovery:
-		 *   skip intent replay; mount the committed-root state as-is.
-		 * - read-only mount (-o ro) with explicit -o recovery:
-		 *   force intent replay (emergency recovery mode).
-		 * - read-write mount (default) without -o recovery:
-		 *   auto-detect intent records and replay if present.
-		 * - read-write mount with -o recovery:
-		 *   force intent replay (same as explicit recovery_mode).
+		 * The VRBT intent-log tail is the cursor already covered by the
+		 * selected committed root. Bytes before it are not forward replay
+		 * work and must never be fed back through mutation replay. The
+		 * bounded kernel carrier has no authoritative post-root log scanner
+		 * yet, so mount recovers exactly the selected root and its matching
+		 * namespace snapshot. Explicit recovery mode is retained for the
+		 * Rust mount contract, with an empty forward-record set.
 		 */
-		bool explicit_recovery = tidefs_fc ? tidefs_fc->recovery_mode : false;
+		if (explicit_recovery)
+			pr_info("tidefs_posix_vfs: explicit recovery mode, no forward intent records\n");
 
-		if (mount_read_only && !explicit_recovery) {
-			/* Read-only mount: skip intent replay entirely.
-			 * Do not read or replay intent-log records. */
-			goto skip_intent_replay;
-		}
-
-			/* Compute the Rust engine intent-log offset. The C fixed
-			 * namespace mirror owns the beginning of the pool data
-			 * area, so engine-local allocator/intent/writeback data
-			 * starts at TIDEFS_KERNEL_POOL_ENGINE_DATA_OFFSET. */
-			data_area_offset = label_out.superblock_offset + label_out.superblock_size;
-			if (block_size > 0) {
-				unsigned long long rem = data_area_offset % block_size;
-				if (rem)
-					data_area_offset += block_size - rem;
-			}
-			data_area_offset += TIDEFS_KERNEL_POOL_ENGINE_DATA_OFFSET +
-					    TIDEFS_KERNEL_POOL_ENGINE_INTENT_LOG_OFFSET;
-
-		/* Extract intent_log_tail from the VRBT embedded in the
-		 * superblock region (offset 3*block_size within ledger_buf). */
-		intent_tail = tidefs_posix_vfs_engine_get_vrbt_intent_tail(
-			ledger_buf, label_out.superblock_size,
-			block_size);
-
-		if (intent_tail > 0 && intent_tail <= (4ULL * 1024 * 1024)) {
-			/* Read persisted intent-log records from the data area.
-			 * Intent records are written starting at data_area_offset;
-			 * intent_log_tail tracks the cumulative byte offset. */
-			sector_t start_sector = data_area_offset / block_size;
-			unsigned int sectors_to_read =
-				(unsigned int)((intent_tail + block_size - 1) / block_size);
-			unsigned int i;
-
-			intent_buf = kzalloc(intent_tail, GFP_KERNEL);
-			if (!intent_buf) {
-				ret = -ENOMEM;
-				goto out_free;
-			}
-			intent_len = intent_tail;
-			recovery_mode = 1;
-
-			{
-				unsigned long offset = 0;
-				for (i = 0; i < sectors_to_read && offset < intent_tail; i++) {
-					struct buffer_head *bh = sb_bread(sb, start_sector + i);
-					unsigned long chunk;
-
-					if (!bh) {
-						pr_err("tidefs_posix_vfs: failed to read intent sector %llu\n",
-						       (unsigned long long)(start_sector + i));
-						ret = -EIO;
-						kfree(intent_buf);
-						goto out_free;
-					}
-					chunk = min_t(unsigned long, block_size, intent_tail - offset);
-					memcpy(intent_buf + offset, bh->b_data, chunk);
-					offset += chunk;
-					brelse(bh);
-				}
-			}
-
-			pr_info("tidefs_posix_vfs: read %lu intent bytes from data area (tail=%llu)\n",
-				intent_len, intent_tail);
-		} else if (explicit_recovery) {
-			/*
-			 * Explicit -o recovery flag but no intent records found
-			 * on disk. Set recovery_mode anyway so the Rust mount
-			 * sequence knows we're in recovery mode (allows clean
-			 * mount with empty intent log).
-			 */
-			recovery_mode = 1;
-			pr_info("tidefs_posix_vfs: explicit recovery mode, no intent records on disk\n");
-		}
-
-	skip_intent_replay:
 		/* ── Phase 4: Validate label + select committed root (Rust replay adapter) ─ */
 		{
 		struct tidefs_posix_vfs_replay_mount_out replay_out;
@@ -7503,11 +7415,9 @@ static int tidefs_posix_vfs_fill_super_bdev(struct super_block *sb,
 		ret = tidefs_posix_vfs_kernel_replay_mount(
 			label_buf, TIDEFS_POSIX_TFS_POOL_LABEL_SIZE,
 			ledger_buf, label_out.superblock_size,
-			intent_buf, intent_len,
+			NULL, 0,
 			recovery_mode,
 			&replay_out);
-		if (intent_buf)
-			kfree(intent_buf);
 		if (ret < 0) {
 			pr_err("tidefs_posix_vfs: kernel replay mount failed (err=%d)\n", ret);
 			goto out_free;
@@ -7569,7 +7479,7 @@ static int tidefs_posix_vfs_fill_super_bdev(struct super_block *sb,
 			ctx->pool.replay_errored);
 		}
 
-	} /* ── end Phase 3.5 (intent-log read + replay mount) ──────────── */
+	} /* ── end Phase 3.5 (committed-root replay boundary) ──────────── */
 
 	sb->s_fs_info = ctx;
 	sb->s_magic = TIDEFS_POSIX_TFS_MAGIC;
