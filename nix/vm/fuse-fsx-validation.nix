@@ -124,7 +124,7 @@ let
     for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff \
                   reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync \
                   expr head tail cut kill ps test seq du dirname basename \
-                  readlink tr cmp diff mountpoint uname date umount truncate; do
+                  readlink tr cmp diff mountpoint uname date umount truncate timeout; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
@@ -176,7 +176,8 @@ let
 
 
     # Fix ELF interpreter paths for initrd: reset to /lib/ld-linux-x86-64.so.2
-    for bin in "$RUN_DIR/bin/busybox" "$RUN_DIR/bin/tidefsctl" "$RUN_DIR/bin/fsx"; do
+    for bin in "$RUN_DIR/bin/busybox" "$RUN_DIR/bin/tidefsctl" "$RUN_DIR/bin/fsx" \
+               "$RUN_DIR/bin/tidefs-mmap-workload"; do
       if [ -f "$bin" ]; then
         "$PATCHELF" --set-interpreter /lib/ld-linux-x86-64.so.2 "$bin" 2>/dev/null || true
         "$PATCHELF" --set-rpath /usr/lib:/lib "$bin" 2>/dev/null || true
