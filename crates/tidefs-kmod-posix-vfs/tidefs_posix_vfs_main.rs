@@ -549,13 +549,6 @@ impl KernelEngine {
         self.committed_root.set(Some(root));
     }
 
-    /// Take the current committed root (used by txg_commit_barrier).
-    fn take_committed_root(
-        &self,
-    ) -> Option<crate::tidefs_kmod_bridge::kernel_types::CommittedRoot> {
-        self.committed_root.take()
-    }
-
     /// Returns true if a committed root is currently tracked.
     pub fn has_committed_root(&self) -> bool {
         self.committed_root.get().is_some()
@@ -578,6 +571,79 @@ impl KernelEngine {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
         }
         Ok(io_ctx)
+    }
+
+    /// Publish the mounted engine's actual imported-root frontier.
+    ///
+    /// The generic VFS engine's optional `CommittedRoot` digest is useful to
+    /// its mount lifecycle, but the configured-pool carrier is initialized
+    /// directly from the imported VRBT/VCRP fields. Its sync barrier must
+    /// therefore publish from this mounted I/O authority even when no generic
+    /// digest marker was installed.
+    fn publish_mounted_committed_root(
+        &self,
+    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
+        if !self.pool_is_mounted() {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
+        }
+
+        let io_ctx = self.mounted_pool_io_ctx()?;
+        let committed_txg = io_ctx.committed_txg;
+
+        // Layout: [VCRL at superblock_offset] [VCRP primary at offset+block_size]
+        //         [VCRP backup at offset+2*block_size] [VRBT at offset+3*block_size]
+        let block_size = io_ctx.sector_size as u64;
+        if block_size < 512 {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL);
+        }
+
+        let pointer_offset = io_ctx.superblock_offset.saturating_add(block_size);
+        let root_offset = io_ctx
+            .superblock_offset
+            .saturating_add(3u64.saturating_mul(block_size));
+        let pointer_sector = pointer_offset / block_size;
+        let root_sector = root_offset / block_size;
+
+        let intent_tail = self.intent_log_tail.get();
+        let inode_table_root = self.inode_table_root.get().max(io_ctx.root_ino);
+        let extent_map_root = self.extent_map_root.get().max(inode_table_root);
+        let vrbt = Self::encode_vrbt_block(
+            committed_txg,
+            io_ctx.root_ino,
+            inode_table_root,
+            extent_map_root,
+            intent_tail,
+        );
+        let mut root_hash = [0u8; 32];
+        root_hash.copy_from_slice(&vrbt[Self::VRBT_HASH_OFFSET..Self::VRBT_WIRE_SIZE]);
+
+        let vcrp = Self::encode_vcrp_record(
+            committed_txg,
+            root_sector,
+            committed_txg,
+            &root_hash,
+        );
+        let vcrl = Self::encode_vcrl_ledger(io_ctx.root_ino, &io_ctx.pool_uuid, committed_txg);
+        let write_fn = io_ctx
+            .write_sectors_fn
+            .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV)?;
+        let sector_size = io_ctx.sector_size;
+
+        Self::write_padded_sector(
+            write_fn,
+            io_ctx.superblock_offset / block_size,
+            &vcrl,
+            sector_size,
+        )?;
+        Self::write_padded_sector(write_fn, pointer_sector, &vcrp, sector_size)?;
+        Self::write_padded_sector(
+            write_fn,
+            pointer_sector.saturating_add(1),
+            &vcrp,
+            sector_size,
+        )?;
+        Self::write_padded_sector(write_fn, root_sector, &vrbt, sector_size)?;
+        io_ctx.flush()
     }
 
     fn teardown_pool_authority(
@@ -6798,78 +6864,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         _committed_root: &crate::tidefs_kmod_bridge::kernel_types::CommittedRoot,
         _device_index: u32,
     ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
-        if !self.pool_is_mounted() {
-            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
-        }
-
-        let io_ctx = self.mounted_pool_io_ctx()?;
-
-        let committed_txg = io_ctx.committed_txg;
-
-        // Determine where to place VRBT and VCRP within the superblock region.
-        // Layout: [VCRL at superblock_offset] [VCRP primary at offset+block_size]
-        //         [VCRP backup at offset+2*block_size] [VRBT at offset+3*block_size]
-        let block_size = io_ctx.sector_size as u64;
-        if block_size < 512 {
-            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL);
-        }
-
-        let pointer_offset = io_ctx.superblock_offset.saturating_add(block_size);
-        let root_offset = io_ctx
-            .superblock_offset
-            .saturating_add(3u64.saturating_mul(block_size));
-        let pointer_sector = pointer_offset / block_size;
-        let root_sector = root_offset / block_size;
-
-        // Encode the VRBT committed-root block.
-        let intent_tail = self.intent_log_tail.get();
-        let inode_table_root = self.inode_table_root.get().max(io_ctx.root_ino);
-        let extent_map_root = self.extent_map_root.get().max(inode_table_root);
-        let vrbt = Self::encode_vrbt_block(
-            committed_txg,
-            io_ctx.root_ino, // namespace_root
-            inode_table_root,
-            extent_map_root,
-            intent_tail,     // intent_log_tail
-        );
-        let mut root_hash = [0u8; 32];
-        root_hash.copy_from_slice(&vrbt[Self::VRBT_HASH_OFFSET..Self::VRBT_WIRE_SIZE]);
-
-        // Encode the VCRP pointer record.
-        let vcrp = Self::encode_vcrp_record(
-            committed_txg, // pointer_sequence
-            root_sector,
-            committed_txg, // commit_group_id
-            &root_hash,
-        );
-
-        // Encode the VCRL committed-root ledger.
-        let vcrl = Self::encode_vcrl_ledger(io_ctx.root_ino, &io_ctx.pool_uuid, committed_txg);
-
-        // Write VCRL at superblock_offset.
-        let write_fn = io_ctx
-            .write_sectors_fn
-            .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV)?;
-        let sector_size = io_ctx.sector_size;
-
-        // Pad and write each record through the C callback.
-        Self::write_padded_sector(
-            write_fn,
-            io_ctx.superblock_offset / block_size,
-            &vcrl,
-            sector_size,
-        )?;
-        Self::write_padded_sector(write_fn, pointer_sector, &vcrp, sector_size)?;
-        Self::write_padded_sector(
-            write_fn,
-            pointer_sector.saturating_add(1),
-            &vcrp,
-            sector_size,
-        )?;
-        Self::write_padded_sector(write_fn, root_sector, &vrbt, sector_size)?;
-        io_ctx.flush()?;
-
-        Ok(())
+        self.publish_mounted_committed_root()
     }
 
     fn set_committed_root(&self, root: crate::tidefs_kmod_bridge::kernel_types::CommittedRoot) {
@@ -6878,10 +6873,9 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
 
     /// Route syncfs and unmount through the shared KernelPoolCore txg barrier.
     ///
-    /// Gates on Mounted pool state. Takes the current committed root and
-    /// attempts to persist it via write_committed_root. When the pool is
-    /// mounted but on-disk persistence is not yet available, the barrier
-    /// succeeds (committed root is in-memory).
+    /// Gates on Mounted pool state and publishes the exact imported-root
+    /// frontier after the matching namespace snapshot, whether or not the
+    /// generic mount lifecycle installed its optional digest marker.
     fn txg_commit_barrier(
         &self,
     ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
@@ -6892,12 +6886,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         self.flush_live_write_buffer_to_storage(None, 0, 0)?;
         self.flush_intent_buffer_to_storage()?;
         self.persist_namespace_snapshot()?;
-        let io_ctx = self.mounted_pool_io_ctx()?;
-        let Some(root) = self.take_committed_root() else {
-            return io_ctx.flush();
-        };
-        self.committed_root.set(Some(root));
-        self.write_committed_root(&root, 0)
+        self.publish_mounted_committed_root()
     }
 }
 
@@ -7776,55 +7765,6 @@ pub extern "C" fn tidefs_posix_vfs_kernel_replay_mount(
             }
             -errno
         }
-    }
-}
-
-// -- Extern "C" VRBT intent-log tail helper ----------------------------------
-
-/// Extract intent_log_tail from the VRBT block embedded in the superblock region.
-///
-/// The C shim calls this before the replay mount to determine whether intent-log
-/// records exist on the block device.  When the returned tail is non-zero, the
-/// shim reads `intent_log_tail` bytes from the data area (superblock_offset +
-/// superblock_size) and passes them to `tidefs_posix_vfs_kernel_replay_mount`
-/// with `recovery_mode=1`.
-///
-/// Returns intent_log_tail on success, or 0 when the VRBT is absent, too small,
-/// has bad magic, or has a hash mismatch.  The C shim treats 0 as "no intent
-/// records to replay".
-#[no_mangle]
-#[cfg(CONFIG_RUST)]
-pub extern "C" fn tidefs_posix_vfs_engine_get_vrbt_intent_tail(
-    superblock_buf: *const u8,
-    superblock_len: core::ffi::c_ulong,
-    block_size: u32,
-) -> u64 {
-    use crate::replay_integration;
-
-    if superblock_buf.is_null() || superblock_len == 0 {
-        return 0;
-    }
-    let blk: usize = if block_size > 0 {
-        block_size as usize
-    } else {
-        4096
-    };
-    let vrbt_offset: usize = 3usize.saturating_mul(blk);
-    let vrbt_end = vrbt_offset.saturating_add(replay_integration::VRBT_WIRE_SIZE);
-    let buf_len = superblock_len as usize;
-    if buf_len < vrbt_end {
-        return 0;
-    }
-    // SAFETY: bounds checked above; C shim owns the buffer.
-    let vrbt_slice = unsafe {
-        core::slice::from_raw_parts(
-            superblock_buf.add(vrbt_offset),
-            replay_integration::VRBT_WIRE_SIZE,
-        )
-    };
-    match replay_integration::decode_vrbt(vrbt_slice) {
-        Ok(vrbt) => vrbt.intent_log_tail,
-        Err(_) => 0,
     }
 }
 
