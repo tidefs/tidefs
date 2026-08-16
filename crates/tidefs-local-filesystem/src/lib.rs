@@ -2029,6 +2029,11 @@ pub struct LocalFileSystem {
     /// Armed when this mounted instance cannot determine whether its latest
     /// root publication became durable. Only reopen may clear this fence.
     mutation_requires_reopen: bool,
+    /// Exact canonical snapshot roots that a device-lifecycle transaction
+    /// authenticated before Pool placement receipts changed. Ordinary
+    /// commits leave this empty; while populated, only these predecessors may
+    /// advance with the mounted filesystem root in one Pool publication.
+    pending_snapshot_root_rewrites: BTreeMap<DatasetId, tidefs_pool_runtime::SnapshotRoot>,
     #[allow(dead_code)]
     // INTENT: kept for planned architecture; callers in test modules or pending wiring into FUSE dispatch
     state_before_transaction: Option<FileSystemState>,
@@ -4692,6 +4697,7 @@ impl LocalFileSystem {
             max_uncommitted_mutations: DEFAULT_MAX_UNCOMMITTED_MUTATIONS,
             in_transaction: false,
             mutation_requires_reopen: false,
+            pending_snapshot_root_rewrites: BTreeMap::new(),
             mutation_delta: None,
             mutation_recorded_commit_group_write: false,
             domain_registry: SpaceDomainRegistry::new(),
@@ -14116,11 +14122,12 @@ impl LocalFileSystem {
             let transaction_id = transaction_id.ok_or(FileSystemError::CorruptState {
                 reason: "mounted commit lost its selected transaction identity",
             })?;
-            let signed_root = match persist_state_with_runtime_at_transaction(
+            let signed_root = match persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
                 &mut self.store,
                 &self.state,
                 transaction_id,
                 self.root_authentication_key,
+                &self.pending_snapshot_root_rewrites,
             ) {
                 Ok(root) => root,
                 Err(error) => {
@@ -14154,6 +14161,10 @@ impl LocalFileSystem {
                 &stored_root,
                 self.root_authentication_key,
             )?;
+            // The canonical Pool root now contains every authorized snapshot
+            // successor. Later fallible maintenance may be retried, but must
+            // not attempt the same predecessor transition again.
+            self.pending_snapshot_root_rewrites.clear();
             // The new root is now durable and has passed the same Pool-backed
             // validation as mount.  Revoke caller-side rollback authority
             // before any fallible post-commit maintenance: later failures can
@@ -14627,6 +14638,7 @@ impl LocalFileSystem {
     fn rollback_mutation_delta(&mut self) {
         self.inode_cache.borrow_mut().clear();
         self.store.discard_metadata_candidate();
+        self.pending_snapshot_root_rewrites.clear();
         if let Some(delta) = self.mutation_delta.take() {
             // Restore inode/directory/snapshot metadata.
             for (id, inode) in delta.old_inodes {

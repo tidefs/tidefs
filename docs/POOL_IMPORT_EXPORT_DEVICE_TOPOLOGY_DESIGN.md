@@ -107,9 +107,14 @@ or establish media privacy, secure erase, sanitization, or decommissioning.
 
 The bounded local removal path is owned by the reachable mounted filesystem,
 not by an offline CLI helper. It syncs mounted state, authenticates every active
-current filesystem typed root, validates every canonical Pool-runtime volume
-graph, refuses filesystem snapshots/clones and non-active filesystem roots,
-publishes the removal label intent, and allocation-fences the target. Pool
+current filesystem typed root, authenticates every data-retaining
+snapshot-table record of the mounted filesystem against its catalog entry,
+lifecycle pin, typed Pool snapshot root, exact captured filesystem-root
+reference, and complete captured content graph, and validates every canonical
+Pool-runtime volume graph. Snapshots or clones owned by independently rooted
+filesystems, independently mountable filesystem dataset clones, and non-active
+filesystem roots refuse before it publishes the removal label intent and
+allocation-fences the target. Pool
 evacuation then rewrites every receipt-backed logical object to surviving
 members while the target stays attached. For each unmounted independent
 filesystem, the same owner copy-on-writes changed content manifests, durably
@@ -118,6 +123,17 @@ refreshing the mounted root ring. Volume roots, volume snapshots, and volume
 clones carry immutable keys and digests rather than placement generations, so
 their typed roots remain unchanged while all referenced maps and chunks
 relocate.
+
+For each retained mounted-filesystem snapshot or snapshot-table clone whose
+captured graph contains relocated receipts, the owner loads the authenticated
+captured state, copy-on-writes affected content manifests, durably queues the
+predecessor manifests, and prepares a replacement authenticated filesystem
+root. The corresponding snapshot record, catalog generation, lifecycle pin,
+and typed Pool snapshot source then advance with mounted filesystem state in
+one canonical Pool-root transition. Ordinary commits still reject any typed
+snapshot-root disagreement; device lifecycle authorizes only the exact
+preflight-authenticated predecessor. Snapshot-specific files, a second Pool
+owner, and a parallel snapshot store are not introduced.
 
 Chunk relocation advances placement-receipt generations. The mounted owner
 therefore validates survivor payload identity, writes changed content
@@ -144,8 +160,8 @@ The operator result reports evacuation counts, committed topology generation,
 and remaining members. It explicitly provides no secure-erase,
 media-remanence, sanitization, or decommissioning guarantee. Failed-device
 loss, replacement/rebuild, writable degraded operation, simultaneous
-multi-mounted filesystem atomic removal, and filesystem snapshot/clone root
-rewriting remain separate work.
+multi-mounted filesystem atomic removal, independently rooted snapshot/clone
+reconciliation, and filesystem dataset clones remain separate work.
 
 ## Mounted Present-Member Replacement Boundary
 
@@ -153,9 +169,11 @@ The bounded replacement path also belongs to the reachable mounted owner. It
 admits only an exact writable two-member `Replicated { copies: 2 }` Pool, one
 mounted filesystem, any number of authenticated active unmounted independent
 filesystem roots, any number of checksum-validated co-owned Pool-runtime
-volume, volume-snapshot, and volume-clone roots, no filesystem-sourced
-snapshot/clone or filesystem clone, and a distinct blank same-backing candidate
-at least as large as the readable old member. Durable versioned checksummed
+volume, volume-snapshot, and volume-clone roots, any number of authenticated
+data-retaining snapshot-table roots of the mounted filesystem, no snapshot or
+clone owned by an independently rooted filesystem, no independently mountable
+filesystem dataset clone, and a distinct blank same-backing candidate at least
+as large as the readable old member. Durable versioned checksummed
 label evidence binds the Pool GUID, full old/new device GUIDs, member index,
 next topology generation, subject inventory, verified receipt progress, bytes
 rebuilt, and terminal state. Old/new paths remain descriptive locators resolved
@@ -179,9 +197,9 @@ replacement reimports from only the survivor plus replacement. Operator output
 reports rebuild counts, exact identity, topology generation, completion and
 detach safety while explicitly claiming no secure erase, media remanence,
 sanitization, or decommissioning. Absent or unreadable old members, writable
-degraded replacement, erasure coding, filesystem snapshot/clone reconciliation,
-simultaneous multi-mounted filesystem atomicity, and hot-spare policy remain
-separate work.
+degraded replacement, erasure coding, independently rooted snapshot/clone
+reconciliation, simultaneous multi-mounted filesystem atomicity, and hot-spare
+policy remain separate work.
 
 ## Authority Limits
 
