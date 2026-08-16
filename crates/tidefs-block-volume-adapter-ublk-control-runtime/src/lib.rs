@@ -5814,17 +5814,54 @@ pub const fn build_get_dev_info2_spec(
     Ok(UblkControlGetDevInfo2Spec::get_dev_info2())
 }
 
-/// Build a [`UblkSrvCtrlCmd`] that points the kernel at `dev_info` for
-/// returning device information.
-pub fn build_get_dev_info2_ctrl_cmd(
+struct UblkControlGetDevInfo2Payload {
+    bytes: Vec<u8>,
+    dev_path_len: u16,
+}
+
+impl UblkControlGetDevInfo2Payload {
+    fn new(input: UblkControlGetDevInfo2Input) -> Self {
+        let mut bytes = format!("/dev/ublkc{}", input.dev_id).into_bytes();
+        bytes.push(0);
+        let dev_path_len = u16::try_from(bytes.len())
+            .expect("a u32 ublk device id always fits the Linux path-length field");
+        bytes.resize(bytes.len() + core::mem::size_of::<UblkSrvCtrlDevInfo>(), 0);
+        Self {
+            bytes,
+            dev_path_len,
+        }
+    }
+
+    fn dev_info(&self) -> UblkSrvCtrlDevInfo {
+        let offset = usize::from(self.dev_path_len);
+        // SAFETY: `new` appends exactly one complete `UblkSrvCtrlDevInfo`
+        // output region after the NUL-terminated device path. Linux writes
+        // that region before the control CQE completes. The variable-length
+        // path need not leave the output naturally aligned, so read it with
+        // `read_unaligned`.
+        unsafe {
+            self.bytes
+                .as_ptr()
+                .add(offset)
+                .cast::<UblkSrvCtrlDevInfo>()
+                .read_unaligned()
+        }
+    }
+}
+
+/// Build a [`UblkSrvCtrlCmd`] whose payload follows the Linux
+/// `UBLK_U_CMD_GET_DEV_INFO2` path-plus-output layout.
+fn build_get_dev_info2_ctrl_cmd(
     input: UblkControlGetDevInfo2Input,
-    dev_info: &mut UblkSrvCtrlDevInfo,
+    payload: &mut UblkControlGetDevInfo2Payload,
 ) -> UblkSrvCtrlCmd {
     UblkSrvCtrlCmd {
         dev_id: input.dev_id,
         queue_id: u16::MAX,
-        len: core::mem::size_of::<UblkSrvCtrlDevInfo>() as u16,
-        addr: (dev_info as *mut UblkSrvCtrlDevInfo) as usize as u64,
+        len: u16::try_from(payload.bytes.len())
+            .expect("GET_DEV_INFO2 path and fixed output fit the Linux length field"),
+        addr: payload.bytes.as_mut_ptr() as usize as u64,
+        dev_path_len: payload.dev_path_len,
         ..UblkSrvCtrlCmd::default()
     }
 }
@@ -5848,8 +5885,8 @@ pub fn issue_get_dev_info2(
     let mut ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
         .build(UBLK_CONTROL_GET_DEV_INFO2_RING_ENTRIES)
         .map_err(map_get_dev_info2_io_uring_setup_error)?;
-    let mut dev_info = UblkSrvCtrlDevInfo::default();
-    let command = build_get_dev_info2_ctrl_cmd(input, &mut dev_info);
+    let mut payload = UblkControlGetDevInfo2Payload::new(input);
+    let command = build_get_dev_info2_ctrl_cmd(input, &mut payload);
     let entry = opcode::UringCmd80::new(types::Fd(fd.as_raw_fd()), spec.request_raw)
         .cmd(encode_get_dev_info2_cmd80(command))
         .build()
@@ -5859,8 +5896,10 @@ pub fn issue_get_dev_info2(
         let mut submission = ring.submission();
         unsafe {
             // SAFETY: `entry` embeds a ublk GET_DEV_INFO2 command whose `addr`
-            // field points at `dev_info`; the struct remains live until the CQE
-            // is consumed below, and this private ring has no other SQEs.
+            // field points at `payload`; its NUL-terminated `/dev/ublkcN` path
+            // is followed by one complete device-info output region. The
+            // allocation remains live until the CQE is consumed below, and
+            // this private ring has no other SQEs.
             submission
                 .push(&entry)
                 .map_err(|_| UblkControlGetDevInfo2Error::SubmissionQueueFull)?;
@@ -5885,7 +5924,7 @@ pub fn issue_get_dev_info2(
         ));
     }
 
-    Ok(dev_info)
+    Ok(payload.dev_info())
 }
 
 fn map_get_dev_info2_io_uring_setup_error(error: io::Error) -> UblkControlGetDevInfo2Error {
@@ -10564,25 +10603,32 @@ fn build_get_dev_info2_spec_accepts_concrete_dev_id() {
 }
 
 #[test]
-fn build_get_dev_info2_ctrl_cmd_encodes_dev_id_and_addr() {
+fn build_get_dev_info2_ctrl_cmd_encodes_path_and_output_buffer() {
     let input = UblkControlGetDevInfo2Input::from_kernel_dev_id(7);
-    let mut dev_info = UblkSrvCtrlDevInfo::default();
-    let cmd = build_get_dev_info2_ctrl_cmd(input, &mut dev_info);
+    let mut payload = UblkControlGetDevInfo2Payload::new(input);
+    let expected_addr = payload.bytes.as_mut_ptr() as usize as u64;
+    let cmd = build_get_dev_info2_ctrl_cmd(input, &mut payload);
 
     assert_eq!(cmd.dev_id, 7);
     assert_eq!(cmd.queue_id, u16::MAX);
-    assert_eq!(cmd.len as usize, size_of::<UblkSrvCtrlDevInfo>());
+    assert_eq!(cmd.len as usize, payload.bytes.len());
+    assert_eq!(cmd.addr, expected_addr);
+    assert_eq!(usize::from(cmd.dev_path_len), b"/dev/ublkc7\0".len());
     assert_eq!(
-        cmd.addr,
-        (&mut dev_info as *mut UblkSrvCtrlDevInfo) as usize as u64
+        &payload.bytes[..usize::from(cmd.dev_path_len)],
+        b"/dev/ublkc7\0"
+    );
+    assert_eq!(
+        payload.bytes.len() - usize::from(cmd.dev_path_len),
+        size_of::<UblkSrvCtrlDevInfo>()
     );
 }
 
 #[test]
 fn get_dev_info2_cmd80_encodes_round_trips_dev_id() {
     let input = UblkControlGetDevInfo2Input::from_kernel_dev_id(55);
-    let mut dev_info = UblkSrvCtrlDevInfo::default();
-    let cmd = build_get_dev_info2_ctrl_cmd(input, &mut dev_info);
+    let mut payload = UblkControlGetDevInfo2Payload::new(input);
+    let cmd = build_get_dev_info2_ctrl_cmd(input, &mut payload);
     let payload = encode_get_dev_info2_cmd80(cmd);
 
     // dev_id is at bytes 0..4 (little-endian)
