@@ -40,6 +40,7 @@ pub(crate) struct ImportedBackingDirOwner {
     pub(crate) reachable: bool,
 }
 
+#[cfg(feature = "block-volume")]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct StaleUblkOwnerCandidate {
     pub(crate) pid: u32,
@@ -221,6 +222,7 @@ pub(crate) fn route_or_refuse_active_for_uuid_with_args(
 /// The record is descriptive input only. Callers must independently match its
 /// dead PID to the canonical Pool import lock and to kernel GET_DEV_INFO2
 /// before issuing any recovery command.
+#[cfg(feature = "block-volume")]
 pub(crate) fn stale_ublk_owner_candidate(
     pool: &str,
     pool_uuid: [u8; 16],
@@ -229,6 +231,7 @@ pub(crate) fn stale_ublk_owner_candidate(
     stale_ublk_owner_candidate_at(&pool_runtime_root(), pool, pool_uuid, volume)
 }
 
+#[cfg(feature = "block-volume")]
 fn stale_ublk_owner_candidate_at(
     root: &Path,
     pool: &str,
@@ -1715,6 +1718,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(feature = "block-volume")]
     #[test]
     fn stale_ublk_owner_candidate_requires_exact_dead_pool_volume_owner() {
         let dir = tempfile::tempdir().unwrap();
