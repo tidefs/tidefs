@@ -1330,13 +1330,6 @@ impl VfsLocalFileSystem {
                     LivePoolAdminCommand::PoolIntegrityCheck => {
                         self.live_pool_integrity_check(pool, &args, wants_json)
                     }
-                    LivePoolAdminCommand::DeviceRemove => {
-                        self.live_device_remove(&args, wants_json)
-                    }
-                    LivePoolAdminCommand::DeviceReplace => {
-                        self.live_device_replace(&args, wants_json)
-                    }
-                    LivePoolAdminCommand::DeviceStatus => self.live_device_status(wants_json),
                     command => {
                         let (command_name, operation) = command.parts();
                         live_admin_typed_error(LivePoolAdminError::unsupported_command(
@@ -1373,8 +1366,6 @@ impl VfsLocalFileSystem {
             | LivePoolAdminCommand::SnapshotExtract
             | LivePoolAdminCommand::SnapshotSend
             | LivePoolAdminCommand::PerformanceAdmissionSnapshot
-            | LivePoolAdminCommand::DeviceRemove
-            | LivePoolAdminCommand::DeviceReplace
             | LivePoolAdminCommand::BlockAttach => true,
             LivePoolAdminCommand::DatasetSetStrategy => !matches!(
                 request.args.0.get("list"),
@@ -1388,7 +1379,9 @@ impl VfsLocalFileSystem {
             | LivePoolAdminCommand::DatasetGet
             | LivePoolAdminCommand::DatasetListProps
             | LivePoolAdminCommand::SnapshotList
-            | LivePoolAdminCommand::DeviceStatus => false,
+            | LivePoolAdminCommand::DeviceStatus
+            | LivePoolAdminCommand::DeviceRemove
+            | LivePoolAdminCommand::DeviceReplace => false,
         }
     }
 
@@ -3249,9 +3242,37 @@ impl VfsLocalFileSystem {
         }
         live_admin_ok_text(out)
     }
+}
+
+impl SharedLocalFileSystem {
+    /// Serve bounded device administration through the one already-open
+    /// mounted Pool owner, without routing through VFS semantics.
+    pub fn handle_live_device_admin_request(
+        &self,
+        request: &LivePoolAdminRequest,
+    ) -> LivePoolAdminResponse {
+        if let Err(err) = request.validate_version() {
+            return live_admin_typed_error(err);
+        }
+
+        let args = live_admin_args_to_json(&request.args);
+        let wants_json = request.output.wants_json();
+        match request.command {
+            LivePoolAdminCommand::DeviceStatus => self.live_device_status(wants_json),
+            LivePoolAdminCommand::DeviceRemove => self.live_device_remove(&args, wants_json),
+            LivePoolAdminCommand::DeviceReplace => self.live_device_replace(&args, wants_json),
+            command => {
+                let (command_name, operation) = command.parts();
+                live_admin_typed_error(LivePoolAdminError::unsupported_command(
+                    command_name,
+                    operation,
+                ))
+            }
+        }
+    }
 
     fn live_device_status(&self, wants_json: bool) -> LivePoolAdminResponse {
-        let fs = self.fs.borrow();
+        let fs = self.borrow();
         let topology = fs.store.pool().topology_status();
         let replacement = fs.store.pool().device_replacement_result();
         let state_name = |state| match state {
@@ -3397,11 +3418,10 @@ impl VfsLocalFileSystem {
             );
         }
         if let Err(err) = self
-            .fs
             .borrow()
             .ensure_mutation_allowed("replace mounted pool device")
         {
-            let evidence = self.fs.borrow().store.pool().device_replacement_result();
+            let evidence = self.borrow().store.pool().device_replacement_result();
             return refusal(
                 1,
                 format!("device replace: mutation requires reopen: {err}"),
@@ -3409,7 +3429,7 @@ impl VfsLocalFileSystem {
             );
         }
 
-        let mut fs = self.fs.borrow_mut();
+        let mut fs = self.borrow_mut();
         // A reopened replacement is deliberately generation-fenced until Pool
         // reattaches the exact recorded candidate or finishes terminal
         // evidence for an already-published topology. Resume that Pool
@@ -3524,7 +3544,6 @@ impl VfsLocalFileSystem {
 
     fn live_device_remove(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
         if let Err(err) = self
-            .fs
             .borrow()
             .ensure_mutation_allowed("remove mounted pool device")
         {
@@ -3543,7 +3562,7 @@ impl VfsLocalFileSystem {
             );
         }
 
-        let mut fs = self.fs.borrow_mut();
+        let mut fs = self.borrow_mut();
         if let Err(err) = fs.sync_all() {
             return live_admin_error(
                 1,
@@ -7841,7 +7860,19 @@ mod tests {
         args: Value,
         wants_json: bool,
     ) -> Value {
-        live_admin(engine, "device", operation, args, wants_json)
+        let command = LivePoolAdminCommand::from_parts("device", operation)
+            .expect("test live device admin command");
+        let mut request = LivePoolAdminRequest::new(command, "tank");
+        request.output = if wants_json {
+            LivePoolAdminOutput::MachineJson
+        } else {
+            LivePoolAdminOutput::Human
+        };
+        request.args = live_admin_args_from_json(args);
+        let response = engine
+            .shared_filesystem()
+            .handle_live_device_admin_request(&request);
+        live_admin_response_to_assertion_json(response)
     }
 
     fn live_pool_admin(
@@ -8058,6 +8089,37 @@ mod tests {
         assert_eq!(value["json"]["kind"], "unsupported_command");
         assert_eq!(value["json"]["command"], "pool");
         assert_eq!(value["json"]["operation"], "status");
+    }
+
+    #[test]
+    fn live_device_admin_uses_shared_owner_not_vfs_dispatch() {
+        let (engine, _td) = temp_fs();
+
+        for (command, operation) in [
+            (LivePoolAdminCommand::DeviceStatus, "status"),
+            (LivePoolAdminCommand::DeviceRemove, "remove"),
+            (LivePoolAdminCommand::DeviceReplace, "replace"),
+        ] {
+            let request = LivePoolAdminRequest::new(command, "tank");
+            let vfs_response = engine
+                .handle_live_pool_admin_request(&request)
+                .expect("dispatch through VFS");
+            let vfs_value = live_admin_response_to_assertion_json(vfs_response);
+            assert_eq!(vfs_value["ok"], false);
+            assert_eq!(vfs_value["json"]["kind"], "unsupported_command");
+            assert_eq!(vfs_value["json"]["command"], "device");
+            assert_eq!(vfs_value["json"]["operation"], operation);
+        }
+
+        let request = LivePoolAdminRequest::new(LivePoolAdminCommand::DeviceStatus, "tank");
+        let owner_response = engine
+            .shared_filesystem()
+            .handle_live_device_admin_request(&request);
+        let owner_value = live_admin_response_to_assertion_json(owner_response);
+        assert_eq!(owner_value["ok"], true);
+        assert!(owner_value["text"]
+            .as_str()
+            .is_some_and(|output| output.starts_with("device status:")));
     }
 
     #[test]
