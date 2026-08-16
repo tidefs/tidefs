@@ -156,6 +156,7 @@ fn run_ublk_data_queue_io_loop_impl(
     let mut io_loop_commit_and_fetch_submitted = 0u64;
     let mut io_loop_failure_class = UblkDataQueueIoLoopFailureClass::HostNotAdmitted;
     let mut io_loop_errno = None;
+    let mut writer_authority_loss = None;
     let mut shutdown_graceful = false;
     let mut drain_cqes_processed: u64 = 0;
     let mut drain_iterations: u64 = 0;
@@ -418,6 +419,18 @@ fn run_ublk_data_queue_io_loop_impl(
                                                 };
                                                 let mut iteration = 0u32;
                                                 'io_loop: loop {
+                                                    if let Err(error) =
+                                                        backend.maintain_writer_authority()
+                                                    {
+                                                        eprintln!(
+                                                            "tidefs ublk-serve: clustered writer authority lost; fencing I/O and tearing down device: {error}"
+                                                        );
+                                                        io_loop_failure_class =
+                                                            UblkDataQueueIoLoopFailureClass::IoLoopPrematureExit;
+                                                        writer_authority_loss =
+                                                            Some(error.to_string());
+                                                        break 'io_loop;
+                                                    }
                                                     if let Some(ref shutdown_flag) = shutdown {
                                                         if shutdown_flag.load(Ordering::Relaxed) {
                                                             eprintln!("tidefs ublk-serve: shutdown signal received, draining I/O loop");
@@ -716,7 +729,8 @@ fn run_ublk_data_queue_io_loop_impl(
                                                 }
 
                                                 // ── Shutdown drain and final flush ──────────
-                                                if shutdown_graceful
+                                                if (shutdown_graceful
+                                                    || writer_authority_loss.is_some())
                                                     && start_dev_uring_cmd_completed
                                                 {
                                                     let drain_deadline = std::time::Instant::now()
@@ -725,6 +739,17 @@ fn run_ublk_data_queue_io_loop_impl(
                                                         );
                                                     eprintln!("tidefs ublk-serve: shutdown phase: draining in-flight I/O (deadline {drain_deadline_secs}s)");
                                                     'drain: loop {
+                                                        if writer_authority_loss.is_none() {
+                                                            if let Err(error) =
+                                                                backend.maintain_writer_authority()
+                                                            {
+                                                                eprintln!(
+                                                                    "tidefs ublk-serve: writer authority lost during shutdown drain; backend fenced: {error}"
+                                                                );
+                                                                writer_authority_loss =
+                                                                    Some(error.to_string());
+                                                            }
+                                                        }
                                                         if std::time::Instant::now()
                                                             >= drain_deadline
                                                         {
@@ -993,7 +1018,21 @@ fn run_ublk_data_queue_io_loop_impl(
                                                         eprintln!("tidefs ublk-serve: shutdown phase: drain complete ({drain_iterations} iterations, {drain_cqes_processed} CQEs processed, in-flight counter verified zero)");
                                                     }
 
-                                                    if backend.is_read_only() {
+                                                    if writer_authority_loss.is_none() {
+                                                        if let Err(error) =
+                                                            backend.maintain_writer_authority()
+                                                        {
+                                                            eprintln!(
+                                                                "tidefs ublk-serve: writer authority lost before final flush; backend fenced: {error}"
+                                                            );
+                                                            writer_authority_loss =
+                                                                Some(error.to_string());
+                                                        }
+                                                    }
+
+                                                    if writer_authority_loss.is_some() {
+                                                        eprintln!("tidefs ublk-serve: shutdown phase: writer authority is fenced; refusing final backend flush");
+                                                    } else if backend.is_read_only() {
                                                         eprintln!("tidefs ublk-serve: shutdown phase: read-only backend has no dirty data to flush");
                                                     } else {
                                                         eprintln!("tidefs ublk-serve: shutdown phase: issuing final backend flush");
@@ -1219,7 +1258,7 @@ fn run_ublk_data_queue_io_loop_impl(
     let started_export_admission_artifact_written =
         started_export_admission_artifact_path.is_some();
 
-    Ok(UblkDataQueueIoLoopReport {
+    let report = UblkDataQueueIoLoopReport {
         start_dev_uring_cmd_completed,
         ublk_device_pair_created,
         ublk_device_pair_deleted,
@@ -1253,7 +1292,13 @@ fn run_ublk_data_queue_io_loop_impl(
         barrier_audit_total_entries,
         started_export_admission_artifact_path,
         started_export_admission_artifact_written,
-    })
+    };
+    if let Some(error) = writer_authority_loss {
+        return Err(AppError::new(format!(
+            "clustered writer authority lost after ublk teardown: {error}"
+        )));
+    }
+    Ok(report)
 }
 
 #[cfg(test)]

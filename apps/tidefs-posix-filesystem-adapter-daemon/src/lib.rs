@@ -152,9 +152,7 @@ const MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 const MOUNT_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
 const MOUNT_FUSE_INIT_TIMEOUT_SECS: u64 = 5;
 #[cfg(feature = "cluster")]
-const CLUSTER_LEASE_MIN_RENEWAL_LEAD_MS: u64 = 250;
-#[cfg(feature = "cluster")]
-const CLUSTER_LEASE_MAX_RENEWAL_LEAD_MS: u64 = 10_000;
+pub use tidefs_cluster::{ClusterLeaseGrant, ClusterLeaseSession};
 // The selected local mount owns its bounded scrub work-per-tick policy.
 // Optional observations report this behavior but do not configure it.
 const MOUNT_SCRUB_MAX_RECORDS_PER_TICK: u64 = 1;
@@ -636,34 +634,6 @@ pub enum MountAuthorityWire<'a> {
     },
 }
 
-/// Validated cluster lease authority for a mounted pool.
-#[cfg(feature = "cluster")]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClusterLeaseGrant {
-    /// Opaque authority token carrying owner, epoch, lease, and write fence.
-    pub token: tidefs_cluster::PoolLeaseToken,
-    /// Conservative process-local deadline measured after transport receipt.
-    pub valid_until: Instant,
-}
-
-#[cfg(feature = "cluster")]
-impl ClusterLeaseGrant {
-    fn remaining(&self) -> Duration {
-        self.valid_until.saturating_duration_since(Instant::now())
-    }
-}
-
-/// Live transport session for renewing and releasing one Pool lease.
-#[cfg(feature = "cluster")]
-pub trait ClusterLeaseSession: std::fmt::Debug + Send {
-    fn renew(
-        &mut self,
-        token: &tidefs_cluster::PoolLeaseToken,
-    ) -> Result<ClusterLeaseGrant, String>;
-
-    fn release(&mut self, token: &tidefs_cluster::PoolLeaseToken) -> Result<(), String>;
-}
-
 /// Validated authority plus the live session that keeps it renewable.
 #[cfg(feature = "cluster")]
 pub struct ClusterMountAuthority {
@@ -947,7 +917,7 @@ impl ClusterMountAuthority {
             mutation_deadline: tidefs_local_filesystem::ExternalMutationDeadline::new_until(
                 valid_until,
             ),
-            next_renewal: cluster_lease_renewal_at(valid_until),
+            next_renewal: tidefs_cluster::cluster_lease_renewal_at(valid_until),
             token: grant.token,
             session,
             vfs_rpc_owner: None,
@@ -1047,7 +1017,7 @@ impl ClusterMountAuthority {
                 "cluster mount: renewal local validity expired before installation".to_string(),
             );
         }
-        self.next_renewal = cluster_lease_renewal_at(renewed.valid_until);
+        self.next_renewal = tidefs_cluster::cluster_lease_renewal_at(renewed.valid_until);
         self.token = renewed.token;
         if let Some(vfs_rpc_owner) = &self.vfs_rpc_owner {
             *vfs_rpc_owner
@@ -1076,21 +1046,6 @@ impl ClusterMountAuthority {
         self.mutation_deadline.fence();
         Ok(())
     }
-}
-
-#[cfg(feature = "cluster")]
-fn cluster_lease_renewal_at(valid_until: Instant) -> Instant {
-    let now = Instant::now();
-    let valid_for = valid_until.saturating_duration_since(now);
-    let remaining_ms = u64::try_from(valid_for.as_millis()).unwrap_or(u64::MAX);
-    let lead_ms = (remaining_ms / 3)
-        .clamp(
-            CLUSTER_LEASE_MIN_RENEWAL_LEAD_MS,
-            CLUSTER_LEASE_MAX_RENEWAL_LEAD_MS,
-        )
-        .min((remaining_ms / 2).max(1));
-    now.checked_add(Duration::from_millis(remaining_ms.saturating_sub(lead_ms)))
-        .unwrap_or(now)
 }
 
 #[cfg(feature = "cluster")]

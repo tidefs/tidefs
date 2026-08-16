@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 
 use std::fs::OpenOptions;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tidefs_block_volume_adapter_daemon::storage_backend::{
     BackendError, BlockVolumeStorageBackend, PoolVolumeBackend,
 };
 use tidefs_block_volume_adapter_daemon::DataQueueWorker;
-use tidefs_cluster::{EpochId, PoolLeaseToken, WriteFence};
+use tidefs_cluster::{ClusterLeaseGrant, ClusterLeaseSession, EpochId, PoolLeaseToken, WriteFence};
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, SyncGuarantee};
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 use tidefs_pool_runtime::PoolRuntime;
@@ -58,6 +59,39 @@ fn clustered_lease(runtime: &PoolRuntime, pool_guid: [u8; 16]) -> PoolLeaseToken
         WriteFence::new(EpochId(3), 5),
         60_000,
     )
+}
+
+#[derive(Debug)]
+struct MockLeaseSession {
+    events: Arc<Mutex<Vec<&'static str>>>,
+    fail_renewal: bool,
+}
+
+impl ClusterLeaseSession for MockLeaseSession {
+    fn renew(&mut self, token: &PoolLeaseToken) -> Result<ClusterLeaseGrant, String> {
+        self.events.lock().unwrap().push("renew");
+        if self.fail_renewal {
+            return Err("injected authority loss".to_string());
+        }
+        let mut renewed = token.clone();
+        renewed.expiration_deadline_ms += 60_000;
+        Ok(ClusterLeaseGrant {
+            token: renewed,
+            valid_until: Instant::now() + Duration::from_secs(60),
+        })
+    }
+
+    fn release(&mut self, _token: &PoolLeaseToken) -> Result<(), String> {
+        self.events.lock().unwrap().push("release");
+        Ok(())
+    }
+}
+
+fn renewable_grant(token: PoolLeaseToken) -> ClusterLeaseGrant {
+    ClusterLeaseGrant {
+        token,
+        valid_until: Instant::now() + Duration::from_millis(300),
+    }
 }
 
 fn descriptor(op: u8, start_sector: u64, sector_count: u32, address: u64) -> UblkSrvIoDesc {
@@ -227,6 +261,144 @@ fn clustered_pool_volume_backend_renews_only_the_same_extended_grant() {
     backend
         .read_blocks(0, 1, 4096)
         .expect("renewed authority keeps the backend live");
+}
+
+#[test]
+fn clustered_pool_volume_live_carrier_renews_and_release_fences() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut runtime, _device) = runtime(&dir);
+    create_volume(&mut runtime, "vol", 11);
+    let pool_guid = runtime.pool().pool_guid();
+    let lease = clustered_lease(&runtime, pool_guid);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let session = MockLeaseSession {
+        events: Arc::clone(&events),
+        fail_renewal: false,
+    };
+    let mut backend = PoolVolumeBackend::open_renewable_clustered(
+        runtime,
+        "vol",
+        false,
+        renewable_grant(lease),
+        Box::new(session),
+    )
+    .expect("open renewable clustered backend");
+
+    std::thread::sleep(Duration::from_millis(180));
+    backend
+        .maintain_writer_authority()
+        .expect("renew live writer authority");
+    backend
+        .write_blocks(0, &[0x61; 4096], 4096)
+        .expect("write after renewal");
+    backend.flush().expect("flush after renewal");
+    backend
+        .release_clustered_authority()
+        .expect("release after carrier stop");
+
+    assert_eq!(*events.lock().unwrap(), vec!["renew", "release"]);
+    assert!(matches!(
+        backend.read_blocks(0, 1, 4096),
+        Err(BackendError::ClusterAuthorityExpired)
+    ));
+}
+
+#[test]
+fn clustered_pool_volume_renewal_loss_fences_before_teardown_release() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut runtime, _device) = runtime(&dir);
+    create_volume(&mut runtime, "vol", 12);
+    let pool_guid = runtime.pool().pool_guid();
+    let lease = clustered_lease(&runtime, pool_guid);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let session = MockLeaseSession {
+        events: Arc::clone(&events),
+        fail_renewal: true,
+    };
+    let mut backend = PoolVolumeBackend::open_renewable_clustered(
+        runtime,
+        "vol",
+        false,
+        renewable_grant(lease),
+        Box::new(session),
+    )
+    .expect("open renewable clustered backend");
+
+    std::thread::sleep(Duration::from_millis(180));
+    let error = backend.maintain_writer_authority().unwrap_err();
+    assert!(error.to_string().contains("injected authority loss"));
+    assert!(matches!(
+        backend.write_blocks(0, &[0x62; 4096], 4096),
+        Err(BackendError::ClusterAuthorityExpired)
+    ));
+    backend
+        .release_clustered_authority()
+        .expect("release fenced predecessor lease during teardown");
+    assert_eq!(*events.lock().unwrap(), vec!["renew", "release"]);
+}
+
+#[test]
+fn higher_fence_successor_reopens_released_clustered_volume() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut runtime, device) = runtime(&dir);
+    create_volume(&mut runtime, "vol", 13);
+    let pool_guid = runtime.pool().pool_guid();
+    let predecessor = clustered_lease(&runtime, pool_guid);
+    let predecessor_events = Arc::new(Mutex::new(Vec::new()));
+    let mut backend = PoolVolumeBackend::open_renewable_clustered(
+        runtime,
+        "vol",
+        false,
+        renewable_grant(predecessor.clone()),
+        Box::new(MockLeaseSession {
+            events: Arc::clone(&predecessor_events),
+            fail_renewal: false,
+        }),
+    )
+    .expect("open predecessor");
+    backend
+        .write_blocks(2, &[0x6a; 4096], 4096)
+        .expect("write predecessor bytes");
+    backend.flush().expect("commit predecessor bytes");
+    backend
+        .release_clustered_authority()
+        .expect("release predecessor");
+    drop(backend);
+
+    let runtime = PoolRuntime::open_block_devices(
+        dir.path(),
+        &[device],
+        "tank",
+        PoolRedundancyPolicy::default(),
+        &StoreOptions::default(),
+    )
+    .expect("reopen Pool for successor");
+    let mut successor = predecessor;
+    successor.node_id = 8;
+    successor.lease_id += 1;
+    successor.write_fence = WriteFence::new(successor.epoch, 6);
+    successor.expiration_deadline_ms += 60_000;
+    let successor_events = Arc::new(Mutex::new(Vec::new()));
+    let mut backend = PoolVolumeBackend::open_renewable_clustered(
+        runtime,
+        "vol",
+        false,
+        renewable_grant(successor),
+        Box::new(MockLeaseSession {
+            events: Arc::clone(&successor_events),
+            fail_renewal: false,
+        }),
+    )
+    .expect("open higher-fence successor");
+    let read = backend
+        .read_blocks(2, 1, 4096)
+        .expect("successor reads committed predecessor bytes");
+    assert_eq!(read.payload.unwrap(), vec![0x6a; 4096]);
+    backend
+        .release_clustered_authority()
+        .expect("release successor");
+    assert_eq!(*predecessor_events.lock().unwrap(), vec!["release"]);
+    assert_eq!(*successor_events.lock().unwrap(), vec!["release"]);
 }
 
 #[test]

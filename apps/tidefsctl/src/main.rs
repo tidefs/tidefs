@@ -1404,6 +1404,71 @@ mod tests {
         assert!(args.is_ok(), "explicit Pool devices should parse");
     }
 
+    #[cfg(all(feature = "block-volume", feature = "cluster"))]
+    #[test]
+    fn cli_parse_cluster_block_attach_requires_exact_trust_and_devices() {
+        use clap::Parser;
+        let accepted = Cli::try_parse_from([
+            "tidefsctl",
+            "block",
+            "attach",
+            "mypool/vol",
+            "--devices",
+            "/dev/loop0",
+            "--cluster",
+            "--cluster-authority-addr",
+            "127.0.0.1:7411",
+            "--cluster-node-credential",
+            "/run/keys/owner.credential",
+            "--cluster-trusted-authority-identity",
+            "/run/keys/authority.identity",
+        ]);
+        assert!(
+            accepted.is_ok(),
+            "complete clustered block owner should parse"
+        );
+
+        for refused in [
+            vec![
+                "tidefsctl",
+                "block",
+                "attach",
+                "mypool/vol",
+                "--cluster",
+                "--cluster-authority-addr",
+                "127.0.0.1:7411",
+                "--cluster-node-credential",
+                "/run/keys/owner.credential",
+                "--cluster-trusted-authority-identity",
+                "/run/keys/authority.identity",
+            ],
+            vec![
+                "tidefsctl",
+                "block",
+                "attach",
+                "mypool/vol",
+                "--devices",
+                "/dev/loop0",
+                "--cluster",
+            ],
+            vec![
+                "tidefsctl",
+                "block",
+                "attach",
+                "mypool/vol",
+                "--devices",
+                "/dev/loop0",
+                "--cluster-authority-addr",
+                "127.0.0.1:7411",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(refused).is_err(),
+                "incomplete clustered block owner must be refused"
+            );
+        }
+    }
+
     #[cfg(feature = "block-volume")]
     #[test]
     fn cli_parse_block_attach_rejects_backing_dir() {
