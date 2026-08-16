@@ -592,15 +592,17 @@ fn select_ublk_recovery_device(
 ) -> Result<UblkRecoveryDevice, String> {
     let predecessor_pid = i32::try_from(predecessor_pid)
         .map_err(|_| "predecessor PID exceeds the Linux process-id range".to_string())?;
-    let mut matching_owner = probes
-        .iter()
-        .filter(|probe| probe.ublksrv_pid == predecessor_pid);
-    let probe = matching_owner.next().ok_or_else(|| {
-        format!("no kernel ublk device is owned by predecessor PID {predecessor_pid}")
+    // Linux deliberately reports -1 from GET_DEV_INFO2 after the original
+    // ublksrv task disappears. The cached owner and stale import lock prove
+    // the predecessor PID; kernel selection must therefore require one
+    // unambiguous orphan rather than an impossible dead-PID equality.
+    let mut orphaned = probes.iter().filter(|probe| probe.ublksrv_pid == -1);
+    let probe = orphaned.next().ok_or_else(|| {
+        format!("no orphaned kernel ublk device remains for predecessor PID {predecessor_pid}")
     })?;
-    if matching_owner.next().is_some() {
+    if orphaned.next().is_some() {
         return Err(format!(
-            "multiple kernel ublk devices are owned by predecessor PID {predecessor_pid}"
+            "multiple orphaned kernel ublk devices make predecessor PID {predecessor_pid} ambiguous"
         ));
     }
     if probe.state
@@ -904,7 +906,7 @@ mod block_path_tests {
     fn valid_recovery_probe() -> UblkRecoveryProbe {
         UblkRecoveryProbe {
             dev_id: 7,
-            ublksrv_pid: 4242,
+            ublksrv_pid: -1,
             state: tidefs_block_volume_adapter_ublk_control_runtime::TIDEFS_UBLK_RECOVERY_QUIESCED_STATE,
             flags: tidefs_block_volume_adapter_ublk_control_runtime::TIDEFS_UBLK_ADD_DEV_REQUIRED_FEATURES.bits(),
             nr_hw_queues: 2,
@@ -915,7 +917,7 @@ mod block_path_tests {
     }
 
     #[test]
-    fn block_recovery_selects_only_one_exact_kernel_owner_and_volume() {
+    fn block_recovery_selects_only_one_orphaned_kernel_device_and_volume() {
         let probe = valid_recovery_probe();
         assert_eq!(
             select_ublk_recovery_device(4242, probe.capacity_bytes, &[probe]).unwrap(),
@@ -926,15 +928,27 @@ mod block_path_tests {
             }
         );
 
+        let mut live = probe;
+        live.dev_id = 8;
+        live.ublksrv_pid = 4343;
+        assert_eq!(
+            select_ublk_recovery_device(4242, probe.capacity_bytes, &[live, probe]).unwrap(),
+            UblkRecoveryDevice {
+                dev_id: 7,
+                nr_hw_queues: 2,
+                queue_depth: 64,
+            }
+        );
+
         assert!(
-            select_ublk_recovery_device(4343, probe.capacity_bytes, &[probe])
+            select_ublk_recovery_device(4242, live.capacity_bytes, &[live])
                 .unwrap_err()
-                .contains("no kernel ublk device")
+                .contains("no orphaned kernel ublk device")
         );
         assert!(
             select_ublk_recovery_device(4242, probe.capacity_bytes, &[probe, probe])
                 .unwrap_err()
-                .contains("multiple kernel ublk devices")
+                .contains("multiple orphaned kernel ublk devices")
         );
 
         let mut invalid = probe;

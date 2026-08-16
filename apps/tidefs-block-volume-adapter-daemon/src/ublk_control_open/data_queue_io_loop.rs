@@ -262,9 +262,9 @@ fn run_ublk_data_queue_io_loop_impl(
                 "recover ublk device {reconnect_id}: predecessor PID exceeds the Linux process-id range"
             ))
         })?;
-        if dev_info.ublksrv_pid != predecessor_pid {
+        if dev_info.ublksrv_pid != -1 {
             return Err(AppError::new(format!(
-                "recover ublk device {reconnect_id}: GET_DEV_INFO2 owner PID {} no longer matches predecessor PID {predecessor_pid}",
+                "recover ublk device {reconnect_id}: GET_DEV_INFO2 reports live owner PID {} after predecessor PID {predecessor_pid} was admitted as dead",
                 dev_info.ublksrv_pid
             )));
         }

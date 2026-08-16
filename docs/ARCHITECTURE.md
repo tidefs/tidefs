@@ -256,14 +256,18 @@ Standalone process-crash recovery remains part of that same operator path.
 cached `owner_kind=ublk` record only as a candidate. Its exact Pool UUID,
 volume name, and dead PID must match the Pool's stale import lock; normal
 `pool_import_owned` then reclaims that lock and reopens the canonical volume.
-Before any ublk mutation, `GET_DEV_INFO2` must identify exactly one quiesced
-device with the predecessor PID, retained recovery/reissue flags, valid queue
-geometry, and capacity equal to the canonical volume. The successor issues
-`START_USER_RECOVERY`, reopens every existing queue/tag slot without
-`SET_PARAMS`, supplies its PID to `END_USER_RECOVERY`, and serves I/O through
-the ordinary carrier. A mismatch or recovery refusal never falls back to
-`ADD_DEV`, and a setup failure after import withholds Pool label export. There
-is no detached first-device reconnect command or second recovery authority.
+Before any ublk mutation, `GET_DEV_INFO2` must identify exactly one orphaned,
+quiesced device with retained recovery/reissue flags, valid queue geometry, and
+capacity equal to the canonical volume. Linux reports `ublksrv_pid=-1` after
+the predecessor task disappears, so the exact dead PID is established by the
+agreement between cached owner and stale import lock; the kernel side proves
+that no live owner remains and refuses recovery when more than one orphan is
+present. The successor issues `START_USER_RECOVERY`, reopens every existing
+queue/tag slot without `SET_PARAMS`, supplies its PID to `END_USER_RECOVERY`,
+and serves I/O through the ordinary carrier. A mismatch or recovery refusal
+never falls back to `ADD_DEV`, and a setup failure after import withholds Pool
+label export. There is no detached first-device reconnect command or second
+recovery authority.
 
 The logical block size may have a documented default, but capacity is required
 and exact; neither may be synthesized by the adapter. A pool may own mounted
