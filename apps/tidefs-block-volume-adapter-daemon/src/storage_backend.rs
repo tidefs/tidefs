@@ -101,6 +101,7 @@ pub enum BackendError {
     BackingStoreUnavailable,
     PayloadTooShort,
     NoSpace,
+    AlreadyExported,
     ReadOnly,
     InvalidClusterAuthority(&'static str),
     ClusterAuthorityExpired,
@@ -116,6 +117,7 @@ impl fmt::Display for BackendError {
             Self::BackingStoreUnavailable => write!(f, "backing store unavailable"),
             Self::PayloadTooShort => write!(f, "payload too short"),
             Self::NoSpace => write!(f, "no space left on device"),
+            Self::AlreadyExported => write!(f, "block volume is already actively exported"),
             Self::ReadOnly => write!(f, "read-only block volume"),
             Self::InvalidClusterAuthority(reason) => {
                 write!(f, "invalid clustered block authority: {reason}")
@@ -385,14 +387,19 @@ impl PoolVolumeBackend {
         valid_until: Instant,
     ) -> Result<Self, BackendError> {
         let deadline = ExternalMutationDeadline::new_until(valid_until);
-        {
+        let volume = {
             let mut runtime = lock_pool_runtime(&runtime)?;
             validate_clustered_lease(&runtime, &lease, valid_until)?;
+            let volume = runtime
+                .open_volume_export(path)
+                .map_err(map_pool_runtime_error)?;
             runtime
                 .install_external_mutation_deadline(deadline.clone())
                 .map_err(map_pool_runtime_error)?;
-        }
-        let mut backend = Self::open_shared(runtime, path, read_only)?;
+            volume
+        };
+        let mut backend =
+            Self::from_open_volume(PoolVolumeOwner::Standalone(runtime), volume, read_only)?;
         backend.clustered_authority = Some(ClusteredPoolVolumeAuthority {
             lease,
             deadline,
@@ -463,11 +470,19 @@ impl PoolVolumeBackend {
         read_only: bool,
     ) -> Result<Self, BackendError> {
         let volume = lock_pool_runtime(&runtime)?
-            .open_volume(path)
+            .open_volume_export(path)
             .map_err(map_pool_runtime_error)?;
+        Self::from_open_volume(PoolVolumeOwner::Standalone(runtime), volume, read_only)
+    }
+
+    fn from_open_volume(
+        owner: PoolVolumeOwner,
+        volume: tidefs_pool_runtime::PoolVolume,
+        read_only: bool,
+    ) -> Result<Self, BackendError> {
         let geometry = BlockDeviceGeometry::from_pool(volume.geometry())?;
         Ok(Self {
-            owner: PoolVolumeOwner::Standalone(runtime),
+            owner,
             volume,
             geometry,
             read_only,
@@ -483,16 +498,9 @@ impl PoolVolumeBackend {
         let volume = owner
             .borrow()
             .pool_runtime()
-            .open_volume(path)
+            .open_volume_export(path)
             .map_err(map_pool_runtime_error)?;
-        let geometry = BlockDeviceGeometry::from_pool(volume.geometry())?;
-        Ok(Self {
-            owner: PoolVolumeOwner::Mounted(owner),
-            volume,
-            geometry,
-            read_only,
-            clustered_authority: None,
-        })
+        Self::from_open_volume(PoolVolumeOwner::Mounted(owner), volume, read_only)
     }
 
     /// Renew the process-local gate only with the same committed writer,
@@ -834,6 +842,10 @@ fn validate_clustered_lease(
 fn map_pool_runtime_error(error: tidefs_pool_runtime::PoolRuntimeError) -> BackendError {
     match error {
         tidefs_pool_runtime::PoolRuntimeError::Bounds => BackendError::OutOfBounds,
+        tidefs_pool_runtime::PoolRuntimeError::VolumeAlreadyExported(_)
+        | tidefs_pool_runtime::PoolRuntimeError::VolumeExportActive { .. } => {
+            BackendError::AlreadyExported
+        }
         tidefs_pool_runtime::PoolRuntimeError::PhysicalNoSpace { .. } => BackendError::NoSpace,
         tidefs_pool_runtime::PoolRuntimeError::Store(
             tidefs_local_object_store::StoreError::NoSpace,

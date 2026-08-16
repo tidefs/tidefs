@@ -108,10 +108,11 @@ The selected dependency and authority direction is:
 3. One shared Pool-backed dataset runtime owns the opened `Pool`, pool identity
    and properties, the canonical `DatasetCatalog`, the table of typed dataset
    roots, a caller-neutral live view of the Pool-owned capacity, transaction
-   publication, replay frontier, pin/drain state, and orderly close. It does not
-   copy the Pool allocator counters into a second ledger. This boundary is
-   factored from the proven Pool-backed publication and recovery machinery; it
-   is not a parallel engine.
+   publication, replay frontier, durable pin/drain state, one process-local
+   active volume-export registry, and orderly close. It does not copy the Pool
+   allocator counters into a second ledger or persist transient exports in a
+   side format. This boundary is factored from the proven Pool-backed
+   publication and recovery machinery; it is not a parallel engine.
 4. `FilesystemDatasetEngine` owns inode, directory, extent, POSIX metadata,
    filesystem logical capacity/quota/reserve/statfs projection, and filesystem
    snapshot semantics for one `DatasetId`. Physical admission and visible free
@@ -158,7 +159,14 @@ needed to reopen coherently:
 - pool properties and capacity/reserve counters;
 - a typed root record for each live `DatasetId`;
 - the current transaction/replay generation; and
-- pending reclaim, pin, and lifecycle obligations that must survive reopen.
+- pending reclaim, snapshot pin, and lifecycle obligations that must survive
+  reopen.
+
+An active block export is deliberately not one of those durable records.
+`PoolRuntime::open_volume_export` pins its exact `DatasetId` only for the
+lifetime of the real in-process backend. Crash/reopen begins without that
+process-local pin; the ordinary Pool import and clustered lease/fence
+authorities decide whether the new process may own the Pool.
 
 Each typed dataset root then points to exactly one semantic engine root:
 
@@ -220,8 +228,12 @@ volume; clone delete removes only the unpromoted clone's catalog/root
 authority. Reopen validates the surviving lineage, typed roots, geometry, and
 map graphs before publication.
 
-Clone lifecycle mutations use the same Pool owner as block attach and are
-refused while the affected source or clone volume is actively exported.
+`PoolVolumeBackend` obtains its volume through the runtime's exclusive export
+open and holds that RAII pin until carrier teardown drops the backend. A second
+export, volume resize/rename/destroy, source snapshot creation/restore, and
+clone promotion/destroy are refused before mutation while their volume is
+actively exported. Detached non-carrier volume handles may still stage private
+data, but cannot publish it over the active export's root.
 Filesystem `SnapshotRecord::Clone` entries remain shared-root snapshot-table
 metadata, not independently mountable writable datasets. The product clone
 command explicitly refuses filesystem snapshot sources until filesystem roots
@@ -245,8 +257,11 @@ filesystems and block exports concurrently, but all front ends attach to the
 same neutral pool owner. The mounted live owner is `SharedPoolDatasetOwner`;
 `BlockAttach` passes that handle to `PoolVolumeBackend`, whose bounded data
 operations borrow `PoolRuntime` directly instead of calling
-`VfsLocalFileSystem` or a filesystem-shaped volume bridge. A standalone local
-block export can still own and import a pool without mounting a filesystem.
+`VfsLocalFileSystem` or a filesystem-shaped volume bridge. The backend's
+runtime-owned export pin is shared by standalone, mounted, and clustered
+constructors and releases when the backend drops after ublk teardown. A
+standalone local block export can still own and import a pool without mounting
+a filesystem.
 
 ### Local And Clustered Composition
 
@@ -288,8 +303,9 @@ flush/FUA continuity.
 - **Consolidate:** keep catalog persistence and pool-wide properties in
   `PoolRuntime`, and keep mounted live-owner and block routing on the one
   `SharedPoolDatasetOwner`; expose the one Pool-owned physical capacity through
-  that runtime while retaining only dataset-specific quota/statfs projections;
-  continue consolidating pin, reclaim, transaction, and teardown decisions
+  that runtime while retaining only dataset-specific quota/statfs projections,
+  and keep active volume-export pins in that runtime rather than adapters;
+  continue consolidating reclaim, transaction, and teardown decisions
   duplicated by front ends. Any future clustered dataset
   lifecycle must mutate the real durable `PoolRuntime` catalog under committed
   lease and fence authority; clustered mode must not introduce a mirror or an
@@ -334,6 +350,7 @@ device launch, or second directory/file backend does not satisfy the slice.
 | Carrier open | `apps/tidefs-posix-filesystem-adapter-daemon/src/lib.rs::run_mount` | Opens `PoolDatasetOwner` on the runtime metadata directory plus the devices, resolves the filesystem dataset, applies the selected sync, timestamp, capacity, writeback, maintenance, transform, and validation controls, shares it through one `SharedPoolDatasetOwner`, wraps the filesystem projection in the one VFS/FUSE session, and publishes that same owner live. | This is the only local mount runtime implementation. |
 | Object authority | `crates/tidefs-local-object-store/src/pool/mod.rs` | Opens the same labeled devices as a `Pool`, owns placement/device I/O, and persists object records and pool labels. | Keep as the only object/device I/O authority. |
 | Capacity | `Pool::pool_stats`, `PoolRuntime::physical_capacity`, filesystem dataset capacity projection | The opened `Pool` owns exact live physical use and final write refusal across filesystem and volume objects. `PoolRuntime` exposes that state without another counter ledger. Filesystem statfs, quota, and admission use the restrictive combination of their logical dataset projection and the live Pool view. Mounted filesystem and volume operations serialize through `SharedPoolDatasetOwner`, so a committed volume write is visible to the next filesystem decision. | Keep one physical owner at Pool; never reconstruct physical free space from filesystem logical counters. |
+| Volume export | `PoolRuntime::open_volume_export`, `PoolVolumeBackend` | The runtime admits one active backend per volume `DatasetId` and the returned handle owns its process-local RAII pin. Standalone, mounted, and clustered constructors use the same gate. Conflicting lifecycle/root mutations refuse before publication or reclaim; backend drop releases the pin, while reopen starts with no transient export state. | Keep export ownership in `PoolRuntime`; never add an adapter registry or host-side marker. |
 | Filesystem root/recovery | `crates/tidefs-local-filesystem/src/{lib,recovery}.rs` | Selects Pool-backed root-slot records, validates content through Pool receipts, replays intent and commit-group state, and constructs live filesystem state. | Keep and focus as the single mounted transaction/root/recovery authority. |
 | Dataset/inode/namespace | `FilesystemDatasetEngine`, `FileSystemState`, `DatasetInodeAuthority`, FUSE maps | The filesystem engine owns durable dataset, root, inode, and directory state beside the neutral `PoolRuntime`. `VfsLocalFileSystem` has no second inode projection, and the selected adapter has no second namespace attachment. FUSE lookup/forget references remain adapter-local maps. The former standalone namespace and inode-table packages plus their validation-only or duplicate persistence tests had no mounted consumer and were removed. | Keep every durable decision in the dataset authority; keep kernel-reference state as an adapter-local derived projection. |
 | VFS/FUSE | `vfs_engine_impl.rs`, `fuse_vfs_adapter.rs` | VFS calls local-filesystem for lookup and mutation semantics. The adapter projects engine results, handles, lookup references, caches, replies, and FUSE lifecycle without another namespace owner, merged directory view, or mutation fallback. | Keep VFS as the semantic owner and FUSE as a derived kernel transport projection. |
