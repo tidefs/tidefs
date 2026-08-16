@@ -681,6 +681,11 @@ PINEOF
       exit 2
     fi
 
+    if [ "$PASSC" -eq 0 ]; then
+      echo "VALIDATION: FAIL -- guest emitted no recognized validation rows"
+      exit 1
+    fi
+
     echo "VALIDATION: PASS"
     exit 0
   '';
