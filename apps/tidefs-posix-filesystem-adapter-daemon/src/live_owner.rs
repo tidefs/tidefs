@@ -556,11 +556,7 @@ fn dispatch_request(
         | LivePoolAdminCommand::SnapshotDestroy => delegate_admin_request(&request, admin),
         #[cfg(not(feature = "block-volume"))]
         LivePoolAdminCommand::SnapshotRollback => rollback_snapshot(&request, admin),
-        LivePoolAdminCommand::PoolGet
-        | LivePoolAdminCommand::PoolSet
-        | LivePoolAdminCommand::PoolListProps
-        | LivePoolAdminCommand::PoolIntegrityCheck
-        | LivePoolAdminCommand::DatasetCreate
+        LivePoolAdminCommand::DatasetCreate
         | LivePoolAdminCommand::DatasetList
         | LivePoolAdminCommand::DatasetSetStrategy
         | LivePoolAdminCommand::DatasetUpgrade
@@ -575,11 +571,15 @@ fn dispatch_request(
         | LivePoolAdminCommand::PerformanceAdmissionSnapshot => {
             delegate_admin_request(&request, admin)
         }
-        LivePoolAdminCommand::DeviceStatus
+        LivePoolAdminCommand::PoolGet
+        | LivePoolAdminCommand::PoolSet
+        | LivePoolAdminCommand::PoolListProps
+        | LivePoolAdminCommand::PoolIntegrityCheck
+        | LivePoolAdminCommand::DeviceStatus
         | LivePoolAdminCommand::DeviceRemove
         | LivePoolAdminCommand::DeviceReplace => match admin {
             LiveOwnerAdmin::Fuse { filesystem, .. } => {
-                filesystem.handle_live_device_admin_request(&request)
+                filesystem.handle_live_pool_owner_admin_request(&request)
             }
             #[cfg(feature = "block-volume")]
             LiveOwnerAdmin::StandaloneBlock { .. } => unsupported_admin_command_response(&request),
