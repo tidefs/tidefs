@@ -7,9 +7,9 @@ use tidefs_block_volume_adapter_core::{
     BlockVolumeQueueSetRecord,
 };
 use tidefs_ublk_abi::{
-    params_size, UblkParamBasic, UblkParamDiscard, UblkParamSegment, UblkParams, UBLK_ATTR_FUA,
-    UBLK_ATTR_READ_ONLY, UBLK_MAX_NR_QUEUES, UBLK_MAX_QUEUE_DEPTH, UBLK_MIN_SEGMENT_SIZE,
-    UBLK_PARAM_TYPE_BASIC, UBLK_PARAM_TYPE_DISCARD, UBLK_PARAM_TYPE_SEGMENT,
+    params_size, UblkParamBasic, UblkParamDiscard, UblkParamSegment, UblkParams,
+    UBLK_ATTR_READ_ONLY, UBLK_ATTR_VOLATILE_CACHE, UBLK_MAX_NR_QUEUES, UBLK_MAX_QUEUE_DEPTH,
+    UBLK_MIN_SEGMENT_SIZE, UBLK_PARAM_TYPE_BASIC, UBLK_PARAM_TYPE_DISCARD, UBLK_PARAM_TYPE_SEGMENT,
 };
 
 pub(crate) fn build_ublk_parameter_spec_report(
@@ -143,7 +143,11 @@ fn build_ublk_parameters_for_queue(
         len: params_size() as u32,
         types: UBLK_PARAM_TYPE_BASIC | UBLK_PARAM_TYPE_DISCARD | UBLK_PARAM_TYPE_SEGMENT,
         basic: UblkParamBasic {
-            attrs: UBLK_ATTR_FUA | if read_only { UBLK_ATTR_READ_ONLY } else { 0 },
+            attrs: if read_only {
+                UBLK_ATTR_READ_ONLY
+            } else {
+                UBLK_ATTR_VOLATILE_CACHE
+            },
             logical_bs_shift,
             physical_bs_shift,
             io_opt_shift,
@@ -297,5 +301,24 @@ mod tests {
         assert_eq!(report.params.basic.logical_bs_shift, 12);
         assert_eq!(report.params.basic.physical_bs_shift, 12);
         assert_eq!(report.params.basic.io_min_shift, 12);
+    }
+
+    #[test]
+    fn writable_pool_volume_advertises_volatile_cache_without_fua() {
+        let geometry = BlockDeviceGeometry::from_pool(
+            tidefs_pool_runtime::VolumeGeometry::new(4 * 1024 * 1024)
+                .expect("create Pool volume geometry"),
+        )
+        .expect("project Pool volume geometry");
+
+        let report = build_ublk_parameter_spec_report_with_geometry(geometry, 1, 64, false)
+            .expect("project ublk parameters");
+
+        assert_ne!(report.params.basic.attrs & UBLK_ATTR_VOLATILE_CACHE, 0);
+        assert_eq!(
+            report.params.basic.attrs & tidefs_ublk_abi::UBLK_ATTR_FUA,
+            0
+        );
+        assert_eq!(report.params.basic.attrs & UBLK_ATTR_READ_ONLY, 0);
     }
 }

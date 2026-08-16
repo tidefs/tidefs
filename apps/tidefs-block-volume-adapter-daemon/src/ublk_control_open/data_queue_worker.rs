@@ -383,11 +383,15 @@ impl DataQueueWorker {
         &mut self,
         dispatcher: &mut UblkIoUringDispatcher,
         tag: u16,
-        _desc: &UblkSrvIoDesc,
+        desc: &UblkSrvIoDesc,
         raw_flags: u32,
     ) -> Result<DataQueueWorkerResultEntry, DataQueueWorkerError> {
         // Accept all kernel raw flags; flags are advisory hints.
         let _ = raw_flags;
+        if let Err(error) = validate_flush_descriptor(desc) {
+            self.error_ops += 1;
+            return Err(error);
+        }
         match dispatcher.flush() {
             Ok(()) => {
                 self.flush_ops += 1;
@@ -753,13 +757,9 @@ impl DataQueueWorker {
     ) -> Result<DataQueueWorkerResultEntry, DataQueueWorkerError> {
         // Accept all kernel raw flags; flags are advisory hints.
         let _ = raw_flags;
-        if desc.start_sector != 0 || desc.count_or_zones != 0 {
+        if let Err(error) = validate_flush_descriptor(desc) {
             self.error_ops += 1;
-            return Err(DataQueueWorkerError::RangeOnFlush);
-        }
-        if desc.addr != 0 {
-            self.error_ops += 1;
-            return Err(DataQueueWorkerError::UnexpectedBufferAddress);
+            return Err(error);
         }
         match backend.flush() {
             Ok(()) => {
@@ -1084,6 +1084,20 @@ impl DataQueueWorker {
     }
 }
 
+fn validate_flush_descriptor(desc: &UblkSrvIoDesc) -> Result<(), DataQueueWorkerError> {
+    // Linux creates synthetic flush requests with blk_rq_init(), which leaves
+    // the otherwise irrelevant sector at (sector_t)-1. No other range is valid.
+    if !matches!(desc.start_sector, 0 | u64::MAX) || desc.count_or_zones != 0 {
+        return Err(DataQueueWorkerError::RangeOnFlush);
+    }
+    // TideFS uses UBLK_F_USER_COPY and submits FETCH/COMMIT commands with no
+    // mapped request buffer. A flush carries no payload and must retain addr=0.
+    if desc.addr != 0 {
+        return Err(DataQueueWorkerError::UnexpectedBufferAddress);
+    }
+    Ok(())
+}
+
 fn data_queue_worker_smoke_payload(len: usize) -> Vec<u8> {
     (0..len)
         .map(|idx| (idx as u8).wrapping_mul(37).wrapping_add(11))
@@ -1094,6 +1108,7 @@ fn data_queue_worker_smoke_payload(len: usize) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::io;
+    use std::os::fd::AsRawFd;
     use tidefs_block_volume_adapter_core::{
         BlockVolumeCompletionClass, BlockVolumeGeometryRecord, BlockVolumeId,
     };
@@ -1461,6 +1476,64 @@ mod tests {
     }
 
     #[test]
+    fn worker_flush_accepts_linux_synthetic_sector_sentinel() {
+        let geometry = test_geometry();
+        let (_dir, mut image) = test_image();
+        let mut worker = DataQueueWorker::new(0, geometry);
+
+        let result = worker
+            .process_one(&mut image, 6, &io_desc(UBLK_IO_OP_FLUSH, 0, u64::MAX, 0, 0))
+            .expect("Linux synthetic FLUSH sector sentinel should succeed");
+
+        assert_eq!(result.request_class, BlockVolumeRequestClass::Flush);
+        assert_eq!(
+            result.completion_class,
+            BlockVolumeCompletionClass::Completed
+        );
+        assert_eq!(result.io_cmd.result, UBLK_IO_RES_OK);
+        assert_eq!(result.byte_count, 0);
+        assert_eq!(worker.flush_ops, 1);
+        assert_eq!(worker.completed_ops, 1);
+        assert_eq!(worker.error_ops, 0);
+        assert_eq!(worker.barrier_audit.flush_count, 1);
+    }
+
+    #[test]
+    fn worker_io_uring_flush_accepts_linux_synthetic_sector_sentinel() {
+        let geometry = test_geometry();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("io-uring-flush.img");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open io_uring image");
+        file.set_len(4096).expect("size io_uring image");
+        let mut dispatcher =
+            UblkIoUringDispatcher::new(file.as_raw_fd()).expect("create io_uring dispatcher");
+        let mut worker = DataQueueWorker::new(0, geometry);
+
+        let result = worker
+            .process_one_io_uring(
+                &mut dispatcher,
+                7,
+                &io_desc(UBLK_IO_OP_FLUSH, 0, u64::MAX, 0, 0),
+                None,
+                None,
+            )
+            .expect("Linux synthetic FLUSH sector sentinel should reach io_uring fsync");
+
+        assert_eq!(result.request_class, BlockVolumeRequestClass::Flush);
+        assert_eq!(result.io_cmd.result, UBLK_IO_RES_OK);
+        assert_eq!(worker.flush_ops, 1);
+        assert_eq!(worker.completed_ops, 1);
+        assert_eq!(worker.error_ops, 0);
+        assert_eq!(dispatcher.flush_ops, 1);
+    }
+
+    #[test]
     fn worker_flush_rejects_range_and_buffer_shape() {
         let geometry = test_geometry();
         let (_dir, mut image) = test_image();
@@ -1476,13 +1549,14 @@ mod tests {
         let count = worker.process_one(&mut image, 6, &io_desc(UBLK_IO_OP_FLUSH, 0, 0, 8, 0));
         assert_eq!(count.unwrap_err(), DataQueueWorkerError::RangeOnFlush);
 
-        let buffer = worker.process_one(
-            &mut image,
-            7,
-            &io_desc(UBLK_IO_OP_FLUSH, 0, 0, 0, DEMO_BUFFER_ADDR),
-        );
         assert_eq!(
-            buffer.unwrap_err(),
+            worker
+                .process_one(
+                    &mut image,
+                    7,
+                    &io_desc(UBLK_IO_OP_FLUSH, 0, 0, 0, DEMO_BUFFER_ADDR),
+                )
+                .unwrap_err(),
             DataQueueWorkerError::UnexpectedBufferAddress
         );
 
