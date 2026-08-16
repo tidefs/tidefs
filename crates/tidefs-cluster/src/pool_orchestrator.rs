@@ -56,10 +56,6 @@ fn pool_message_kind(message: &ClusterPoolMessage) -> &'static str {
         ClusterPoolMessage::LeaseResponse(_) => "lease response",
         ClusterPoolMessage::OwnerObservationRequest(_) => "owner observation request",
         ClusterPoolMessage::OwnerObservationResponse(_) => "owner observation response",
-        ClusterPoolMessage::CatalogDeltaRequest(_) => "catalog delta request",
-        ClusterPoolMessage::CatalogDeltaResponse(_) => "catalog delta response",
-        ClusterPoolMessage::CatalogQueryRequest(_) => "catalog query request",
-        ClusterPoolMessage::CatalogQueryResponse(_) => "catalog query response",
     }
 }
 

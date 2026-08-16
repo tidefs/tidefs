@@ -112,10 +112,6 @@ pub struct EpochCommitNotification {
     /// Monotonic commit index, incremented per dispatch call.
     /// Consumers can store the last-seen index to suppress replays.
     pub commit_index: u64,
-    /// Optional serialized catalog delta (dataset create/destroy/rename)
-    /// carried by the committed epoch proposal.
-    /// `None` when this epoch carries no catalog mutation.
-    pub catalog_delta_bytes: Option<Vec<u8>>,
 }
 
 // ── EpochCommitSubscriber ───────────────────────────────────────────
@@ -217,7 +213,6 @@ impl EpochCommitBus {
             roster_hash: roster.roster_hash,
             member_ids: roster.member_ids,
             commit_index: *idx,
-            catalog_delta_bytes: None,
         };
 
         let subs = self.subscribers.borrow();

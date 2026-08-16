@@ -38,10 +38,6 @@ pub enum PoolProtocolError {
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PoolDiscriminant {
-    CatalogDeltaRequest = 0x16,
-    CatalogDeltaResponse = 0x17,
-    CatalogQueryRequest = 0x18,
-    CatalogQueryResponse = 0x19,
     CreateRequest = 0x10,
     CreateResponse = 0x11,
     ImportRequest = 0x12,
@@ -61,10 +57,6 @@ impl PoolDiscriminant {
             0x13 => Some(Self::ImportResponse),
             0x14 => Some(Self::LeaseRequest),
             0x15 => Some(Self::LeaseResponse),
-            0x16 => Some(Self::CatalogDeltaRequest),
-            0x17 => Some(Self::CatalogDeltaResponse),
-            0x18 => Some(Self::CatalogQueryRequest),
-            0x19 => Some(Self::CatalogQueryResponse),
             0x1a => Some(Self::OwnerObservationRequest),
             0x1b => Some(Self::OwnerObservationResponse),
             _ => None,
@@ -311,132 +303,6 @@ pub struct ClusterPoolOwnerObservationResponse {
 }
 
 // ---------------------------------------------------------------------------
-// CatalogQueryType
-// ---------------------------------------------------------------------------
-
-/// Query types for catalog read operations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum CatalogQueryType {
-    /// List all datasets in the pool catalog.
-    ListAll = 0,
-    /// Look up a single dataset by path.
-    Lookup = 1,
-}
-
-impl CatalogQueryType {
-    pub const fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::ListAll),
-            1 => Some(Self::Lookup),
-            _ => None,
-        }
-    }
-    pub const fn to_u8(self) -> u8 {
-        self as u8
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ClusterPoolCatalogQueryRequest
-// ---------------------------------------------------------------------------
-
-/// Request to read from the cluster catalog authority.
-///
-/// No lease is required for read operations; any node can query the
-/// catalog state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClusterPoolCatalogQueryRequest {
-    /// Opaque request id for matching responses.
-    pub request_id: u64,
-    /// Pool UUID to query.
-    pub pool_guid: [u8; 16],
-    /// The node making the query.
-    pub requesting_node_id: u64,
-    /// Type of query to perform (see [`CatalogQueryType`]).
-    pub query_type_u8: u8,
-    /// Path argument for Lookup queries (ignored for ListAll).
-    pub path: String,
-}
-
-// ---------------------------------------------------------------------------
-// CatalogEntryRow — serializable catalog entry for query responses
-// ---------------------------------------------------------------------------
-
-/// A single dataset catalog entry for wire transmission.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CatalogEntryRow {
-    /// Full hierarchical path (e.g. "tank/fs1").
-    pub path: String,
-    /// Stable dataset identifier (16 bytes).
-    pub dataset_id_bytes: Vec<u8>,
-    /// Dataset type discriminant (see DatasetType::to_u8).
-    pub dataset_type_u8: u8,
-    /// Creation txg.
-    pub creation_txg: u64,
-    /// Lifecycle state discriminant.
-    pub lifecycle_state_u8: u8,
-    /// Per-dataset flags bitmask.
-    pub flags_u16: u16,
-}
-
-// ---------------------------------------------------------------------------
-// ClusterPoolCatalogQueryResponse
-// ---------------------------------------------------------------------------
-
-/// Response to a [`ClusterPoolCatalogQueryRequest`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClusterPoolCatalogQueryResponse {
-    pub request_id: u64,
-    pub node_id: u64,
-    pub pool_guid: [u8; 16],
-    pub success: bool,
-    /// Catalog entries returned by the query (empty on failure).
-    pub entries: Vec<CatalogEntryRow>,
-    /// Catalog version at the time of the query.
-    pub catalog_version: u64,
-    /// Error message if the query failed.
-    pub error: Option<String>,
-}
-
-// ClusterPoolMessage — union type for dispatch
-// ---------------------------------------------------------------------------
-// ClusterPoolCatalogDeltaRequest
-// ---------------------------------------------------------------------------
-
-/// Request to apply a dataset catalog mutation to the cluster authority.
-///
-/// Sent by a client node that holds the pool lease. The storage-node applies
-/// the delta against its `ClusterLeaseRuntime::pool_catalog` and responds
-/// with the new catalog version.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClusterPoolCatalogDeltaRequest {
-    /// Opaque request id for matching responses.
-    pub request_id: u64,
-    /// Pool UUID to mutate.
-    pub pool_guid: [u8; 16],
-    /// The node requesting the mutation.
-    pub requesting_node_id: u64,
-    /// Bincode-serialized `crate::dataset_catalog::CatalogDelta`.
-    pub delta_bytes: Vec<u8>,
-}
-
-// ---------------------------------------------------------------------------
-// ClusterPoolCatalogDeltaResponse
-// ---------------------------------------------------------------------------
-
-/// Response to a `ClusterPoolCatalogDeltaRequest`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClusterPoolCatalogDeltaResponse {
-    pub request_id: u64,
-    pub node_id: u64,
-    pub pool_guid: [u8; 16],
-    pub success: bool,
-    /// New catalog version after applying the delta (on success).
-    pub catalog_version: Option<u64>,
-    pub error: Option<String>,
-}
-// ---------------------------------------------------------------------------
 
 /// All cluster pool protocol messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -449,10 +315,6 @@ pub enum ClusterPoolMessage {
     LeaseResponse(ClusterPoolLeaseResponse),
     OwnerObservationRequest(ClusterPoolOwnerObservationRequest),
     OwnerObservationResponse(ClusterPoolOwnerObservationResponse),
-    CatalogDeltaRequest(ClusterPoolCatalogDeltaRequest),
-    CatalogDeltaResponse(ClusterPoolCatalogDeltaResponse),
-    CatalogQueryRequest(ClusterPoolCatalogQueryRequest),
-    CatalogQueryResponse(ClusterPoolCatalogQueryResponse),
 }
 
 impl ClusterPoolMessage {
@@ -489,10 +351,6 @@ impl ClusterPoolMessage {
             Self::LeaseResponse(_) => PoolDiscriminant::LeaseResponse as u8,
             Self::OwnerObservationRequest(_) => PoolDiscriminant::OwnerObservationRequest as u8,
             Self::OwnerObservationResponse(_) => PoolDiscriminant::OwnerObservationResponse as u8,
-            Self::CatalogDeltaRequest(_) => PoolDiscriminant::CatalogDeltaRequest as u8,
-            Self::CatalogDeltaResponse(_) => PoolDiscriminant::CatalogDeltaResponse as u8,
-            Self::CatalogQueryRequest(_) => PoolDiscriminant::CatalogQueryRequest as u8,
-            Self::CatalogQueryResponse(_) => PoolDiscriminant::CatalogQueryResponse as u8,
         }
     }
 
@@ -514,14 +372,6 @@ impl ClusterPoolMessage {
                 Self::OwnerObservationRequest(m) => bincode::serialize(m)
                     .map_err(|e| PoolProtocolError::Serialize(e.to_string()))?,
                 Self::OwnerObservationResponse(m) => bincode::serialize(m)
-                    .map_err(|e| PoolProtocolError::Serialize(e.to_string()))?,
-                Self::CatalogDeltaRequest(m) => bincode::serialize(m)
-                    .map_err(|e| PoolProtocolError::Serialize(e.to_string()))?,
-                Self::CatalogDeltaResponse(m) => bincode::serialize(m)
-                    .map_err(|e| PoolProtocolError::Serialize(e.to_string()))?,
-                Self::CatalogQueryRequest(m) => bincode::serialize(m)
-                    .map_err(|e| PoolProtocolError::Serialize(e.to_string()))?,
-                Self::CatalogQueryResponse(m) => bincode::serialize(m)
                     .map_err(|e| PoolProtocolError::Serialize(e.to_string()))?,
             };
         Ok(payload)
@@ -571,26 +421,6 @@ impl ClusterPoolMessage {
                 let msg: ClusterPoolOwnerObservationResponse = bincode::deserialize(payload)
                     .map_err(|e| PoolProtocolError::Deserialize(e.to_string()))?;
                 Ok(Self::OwnerObservationResponse(msg))
-            }
-            PoolDiscriminant::CatalogDeltaRequest => {
-                let msg: ClusterPoolCatalogDeltaRequest = bincode::deserialize(payload)
-                    .map_err(|e| PoolProtocolError::Deserialize(e.to_string()))?;
-                Ok(Self::CatalogDeltaRequest(msg))
-            }
-            PoolDiscriminant::CatalogDeltaResponse => {
-                let msg: ClusterPoolCatalogDeltaResponse = bincode::deserialize(payload)
-                    .map_err(|e| PoolProtocolError::Deserialize(e.to_string()))?;
-                Ok(Self::CatalogDeltaResponse(msg))
-            }
-            PoolDiscriminant::CatalogQueryRequest => {
-                let msg: ClusterPoolCatalogQueryRequest = bincode::deserialize(payload)
-                    .map_err(|e| PoolProtocolError::Deserialize(e.to_string()))?;
-                Ok(Self::CatalogQueryRequest(msg))
-            }
-            PoolDiscriminant::CatalogQueryResponse => {
-                let msg: ClusterPoolCatalogQueryResponse = bincode::deserialize(payload)
-                    .map_err(|e| PoolProtocolError::Deserialize(e.to_string()))?;
-                Ok(Self::CatalogQueryResponse(msg))
             }
         }
     }

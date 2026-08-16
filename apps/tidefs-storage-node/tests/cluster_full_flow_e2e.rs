@@ -2,8 +2,8 @@
 //! Multi-node clustered pool full-flow E2E tests (#6610).
 //!
 //! Exercises the full clustered pool operator path:
-//!   pool create across nodes -> import validation -> dataset catalog ->
-//!   placement heal exercise -> label verification.
+//!   pool create across nodes -> import validation -> placement heal exercise
+//!   -> label verification.
 //!
 //! Uses multiple StorageNode TestServers connected via live Transport
 //! with CP01-framed messages and ClusterLeaseRuntime.
@@ -26,10 +26,7 @@ use tidefs_cluster::pool_config::{ClusterPlacementPolicy, ClusterRedundancy, Fai
 use tidefs_cluster::pool_lease_client::ClusterLeaseClient;
 use tidefs_cluster::pool_lease_token::PoolLeaseToken;
 use tidefs_cluster::pool_protocol::ClusterPoolLeaseRequest;
-use tidefs_cluster::pool_protocol::{
-    CatalogQueryType, ClusterPoolCatalogDeltaRequest, ClusterPoolCatalogQueryRequest,
-    ClusterPoolCreateRequest, ClusterPoolMessage, NodeDeviceSpec,
-};
+use tidefs_cluster::pool_protocol::{ClusterPoolCreateRequest, ClusterPoolMessage, NodeDeviceSpec};
 use tidefs_cluster::{
     ClusterLeaseConfig, ClusterPoolLeaseAction, ClusterPoolLeaseResponse, LossEvent,
     PlacementHealCoordinator, PlacementMap,
@@ -526,10 +523,9 @@ fn cluster_full_flow_refuses_wrong_keys_plaintext_and_bootstrap() {
     );
 }
 
-/// Full clustered pool create with lease acquisition, catalog operations,
-/// and placement heal exercise.
+/// Full clustered pool create with lease acquisition and placement heal exercise.
 #[test]
-fn cluster_full_flow_create_lease_catalog_heal() {
+fn cluster_full_flow_create_lease_heal() {
     let dir = tempfile::tempdir().expect("temp dir");
     let dev0 = make_test_device(dir.path(), "node1-dev0", TEST_DEVICE_BYTES);
     let dev1 = make_test_device(dir.path(), "node2-dev0", TEST_DEVICE_BYTES);
@@ -754,77 +750,7 @@ fn cluster_full_flow_create_lease_catalog_heal() {
         other => panic!("unexpected final release response: {other:?}"),
     }
 
-    // -- Phase 4: Catalog delta (create dataset) through CP01 --
-    let delta = tidefs_cluster::dataset_catalog::CatalogDelta::Create {
-        path: "pool/ds_test".to_string(),
-        dataset_id_bytes: vec![0xAA; 16],
-        dataset_type_u8: 1u8,
-        creation_txg: 1,
-        properties: vec![],
-        flags_u16: 0,
-    };
-    let delta_bytes = bincode::serialize(&delta).expect("serialize catalog delta");
-
-    let cat_delta_req = ClusterPoolCatalogDeltaRequest {
-        request_id: 100,
-        pool_guid,
-        requesting_node_id: 9990,
-        delta_bytes,
-    };
-
-    send_cp01(
-        &mut client,
-        sid1,
-        &ClusterPoolMessage::CatalogDeltaRequest(cat_delta_req),
-    );
-
-    let cat_delta_resp = recv_cp01(&mut client, sid1, 100);
-    match cat_delta_resp {
-        Some(ClusterPoolMessage::CatalogDeltaResponse(ref resp)) => {
-            if resp.success {
-                eprintln!(
-                    "[test] catalog delta succeeded, version={:?}",
-                    resp.catalog_version
-                );
-            } else {
-                eprintln!("[test] catalog delta refused: {:?}", resp.error);
-            }
-        }
-        other => eprintln!("[test] unexpected catalog delta response: {other:?}"),
-    }
-
-    // -- Phase 5: Catalog query (list datasets) through CP01 --
-    let cat_query_req = ClusterPoolCatalogQueryRequest {
-        request_id: 101,
-        pool_guid,
-        requesting_node_id: 9990,
-        query_type_u8: CatalogQueryType::ListAll.to_u8(),
-        path: String::new(),
-    };
-
-    send_cp01(
-        &mut client,
-        sid1,
-        &ClusterPoolMessage::CatalogQueryRequest(cat_query_req),
-    );
-
-    let cat_query_resp = recv_cp01(&mut client, sid1, 100);
-    match cat_query_resp {
-        Some(ClusterPoolMessage::CatalogQueryResponse(ref resp)) => {
-            if resp.success {
-                eprintln!(
-                    "[test] catalog query: {} entries, version={}",
-                    resp.entries.len(),
-                    resp.catalog_version
-                );
-            } else {
-                eprintln!("[test] catalog query refused: {:?}", resp.error);
-            }
-        }
-        other => eprintln!("[test] unexpected catalog query response: {other:?}"),
-    }
-
-    // -- Phase 6: Placement map exercise --
+    // -- Phase 4: Placement map exercise --
     let mut pm = PlacementMap::new(1);
     pm.insert(10, 1);
     pm.insert(20, 2);
@@ -841,7 +767,7 @@ fn cluster_full_flow_create_lease_catalog_heal() {
         .unwrap_or_default();
     assert!(obj10_reps.contains(&1), "obj 10 has member 1");
 
-    // -- Phase 7: Placement heal coordinator exercise --
+    // -- Phase 5: Placement heal coordinator exercise --
     let mut coordinator = PlacementHealCoordinator::new(1, None);
     {
         let pm2 = coordinator.placement_mut();
@@ -1887,7 +1813,7 @@ fn cluster_full_flow_mirror_create_and_verify() {
 ///
 /// This test exercises the full lifecycle:
 /// 1. Connected: create succeeds
-/// 2. Fenced: create, import, lease, catalog delta are refused with
+/// 2. Fenced: create, import, and lease are refused with
 ///    "minority-fenced:" errors
 /// 3. Healed: fence cleared, create succeeds again
 #[test]

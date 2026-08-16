@@ -23,10 +23,6 @@ use tidefs_membership_epoch::EpochId;
 use tidefs_replication_model::FlowCommitResult;
 
 use crate::authority::{AcquireOutcome, LeaseAuthority, RenewOutcome};
-use crate::dataset_catalog::{
-    CatalogDelta, ClusterCatalogError, ClusterDatasetCatalog, ClusterPoolCatalog,
-    DatasetCreateRequest,
-};
 use crate::lease_state_machine::LeaseStateMachine;
 use crate::placement_heal::{
     HealState, HealStats, LossEvent, PlacementHealCoordinator, PlacementMap,
@@ -110,9 +106,6 @@ pub struct ClusterLeaseRuntime {
     heal_coordinator: PlacementHealCoordinator,
     /// Write-fence authority for single-writer write-path gating.
     fence_authority: Option<FenceAuthority>,
-    /// Pool-scoped cluster-gated dataset catalog for serialized catalog
-    /// mutations with committed state persistence and version tracking.
-    pool_catalog: Option<ClusterPoolCatalog>,
     /// Active-client mode tracker for per-dataset write-mode detection.
     client_mode_tracker: crate::client_mode::ClientModeTracker,
     now_ms: u64,
@@ -141,7 +134,6 @@ impl ClusterLeaseRuntime {
             now_ms: 0,
             backfill: RebuildBackfillInitiator::new(current_epoch),
             heal_coordinator: PlacementHealCoordinator::new(current_epoch.0, None),
-            pool_catalog: None,
             client_mode_tracker: crate::client_mode::ClientModeTracker::default(),
         }
     }
@@ -181,16 +173,6 @@ impl ClusterLeaseRuntime {
     /// Set the write-fence authority for single-writer write-path gating.
     pub fn with_fence_authority(mut self, fence_authority: FenceAuthority) -> Self {
         self.fence_authority = Some(fence_authority);
-        self
-    }
-
-    /// Set the pool-scoped dataset catalog for cluster-gated catalog mutations.
-    ///
-    /// The catalog's lease lifecycle and committed state persistence are
-    /// automatically managed. When a lease is acquired, the inner catalog
-    /// is gated; on loss or epoch transition, the gate is cleared.
-    pub fn with_pool_catalog(mut self, catalog: ClusterPoolCatalog) -> Self {
-        self.pool_catalog = Some(catalog);
         self
     }
 
@@ -339,137 +321,6 @@ impl ClusterLeaseRuntime {
         ))
     }
 
-    // ── Dataset catalog accessors ─────────────────────────────────
-
-    /// Return a reference to the pool-scoped catalog, if configured.
-    pub fn pool_catalog(&self) -> Option<&ClusterPoolCatalog> {
-        self.pool_catalog.as_ref()
-    }
-
-    /// Return a mutable reference to the pool-scoped catalog.
-    pub fn pool_catalog_mut(&mut self) -> Option<&mut ClusterPoolCatalog> {
-        self.pool_catalog.as_mut()
-    }
-
-    /// Return a reference to the inner cluster-gated catalog, if configured.
-    pub fn dataset_catalog(&self) -> Option<&ClusterDatasetCatalog> {
-        self.pool_catalog.as_ref().map(|pc| pc.catalog())
-    }
-
-    /// Encode the catalog's committed state for inclusion in epoch commit.
-    ///
-    /// Returns `None` if no catalog is configured.
-    pub fn encode_catalog_committed_state(&self) -> Option<Vec<u8>> {
-        self.pool_catalog
-            .as_ref()
-            .map(|pc| pc.encode_committed_state())
-    }
-
-    /// BLAKE3 digest of the catalog's committed state for cross-node verification.
-    pub fn catalog_committed_state_digest(&self) -> Option<[u8; 32]> {
-        self.pool_catalog
-            .as_ref()
-            .map(|pc| pc.committed_state_digest())
-    }
-
-    /// Current catalog version (monotonically incremented on each committed delta).
-    pub fn catalog_version(&self) -> Option<u64> {
-        self.pool_catalog.as_ref().map(|pc| pc.version())
-    }
-
-    /// Prepare a create-dataset delta for cluster proposal.
-    ///
-    /// Returns `None` if no dataset catalog is configured. Returns an error
-    /// if the lease gate check fails or the catalog rejects the mutation.
-    pub fn prepare_dataset_create(
-        &self,
-        path: &str,
-        dataset_id: tidefs_dataset_catalog::DatasetId,
-        dataset_type: tidefs_dataset_catalog::DatasetType,
-        creation_txg: u64,
-        properties: Vec<u8>,
-        flags: tidefs_dataset_catalog::DatasetFlags,
-    ) -> Option<Result<CatalogDelta, ClusterCatalogError>> {
-        let cat = self.pool_catalog.as_ref()?;
-        let fence = cat.active_fence()?;
-        Some(cat.prepare_create_delta(
-            fence,
-            DatasetCreateRequest {
-                path: path.into(),
-                dataset_id,
-                dataset_type,
-                creation_txg,
-                properties,
-                flags,
-            },
-        ))
-    }
-
-    /// Prepare a destroy-dataset delta for cluster proposal.
-    pub fn prepare_dataset_destroy(
-        &self,
-        path: &str,
-    ) -> Option<Result<CatalogDelta, ClusterCatalogError>> {
-        let cat = self.pool_catalog.as_ref()?;
-        let fence = cat.active_fence()?;
-        Some(cat.prepare_destroy_delta(fence, path))
-    }
-
-    /// Prepare a rename-dataset delta for cluster proposal.
-    pub fn prepare_dataset_rename(
-        &self,
-        old_path: &str,
-        new_path: &str,
-    ) -> Option<Result<CatalogDelta, ClusterCatalogError>> {
-        let cat = self.pool_catalog.as_ref()?;
-        let fence = cat.active_fence()?;
-        Some(cat.prepare_rename_delta(fence, old_path, new_path))
-    }
-
-    /// Apply a committed catalog delta to the local dataset catalog.
-    ///
-    /// Returns `None` if no dataset catalog is configured.
-    pub fn apply_dataset_delta(
-        &mut self,
-        delta: &CatalogDelta,
-    ) -> Option<Result<(), tidefs_dataset_catalog::CatalogError>> {
-        // Use apply_committed_delta which also bumps the version counter.
-        self.pool_catalog
-            .as_mut()
-            .map(|cat| cat.apply_committed_delta(delta).map(|_v| ()))
-    }
-
-    /// Apply a committed catalog delta received from the cluster epoch
-    /// commit path.
-    ///
-    /// Deserializes a [`CatalogDelta`] from raw bytes (as produced by
-    /// `bincode::serialize`), applies it to the pool catalog, and returns
-    /// the new catalog version on success.
-    ///
-    /// This is the primary ingress point for catalog deltas arriving via
-    /// the epoch commit path. Unlike prepare methods, this does NOT check
-    /// the lease gate — the delta was already committed by cluster quorum.
-    ///
-    /// Returns `None` if no pool catalog is configured.
-    pub fn apply_committed_catalog_delta(
-        &mut self,
-        delta_bytes: &[u8],
-    ) -> Option<Result<u64, ClusterCatalogError>> {
-        let cat = self.pool_catalog.as_mut()?;
-        let delta: CatalogDelta = match bincode::deserialize(delta_bytes) {
-            Ok(d) => d,
-            Err(_) => {
-                return Some(Err(ClusterCatalogError::Catalog(
-                    tidefs_dataset_catalog::CatalogError::CorruptEncoding,
-                )));
-            }
-        };
-        Some(
-            cat.apply_committed_delta(&delta)
-                .map_err(ClusterCatalogError::from),
-        )
-    }
-
     /// Process an incoming membership lease message from a peer.
     ///
     /// This is the primary ingress point for lease protocol messages
@@ -481,19 +332,9 @@ impl ClusterLeaseRuntime {
                     if let Err(e) = self.sm.grant() {
                         tracing::warn!("acquire ack but grant failed: {:?}", e);
                     } else {
-                        // Single-writer fence: issue new fence on lease acquisition.
-                        // Single-writer fence: issue new fence on lease acquisition.
-                        let fence = if let Some(ref fence_auth) = self.fence_authority {
-                            let epoch = self.sm.current_epoch();
-                            fence_auth.issue_fence(epoch)
-                        } else {
-                            // If no fence_authority is configured, synthesize a fence
-                            // from the current epoch so the catalog can still be gated.
-                            crate::write_fence::WriteFence::new(self.sm.current_epoch(), 0)
-                        };
-                        // Notify the dataset catalog of lease acquisition.
-                        if let Some(ref mut cat) = self.pool_catalog {
-                            cat.on_lease_acquired(fence);
+                        // Advance the single-writer fence on lease acquisition.
+                        if let Some(ref fence_auth) = self.fence_authority {
+                            let _ = fence_auth.issue_fence(self.sm.current_epoch());
                         }
                     }
                 }
@@ -625,11 +466,6 @@ impl ClusterLeaseRuntime {
         if let Some(ref fence_auth) = self.fence_authority {
             fence_auth.clear();
         }
-
-        // Notify the dataset catalog of lease loss.
-        if let Some(ref mut cat) = self.pool_catalog {
-            cat.on_lease_lost();
-        }
     }
 
     /// Periodic tick — checks for deadline-driven expiry and triggers
@@ -691,21 +527,12 @@ impl ClusterLeaseRuntime {
             if let Some(ref fence_auth) = self.fence_authority {
                 fence_auth.clear();
             }
-
-            // Notify the dataset catalog of lease loss.
-            if let Some(ref mut cat) = self.pool_catalog {
-                cat.on_lease_lost();
-            }
         }
     }
 
     /// Called when the membership epoch transitions.
     pub fn on_epoch_transition(&mut self, new_epoch: EpochId) {
         self.sm.on_epoch_transition(new_epoch);
-        // Epoch transitions invalidate the current lease; notify the catalog.
-        if let Some(ref mut cat) = self.pool_catalog {
-            cat.on_lease_lost();
-        }
         self.heal_coordinator.on_epoch_transition(new_epoch.0);
         let aborted = self.backfill.on_epoch_transition(new_epoch);
         if aborted > 0 {

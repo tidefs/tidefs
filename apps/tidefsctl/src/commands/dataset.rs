@@ -10,12 +10,6 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Args, Subcommand, ValueEnum};
-#[cfg(feature = "cluster")]
-use tidefs_cluster::dataset_catalog::CatalogDelta;
-#[cfg(feature = "cluster")]
-use tidefs_cluster::pool_lease_client::ClusterLeaseClient;
-#[cfg(feature = "cluster")]
-use tidefs_cluster::pool_protocol::CatalogQueryType;
 use tidefs_dataset_lifecycle::{
     DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
 };
@@ -27,9 +21,6 @@ use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 use tidefs_pool_runtime::{PoolRuntime, VolumeReclaimOutcome};
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
-
-#[cfg(feature = "cluster")]
-use bincode;
 
 use crate::parser::{self, DatasetTarget, PropertyAssignment};
 
@@ -186,24 +177,6 @@ pub struct DatasetCreateArgs {
     #[arg(long = "json")]
     pub json: bool,
 
-    #[cfg(feature = "cluster")]
-    /// Route this operation through cluster authority instead of local pool.
-    /// Requires --cluster-node-addr and --cluster-node-id.
-    #[arg(long = "cluster", default_value_t = false)]
-    pub cluster: bool,
-
-    #[cfg(feature = "cluster")]
-    /// Cluster storage-node address. Required when --cluster is set.
-    /// Format: host:port.
-    #[arg(long = "cluster-node-addr")]
-    pub cluster_node_addr: Option<String>,
-
-    #[cfg(feature = "cluster")]
-    /// Node identifier for this cluster client (nonzero).
-    /// Required when --cluster is set.
-    #[arg(long = "cluster-node-id")]
-    pub cluster_node_id: Option<u64>,
-
     /// Write-acknowledgment sync guarantee: local, remote-copy, or full-redundancy.
     /// Defaults to local (single-node safety).
     #[arg(long = "sync", default_value = "local")]
@@ -227,24 +200,6 @@ pub struct DatasetListArgs {
     /// Emit machine-parseable JSON
     #[arg(long = "json")]
     pub json: bool,
-
-    #[cfg(feature = "cluster")]
-    /// Route this operation through cluster authority instead of local pool.
-    /// Requires --cluster-node-addr and --cluster-node-id.
-    #[arg(long = "cluster", default_value_t = false)]
-    pub cluster: bool,
-
-    #[cfg(feature = "cluster")]
-    /// Cluster storage-node address. Required when --cluster is set.
-    /// Format: host:port.
-    #[arg(long = "cluster-node-addr")]
-    pub cluster_node_addr: Option<String>,
-
-    #[cfg(feature = "cluster")]
-    /// Node identifier for this cluster client (nonzero).
-    /// Required when --cluster is set.
-    #[arg(long = "cluster-node-id")]
-    pub cluster_node_id: Option<u64>,
 }
 /// `dataset resize <pool>/<volume> --size <bytes> [--devices <dev>...]`
 #[derive(Args, Debug)]
@@ -279,24 +234,6 @@ pub struct DatasetRenameArgs {
     /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
-
-    #[cfg(feature = "cluster")]
-    /// Route this operation through cluster authority instead of local pool.
-    /// Requires --cluster-node-addr and --cluster-node-id.
-    #[arg(long = "cluster", default_value_t = false)]
-    pub cluster: bool,
-
-    #[cfg(feature = "cluster")]
-    /// Cluster storage-node address. Required when --cluster is set.
-    /// Format: host:port.
-    #[arg(long = "cluster-node-addr")]
-    pub cluster_node_addr: Option<String>,
-
-    #[cfg(feature = "cluster")]
-    /// Node identifier for this cluster client (nonzero).
-    /// Required when --cluster is set.
-    #[arg(long = "cluster-node-id")]
-    pub cluster_node_id: Option<u64>,
 }
 /// `dataset destroy <pool>/<name> [--devices <dev>...]`
 #[derive(Args, Debug)]
@@ -315,24 +252,6 @@ pub struct DatasetDestroyArgs {
     /// Emit machine-parseable JSON
     #[arg(long = "json")]
     pub json: bool,
-
-    #[cfg(feature = "cluster")]
-    /// Route this operation through cluster authority instead of local pool.
-    /// Requires --cluster-node-addr and --cluster-node-id.
-    #[arg(long = "cluster", default_value_t = false)]
-    pub cluster: bool,
-
-    #[cfg(feature = "cluster")]
-    /// Cluster storage-node address. Required when --cluster is set.
-    /// Format: host:port.
-    #[arg(long = "cluster-node-addr")]
-    pub cluster_node_addr: Option<String>,
-
-    #[cfg(feature = "cluster")]
-    /// Node identifier for this cluster client (nonzero).
-    /// Required when --cluster is set.
-    #[arg(long = "cluster-node-id")]
-    pub cluster_node_id: Option<u64>,
 }
 /// `dataset set-strategy <pool> <name> [--devices <dev>...] [--enable <features>] [--disable <features>] [--list] [--class <class>]`
 #[derive(Args, Debug)]
@@ -641,95 +560,6 @@ fn dataset_id_from_name(name: &str) -> DatasetId {
     let hash = blake3::hash(name.as_bytes());
     id_bytes.copy_from_slice(&hash.as_bytes()[..16]);
     DatasetId::from_bytes(id_bytes)
-}
-
-// ── Cluster mode shared helpers ─────────────────────────────────────
-
-/// Resolve the pool GUID from device labels. Exits on failure.
-#[cfg(feature = "cluster")]
-fn resolve_cluster_pool_guid(devices: &[std::path::PathBuf], operation: &str) -> [u8; 16] {
-    let entries = match tidefs_pool_scan::scan_labels(devices) {
-        Ok(entries) => entries,
-        Err(err) => {
-            eprintln!("tidefsctl dataset {operation}: pool label scan failed: {err}");
-            process::exit(1);
-        }
-    };
-    match tidefs_pool_scan::PoolAssembler::assemble(&entries, None) {
-        Ok(config) => config.pool_uuid,
-        Err(err) => {
-            eprintln!("tidefsctl dataset {operation}: pool assembly failed: {err}");
-            process::exit(1);
-        }
-    }
-}
-
-/// Validate cluster args and return (node_addr, node_id). Exits on failure.
-#[cfg(feature = "cluster")]
-fn validate_cluster_args<'a>(
-    node_addr: &'a Option<String>,
-    node_id: Option<u64>,
-    operation: &'a str,
-) -> (&'a str, u64) {
-    let addr = node_addr.as_deref().unwrap_or_else(|| {
-        eprintln!("tidefsctl dataset {operation}: --cluster requires --cluster-node-addr");
-        process::exit(1);
-    });
-    let id = node_id.unwrap_or_else(|| {
-        eprintln!("tidefsctl dataset {operation}: --cluster requires --cluster-node-id (nonzero)");
-        process::exit(1);
-    });
-    if id == 0 {
-        eprintln!("tidefsctl dataset {operation}: --cluster-node-id must be nonzero");
-        process::exit(1);
-    }
-    (addr, id)
-}
-
-/// Require devices for cluster mode. Exits if absent.
-#[cfg(feature = "cluster")]
-fn require_devices_for_cluster<'a>(
-    devices: Option<&'a [std::path::PathBuf]>,
-    operation: &'a str,
-) -> &'a [std::path::PathBuf] {
-    devices.unwrap_or_else(|| {
-        eprintln!("tidefsctl dataset {operation}: --cluster requires --devices");
-        process::exit(1);
-    })
-}
-
-/// Submit a CatalogDelta to the cluster authority and exit on failure.
-/// Returns the new catalog version on success.
-#[cfg(feature = "cluster")]
-fn submit_cluster_delta(
-    node_addr: &str,
-    node_id: u64,
-    pool_guid: [u8; 16],
-    delta: &CatalogDelta,
-    operation: &str,
-) -> u64 {
-    let delta_bytes = match bincode::serialize(delta) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("tidefsctl dataset {operation}: failed to serialize catalog delta: {e}");
-            process::exit(1);
-        }
-    };
-    match ClusterLeaseClient::submit_catalog_delta(node_addr, node_id, pool_guid, delta_bytes) {
-        Ok(resp) => {
-            if resp.success {
-                resp.catalog_version.unwrap_or(0)
-            } else {
-                let err = resp.error.unwrap_or_else(|| "unknown error".to_string());
-                eprintln!("tidefsctl dataset {operation}: cluster refused: {err}");
-                process::exit(1);
-            }
-        }
-        Err(e) => {
-            eprintln!("tidefsctl dataset {operation}: cluster transport error: {e}");
-            process::exit(1);
-        }
-    }
 }
 
 fn exit_dataset_error(operation: &str, message: impl Into<String>, json: bool) -> ! {
@@ -1232,16 +1062,6 @@ fn handle_create(args: DatasetCreateArgs) {
         DatasetTypeArg::Snapshot => unreachable!("snapshot create was refused above"),
     }
 
-    // ── Cluster-authoritative path ─────────────────────────────────
-    #[cfg(feature = "cluster")]
-    if args.cluster {
-        exit_dataset_error(
-            "create",
-            "clustered dataset creation is refused until committed cluster ownership publishes through the shared Pool runtime",
-            args.json,
-        );
-    }
-
     let live_args = super::live_owner::live_admin_args([
         ("target", LivePoolAdminArg::String(args.target.clone())),
         ("name", LivePoolAdminArg::String(leaf.to_string())),
@@ -1395,68 +1215,6 @@ fn handle_create(args: DatasetCreateArgs) {
 fn handle_list(args: DatasetListArgs) {
     let pool = list_pool_from_args(&args);
 
-    // ── Cluster-authoritative path ─────────────────────────────────
-    #[cfg(feature = "cluster")]
-    if args.cluster {
-        let (node_addr, node_id) =
-            validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "list");
-        let devs = require_devices_for_cluster(args.devices.as_deref(), "list");
-        let pool_guid = resolve_cluster_pool_guid(devs, "list");
-        let pool_name = pool.unwrap_or_else(|| "<devices>".to_string());
-
-        match ClusterLeaseClient::query_catalog(
-            node_addr,
-            node_id,
-            pool_guid,
-            CatalogQueryType::ListAll,
-            "",
-        ) {
-            Ok(resp) => {
-                if !resp.success {
-                    let err = resp.error.unwrap_or_else(|| "unknown error".to_string());
-                    eprintln!("tidefsctl dataset list: cluster query failed: {err}");
-                    process::exit(1);
-                }
-                let mut rows: Vec<_> = resp
-                    .entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let dataset_type = DatasetType::from_u8(entry.dataset_type_u8)?;
-                        if !dataset_type_matches(dataset_type, args.dataset_type) {
-                            return None;
-                        }
-                        Some(DatasetListRow {
-                            pool: pool_name.clone(),
-                            path: entry.path.clone(),
-                            dataset_type,
-                            used_bytes: None,
-                            available_bytes: None,
-                            mountpoint: None,
-                        })
-                    })
-                    .collect();
-                rows.sort_by(|left, right| left.path.cmp(&right.path));
-                if args.json {
-                    let mut out = serde_json::json!({
-                        "ok": true,
-                        "pool": pool_name,
-                        "catalog_version": resp.catalog_version,
-                        "datasets": [],
-                    });
-                    out["datasets"] = serde_json::Value::Array(dataset_rows_json(&rows));
-                    print_json_or_exit(out);
-                } else {
-                    print_dataset_rows(Some(&pool_name), &rows, false);
-                }
-                return;
-            }
-            Err(e) => {
-                eprintln!("tidefsctl dataset list: cluster transport error: {e}");
-                process::exit(1);
-            }
-        }
-    }
-
     let Some(pool) = pool else {
         print_dataset_rows(None, &[], args.json);
         return;
@@ -1570,28 +1328,6 @@ fn handle_rename(args: DatasetRenameArgs) {
     if new_name == "root" {
         eprintln!("tidefsctl dataset rename: cannot rename to 'root'");
         process::exit(1);
-    }
-
-    // ── Cluster-authoritative path ─────────────────────────────────
-    #[cfg(feature = "cluster")]
-    if args.cluster {
-        let (node_addr, node_id) =
-            validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "rename");
-        let devs = require_devices_for_cluster(args.devices.as_deref(), "rename");
-        let pool_guid = resolve_cluster_pool_guid(devs, "rename");
-
-        let delta = CatalogDelta::Rename {
-            old_path: old_name.clone(),
-            new_path: new_name.clone(),
-        };
-
-        let catalog_version = submit_cluster_delta(node_addr, node_id, pool_guid, &delta, "rename");
-
-        println!(
-            "dataset '{old_name}' renamed to '{new_name}' in clustered pool '{}' (catalog_version={catalog_version})",
-            args.pool
-        );
-        return;
     }
 
     let live_args = super::live_owner::live_admin_args([
@@ -2310,37 +2046,6 @@ fn handle_destroy(args: DatasetDestroyArgs) {
         ("name", LivePoolAdminArg::String(name.clone())),
         ("force", LivePoolAdminArg::Bool(args.force)),
     ]);
-
-    // ── Cluster-authoritative path ─────────────────────────────────
-    #[cfg(feature = "cluster")]
-    if args.cluster {
-        let (node_addr, node_id) =
-            validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "destroy");
-        let devs = require_devices_for_cluster(args.devices.as_deref(), "destroy");
-        let pool_guid = resolve_cluster_pool_guid(devs, "destroy");
-
-        let delta = CatalogDelta::Destroy { path: name.clone() };
-
-        let catalog_version =
-            submit_cluster_delta(node_addr, node_id, pool_guid, &delta, "destroy");
-
-        if args.json {
-            print_json_or_exit(serde_json::json!({
-                "ok": true,
-                "operation": "destroy",
-                "pool": target.pool,
-                "dataset": name,
-                "force": args.force,
-                "catalog_version": catalog_version,
-            }));
-        } else {
-            println!(
-                "dataset '{name}' destroyed in clustered pool '{}' (catalog_version={catalog_version})",
-                target.pool
-            );
-        }
-        return;
-    }
 
     if let Some(devices) = args
         .devices

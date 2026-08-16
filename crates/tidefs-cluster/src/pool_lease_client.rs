@@ -20,9 +20,7 @@
 
 use crate::pool_lease_token::PoolLeaseToken;
 use crate::pool_protocol::{
-    CatalogQueryType, ClusterPoolCatalogDeltaRequest, ClusterPoolCatalogDeltaResponse,
-    ClusterPoolCatalogQueryRequest, ClusterPoolCatalogQueryResponse, ClusterPoolLeaseAction,
-    ClusterPoolLeaseRequest, ClusterPoolMessage, PoolProtocolError,
+    ClusterPoolLeaseAction, ClusterPoolLeaseRequest, ClusterPoolMessage, PoolProtocolError,
 };
 
 /// Magic prefix for cluster pool protocol messages (CP01 = Cluster Pool v1).
@@ -163,120 +161,6 @@ impl ClusterLeaseClient {
                 }
                 Ok(token)
             }
-            _other => Err(LeaseClientError::Protocol(
-                PoolProtocolError::UnknownDiscriminant(0),
-            )),
-        }
-    }
-
-    /// Submit a dataset catalog delta to the cluster authority.
-    ///
-    /// Connects to the storage-node, sends a `CatalogDeltaRequest` containing
-    /// the serialized `CatalogDelta`, and returns the new catalog version.
-    pub fn submit_catalog_delta(
-        node_addr: &str,
-        requesting_node_id: u64,
-        pool_guid: [u8; 16],
-        delta_bytes: Vec<u8>,
-    ) -> Result<ClusterPoolCatalogDeltaResponse, LeaseClientError> {
-        use std::io::{Read, Write};
-        use std::net::TcpStream;
-        use std::time::Duration;
-
-        let mut stream = TcpStream::connect(node_addr)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-
-        let request = ClusterPoolMessage::CatalogDeltaRequest(ClusterPoolCatalogDeltaRequest {
-            request_id: 1,
-            pool_guid,
-            requesting_node_id,
-            delta_bytes,
-        });
-        let encoded = request.encode()?;
-
-        let mut wire = Vec::with_capacity(4 + encoded.len());
-        wire.extend_from_slice(CLUSTER_POOL_MESSAGE_MAGIC);
-        wire.extend_from_slice(&encoded);
-        stream.write_all(&wire)?;
-
-        let mut magic_buf = [0u8; 4];
-        stream.read_exact(&mut magic_buf)?;
-        if &magic_buf != CLUSTER_POOL_MESSAGE_MAGIC {
-            return Err(LeaseClientError::Protocol(
-                PoolProtocolError::UnknownDiscriminant(0),
-            ));
-        }
-
-        let mut payload = Vec::new();
-        stream.read_to_end(&mut payload)?;
-        if payload.is_empty() {
-            return Err(LeaseClientError::Protocol(
-                PoolProtocolError::PayloadTooShort(0),
-            ));
-        }
-
-        let response = ClusterPoolMessage::decode(&payload)?;
-        match response {
-            ClusterPoolMessage::CatalogDeltaResponse(resp) => Ok(resp),
-            _other => Err(LeaseClientError::Protocol(
-                PoolProtocolError::UnknownDiscriminant(0),
-            )),
-        }
-    }
-
-    /// Query the cluster catalog authority for dataset entries.
-    ///
-    /// Connects to the storage-node, sends a `CatalogQueryRequest`, and
-    /// returns the response containing catalog entries and version.
-    pub fn query_catalog(
-        node_addr: &str,
-        requesting_node_id: u64,
-        pool_guid: [u8; 16],
-        query_type: CatalogQueryType,
-        path: &str,
-    ) -> Result<ClusterPoolCatalogQueryResponse, LeaseClientError> {
-        use std::io::{Read, Write};
-        use std::net::TcpStream;
-        use std::time::Duration;
-
-        let mut stream = TcpStream::connect(node_addr)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-
-        let request = ClusterPoolMessage::CatalogQueryRequest(ClusterPoolCatalogQueryRequest {
-            request_id: 1,
-            pool_guid,
-            requesting_node_id,
-            query_type_u8: query_type.to_u8(),
-            path: path.to_string(),
-        });
-        let encoded = request.encode()?;
-
-        let mut wire = Vec::with_capacity(4 + encoded.len());
-        wire.extend_from_slice(CLUSTER_POOL_MESSAGE_MAGIC);
-        wire.extend_from_slice(&encoded);
-        stream.write_all(&wire)?;
-
-        let mut magic_buf = [0u8; 4];
-        stream.read_exact(&mut magic_buf)?;
-        if &magic_buf != CLUSTER_POOL_MESSAGE_MAGIC {
-            return Err(LeaseClientError::Protocol(
-                PoolProtocolError::UnknownDiscriminant(0),
-            ));
-        }
-
-        let mut payload = Vec::new();
-        stream.read_to_end(&mut payload)?;
-        if payload.is_empty() {
-            return Err(LeaseClientError::Protocol(
-                PoolProtocolError::PayloadTooShort(0),
-            ));
-        }
-
-        let response = ClusterPoolMessage::decode(&payload)?;
-        match response {
-            ClusterPoolMessage::CatalogQueryResponse(resp) => Ok(resp),
             _other => Err(LeaseClientError::Protocol(
                 PoolProtocolError::UnknownDiscriminant(0),
             )),

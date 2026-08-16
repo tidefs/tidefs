@@ -505,7 +505,6 @@ mod integration_tests {
             roster_hash: roster.roster_hash,
             member_ids: roster.member_ids.clone(),
             commit_index: 1,
-            catalog_delta_bytes: None,
         };
         // Can't easily test via the bus since push happens inside subscriber;
         // verify that subscriber works by manually calling on_epoch_committed
