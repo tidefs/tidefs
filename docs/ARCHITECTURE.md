@@ -286,9 +286,12 @@ flush/FUA continuity.
 - **Retain only as focused development backends when they provide distinct
   signal:** file-image, in-memory block, model, and ublk boundary probes. A
   model or its own tests do not justify a parallel product runtime. The large
-  in-memory block admission/receipt structures and clustered catalog mirrors
-  must either be consumed by the selected carrier or be consolidated/deleted
-  after exact consumer review.
+  model-only clustered block admission/receipt ledger was removed after the
+  authenticated Pool lease and `PoolVolumeBackend` ublk owner became the real
+  carrier authority. Reserve escrow and cross-node receipt continuity remain
+  missing carrier work, not inputs to a synthetic admission record. Clustered
+  catalog mirrors must likewise be consumed by the selected carrier or be
+  consolidated/deleted after exact consumer review.
 
 The first implementation slice after this decision is the smallest vertical
 part of the named local block carrier that publishes one exact volume root in
