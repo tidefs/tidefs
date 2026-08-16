@@ -460,6 +460,53 @@ pub fn pool_import_owned(
         read_only,
     })
 }
+
+/// Return the dead process recorded by this Pool's exact import lock.
+///
+/// This is a read-only recovery preflight. The normal import path remains the
+/// sole authority that may reclaim the lock and activate Pool ownership.
+///
+/// # Errors
+///
+/// Returns [`ImportError`] when an existing lock cannot be read or does not
+/// contain one valid Linux process id.
+pub fn stale_import_lock_pid(
+    lock_dir: &Path,
+    pool_uuid: &[u8; 16],
+) -> Result<Option<u32>, ImportError> {
+    stale_import_lock_pid_at(&lock_dir.join(hex_uuid(pool_uuid)))
+}
+
+fn stale_import_lock_pid_at(lock_path: &Path) -> Result<Option<u32>, ImportError> {
+    let content = match fs::read_to_string(lock_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ImportError::Io {
+                device_path: Some(lock_path.to_path_buf()),
+                msg: format!("read import lock owner: {error}"),
+            });
+        }
+    };
+    let pid = content
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| ImportError::Io {
+            device_path: Some(lock_path.to_path_buf()),
+            msg: format!("parse import lock owner PID: {error}"),
+        })?;
+    if !(2..=i32::MAX as u32).contains(&pid) {
+        return Err(ImportError::Io {
+            device_path: Some(lock_path.to_path_buf()),
+            msg: format!("import lock owner PID {pid} is outside the Linux process-id range"),
+        });
+    }
+    if Path::new(&format!("/proc/{pid}")).exists() {
+        Ok(None)
+    } else {
+        Ok(Some(pid))
+    }
+}
 // ---------------------------------------------------------------------------
 // pool_export — public entry point
 // ---------------------------------------------------------------------------
@@ -1907,19 +1954,10 @@ impl PoolImport {
 
     /// Return true when the lock file exists but the owning process is dead.
     fn is_lock_stale(&self) -> bool {
-        let Ok(content) = fs::read_to_string(&self.lock_path) else {
-            return false;
-        };
-        let pid_str = content.trim();
-        let Ok(pid) = pid_str.parse::<i32>() else {
-            return false;
-        };
-        if pid <= 1 {
-            return false;
-        }
-        // Check whether /proc/<pid> exists (Linux-only; TideFS is Linux-only).
-        let proc_path = format!("/proc/{pid}");
-        !Path::new(&proc_path).exists()
+        stale_import_lock_pid_at(&self.lock_path)
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     // ------------------------------------------------------------------
@@ -3101,6 +3139,29 @@ mod tests {
             ImportError::AlreadyImported { .. } => {}
             e => panic!("expected AlreadyImported, got {e}"),
         }
+    }
+
+    #[test]
+    fn stale_import_lock_pid_reports_only_a_dead_exact_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_dir = dir.path().join("locks");
+        fs::create_dir_all(&lock_dir).unwrap();
+        let pool_uuid = [0xA7; 16];
+        let lock_path = lock_dir.join(hex_uuid(&pool_uuid));
+
+        fs::write(&lock_path, format!("{}\n", std::process::id())).unwrap();
+        assert_eq!(stale_import_lock_pid(&lock_dir, &pool_uuid).unwrap(), None);
+
+        let dead_pid = i32::MAX as u32;
+        assert!(!Path::new(&format!("/proc/{dead_pid}")).exists());
+        fs::write(&lock_path, format!("{dead_pid}\n")).unwrap();
+        assert_eq!(
+            stale_import_lock_pid(&lock_dir, &pool_uuid).unwrap(),
+            Some(dead_pid)
+        );
+
+        fs::write(&lock_path, "not-a-pid\n").unwrap();
+        assert!(stale_import_lock_pid(&lock_dir, &pool_uuid).is_err());
     }
 
     // -- read-only import tests --

@@ -20,13 +20,17 @@ use tidefs_ublk_abi::{
 };
 
 struct UblkDataQueueIoLoopConfig {
-    reconnect_dev_id: Option<u32>,
+    reconnect_device: Option<(u32, u32)>,
     max_iterations: Option<u32>,
     shutdown: Option<Arc<AtomicBool>>,
     io_uring_enabled: bool,
     nr_hw_queues: u16,
     queue_depth: u16,
     drain_deadline_secs: u64,
+}
+
+const fn should_issue_fresh_device_setup(from_reconnect: bool) -> bool {
+    !from_reconnect
 }
 
 fn completed_read_payload<'a>(
@@ -77,7 +81,7 @@ fn submit_data_queue_and_wait(
 }
 
 pub fn run_ublk_live_device(
-    reconnect_dev_id: Option<u32>,
+    reconnect_device: Option<(u32, u32)>,
     backend: &mut dyn BlockVolumeStorageBackend,
     shutdown: Arc<AtomicBool>,
     io_uring_enabled: bool,
@@ -88,7 +92,7 @@ pub fn run_ublk_live_device(
     let report = run_ublk_data_queue_io_loop_impl(
         backend,
         UblkDataQueueIoLoopConfig {
-            reconnect_dev_id,
+            reconnect_device,
             max_iterations: None,
             shutdown: Some(shutdown),
             io_uring_enabled,
@@ -104,7 +108,7 @@ pub fn run_ublk_live_device(
 }
 
 pub fn run_ublk_data_queue_io_loop_boundary(
-    reconnect_dev_id: Option<u32>,
+    reconnect_device: Option<(u32, u32)>,
     max_iterations: u32,
     backend: &mut dyn BlockVolumeStorageBackend,
     io_uring_enabled: bool,
@@ -115,7 +119,7 @@ pub fn run_ublk_data_queue_io_loop_boundary(
     run_ublk_data_queue_io_loop_impl(
         backend,
         UblkDataQueueIoLoopConfig {
-            reconnect_dev_id,
+            reconnect_device,
             max_iterations: Some(max_iterations),
             shutdown: None,
             io_uring_enabled,
@@ -131,7 +135,7 @@ fn run_ublk_data_queue_io_loop_impl(
     config: UblkDataQueueIoLoopConfig,
 ) -> Result<UblkDataQueueIoLoopReport, AppError> {
     let UblkDataQueueIoLoopConfig {
-        reconnect_dev_id,
+        reconnect_device,
         max_iterations,
         shutdown,
         io_uring_enabled,
@@ -141,7 +145,7 @@ fn run_ublk_data_queue_io_loop_impl(
     } = config;
 
     let mut inputs = UblkControlOpenInputs::read_host()?;
-    let add_dev_input =
+    let mut add_dev_input =
         UblkControlAddDevInput::from_nr_hw_queues_and_depth(nr_hw_queues, queue_depth);
     let mut completion_trace =
         UblkCompletionTrace::from_env(add_dev_input.nr_hw_queues, add_dev_input.queue_depth);
@@ -217,30 +221,86 @@ fn run_ublk_data_queue_io_loop_impl(
     // ── Device ID tracking: supports reconnect to existing devices ──
     let mut resolved_dev_id: Option<u32> = None;
     let mut from_reconnect = false;
+    let mut reconnect_dev_info = None;
 
-    // Try reconnect first if a device ID was given
-    if let Some(reconnect_id) = reconnect_dev_id {
-        if inputs.should_attempt_control_open() {
-            match open_control_device_file(&inputs.control_path) {
-                Ok(ctrl_dev) => {
-                    inputs.control_open_result = Some(Ok(()));
-                    let start_input = tidefs_block_volume_adapter_ublk_control_runtime::UblkControlStartUserRecoveryInput::from_kernel_dev_id(reconnect_id);
-                    match tidefs_block_volume_adapter_ublk_control_runtime::issue_start_user_recovery(ctrl_dev.as_fd(), start_input) {
-                        Ok(outcome) => {
-                            eprintln!("ublk-serve: reconnect START_USER_RECOVERY ok dev={}", outcome.dev_id);
-                            resolved_dev_id = Some(outcome.dev_id);
-                            from_reconnect = true;
-                        }
-                        Err(e) => {
-                            eprintln!("ublk-serve: START_USER_RECOVERY refused ({}), falling back", e.as_str());
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("ublk-serve: open control failed ({e:?}), falling back");
-                }
-            }
+    // A named reconnect is an exact recovery request. Any refusal must fail
+    // closed; silently replacing the requested device with ADD_DEV would sever
+    // the Pool/volume-to-kernel-device ownership proof.
+    if let Some((reconnect_id, predecessor_pid)) = reconnect_device {
+        if !inputs.should_attempt_control_open() {
+            return Err(AppError::new(format!(
+                "recover ublk device {reconnect_id}: host control device is not admitted"
+            )));
         }
+        let ctrl_dev = open_control_device_file(&inputs.control_path).map_err(|error| {
+            AppError::new(format!(
+                "recover ublk device {reconnect_id}: open control device failed: {}",
+                error.as_str()
+            ))
+        })?;
+        inputs.control_open_result = Some(Ok(()));
+        let dev_info = tidefs_block_volume_adapter_ublk_control_runtime::issue_get_dev_info2(
+            ctrl_dev.as_fd(),
+            reconnect_id,
+        )
+        .map_err(|error| {
+            AppError::new(format!(
+                "recover ublk device {reconnect_id}: GET_DEV_INFO2 failed: {}",
+                error.as_str()
+            ))
+        })?;
+        if dev_info.state
+            != tidefs_block_volume_adapter_ublk_control_runtime::TIDEFS_UBLK_RECOVERY_QUIESCED_STATE
+        {
+            return Err(AppError::new(format!(
+                "recover ublk device {reconnect_id}: kernel state {} is not quiesced",
+                dev_info.state
+            )));
+        }
+        let predecessor_pid = i32::try_from(predecessor_pid).map_err(|_| {
+            AppError::new(format!(
+                "recover ublk device {reconnect_id}: predecessor PID exceeds the Linux process-id range"
+            ))
+        })?;
+        if dev_info.ublksrv_pid != predecessor_pid {
+            return Err(AppError::new(format!(
+                "recover ublk device {reconnect_id}: GET_DEV_INFO2 owner PID {} no longer matches predecessor PID {predecessor_pid}",
+                dev_info.ublksrv_pid
+            )));
+        }
+        let recovered_add_dev_input = UblkControlAddDevInput {
+            nr_hw_queues: dev_info.nr_hw_queues,
+            queue_depth: dev_info.queue_depth,
+            max_io_buf_bytes: dev_info.max_io_buf_bytes,
+            flags: UblkFeatureFlags(dev_info.flags),
+        };
+        tidefs_block_volume_adapter_ublk_control_runtime::build_add_dev_spec(
+            recovered_add_dev_input,
+        )
+        .map_err(|error| {
+            AppError::new(format!(
+                "recover ublk device {reconnect_id}: invalid existing queue geometry or recovery flags: {}",
+                error.as_str()
+            ))
+        })?;
+        let start_input = UblkControlStartUserRecoveryInput::from_kernel_dev_id(reconnect_id);
+        let outcome =
+            issue_start_user_recovery(ctrl_dev.as_fd(), start_input).map_err(|error| {
+                AppError::new(format!(
+                    "recover ublk device {reconnect_id}: START_USER_RECOVERY refused: {}",
+                    error.as_str()
+                ))
+            })?;
+        eprintln!(
+            "tidefs ublk carrier: START_USER_RECOVERY succeeded for dev_id={}",
+            outcome.dev_id
+        );
+        add_dev_input = recovered_add_dev_input;
+        completion_trace =
+            UblkCompletionTrace::from_env(add_dev_input.nr_hw_queues, add_dev_input.queue_depth);
+        resolved_dev_id = Some(outcome.dev_id);
+        reconnect_dev_info = Some(dev_info);
+        from_reconnect = true;
     }
 
     if inputs.should_attempt_control_open() {
@@ -267,17 +327,12 @@ fn run_ublk_data_queue_io_loop_impl(
                         .features
                         .contains(TIDEFS_UBLK_ADD_DEV_REQUIRED_FEATURES)
                 }) {
-                    add_dev_attempted = !from_reconnect;
+                    add_dev_attempted = should_issue_fresh_device_setup(from_reconnect);
                     let current_add_dev_result = if from_reconnect {
-                        // Already have dev_id from reconnect, skip ADD_DEV
+                        // START_USER_RECOVERY retained this exact device and its
+                        // existing queue geometry; never create a replacement.
                         Ok(tidefs_block_volume_adapter_ublk_control_runtime::UblkControlAddDevOutcome::from_dev_info(
-                            tidefs_ublk_abi::UblkSrvCtrlDevInfo {
-                                dev_id: resolved_dev_id.unwrap_or(0),
-                                nr_hw_queues: add_dev_input.nr_hw_queues,
-                                queue_depth: add_dev_input.queue_depth,
-                                max_io_buf_bytes: add_dev_input.max_io_buf_bytes,
-                                ..Default::default()
-                            }
+                            reconnect_dev_info.expect("named recovery retained GET_DEV_INFO2")
                         ))
                     } else {
                         issue_add_dev(control_device.as_fd(), add_dev_input)
@@ -289,8 +344,8 @@ fn run_ublk_data_queue_io_loop_impl(
                         let geometry = backend.geometry();
                         if let Ok(parameter_report) = build_ublk_parameter_spec_report_with_geometry(
                             geometry,
-                            nr_hw_queues,
-                            queue_depth,
+                            add_dev_input.nr_hw_queues,
+                            add_dev_input.queue_depth,
                             backend.is_read_only(),
                         ) {
                             set_params_block_size_bytes =
@@ -298,16 +353,25 @@ fn run_ublk_data_queue_io_loop_impl(
                             set_params_block_count = u64::try_from(geometry.block_count).ok();
                             set_params_dev_sectors =
                                 Some(parameter_report.params.basic.dev_sectors);
-                            let set_params_input =
-                                UblkControlSetParamsInput::from_kernel_dev_id_and_params(
-                                    add_outcome.dev_info.dev_id,
-                                    parameter_report.params,
-                                );
-                            set_params_attempted = true;
                             let set_params_result =
-                                issue_set_params(control_device.as_fd(), set_params_input);
+                                if !should_issue_fresh_device_setup(from_reconnect) {
+                                    // The retained device is already started. Linux
+                                    // rejects SET_PARAMS during user recovery; its
+                                    // canonical parameters and capacity were
+                                    // validated before START_USER_RECOVERY.
+                                    Ok(())
+                                } else {
+                                    let set_params_input =
+                                        UblkControlSetParamsInput::from_kernel_dev_id_and_params(
+                                            add_outcome.dev_info.dev_id,
+                                            parameter_report.params,
+                                        );
+                                    set_params_attempted = true;
+                                    issue_set_params(control_device.as_fd(), set_params_input)
+                                        .map(|_| ())
+                                };
                             if set_params_result.is_ok() {
-                                set_params_completed = true;
+                                set_params_completed = !from_reconnect;
                                 // Open data queue runtime
                                 let data_queue_input =
                                     UblkDataQueueRuntimeOpenInput::from_kernel_dev_id(
@@ -368,7 +432,10 @@ fn run_ublk_data_queue_io_loop_impl(
                                                 );
                                             start_dev_uring_cmd_attempted = true;
                                             let sd_result = if from_reconnect {
-                                                let end_input = tidefs_block_volume_adapter_ublk_control_runtime::UblkControlEndUserRecoveryInput::from_kernel_dev_id(resolved_dev_id.unwrap_or(0));
+                                                let end_input = tidefs_block_volume_adapter_ublk_control_runtime::UblkControlEndUserRecoveryInput::from_kernel_dev_id_and_daemon_pid(
+                                                    resolved_dev_id.unwrap_or(0),
+                                                    daemon_pid,
+                                                );
                                                 match tidefs_block_volume_adapter_ublk_control_runtime::issue_end_user_recovery(control_device.as_fd(), end_input) {
                                                     Ok(outcome) => {
                                                         eprintln!("ublk-serve: reconnect END_USER_RECOVERY ok dev={}", outcome.dev_id);
@@ -1353,6 +1420,12 @@ mod tests {
         let payload = completed_read_payload(&read_buf, &entry).expect("read payload");
         assert_eq!(payload.len(), 512);
         assert!(payload.iter().all(|byte| *byte == 0x5a));
+    }
+
+    #[test]
+    fn reconnect_skips_fresh_add_dev_and_set_params_setup() {
+        assert!(!should_issue_fresh_device_setup(true));
+        assert!(should_issue_fresh_device_setup(false));
     }
 
     #[test]

@@ -490,7 +490,11 @@ pub const UBLK_DATA_QUEUE_PATH_TEMPLATE: &str = "/dev/ublkcN";
 pub const TIDEFS_UBLK_ADD_DEV_REQUIRED_FEATURES: UblkFeatureFlags =
     UblkFeatureFlags::CMD_IOCTL_ENCODE
         .union(UblkFeatureFlags::USER_COPY)
+        .union(UblkFeatureFlags::USER_RECOVERY)
+        .union(UblkFeatureFlags::USER_RECOVERY_REISSUE)
         .union(UblkFeatureFlags::UPDATE_SIZE);
+/// Kernel device state required before `START_USER_RECOVERY`.
+pub const TIDEFS_UBLK_RECOVERY_QUIESCED_STATE: u16 = 2;
 /// Tidefs Ublk Add Dev Default Max Io Buf Bytes.
 pub const TIDEFS_UBLK_ADD_DEV_DEFAULT_MAX_IO_BUF_BYTES: u32 = 1024 * 1024;
 /// Tidefs Ublk Add Dev Default Queue Depth.
@@ -4485,13 +4489,15 @@ impl UblkControlEndUserRecoveryCommand {
 pub struct UblkControlEndUserRecoveryInput {
     /// Dev Id.
     pub dev_id: u32,
+    /// PID of the successor ublk server that owns the reopened queues.
+    pub daemon_pid: i32,
 }
 
 impl UblkControlEndUserRecoveryInput {
-    /// From Kernel Dev Id.
+    /// From Kernel Dev Id And Daemon Pid.
     #[must_use]
-    pub const fn from_kernel_dev_id(dev_id: u32) -> Self {
-        Self { dev_id }
+    pub const fn from_kernel_dev_id_and_daemon_pid(dev_id: u32, daemon_pid: i32) -> Self {
+        Self { dev_id, daemon_pid }
     }
 }
 
@@ -4514,6 +4520,8 @@ pub struct UblkControlEndUserRecoverySpec {
     pub mutates_control_state: bool,
     /// Dev Id.
     pub dev_id: u32,
+    /// Daemon Pid.
+    pub daemon_pid: i32,
 }
 
 impl UblkControlEndUserRecoverySpec {
@@ -4531,6 +4539,7 @@ impl UblkControlEndUserRecoverySpec {
             uring_cmd_sqe_bytes: 128,
             mutates_control_state: true,
             dev_id: input.dev_id,
+            daemon_pid: input.daemon_pid,
         }
     }
 }
@@ -4540,6 +4549,8 @@ impl UblkControlEndUserRecoverySpec {
 pub enum UblkControlEndUserRecoveryError {
     /// Autodeviceid.
     AutoDeviceId,
+    /// Invaliddaemonpid.
+    InvalidDaemonPid(i32),
     /// Iouringsetuperrno.
     IoUringSetupErrno(i32),
     /// Iouringsetupmissingerrno.
@@ -4564,6 +4575,7 @@ impl UblkControlEndUserRecoveryError {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AutoDeviceId => "auto_device_id_not_concrete",
+            Self::InvalidDaemonPid(_) => "invalid_daemon_pid",
             Self::IoUringSetupErrno(_) => "io_uring_setup_errno",
             Self::IoUringSetupMissingErrno => "io_uring_setup_missing_errno",
             Self::SubmissionQueueFull => "submission_queue_full",
@@ -4596,6 +4608,8 @@ pub struct UblkControlEndUserRecoveryOutcome {
     pub request_raw: u32,
     /// Dev Id.
     pub dev_id: u32,
+    /// Daemon Pid.
+    pub daemon_pid: i32,
 }
 
 impl UblkControlEndUserRecoveryOutcome {
@@ -4608,7 +4622,20 @@ impl UblkControlEndUserRecoveryOutcome {
                 .request()
                 .raw(),
             dev_id: input.dev_id,
+            daemon_pid: input.daemon_pid,
         }
+    }
+}
+
+/// Build the control command that binds recovery completion to the successor
+/// ublk server process.
+#[must_use]
+pub fn build_end_user_recovery_ctrl_cmd(input: UblkControlEndUserRecoveryInput) -> UblkSrvCtrlCmd {
+    UblkSrvCtrlCmd {
+        dev_id: input.dev_id,
+        queue_id: u16::MAX,
+        data: [input.daemon_pid as u64],
+        ..UblkSrvCtrlCmd::default()
     }
 }
 
@@ -4688,11 +4715,7 @@ pub fn issue_end_user_recovery(
             Some(errno) => UblkControlEndUserRecoveryError::IoUringSetupErrno(errno),
             None => UblkControlEndUserRecoveryError::IoUringSetupMissingErrno,
         })?;
-    let command = UblkSrvCtrlCmd {
-        dev_id: input.dev_id,
-        queue_id: u16::MAX,
-        ..UblkSrvCtrlCmd::default()
-    };
+    let command = build_end_user_recovery_ctrl_cmd(input);
     let entry = opcode::UringCmd80::new(types::Fd(fd.as_raw_fd()), spec.request_raw)
         .cmd(encode_ctrl_cmd80(command))
         .build()
@@ -4748,6 +4771,11 @@ const fn validate_end_user_recovery_input(
 ) -> Result<(), UblkControlEndUserRecoveryError> {
     if input.dev_id == u32::MAX {
         return Err(UblkControlEndUserRecoveryError::AutoDeviceId);
+    }
+    if input.daemon_pid <= 1 {
+        return Err(UblkControlEndUserRecoveryError::InvalidDaemonPid(
+            input.daemon_pid,
+        ));
     }
     Ok(())
 }
@@ -6253,6 +6281,8 @@ mod tests {
         assert_eq!(spec.max_io_buf_bytes, 1024 * 1024);
         assert!(spec.flags.contains(UblkFeatureFlags::CMD_IOCTL_ENCODE));
         assert!(spec.flags.contains(UblkFeatureFlags::USER_COPY));
+        assert!(spec.flags.contains(UblkFeatureFlags::USER_RECOVERY));
+        assert!(spec.flags.contains(UblkFeatureFlags::USER_RECOVERY_REISSUE));
     }
 
     #[test]
@@ -6266,6 +6296,8 @@ mod tests {
         assert_eq!(info.ublksrv_pid, 0);
         assert!(UblkFeatureFlags(info.flags).contains(UblkFeatureFlags::CMD_IOCTL_ENCODE));
         assert!(UblkFeatureFlags(info.flags).contains(UblkFeatureFlags::USER_COPY));
+        assert!(UblkFeatureFlags(info.flags).contains(UblkFeatureFlags::USER_RECOVERY));
+        assert!(UblkFeatureFlags(info.flags).contains(UblkFeatureFlags::USER_RECOVERY_REISSUE));
     }
 
     #[test]
@@ -6280,6 +6312,33 @@ mod tests {
         let info = build_add_dev_info(input).unwrap();
         assert_eq!(info.nr_hw_queues, 4);
         assert_eq!(info.queue_depth, 32);
+    }
+
+    #[test]
+    fn add_dev_recovery_end_command_encodes_successor_pid() {
+        let input = UblkControlEndUserRecoveryInput::from_kernel_dev_id_and_daemon_pid(17, 4242);
+        let command = build_end_user_recovery_ctrl_cmd(input);
+
+        assert_eq!(command.dev_id, 17);
+        assert_eq!(command.queue_id, u16::MAX);
+        assert_eq!(command.data[0], 4242);
+        assert_eq!(
+            UblkControlEndUserRecoverySpec::from_input(input).daemon_pid,
+            4242
+        );
+        assert_eq!(
+            UblkControlEndUserRecoveryOutcome::from_input(input).daemon_pid,
+            4242
+        );
+    }
+
+    #[test]
+    fn add_dev_recovery_end_input_refuses_non_process_pid() {
+        let input = UblkControlEndUserRecoveryInput::from_kernel_dev_id_and_daemon_pid(17, 1);
+        assert_eq!(
+            validate_end_user_recovery_input(input),
+            Err(UblkControlEndUserRecoveryError::InvalidDaemonPid(1))
+        );
     }
 
     #[test]
