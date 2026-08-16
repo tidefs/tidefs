@@ -124,7 +124,7 @@ let
     for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff \
                   reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync \
                   expr head tail cut kill ps test seq du dirname basename \
-                  readlink tr cmp diff mountpoint uname date umount truncate; do
+                  readlink tr cmp diff mountpoint uname date umount truncate timeout; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
@@ -176,7 +176,8 @@ let
 
 
     # Fix ELF interpreter paths for initrd: reset to /lib/ld-linux-x86-64.so.2
-    for bin in "$RUN_DIR/bin/busybox" "$RUN_DIR/bin/tidefsctl" "$RUN_DIR/bin/fsx"; do
+    for bin in "$RUN_DIR/bin/busybox" "$RUN_DIR/bin/tidefsctl" "$RUN_DIR/bin/fsx" \
+               "$RUN_DIR/bin/tidefs-mmap-workload"; do
       if [ -f "$bin" ]; then
         "$PATCHELF" --set-interpreter /lib/ld-linux-x86-64.so.2 "$bin" 2>/dev/null || true
         "$PATCHELF" --set-rpath /usr/lib:/lib "$bin" 2>/dev/null || true
@@ -208,6 +209,27 @@ BLOCKED=0
 pass()    { echo "PASS: $1"; PASSED=$((PASSED + 1)); }
 fail()    { echo "FAIL: $1 -- $2"; FAILED=$((FAILED + 1)); }
 blocked() { echo "BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
+
+wait_for_pid_exit() {
+    PID_TO_WAIT=$1
+    WAIT_SECONDS=$2
+    for _ in $(seq 1 "$WAIT_SECONDS"); do
+        ! kill -0 "$PID_TO_WAIT" 2>/dev/null && return 0
+        sleep 1
+    done
+    ! kill -0 "$PID_TO_WAIT" 2>/dev/null
+}
+
+stop_exact_mount_owner() {
+    OWNER_PID=$1
+    [ -n "$OWNER_PID" ] || return 0
+    kill -0 "$OWNER_PID" 2>/dev/null || { wait "$OWNER_PID" 2>/dev/null || true; return 0; }
+    kill "$OWNER_PID" 2>/dev/null || true
+    if ! wait_for_pid_exit "$OWNER_PID" 10; then
+        kill -KILL "$OWNER_PID" 2>/dev/null || true
+    fi
+    wait "$OWNER_PID" 2>/dev/null || true
+}
 
 MNT=/mnt/tidefs
 DEVICE=/store/tidefs-device.tidefs
@@ -317,22 +339,33 @@ else
 fi
 
 # ── Phase 2b: mmap workload ──────────────────────────────────────────
+MMAP_WORKLOAD_OK=0
 if [ "$MOUNTED" -eq 1 ] && [ -x /bin/tidefs-mmap-workload ]; then
     MMAP_DIR="$MNT/mmap-workload"
     mkdir -p "$MMAP_DIR"
 
     echo "Running tidefs-mmap-workload $MMAP_DIR"
-    if /bin/tidefs-mmap-workload "$MMAP_DIR" > /tmp/mmap.out 2>&1; then
-        PASS_LINES=$(grep -c '"status":"PASS"' /tmp/mmap.out 2>/dev/null || echo 0)
-        FAIL_LINES=$(grep -c '"status":"FAIL"' /tmp/mmap.out 2>/dev/null || echo 0)
-        if [ "$FAIL_LINES" -eq 0 ]; then
-            pass "mmap_workload" "$PASS_LINES tests passed"
-        else
-            fail "mmap_workload" "$FAIL_LINES failures (see /tmp/mmap.out)"
-        fi
+    : > /tmp/mmap.out
+    tail -f /tmp/mmap.out &
+    MMAP_TAIL_PID=$!
+    if timeout -k 2 180 /bin/tidefs-mmap-workload "$MMAP_DIR" \
+        > /tmp/mmap.out 2>&1; then
+        MMAP_RC=0
     else
         MMAP_RC=$?
-        fail "mmap_workload" "exit=$MMAP_RC (see /tmp/mmap.out)"
+    fi
+    kill "$MMAP_TAIL_PID" 2>/dev/null || true
+    wait "$MMAP_TAIL_PID" 2>/dev/null || true
+    echo "=== mmap workload output ==="
+    cat /tmp/mmap.out
+    echo "=== end mmap workload output ==="
+    PASS_LINES=$(grep -c '"outcome":"pass"' /tmp/mmap.out 2>/dev/null || true)
+    FAIL_LINES=$(grep -c '"outcome":"fail"' /tmp/mmap.out 2>/dev/null || true)
+    if [ "$MMAP_RC" -eq 0 ] && [ "$FAIL_LINES" -eq 0 ] && [ "$PASS_LINES" -gt 0 ]; then
+        pass "mmap_workload" "$PASS_LINES tests passed"
+        MMAP_WORKLOAD_OK=1
+    else
+        fail "mmap_workload" "exit=$MMAP_RC pass=$PASS_LINES fail=$FAIL_LINES"
     fi
 elif [ "$MOUNTED" -eq 1 ]; then
     blocked "mmap_workload" "mmap workload binary not available"
@@ -340,22 +373,139 @@ else
     blocked "mmap_workload" "filesystem not mounted"
 fi
 
-# ── Phase 3: Tear-down ───────────────────────────────────────────────
+# ── Phase 3: Clean unmount and Pool export ───────────────────────────
+EXPORTED=0
 if [ "$MOUNTED" -eq 1 ]; then
-    if umount "$MNT" 2>/tmp/um.err; then
-        pass "unmount"
+    if timeout -k 2 30 /bin/tidefsctl pool export "$POOL" --devices "$DEVICE" \
+        > /tmp/export.out 2>/tmp/export.err; then
+        EXPORT_RC=0
     else
-        fail "unmount" "$(cat /tmp/um.err)"
+        EXPORT_RC=$?
     fi
+    if wait_for_pid_exit "$DAEMON_PID" 30; then
+        if wait "$DAEMON_PID"; then
+            DAEMON_RC=0
+        else
+            DAEMON_RC=$?
+        fi
+    else
+        DAEMON_RC=124
+    fi
+    echo "=== initial export output ==="
+    cat /tmp/export.out /tmp/export.err 2>/dev/null || true
+    echo "=== initial mount daemon log ==="
+    cat /tmp/daemon.log 2>/dev/null || true
+    if [ "$EXPORT_RC" -eq 0 ] && [ "$DAEMON_RC" -eq 0 ] \
+        && ! mountpoint -q "$MNT" 2>/dev/null; then
+        pass "unmount"
+        pass "pool_export"
+        EXPORTED=1
+        MOUNTED=0
+    else
+        fail "unmount" "export=$EXPORT_RC daemon=$DAEMON_RC mounted=$(mountpoint -q "$MNT" 2>/dev/null && echo yes || echo no)"
+        fail "pool_export" "$(cat /tmp/export.out /tmp/export.err 2>/dev/null)"
+        umount -l "$MNT" 2>/dev/null || true
+        stop_exact_mount_owner "$DAEMON_PID"
+        MOUNTED=0
+    fi
+    DAEMON_PID=""
 else
     blocked "unmount" "filesystem not mounted"
+    blocked "pool_export" "filesystem not mounted"
+    stop_exact_mount_owner "$DAEMON_PID"
+    DAEMON_PID=""
 fi
 
-if [ -n "$DAEMON_PID" ]; then
-    kill "$DAEMON_PID" 2>/dev/null || true
-    sleep 1
-    kill -9 "$DAEMON_PID" 2>/dev/null || true
-    pass "daemon_stop"
+# ── Phase 4: Pool reimport and remount ────────────────────────────────
+REMOUNTED=0
+REMOUNT_PID=""
+if [ "$EXPORTED" -eq 1 ] && [ "$FUSE_READY" -eq 1 ]; then
+    /bin/tidefsctl pool mount "$POOL" "$MNT" --devices "$DEVICE" \
+        > /tmp/remount.log 2>&1 &
+    REMOUNT_PID=$!
+    for _ in $(seq 1 30); do
+        if mountpoint -q "$MNT" 2>/dev/null; then
+            REMOUNTED=1
+            break
+        fi
+        ! kill -0 "$REMOUNT_PID" 2>/dev/null && break
+        sleep 1
+    done
+    if [ "$REMOUNTED" -eq 1 ]; then
+        if grep -q 'pool ".*" imported' /tmp/remount.log 2>/dev/null; then
+            pass "pool_reimport"
+        else
+            fail "pool_reimport" "mount became ready without import record: $(tail -20 /tmp/remount.log 2>/dev/null)"
+        fi
+        pass "remount"
+    else
+        fail "pool_reimport" "$(tail -20 /tmp/remount.log 2>/dev/null)"
+        fail "remount" "mountpoint did not reappear within 30s"
+        stop_exact_mount_owner "$REMOUNT_PID"
+        REMOUNT_PID=""
+    fi
+else
+    blocked "pool_reimport" "clean export or FUSE unavailable"
+    blocked "remount" "clean export or FUSE unavailable"
+fi
+
+# ── Phase 5: Exact mmap persistence after remount ─────────────────────
+if [ "$REMOUNTED" -eq 1 ] && [ -x /bin/tidefs-mmap-workload ]; then
+    if /bin/tidefs-mmap-workload --verify-persistence "$MNT/mmap-workload" \
+        > /tmp/mmap-persist.out 2>&1; then
+        PERSIST_RC=0
+    else
+        PERSIST_RC=$?
+    fi
+    echo "=== mmap persistence output ==="
+    cat /tmp/mmap-persist.out
+    echo "=== end mmap persistence output ==="
+    PERSIST_PASS_LINES=$(grep -c '"outcome":"pass"' /tmp/mmap-persist.out 2>/dev/null || true)
+    PERSIST_FAIL_LINES=$(grep -c '"outcome":"fail"' /tmp/mmap-persist.out 2>/dev/null || true)
+    if [ "$MMAP_WORKLOAD_OK" -eq 1 ] && [ "$PERSIST_RC" -eq 0 ] \
+        && [ "$PERSIST_PASS_LINES" -eq 2 ] && [ "$PERSIST_FAIL_LINES" -eq 0 ]; then
+        pass "mmap_persistence" "two exact pages survived export/reimport/remount"
+    else
+        fail "mmap_persistence" "initial=$MMAP_WORKLOAD_OK exit=$PERSIST_RC pass=$PERSIST_PASS_LINES fail=$PERSIST_FAIL_LINES"
+    fi
+elif [ "$REMOUNTED" -eq 1 ]; then
+    blocked "mmap_persistence" "mmap workload binary not available"
+else
+    blocked "mmap_persistence" "filesystem not remounted"
+fi
+
+# ── Phase 6: Final clean export ───────────────────────────────────────
+if [ "$REMOUNTED" -eq 1 ]; then
+    if timeout -k 2 30 /bin/tidefsctl pool export "$POOL" --devices "$DEVICE" \
+        > /tmp/final-export.out 2>/tmp/final-export.err; then
+        FINAL_EXPORT_RC=0
+    else
+        FINAL_EXPORT_RC=$?
+    fi
+    if wait_for_pid_exit "$REMOUNT_PID" 30; then
+        if wait "$REMOUNT_PID"; then
+            REMOUNT_RC=0
+        else
+            REMOUNT_RC=$?
+        fi
+    else
+        REMOUNT_RC=124
+    fi
+    echo "=== final export output ==="
+    cat /tmp/final-export.out /tmp/final-export.err 2>/dev/null || true
+    echo "=== remount daemon log ==="
+    cat /tmp/remount.log 2>/dev/null || true
+    if [ "$FINAL_EXPORT_RC" -eq 0 ] && [ "$REMOUNT_RC" -eq 0 ] \
+        && ! mountpoint -q "$MNT" 2>/dev/null; then
+        pass "final_export"
+    else
+        fail "final_export" "export=$FINAL_EXPORT_RC daemon=$REMOUNT_RC mounted=$(mountpoint -q "$MNT" 2>/dev/null && echo yes || echo no)"
+        umount -l "$MNT" 2>/dev/null || true
+        stop_exact_mount_owner "$REMOUNT_PID"
+    fi
+    REMOUNT_PID=""
+else
+    blocked "final_export" "filesystem not remounted"
 fi
 
 # ── Validation Summary ──────────────────────────────────────────────────
@@ -386,6 +536,7 @@ INITSCRIPT
     VAL_LOG="$RUN_DIR/qemu-boot.log"
 
     echo "  Booting QEMU VM..."
+    set +e
     timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
       -kernel "$KERNEL_IMG" \
       -initrd "$RUN_DIR/initrd.img" \
@@ -394,15 +545,17 @@ INITSCRIPT
       -smp 1 \
       -nographic \
       -no-reboot \
-      > "$VAL_LOG" 2>&1 || true
+      > "$VAL_LOG" 2>&1
+    QEMU_STATUS=$?
+    set -e
 
-    echo "  QEMU boot completed"
+    echo "  QEMU boot completed (exit=$QEMU_STATUS)"
 
     # ── Parse validation rows ────────────────────────────────────────────
     echo ""
     echo "=== FUSE fsx Validation Results ==="
 
-    PASSC=0; FAILC=0; BLOCKC=0
+    PASSC=0; FAILC=0; BLOCKC=0; GUEST_COMPLETED=0
 
     while IFS= read -r line; do
       case "$line" in
@@ -411,9 +564,13 @@ INITSCRIPT
         "BLOCKED: "*) echo "  $line"; BLOCKC=$((BLOCKC + 1)) ;;
       esac
     done < <(grep -E '^(PASS|FAIL|BLOCKED):' "$VAL_LOG" 2>/dev/null || true)
+    if grep -q '^=== End ===' "$VAL_LOG" 2>/dev/null; then
+      GUEST_COMPLETED=1
+    fi
 
     echo ""
     echo "Validation: $PASSC passed, $FAILC failed, $BLOCKC blocked"
+    echo "QEMU exit: $QEMU_STATUS; guest completed: $GUEST_COMPLETED"
     echo "Validation log: $VAL_LOG"
 
     # ── Produce validation record ────────────────────────────────────────
@@ -528,6 +685,18 @@ PINEOF
       echo "VALIDATION: FAIL -- $SEED_FAILC seeds failed"
       exit 1
     fi
+    if [ "$QEMU_STATUS" -eq 124 ]; then
+      echo "VALIDATION: FAIL -- QEMU timed out after ''${TIMEOUT_SEC}s"
+      exit 1
+    fi
+    if [ "$QEMU_STATUS" -ne 0 ]; then
+      echo "VALIDATION: FAIL -- QEMU exited with status $QEMU_STATUS"
+      exit 1
+    fi
+    if [ "$GUEST_COMPLETED" -ne 1 ]; then
+      echo "VALIDATION: FAIL -- guest did not complete validation and teardown"
+      exit 1
+    fi
     if [ "$FAILC" -gt 0 ]; then
       echo "VALIDATION: FAIL -- $FAILC validation rows failed"
       exit 1
@@ -536,6 +705,11 @@ PINEOF
     if [ "$BLOCKC" -gt 0 ] && [ "$PASSC" -eq 0 ]; then
       echo "VALIDATION: BLOCKED"
       exit 2
+    fi
+
+    if [ "$PASSC" -eq 0 ]; then
+      echo "VALIDATION: FAIL -- guest emitted no recognized validation rows"
+      exit 1
     fi
 
     echo "VALIDATION: PASS"
