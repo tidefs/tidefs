@@ -6460,9 +6460,6 @@ const VSNP_KIND_PUSH: u8 = 1;
 const VSNP_KIND_PULL_REQUEST: u8 = 2;
 const VSNP_KIND_PULL_RESPONSE: u8 = 3;
 const VSNP_KIND_ACK: u8 = 4;
-const VSNP_KIND_BLOCK_PUSH: u8 = 5;
-const VSNP_KIND_BLOCK_PULL_REQUEST: u8 = 6;
-const VSNP_KIND_BLOCK_PULL_RESPONSE: u8 = 7;
 
 fn build_vsnp_ack(message: &str) -> Vec<u8> {
     let b = message.as_bytes();
@@ -6471,15 +6468,6 @@ fn build_vsnp_ack(message: &str) -> Vec<u8> {
     msg.push(VSNP_KIND_ACK);
     msg.extend_from_slice(&(b.len() as u32).to_le_bytes());
     msg.extend_from_slice(b);
-    msg
-}
-
-fn build_vsnp_block_pull_response(block_data: &[u8]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(4 + 1 + 4 + block_data.len());
-    msg.extend_from_slice(b"VSNP");
-    msg.push(VSNP_KIND_BLOCK_PULL_RESPONSE);
-    msg.extend_from_slice(&(block_data.len() as u32).to_le_bytes());
-    msg.extend_from_slice(block_data);
     msg
 }
 
@@ -6555,65 +6543,6 @@ fn handle_vsnp_message(
             auth_key.copy_from_slice(&raw[9..9 + 32]);
             handle_vsnp_pull_request(session_id, auth_key, ctx)
         }
-        VSNP_KIND_BLOCK_PUSH => {
-            // Parse block push: [magic(4)][kind(1)][key_len(4)][key(32)][name_len(4)][name][data_len(4)][data]
-            if raw.len() < 9 + 4 {
-                return Err("VSNP block_push: too short".into());
-            }
-            let key_len = u32::from_le_bytes(raw[5..9].try_into().unwrap()) as usize;
-            if key_len != 32 {
-                return Err(format!("VSNP block_push: key_len={key_len}"));
-            }
-            if raw.len() < 9 + 32 + 4 {
-                return Err("VSNP block_push: too short for name_len".into());
-            }
-            let mut auth_key = [0u8; 32];
-            auth_key.copy_from_slice(&raw[9..9 + 32]);
-            let name_len = u32::from_le_bytes(raw[9 + 32..13 + 32].try_into().unwrap()) as usize;
-            let name_start = 13 + 32;
-            if raw.len() < name_start + name_len + 4 {
-                return Err("VSNP block_push: too short for data_len".into());
-            }
-            let _device_name =
-                String::from_utf8_lossy(&raw[name_start..name_start + name_len]).into_owned();
-            let data_len = u32::from_le_bytes(
-                raw[name_start + name_len..name_start + name_len + 4]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            let data_start = name_start + name_len + 4;
-            if raw.len() < data_start + data_len {
-                return Err(format!(
-                    "VSNP block_push: need {} bytes, got {}",
-                    data_start + data_len,
-                    raw.len()
-                ));
-            }
-            let block_data = &raw[data_start..data_start + data_len];
-            handle_vsnp_block_push(session_id, block_data, auth_key, ctx)
-        }
-        VSNP_KIND_BLOCK_PULL_REQUEST => {
-            if raw.len() < 9 + 4 {
-                return Err("VSNP block_pull_request: too short".into());
-            }
-            let key_len = u32::from_le_bytes(raw[5..9].try_into().unwrap()) as usize;
-            if key_len != 32 {
-                return Err(format!("VSNP block_pull_request: key_len={key_len}"));
-            }
-            if raw.len() < 9 + 32 + 4 {
-                return Err("VSNP block_pull_request: too short for name_len".into());
-            }
-            let mut auth_key = [0u8; 32];
-            auth_key.copy_from_slice(&raw[9..9 + 32]);
-            let name_len = u32::from_le_bytes(raw[9 + 32..13 + 32].try_into().unwrap()) as usize;
-            let name_start = 13 + 32;
-            if raw.len() < name_start + name_len {
-                return Err("VSNP block_pull_request: too short".into());
-            }
-            let _device_name =
-                String::from_utf8_lossy(&raw[name_start..name_start + name_len]).into_owned();
-            handle_vsnp_block_pull_request(session_id, auth_key, ctx)
-        }
         other => Err(format!("unknown VSNP kind: {other}")),
     }
 }
@@ -6657,38 +6586,6 @@ fn handle_vsnp_pull_request(
     let export = build_bridged_vfssend2_send_payload(&mut fs, fs_root, auth_key, &ctx.config, &[])?;
 
     Ok(Some(build_vsnp_pull_response(&export)))
-}
-
-fn handle_vsnp_block_push(
-    _session_id: tidefs_transport::SessionId,
-    block_data: &[u8],
-    _auth_key_bytes: [u8; 32],
-    ctx: &SessionContext,
-) -> Result<Option<Vec<u8>>, String> {
-    let fs_root = ctx.config.fs_root.as_ref().ok_or("no fs_root configured")?;
-    let block_file = std::path::Path::new(fs_root).join("block-volume-data");
-
-    std::fs::write(&block_file, block_data).map_err(|e| format!("write block data: {e}"))?;
-
-    let ack = format!("received block volume ({} bytes)", block_data.len());
-    Ok(Some(build_vsnp_ack(&ack)))
-}
-
-fn handle_vsnp_block_pull_request(
-    _session_id: tidefs_transport::SessionId,
-    _auth_key_bytes: [u8; 32],
-    ctx: &SessionContext,
-) -> Result<Option<Vec<u8>>, String> {
-    let fs_root = ctx.config.fs_root.as_ref().ok_or("no fs_root configured")?;
-    let block_file = std::path::Path::new(fs_root).join("block-volume-data");
-
-    let block_data = std::fs::read(&block_file).map_err(|e| format!("read block data: {e}"))?;
-
-    if block_data.is_empty() {
-        return Err("no block data found".into());
-    }
-
-    Ok(Some(build_vsnp_block_pull_response(&block_data)))
 }
 
 #[cfg(test)]
@@ -7212,6 +7109,26 @@ mod cluster_pool_handler_tests {
         let store = ReplicatedObjectStore::open(&paths, ReplicatedStoreConfig::default()).unwrap();
         let backend = Arc::new(Mutex::new(StoreBackend::Local(Box::new(store))));
         (dir, backend)
+    }
+
+    #[test]
+    fn vsnp_retired_block_side_file_kinds_are_refused() {
+        let (_store_dir, store) = frame_local_store();
+        let fs_root = tempfile::tempdir().unwrap();
+        let mut ctx = frame_test_context(store);
+        ctx.config.fs_root = Some(fs_root.path().to_path_buf());
+
+        for kind in [5u8, 6, 7] {
+            let raw = [b'V', b'S', b'N', b'P', kind];
+            assert_eq!(
+                handle_vsnp_message(tidefs_transport::SessionId::new(91), &raw, &ctx).unwrap_err(),
+                format!("unknown VSNP kind: {kind}")
+            );
+        }
+        assert!(
+            std::fs::read_dir(fs_root.path()).unwrap().next().is_none(),
+            "retired VSNP block kinds must not create side-file state"
+        );
     }
 
     fn full_send_exports(auth_key: RootAuthenticationKey) -> (Vec<u8>, Vec<u8>) {

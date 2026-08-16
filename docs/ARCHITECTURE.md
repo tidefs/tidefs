@@ -277,9 +277,12 @@ flush/FUA continuity.
   transaction, and teardown decisions currently duplicated by front ends.
 - **Remove from product paths when the shared consumer lands:** the retired
   directory-backed `tidefsctl block` route, hard-coded volume IDs and geometry,
-  global `b:<offset>` keys and written-block index, storage-node
-  `block-volume-data` side file, receiptless `fs_root` reopen paths, and
-  adapter-local committed-root or recovery decisions.
+  global `b:<offset>` keys and written-block index, receiptless `fs_root` reopen
+  paths, and adapter-local committed-root or recovery decisions. The
+  storage-node `block-volume-data` side file and its private VSNP block
+  push/pull kinds were removed after the Pool-backed clustered block carrier
+  landed; any future remote block protocol must consume that carrier instead
+  of creating a second storage authority.
 - **Retain only as focused development backends when they provide distinct
   signal:** file-image, in-memory block, model, and ublk boundary probes. A
   model or its own tests do not justify a parallel product runtime. The large
