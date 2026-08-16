@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tidefs_dataset_catalog::{
@@ -64,6 +64,11 @@ pub enum PoolRuntimeError {
     InvalidVolume(&'static str),
     InvalidSnapshot(&'static str),
     StaleVolumeHandle(DatasetId),
+    VolumeAlreadyExported(DatasetId),
+    VolumeExportActive {
+        dataset_id: DatasetId,
+        operation: &'static str,
+    },
     PublicationOutcomeUncertain(StoreError),
     PublicationRequiresReopen,
     ExternalMutationAuthorityExpired {
@@ -107,6 +112,16 @@ impl fmt::Display for PoolRuntimeError {
             Self::StaleVolumeHandle(id) => {
                 write!(f, "volume {id} was changed through another open handle")
             }
+            Self::VolumeAlreadyExported(id) => {
+                write!(f, "volume {id} is already actively exported")
+            }
+            Self::VolumeExportActive {
+                dataset_id,
+                operation,
+            } => write!(
+                f,
+                "volume {dataset_id} is actively exported; close it before {operation}"
+            ),
             Self::PublicationOutcomeUncertain(error) => write!(
                 f,
                 "canonical Pool publication outcome is uncertain; reopen before mutation: {error}"
@@ -177,6 +192,54 @@ pub struct PoolPhysicalCapacity {
     pub used_bytes: u64,
     pub available_bytes: u64,
     pub object_count: u64,
+}
+
+/// One runtime-local exclusive export registry.
+///
+/// Durable Pool state never contains this registry. An export exists only
+/// while a real carrier in this process holds its RAII pin.
+#[derive(Debug, Default)]
+struct ActiveVolumeExports {
+    dataset_ids: Mutex<BTreeSet<DatasetId>>,
+}
+
+impl ActiveVolumeExports {
+    fn pin(self: &Arc<Self>, dataset_id: DatasetId) -> Result<VolumeExportPin> {
+        let mut active = self
+            .dataset_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !active.insert(dataset_id) {
+            return Err(PoolRuntimeError::VolumeAlreadyExported(dataset_id));
+        }
+        Ok(VolumeExportPin {
+            owner: Arc::clone(self),
+            dataset_id,
+        })
+    }
+
+    fn contains(&self, dataset_id: DatasetId) -> bool {
+        self.dataset_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&dataset_id)
+    }
+}
+
+#[derive(Debug)]
+struct VolumeExportPin {
+    owner: Arc<ActiveVolumeExports>,
+    dataset_id: DatasetId,
+}
+
+impl Drop for VolumeExportPin {
+    fn drop(&mut self) {
+        self.owner
+            .dataset_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.dataset_id);
+    }
 }
 
 /// Process-local monotonic deadline shared with an external writer authority.
@@ -365,6 +428,7 @@ pub struct PoolRuntime {
     publication_requires_reopen: bool,
     external_mutation_deadline: Option<ExternalMutationDeadline>,
     last_volume_reclaim: VolumeReclaimOutcome,
+    active_volume_exports: Arc<ActiveVolumeExports>,
 }
 
 impl PoolRuntime {
@@ -392,6 +456,7 @@ impl PoolRuntime {
             publication_requires_reopen: false,
             external_mutation_deadline: None,
             last_volume_reclaim: VolumeReclaimOutcome::default(),
+            active_volume_exports: Arc::new(ActiveVolumeExports::default()),
         };
         runtime.root.catalog.validate_published_lineage()?;
         runtime.validate_snapshot_roots()?;
@@ -882,6 +947,16 @@ impl PoolRuntime {
             ));
         }
         let dataset_id = self.root.catalog.lookup(old_path)?;
+        let (_, _, dataset_type, _, _, _) =
+            self.root
+                .catalog
+                .get_by_id(&dataset_id)
+                .ok_or(PoolRuntimeError::CorruptRoot(
+                    "dataset rename lost catalog identity",
+                ))?;
+        if dataset_type == DatasetType::Volume {
+            self.ensure_volume_not_exported(dataset_id, "renaming the volume")?;
+        }
         let mut next = self.root.clone();
         next.catalog.rename(old_path, new_path)?;
         next.generation = next_generation(next.generation)?;
@@ -906,6 +981,7 @@ impl PoolRuntime {
 
         let geometry = VolumeGeometry::new(capacity_bytes)?;
         let volume = self.open_volume(path)?;
+        self.ensure_volume_not_exported(volume.dataset_id, "resizing the volume")?;
         if geometry.capacity_bytes == volume.root.geometry.capacity_bytes {
             return Err(PoolRuntimeError::InvalidVolume(
                 "requested capacity already matches committed capacity",
@@ -1007,6 +1083,7 @@ impl PoolRuntime {
         }
         let source_path = volume_snapshot_source_path(path)?;
         let volume = self.open_volume(source_path)?;
+        self.ensure_volume_not_exported(volume.dataset_id, "creating a volume snapshot")?;
         let snapshot_id = volume_snapshot_dataset_id(path, volume.dataset_id);
         if self.root.catalog.contains(path) {
             return Err(PoolRuntimeError::InvalidSnapshot(
@@ -1133,6 +1210,7 @@ impl PoolRuntime {
         let (source_path, captured_root) =
             self.validate_volume_snapshot(path, snapshot_reference, &snapshot_root)?;
         let current = self.open_volume(&source_path)?;
+        self.ensure_volume_not_exported(current.dataset_id, "restoring a volume snapshot")?;
         if current.root.geometry == captured_root.geometry
             && current.root.map_root == captured_root.map_root
         {
@@ -1315,6 +1393,7 @@ impl PoolRuntime {
             ));
         }
         let mut summary = self.open_volume_clone(path)?;
+        self.ensure_volume_not_exported(summary.clone_id, "promoting the volume clone")?;
         let mut next = self.root.clone();
         next.catalog.promote_clone(path)?;
         next.generation = next_generation(next.generation)?;
@@ -1332,6 +1411,7 @@ impl PoolRuntime {
             ));
         }
         let summary = self.open_volume_clone(path)?;
+        self.ensure_volume_not_exported(summary.clone_id, "destroying the volume clone")?;
         let released_reference = *self
             .root
             .dataset_roots
@@ -1360,6 +1440,7 @@ impl PoolRuntime {
             ));
         }
         let volume = self.open_volume(path)?;
+        self.ensure_volume_not_exported(volume.dataset_id, "destroying the volume")?;
         if self
             .list_volume_snapshots()?
             .iter()
@@ -1485,7 +1566,33 @@ impl PoolRuntime {
             committed_reference: reference,
             root,
             dirty_chunks: BTreeMap::new(),
+            export_pin: None,
         })
+    }
+
+    /// Open one named volume for an exclusive real block export.
+    ///
+    /// The returned handle owns a process-local pin. Dropping it releases the
+    /// pin exactly once; no transient export state is written into the
+    /// canonical Pool root or a host-side file.
+    pub fn open_volume_export(&self, path: &str) -> Result<PoolVolume> {
+        let mut volume = self.open_volume(path)?;
+        volume.export_pin = Some(self.active_volume_exports.pin(volume.dataset_id)?);
+        Ok(volume)
+    }
+
+    fn ensure_volume_not_exported(
+        &self,
+        dataset_id: DatasetId,
+        operation: &'static str,
+    ) -> Result<()> {
+        if self.active_volume_exports.contains(dataset_id) {
+            return Err(PoolRuntimeError::VolumeExportActive {
+                dataset_id,
+                operation,
+            });
+        }
+        Ok(())
     }
 
     fn open_volume_snapshot(
@@ -2070,6 +2177,7 @@ pub struct PoolVolume {
     committed_reference: DatasetRootRef,
     root: VolumeRoot,
     dirty_chunks: BTreeMap<u64, Option<Vec<u8>>>,
+    export_pin: Option<VolumeExportPin>,
 }
 
 impl PoolVolume {
@@ -2199,9 +2307,20 @@ impl PoolVolume {
     }
 
     /// Commit dirty chunks, immutable map nodes, the volume root, then the
-    /// canonical Pool root. A stale handle is refused before it writes.
+    /// canonical Pool root. A stale handle or a non-export handle competing
+    /// with the active export is refused before it writes.
     pub fn flush(&mut self, runtime: &mut PoolRuntime) -> Result<()> {
         runtime.ensure_external_mutation_authority("volume flush")?;
+        match &self.export_pin {
+            Some(pin)
+                if pin.dataset_id == self.dataset_id
+                    && Arc::ptr_eq(&pin.owner, &runtime.active_volume_exports) => {}
+            Some(_) => return Err(PoolRuntimeError::StaleVolumeHandle(self.dataset_id)),
+            None => runtime.ensure_volume_not_exported(
+                self.dataset_id,
+                "publishing through another volume handle",
+            )?,
+        }
         let current = runtime
             .dataset_root(self.dataset_id)
             .ok_or(PoolRuntimeError::MissingRoot(self.dataset_id))?;
@@ -3351,6 +3470,92 @@ mod tests {
         assert_eq!(*owner.dataset_root(volume_id).unwrap(), root_before);
         assert_eq!(owner.physical_capacity().unwrap(), capacity_before);
         assert_eq!(volume.read_blocks(&owner, 0, 1).unwrap(), vec![0; 4096]);
+    }
+
+    #[test]
+    fn volume_export_pin_refuses_lifecycle_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        let volume_id = create_volume(&mut owner, "vol", 63);
+        owner.create_volume_snapshot("vol@snap").unwrap();
+        let clone = owner.create_volume_clone("clone", "vol@snap").unwrap();
+
+        let exported = owner.open_volume_export("vol").unwrap();
+        assert!(matches!(
+            owner.open_volume_export("vol"),
+            Err(PoolRuntimeError::VolumeAlreadyExported(id)) if id == volume_id
+        ));
+        let root_before = *owner.dataset_root(volume_id).unwrap();
+        let capacity_before = owner.physical_capacity().unwrap();
+        let reclaim_before = owner.pending_volume_reclaim_objects();
+
+        let mut competing = owner.open_volume("vol").unwrap();
+        competing.write_blocks(&owner, 0, &[7; 4096]).unwrap();
+        assert!(matches!(
+            competing.flush(&mut owner),
+            Err(PoolRuntimeError::VolumeExportActive { dataset_id, .. })
+                if dataset_id == volume_id
+        ));
+
+        for result in [
+            owner.resize_volume("vol", 8 * 1024 * 1024).map(|_| ()),
+            owner.create_volume_snapshot("vol@blocked").map(|_| ()),
+            owner.restore_volume_snapshot("vol@snap").map(|_| ()),
+            owner.rename_dataset("vol", "renamed").map(|_| ()),
+            owner.destroy_volume("vol").map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(PoolRuntimeError::VolumeExportActive { dataset_id, .. })
+                    if dataset_id == volume_id
+            ));
+        }
+        assert_eq!(*owner.dataset_root(volume_id).unwrap(), root_before);
+        assert_eq!(owner.physical_capacity().unwrap(), capacity_before);
+        assert_eq!(owner.pending_volume_reclaim_objects(), reclaim_before);
+        assert!(owner.dataset_catalog().contains("vol"));
+        assert!(!owner.dataset_catalog().contains("renamed"));
+        assert!(!owner.dataset_catalog().contains("vol@blocked"));
+
+        let clone_export = owner.open_volume_export("clone").unwrap();
+        assert!(matches!(
+            owner.promote_volume_clone("clone"),
+            Err(PoolRuntimeError::VolumeExportActive { dataset_id, .. })
+                if dataset_id == clone.clone_id
+        ));
+        assert!(matches!(
+            owner.destroy_volume_clone("clone"),
+            Err(PoolRuntimeError::VolumeExportActive { dataset_id, .. })
+                if dataset_id == clone.clone_id
+        ));
+        drop(clone_export);
+        owner.promote_volume_clone("clone").unwrap();
+
+        drop(exported);
+        owner.resize_volume("vol", 8 * 1024 * 1024).unwrap();
+        let reopened_export = owner.open_volume_export("vol").unwrap();
+        drop(reopened_export);
+    }
+
+    #[test]
+    fn volume_export_pin_is_process_local_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = runtime(dir.path());
+        create_volume(&mut owner, "vol", 64);
+        let predecessor = owner.open_volume_export("vol").unwrap();
+        let config = owner.pool().config().clone();
+        drop(owner);
+
+        let pool = Pool::open(config, PoolProperties::default(), &StoreOptions::default()).unwrap();
+        let reopened = PoolRuntime::open(pool).unwrap();
+        let successor = reopened.open_volume_export("vol").unwrap();
+        assert_eq!(
+            successor.read_blocks(&reopened, 0, 1).unwrap(),
+            vec![0; 4096]
+        );
+
+        drop(predecessor);
+        drop(successor);
     }
 
     fn reopen(runtime: PoolRuntime) -> PoolRuntime {

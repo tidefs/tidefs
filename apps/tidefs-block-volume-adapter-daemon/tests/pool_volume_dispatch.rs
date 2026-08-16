@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tidefs_block_volume_adapter_daemon::storage_backend::{
-    BackendError, BlockVolumeStorageBackend, PoolVolumeBackend,
+    BackendError, BlockVolumeStorageBackend, PoolVolumeBackend, SharedPoolRuntime,
 };
 use tidefs_block_volume_adapter_daemon::DataQueueWorker;
 use tidefs_cluster::{ClusterLeaseGrant, ClusterLeaseSession, EpochId, PoolLeaseToken, WriteFence};
@@ -132,6 +132,138 @@ fn pool_volume_backend_flushes_and_reopens_committed_data() {
         .read_blocks(2, 1, 4096)
         .expect("read reopened volume block");
     assert_eq!(read.payload.expect("read payload"), vec![0x5a; 4096]);
+}
+
+#[test]
+fn volume_export_backend_is_exclusive_and_drop_releases_pin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut runtime, _device) = runtime(&dir);
+    create_volume(&mut runtime, "vol", 16);
+    let volume_id = runtime
+        .dataset_catalog()
+        .lookup("vol")
+        .expect("volume identity");
+    let runtime = SharedPoolRuntime::new(Mutex::new(runtime));
+
+    let backend = PoolVolumeBackend::open_shared(Arc::clone(&runtime), "vol", false)
+        .expect("open first Pool volume export");
+    assert!(matches!(
+        PoolVolumeBackend::open_shared(Arc::clone(&runtime), "vol", false),
+        Err(BackendError::AlreadyExported)
+    ));
+    {
+        let mut owner = runtime.lock().expect("lock shared Pool runtime");
+        let root_before = *owner.dataset_root(volume_id).expect("volume root");
+        assert!(matches!(
+            owner.resize_volume("vol", 8 * 1024 * 1024),
+            Err(tidefs_pool_runtime::PoolRuntimeError::VolumeExportActive {
+                dataset_id,
+                ..
+            }) if dataset_id == volume_id
+        ));
+        assert_eq!(
+            *owner
+                .dataset_root(volume_id)
+                .expect("unchanged volume root"),
+            root_before
+        );
+    }
+
+    drop(backend);
+    runtime
+        .lock()
+        .expect("lock released Pool runtime")
+        .resize_volume("vol", 8 * 1024 * 1024)
+        .expect("resize after export drop");
+    let reopened = PoolVolumeBackend::open_shared(Arc::clone(&runtime), "vol", false)
+        .expect("open export after drop");
+    drop(reopened);
+}
+
+#[test]
+fn volume_export_failed_clustered_open_preserves_live_owner() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut runtime, _device) = runtime(&dir);
+    create_volume(&mut runtime, "vol", 18);
+    let lease = clustered_lease(&runtime, runtime.pool().pool_guid());
+    let runtime = SharedPoolRuntime::new(Mutex::new(runtime));
+
+    let backend = PoolVolumeBackend::open_clustered_shared(
+        Arc::clone(&runtime),
+        "vol",
+        false,
+        lease.clone(),
+        Instant::now() + Duration::from_secs(60),
+    )
+    .expect("open live clustered export");
+    assert!(matches!(
+        PoolVolumeBackend::open_clustered_shared(
+            Arc::clone(&runtime),
+            "vol",
+            false,
+            lease,
+            Instant::now() + Duration::from_millis(5),
+        ),
+        Err(BackendError::AlreadyExported)
+    ));
+    std::thread::sleep(Duration::from_millis(10));
+    backend
+        .read_blocks(0, 1, 4096)
+        .expect("failed duplicate must not replace the live deadline");
+
+    drop(backend);
+    let reopened = PoolVolumeBackend::open_shared(Arc::clone(&runtime), "vol", false)
+        .expect("failed duplicate must not leak an export pin");
+    drop(reopened);
+}
+
+#[test]
+fn volume_export_mounted_backend_uses_same_runtime_pin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut owner = PoolDatasetOwner::open_with_root_authentication_key(
+        dir.path(),
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+    )
+    .expect("open mounted Pool owner");
+    let volume_id = DatasetId::from_bytes([17; 16]);
+    owner
+        .create_volume_dataset(
+            "vol",
+            volume_id,
+            4 * 1024 * 1024,
+            Vec::new(),
+            DatasetFlags::NONE,
+            SyncGuarantee::Local,
+        )
+        .expect("create mounted Pool volume");
+    let shared_owner = SharedPoolDatasetOwner::new(owner);
+
+    let backend = PoolVolumeBackend::open_mounted(shared_owner.clone(), "vol", false)
+        .expect("open mounted Pool export");
+    assert!(matches!(
+        PoolVolumeBackend::open_mounted(shared_owner.clone(), "vol", false),
+        Err(BackendError::AlreadyExported)
+    ));
+    assert!(matches!(
+        shared_owner
+            .borrow_mut()
+            .pool_runtime_mut("resize exported mounted volume")
+            .expect("mutable Pool runtime")
+            .resize_volume("vol", 8 * 1024 * 1024),
+        Err(tidefs_pool_runtime::PoolRuntimeError::VolumeExportActive {
+            dataset_id,
+            ..
+        }) if dataset_id == volume_id
+    ));
+
+    drop(backend);
+    shared_owner
+        .borrow_mut()
+        .pool_runtime_mut("resize released mounted volume")
+        .expect("mutable Pool runtime")
+        .resize_volume("vol", 8 * 1024 * 1024)
+        .expect("resize after mounted export drop");
 }
 
 #[test]
