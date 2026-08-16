@@ -319,7 +319,7 @@ device launch, or second directory/file backend does not satisfy the slice.
 | Carrier open | `apps/tidefs-posix-filesystem-adapter-daemon/src/lib.rs::run_mount` | Opens `LocalFileSystem` on the runtime metadata directory plus the devices, resolves the dataset, applies the selected sync, timestamp, capacity, writeback, maintenance, transform, and validation controls, wraps the one VFS/FUSE session, and publishes a live owner. | This is the only local mount runtime implementation. |
 | Object authority | `crates/tidefs-local-object-store/src/pool/mod.rs` | Opens the same labeled devices as a `Pool`, owns placement/device I/O, and persists object records and pool labels. | Keep as the only object/device I/O authority. |
 | Filesystem root/recovery | `crates/tidefs-local-filesystem/src/{lib,recovery}.rs` | Selects Pool-backed root-slot records, validates content through Pool receipts, replays intent and commit-group state, and constructs live filesystem state. | Keep and focus as the single mounted transaction/root/recovery authority. |
-| Dataset/inode/namespace | `FileSystemState`, `DatasetInodeAuthority`, `tidefs-inode-table`, FUSE maps | Local-filesystem owns durable dataset, root, inode, and directory state. `VfsLocalFileSystem` has no inode-table projection, and the selected adapter has no second namespace attachment or inode-table-backed normal dependency. FUSE lookup/forget references remain adapter-local maps. The former standalone namespace package and its validation self-smoke had no other consumer and were removed. | Keep every durable decision in the dataset authority; keep any distinct kernel-reference projection outside mounted truth. |
+| Dataset/inode/namespace | `FileSystemState`, `DatasetInodeAuthority`, FUSE maps | Local-filesystem owns durable dataset, root, inode, and directory state. `VfsLocalFileSystem` has no second inode projection, and the selected adapter has no second namespace attachment. FUSE lookup/forget references remain adapter-local maps. The former standalone namespace and inode-table packages plus their validation-only or duplicate persistence tests had no mounted consumer and were removed. | Keep every durable decision in the dataset authority; keep kernel-reference state as an adapter-local derived projection. |
 | VFS/FUSE | `vfs_engine_impl.rs`, `fuse_vfs_adapter.rs` | VFS calls local-filesystem for lookup and mutation semantics. The adapter projects engine results, handles, lookup references, caches, replies, and FUSE lifecycle without another namespace owner, merged directory view, or mutation fallback. | Keep VFS as the semantic owner and FUSE as a derived kernel transport projection. |
 | Status/admin | `live_owner.rs`, `apps/tidefsctl/src/commands/live_owner.rs` | The owner socket delegates live work to the mounted engine and refuses reopening active devices behind it. For bounded present-member removal/replacement, that one owner uses its neutral `PoolRuntime` to authenticate every active filesystem root, copy-on-write relocated content manifests for unmounted independent filesystems, durably queue predecessor manifests, and publish every successor typed root before topology publication. Versioned checksummed label lifecycle records, not runtime-directory side files, bind the Pool/member GUID authority needed to resume before receipt recovery. | Keep and thin; status must describe the same imported Pool and root selected for mounted I/O. The bounded Pool-wide lifecycle path is source to lift out of the VFS-specific owner, not authority for a second runtime. |
 | Shutdown/export | `run_mount`, `fuser::BackgroundSession::join`, adapter `destroy`, `pool_export`, live-owner `stop` | `join` drops the mount first; adapter destroy drains/syncs; labels export afterward; endpoint cleanup is last. | Preserve this order and make every failure explicit to the operator. |
@@ -329,10 +329,10 @@ device launch, or second directory/file backend does not satisfy the slice.
 The repository is not short of implementations; it has too many overlapping
 ones in the default graph:
 
-- 164 root-workspace packages plus four excluded fuzz packages are present.
-- The default normal dependency closure of `tidefsctl` is 72 of 164 workspace
-  packages (183 total); selecting its explicit `full` feature reaches 98
-  workspace packages (220 total). Its manifest now has 16 required and 13
+- 163 root-workspace packages plus four excluded fuzz packages are present.
+- The default normal dependency closure of `tidefsctl` is 71 of 163 workspace
+  packages (181 total); selecting its explicit `full` feature reaches 97
+  workspace packages (219 total). Its manifest now has 16 required and 13
   optional normal dependencies. The default parser, help, source modules, and
   direct dependency edges therefore carry only the local pool, mount, device,
   dataset, snapshot, defrag, live-owner, and status families.
@@ -345,8 +345,8 @@ ones in the default graph:
   authority; `receipt-demo` and `workload-telemetry` each own one optional
   source/dependency family. `full` aggregates them with the retained data-policy
   and replication forwarding features for development packaging.
-- The daemon's default normal tree reaches 71 of 164 workspace packages (169
-  total packages including external crates), versus 88 workspace and 187 total
+- The daemon's default normal tree reaches 70 of 163 workspace packages (166
+  total packages including external crates), versus 87 workspace and 187 total
   with `full`. Its default carrier also excludes the distributed, claim,
   performance, storage-intent read-serving, and quorum-write families removed
   from the standalone `tidefs-local-filesystem`; its explicit features restore
@@ -359,11 +359,11 @@ ones in the default graph:
   validation orchestration.
 - Mounted pool admission no longer selects fixed roots or replays filesystem
   transactions; Pool-backed local-filesystem recovery owns mounted state.
-- The default `tidefs-local-filesystem` normal tree is 58 workspace packages
-  (136 total) and excludes device-removal, replication-model, erasure-coding,
+- The default `tidefs-local-filesystem` normal tree is 57 workspace packages
+  (134 total) and excludes device-removal, replication-model, erasure-coding,
   claim-ledger, performance-contract, storage-intent read-serving, and
   quorum-write families. Its explicit `full` feature restores the retained
-  optional subsystems and reaches 95 workspace packages (183 total).
+  optional subsystems and reaches 94 workspace packages (183 total).
 - These normal-edge counts use `cargo tree --locked --offline
   --no-default-features -e normal -p <package>` and add `--all-features` only
   for the corresponding `full` census. Keeping `--no-default-features`
@@ -398,7 +398,7 @@ must be repaired only after assigning them to the target owners above.
 | Layer | Representative source | Source role |
 |---|---|---|
 | POSIX/FUSE adapter | `crates/tidefs-fuser` (package `fuser`), `tidefs-posix-filesystem-adapter-reply`, `tidefs-posix-filesystem-adapter-workers-io`, `tidefs-posix-filesystem-adapter-workers-locks`, `tidefs-types-posix-filesystem-adapter-core` | FUSE protocol binding, reply construction, I/O dispatch, lock dispatch, and adapter types for the userspace mount path. |
-| VFS and namespace | `tidefs-vfs-engine`, `tidefs-inode-table`, `tidefs-local-filesystem`, `tidefs-dir-index`, `tidefs-extent-map`, `tidefs-object-io` | Local filesystem operation dispatch, path resolution, inode state, directory indexing, file extent mapping, and object offset bridging. The standalone namespace package was removed after the selected carrier stopped consuming it. |
+| VFS and namespace | `tidefs-vfs-engine`, `tidefs-local-filesystem`, `tidefs-dir-index`, `tidefs-extent-map`, `tidefs-object-io` | Local filesystem operation dispatch, path resolution, inode state, directory indexing, file extent mapping, and object offset bridging. The standalone namespace and inode-table packages were removed after the selected carrier stopped consuming them. |
 | POSIX metadata and access checks | `tidefs-permission`, `tidefs-posix-acl`, `tidefs-xattr-storage`, `tidefs-posix-semantics`, `tidefs-inode-attributes`, `tidefs-types-vfs-core` | Permission, ACL, extended-attribute, inode-attribute, semantic-definition, and in-process `LockList` advisory-lock code used by the local filesystem path. |
 | Local object and pool storage | `tidefs-local-object-store`, `tidefs-block-allocator`, `tidefs-space-accounting`, `tidefs-commit_group`, `tidefs-intent-log`, `tidefs-pool-import`, `tidefs-pool-scan`, `tidefs-pool-allocator`, `tidefs-spacemap-allocator`, `tidefs-reserve-ledger` | Local object persistence, allocation/accounting, transaction grouping, intent logging, pool scan/import, and reserve-ledger ownership. |
 | Dataset and cleanup state | `tidefs-dataset-catalog`, `tidefs-dataset-lifecycle`, `tidefs-dataset-properties`, `tidefs-dataset-feature-flags`, `tidefs-cleanup-queue-core`, `tidefs-reclaim-queue-core`, `tidefs-reclaim`, `tidefs-segment-cleaner`, `tidefs-compaction`, `tidefs-dedup` | Dataset metadata, segment maintenance, compaction, and dedup model code. The mounted logical reclaim queue is a Pool-receipted filesystem system object persisted before root publication; object-store receipt-bound queues remain the separate physical-release authority. |
@@ -458,7 +458,7 @@ and focused carrier tests. Publication claims remain a separate decision.
 
 ## Package-Root Disposition
 
-This target disposition covers all 164 workspace members and all four excluded
+This target disposition covers all 163 workspace members and all four excluded
 fuzz package roots. `docs/workspace-package-classification.md` remains the
 current-consumer inventory while this section decides the target dependency
 shape.
@@ -516,7 +516,7 @@ tidefs-xattr-storage
 tidefsctl
 ```
 
-### Consolidate: 53 Workspace Packages
+### Consolidate: 52 Workspace Packages
 
 The behavior may be useful to the selected carrier, but it is not an
 independent durable authority. Absorb it into the nearest kept owner, make it a
@@ -544,7 +544,6 @@ tidefs-frame
 tidefs-gc-pin-set
 tidefs-geometry-convert
 tidefs-incremental-job-core
-tidefs-inode-table
 tidefs-invalidation-feed
 tidefs-locator-table
 tidefs-lock-service

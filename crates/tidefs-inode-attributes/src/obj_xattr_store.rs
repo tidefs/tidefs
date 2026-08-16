@@ -36,7 +36,10 @@ use std::sync::{Arc, Mutex};
 
 use tidefs_local_object_store::{LocalObjectStore, StoreOptions};
 
-use crate::xattr::{XattrError, XattrKey, XattrStore, XattrValue, XATTR_CREATE, XATTR_REPLACE};
+use crate::xattr::{
+    XattrError, XattrKey, XattrStore, XattrValue, MAX_XATTR_COUNT, MAX_XATTR_VALUE_LEN,
+    XATTR_CREATE, XATTR_REPLACE,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -44,12 +47,6 @@ use crate::xattr::{XattrError, XattrKey, XattrStore, XattrValue, XATTR_CREATE, X
 
 /// Key prefix for per-inode xattr blobs in the named object-store API.
 const XATTR_KEY_PREFIX: &str = "xattr:";
-
-/// Maximum number of extended attributes per inode.
-pub const MAX_XATTR_COUNT: usize = 256;
-
-/// Maximum size of a single extended attribute value (64 KiB).
-pub const MAX_XATTR_VALUE_LEN: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Binary serialization

@@ -54,7 +54,7 @@ includes `IntegrityTrailerV2`; this policy does not by itself claim that every
 metadata and data path has mounted, production-validated read verification.
 
 Relevant surfaces: `tidefs-local-object-store`, `tidefs-local-filesystem`,
-`tidefs-inode-table`, `tidefs-extent-map`, `tidefs-intent-log`,
+`tidefs-extent-map`, `tidefs-intent-log`,
 `tidefs-dataset-catalog`, `tidefs-space-accounting`.
 
 ### 2.3 Committed-Root and Superblock Tamper Detection

@@ -145,7 +145,7 @@ pub fn perm_from_mode(mode: u32) -> u16 {
 ///
 /// Timestamps (`atime`, `mtime`, `ctime`) are accepted as [`Duration`]
 /// from the Unix epoch (1970-01-01T00:00:00Z), matching the
-/// representation used by `tidefs_inode_table::InodeAttributes`.
+/// representation used by TideFS inode attributes.
 ///
 /// `crtime` (creation time) is always set to the Unix epoch.
 /// `flags` is always set to 0.

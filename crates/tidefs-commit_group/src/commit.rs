@@ -25,8 +25,8 @@ const NAMESPACE_SUBSYSTEM: &str = "namespace";
 
 /// Trait abstracting the inode-table operations needed by the commit path.
 ///
-/// This is a narrow interface; the full `tidefs-inode-table` crate (issue
-/// #2507) will implement it once ready.
+/// This narrow interface is implemented by the selected metadata authority;
+/// it does not introduce a second inode allocator or persistence model.
 pub trait InodeTableCommit {
     /// Apply a `setattr` mutation for a single inode.
     fn apply_setattr(

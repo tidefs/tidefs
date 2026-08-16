@@ -97,7 +97,6 @@ fuse = [
     "dep:tidefs-intent-log",
     "dep:tidefs-reclaim",
     "dep:tidefs-inode-attributes",
-    "dep:tidefs-inode-table",
     "dep:tidefs-commit_group",
     "dep:tidefs-trace-oracle",
     "dep:tidefs-vfs-engine",
@@ -158,7 +157,6 @@ tidefs-reclaim-queue-core = { workspace = true }
 tidefs-segment-cleaner = { workspace = true, optional = true }
 tidefs-types-reclaim-queue-core = { workspace = true }
 tidefs-inode-attributes = { workspace = true, optional = true }
-tidefs-inode-table = { workspace = true, optional = true }
 tidefs-commit_group = { workspace = true, optional = true }
 tidefs-trace-oracle = { workspace = true, optional = true }
 tidefs-vfs-engine = { workspace = true, optional = true }

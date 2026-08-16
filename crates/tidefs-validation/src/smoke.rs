@@ -116,8 +116,6 @@ pub mod dir_index;
 
 // ── inode-table smoke ──────────────────────────────────────────────────────
 #[cfg(feature = "fuse")]
-pub mod inode_table;
-
 // ── inode-attributes smoke ─────────────────────────────────────────────────
 #[cfg(feature = "fuse")]
 pub mod inode_attributes;

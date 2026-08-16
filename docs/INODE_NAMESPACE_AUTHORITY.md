@@ -17,9 +17,8 @@ This decision covers:
   snapshots, committed roots, and replay;
 - dataset root identity and the current root dataset bridge;
 - FUSE lookup/forget references and adapter lookup caches;
-- the relationship between `LocalFileSystem`, the now-retired
-  `tidefs-namespace` package, `tidefs-inode-table`, and FUSE adapter
-  registries;
+- the relationship between `LocalFileSystem`, the now-retired standalone
+  namespace and inode-table packages, and FUSE adapter registries;
 - old pre-release catalog handling for inode and root dataset mismatches.
 
 This decision does not by itself prove crash consistency for rename, replay,
@@ -40,8 +39,9 @@ The selected local mounted carrier applies the decision as follows:
   namespace fallback, mirrored durable attributes, or merged directory view.
 - FUSE lookup counts, forget counts, and path/negative caches are derived
   kernel-reference state only. The selected adapter has no inode-table-backed
-  lookup/read/write batch. The unattached `tidefs-namespace` package and its
-  validation-only self-smoke were removed after their last mounted consumer
+  lookup/read/write batch. The unattached standalone namespace and inode-table
+  packages, their validation-only self-smokes, and the inode-table duplicate
+  persistence pipeline were removed after their last mounted consumer
   disappeared.
 - The mounted pool lifecycle checks stable inode identity through rename,
   hard-link, unlink, clean export/reimport, and crash recovery.
@@ -55,8 +55,8 @@ is above and in `docs/ARCHITECTURE.md`.
 Documentation:
 
 - `docs/REVIEW_TODO_REGISTER.md` originally recorded TFR-004 split authority
-  between `LocalFileSystem`, the former `tidefs-namespace` package,
-  `tidefs-inode-table`, and FUSE lookup/forget state.
+  between `LocalFileSystem`, the former standalone namespace and inode-table
+  packages, and FUSE lookup/forget state.
 - `docs/REVIEW_TODO_REGISTER.md` records recent TFR-004 cleanup commits:
   root dataset ID alignment, fail-closed mismatched root catalogs, explicit
   namespace inode ID preservation, inode-table corruption fail-closed behavior,
@@ -98,17 +98,18 @@ Former standalone namespace package, removed after #2397 and #2534:
   that bridge, the package had only its own tests and one validation self-smoke;
   #2534 removed both rather than preserving a second authority.
 
-Inode table:
+Former standalone inode-table package, removed by #2536:
 
-- `crates/tidefs-inode-table/src/inode_table_impl.rs` describes
-  `InodeTable` as an authoritative inode-number-to-attributes registry, but
-  the same file carries a TFR-004 marker because the table has a separate
-  allocation and state model.
-- `InodeTableInner` owns slots, a free list, generation state, and open
-  reference counts; `allocate()`, `lookup()`, and `commit()` persist a cursor,
+- At decision time, `crates/tidefs-inode-table/src/inode_table_impl.rs`
+  described `InodeTable` as an authoritative inode-number-to-attributes
+  registry while carrying a separate allocation and state model.
+- `InodeTableInner` owned slots, a free list, generation state, and open
+  reference counts; `allocate()`, `lookup()`, and `commit()` persisted a cursor,
   generation, and free list through `crates/tidefs-inode-table/src/persist.rs`.
-- That state can be useful as an adapter or kernel-facing projection, but it
-  must not be a second durable mounted dataset allocator.
+- No mounted carrier or kernel-reference consumer used that state. #2536 moved
+  the surviving xattr/link limits into `tidefs-inode-attributes` and removed
+  the detached package rather than retaining a second allocator or persistence
+  model.
 
 FUSE adapter:
 
@@ -122,7 +123,7 @@ FUSE adapter:
 - `bump_forget_refcount()` and `dispatch_forget()` track kernel lookup
   references and decide when adapter caches can be invalidated.
 - At decision time, the now-retired pre-contraction `fuse_lookup_forget.rs`
-  wrapped `tidefs-inode-table::InodeTable` for an unwired lookup/forget batch.
+  wrapped the now-removed `tidefs-inode-table::InodeTable` for an unwired lookup/forget batch.
   Its removal left kernel reference accounting in `FuseVfsAdapter` itself.
 
 ## Owner Models Compared
@@ -206,10 +207,9 @@ carrier and its package has been retired. Any future persistent namespace
 consumer must obtain mounted IDs from `DatasetInodeAuthority`; it must not add
 another allocator or revive an in-memory fallback as durable truth.
 
-`tidefs-inode-table` must not allocate durable mounted inode IDs. Its state may
-remain useful for non-mounted tests or kernel-reference projections, but
-`VfsLocalFileSystem` does not consume it and it is not the mounted dataset
-owner.
+The former `tidefs-inode-table` package did not allocate durable mounted inode
+IDs and had no kernel-reference consumer. It was removed by #2536; the live
+timestamp, xattr, and attribute contracts remain in `tidefs-inode-attributes`.
 
 ### Persisted Inode IDs
 

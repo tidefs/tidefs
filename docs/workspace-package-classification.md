@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 164 |
+| Workspace packages | 163 |
 | Explicitly excluded package roots | 4 |
-| Discovered package manifests | 168 |
-| Classified package roots | 168 |
+| Discovered package manifests | 167 |
+| Classified package roots | 167 |
 
 ## TFR-002 Category Mapping
 
@@ -25,7 +25,7 @@ root.
 
 | TFR-002 category | Current roles | Count | Boundary |
 | --- | --- | ---: | --- |
-| `product` | `product-code`, `adapter-operator` | 145 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
+| `product` | `product-code`, `adapter-operator` | 144 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
 | `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 22 | Repo policy tooling, CI/developer support, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
 | `third-party` | `vendored-third-party` | 1 | Vendored or forked upstream code carried with separate provenance. |
 | `delete` | `scaffold-transitional`, `archive-delete-candidate` | 0 | No current package root is classified for deletion. Both roles are retired and rejected by `check-workspace-policy`; any future dead-scaffolding candidate must reference TFR-002/TFR-013 evidence and an issue-backed delete/archive plan. |
@@ -52,7 +52,7 @@ holding area.
 
 | Role | Count |
 | --- | ---: |
-| `product-code` | 131 |
+| `product-code` | 130 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
 | `proof-harness` | 10 |
@@ -127,7 +127,6 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-geometry-convert` | `tidefs-geometry-convert` | `workspace-member` | `product-code` | standalone-checkable current product component for geometry-conversion policy/cursor types, budgeted locator-walk progress, BLAKE3 payload digests, checkpointed fail-stop error reporting, and harness-backed pool/locator/EC runtime conversion authority; mounted pool release behavior remains separately validation-gated. |
 | `crates/tidefs-incremental-job-core` | `tidefs-incremental-job-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-inode-attributes` | `tidefs-inode-attributes` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-inode-table` | `tidefs-inode-table` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-intent-log` | `tidefs-intent-log` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-invalidation-feed` | `tidefs-invalidation-feed` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-kernel-cutover-runtime` | `tidefs-kernel-cutover-runtime` | `workspace-member` | `product-code` | planned authority surface; follow-up issue #825 required before release claims. |
