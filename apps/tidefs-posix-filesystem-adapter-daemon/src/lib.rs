@@ -1463,7 +1463,6 @@ struct StartedMount {
     queue_depth_engine: live_owner::LiveOwnerEngine,
     background_scheduler: Option<Arc<Mutex<Option<BackgroundScheduler>>>>,
     mmap_coherency: Arc<mmap_coherency::MmapCoherency>,
-    #[cfg(feature = "cluster")]
     shared_pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
     #[cfg(feature = "cluster")]
     cluster_vfs_rpc_owner: Option<cluster_vfs_rpc_owner::ClusterVfsRpcOwnerHandle>,
@@ -1951,7 +1950,6 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         queue_depth_engine,
         background_scheduler,
         mmap_coherency,
-        #[cfg(feature = "cluster")]
         shared_pool_owner,
         #[cfg(feature = "cluster")]
         cluster_vfs_rpc_owner,
@@ -2131,7 +2129,6 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
         queue_depth_engine,
         background_scheduler,
         mmap_coherency,
-        #[cfg(feature = "cluster")]
         shared_pool_owner,
         #[cfg(feature = "cluster")]
         mut cluster_vfs_rpc_owner,
@@ -2254,15 +2251,25 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
     #[cfg(not(feature = "cluster"))]
     let cluster_vfs_rpc_owner_result: Result<(), String> = Ok(());
     session.join();
+    let mounted_close_result = shared_pool_owner
+        .borrow_mut()
+        .close_mounted()
+        .map_err(|error| {
+            format!("close mounted Pool/filesystem owner before label export: {error}")
+        });
     let artifact_result = match config.runtime.queue_depth_artifact.as_deref() {
         Some(path) => write_queue_depth_runtime_artifact(&queue_depth_engine, path),
         None => Ok(()),
     };
-    let export_result = match import_owner {
-        Some(owner) => owner
+    let export_result = match (import_owner, &mounted_close_result) {
+        (Some(owner), Ok(())) => owner
             .export()
             .map_err(|err| format!("clean pool export failed during unmount: {err}")),
-        None => Ok(()),
+        (Some(_owner), Err(_)) => Err(
+            "Pool label export withheld because the mounted filesystem did not close cleanly"
+                .to_string(),
+        ),
+        (None, _) => Ok(()),
     };
     #[cfg(feature = "cluster")]
     let (authority_loss, lease_release_result) = match cluster_lease_renewal.as_mut() {
@@ -2287,7 +2294,7 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
     let lease_release_result: Result<(), String> = Ok(());
     #[cfg(not(feature = "cluster"))]
     let authority_loss: Option<String> = None;
-    if export_result.is_ok() && !snapshot_export {
+    if mounted_close_result.is_ok() && export_result.is_ok() && !snapshot_export {
         if let Some(ref pool_name) = config.pool_name {
             eprintln!("tidefsctl: pool exported: {pool_name}");
         }
@@ -2310,6 +2317,7 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
     for result in [
         &carrier_drain_result,
         &cluster_vfs_rpc_owner_result,
+        &mounted_close_result,
         &artifact_result,
         &export_result,
         &lease_release_result,

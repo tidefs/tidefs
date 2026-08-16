@@ -3882,6 +3882,30 @@ impl PoolDatasetOwner {
         self.filesystem.background_scheduler = None;
     }
 
+    /// Complete the fallible storage side of a clean mounted shutdown.
+    ///
+    /// The mounted carrier calls this after it has stopped admitting work and
+    /// joined the FUSE session, but before it exports Pool labels.  A successful
+    /// close commits and syncs writable state, then fences this in-process owner
+    /// so neither a stale carrier handle nor [`Drop`] can publish after export.
+    /// On failure the same fence forces recovery through a fresh reopen instead
+    /// of giving the destructor an unreportable second publication attempt.
+    pub fn close_mounted(&mut self) -> Result<()> {
+        let _released_locks = self.release_all_locks_for_mount();
+        self.stop_background_scheduler();
+        if let Some(handle) = self.filesystem.writeback_handle.take() {
+            handle.shutdown();
+        }
+
+        let result = if self.filesystem.recovery_policy.allows_any_mutation() {
+            self.fsync_all()
+        } else {
+            Ok(())
+        };
+        self.arm_mutation_reopen_fence();
+        result
+    }
+
     /// Quarantine this mounted instance after an indeterminate final-root
     /// publication.
     ///
@@ -16372,6 +16396,31 @@ mod mutation_reopen_fence_tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn mounted_close_commits_dirty_state_and_fences_late_mutation() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut fs = LocalFileSystem::open(root.path()).expect("open filesystem");
+        fs.set_auto_commit(false).expect("disable auto commit");
+        fs.create_file("/closed.txt", DEFAULT_FILE_PERMISSIONS)
+            .expect("create file");
+        fs.write_file("/closed.txt", 0, b"durable close")
+            .expect("stage file data");
+
+        fs.close_mounted().expect("close mounted owner");
+        assert!(matches!(
+            fs.create_file("/late.txt", DEFAULT_FILE_PERMISSIONS),
+            Err(FileSystemError::MutationRequiresReopen { .. })
+        ));
+        drop(fs);
+
+        let reopened = LocalFileSystem::open(root.path()).expect("reopen filesystem");
+        assert_eq!(
+            reopened.read_file("/closed.txt").expect("read closed file"),
+            b"durable close"
+        );
+        assert!(reopened.lookup("/late.txt").is_err());
+    }
 
     #[test]
     fn external_mutation_deadline_fences_the_existing_local_gate() {
