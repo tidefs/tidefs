@@ -345,12 +345,17 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/tidefs-mmap-workload ]; then
     mkdir -p "$MMAP_DIR"
 
     echo "Running tidefs-mmap-workload $MMAP_DIR"
+    : > /tmp/mmap.out
+    tail -f /tmp/mmap.out &
+    MMAP_TAIL_PID=$!
     if timeout -k 2 180 /bin/tidefs-mmap-workload "$MMAP_DIR" \
         > /tmp/mmap.out 2>&1; then
         MMAP_RC=0
     else
         MMAP_RC=$?
     fi
+    kill "$MMAP_TAIL_PID" 2>/dev/null || true
+    wait "$MMAP_TAIL_PID" 2>/dev/null || true
     echo "=== mmap workload output ==="
     cat /tmp/mmap.out
     echo "=== end mmap workload output ==="
