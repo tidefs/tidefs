@@ -572,10 +572,18 @@ fn dispatch_request(
         | LivePoolAdminCommand::SnapshotList
         | LivePoolAdminCommand::SnapshotExtract
         | LivePoolAdminCommand::SnapshotSend
-        | LivePoolAdminCommand::PerformanceAdmissionSnapshot
-        | LivePoolAdminCommand::DeviceStatus
+        | LivePoolAdminCommand::PerformanceAdmissionSnapshot => {
+            delegate_admin_request(&request, admin)
+        }
+        LivePoolAdminCommand::DeviceStatus
         | LivePoolAdminCommand::DeviceRemove
-        | LivePoolAdminCommand::DeviceReplace => delegate_admin_request(&request, admin),
+        | LivePoolAdminCommand::DeviceReplace => match admin {
+            LiveOwnerAdmin::Fuse { filesystem, .. } => {
+                filesystem.handle_live_device_admin_request(&request)
+            }
+            #[cfg(feature = "block-volume")]
+            LiveOwnerAdmin::StandaloneBlock { .. } => unsupported_admin_command_response(&request),
+        },
         #[cfg(feature = "block-volume")]
         LivePoolAdminCommand::BlockAttach => match admin {
             LiveOwnerAdmin::Fuse { filesystem, .. } => block_attach(
