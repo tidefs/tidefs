@@ -1839,41 +1839,6 @@ fn receive_import_report(report: vfs::ChangedRecordImportReport) -> protocol::Re
     }
 }
 
-fn snapshot_summary_report(summary: vfs::SnapshotSummary) -> protocol::SnapshotSummaryReport {
-    protocol::SnapshotSummaryReport {
-        name: summary.name,
-        source_transaction_id: summary.source_transaction_id,
-        source_generation: summary.source_generation,
-        created_at_generation: summary.created_at_generation,
-    }
-}
-
-fn snapshot_rollback_report(
-    report: vfs::SnapshotRollbackReport,
-) -> protocol::SnapshotRollbackReport {
-    protocol::SnapshotRollbackReport {
-        spec: report.spec.to_string(),
-        snapshot: snapshot_summary_report(report.snapshot),
-        generation_before: report.generation_before,
-        restored_source_generation: report.restored_source_generation,
-        published_generation: report.published_generation,
-        snapshot_catalog_entries: report.snapshot_catalog_entries as u64,
-        production_fsck_required: report.production_fsck_required,
-    }
-}
-
-fn snapshot_clone_summary_report(
-    summary: vfs::CloneSummary,
-) -> protocol::SnapshotCloneSummaryReport {
-    protocol::SnapshotCloneSummaryReport {
-        name: summary.name,
-        origin: summary.origin,
-        source_transaction_id: summary.source_transaction_id,
-        source_generation: summary.source_generation,
-        created_at_generation: summary.created_at_generation,
-    }
-}
-
 fn placement_receipt_inventory_json(store: &StoreBackend) -> serde_json::Value {
     match store {
         StoreBackend::PoolBacked(pool) => match pool.placement_receipt_refs(ObjectIoClass::Data) {
@@ -6028,80 +5993,6 @@ fn handle_frame_ctx(
                 repaired_placement_receipt_ref,
             })
         }
-        // ── Snapshot lifecycle operations (clustered dataset path) ──
-        Frame::SnapshotCreate { snapshot_name } => {
-            let fs_root = ctx.config.fs_root.as_ref()?;
-            let auth_key = ctx.config.root_auth_key?;
-            let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
-                fs_root,
-                StoreOptions::default(),
-                auth_key,
-            ) {
-                Ok(fs) => fs,
-                Err(e) => {
-                    return Some(Frame::Error {
-                        message: format!("open fs for snapshot create: {e}"),
-                    })
-                }
-            };
-            match fs.create_snapshot(snapshot_name) {
-                Ok(summary) => Some(Frame::SnapshotCreateResponse {
-                    summary: snapshot_summary_report(summary),
-                }),
-                Err(e) => Some(Frame::Error {
-                    message: format!("create snapshot: {e}"),
-                }),
-            }
-        }
-        Frame::SnapshotDestroy { snapshot_name } => {
-            let fs_root = ctx.config.fs_root.as_ref()?;
-            let auth_key = ctx.config.root_auth_key?;
-            let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
-                fs_root,
-                StoreOptions::default(),
-                auth_key,
-            ) {
-                Ok(fs) => fs,
-                Err(e) => {
-                    return Some(Frame::Error {
-                        message: format!("open fs for snapshot destroy: {e}"),
-                    })
-                }
-            };
-            match fs.delete_snapshot(snapshot_name) {
-                Ok(summary) => Some(Frame::SnapshotDestroyResponse {
-                    summary: snapshot_summary_report(summary),
-                }),
-                Err(e) => Some(Frame::Error {
-                    message: format!("destroy snapshot: {e}"),
-                }),
-            }
-        }
-        Frame::SnapshotRollback { snapshot_name } => {
-            let fs_root = ctx.config.fs_root.as_ref()?;
-            let auth_key = ctx.config.root_auth_key?;
-            let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
-                fs_root,
-                StoreOptions::default(),
-                auth_key,
-            ) {
-                Ok(fs) => fs,
-                Err(e) => {
-                    return Some(Frame::Error {
-                        message: format!("open fs for snapshot rollback: {e}"),
-                    })
-                }
-            };
-            match fs.rollback_to_snapshot(snapshot_name) {
-                Ok(report) => Some(Frame::SnapshotRollbackResponse {
-                    report: snapshot_rollback_report(report),
-                }),
-                Err(e) => Some(Frame::Error {
-                    message: format!("rollback to snapshot: {e}"),
-                }),
-            }
-        }
-        // ── Snapshot clone operation ──
         // ── Chunked send/receive with cursor-based resume ──
         Frame::SendChunked { key } => {
             let fs_root = ctx.config.fs_root.as_ref()?;
@@ -6148,33 +6039,6 @@ fn handle_frame_ctx(
                     .into(),
         }),
 
-        Frame::SnapshotClone {
-            clone_name,
-            source_snapshot,
-        } => {
-            let fs_root = ctx.config.fs_root.as_ref()?;
-            let auth_key = ctx.config.root_auth_key?;
-            let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
-                fs_root,
-                StoreOptions::default(),
-                auth_key,
-            ) {
-                Ok(fs) => fs,
-                Err(e) => {
-                    return Some(Frame::Error {
-                        message: format!("open fs for snapshot clone: {e}"),
-                    })
-                }
-            };
-            match fs.create_clone(&clone_name, &source_snapshot) {
-                Ok(summary) => Some(Frame::SnapshotCloneResponse {
-                    summary: snapshot_clone_summary_report(summary),
-                }),
-                Err(e) => Some(Frame::Error {
-                    message: format!("create clone: {e}"),
-                }),
-            }
-        }
         Frame::Ok
         | Frame::GetResponse { .. }
         | Frame::DeleteResponse { .. }
@@ -6187,10 +6051,6 @@ fn handle_frame_ctx(
         | Frame::Error { .. }
         | Frame::ScrubResponse { .. }
         | Frame::RepairObjectAck { .. }
-        | Frame::SnapshotCreateResponse { .. }
-        | Frame::SnapshotDestroyResponse { .. }
-        | Frame::SnapshotRollbackResponse { .. }
-        | Frame::SnapshotCloneResponse { .. }
         | Frame::SendChunkedResponse { .. }
         | Frame::PutWithReceiptResponse { .. }
         | Frame::SendResumeResponse { .. } => None,

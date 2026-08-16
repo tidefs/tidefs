@@ -56,19 +56,6 @@ pub mod tag {
     ///           + has_recorded_receipt(u8) + placement_receipt_ref
     pub const PUTW: &[u8; 4] = b"PUTW";
 
-    /// Snapshot lifecycle operations dispatched through the clustered path.
-    /// Snapshot create: name_len(u8) + snapshot_name
-    pub const SNPC: &[u8; 4] = b"SNPC";
-    /// Snapshot destroy: name_len(u8) + snapshot_name
-    pub const SNPD: &[u8; 4] = b"SNPD";
-    /// Snapshot rollback: name_len(u8) + snapshot_name
-    /// Response: ok(u8) + versioned typed rollback report
-    pub const SNPR: &[u8; 4] = b"SNPR";
-    /// Snapshot clone: create a writable clone from a snapshot.
-    /// Request: clone_name_len(u8) + clone_name + source_snapshot_len(u8) + source_snapshot
-    /// Response: ok(u8) + versioned typed clone summary
-    pub const SNPCL: &[u8; 4] = b"SNCL";
-
     // ── Chunked send/receive with resume support ──
     /// Send chunked: request a chunked export (full or incremental) with cursor tracking.
     /// Request: key_len(u16 LE) + key
@@ -347,79 +334,6 @@ impl ScrubReport {
             object.insert("error".into(), serde_json::json!(error));
         }
         serde_json::Value::Object(object).to_string()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SnapshotSummaryReport {
-    pub name: String,
-    pub source_transaction_id: u64,
-    pub source_generation: u64,
-    pub created_at_generation: u64,
-}
-
-impl SnapshotSummaryReport {
-    pub fn diagnostic_json(&self) -> String {
-        serde_json::json!({
-            "name": self.name,
-            "source_transaction_id": self.source_transaction_id,
-            "source_generation": self.source_generation,
-            "created_at_generation": self.created_at_generation,
-        })
-        .to_string()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SnapshotRollbackReport {
-    pub spec: String,
-    pub snapshot: SnapshotSummaryReport,
-    pub generation_before: u64,
-    pub restored_source_generation: u64,
-    pub published_generation: u64,
-    pub snapshot_catalog_entries: u64,
-    pub production_fsck_required: bool,
-}
-
-impl SnapshotRollbackReport {
-    pub fn diagnostic_json(&self) -> String {
-        serde_json::json!({
-            "spec": self.spec,
-            "snapshot": {
-                "name": self.snapshot.name,
-                "source_transaction_id": self.snapshot.source_transaction_id,
-                "source_generation": self.snapshot.source_generation,
-                "created_at_generation": self.snapshot.created_at_generation,
-            },
-            "generation_before": self.generation_before,
-            "restored_source_generation": self.restored_source_generation,
-            "published_generation": self.published_generation,
-            "snapshot_catalog_entries": self.snapshot_catalog_entries,
-            "production_fsck_required": self.production_fsck_required,
-        })
-        .to_string()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SnapshotCloneSummaryReport {
-    pub name: String,
-    pub origin: String,
-    pub source_transaction_id: u64,
-    pub source_generation: u64,
-    pub created_at_generation: u64,
-}
-
-impl SnapshotCloneSummaryReport {
-    pub fn diagnostic_json(&self) -> String {
-        serde_json::json!({
-            "name": self.name,
-            "origin": self.origin,
-            "source_transaction_id": self.source_transaction_id,
-            "source_generation": self.source_generation,
-            "created_at_generation": self.created_at_generation,
-        })
-        .to_string()
     }
 }
 
@@ -808,68 +722,6 @@ fn take_scrub_report(payload: &[u8], pos: &mut usize) -> Option<ScrubReport> {
     })
 }
 
-fn put_snapshot_summary_report(buf: &mut Vec<u8>, report: &SnapshotSummaryReport) {
-    put_string(buf, &report.name);
-    put_u64(buf, report.source_transaction_id);
-    put_u64(buf, report.source_generation);
-    put_u64(buf, report.created_at_generation);
-}
-
-fn take_snapshot_summary_report(payload: &[u8], pos: &mut usize) -> Option<SnapshotSummaryReport> {
-    Some(SnapshotSummaryReport {
-        name: take_string(payload, pos)?,
-        source_transaction_id: take_u64(payload, pos)?,
-        source_generation: take_u64(payload, pos)?,
-        created_at_generation: take_u64(payload, pos)?,
-    })
-}
-
-fn put_snapshot_rollback_report(buf: &mut Vec<u8>, report: &SnapshotRollbackReport) {
-    put_string(buf, &report.spec);
-    put_snapshot_summary_report(buf, &report.snapshot);
-    put_u64(buf, report.generation_before);
-    put_u64(buf, report.restored_source_generation);
-    put_u64(buf, report.published_generation);
-    put_u64(buf, report.snapshot_catalog_entries);
-    put_bool(buf, report.production_fsck_required);
-}
-
-fn take_snapshot_rollback_report(
-    payload: &[u8],
-    pos: &mut usize,
-) -> Option<SnapshotRollbackReport> {
-    Some(SnapshotRollbackReport {
-        spec: take_string(payload, pos)?,
-        snapshot: take_snapshot_summary_report(payload, pos)?,
-        generation_before: take_u64(payload, pos)?,
-        restored_source_generation: take_u64(payload, pos)?,
-        published_generation: take_u64(payload, pos)?,
-        snapshot_catalog_entries: take_u64(payload, pos)?,
-        production_fsck_required: take_bool(payload, pos)?,
-    })
-}
-
-fn put_snapshot_clone_summary_report(buf: &mut Vec<u8>, report: &SnapshotCloneSummaryReport) {
-    put_string(buf, &report.name);
-    put_string(buf, &report.origin);
-    put_u64(buf, report.source_transaction_id);
-    put_u64(buf, report.source_generation);
-    put_u64(buf, report.created_at_generation);
-}
-
-fn take_snapshot_clone_summary_report(
-    payload: &[u8],
-    pos: &mut usize,
-) -> Option<SnapshotCloneSummaryReport> {
-    Some(SnapshotCloneSummaryReport {
-        name: take_string(payload, pos)?,
-        origin: take_string(payload, pos)?,
-        source_transaction_id: take_u64(payload, pos)?,
-        source_generation: take_u64(payload, pos)?,
-        created_at_generation: take_u64(payload, pos)?,
-    })
-}
-
 fn encode_placement_receipt_ref(buf: &mut Vec<u8>, receipt: &PlacementReceiptRef) {
     buf.extend_from_slice(&receipt.object_id.to_le_bytes());
     buf.extend_from_slice(&receipt.object_key);
@@ -1058,43 +910,6 @@ pub enum Frame {
     PutWithReceiptResponse {
         key: Vec<u8>,
         recorded_receipt_ref: Option<PlacementReceiptRef>,
-    },
-
-    // ── Snapshot lifecycle operations through the clustered storage-node path ──
-    /// Create a named snapshot of the current dataset root.
-    /// The storage node opens its configured fs_root LocalFileSystem,
-    /// calls create_snapshot, and returns the summary.
-    SnapshotCreate {
-        snapshot_name: String,
-    },
-    /// Response to SnapshotCreate: typed summary of the created snapshot.
-    SnapshotCreateResponse {
-        summary: SnapshotSummaryReport,
-    },
-    /// Destroy a named snapshot, unpinning its object graph from GC.
-    SnapshotDestroy {
-        snapshot_name: String,
-    },
-    /// Response to SnapshotDestroy: typed summary of the destroyed snapshot.
-    SnapshotDestroyResponse {
-        summary: SnapshotSummaryReport,
-    },
-    /// Rollback the dataset to a named snapshot state.
-    SnapshotRollback {
-        snapshot_name: String,
-    },
-    /// Response to SnapshotRollback: typed report of the rollback operation.
-    SnapshotRollbackResponse {
-        report: SnapshotRollbackReport,
-    },
-    /// Create a writable clone from a named snapshot.
-    SnapshotClone {
-        clone_name: String,
-        source_snapshot: String,
-    },
-    /// Response to SnapshotClone: typed summary of the created clone.
-    SnapshotCloneResponse {
-        summary: SnapshotCloneSummaryReport,
     },
 
     // ── Chunked send/receive with cursor-based resume ──
@@ -1309,61 +1124,6 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
             } else {
                 buf.push(0);
             }
-        }
-        // ── Snapshot lifecycle encode ──
-        Frame::SnapshotCreate { snapshot_name } => {
-            buf.extend_from_slice(tag::SNPC);
-            let name_bytes = snapshot_name.as_bytes();
-            buf.push(name_bytes.len() as u8);
-            buf.extend_from_slice(name_bytes);
-        }
-        Frame::SnapshotCreateResponse { summary } => {
-            buf.extend_from_slice(tag::SNPC);
-            buf.push(1u8);
-            buf.push(RESPONSE_VERSION);
-            put_snapshot_summary_report(&mut buf, summary);
-        }
-        Frame::SnapshotDestroy { snapshot_name } => {
-            buf.extend_from_slice(tag::SNPD);
-            let name_bytes = snapshot_name.as_bytes();
-            buf.push(name_bytes.len() as u8);
-            buf.extend_from_slice(name_bytes);
-        }
-        Frame::SnapshotDestroyResponse { summary } => {
-            buf.extend_from_slice(tag::SNPD);
-            buf.push(1u8);
-            buf.push(RESPONSE_VERSION);
-            put_snapshot_summary_report(&mut buf, summary);
-        }
-        Frame::SnapshotRollback { snapshot_name } => {
-            buf.extend_from_slice(tag::SNPR);
-            let name_bytes = snapshot_name.as_bytes();
-            buf.push(name_bytes.len() as u8);
-            buf.extend_from_slice(name_bytes);
-        }
-        Frame::SnapshotRollbackResponse { report } => {
-            buf.extend_from_slice(tag::SNPR);
-            buf.push(1u8);
-            buf.push(RESPONSE_VERSION);
-            put_snapshot_rollback_report(&mut buf, report);
-        }
-        Frame::SnapshotClone {
-            clone_name,
-            source_snapshot,
-        } => {
-            buf.extend_from_slice(tag::SNPCL);
-            let cn_bytes = clone_name.as_bytes();
-            buf.push(cn_bytes.len() as u8);
-            buf.extend_from_slice(cn_bytes);
-            let ss_bytes = source_snapshot.as_bytes();
-            buf.push(ss_bytes.len() as u8);
-            buf.extend_from_slice(ss_bytes);
-        }
-        Frame::SnapshotCloneResponse { summary } => {
-            buf.extend_from_slice(tag::SNPCL);
-            buf.push(1u8);
-            buf.push(RESPONSE_VERSION);
-            put_snapshot_clone_summary_report(&mut buf, summary);
         }
         // ── Chunked send/receive encode ──
         Frame::SendChunked { key } => {
@@ -1809,80 +1569,6 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
                 None
             }
         }
-        // ── Snapshot lifecycle tag decoders ──
-        t if t == tag::SNPC => {
-            if payload.is_empty() {
-                return None;
-            }
-            if payload[0] == 1 && payload.len() >= 2 && payload[1] == RESPONSE_VERSION {
-                let mut pos = 2;
-                Some(Frame::SnapshotCreateResponse {
-                    summary: take_snapshot_summary_report(payload, &mut pos)?,
-                })
-            } else if payload.len() >= 1 {
-                // Request: name_len(u8) + snapshot_name
-                let name_len = payload[0] as usize;
-                if payload.len() < 1 + name_len {
-                    return None;
-                }
-                let snapshot_name = String::from_utf8(payload[1..1 + name_len].to_vec()).ok()?;
-                Some(Frame::SnapshotCreate { snapshot_name })
-            } else {
-                None
-            }
-        }
-        t if t == tag::SNPD => {
-            if payload.is_empty() {
-                return None;
-            }
-            if payload[0] == 1 && payload.len() >= 2 && payload[1] == RESPONSE_VERSION {
-                let mut pos = 2;
-                Some(Frame::SnapshotDestroyResponse {
-                    summary: take_snapshot_summary_report(payload, &mut pos)?,
-                })
-            } else if payload.len() >= 1 {
-                // Request: name_len(u8) + snapshot_name
-                let name_len = payload[0] as usize;
-                if payload.len() < 1 + name_len {
-                    return None;
-                }
-                let snapshot_name = String::from_utf8(payload[1..1 + name_len].to_vec()).ok()?;
-                Some(Frame::SnapshotDestroy { snapshot_name })
-            } else {
-                None
-            }
-        }
-        t if t == tag::SNPCL => {
-            if payload.is_empty() {
-                return None;
-            }
-            if payload[0] == 1 && payload.len() >= 2 && payload[1] == RESPONSE_VERSION {
-                let mut pos = 2;
-                Some(Frame::SnapshotCloneResponse {
-                    summary: take_snapshot_clone_summary_report(payload, &mut pos)?,
-                })
-            } else if payload.len() >= 2 {
-                // Request: clone_name_len(u8) + clone_name + source_snapshot_len(u8) + source_snapshot
-                let cn_len = payload[0] as usize;
-                if payload.len() < 1 + cn_len + 1 {
-                    return None;
-                }
-                let clone_name = String::from_utf8(payload[1..1 + cn_len].to_vec()).ok()?;
-                let ss_off = 1 + cn_len;
-                let ss_len = payload[ss_off] as usize;
-                if payload.len() < ss_off + 1 + ss_len {
-                    return None;
-                }
-                let source_snapshot =
-                    String::from_utf8(payload[ss_off + 1..ss_off + 1 + ss_len].to_vec()).ok()?;
-                Some(Frame::SnapshotClone {
-                    clone_name,
-                    source_snapshot,
-                })
-            } else {
-                None
-            }
-        }
         // ── Chunked send/receive tag decoders ──
         t if t == tag::SNDC => {
             if payload.is_empty() {
@@ -1951,27 +1637,6 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
                 }
                 let cursor = payload[1..1 + cl].to_vec();
                 Some(Frame::SendResume { cursor })
-            } else {
-                None
-            }
-        }
-        t if t == tag::SNPR => {
-            if payload.is_empty() {
-                return None;
-            }
-            if payload[0] == 1 && payload.len() >= 2 && payload[1] == RESPONSE_VERSION {
-                let mut pos = 2;
-                Some(Frame::SnapshotRollbackResponse {
-                    report: take_snapshot_rollback_report(payload, &mut pos)?,
-                })
-            } else if payload.len() >= 1 {
-                // Request: name_len(u8) + snapshot_name
-                let name_len = payload[0] as usize;
-                if payload.len() < 1 + name_len {
-                    return None;
-                }
-                let snapshot_name = String::from_utf8(payload[1..1 + name_len].to_vec()).ok()?;
-                Some(Frame::SnapshotRollback { snapshot_name })
             } else {
                 None
             }
@@ -2108,37 +1773,6 @@ mod tests {
         }
     }
 
-    fn sample_snapshot_summary(name: &str) -> SnapshotSummaryReport {
-        SnapshotSummaryReport {
-            name: name.into(),
-            source_transaction_id: 100,
-            source_generation: 42,
-            created_at_generation: 43,
-        }
-    }
-
-    fn sample_rollback_report() -> SnapshotRollbackReport {
-        SnapshotRollbackReport {
-            spec: "snapshot-rollback".into(),
-            snapshot: sample_snapshot_summary("safe-point"),
-            generation_before: 100,
-            restored_source_generation: 42,
-            published_generation: 101,
-            snapshot_catalog_entries: 3,
-            production_fsck_required: false,
-        }
-    }
-
-    fn sample_clone_summary() -> SnapshotCloneSummaryReport {
-        SnapshotCloneSummaryReport {
-            name: "myclone".into(),
-            origin: "origin-snap".into(),
-            source_transaction_id: 100,
-            source_generation: 42,
-            created_at_generation: 43,
-        }
-    }
-
     #[test]
     fn roundtrip_put() {
         let f = Frame::Put {
@@ -2204,11 +1838,6 @@ mod tests {
             serde_json::from_str(&sample_scrub_report(2).diagnostic_json()).unwrap();
         assert_eq!(scrub["findings_count"], 2);
         assert_eq!(scrub["completed"], false);
-
-        let rollback: serde_json::Value =
-            serde_json::from_str(&sample_rollback_report().diagnostic_json()).unwrap();
-        assert_eq!(rollback["snapshot"]["name"], "safe-point");
-        assert_eq!(rollback["published_generation"], 101);
     }
     #[test]
     fn roundtrip_error() {
@@ -2498,90 +2127,6 @@ mod tests {
             key,
             placement_receipt_ref: receipt,
             value: payload.to_vec(),
-        };
-        assert_eq!(decode(&encode(&f)), Some(f));
-    }
-
-    // ── Snapshot lifecycle roundtrip tests ──
-    #[test]
-    fn roundtrip_snapshot_create_request() {
-        let f = Frame::SnapshotCreate {
-            snapshot_name: "before-upgrade".into(),
-        };
-        assert_eq!(decode(&encode(&f)), Some(f));
-    }
-
-    #[test]
-    fn roundtrip_snapshot_create_response() {
-        let f = Frame::SnapshotCreateResponse {
-            summary: sample_snapshot_summary("before-upgrade"),
-        };
-        assert_eq!(decode(&encode(&f)), Some(f));
-    }
-
-    #[test]
-    fn roundtrip_snapshot_destroy_request() {
-        let f = Frame::SnapshotDestroy {
-            snapshot_name: "old-snap".into(),
-        };
-        assert_eq!(decode(&encode(&f)), Some(f));
-    }
-
-    #[test]
-    fn roundtrip_snapshot_destroy_response() {
-        let f = Frame::SnapshotDestroyResponse {
-            summary: sample_snapshot_summary("old-snap"),
-        };
-        assert_eq!(decode(&encode(&f)), Some(f));
-    }
-
-    #[test]
-    fn roundtrip_snapshot_rollback_request() {
-        let f = Frame::SnapshotRollback {
-            snapshot_name: "safe-point".into(),
-        };
-        assert_eq!(decode(&encode(&f)), Some(f));
-    }
-
-    #[test]
-    fn roundtrip_snapshot_rollback_response() {
-        let f = Frame::SnapshotRollbackResponse {
-            report: sample_rollback_report(),
-        };
-        assert_eq!(decode(&encode(&f)), Some(f));
-    }
-
-    #[test]
-    fn roundtrip_snapshot_rollback_long_name() {
-        let f = Frame::SnapshotRollback {
-            snapshot_name: "tidefs-autosnap-2026-05-28T14-30-00Z".into(),
-        };
-        assert_eq!(decode(&encode(&f)), Some(f));
-    }
-
-    // ── Snapshot clone roundtrip tests ──
-    #[test]
-    fn roundtrip_snapshot_clone_request() {
-        let f = Frame::SnapshotClone {
-            clone_name: "myclone".into(),
-            source_snapshot: "origin-snap".into(),
-        };
-        assert_eq!(decode(&encode(&f)), Some(f));
-    }
-
-    #[test]
-    fn roundtrip_snapshot_clone_response() {
-        let f = Frame::SnapshotCloneResponse {
-            summary: sample_clone_summary(),
-        };
-        assert_eq!(decode(&encode(&f)), Some(f));
-    }
-
-    #[test]
-    fn roundtrip_snapshot_clone_long_names() {
-        let f = Frame::SnapshotClone {
-            clone_name: "writable-clone-of-before-major-upgrade-v2".into(),
-            source_snapshot: "autosnap-2026-05-28T14-30-00Z-pre-upgrade".into(),
         };
         assert_eq!(decode(&encode(&f)), Some(f));
     }
