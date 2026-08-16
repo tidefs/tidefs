@@ -162,10 +162,6 @@ pub mod workers_locks;
 #[cfg(feature = "fuse")]
 pub mod ingress;
 
-// ── P5-02 capacity smoke ──────────────────────────────────────────────────
-#[cfg(feature = "fuse")]
-pub mod capacity;
-
 // ── P5-02 scheduler smoke ─────────────────────────────────────────────────
 #[cfg(feature = "fuse")]
 pub mod scheduler;
@@ -177,10 +173,6 @@ pub mod fusewire;
 // ── P5-02 reply smoke ─────────────────────────────────────────────────────
 #[cfg(feature = "fuse")]
 pub mod reply;
-
-// ── workers-io smoke ───────────────────────────────────────────────────────
-#[cfg(all(feature = "fuse", test))]
-pub mod workers_io;
 
 // ── local-filesystem smoke ─────────────────────────────────────────────────
 #[cfg(feature = "fuse")]
