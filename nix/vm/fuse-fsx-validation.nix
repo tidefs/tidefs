@@ -529,6 +529,7 @@ INITSCRIPT
     VAL_LOG="$RUN_DIR/qemu-boot.log"
 
     echo "  Booting QEMU VM..."
+    set +e
     timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
       -kernel "$KERNEL_IMG" \
       -initrd "$RUN_DIR/initrd.img" \
@@ -537,15 +538,17 @@ INITSCRIPT
       -smp 1 \
       -nographic \
       -no-reboot \
-      > "$VAL_LOG" 2>&1 || true
+      > "$VAL_LOG" 2>&1
+    QEMU_STATUS=$?
+    set -e
 
-    echo "  QEMU boot completed"
+    echo "  QEMU boot completed (exit=$QEMU_STATUS)"
 
     # ── Parse validation rows ────────────────────────────────────────────
     echo ""
     echo "=== FUSE fsx Validation Results ==="
 
-    PASSC=0; FAILC=0; BLOCKC=0
+    PASSC=0; FAILC=0; BLOCKC=0; GUEST_COMPLETED=0
 
     while IFS= read -r line; do
       case "$line" in
@@ -554,9 +557,13 @@ INITSCRIPT
         "BLOCKED: "*) echo "  $line"; BLOCKC=$((BLOCKC + 1)) ;;
       esac
     done < <(grep -E '^(PASS|FAIL|BLOCKED):' "$VAL_LOG" 2>/dev/null || true)
+    if grep -q '^=== End ===' "$VAL_LOG" 2>/dev/null; then
+      GUEST_COMPLETED=1
+    fi
 
     echo ""
     echo "Validation: $PASSC passed, $FAILC failed, $BLOCKC blocked"
+    echo "QEMU exit: $QEMU_STATUS; guest completed: $GUEST_COMPLETED"
     echo "Validation log: $VAL_LOG"
 
     # ── Produce validation record ────────────────────────────────────────
@@ -669,6 +676,18 @@ PINEOF
 
     if [ -n "$SEEDS" ] && [ "$SEED_FAILC" -gt 0 ]; then
       echo "VALIDATION: FAIL -- $SEED_FAILC seeds failed"
+      exit 1
+    fi
+    if [ "$QEMU_STATUS" -eq 124 ]; then
+      echo "VALIDATION: FAIL -- QEMU timed out after ''${TIMEOUT_SEC}s"
+      exit 1
+    fi
+    if [ "$QEMU_STATUS" -ne 0 ]; then
+      echo "VALIDATION: FAIL -- QEMU exited with status $QEMU_STATUS"
+      exit 1
+    fi
+    if [ "$GUEST_COMPLETED" -ne 1 ]; then
+      echo "VALIDATION: FAIL -- guest did not complete validation and teardown"
       exit 1
     fi
     if [ "$FAILC" -gt 0 ]; then
