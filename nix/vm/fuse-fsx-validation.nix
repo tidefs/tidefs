@@ -345,7 +345,8 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/tidefs-mmap-workload ]; then
     mkdir -p "$MMAP_DIR"
 
     echo "Running tidefs-mmap-workload $MMAP_DIR"
-    if /bin/tidefs-mmap-workload "$MMAP_DIR" > /tmp/mmap.out 2>&1; then
+    if timeout -k 2 180 /bin/tidefs-mmap-workload "$MMAP_DIR" \
+        > /tmp/mmap.out 2>&1; then
         MMAP_RC=0
     else
         MMAP_RC=$?

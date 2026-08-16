@@ -44,6 +44,7 @@ static void emit_row(const char *name, const char *outcome,
     if (note && *note)
         printf(",\"output_note\":\"%s\"", note);
     printf("}\n");
+    fflush(stdout);
 }
 
 static void emit_row_pass(const char *name, const char *note) {
