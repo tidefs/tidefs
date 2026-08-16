@@ -90,6 +90,22 @@ fn fuse_op_diagnostics_enabled() -> bool {
     )
 }
 
+/// Validate protocol flags carried by a FUSE WRITE request.
+///
+/// `FUSE_WRITE_CACHE` is not limited to mounts that negotiated the optional
+/// FUSE writeback-cache capability.  Linux also sets it when it writes dirty
+/// pages created by a shared writable mapping.  On a normal cache-disabled
+/// mount those requests still carry the original writable handle and must be
+/// written through to the engine instead of being rejected with `EINVAL`.
+fn validate_fuse_write_flags(write_flags: u32) -> Result<(), Errno> {
+    let supported_flags = FUSE_WRITE_LOCKOWNER | FUSE_WRITE_KILL_PRIV | FUSE_WRITE_CACHE;
+    if (write_flags & !supported_flags) == 0 {
+        Ok(())
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
 // Matches the committed LocalFileSystem root dataset id.
 const ROOT_DATASET_ID: tidefs_dataset_catalog::DatasetId =
     tidefs_dataset_catalog::DatasetId::from_bytes([0u8; 16]);
@@ -3613,9 +3629,8 @@ impl FuseVfsAdapter {
         }
     }
 
-    /// Enable FUSE writeback cache: FUSE_WRITE_CACHE flagged writes are
-    /// accepted and routed through the dirty-page tracker instead of being
-    /// rejected.
+    /// Enable the optional FUSE writeback-cache mode.  `FUSE_WRITE_CACHE`
+    /// requests are routed through the dirty-page tracker in this mode.
     #[must_use]
     pub fn with_writeback_cache_enabled(mut self) -> Self {
         self.writeback_cache_enabled = true;
@@ -3624,8 +3639,8 @@ impl FuseVfsAdapter {
     }
     /// Disable FUSE writeback cache. Overrides the profile default.
     ///
-    /// When disabled, FUSE_WRITE_CACHE flagged writes are rejected
-    /// and all writes go through the synchronous path.
+    /// When disabled, ordinary and shared-mmap page-cache writes remain
+    /// write-through to the engine; daemon-side writeback staging is off.
     #[must_use]
     pub fn with_writeback_cache_disabled(mut self) -> Self {
         self.writeback_cache_enabled = false;
@@ -9585,7 +9600,7 @@ impl Filesystem for FuseVfsAdapter {
         fh: u64,
         offset: i64,
         data: &[u8],
-        _write_flags: u32,
+        write_flags: u32,
         flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
@@ -9606,7 +9621,7 @@ impl Filesystem for FuseVfsAdapter {
                 fh,
                 offset,
                 data.len(),
-                _write_flags,
+                write_flags,
                 flags
             );
         }
@@ -9635,26 +9650,15 @@ impl Filesystem for FuseVfsAdapter {
             }
         }
 
-        // Validate write_flags. FUSE_WRITE_CACHE is accepted only when
-        // writeback_cache is enabled; unknown flag bits are always rejected.
-        {
-            let base_flags: u32 = FUSE_WRITE_LOCKOWNER | FUSE_WRITE_KILL_PRIV;
-            let supported_flags = if self.writeback_cache_enabled {
-                base_flags | FUSE_WRITE_CACHE
-            } else {
-                base_flags
-            };
-            if (_write_flags & !supported_flags) != 0 {
-                crate::observability::HIST_WRITE.record(_start.elapsed());
-                crate::observability::FuseErrorCode::from_errno(
-                    tidefs_types_vfs_core::Errno(libc::EINVAL as u16),
-                    "write",
-                    ino,
-                )
-                .emit();
-                reply.reply_errno(Errno::EINVAL);
-                return;
-            }
+        // Linux marks shared-mmap page writeback with FUSE_WRITE_CACHE even
+        // when the optional mount writeback cache is disabled.  Accept that
+        // protocol flag and let dispatch select the normal write-through path;
+        // unknown bits remain a hard refusal.
+        if let Err(errno) = validate_fuse_write_flags(write_flags) {
+            crate::observability::HIST_WRITE.record(_start.elapsed());
+            crate::observability::FuseErrorCode::from_errno(errno, "write", ino).emit();
+            reply.reply_errno(errno);
+            return;
         }
 
         let result = self.dispatch_write_with_request_flags(
@@ -9664,7 +9668,7 @@ impl Filesystem for FuseVfsAdapter {
             offset,
             data,
             WriteDispatchFlags {
-                write: _write_flags,
+                write: write_flags,
                 request_open: flags as u32,
             },
         );
@@ -10662,6 +10666,22 @@ mod tests {
     use tidefs_vfs_engine::{
         LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminResponseBody,
     };
+
+    #[test]
+    fn fuse_write_cache_flag_is_valid_for_shared_mmap_writeback() {
+        assert_eq!(validate_fuse_write_flags(FUSE_WRITE_CACHE), Ok(()));
+        assert_eq!(
+            validate_fuse_write_flags(
+                FUSE_WRITE_CACHE | FUSE_WRITE_LOCKOWNER | FUSE_WRITE_KILL_PRIV
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn fuse_write_flags_reject_unknown_protocol_bits() {
+        assert_eq!(validate_fuse_write_flags(1_u32 << 31), Err(Errno::EINVAL));
+    }
 
     #[derive(Debug, Default)]
     struct RecordingPruneNotifySink {
@@ -43260,9 +43280,9 @@ mod tests {
     }
 
     /// Regression guard: coherency profiles must not implicitly flip the
-    /// handler admission flag.  `MountConfig::writeback_cache` is the single
-    /// authority for both `MountOption::WritebackCache` and FUSE_WRITE_CACHE
-    /// acceptance.
+    /// daemon-side writeback mode. `MountConfig::writeback_cache` controls the
+    /// mount capability and dirty-page staging; shared-mmap page writes remain
+    /// valid protocol requests when that optional mode is disabled.
     #[test]
     fn coherency_profiles_do_not_enable_writeback_without_override() {
         let profiles = [

@@ -8,6 +8,7 @@
  *
  * Compile: cc -Wall -O2 -o tidefs-mmap-workload tidefs-mmap-workload.c
  * Usage:   ./tidefs-mmap-workload <test-directory>
+ *          ./tidefs-mmap-workload --verify-persistence <test-directory>
  *
  * Output:  JSON validation rows on stdout.
  */
@@ -29,6 +30,7 @@
 #define PAGE 4096
 
 static char test_dir[4096];
+static int failed_rows;
 
 static void die(const char *msg) {
     fprintf(stderr, "mmap-workload: %s: %s\n", msg, strerror(errno));
@@ -49,11 +51,77 @@ static void emit_row_pass(const char *name, const char *note) {
 }
 
 static void emit_row_fail(const char *name, const char *note) {
+    failed_rows++;
     emit_row(name, "fail", "mounted-userspace", note);
 }
 
 static void emit_row_blocked(const char *name, const char *note) {
     emit_row(name, "blocked", "mounted-userspace", note);
+}
+
+static void verify_persisted_page(const char *row_name, const char *file_name,
+                                  unsigned char expected) {
+    char path[8192];
+    unsigned char page[PAGE];
+    size_t consumed = 0;
+    struct stat st;
+
+    snprintf(path, sizeof(path), "%s/%s", test_dir, file_name);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        char note[192];
+        int saved_errno = errno;
+        snprintf(note, sizeof(note), "open failed: errno=%d (%s)",
+                 saved_errno, strerror(saved_errno));
+        emit_row_fail(row_name, note);
+        return;
+    }
+    if (fstat(fd, &st) < 0) {
+        char note[192];
+        int saved_errno = errno;
+        snprintf(note, sizeof(note), "fstat failed: errno=%d (%s)",
+                 saved_errno, strerror(saved_errno));
+        close(fd);
+        emit_row_fail(row_name, note);
+        return;
+    }
+    if (st.st_size != PAGE) {
+        char note[128];
+        snprintf(note, sizeof(note), "size mismatch: expected=%d actual=%lld",
+                 PAGE, (long long)st.st_size);
+        close(fd);
+        emit_row_fail(row_name, note);
+        return;
+    }
+    while (consumed < sizeof(page)) {
+        ssize_t got = read(fd, page + consumed, sizeof(page) - consumed);
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0) {
+            char note[192];
+            int saved_errno = got < 0 ? errno : 0;
+            snprintf(note, sizeof(note),
+                     "read failed: bytes=%zu errno=%d (%s)", consumed,
+                     saved_errno, saved_errno ? strerror(saved_errno) : "short read");
+            close(fd);
+            emit_row_fail(row_name, note);
+            return;
+        }
+        consumed += (size_t)got;
+    }
+    close(fd);
+
+    for (size_t i = 0; i < sizeof(page); i++) {
+        if (page[i] != expected) {
+            char note[160];
+            snprintf(note, sizeof(note),
+                     "byte mismatch: offset=%zu expected=0x%02x actual=0x%02x",
+                     i, expected, page[i]);
+            emit_row_fail(row_name, note);
+            return;
+        }
+    }
+    emit_row_pass(row_name, "exact page survived export/reimport/remount");
 }
 
 /* ── test implementations ───────────────────────────────────────── */
@@ -74,9 +142,16 @@ static void test_mmap_read_write_shared(void) {
 
     /* write pattern through mmap */
     memset(p, 0xAB, PAGE);
-    if (msync(p, PAGE, MS_SYNC) < 0)
-        { munmap(p, PAGE); close(fd);
-          emit_row_fail("mmap-read-write-shared", "msync failed"); return; }
+    if (msync(p, PAGE, MS_SYNC) < 0) {
+        int saved_errno = errno;
+        char note[160];
+        snprintf(note, sizeof(note), "msync failed: errno=%d (%s)",
+                 saved_errno, strerror(saved_errno));
+        munmap(p, PAGE);
+        close(fd);
+        emit_row_fail("mmap-read-write-shared", note);
+        return;
+    }
 
     /* read back through read(2) and compare */
     lseek(fd, 0, SEEK_SET);
@@ -153,9 +228,17 @@ static void test_msync_sync(void) {
         { close(fd); emit_row_fail("msync-sync", "mmap failed"); return; }
 
     memset(p, 0xCD, PAGE);
-    if (msync(p, PAGE, MS_SYNC) < 0)
-        { munmap(p, PAGE); close(fd);
-          emit_row_fail("msync-sync", "msync MS_SYNC returned error"); return; }
+    if (msync(p, PAGE, MS_SYNC) < 0) {
+        int saved_errno = errno;
+        char note[176];
+        snprintf(note, sizeof(note),
+                 "msync MS_SYNC returned error: errno=%d (%s)",
+                 saved_errno, strerror(saved_errno));
+        munmap(p, PAGE);
+        close(fd);
+        emit_row_fail("msync-sync", note);
+        return;
+    }
 
     /* verify durable via re-read after munmap */
     munmap(p, PAGE);
@@ -446,13 +529,32 @@ static void test_direct_io_reconciliation(void) {
 /* ── main ───────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <test-directory>\n", argv[0]);
+    int verify_persistence = 0;
+    const char *directory = NULL;
+
+    if (argc == 2) {
+        directory = argv[1];
+    } else if (argc == 3 && strcmp(argv[1], "--verify-persistence") == 0) {
+        verify_persistence = 1;
+        directory = argv[2];
+    } else {
+        fprintf(stderr,
+                "Usage: %s [--verify-persistence] <test-directory>\n",
+                argv[0]);
         return 1;
     }
 
-    strncpy(test_dir, argv[1], sizeof(test_dir) - 1);
+    strncpy(test_dir, directory, sizeof(test_dir) - 1);
     test_dir[sizeof(test_dir) - 1] = '\0';
+
+    if (verify_persistence) {
+        printf("[\n");
+        verify_persisted_page("mmap-read-write-shared-persisted", "mmaps.txt", 0xAB);
+        printf(",\n");
+        verify_persisted_page("msync-sync-persisted", "msyncs.txt", 0xCD);
+        printf("\n]\n");
+        return failed_rows == 0 ? 0 : 1;
+    }
 
     /* Ensure test directory exists */
     if (mkdir(test_dir, 0755) < 0 && errno != EEXIST)
@@ -480,5 +582,5 @@ int main(int argc, char **argv) {
     printf("\n");
 
     printf("]\n");
-    return 0;
+    return failed_rows == 0 ? 0 : 1;
 }
