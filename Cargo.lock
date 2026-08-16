@@ -2082,7 +2082,6 @@ dependencies = [
  "tidefs-background-scheduler",
  "tidefs-cache-coherency",
  "tidefs-incremental-job-core",
- "tidefs-posix-filesystem-adapter-workers-io",
  "tidefs-types-cache-lattice-core",
  "tidefs-types-incremental-job-core",
 ]

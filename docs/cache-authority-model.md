@@ -16,8 +16,10 @@ and `validation/claims.toml`.
 `tidefs-local-filesystem` has no local whole-file content cache. Dirty overlay
 reads use the write buffer, while committed full and range reads return through
 current Pool placement authority. The FUSE daemon's `ReadCache` and
-`tidefs-cache-core::PageCache` remain separate dispatch paths; this removal does
-not claim that the adapter has been consolidated onto cache-core.
+`tidefs-cache-core::PageCache` remain separate dispatch paths. Issue #2538
+removed an unused worker-owned `ReadCache` trait and the reverse dependency
+that implemented it in cache-core; that contraction does not claim that the
+live daemon cache has been consolidated onto cache-core.
 
 ## Authority Classes
 
@@ -60,7 +62,9 @@ not claim that the adapter has been consolidated onto cache-core.
 3. The FUSE daemon `ReadCache` in `read_cache.rs` is **Derived**, but its live
    adapter dispatch remains separate from `tidefs-cache-core::PageCache`.
    Consolidation must change that carrier path explicitly; deleting the local
-   filesystem cache alone does not establish it.
+   filesystem cache alone does not establish it. Adapter code may consume
+   cache-core APIs, but cache-core must not depend upward on adapter-owned
+   traits or worker packages.
 
 4. The local-filesystem `page_cache/` module is classified as **Derived**. It
    mirrors object-store content for read acceleration and must never be cited
