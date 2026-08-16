@@ -5664,9 +5664,13 @@ mod tests {
             &committed_base,
         )]);
 
-        let replayed =
-            replay_uncommitted_with_pool(&log, &mut fs.state, fs.store.pool_mut(), &committed_base)
-                .expect("replay metadata-only Pool intent");
+        let replayed = replay_uncommitted_with_pool(
+            &log,
+            &mut fs.filesystem.state,
+            fs.store.pool_mut(),
+            &committed_base,
+        )
+        .expect("replay metadata-only Pool intent");
         assert_eq!(replayed, 1);
         assert_eq!(fs.state.inodes[&inode_id], updated);
         assert!(!fs.state.dirty_content.contains(&inode_id));
@@ -5700,7 +5704,7 @@ mod tests {
         for _ in 0..2 {
             let replayed = replay_uncommitted_with_pool(
                 &log,
-                &mut fs.state,
+                &mut fs.filesystem.state,
                 fs.store.pool_mut(),
                 &committed_base,
             )
@@ -5731,8 +5735,13 @@ mod tests {
             &committed_base,
         )]);
 
-        replay_uncommitted_with_pool(&log, &mut fs.state, fs.store.pool_mut(), &committed_base)
-            .expect_err("missing content must not authorize metadata transition");
+        replay_uncommitted_with_pool(
+            &log,
+            &mut fs.filesystem.state,
+            fs.store.pool_mut(),
+            &committed_base,
+        )
+        .expect_err("missing content must not authorize metadata transition");
         assert_eq!(fs.state.inodes[&inode_id], current);
 
         let content_key = content_object_key_for_version(inode_id, updated.data_version);
@@ -5742,8 +5751,13 @@ mod tests {
             .raw_primary_store_mut()
             .put(content_key, &encoded)
             .expect("stage receiptless content fixture");
-        replay_uncommitted_with_pool(&log, &mut fs.state, fs.store.pool_mut(), &committed_base)
-            .expect_err("receiptless content must not authorize metadata transition");
+        replay_uncommitted_with_pool(
+            &log,
+            &mut fs.filesystem.state,
+            fs.store.pool_mut(),
+            &committed_base,
+        )
+        .expect_err("receiptless content must not authorize metadata transition");
         assert_eq!(fs.state.inodes[&inode_id], current);
 
         drop(fs);
@@ -5786,9 +5800,13 @@ mod tests {
             pool_metadata_entry(1, updated, &committed_base),
         ]);
 
-        let replayed =
-            replay_uncommitted_with_pool(&log, &mut fs.state, fs.store.pool_mut(), &committed_base)
-                .expect("replay data before later metadata");
+        let replayed = replay_uncommitted_with_pool(
+            &log,
+            &mut fs.filesystem.state,
+            fs.store.pool_mut(),
+            &committed_base,
+        )
+        .expect("replay data before later metadata");
         assert_eq!(replayed, 2);
         let recovered = &fs.state.inodes[&inode_id];
         assert_eq!(recovered.mode, S_IFREG | 0o600);

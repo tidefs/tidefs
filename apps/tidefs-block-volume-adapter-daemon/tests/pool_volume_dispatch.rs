@@ -10,6 +10,7 @@ use tidefs_block_volume_adapter_daemon::storage_backend::{
 use tidefs_block_volume_adapter_daemon::DataQueueWorker;
 use tidefs_cluster::{ClusterLeaseGrant, ClusterLeaseSession, EpochId, PoolLeaseToken, WriteFence};
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, SyncGuarantee};
+use tidefs_local_filesystem::{PoolDatasetOwner, RootAuthenticationKey, SharedPoolDatasetOwner};
 use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 use tidefs_pool_runtime::PoolRuntime;
 use tidefs_ublk_abi::{UblkSrvIoDesc, UBLK_IO_OP_FLUSH, UBLK_IO_OP_READ, UBLK_IO_OP_WRITE};
@@ -131,6 +132,68 @@ fn pool_volume_backend_flushes_and_reopens_committed_data() {
         .read_blocks(2, 1, 4096)
         .expect("read reopened volume block");
     assert_eq!(read.payload.expect("read payload"), vec![0x5a; 4096]);
+}
+
+#[test]
+fn mounted_pool_volume_backend_uses_shared_owner_and_preserves_mutation_fence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut owner = PoolDatasetOwner::open_with_root_authentication_key(
+        dir.path(),
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+    )
+    .expect("open mounted Pool owner");
+    owner
+        .create_volume_dataset(
+            "vol",
+            DatasetId::from_bytes([14; 16]),
+            4 * 1024 * 1024,
+            Vec::new(),
+            DatasetFlags::NONE,
+            SyncGuarantee::Local,
+        )
+        .expect("create mounted Pool volume");
+    let shared_owner = SharedPoolDatasetOwner::new(owner);
+    let mut backend = PoolVolumeBackend::open_mounted(shared_owner.clone(), "vol", false)
+        .expect("open mounted Pool volume backend");
+
+    backend
+        .write_blocks(2, &[0x6d; 4096], 4096)
+        .expect("write through mounted Pool owner");
+    backend.flush().expect("flush through mounted Pool owner");
+    {
+        let owner = shared_owner.borrow();
+        let volume = owner
+            .pool_runtime()
+            .open_volume("vol")
+            .expect("open volume through the same Pool runtime");
+        assert_eq!(
+            volume
+                .read_blocks(owner.pool_runtime(), 2, 1)
+                .expect("read committed mounted volume bytes"),
+            vec![0x6d; 4096]
+        );
+    }
+
+    shared_owner
+        .borrow_mut()
+        .fence_external_mutation_authority();
+    let read = backend
+        .read_blocks(2, 1, 4096)
+        .expect("the mutation fence must not hide committed reads");
+    assert_eq!(read.payload.expect("read payload"), vec![0x6d; 4096]);
+    assert!(matches!(
+        backend.write_blocks(3, &[0x7e; 4096], 4096),
+        Err(BackendError::Other(message)) if message.contains("reopen")
+    ));
+    assert!(matches!(
+        backend.write_zeroes(2, 1, 4096),
+        Err(BackendError::Other(message)) if message.contains("reopen")
+    ));
+    assert!(matches!(
+        backend.flush(),
+        Err(BackendError::Other(message)) if message.contains("reopen")
+    ));
 }
 
 #[test]

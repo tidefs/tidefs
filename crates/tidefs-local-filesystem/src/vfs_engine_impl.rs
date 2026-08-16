@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! VfsEngine trait implementation wrapping LocalFileSystem.
+//! VfsEngine trait implementation wrapping PoolDatasetOwner.
 //!
-//! Wraps `LocalFileSystem` in a shared mutex to provide interior mutability,
+//! Wraps `PoolDatasetOwner` in a shared mutex to provide interior mutability,
 //! matching the VfsEngine `&self` contract while allowing other front ends to
 //! take the same Pool owner for bounded operations. Most namespace operations map to
-//! existing LocalFileSystem path-based methods using a lazy inode-to-path
+//! existing PoolDatasetOwner path-based methods using a lazy inode-to-path
 //! resolution layer; hot inode-native operations such as xattrs avoid that
 //! path reconstruction.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 #[cfg(feature = "replication-io")]
@@ -67,7 +67,7 @@ use tidefs_encryption::key_hierarchy::{DatasetDEK, PoolWrappingKey, SALT_LEN};
 use tidefs_encryption::key_manager::{BorrowedKeyStore, KeyManager, KeyRotation};
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 
-use crate::{CopyFileRangeIntent, FileSystemState, LocalFileSystem};
+use crate::{CopyFileRangeIntent, FileSystemState, PoolDatasetOwner, SharedPoolDatasetOwner};
 
 #[cfg(test)]
 const O_RDONLY: u32 = 0;
@@ -125,7 +125,7 @@ fn build_child_path(parent_path: &str, name: &[u8]) -> std::result::Result<Strin
     }
 }
 
-/// Map a LocalFileSystem error to the canonical VFS Errno.
+/// Map a PoolDatasetOwner error to the canonical VFS Errno.
 fn map_errno(err: &FileSystemError) -> Errno {
     match err {
         FileSystemError::NotFound { .. } => Errno::ENOENT,
@@ -152,44 +152,13 @@ fn map_errno(err: &FileSystemError) -> Errno {
 
 // ── VfsLocalFileSystem ────────────────────────────────────────────────────
 
-/// VfsEngine adapter wrapping `LocalFileSystem` with interior mutability.
+/// VfsEngine adapter wrapping `PoolDatasetOwner` with interior mutability.
 ///
 /// Maintains a lazy inode→path cache that bridges the VfsEngine inode
-/// space to LocalFileSystem path space.  The cache is populated by a
+/// space to PoolDatasetOwner path space.  The cache is populated by a
 /// single tree walk from root on first miss and invalidated as needed.
-#[derive(Clone)]
-pub struct SharedLocalFileSystem(Arc<Mutex<LocalFileSystem>>);
-
-impl SharedLocalFileSystem {
-    #[must_use]
-    pub fn new(fs: LocalFileSystem) -> Self {
-        Self(Arc::new(Mutex::new(fs)))
-    }
-
-    #[must_use]
-    pub fn borrow(&self) -> MutexGuard<'_, LocalFileSystem> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[must_use]
-    pub fn borrow_mut(&self) -> MutexGuard<'_, LocalFileSystem> {
-        self.borrow()
-    }
-
-    pub fn into_inner(self) -> LocalFileSystem {
-        match Arc::try_unwrap(self.0) {
-            Ok(filesystem) => filesystem
-                .into_inner()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            Err(_) => panic!("VFS filesystem owner still shared"),
-        }
-    }
-}
-
 pub struct VfsLocalFileSystem {
-    fs: SharedLocalFileSystem,
+    fs: SharedPoolDatasetOwner,
     read_only: bool,
     path_cache: RefCell<BTreeMap<InodeId, String>>,
     file_handle_table: RefCell<FileHandleTable>,
@@ -211,12 +180,12 @@ impl VfsLocalFileSystem {
     const POSIX_ACL_ACCESS_XATTR: &[u8] = b"system.posix_acl_access";
     const POSIX_ACL_DEFAULT_XATTR: &[u8] = b"system.posix_acl_default";
 
-    /// Wrap an open `LocalFileSystem` into a VfsEngine adapter.
-    pub fn new(fs: LocalFileSystem) -> Self {
+    /// Wrap an open `PoolDatasetOwner` into a VfsEngine adapter.
+    pub fn new(fs: PoolDatasetOwner) -> Self {
         let mut path_cache = BTreeMap::new();
         path_cache.insert(ROOT_INODE_ID, "/".to_string());
         Self {
-            fs: SharedLocalFileSystem::new(fs),
+            fs: SharedPoolDatasetOwner::new(fs),
             read_only: false,
             path_cache: RefCell::new(path_cache),
             file_handle_table: RefCell::new(FileHandleTable::new()),
@@ -300,15 +269,15 @@ impl VfsLocalFileSystem {
         cache.insert(ROOT_INODE_ID, self.root_path());
     }
 
-    /// Consume the adapter and return the inner `LocalFileSystem`.
-    pub fn into_inner(self) -> LocalFileSystem {
+    /// Consume the adapter and return the inner `PoolDatasetOwner`.
+    pub fn into_inner(self) -> PoolDatasetOwner {
         self.fs.into_inner()
     }
 
     /// Share the one mounted Pool/filesystem owner with another in-process
     /// front end. Callers must hold the mutex only for one bounded operation.
     #[must_use]
-    pub fn shared_filesystem(&self) -> SharedLocalFileSystem {
+    pub fn shared_pool_owner(&self) -> SharedPoolDatasetOwner {
         self.fs.clone()
     }
 
@@ -336,7 +305,7 @@ impl VfsLocalFileSystem {
     /// Direct inode-ID-based attribute lookup (bypasses path resolution).
     ///
     /// Calls `engine_getattr` on the inner
-    /// [`LocalFileSystem`], resolving the inode through the ARC cache
+    /// [`PoolDatasetOwner`], resolving the inode through the ARC cache
     /// and inode table without converting to a path first.
     ///
     /// This is the preferred entry point for FUSE GETATTR dispatch when
@@ -348,7 +317,7 @@ impl VfsLocalFileSystem {
     /// Direct inode-ID-based attribute mutation (bypasses path resolution).
     ///
     /// Calls `engine_setattr` on the inner
-    /// [`LocalFileSystem`], applying the metadata-only fields of `set`
+    /// [`PoolDatasetOwner`], applying the metadata-only fields of `set`
     /// (mode, uid, gid, timestamps) through the mutation machinery.
     ///
     /// `FATTR_SIZE` is not handled here; the caller is responsible for
@@ -508,7 +477,7 @@ impl VfsLocalFileSystem {
 
     fn parent_record_for_path(
         &self,
-        fs: &LocalFileSystem,
+        fs: &PoolDatasetOwner,
         parent: InodeId,
         parent_path: &str,
     ) -> std::result::Result<InodeRecord, Errno> {
@@ -673,7 +642,7 @@ impl VfsLocalFileSystem {
     }
 
     fn apply_metadata_setattr_to_inode(
-        fs: &mut LocalFileSystem,
+        fs: &mut PoolDatasetOwner,
         inode_id: InodeId,
         attr: &SetAttr,
         size_changed: bool,
@@ -2787,7 +2756,7 @@ impl VfsLocalFileSystem {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
         };
-        let normalized_path = match LocalFileSystem::normalize_snapshot_extract_path(file_path) {
+        let normalized_path = match PoolDatasetOwner::normalize_snapshot_extract_path(file_path) {
             Ok(path) => path,
             Err(err) => {
                 return live_admin_error(
@@ -2926,7 +2895,7 @@ impl VfsLocalFileSystem {
     }
 }
 
-impl SharedLocalFileSystem {
+impl SharedPoolDatasetOwner {
     fn live_pool_get(&self, args: &Value) -> LivePoolAdminResponse {
         let property = match live_admin_arg(args, "property") {
             Ok(value) => value,
@@ -3101,7 +3070,7 @@ impl SharedLocalFileSystem {
                 "pool": pool,
                 "pass": pass,
                 "state_source": "live-owner",
-                "owner_state": "mounted LocalFileSystem",
+                "owner_state": "mounted PoolDatasetOwner",
                 "offline_inputs_ignored": backing_dir_arg.is_some() || device_arg_count > 0,
                 "requested_limits": {
                     "max_records": max_records,
@@ -3179,7 +3148,7 @@ impl SharedLocalFileSystem {
         }
 
         let mut out = format!(
-            "pool integrity-check: {pool}\n  source:        live owner (mounted LocalFileSystem)\n  pass:          {}\n  verifier:      {}\n  roots:         verified={} candidates={} invalid={}\n  objects:       checked={} chunks={}\n  suspect-log:   unresolved={} total={}\n  intent-log:    pending={}\n  statfs:        blocks={} free={} avail={}\n  inodes:        count={} next={}\n  object-store:  live_objects={} live_bytes={} segments={}",
+            "pool integrity-check: {pool}\n  source:        live owner (mounted PoolDatasetOwner)\n  pass:          {}\n  verifier:      {}\n  roots:         verified={} candidates={} invalid={}\n  objects:       checked={} chunks={}\n  suspect-log:   unresolved={} total={}\n  intent-log:    pending={}\n  statfs:        blocks={} free={} avail={}\n  inodes:        count={} next={}\n  object-store:  live_objects={} live_bytes={} segments={}",
             if pass { "yes" } else { "no" },
             verifier.outcome.human_name(),
             verifier.verified_committed_roots.len(),
@@ -3673,7 +3642,7 @@ struct RelocatedContentReceiptReplacement {
     old_manifest_key: ObjectKey,
 }
 
-impl LocalFileSystem {
+impl PoolDatasetOwner {
     /// Complete a mounted device removal without invalidating the exact Pool
     /// receipt generations embedded in content manifests.
     pub(crate) fn complete_mounted_device_removal(
@@ -4029,7 +3998,7 @@ impl LocalFileSystem {
                     self.store.pool_mut(),
                     &snapshot.captured_state,
                     transaction_id,
-                    self.root_authentication_key,
+                    self.filesystem.root_authentication_key,
                 )?;
                 let root_bytes = crate::encoding::encode_root_commit(&signed_root);
                 let source_reference = self.store.prepare_snapshot_source_root(
@@ -4179,7 +4148,7 @@ impl LocalFileSystem {
                         &mut self.store,
                         &filesystem.state,
                         transaction_id,
-                        self.root_authentication_key,
+                        self.filesystem.root_authentication_key,
                         &snapshot_rewrites,
                     )?;
                 self.store.pool_mut().sync_all()?;
@@ -4231,7 +4200,7 @@ impl LocalFileSystem {
                 self.store.pool_mut(),
                 &snapshot.captured_state,
                 transaction_id,
-                self.root_authentication_key,
+                self.filesystem.root_authentication_key,
             )?;
             let root_bytes = crate::encoding::encode_root_commit(&signed_root);
             let source_reference = self.store.prepare_snapshot_source_root(
@@ -4965,7 +4934,7 @@ struct LiveSnapshotEncodedStream {
 #[cfg(feature = "replication-io")]
 fn live_snapshot_send_plan(
     args: &Value,
-    fs: &mut LocalFileSystem,
+    fs: &mut PoolDatasetOwner,
 ) -> Result<LiveSnapshotSendPlan, String> {
     let format = LiveSnapshotSendFormat::parse(args)?;
     let pool_id = live_admin_hex_16_or_default(args, "pool_id")
@@ -5012,7 +4981,7 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
 #[cfg(feature = "replication-io")]
 fn live_snapshot_send_from_root_arg(
     args: &Value,
-    fs: &mut LocalFileSystem,
+    fs: &mut PoolDatasetOwner,
 ) -> Result<CommittedRootSummary, String> {
     let hex = live_admin_arg(args, "from_root")
         .map_err(|_| "snapshot send: --from-root required for incremental live-owner send")?;
@@ -5071,7 +5040,7 @@ fn live_admin_hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(feature = "replication-io")]
 fn live_snapshot_send_export(
-    fs: &mut LocalFileSystem,
+    fs: &mut PoolDatasetOwner,
     plan: &LiveSnapshotSendPlan,
 ) -> crate::Result<LiveSnapshotEncodedStream> {
     let export = match &plan.mode {
@@ -5625,7 +5594,7 @@ impl VfsLocalFileSystem {
         debug_assert_eq!(tick, planned_tick);
         dest_record.data_version = tick;
         dest_record.metadata_version = tick;
-        LocalFileSystem::advance_subtree_revision(&mut dest_record);
+        PoolDatasetOwner::advance_subtree_revision(&mut dest_record);
         if let Err(err) = fs.account_new_file_content(
             dest_fh.inode_id,
             materialized_bytes,
@@ -5642,7 +5611,7 @@ impl VfsLocalFileSystem {
             let dataset_id = DatasetId::from_bytes(fs.mounted_dataset_id);
             let pool_store = fs.store.pool_mut().pool_store_mut();
             let mut content_store = FilesystemContentWriteStore::new(pool_store, dataset_id);
-            let mut dedup = fs.dedup_index.borrow_mut();
+            let mut dedup = fs.filesystem.dedup_index.borrow_mut();
             reflink_chunked_content(
                 dedup_enabled,
                 &mut content_store,
@@ -7465,7 +7434,7 @@ mod tests {
 
     fn temp_fs() -> (VfsLocalFileSystem, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let fs = LocalFileSystem::open(dir.path()).expect("open");
+        let fs = PoolDatasetOwner::open(dir.path()).expect("open");
         (VfsLocalFileSystem::new(fs), dir)
     }
 
@@ -7602,7 +7571,7 @@ mod tests {
         engine.fs.borrow_mut().arm_mutation_reopen_fence();
         drop(engine);
 
-        let reopened = LocalFileSystem::open_with_block_devices(
+        let reopened = PoolDatasetOwner::open_with_block_devices(
             td.path().join("metadata"),
             &devices,
             tidefs_local_object_store::StoreOptions::default(),
@@ -7670,7 +7639,7 @@ mod tests {
         let inode_id;
 
         {
-            let local_fs = LocalFileSystem::open_with_root_authentication_key(
+            let local_fs = PoolDatasetOwner::open_with_root_authentication_key(
                 dir.path(),
                 tidefs_local_object_store::StoreOptions::test_fast(),
                 root_key,
@@ -7697,7 +7666,7 @@ mod tests {
 
         let after_read;
         {
-            let local_fs = LocalFileSystem::open_with_root_authentication_key(
+            let local_fs = PoolDatasetOwner::open_with_root_authentication_key(
                 dir.path(),
                 tidefs_local_object_store::StoreOptions::test_fast(),
                 root_key,
@@ -7733,7 +7702,7 @@ mod tests {
                 .expect("commit read atime");
         }
 
-        let reopened = LocalFileSystem::open_with_root_authentication_key(
+        let reopened = PoolDatasetOwner::open_with_root_authentication_key(
             dir.path(),
             tidefs_local_object_store::StoreOptions::test_fast(),
             root_key,
@@ -7753,7 +7722,7 @@ mod tests {
         let file_name = b"deferred-read-atime.txt";
 
         {
-            let local_fs = LocalFileSystem::open_with_root_authentication_key(
+            let local_fs = PoolDatasetOwner::open_with_root_authentication_key(
                 dir.path(),
                 tidefs_local_object_store::StoreOptions::test_fast(),
                 root_key,
@@ -7777,7 +7746,7 @@ mod tests {
 
         let after_read;
         {
-            let mut local_fs = LocalFileSystem::open_with_root_authentication_key(
+            let mut local_fs = PoolDatasetOwner::open_with_root_authentication_key(
                 dir.path(),
                 tidefs_local_object_store::StoreOptions::test_fast(),
                 root_key,
@@ -7819,7 +7788,7 @@ mod tests {
                 .expect("commit read atime");
         }
 
-        let reopened = LocalFileSystem::open_with_root_authentication_key(
+        let reopened = PoolDatasetOwner::open_with_root_authentication_key(
             dir.path(),
             tidefs_local_object_store::StoreOptions::test_fast(),
             root_key,
@@ -7869,7 +7838,7 @@ mod tests {
         };
         request.args = live_admin_args_from_json(args);
         let response = engine
-            .shared_filesystem()
+            .shared_pool_owner()
             .handle_live_pool_owner_admin_request(&request);
         live_admin_response_to_assertion_json(response)
     }
@@ -7890,7 +7859,7 @@ mod tests {
         };
         request.args = live_admin_args_from_json(args);
         let response = engine
-            .shared_filesystem()
+            .shared_pool_owner()
             .handle_live_pool_owner_admin_request(&request);
         live_admin_response_to_assertion_json(response)
     }
@@ -8000,7 +7969,7 @@ mod tests {
             file.set_len(8 * 1024 * 1024).expect("size device image");
             devices.push(path);
         }
-        let fs = LocalFileSystem::open_with_block_devices(
+        let fs = PoolDatasetOwner::open_with_block_devices(
             metadata,
             &devices,
             tidefs_local_object_store::StoreOptions::default(),
@@ -8016,8 +7985,8 @@ mod tests {
         pool_name: &str,
         policy: tidefs_local_object_store::pool::PoolRedundancyPolicy,
         dataset_path: &str,
-    ) -> LocalFileSystem {
-        LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+    ) -> PoolDatasetOwner {
+        PoolDatasetOwner::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
             metadata,
             pool_name,
             policy,
@@ -8125,7 +8094,7 @@ mod tests {
 
         let request = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolListProps, "tank");
         let owner_response = engine
-            .shared_filesystem()
+            .shared_pool_owner()
             .handle_live_pool_owner_admin_request(&request);
         let owner_value = live_admin_response_to_assertion_json(owner_response);
         assert_eq!(owner_value["ok"], true);
@@ -8186,7 +8155,7 @@ mod tests {
 
         let request = LivePoolAdminRequest::new(LivePoolAdminCommand::DeviceStatus, "tank");
         let owner_response = engine
-            .shared_filesystem()
+            .shared_pool_owner()
             .handle_live_pool_owner_admin_request(&request);
         let owner_value = live_admin_response_to_assertion_json(owner_response);
         assert_eq!(owner_value["ok"], true);
@@ -8305,7 +8274,7 @@ mod tests {
             engine
                 .fs
                 .borrow()
-                .open_volume_dataset("volume0")
+                .open_pool_volume("volume0")
                 .expect("resized volume")
                 .geometry()
                 .capacity_bytes,
@@ -8324,7 +8293,7 @@ mod tests {
                 && text.contains("pending_objects=0")
                 && text.contains("secure_erasure=false")
         }));
-        assert!(engine.fs.borrow().open_volume_dataset("volume0").is_err());
+        assert!(engine.fs.borrow().open_pool_volume("volume0").is_err());
     }
 
     #[test]
@@ -8345,10 +8314,10 @@ mod tests {
 
         {
             let mut fs = engine.fs.borrow_mut();
-            let mut volume = fs.open_volume_dataset("volume0").unwrap();
-            fs.write_volume_blocks(&mut volume, 0, &[0x11; 4096])
+            let mut volume = fs.open_pool_volume("volume0").unwrap();
+            fs.write_pool_volume_blocks(&mut volume, 0, &[0x11; 4096])
                 .unwrap();
-            fs.flush_volume(&mut volume).unwrap();
+            fs.flush_pool_volume(&mut volume).unwrap();
         }
 
         let snapshot = live_snapshot_admin(
@@ -8376,10 +8345,10 @@ mod tests {
 
         {
             let mut fs = engine.fs.borrow_mut();
-            let mut volume = fs.open_volume_dataset("renamed").unwrap();
-            fs.write_volume_blocks(&mut volume, 0, &[0x22; 4096])
+            let mut volume = fs.open_pool_volume("renamed").unwrap();
+            fs.write_pool_volume_blocks(&mut volume, 0, &[0x22; 4096])
                 .unwrap();
-            fs.flush_volume(&mut volume).unwrap();
+            fs.flush_pool_volume(&mut volume).unwrap();
         }
 
         let rollback = live_snapshot_admin(
@@ -8391,8 +8360,8 @@ mod tests {
         assert_eq!(rollback["ok"], true, "rollback response: {rollback}");
         let restored_bytes = {
             let fs = engine.fs.borrow();
-            let volume = fs.open_volume_dataset("renamed").unwrap();
-            fs.read_volume_blocks(&volume, 0, 1).unwrap()
+            let volume = fs.open_pool_volume("renamed").unwrap();
+            fs.read_pool_volume_blocks(&volume, 0, 1).unwrap()
         };
         assert_eq!(restored_bytes, vec![0x11; 4096]);
 
@@ -8466,10 +8435,10 @@ mod tests {
 
         {
             let mut fs = engine.fs.borrow_mut();
-            let mut volume = fs.open_volume_dataset("source").unwrap();
-            fs.write_volume_blocks(&mut volume, 0, &[0x11; 4096])
+            let mut volume = fs.open_pool_volume("source").unwrap();
+            fs.write_pool_volume_blocks(&mut volume, 0, &[0x11; 4096])
                 .unwrap();
-            fs.flush_volume(&mut volume).unwrap();
+            fs.flush_pool_volume(&mut volume).unwrap();
         }
         let snapshot =
             live_snapshot_admin(&engine, "create", json!({"target": "source@base"}), false);
@@ -8508,17 +8477,17 @@ mod tests {
 
         {
             let mut fs = engine.fs.borrow_mut();
-            let source = fs.open_volume_dataset("source").unwrap();
-            let mut clone = fs.open_volume_dataset("clone").unwrap();
+            let source = fs.open_pool_volume("source").unwrap();
+            let mut clone = fs.open_pool_volume("clone").unwrap();
             assert_eq!(
-                fs.read_volume_blocks(&clone, 0, 1).unwrap(),
+                fs.read_pool_volume_blocks(&clone, 0, 1).unwrap(),
                 vec![0x11; 4096]
             );
-            fs.write_volume_blocks(&mut clone, 0, &[0x22; 4096])
+            fs.write_pool_volume_blocks(&mut clone, 0, &[0x22; 4096])
                 .unwrap();
-            fs.flush_volume(&mut clone).unwrap();
+            fs.flush_pool_volume(&mut clone).unwrap();
             assert_eq!(
-                fs.read_volume_blocks(&source, 0, 1).unwrap(),
+                fs.read_pool_volume_blocks(&source, 0, 1).unwrap(),
                 vec![0x11; 4096]
             );
         }
@@ -8540,9 +8509,9 @@ mod tests {
         );
         {
             let fs = engine.fs.borrow();
-            let clone = fs.open_volume_dataset("clone").unwrap();
+            let clone = fs.open_pool_volume("clone").unwrap();
             assert_eq!(
-                fs.read_volume_blocks(&clone, 0, 1).unwrap(),
+                fs.read_pool_volume_blocks(&clone, 0, 1).unwrap(),
                 vec![0x22; 4096]
             );
         }
@@ -8757,7 +8726,7 @@ mod tests {
         assert_eq!(checked["ok"], true, "integrity response: {checked}");
         let report = &checked["json"];
         assert_eq!(report["state_source"], "live-owner");
-        assert_eq!(report["owner_state"], "mounted LocalFileSystem");
+        assert_eq!(report["owner_state"], "mounted PoolDatasetOwner");
         assert_eq!(report["offline_inputs_ignored"], true);
         assert_eq!(report["requested_limits"]["applied"], false);
         assert!(report["filesystem"]["file_count"].as_u64().unwrap_or(0) >= 1);
@@ -9024,7 +8993,7 @@ mod tests {
         }
         drop(engine);
 
-        let reopened = LocalFileSystem::open_with_block_devices(
+        let reopened = PoolDatasetOwner::open_with_block_devices(
             &metadata,
             std::slice::from_ref(&survivor_path),
             tidefs_local_object_store::StoreOptions::default(),
@@ -9108,7 +9077,7 @@ mod tests {
                 .expect("size replacement device image");
         }
         let policy = tidefs_local_object_store::pool::PoolRedundancyPolicy::replicated(2);
-        let mut filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        let mut filesystem = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
             &metadata,
             &old_devices,
             "live-device-replace",
@@ -9154,7 +9123,7 @@ mod tests {
             .sync_all()
             .expect("commit independent replacement file");
         drop(independent);
-        let filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        let filesystem = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
             &metadata,
             &old_devices,
             "live-device-replace",
@@ -9195,7 +9164,7 @@ mod tests {
         );
         drop(engine);
 
-        let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        let reopened = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
             &metadata,
             &[replacement.clone(), old_devices[1].clone()],
             "live-device-replace",
@@ -9240,7 +9209,7 @@ mod tests {
                 .expect("size replacement resume image");
         }
         let policy = tidefs_local_object_store::pool::PoolRedundancyPolicy::replicated(2);
-        let mut filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        let mut filesystem = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
             &metadata,
             &old_devices,
             "live-device-replace-resume",
@@ -9288,7 +9257,7 @@ mod tests {
             .sync_all()
             .expect("commit independent replacement-resume file");
         drop(independent);
-        let mut filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        let mut filesystem = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
             &metadata,
             &old_devices,
             "live-device-replace-resume",
@@ -9321,7 +9290,7 @@ mod tests {
         assert_legacy_device_lifecycle_files_absent(&metadata);
         drop(filesystem);
 
-        let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        let reopened = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
             &metadata,
             &old_devices,
             "live-device-replace-resume",
@@ -9367,7 +9336,7 @@ mod tests {
         }
         drop(engine);
 
-        let reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        let reopened = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
             &metadata,
             &[replacement.clone(), old_devices[1].clone()],
             "live-device-replace-resume",
@@ -9440,7 +9409,7 @@ mod tests {
             .expect("commit independent removal-resume file");
         drop(independent);
         let engine = VfsLocalFileSystem::new(
-            LocalFileSystem::open_with_block_devices(
+            PoolDatasetOwner::open_with_block_devices(
                 &metadata,
                 &devices,
                 tidefs_local_object_store::StoreOptions::default(),
@@ -9545,7 +9514,7 @@ mod tests {
         assert_legacy_device_lifecycle_files_absent(&metadata);
         drop(engine);
 
-        let reopened = LocalFileSystem::open_with_block_devices(
+        let reopened = PoolDatasetOwner::open_with_block_devices(
             &metadata,
             &devices,
             tidefs_local_object_store::StoreOptions::default(),
@@ -9671,7 +9640,7 @@ mod tests {
         );
         let snapshot_metadata = snapshot_root.path().join("metadata");
         drop(snapshot_engine);
-        let mut snapshot_reopened = LocalFileSystem::open_with_block_devices(
+        let mut snapshot_reopened = PoolDatasetOwner::open_with_block_devices(
             &snapshot_metadata,
             std::slice::from_ref(&snapshot_devices[0]),
             tidefs_local_object_store::StoreOptions::default(),
@@ -9780,7 +9749,7 @@ mod tests {
             .expect("commit independent removal file");
         drop(independent);
         let dataset_engine = VfsLocalFileSystem::new(
-            LocalFileSystem::open_with_block_devices(
+            PoolDatasetOwner::open_with_block_devices(
                 &metadata,
                 &dataset_devices,
                 tidefs_local_object_store::StoreOptions::default(),
@@ -9911,7 +9880,7 @@ mod tests {
             crate::snapshot::snapshot_record_dataset_id_for_dataset(record, independent_dataset_id);
         drop(independent);
 
-        let filesystem = LocalFileSystem::open_with_block_devices(
+        let filesystem = PoolDatasetOwner::open_with_block_devices(
             &metadata,
             &devices,
             tidefs_local_object_store::StoreOptions::default(),
@@ -9964,7 +9933,7 @@ mod tests {
     fn live_snapshot_send_exports_from_mounted_pool_owner() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
-        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        let mut fs = PoolDatasetOwner::open(&store).expect("open fs");
         fs.create_file("/live.txt", 0o644).expect("create file");
         fs.write_file("/live.txt", 0, b"live owner snapshot send")
             .expect("write file");
@@ -9999,7 +9968,7 @@ mod tests {
     fn live_snapshot_send_incremental_exports_from_authorized_live_root() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
-        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        let mut fs = PoolDatasetOwner::open(&store).expect("open fs");
         fs.create_file("/base.txt", 0o644).expect("create base");
         fs.write_file("/base.txt", 0, b"base bytes")
             .expect("write base");
@@ -10046,7 +10015,7 @@ mod tests {
     fn live_snapshot_send_incremental_requires_authorized_from_root() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
-        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        let mut fs = PoolDatasetOwner::open(&store).expect("open fs");
         fs.create_file("/live.txt", 0o644).expect("create file");
         fs.write_file("/live.txt", 0, b"live owner snapshot send")
             .expect("write file");
@@ -10127,7 +10096,7 @@ mod tests {
     fn live_snapshot_send_rejects_target_addr_until_remote_admission_is_wired() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
-        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        let mut fs = PoolDatasetOwner::open(&store).expect("open fs");
         fs.create_file("/live.txt", 0o644).expect("create file");
         fs.write_file("/live.txt", 0, b"live owner snapshot send")
             .expect("write file");
@@ -10165,7 +10134,7 @@ mod tests {
     fn live_snapshot_send_rejects_unknown_format_before_exporting() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
-        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        let mut fs = PoolDatasetOwner::open(&store).expect("open fs");
         fs.create_file("/live.txt", 0o644).expect("create file");
         fs.write_file("/live.txt", 0, b"live owner snapshot send")
             .expect("write file");
@@ -10200,7 +10169,7 @@ mod tests {
     fn live_snapshot_extract_reads_snapshot_file_and_output_path() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
-        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        let mut fs = PoolDatasetOwner::open(&store).expect("open fs");
         fs.create_file("/lost.txt", 0o644).expect("create file");
         fs.write_file("/lost.txt", 0, b"snapshot bytes")
             .expect("write file");
@@ -10361,7 +10330,7 @@ mod tests {
         content_capacity_bytes: u64,
     ) -> (VfsLocalFileSystem, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let fs = LocalFileSystem::open_with_allocator_policy(
+        let fs = PoolDatasetOwner::open_with_allocator_policy(
             dir.path(),
             crate::human::local_filesystem::StoreOptions::default(),
             crate::types::LocalStorageAllocatorPolicy::new(content_capacity_bytes, 1_000_000),
@@ -10897,10 +10866,10 @@ mod tests {
     /// Create a temp filesystem with a subdirectory, then wrap it with
     /// with_dataset_root to simulate a per-dataset mount.
     /// The dataset directory is created through the VFS engine so it is
-    /// visible to the LocalFileSystem layer.
+    /// visible to the PoolDatasetOwner layer.
     fn temp_dataset_fs(ds_name: &str) -> (VfsLocalFileSystem, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let fs = LocalFileSystem::open(dir.path()).expect("open");
+        let fs = PoolDatasetOwner::open(dir.path()).expect("open");
         let ds_path = format!("/{ds_name}");
 
         // Create the dataset directory through the VFS engine.
@@ -10913,7 +10882,7 @@ mod tests {
         }
 
         // Re-open and wrap with dataset root.
-        let fs = LocalFileSystem::open(dir.path()).expect("reopen");
+        let fs = PoolDatasetOwner::open(dir.path()).expect("reopen");
         let engine = VfsLocalFileSystem::new(fs).with_dataset_root(&ds_path);
         (engine, dir)
     }
@@ -11017,7 +10986,7 @@ mod tests {
         let root = engine.get_root_inode(&ctx()).unwrap();
 
         // Create a file OUTSIDE the dataset (at pool root)
-        // via direct LocalFileSystem access, then verify it's not visible
+        // via direct PoolDatasetOwner access, then verify it's not visible
         // through the VFS engine.
         let mut fs = engine.fs.borrow_mut();
         fs.create_file("/outside.txt", 0o644)
@@ -11346,7 +11315,7 @@ mod tests {
     #[test]
     fn create_burst_empty_files_stays_metadata_only_until_write() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut fs = LocalFileSystem::open(dir.path()).expect("open");
+        let mut fs = PoolDatasetOwner::open(dir.path()).expect("open");
         fs.set_auto_commit(false)
             .expect("test setup mutation must be admitted");
         fs.set_commit_group_throughput_profile()
@@ -11411,7 +11380,7 @@ mod tests {
         engine.release(&first_fh).unwrap();
         drop(engine);
 
-        let mut reopened = LocalFileSystem::open(dir.path()).unwrap();
+        let mut reopened = PoolDatasetOwner::open(dir.path()).unwrap();
         assert_eq!(reopened.read_file("/perm-001").unwrap(), b"");
         reopened.write_file("/perm-001", 0, b"y").unwrap();
         assert_eq!(reopened.read_file("/perm-001").unwrap(), b"y");
@@ -13679,7 +13648,7 @@ mod tests {
     fn copy_file_range_whole_file_accounts_and_releases_destination_capacity() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_len = crate::constants::content_chunk_size() as usize;
-        let local_fs = LocalFileSystem::open_with_capacity(
+        let local_fs = PoolDatasetOwner::open_with_capacity(
             dir.path(),
             tidefs_local_object_store::StoreOptions::test_fast(),
             (data_len as u64) * 2,
@@ -13795,7 +13764,7 @@ mod tests {
     fn copy_file_range_whole_file_charges_sparse_source_materialized_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let chunk = crate::constants::content_chunk_size() as usize;
-        let local_fs = LocalFileSystem::open_with_capacity(
+        let local_fs = PoolDatasetOwner::open_with_capacity(
             dir.path(),
             tidefs_local_object_store::StoreOptions::test_fast(),
             (chunk as u64) * 5,
@@ -13868,7 +13837,7 @@ mod tests {
     fn copy_file_range_whole_file_publishes_pool_receipts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_len = crate::constants::content_chunk_size() as usize;
-        let local_fs = LocalFileSystem::open_with_capacity(
+        let local_fs = PoolDatasetOwner::open_with_capacity(
             dir.path(),
             tidefs_local_object_store::StoreOptions::test_fast(),
             (data_len as u64) * 3,
@@ -17432,7 +17401,7 @@ mod tests {
     #[test]
     fn xattr_burst_with_deferred_commit_stays_batched_below_threshold() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut fs = LocalFileSystem::open(dir.path()).expect("open");
+        let mut fs = PoolDatasetOwner::open(dir.path()).expect("open");
         fs.set_auto_commit(false)
             .expect("test setup mutation must be admitted");
         fs.set_max_uncommitted_mutations(16 * 1024)
@@ -18297,7 +18266,7 @@ mod tests {
     #[test]
     fn unlink_burst_prunes_removed_cached_paths() {
         let td = tempfile::tempdir().expect("tempdir");
-        let mut fs = LocalFileSystem::open(td.path()).expect("open");
+        let mut fs = PoolDatasetOwner::open(td.path()).expect("open");
         fs.set_auto_commit(false)
             .expect("test setup mutation must be admitted");
         fs.set_commit_group_throughput_profile()
@@ -18887,7 +18856,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create temp root");
-        let local_fs = LocalFileSystem::open_with_root_authentication_key(
+        let local_fs = PoolDatasetOwner::open_with_root_authentication_key(
             &root,
             tidefs_local_object_store::StoreOptions::default(),
             RootAuthenticationKey::demo_key(),

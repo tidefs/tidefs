@@ -464,7 +464,12 @@ fn mounted_capacity_projection_consumes_committed_accounting_not_pool_free_claim
         .expect("write data file");
     fs.sync_all().expect("commit data file");
 
-    let consumed = fs.state.space_accounting.counters().total_consumed_bytes();
+    let consumed = fs
+        .filesystem
+        .state
+        .space_accounting
+        .counters()
+        .total_consumed_bytes();
     assert!(
         consumed > 0,
         "test setup must commit consumed bytes through SpaceAccounting"
@@ -595,7 +600,7 @@ fn stage_probe_file_state(
     bytes: &[u8],
 ) -> (FileSystemState, String, InodeId, Vec<u8>) {
     validate_name(name).expect("probe file name is valid");
-    let mut staged = fs.state.clone();
+    let mut staged = fs.filesystem.state.clone();
     let tick = staged.generation.saturating_add(1).max(1);
     staged.generation = tick;
     let inode_id = staged.allocate_inode_id();
@@ -2063,7 +2068,7 @@ fn zero_length_write_does_not_extend_or_allocate() {
     let record_before = fs.stat("/sparse.bin").expect("stat before");
     let allocator_before = fs.allocator_report().expect("allocator before");
     let space_before = fs.space_counters();
-    let dirty_extent_maps_before = fs.state.dirty_extent_maps.clone();
+    let dirty_extent_maps_before = fs.filesystem.state.dirty_extent_maps.clone();
     let write_buffer_present_before = fs.write_buffers.contains_key(&record_before.inode_id);
     let intent_seq_before = intent_log.current_seq();
 
@@ -2082,7 +2087,10 @@ fn zero_length_write_does_not_extend_or_allocate() {
         allocator_before
     );
     assert_eq!(fs.space_counters(), space_before);
-    assert_eq!(fs.state.dirty_extent_maps, dirty_extent_maps_before);
+    assert_eq!(
+        fs.filesystem.state.dirty_extent_maps,
+        dirty_extent_maps_before
+    );
     assert_eq!(
         fs.write_buffers.contains_key(&record_before.inode_id),
         write_buffer_present_before
@@ -4154,7 +4162,7 @@ fn missing_manifest_newer_root_is_skipped_without_operator_repair() {
     publish_root_commit(
         fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &root_requiring_missing_manifest,
-        fs.root_authentication_key,
+        fs.filesystem.root_authentication_key,
     )
     .expect("publish root commit that requires a missing manifest");
     fs.store
@@ -4586,7 +4594,7 @@ fn uncommitted_transaction_objects_are_ignored_on_reopen() {
     fs.create_dir("/stable", 0o755).expect("create stable dir");
     let committed_generation = fs.stats().filesystem_generation;
 
-    let mut staged = fs.state.clone();
+    let mut staged = fs.filesystem.state.clone();
     let tick = staged.generation.saturating_add(1);
     staged.generation = tick;
     let inode_id = staged.allocate_inode_id();
@@ -5348,7 +5356,7 @@ fn invalid_transaction_manifest_makes_newer_root_candidate_unselectable() {
     publish_root_commit(
         fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &corrupt_root,
-        fs.root_authentication_key,
+        fs.filesystem.root_authentication_key,
     )
     .expect("publish newer root commit");
     fs.store
@@ -5430,7 +5438,7 @@ fn bad_link_count_committed_root_is_skipped_before_mount_without_fsck() {
     fs.sync_all().expect("sync stable state");
     let committed_generation = fs.stats().filesystem_generation;
 
-    let mut bad = fs.state.clone();
+    let mut bad = fs.filesystem.state.clone();
     bad.generation = committed_generation.saturating_add(1);
     let bad_generation = bad.generation;
     let root_inode = Arc::make_mut(&mut bad.inodes)
@@ -5447,7 +5455,7 @@ fn bad_link_count_committed_root_is_skipped_before_mount_without_fsck() {
     publish_root_commit(
         fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &bad_root,
-        fs.root_authentication_key,
+        fs.filesystem.root_authentication_key,
     )
     .expect("publish invalid committed root candidate");
     fs.store
@@ -5484,7 +5492,7 @@ fn unreachable_inode_committed_root_is_skipped_before_mount_without_fsck() {
     fs.sync_all().expect("sync stable state");
     let committed_generation = fs.stats().filesystem_generation;
 
-    let mut bad = fs.state.clone();
+    let mut bad = fs.filesystem.state.clone();
     bad.generation = committed_generation.saturating_add(1);
     let bad_generation = bad.generation;
     let orphan_id = bad.allocate_inode_id();
@@ -5520,7 +5528,7 @@ fn unreachable_inode_committed_root_is_skipped_before_mount_without_fsck() {
     publish_root_commit(
         fs.store.pool_mut().primary_store_mut().raw_store_mut(),
         &bad_root,
-        fs.root_authentication_key,
+        fs.filesystem.root_authentication_key,
     )
     .expect("publish invalid committed root candidate");
     fs.store
@@ -6349,7 +6357,7 @@ fn stage_durable_intent_without_drop(root: &Path, publish_replayed_root: bool) -
         )
         .expect("persist crash fixture intent");
     assert_eq!(reply, IntentLogReplyState::IntentDurable);
-    assert_eq!(fs.intent_log.len(), 1);
+    assert_eq!(fs.filesystem.intent_log.len(), 1);
     assert_eq!(
         IntentLog::load(fs.store.pool().raw_primary_store())
             .expect("reload durable crash fixture intent")
@@ -6358,11 +6366,13 @@ fn stage_durable_intent_without_drop(root: &Path, publish_replayed_root: bool) -
     );
 
     if publish_replayed_root {
-        let root_authentication_key = fs.root_authentication_key;
-        let committed_base = fs.intent_log.pending_entries()[0].root_anchor.clone();
+        let root_authentication_key = fs.filesystem.root_authentication_key;
+        let committed_base = fs.filesystem.intent_log.pending_entries()[0]
+            .root_anchor
+            .clone();
         replay_live_data_with_pool(
-            &fs.intent_log,
-            &mut fs.state,
+            &fs.filesystem.intent_log,
+            &mut fs.filesystem.state,
             fs.store.pool_mut(),
             &committed_base,
         )
@@ -6371,13 +6381,13 @@ fn stage_durable_intent_without_drop(root: &Path, publish_replayed_root: bool) -
             .selected_committed_root_summary()
             .expect("select crash fixture committed root");
         let transaction_id = crate::persistence::next_mounted_commit_transaction_id(
-            fs.state.generation,
+            fs.filesystem.state.generation,
             &previous_root,
         )
         .expect("select crash fixture replay transaction");
         crate::persistence::persist_state_with_pool_at_transaction(
             fs.store.pool_mut(),
-            &fs.state,
+            &fs.filesystem.state,
             transaction_id,
             root_authentication_key,
         )
@@ -6464,15 +6474,15 @@ fn latest_committed_transaction_version_counts(root: &Path) -> (u64, Vec<(Object
 fn intent_log_empty_after_fresh_mount_and_commit() {
     let root = temp_root("intent-log-empty");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
     fs.create_file("/f", 0o644).expect("create");
     fs.write_file("/f", 0, b"hello").expect("write");
     assert!(
-        fs.intent_log.is_empty(),
+        fs.filesystem.intent_log.is_empty(),
         "ordinary buffered writes must not record sync-write intents"
     );
     fs.commit().expect("commit");
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
     cleanup(&root);
 }
 
@@ -6480,18 +6490,18 @@ fn intent_log_empty_after_fresh_mount_and_commit() {
 fn sync_write_intent_appends_and_commit_clears() {
     let root = temp_root("intent-log-append");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
 
     let rec = fs.create_file("/f", 0o644).expect("create");
     let ino = rec.inode_id;
     fs.write_file("/f", 0, b"payload data").expect("write");
     assert!(
-        fs.intent_log.is_empty(),
+        fs.filesystem.intent_log.is_empty(),
         "ordinary write_file stays on the buffered dirty path"
     );
     fs.commit().expect("commit content");
     assert!(
-        fs.intent_log.is_empty(),
+        fs.filesystem.intent_log.is_empty(),
         "committing normal content does not create intent-log raw state"
     );
 
@@ -6500,11 +6510,11 @@ fn sync_write_intent_appends_and_commit_clears() {
         .sync_write_intent(ino, 0, 12, digest, b"payload data")
         .expect("sync_write_intent");
     assert_eq!(reply, IntentLogReplyState::IntentDurable);
-    assert_eq!(fs.intent_log.len(), 1);
+    assert_eq!(fs.filesystem.intent_log.len(), 1);
 
     // Commit clears the intent log
     fs.commit().expect("commit");
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
 
     cleanup(&root);
 }
@@ -6582,9 +6592,9 @@ fn sync_write_intent_replays_after_crash_and_failed_pre_publish_recovery() {
 
     let fs = LocalFileSystem::open_with_options(&root, options())
         .expect("retry recovery after pre-publish failure");
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
     assert!(
-        fs.state.inodes[&fs.lookup("/f").expect("lookup replayed inode")].data_version
+        fs.filesystem.state.inodes[&fs.lookup("/f").expect("lookup replayed inode")].data_version
             > logged_data_version,
         "replay retries must advance beyond occupied interrupted identities"
     );
@@ -6606,29 +6616,29 @@ fn intent_log_clear_persists_across_clean_shutdown() {
         let ino = rec.inode_id;
         fs.write_file("/f", 0, b"data").expect("write");
         assert!(
-            fs.intent_log.is_empty(),
+            fs.filesystem.intent_log.is_empty(),
             "ordinary write_file stays on the buffered dirty path"
         );
         fs.commit().expect("commit content");
         assert!(
-            fs.intent_log.is_empty(),
+            fs.filesystem.intent_log.is_empty(),
             "committing normal content does not create intent-log raw state"
         );
 
         let digest = checksum64(b"data");
         fs.sync_write_intent(ino, 0, 4, digest, b"data")
             .expect("sync_write_intent");
-        assert_eq!(fs.intent_log.len(), 1);
+        assert_eq!(fs.filesystem.intent_log.len(), 1);
 
         // sync_all commits and clears the intent log
         fs.sync_all().expect("sync_all");
-        assert!(fs.intent_log.is_empty());
+        assert!(fs.filesystem.intent_log.is_empty());
     }
 
     {
         let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
         assert!(
-            fs.intent_log.is_empty(),
+            fs.filesystem.intent_log.is_empty(),
             "intent log should remain empty after clean shutdown"
         );
     }
@@ -6671,7 +6681,7 @@ fn published_replay_root_retries_log_clear_without_republishing() {
 
     let fs = LocalFileSystem::open_with_options(&root, options())
         .expect("retry recovery after log-clear failure");
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
     assert_eq!(
         fs.read_file("/f").expect("read already-published payload"),
         INTENT_REPLAY_CRASH_PAYLOAD
@@ -6711,7 +6721,7 @@ fn same_mount_retries_log_clear_after_root_publication_without_replaying_data() 
         payload,
     )
     .expect("append durable data intent");
-    assert_eq!(fs.intent_log.len(), 1);
+    assert_eq!(fs.filesystem.intent_log.len(), 1);
 
     inject_next_intent_log_clear_failure_before_retire();
     let error = fs
@@ -6724,7 +6734,7 @@ fn same_mount_retries_log_clear_after_root_publication_without_replaying_data() 
             ..
         })
     ));
-    assert_eq!(fs.intent_log.len(), 1);
+    assert_eq!(fs.filesystem.intent_log.len(), 1);
     let published_root = fs
         .selected_current_root_summary()
         .expect("select root published before clear failure");
@@ -6732,7 +6742,7 @@ fn same_mount_retries_log_clear_after_root_publication_without_replaying_data() 
 
     fs.commit()
         .expect("same mounted object must retire already-covered intent");
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
     assert_eq!(
         fs.selected_current_root_summary()
             .expect("select root after clear retry"),
@@ -6804,8 +6814,8 @@ fn pool_intent_replay_rejects_wrong_selected_base_root_or_manifest() {
     fs.commit().expect("commit baseline");
 
     let committed_base = committed_intent_base(&mut fs);
-    let base_data_version = fs.state.inodes[&inode_id].data_version;
-    let data_version = next_generation_after(fs.state.generation.max(base_data_version));
+    let base_data_version = fs.filesystem.state.inodes[&inode_id].data_version;
+    let data_version = next_generation_after(fs.filesystem.state.generation.max(base_data_version));
     let mut log = IntentLog::new();
     append_bound_pool_data_intent(
         &mut log,
@@ -6825,16 +6835,23 @@ fn pool_intent_replay_rejects_wrong_selected_base_root_or_manifest() {
         IntegrityDigest64(wrong_manifest.manifest_checksum.0 ^ 0x8000_0000_0000_0000);
 
     for wrong_base in [&wrong_root, &wrong_manifest] {
-        let error =
-            replay_live_data_with_pool(&log, &mut fs.state, fs.store.pool_mut(), wrong_base)
-                .expect_err("replay must reject a different selected committed base");
+        let error = replay_live_data_with_pool(
+            &log,
+            &mut fs.filesystem.state,
+            fs.store.pool_mut(),
+            wrong_base,
+        )
+        .expect_err("replay must reject a different selected committed base");
         assert!(matches!(
             error,
             FileSystemError::CorruptState {
                 reason: "Pool intent replay data is bound to a different committed-base root"
             }
         ));
-        assert_eq!(fs.state.inodes[&inode_id].data_version, base_data_version);
+        assert_eq!(
+            fs.filesystem.state.inodes[&inode_id].data_version,
+            base_data_version
+        );
     }
     assert_eq!(
         fs.read_file("/f").expect("read unchanged baseline"),
@@ -6856,8 +6873,8 @@ fn pool_intent_replay_rejects_wrong_inode_base_data_version() {
     fs.commit().expect("commit baseline");
 
     let committed_base = committed_intent_base(&mut fs);
-    let base_data_version = fs.state.inodes[&inode_id].data_version;
-    let data_version = next_generation_after(fs.state.generation.max(base_data_version));
+    let base_data_version = fs.filesystem.state.inodes[&inode_id].data_version;
+    let data_version = next_generation_after(fs.filesystem.state.generation.max(base_data_version));
     let mut log = IntentLog::new();
     append_bound_pool_data_intent(
         &mut log,
@@ -6870,16 +6887,23 @@ fn pool_intent_replay_rejects_wrong_inode_base_data_version() {
         &committed_base,
     );
 
-    let error =
-        replay_live_data_with_pool(&log, &mut fs.state, fs.store.pool_mut(), &committed_base)
-            .expect_err("replay must reject a false inode predecessor");
+    let error = replay_live_data_with_pool(
+        &log,
+        &mut fs.filesystem.state,
+        fs.store.pool_mut(),
+        &committed_base,
+    )
+    .expect_err("replay must reject a false inode predecessor");
     assert!(matches!(
         error,
         FileSystemError::CorruptState {
             reason: "Pool intent replay inode base data version does not match its predecessor"
         }
     ));
-    assert_eq!(fs.state.inodes[&inode_id].data_version, base_data_version);
+    assert_eq!(
+        fs.filesystem.state.inodes[&inode_id].data_version,
+        base_data_version
+    );
     assert_eq!(
         fs.read_file("/f").expect("read unchanged baseline"),
         b"baseline"
@@ -6900,8 +6924,9 @@ fn pool_intent_replay_applies_sequential_generations_across_unrelated_live_mutat
     fs.commit().expect("commit baseline");
 
     let committed_base = committed_intent_base(&mut fs);
-    let base_data_version = fs.state.inodes[&inode_id].data_version;
-    let first_data_version = next_generation_after(fs.state.generation.max(base_data_version));
+    let base_data_version = fs.filesystem.state.inodes[&inode_id].data_version;
+    let first_data_version =
+        next_generation_after(fs.filesystem.state.generation.max(base_data_version));
     let mut log = IntentLog::new();
     append_bound_pool_data_intent(
         &mut log,
@@ -6919,10 +6944,11 @@ fn pool_intent_replay_applies_sequential_generations_across_unrelated_live_mutat
         .expect("unrelated live mutation")
         .inode_id;
     assert!(
-        fs.state.generation > committed_base.generation,
+        fs.filesystem.state.generation > committed_base.generation,
         "fixture must separate mutable state generation from the committed replay base"
     );
-    let second_data_version = next_generation_after(fs.state.generation.max(first_data_version));
+    let second_data_version =
+        next_generation_after(fs.filesystem.state.generation.max(first_data_version));
     append_bound_pool_data_intent(
         &mut log,
         fs.store.pool_mut(),
@@ -6934,13 +6960,20 @@ fn pool_intent_replay_applies_sequential_generations_across_unrelated_live_mutat
         &committed_base,
     );
 
-    let replayed =
-        replay_live_data_with_pool(&log, &mut fs.state, fs.store.pool_mut(), &committed_base)
-            .expect("replay sequential generations");
+    let replayed = replay_live_data_with_pool(
+        &log,
+        &mut fs.filesystem.state,
+        fs.store.pool_mut(),
+        &committed_base,
+    )
+    .expect("replay sequential generations");
     assert_eq!(replayed, 2);
-    assert_eq!(fs.state.inodes[&inode_id].data_version, second_data_version);
-    assert_eq!(fs.state.generation, second_data_version);
-    assert!(fs.state.inodes.contains_key(&unrelated_inode));
+    assert_eq!(
+        fs.filesystem.state.inodes[&inode_id].data_version,
+        second_data_version
+    );
+    assert_eq!(fs.filesystem.state.generation, second_data_version);
+    assert!(fs.filesystem.state.inodes.contains_key(&unrelated_inode));
     assert_eq!(
         fs.read_file("/f").expect("read sequential replay"),
         b"12cdXYgh"
@@ -6962,7 +6995,7 @@ fn sync_write_intent_marks_state_dirty() {
     // State should be clean after initial commit.
     fs.commit().expect("commit");
     assert!(!fs.has_dirty_metadata());
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
 
     // sync_write_intent must mark the inode dirty.
     let digest = checksum64(b"data");
@@ -6974,11 +7007,11 @@ fn sync_write_intent_marks_state_dirty() {
         fs.has_dirty_metadata(),
         "sync_write_intent must mark state dirty"
     );
-    assert_eq!(fs.intent_log.len(), 1);
+    assert_eq!(fs.filesystem.intent_log.len(), 1);
 
     // Commit must persist state and clear the intent log.
     fs.commit().expect("commit");
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
     assert!(!fs.has_dirty_metadata());
 
     cleanup(&root);
@@ -7000,18 +7033,21 @@ fn do_commit_replays_and_clears_intent_log_when_state_clean() {
     let f_rec = fs.create_file("/f", 0o644).expect("create");
     fs.write_file("/f", 0, b"olddata").expect("write");
     fs.commit().expect("commit write");
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
     assert!(!fs.has_dirty_metadata(), "state must be clean after commit");
 
     // Append an intent log entry directly — no dirty marks from
     // sync_write_intent, simulating a race with a clean commit.
-    fs.intent_log
+    fs.filesystem
+        .intent_log
         .write_next_data_payload(fs.store.pool_mut(), b"payload")
         .expect("write intent payload");
     let root_anchor = committed_intent_base(&mut fs);
-    let base_data_version = fs.state.inodes[&f_rec.inode_id].data_version;
-    let intent_generation = next_generation_after(fs.state.generation.max(base_data_version));
+    let base_data_version = fs.filesystem.state.inodes[&f_rec.inode_id].data_version;
+    let intent_generation =
+        next_generation_after(fs.filesystem.state.generation.max(base_data_version));
     let accepted = fs
+        .filesystem
         .intent_log
         .append(
             fs.store.pool_mut().primary_store_mut().raw_store_mut(),
@@ -7028,13 +7064,13 @@ fn do_commit_replays_and_clears_intent_log_when_state_clean() {
         )
         .expect("append intent");
     assert!(accepted, "intent log append must be accepted");
-    assert_eq!(fs.intent_log.len(), 1);
+    assert_eq!(fs.filesystem.intent_log.len(), 1);
     assert!(!fs.has_dirty_metadata(), "state must still be clean");
 
     // do_commit() must not drop the intent. It replays the log into the
     // state commit, then clears the redundant log records.
     fs.commit().expect("commit while clean");
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
     assert!(!fs.has_dirty_metadata());
     let content = fs.read_file("/f").expect("read replayed content");
     assert_eq!(content, b"payload");
@@ -7053,18 +7089,18 @@ fn do_commit_clears_intent_log_after_state_persist() {
     let f_rec = fs.create_file("/f", 0o644).expect("create");
     fs.write_file("/f", 0, b"committed data").expect("write");
     fs.commit().expect("commit initial content");
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
     assert!(!fs.has_dirty_metadata());
 
     let digest = checksum64(b"committed data");
     fs.sync_write_intent(f_rec.inode_id, 0, 14, digest, b"committed data")
         .expect("sync_write_intent");
-    assert_eq!(fs.intent_log.len(), 1);
+    assert_eq!(fs.filesystem.intent_log.len(), 1);
     assert!(fs.has_dirty_metadata());
 
     // Commit: state is dirty → persist + clear intent log.
     fs.commit().expect("commit");
-    assert!(fs.intent_log.is_empty());
+    assert!(fs.filesystem.intent_log.is_empty());
     assert!(!fs.has_dirty_metadata());
 
     // Data survived the commit.
@@ -8154,7 +8190,7 @@ fn mounted_open_recovery_authority_raw_only_initializes_empty_pool() {
 
     let fs = LocalFileSystem::open_with_options(&root, options())
         .expect("regular open should load authority-initialized pool");
-    assert_eq!(fs.state.generation, 1);
+    assert_eq!(fs.filesystem.state.generation, 1);
 
     cleanup(&root);
 }
@@ -9734,14 +9770,14 @@ fn fsync_file_commits_pending_intent_through_root() {
             .expect("sync_write_intent");
         assert_eq!(reply, IntentLogReplyState::IntentDurable);
         assert!(
-            !fs.intent_log.is_empty(),
+            !fs.filesystem.intent_log.is_empty(),
             "intent log should have entries after sync_write_intent"
         );
 
         fs.fsync_file("/data.bin").expect("fsync_file");
 
         assert!(
-            fs.intent_log.is_empty(),
+            fs.filesystem.intent_log.is_empty(),
             "committed intent entries should be cleared after root publication"
         );
         assert!(
@@ -9760,7 +9796,7 @@ fn fsync_file_commits_pending_intent_through_root() {
             "written data should survive through the committed root"
         );
         assert!(
-            fs.intent_log.is_empty(),
+            fs.filesystem.intent_log.is_empty(),
             "intent log should be empty after mount replay"
         );
     }
@@ -9780,12 +9816,12 @@ fn fsync_file_falls_back_to_do_commit_when_no_intents_pending() {
         fs.create_file("/data.bin", 0o644).expect("create");
         fs.write_file("/data.bin", 0, content).expect("write");
         // No sync_write_intent called — intent log has no entries for this inode.
-        assert!(fs.intent_log.is_empty());
+        assert!(fs.filesystem.intent_log.is_empty());
 
         fs.fsync_file("/data.bin").expect("fsync_file fallback");
 
         // After full commit, intent log is empty and state is clean.
-        assert!(fs.intent_log.is_empty());
+        assert!(fs.filesystem.intent_log.is_empty());
         assert!(
             !fs.is_state_dirty(),
             "state should be clean after do_commit fallback"
@@ -9818,14 +9854,14 @@ fn fsync_data_only_takes_fast_path_when_intents_pending() {
         fs.sync_write_intent(ino, 0, content.len() as u64, digest, content)
             .expect("sync_write_intent");
 
-        assert!(!fs.intent_log.is_empty());
+        assert!(!fs.filesystem.intent_log.is_empty());
         assert!(fs.is_state_dirty());
 
         fs.fsync_data_only().expect("fsync_data_only fast path");
 
         // Fast path flushed intent log but did NOT clear it or clean state.
         assert!(
-            !fs.intent_log.is_empty(),
+            !fs.filesystem.intent_log.is_empty(),
             "intent log NOT cleared by fast path"
         );
         assert!(fs.is_state_dirty(), "state still dirty after fast path");
@@ -9862,8 +9898,8 @@ fn fsync_directory_commits_pending_namespace_intent_through_root() {
         // This simulates what would happen during mkdir/unlink/rename
         // operations that go through the namespace fast path.
         let root_anchor = IntentLogRootAnchor {
-            transaction_id: fs.state.generation.max(1),
-            generation: fs.state.generation,
+            transaction_id: fs.filesystem.state.generation.max(1),
+            generation: fs.filesystem.state.generation,
             manifest_checksum: IntegrityDigest64(0),
         };
         let timestamp_ns = std::time::SystemTime::now()
@@ -9871,6 +9907,7 @@ fn fsync_directory_commits_pending_namespace_intent_through_root() {
             .unwrap_or_default()
             .as_nanos() as u64;
         let accepted = fs
+            .filesystem
             .intent_log
             .append(
                 fs.store.pool_mut().primary_store_mut().raw_store_mut(),
@@ -9886,14 +9923,16 @@ fn fsync_directory_commits_pending_namespace_intent_through_root() {
         assert!(accepted, "namespace intent should be accepted");
 
         assert!(
-            fs.intent_log.has_pending_namespace_for_dir(dir_ino),
+            fs.filesystem
+                .intent_log
+                .has_pending_namespace_for_dir(dir_ino),
             "should detect pending namespace intent for dir"
         );
 
         fs.fsync_directory("/mydir").expect("fsync_directory");
 
         assert!(
-            fs.intent_log.is_empty(),
+            fs.filesystem.intent_log.is_empty(),
             "committed namespace intents should be cleared after root publication"
         );
         assert!(
@@ -9907,7 +9946,7 @@ fn fsync_directory_commits_pending_namespace_intent_through_root() {
         assert_eq!(file.inode_id, file_ino);
         assert_eq!(file.kind(), NodeKind::File);
         assert!(
-            fs.intent_log.is_empty(),
+            fs.filesystem.intent_log.is_empty(),
             "reopen should not require namespace intent replay"
         );
     }
@@ -10011,7 +10050,7 @@ fn admission_check_write_exceeding_quota_is_rejected() {
     let root = temp_root("admit_quota_reject");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/test", 0o644).expect("create file");
-    fs.state.quota_table.set_quota(
+    fs.filesystem.state.quota_table.set_quota(
         ROOT_INODE_ID,
         QuotaConfig {
             hard_limit_bytes: 256,
@@ -10063,7 +10102,7 @@ fn admission_check_sparse_truncate_expand_does_not_charge_quota() {
     let root = temp_root("admit_trunc_expand");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/test", 0o644).expect("create file");
-    fs.state.quota_table.set_quota(
+    fs.filesystem.state.quota_table.set_quota(
         ROOT_INODE_ID,
         QuotaConfig {
             hard_limit_bytes: crate::quota::allocation_grains_for_len(64),
@@ -10883,10 +10922,10 @@ fn block_device_mounted_diagnostics_reject_receiptless_raw_substitute() {
     let committed = commit_off_primary_file_version(&mut fs, "receiptless-diagnostic");
     stage_receiptless_raw_object_substitute(&mut fs, committed.key);
 
-    let generation_before = fs.state.generation;
-    let inodes_before = Arc::clone(&fs.state.inodes);
-    let directories_before = Arc::clone(&fs.state.directories);
-    let snapshots_before = fs.state.snapshots.clone();
+    let generation_before = fs.filesystem.state.generation;
+    let inodes_before = Arc::clone(&fs.filesystem.state.inodes);
+    let directories_before = Arc::clone(&fs.filesystem.state.directories);
+    let snapshots_before = fs.filesystem.state.snapshots.clone();
     let receipts_before = fs
         .store
         .pool()
@@ -10952,10 +10991,13 @@ fn block_device_mounted_diagnostics_reject_receiptless_raw_substitute() {
         .expect_err("receiptless content must not authorize capacity growth");
     assert!(growth_error.to_string().contains("receipt"));
 
-    assert_eq!(fs.state.generation, generation_before);
-    assert_eq!(fs.state.inodes.as_ref(), inodes_before.as_ref());
-    assert_eq!(fs.state.directories.as_ref(), directories_before.as_ref());
-    assert_eq!(fs.state.snapshots, snapshots_before);
+    assert_eq!(fs.filesystem.state.generation, generation_before);
+    assert_eq!(fs.filesystem.state.inodes.as_ref(), inodes_before.as_ref());
+    assert_eq!(
+        fs.filesystem.state.directories.as_ref(),
+        directories_before.as_ref()
+    );
+    assert_eq!(fs.filesystem.state.snapshots, snapshots_before);
     assert_eq!(
         fs.store
             .pool()
@@ -13027,11 +13069,11 @@ fn error_rollback_after_create_dir_leaves_no_leaked_inode() {
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/target", 0o644)
         .expect("create file at conflict path");
-    let inode_count_before = fs.state.inodes.len();
-    let dir_count_before = fs.state.directories.len();
+    let inode_count_before = fs.filesystem.state.inodes.len();
+    let dir_count_before = fs.filesystem.state.directories.len();
     assert!(fs.create_dir("/target", 0o755).is_err());
-    assert_eq!(fs.state.inodes.len(), inode_count_before);
-    assert_eq!(fs.state.directories.len(), dir_count_before);
+    assert_eq!(fs.filesystem.state.inodes.len(), inode_count_before);
+    assert_eq!(fs.filesystem.state.directories.len(), dir_count_before);
     assert!(fs.stat_path("/target").is_ok());
     cleanup(&root);
 }
@@ -13042,11 +13084,11 @@ fn error_rollback_after_create_file_leaves_no_leaked_inode() {
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_dir("/existing", 0o755)
         .expect("create dir at conflict path");
-    let inode_count_before = fs.state.inodes.len();
-    let dir_count_before = fs.state.directories.len();
+    let inode_count_before = fs.filesystem.state.inodes.len();
+    let dir_count_before = fs.filesystem.state.directories.len();
     assert!(fs.create_file("/existing", 0o644).is_err());
-    assert_eq!(fs.state.inodes.len(), inode_count_before);
-    assert_eq!(fs.state.directories.len(), dir_count_before);
+    assert_eq!(fs.filesystem.state.inodes.len(), inode_count_before);
+    assert_eq!(fs.filesystem.state.directories.len(), dir_count_before);
     assert!(fs.stat_path("/existing").is_ok());
     cleanup(&root);
 }
@@ -13058,12 +13100,15 @@ fn error_rollback_after_link_file_leaves_no_partial_state() {
     fs.create_file("/source", 0o644).expect("create source");
     let source_inode_id = fs.lookup("/source").expect("lookup source");
     let source_nlink_before = fs.stat_path("/source").unwrap().nlink;
-    let inode_count_before = fs.state.inodes.len();
-    let dir_count_before = fs.state.directories.len();
+    let inode_count_before = fs.filesystem.state.inodes.len();
+    let dir_count_before = fs.filesystem.state.directories.len();
     fs.create_file("/existing", 0o644).expect("create existing");
     assert!(fs.link_file("/source", "/existing").is_err());
-    assert_eq!(fs.state.inodes.len(), inode_count_before.saturating_add(1));
-    assert_eq!(fs.state.directories.len(), dir_count_before);
+    assert_eq!(
+        fs.filesystem.state.inodes.len(),
+        inode_count_before.saturating_add(1)
+    );
+    assert_eq!(fs.filesystem.state.directories.len(), dir_count_before);
     let source_after = fs.stat_path("/source").unwrap();
     assert_eq!(source_after.nlink, source_nlink_before);
     assert_eq!(source_after.inode_id, source_inode_id);
@@ -13355,6 +13400,7 @@ fn feature_flag_mount_gate_refuses_data_policy_without_build_feature() {
         // that the default mount path also refuses it rather than silently
         // treating the feature as available.
         let roots = fs
+            .filesystem
             .feature_flags
             .persist(fs.store.pool_mut())
             .expect("persist test fixture feature tree");
@@ -13448,14 +13494,14 @@ fn feature_flag_mount_gate_known_features_succeeds() {
             .expect("access feature flags")
             .enable_feature(name.clone(), FeatureClass::RoCompat)
             .expect("enable known feature");
-        assert!(fs.feature_flags().is_enabled(&name));
+        assert!(fs.filesystem.feature_flags().is_enabled(&name));
         fs.persist_feature_flags().expect("persist");
     }
     // Re-open must succeed — compression_zstd is in SupportedFeaturesV1::current().
     let fs =
         LocalFileSystem::open_with_options(&root, options()).expect("re-open with known feature");
     let name = FeatureName::from_str(FEATURE_COMPRESSION_ZSTD).unwrap();
-    assert!(fs.feature_flags().is_enabled(&name));
+    assert!(fs.filesystem.feature_flags().is_enabled(&name));
     cleanup(&root);
 }
 

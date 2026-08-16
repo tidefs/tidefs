@@ -44,8 +44,11 @@ The selected first architecture is one foreground owner process reached through
    does not own filesystem transaction replay.
 3. `tidefs-local-object-store::Pool` is the only durable object/device I/O
    authority below the filesystem.
-4. One focused Pool-backed authority in `tidefs-local-filesystem` owns
-   transaction publication, committed-root selection, replay, and reopen.
+4. One `PoolDatasetOwner` in `tidefs-local-filesystem` owns the already-open
+   `PoolRuntime` beside one `FilesystemDatasetEngine` under a single
+   `SharedPoolDatasetOwner` lock. The runtime owns catalog/typed-root
+   publication; the filesystem engine owns its transaction state, committed
+   filesystem-root selection, replay, and reopen semantics.
 5. The dataset-scoped inode authority selected by
    `docs/INODE_NAMESPACE_AUTHORITY.md` owns durable dataset, root inode, inode,
    and directory identity. The selected mounted carrier does not attach a
@@ -54,21 +57,23 @@ The selected first architecture is one foreground owner process reached through
    inode-table state may remain only for a distinct consumer or derived
    reference projection.
 6. `VfsLocalFileSystem` is the mounted semantic authority. It translates VFS
-   operations into the durable filesystem owner without another namespace or
-   recovery decision.
+   operations into the filesystem dataset engine through the shared Pool
+   owner without another namespace, Pool runtime, or recovery decision.
 7. `FuseVfsAdapter` is a thin kernel projection. It owns FUSE handles, lookup
    references, cache projection, replies, and unmount integration, but no
    durable inode, namespace, root, or transaction truth.
 8. The live-owner endpoint projects status and bounded administration from the
-   same already-open mounted owner. Pool properties, live integrity, and device
-   status/removal/replacement call its shared `LocalFileSystem` handle directly
-   instead of using VFS dispatch. The endpoint is not a second store opener.
+   same already-open `SharedPoolDatasetOwner`. Pool properties, live integrity,
+   and device status/removal/replacement use that neutral handle directly
+   instead of VFS dispatch. Mounted block I/O borrows its `PoolRuntime`
+   directly for each bounded operation. The endpoint is not a second store
+   opener.
 
 The selected carrier path is:
 
 `tidefsctl pool create` -> `tidefsctl pool mount --devices` -> pool label/import
-admission -> `run_mount` -> `LocalFileSystem` -> `VfsLocalFileSystem` ->
-`FuseVfsAdapter` -> mounted path.
+admission -> `run_mount` -> `PoolDatasetOwner` -> `FilesystemDatasetEngine` ->
+`VfsLocalFileSystem` -> `FuseVfsAdapter` -> mounted path.
 
 Clean shutdown drains and commits the VFS engine, unmounts and joins the FUSE
 session, exports the pool labels, and then removes the live-owner endpoint.
@@ -106,10 +111,10 @@ The selected dependency and authority direction is:
    frontier, pin/drain state, and orderly close. This boundary is factored from
    the proven Pool-backed publication and recovery machinery currently
    concentrated in `tidefs-local-filesystem`; it is not a parallel engine.
-4. A filesystem dataset engine owns inode, directory, extent, POSIX metadata,
-   and filesystem snapshot semantics for one `DatasetId`. The existing
-   `LocalFileSystem` and `VfsLocalFileSystem` are the implementation source to
-   separate around this boundary. FUSE remains a projection.
+4. `FilesystemDatasetEngine` owns inode, directory, extent, POSIX metadata,
+   and filesystem snapshot semantics for one `DatasetId`. It is physically
+   separate from `PoolRuntime` inside `PoolDatasetOwner`; `VfsLocalFileSystem`
+   and FUSE remain projections of that engine.
 5. A volume dataset engine owns exact logical capacity, logical and physical
    block geometry, sparse block extents, read/write, flush/FUA ordering,
    discard, resize, and volume snapshot semantics for one `DatasetId`. It uses
@@ -121,8 +126,10 @@ The selected dependency and authority direction is:
    and fencing epochs, placement, replication, handoff, and recovery. It does
    not define a second catalog, dataset format, object store, or local hot path.
 
-`Pool` is therefore too low to own the catalog, while `LocalFileSystem` is too
-filesystem-specific to remain its owner. `tidefs-dataset-lifecycle` is an
+`Pool` is therefore too low to own the catalog, while a filesystem engine is
+too specific to own it. `PoolDatasetOwner` now holds that authority in
+`PoolRuntime` beside, not inside, its filesystem engine.
+`tidefs-dataset-lifecycle` is an
 in-memory lifecycle/model layer and is not the durable pool runtime. The
 shared runtime belongs between raw `Pool` and the filesystem/volume engines;
 its first implementation should extract existing authority rather than add a
@@ -231,10 +238,11 @@ tidefsctl block attach <pool>/<volume>
 The logical block size may have a documented default, but capacity is required
 and exact; neither may be synthesized by the adapter. A pool may own mounted
 filesystems and block exports concurrently, but all front ends attach to the
-same neutral pool owner. The current mounted VFS live owner must be lifted to
-that pool owner instead of teaching `VfsLocalFileSystem` to serve
-`BlockAttach`. Conversely, a standalone local block export must be able to own
-and import a pool without mounting a filesystem.
+same neutral pool owner. The mounted live owner is `SharedPoolDatasetOwner`;
+`BlockAttach` passes that handle to `PoolVolumeBackend`, whose bounded data
+operations borrow `PoolRuntime` directly instead of calling
+`VfsLocalFileSystem` or a filesystem-shaped volume bridge. A standalone local
+block export can still own and import a pool without mounting a filesystem.
 
 ### Local And Clustered Composition
 
@@ -273,10 +281,10 @@ flush/FUA continuity.
   semantics; low-level ublk control/data-queue code; and cluster membership,
   fencing, placement, replication, and transport code with demonstrated
   runtime consumers.
-- **Consolidate:** catalog persistence and pool-wide properties out of
-  `LocalFileSystem` into the shared runtime; mounted live-owner routing into a
-  neutral pool owner; and capacity, pin, reclaim, transaction, and teardown
-  decisions currently duplicated by front ends. Any future clustered dataset
+- **Consolidate:** keep catalog persistence and pool-wide properties in
+  `PoolRuntime`, and keep mounted live-owner and block routing on the one
+  `SharedPoolDatasetOwner`; continue consolidating capacity, pin, reclaim,
+  transaction, and teardown decisions duplicated by front ends. Any future clustered dataset
   lifecycle must mutate the real durable `PoolRuntime` catalog under committed
   lease and fence authority; clustered mode must not introduce a mirror or an
   opaque membership payload as a second catalog authority.
@@ -317,12 +325,12 @@ device launch, or second directory/file backend does not satisfy the slice.
 |---|---|---|---|
 | Create | `apps/tidefsctl/src/commands/pool.rs`, `crates/tidefs-pool-import/src/create.rs` | Writes dual labels plus initial fixed-region VBCR/VRBT bootstrap state and leaves the pool exported. | Keep label/bootstrap creation; stop treating the fixed-region root as mounted filesystem state authority. |
 | Import for mount | `apps/tidefsctl/src/commands/mount.rs`, `crates/tidefs-pool-import/src/lib.rs` | Selects the highest complete redundant label family, validates exact topology-roster and lifecycle agreement plus feature, encryption, and pool-state agreement; acquires the exact import lock; opens devices at the selected copy offsets; activates writable ownership without dropping label extensions; reports removal state; and retains matching export/release. It does not select a fixed-region root, apply `min_epoch`, replay transactions, mount a placeholder namespace, or initialize VRBT. | Keep as mounted device admission only. Pool-backed filesystem root selection and replay belong below `run_mount`; full explicit `pool_import` retains its separate recovery behavior. |
-| Carrier open | `apps/tidefs-posix-filesystem-adapter-daemon/src/lib.rs::run_mount` | Opens `LocalFileSystem` on the runtime metadata directory plus the devices, resolves the dataset, applies the selected sync, timestamp, capacity, writeback, maintenance, transform, and validation controls, wraps the one VFS/FUSE session, and publishes a live owner. | This is the only local mount runtime implementation. |
+| Carrier open | `apps/tidefs-posix-filesystem-adapter-daemon/src/lib.rs::run_mount` | Opens `PoolDatasetOwner` on the runtime metadata directory plus the devices, resolves the filesystem dataset, applies the selected sync, timestamp, capacity, writeback, maintenance, transform, and validation controls, shares it through one `SharedPoolDatasetOwner`, wraps the filesystem projection in the one VFS/FUSE session, and publishes that same owner live. | This is the only local mount runtime implementation. |
 | Object authority | `crates/tidefs-local-object-store/src/pool/mod.rs` | Opens the same labeled devices as a `Pool`, owns placement/device I/O, and persists object records and pool labels. | Keep as the only object/device I/O authority. |
 | Filesystem root/recovery | `crates/tidefs-local-filesystem/src/{lib,recovery}.rs` | Selects Pool-backed root-slot records, validates content through Pool receipts, replays intent and commit-group state, and constructs live filesystem state. | Keep and focus as the single mounted transaction/root/recovery authority. |
-| Dataset/inode/namespace | `FileSystemState`, `DatasetInodeAuthority`, FUSE maps | Local-filesystem owns durable dataset, root, inode, and directory state. `VfsLocalFileSystem` has no second inode projection, and the selected adapter has no second namespace attachment. FUSE lookup/forget references remain adapter-local maps. The former standalone namespace and inode-table packages plus their validation-only or duplicate persistence tests had no mounted consumer and were removed. | Keep every durable decision in the dataset authority; keep kernel-reference state as an adapter-local derived projection. |
+| Dataset/inode/namespace | `FilesystemDatasetEngine`, `FileSystemState`, `DatasetInodeAuthority`, FUSE maps | The filesystem engine owns durable dataset, root, inode, and directory state beside the neutral `PoolRuntime`. `VfsLocalFileSystem` has no second inode projection, and the selected adapter has no second namespace attachment. FUSE lookup/forget references remain adapter-local maps. The former standalone namespace and inode-table packages plus their validation-only or duplicate persistence tests had no mounted consumer and were removed. | Keep every durable decision in the dataset authority; keep kernel-reference state as an adapter-local derived projection. |
 | VFS/FUSE | `vfs_engine_impl.rs`, `fuse_vfs_adapter.rs` | VFS calls local-filesystem for lookup and mutation semantics. The adapter projects engine results, handles, lookup references, caches, replies, and FUSE lifecycle without another namespace owner, merged directory view, or mutation fallback. | Keep VFS as the semantic owner and FUSE as a derived kernel transport projection. |
-| Status/admin | `live_owner.rs`, `apps/tidefsctl/src/commands/live_owner.rs` | The owner socket delegates filesystem-specific live work to the mounted engine and refuses reopening active devices behind it. Pool get/set/list-properties/integrity and device status/removal/replacement bypass VFS dispatch through the existing shared mounted `LocalFileSystem` owner. For bounded present-member removal/replacement, that one owner uses its neutral `PoolRuntime` to authenticate every active filesystem root and every data-retaining snapshot-table root owned by those filesystems, copy-on-write relocated current and captured content manifests, durably queue predecessor manifests, and publish each filesystem state plus all of its changed typed snapshot roots before topology publication. Versioned checksummed label lifecycle records, not runtime-directory side files, bind the Pool/member GUID authority needed to resume before receipt recovery. | Keep and thin; status must describe the same imported Pool and root selected for mounted I/O. The shared mounted handle itself still must be lifted into the neutral Pool dataset owner; the direct route is not authority for a second runtime. |
+| Status/admin | `live_owner.rs`, `apps/tidefsctl/src/commands/live_owner.rs` | The owner socket delegates filesystem-specific live work to the mounted engine and refuses reopening active devices behind it. Pool get/set/list-properties/integrity and device status/removal/replacement bypass VFS dispatch through `SharedPoolDatasetOwner`. Mounted block open/read/write/zero/flush also lock that same owner for one operation and use its `PoolRuntime` directly. For bounded present-member removal/replacement, that runtime authenticates every active filesystem root and every data-retaining snapshot-table root owned by those filesystems, copy-on-write relocates current and captured content manifests, durably queues predecessor manifests, and publishes each filesystem state plus all of its changed typed snapshot roots before topology publication. Versioned checksummed label lifecycle records, not runtime-directory side files, bind the Pool/member GUID authority needed to resume before receipt recovery. | Keep and thin; status and every attached carrier must describe and mutate the same imported Pool and canonical root. Do not add another runtime or filesystem-shaped Pool forwarding surface. |
 | Shutdown/export | `run_mount`, `fuser::BackgroundSession::join`, adapter `destroy`, `pool_export`, live-owner `stop` | `join` drops the mount first; adapter destroy drains/syncs; labels export afterward; endpoint cleanup is last. | Preserve this order and make every failure explicit to the operator. |
 
 ## System-Level Shape
@@ -424,7 +432,8 @@ is architectural scoping for source owners, not current product admission.
 
 The clustered POSIX LOCK boundary separates local in-process FUSE/VFS lock
 dispatch from clustered forwarding admitted through committed clustered-mount
-authority. Local POSIX uses `LocalFileSystem`, `FuseVfsAdapter::new`, and
+authority. Local POSIX uses the `PoolDatasetOwner` filesystem projection,
+`FuseVfsAdapter::new`, and
 `DaemonLockDispatch`; it must not open cluster LOCK transport or derive lock
 authority from membership services. Clustered POSIX lock forwarding is admitted
 through `ClusteredPosixMountRuntime::open_committed_mount(...)`, which supplies
