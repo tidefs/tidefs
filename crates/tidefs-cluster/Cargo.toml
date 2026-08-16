@@ -18,7 +18,6 @@ bincode = { workspace = true }
 blake3 = { version = "1", default-features = false }
 thiserror = "2"
 tidefs-types-pool-label-core = { workspace = true }
-tidefs-dataset-catalog = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 tracing = { workspace = true }
 tidefs-membership-epoch = { workspace = true }

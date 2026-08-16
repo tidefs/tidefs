@@ -242,12 +242,7 @@ pub struct CommitCoordinatorTransportBridge<'a> {
     collector: Arc<Mutex<Option<Arc<AckCollector>>>>,
     /// Milliseconds-since-epoch clock for timestamping.
     clock_ms: Box<dyn Fn() -> u64 + Send>,
-    /// Optional handler for committed catalog deltas.
-    /// Called during [`on_epoch_committed`] with raw catalog_delta_bytes.
-    catalog_delta_handler: Option<CatalogDeltaHandler>,
 }
-
-type CatalogDeltaHandler = Box<dyn FnMut(&[u8]) + Send>;
 
 impl<'a> CommitCoordinatorTransportBridge<'a> {
     /// Create a new bridge.
@@ -264,24 +259,12 @@ impl<'a> CommitCoordinatorTransportBridge<'a> {
                 // production replaces this with a real clock.
                 0
             }),
-            catalog_delta_handler: None,
         }
     }
 
     /// Replace the clock function (useful for tests).
     pub fn with_clock(mut self, clock_ms: Box<dyn Fn() -> u64 + Send>) -> Self {
         self.clock_ms = clock_ms;
-        self
-    }
-
-    /// Set a handler for committed catalog deltas.
-    ///
-    /// When a proposal carrying a catalog delta is committed, this handler
-    /// is called with the raw `catalog_delta_bytes` so the application can
-    /// deserialize and apply the delta through the pool-scoped catalog.
-    /// The handler is called during [`on_epoch_committed`].
-    pub fn with_catalog_delta_handler(mut self, handler: CatalogDeltaHandler) -> Self {
-        self.catalog_delta_handler = Some(handler);
         self
     }
 
@@ -373,7 +356,6 @@ impl<'a> tidefs_membership_epoch::EpochTransitionOps for CommitCoordinatorTransp
             resulting_members: proposal.resulting_members.clone(),
             proposal_hash: proposal.blake3_hash,
             submitted_at_millis: self.now_ms(),
-            catalog_delta_bytes: proposal.catalog_delta_bytes.clone(),
         };
 
         // Broadcast to all active roster peers via transport.
@@ -404,19 +386,10 @@ impl<'a> tidefs_membership_epoch::EpochTransitionOps for CommitCoordinatorTransp
         // the actual timeout logic, so this is intentionally minimal.
     }
 
-    fn on_epoch_committed(&mut self, result: &EpochTransitionResult) {
+    fn on_epoch_committed(&mut self, _result: &EpochTransitionResult) {
         // Clear the current proposal's ack collector.
         let mut guard = self.collector.lock().unwrap();
         *guard = None;
-
-        // Apply any catalog delta carried by the committed proposal.
-        if let Some(ref bytes) = result.proposal.catalog_delta_bytes {
-            if let Some(ref mut handler) = self.catalog_delta_handler {
-                handler(bytes);
-            }
-            // No handler configured: delta is silently skipped here;
-            // it will be applied via the EpochCommitBus subscriber path.
-        }
     }
 
     fn on_timeout(&mut self) {
@@ -599,7 +572,6 @@ mod tests {
                 delta: MembershipDelta::NodeJoined(2),
                 resulting_members: vec![1, 2],
                 blake3_hash: [0xABu8; 32],
-                catalog_delta_bytes: None,
             },
             approvals: 1,
             responses: 1,
@@ -631,7 +603,6 @@ mod tests {
             delta: MembershipDelta::NodeJoined(2),
             resulting_members: vec![1, 2],
             blake3_hash: [0xABu8; 32],
-            catalog_delta_bytes: None,
         };
         bridge.broadcast_proposal(&proposal);
         // Collector should exist after broadcast

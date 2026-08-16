@@ -366,7 +366,6 @@ mod tests {
             roster_hash: roster.roster_hash,
             member_ids: roster.member_ids.clone(),
             commit_index: epoch, // simplified
-            catalog_delta_bytes: None,
         }
     }
 

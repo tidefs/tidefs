@@ -226,7 +226,6 @@ mod tests {
             roster_hash: mk_roster(7, vec![10, 20]).roster_hash,
             member_ids: vec![10, 20],
             commit_index: 1,
-            catalog_delta_bytes: None,
         });
 
         let r = ca.current_roster().unwrap();

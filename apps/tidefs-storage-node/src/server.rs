@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use tidefs_auth::NodeKeyStore;
 use tidefs_cluster::placement_heal::RelocationFlowCommitPlacementPublication;
 use tidefs_cluster::pool_protocol::{
-    CatalogEntryRow, ClusterPoolCatalogDeltaResponse, ClusterPoolCatalogQueryResponse,
     ClusterPoolCreateResponse, ClusterPoolImportResponse, ClusterPoolLeaseAction,
     ClusterPoolLeaseResponse, ClusterPoolMessage, ClusterPoolOwnerObservationResponse,
 };
@@ -2952,7 +2951,7 @@ struct SessionContext {
     pool_owner_lease_checkpoint: Option<Arc<PoolOwnerLeaseCheckpointStore>>,
     /// Split-brain guard for partition-based fencing of write operations.
     /// When set and the node is on the minority side of a partition,
-    /// write-gating operations (import, catalog mutations, lease grants)
+    /// write-gating operations (create, import, and lease grants)
     /// are refused with a typed MinorityFenced error before they hit storage.
     split_brain_guard: Option<Arc<Mutex<SplitBrainGuard>>>,
 }
@@ -4099,7 +4098,7 @@ impl StorageNode {
     /// TransportReplicatedStore's Control/Data/Shadow session families) to
     /// complete handshake against this storage-node peer.
     /// Set the split-brain guard to minority-fenced state, causing all
-    /// write-gating operations (create, import, lease, catalog delta)
+    /// write-gating operations (create, import, and lease grants)
     /// to be refused with a typed minority-fenced error.
     ///
     /// This is a test/diagnostic injection point for partition campaign
@@ -4775,7 +4774,7 @@ fn check_partition_fence(ctx: &SessionContext) -> Result<(), String> {
             let state = format!("{:?}", guard.partition_state);
             return Err(format!(
                 "minority-fenced: node is on the minority side of a partition (state: {state}); \
-                 writes, imports, catalog mutations, and lease grants are refused"
+                 writes, imports, and lease grants are refused"
             ));
         }
     }
@@ -5290,122 +5289,10 @@ fn handle_cluster_pool_message(
                 },
             ))
         }
-        ClusterPoolMessage::CatalogDeltaRequest(req) => {
-            eprintln!(
-                "[storage-node] session {session_id}: catalog delta request pool_guid={:02x?} requesting_node={}",
-                &req.pool_guid[..4], req.requesting_node_id
-            );
-
-            if let Err(fence_err) = check_partition_fence(ctx) {
-                eprintln!(
-                    "[storage-node] session {session_id}: catalog delta refused: {fence_err}"
-                );
-                return Some(ClusterPoolMessage::CatalogDeltaResponse(
-                    ClusterPoolCatalogDeltaResponse {
-                        request_id: req.request_id,
-                        node_id: req.requesting_node_id,
-                        pool_guid: req.pool_guid,
-                        success: false,
-                        catalog_version: None,
-                        error: Some(fence_err),
-                    },
-                ));
-            }
-
-            let (success, catalog_version, error) = if let Some(ref lease_rt) = ctx.lease_runtime {
-                let mut rt = lease_rt.lock().unwrap();
-                match rt.apply_committed_catalog_delta(&req.delta_bytes) {
-                    Some(Ok(version)) => (true, Some(version), None),
-                    Some(Err(e)) => (false, None, Some(format!("{e}"))),
-                    None => (
-                        false,
-                        None,
-                        Some("no pool catalog configured on this node".to_string()),
-                    ),
-                }
-            } else {
-                (
-                    false,
-                    None,
-                    Some("cluster lease runtime not configured on this node".to_string()),
-                )
-            };
-
-            Some(ClusterPoolMessage::CatalogDeltaResponse(
-                ClusterPoolCatalogDeltaResponse {
-                    request_id: req.request_id,
-                    node_id: req.requesting_node_id,
-                    pool_guid: req.pool_guid,
-                    success,
-                    catalog_version,
-                    error,
-                },
-            ))
-        }
-
-        ClusterPoolMessage::CatalogQueryRequest(req) => {
-            eprintln!(
-                "[storage-node] session {session_id}: catalog query request pool_guid={:02x?} requesting_node={} query_type={}",
-                &req.pool_guid[..4], req.requesting_node_id, req.query_type_u8
-            );
-
-            let (success, entries, catalog_version, error) =
-                if let Some(ref lease_rt) = ctx.lease_runtime {
-                    let rt = lease_rt.lock().unwrap();
-                    match rt.pool_catalog() {
-                        Some(pool_cat) => {
-                            let entries: Vec<CatalogEntryRow> = pool_cat
-                                .catalog()
-                                .catalog()
-                                .list_all()
-                                .into_iter()
-                                .map(|(path, id, dtype, txg, flags, lc_state)| CatalogEntryRow {
-                                    path,
-                                    dataset_id_bytes: id.as_bytes().to_vec(),
-                                    dataset_type_u8: dtype.to_u8(),
-                                    creation_txg: txg,
-                                    lifecycle_state_u8: lc_state.to_u8(),
-                                    flags_u16: flags.bits(),
-                                })
-                                .collect();
-                            let version = pool_cat.version();
-                            (true, entries, version, None)
-                        }
-                        None => (
-                            false,
-                            vec![],
-                            0,
-                            Some("no pool catalog configured on this node".to_string()),
-                        ),
-                    }
-                } else {
-                    (
-                        false,
-                        vec![],
-                        0,
-                        Some("cluster lease runtime not configured on this node".to_string()),
-                    )
-                };
-
-            Some(ClusterPoolMessage::CatalogQueryResponse(
-                ClusterPoolCatalogQueryResponse {
-                    request_id: req.request_id,
-                    node_id: req.requesting_node_id,
-                    pool_guid: req.pool_guid,
-                    success,
-                    entries,
-                    catalog_version,
-                    error,
-                },
-            ))
-        }
-
         ClusterPoolMessage::CreateResponse(_)
         | ClusterPoolMessage::ImportResponse(_)
         | ClusterPoolMessage::LeaseResponse(_)
-        | ClusterPoolMessage::OwnerObservationResponse(_)
-        | ClusterPoolMessage::CatalogDeltaResponse(_)
-        | ClusterPoolMessage::CatalogQueryResponse(_) => {
+        | ClusterPoolMessage::OwnerObservationResponse(_) => {
             eprintln!(
                 "[storage-node] session {session_id}: unexpected cluster pool response; ignoring"
             );

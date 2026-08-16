@@ -101,10 +101,6 @@ pub struct EpochProposalMessage {
     pub resulting_members: Vec<u64>,
     /// BLAKE3-256 hash covering the full payload (domain-tagged).
     pub blake3_hash: [u8; 32],
-    /// Optional serialized catalog delta (dataset create/destroy/rename)
-    /// proposed alongside or independently of the membership change.
-    /// `None` when this proposal carries no catalog mutation.
-    pub catalog_delta_bytes: Option<Vec<u8>>,
 }
 
 impl EpochProposalMessage {
@@ -163,7 +159,6 @@ impl EpochProposalMessage {
             delta,
             resulting_members: resulting_members.to_vec(),
             blake3_hash,
-            catalog_delta_bytes: None,
         }
     }
 

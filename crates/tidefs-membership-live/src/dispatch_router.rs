@@ -244,10 +244,6 @@ pub enum MembershipMessage {
         proposal_hash: [u8; 32],
         /// Millisecond timestamp when the proposal was submitted.
         submitted_at_millis: u64,
-        /// Optional serialized [`CatalogDelta`] for a dataset catalog mutation
-        /// proposed alongside or independently of the membership change.
-        /// `None` when this proposal carries no catalog mutation.
-        catalog_delta_bytes: Option<Vec<u8>>,
     },
     /// Acknowledge (accept or reject) a proposal from the commit coordinator.
     ///
@@ -1393,7 +1389,6 @@ mod tests {
                 resulting_members: vec![1, 2],
                 proposal_hash: [0u8; 32],
                 submitted_at_millis: 0,
-                catalog_delta_bytes: None,
             }
             .discriminant(),
         );
@@ -1716,7 +1711,6 @@ mod tests {
                 resulting_members: vec![1, 2],
                 proposal_hash: [0u8; 32],
                 submitted_at_millis: 0,
-                catalog_delta_bytes: None,
             }
             .variant_name(),
             "ProposalSubmission"
@@ -1965,7 +1959,6 @@ mod tests {
                 resulting_members: vec![1, 2],
                 proposal_hash: [0u8; 32],
                 submitted_at_millis: 0,
-                catalog_delta_bytes: None,
             },
             MembershipMessage::ProposalAck {
                 responder: MemberId::new(2),

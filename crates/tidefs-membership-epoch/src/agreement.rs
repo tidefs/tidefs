@@ -472,7 +472,6 @@ impl MembershipEpochAgreement {
                 roster_hash: [0u8; 32], // no BLAKE3 — roster hash not needed here
                 member_ids: proposal.view,
                 commit_index: 0, // bus increments internally
-                catalog_delta_bytes: None,
             };
             bus.dispatch_commit(notification.epoch, notification.member_ids);
         }

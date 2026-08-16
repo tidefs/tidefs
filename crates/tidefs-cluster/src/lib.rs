@@ -21,10 +21,6 @@
 //!   status query API.
 //! - [`placement_transfer`]: Placement transfer coordinator bridging
 //!   placement plans to transport data movement.
-//! - [`dataset_catalog`]: Cluster-aware dataset catalog authority gated by
-//!   lease/fence ownership, wrapping the canonical
-//!   [`tidefs_dataset_catalog::DatasetCatalog`] for single-writer
-//!   serialization of create/destroy/rename mutations.
 //! - [`rebuild_backfill`]: Rebuild backfill initiator bridging
 //!   rebuild-planner outputs to transport state-transfer commands.
 //!
@@ -45,9 +41,7 @@
 //! bincode payload. All hashing uses unique domain-separation strings to
 //! bind digests to their context and prevent cross-domain replay.
 
-pub mod catalog_commit_handler;
 pub mod client_mode;
-pub mod dataset_catalog;
 pub mod placement_transfer;
 pub mod rebuild_backfill;
 pub mod write_fence;
@@ -73,7 +67,6 @@ pub mod types;
 
 // Re-exports
 pub use authority::{AcquireOutcome, LeaseAuthority, RenewOutcome};
-pub use catalog_commit_handler::{make_coordinator_handler, CatalogDeltaSubscriber};
 pub use client_mode::{
     ClientMode, ClientModeConfig, ClientModeSnapshot, ClientModeTracker, ModeTransitionError,
 };
@@ -90,9 +83,6 @@ pub use cluster_authority_store::{
     append_authority_record_to_device, read_all_records_from_device, scan_authority_from_device,
     scan_authority_from_devices, write_authority_chain_to_device, AuthorityStoreError,
     CLUSTER_AUTHORITY_HEADER_SIZE, CLUSTER_AUTHORITY_REGION_MAX, CLUSTER_AUTHORITY_REGION_OFFSET,
-};
-pub use dataset_catalog::{
-    CatalogDelta, ClusterCatalogError, ClusterDatasetCatalog, ClusterPoolCatalog,
 };
 pub use lease_state_machine::LeaseStateMachine;
 pub use placement_heal::{
@@ -119,13 +109,10 @@ pub use pool_owner_lease::{
     PoolOwnerLeaseAuthority, PoolOwnerLeaseError, PoolOwnerLeaseObservation,
 };
 pub use pool_protocol::{
-    CatalogEntryRow, CatalogQueryType, ClusterPoolCatalogDeltaRequest,
-    ClusterPoolCatalogDeltaResponse, ClusterPoolCatalogQueryRequest,
-    ClusterPoolCatalogQueryResponse, ClusterPoolCreateRequest, ClusterPoolCreateResponse,
-    ClusterPoolImportRequest, ClusterPoolImportResponse, ClusterPoolLeaseAction,
-    ClusterPoolLeaseRequest, ClusterPoolLeaseResponse, ClusterPoolMessage,
-    ClusterPoolOwnerObservationRequest, ClusterPoolOwnerObservationResponse, NodeDeviceSpec,
-    PoolProtocolError,
+    ClusterPoolCreateRequest, ClusterPoolCreateResponse, ClusterPoolImportRequest,
+    ClusterPoolImportResponse, ClusterPoolLeaseAction, ClusterPoolLeaseRequest,
+    ClusterPoolLeaseResponse, ClusterPoolMessage, ClusterPoolOwnerObservationRequest,
+    ClusterPoolOwnerObservationResponse, NodeDeviceSpec, PoolProtocolError,
 };
 pub use protocol::{
     AcquireAck, AcquireNack, AcquireRequest, ExpireNotify, MembershipLeaseMessage, ProtocolError,

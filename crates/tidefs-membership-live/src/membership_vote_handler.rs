@@ -315,7 +315,6 @@ impl crate::dispatch_router::MembershipMessageHandler for VoteDispatchAdapter {
             resulting_members: _,
             proposal_hash,
             submitted_at_millis,
-            catalog_delta_bytes: _,
         } = msg
         {
             // Convert MembershipDelta to added/removed sets for validation.
@@ -421,7 +420,6 @@ mod tests {
             resulting_members: vec![1, 2, 3, 4],
             proposal_hash: [8u8; 32],
             submitted_at_millis: 1000,
-            catalog_delta_bytes: None,
         }
     }
 

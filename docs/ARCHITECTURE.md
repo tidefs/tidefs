@@ -271,10 +271,12 @@ flush/FUA continuity.
   fencing, placement, replication, and transport code with demonstrated
   runtime consumers.
 - **Consolidate:** catalog persistence and pool-wide properties out of
-  `LocalFileSystem` into the shared runtime; `ClusterDatasetCatalog` into a
-  committed ownership/proposal wrapper over the same durable catalog; mounted
-  live-owner routing into a neutral pool owner; and capacity, pin, reclaim,
-  transaction, and teardown decisions currently duplicated by front ends.
+  `LocalFileSystem` into the shared runtime; mounted live-owner routing into a
+  neutral pool owner; and capacity, pin, reclaim, transaction, and teardown
+  decisions currently duplicated by front ends. Any future clustered dataset
+  lifecycle must mutate the real durable `PoolRuntime` catalog under committed
+  lease and fence authority; clustered mode must not introduce a mirror or an
+  opaque membership payload as a second catalog authority.
 - **Remove from product paths when the shared consumer lands:** the retired
   directory-backed `tidefsctl block` route, hard-coded volume IDs and geometry,
   global `b:<offset>` keys and written-block index, receiptless `fs_root` reopen
@@ -289,9 +291,11 @@ flush/FUA continuity.
   model-only clustered block admission/receipt ledger was removed after the
   authenticated Pool lease and `PoolVolumeBackend` ublk owner became the real
   carrier authority. Reserve escrow and cross-node receipt continuity remain
-  missing carrier work, not inputs to a synthetic admission record. Clustered
-  catalog mirrors must likewise be consumed by the selected carrier or be
-  consolidated/deleted after exact consumer review.
+  missing carrier work, not inputs to a synthetic admission record. The
+  unconfigured in-memory clustered dataset catalog mirror, its private CP01
+  query/mutation messages, and the unconsumed membership catalog-delta payload
+  were removed; the retained clustered Pool carriers do not claim dataset
+  lifecycle through those retired paths.
 
 The first implementation slice after this decision is the smallest vertical
 part of the named local block carrier that publishes one exact volume root in
