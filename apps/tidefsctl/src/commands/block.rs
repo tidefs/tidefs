@@ -272,11 +272,12 @@ fn handle_attach(
     {
         Ok(owner) => owner,
         Err(error) => {
-            let mut error = format!("import Pool: {error}");
+            let error = format!("import Pool: {error}");
             #[cfg(feature = "cluster")]
-            if let Some(lease) = pending_cluster_lease.as_mut() {
-                error = append_lease_release_error(error, lease.release());
-            }
+            let error = match pending_cluster_lease.as_mut() {
+                Some(lease) => append_lease_release_error(error, lease.release()),
+                None => error,
+            };
             return Err(error);
         }
     };
@@ -292,11 +293,12 @@ fn handle_attach(
     ) {
         Ok(runtime) => runtime,
         Err(error) => {
-            let mut error = format!("open canonical Pool runtime: {error}");
+            let error = format!("open canonical Pool runtime: {error}");
             #[cfg(feature = "cluster")]
-            if let Some(lease) = pending_cluster_lease.as_mut() {
-                error = append_lease_release_error(error, lease.release());
-            }
+            let error = match pending_cluster_lease.as_mut() {
+                Some(lease) => append_lease_release_error(error, lease.release()),
+                None => error,
+            };
             return Err(combine_export_error(error, import_owner.export()));
         }
     };
@@ -428,9 +430,15 @@ fn handle_attach(
     let lease_release_result: Result<(), String> = Ok(());
     drop(backend);
     drop(runtime);
-    let export_result = import_owner
-        .export()
-        .map_err(|error| format!("export Pool after block attach: {error}"));
+    let export_result = match &carrier_result {
+        Ok(_) => import_owner
+            .export()
+            .map_err(|error| format!("export Pool after block attach: {error}")),
+        Err(_) => Err(
+            "Pool label export withheld because the ublk block-volume carrier did not close cleanly"
+                .to_string(),
+        ),
+    };
     let mut completion_errors = Vec::new();
     if let Err(error) = &carrier_result {
         completion_errors.push(error.clone());

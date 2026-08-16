@@ -161,6 +161,47 @@ pub struct UblkDataQueueIoLoopReport {
 }
 
 impl UblkDataQueueIoLoopReport {
+    fn clean_close_result(&self, read_only: bool) -> Result<(), String> {
+        let mut failures = Vec::new();
+
+        if !self.ublk_device_pair_created {
+            failures.push("ublk device pair was not created".to_string());
+        }
+        if !self.start_dev_uring_cmd_completed || !self.io_loop_attempted {
+            failures.push("ublk service loop did not start under daemon ownership".to_string());
+        }
+        if self.io_loop_failure_class != UblkDataQueueIoLoopFailureClass::None {
+            failures.push(format!(
+                "I/O loop failed with class {}",
+                self.io_loop_failure_class.as_str()
+            ));
+        }
+        if !self.shutdown_graceful {
+            failures.push("ublk service loop did not reach graceful shutdown".to_string());
+        }
+        if self.drain_timed_out || self.drain_hung_io_count > 0 {
+            failures.push(format!(
+                "ublk shutdown drain left {} hung request(s) (timed_out={})",
+                self.drain_hung_io_count, self.drain_timed_out
+            ));
+        }
+        if !read_only && !self.final_flush_completed {
+            failures.push("final writable backend flush did not complete".to_string());
+        }
+        if !self.stop_dev_uring_cmd_completed {
+            failures.push("UBLK_CMD_STOP_DEV did not complete".to_string());
+        }
+        if !self.ublk_device_pair_deleted {
+            failures.push("UBLK_CMD_DEL_DEV did not remove the ublk device pair".to_string());
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; additionally "))
+        }
+    }
+
     pub fn print(&self) {
         println!("tidefs block volume adapter ublk data-queue I/O loop boundary");
         println!("gate={}", tidefs_block_volume_adapter_ublk_control_runtime::BLOCK_VOLUME_UBLK_DATA_QUEUE_FETCH_REQ_GATE_OW_301U);

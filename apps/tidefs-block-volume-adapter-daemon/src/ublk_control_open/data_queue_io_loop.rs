@@ -85,7 +85,7 @@ pub fn run_ublk_live_device(
     queue_depth: u16,
     drain_deadline_secs: u64,
 ) -> Result<UblkDataQueueIoLoopReport, AppError> {
-    run_ublk_data_queue_io_loop_impl(
+    let report = run_ublk_data_queue_io_loop_impl(
         backend,
         UblkDataQueueIoLoopConfig {
             reconnect_dev_id,
@@ -96,7 +96,11 @@ pub fn run_ublk_live_device(
             queue_depth,
             drain_deadline_secs,
         },
-    )
+    )?;
+    report
+        .clean_close_result(backend.is_read_only())
+        .map_err(|error| AppError::new(format!("unclean ublk close: {error}")))?;
+    Ok(report)
 }
 
 pub fn run_ublk_data_queue_io_loop_boundary(
@@ -1463,8 +1467,8 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_report_fields_track_graceful_shutdown_state() {
-        let report = UblkDataQueueIoLoopReport {
+    fn clean_close_result_requires_every_writable_shutdown_boundary() {
+        let mut report = UblkDataQueueIoLoopReport {
             start_dev_uring_cmd_completed: true,
             ublk_device_pair_created: true,
             ublk_device_pair_deleted: true,
@@ -1504,6 +1508,56 @@ mod tests {
         assert_eq!(report.drain_iterations, 2);
         assert!(!report.drain_timed_out);
         assert!(report.final_flush_completed);
+        assert!(report.clean_close_result(false).is_ok());
+
+        report.ublk_device_pair_created = false;
+        let error = report
+            .clean_close_result(false)
+            .expect_err("missing ublk device ownership must refuse clean close");
+        assert!(error.contains("ublk device pair was not created"));
+
+        report.ublk_device_pair_created = true;
+        report.start_dev_uring_cmd_completed = false;
+        let error = report
+            .clean_close_result(false)
+            .expect_err("missing service-loop start must refuse clean close");
+        assert!(error.contains("ublk service loop did not start under daemon ownership"));
+
+        report.start_dev_uring_cmd_completed = true;
+        report.io_loop_failure_class = UblkDataQueueIoLoopFailureClass::IoLoopErrno;
+        let error = report
+            .clean_close_result(false)
+            .expect_err("I/O loop failure must refuse clean close");
+        assert!(error.contains("I/O loop failed with class io_loop_errno"));
+
+        report.io_loop_failure_class = UblkDataQueueIoLoopFailureClass::None;
+        report.shutdown_graceful = false;
+        let error = report
+            .clean_close_result(false)
+            .expect_err("non-graceful shutdown must refuse clean close");
+        assert!(error.contains("ublk service loop did not reach graceful shutdown"));
+
+        report.shutdown_graceful = true;
+        report.final_flush_completed = false;
+        let error = report
+            .clean_close_result(false)
+            .expect_err("failed final flush must refuse clean close");
+        assert!(error.contains("final writable backend flush did not complete"));
+        assert!(report.clean_close_result(true).is_ok());
+
+        report.final_flush_completed = true;
+        report.stop_dev_uring_cmd_completed = false;
+        let error = report
+            .clean_close_result(false)
+            .expect_err("failed STOP_DEV must refuse clean close");
+        assert!(error.contains("UBLK_CMD_STOP_DEV did not complete"));
+
+        report.stop_dev_uring_cmd_completed = true;
+        report.ublk_device_pair_deleted = false;
+        let error = report
+            .clean_close_result(false)
+            .expect_err("failed DEL_DEV must refuse clean close");
+        assert!(error.contains("UBLK_CMD_DEL_DEV did not remove the ublk device pair"));
     }
 
     #[test]
@@ -1548,5 +1602,9 @@ mod tests {
         assert_eq!(report.drain_hung_io_count, 2);
         assert!(!report.final_flush_completed);
         assert!(report.ublk_device_pair_deleted); // DEL_DEV still happens after timeout
+        let error = report
+            .clean_close_result(false)
+            .expect_err("timed-out drain must refuse clean close");
+        assert!(error.contains("ublk shutdown drain left 2 hung request(s)"));
     }
 }
