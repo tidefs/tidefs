@@ -144,7 +144,6 @@ members = [
   "apps/tidefs-block-volume-adapter-daemon",
   "apps/tidefsctl",
   "apps/tidefs-storage-node",
-  "apps/tidefs-scrub",
   "xtask/tidefs-xtask",
   "crates/tidefs-encryption",
   "crates/tidefs-compaction",
