@@ -284,7 +284,12 @@ flush/FUA continuity.
   storage-node `block-volume-data` side file and its private VSNP block
   push/pull kinds were removed after the Pool-backed clustered block carrier
   landed; any future remote block protocol must consume that carrier instead
-  of creating a second storage authority.
+  of creating a second storage authority. The storage-node's private snapshot
+  create, destroy, rollback, and clone messages and client commands were also
+  removed because they reopened a configured directory `fs_root` instead of
+  the current Pool-backed owner. Future clustered snapshot lifecycle must
+  authenticate and mutate that owner under its committed lease and fence;
+  distributed snapshot send/receive and barrier paths remain separate.
 - **Retain only as focused development backends when they provide distinct
   signal:** file-image, in-memory block, model, and ublk boundary probes. A
   model or its own tests do not justify a parallel product runtime. The large

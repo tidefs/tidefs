@@ -300,65 +300,6 @@ pub(crate) fn render_health_response(
     out
 }
 
-pub(crate) fn render_snapshot_summary(report: &protocol::SnapshotSummaryReport) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "snapshot: {}", report.name);
-    let _ = writeln!(
-        out,
-        "source_transaction_id: {}",
-        report.source_transaction_id
-    );
-    let _ = writeln!(out, "source_generation: {}", report.source_generation);
-    let _ = writeln!(
-        out,
-        "created_at_generation: {}",
-        report.created_at_generation
-    );
-    out
-}
-
-pub(crate) fn render_snapshot_rollback(report: &protocol::SnapshotRollbackReport) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "spec: {}", report.spec);
-    out.push_str(&render_snapshot_summary(&report.snapshot));
-    let _ = writeln!(out, "generation_before: {}", report.generation_before);
-    let _ = writeln!(
-        out,
-        "restored_source_generation: {}",
-        report.restored_source_generation
-    );
-    let _ = writeln!(out, "published_generation: {}", report.published_generation);
-    let _ = writeln!(
-        out,
-        "snapshot_catalog_entries: {}",
-        report.snapshot_catalog_entries
-    );
-    let _ = writeln!(
-        out,
-        "production_fsck_required: {}",
-        yes_no(report.production_fsck_required)
-    );
-    out
-}
-
-pub(crate) fn render_snapshot_clone(report: &protocol::SnapshotCloneSummaryReport) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "clone: {}", report.name);
-    let _ = writeln!(out, "origin: {}", report.origin);
-    let _ = writeln!(
-        out,
-        "source_transaction_id: {}",
-        report.source_transaction_id
-    );
-    let _ = writeln!(out, "source_generation: {}", report.source_generation);
-    let _ = writeln!(
-        out,
-        "created_at_generation: {}",
-        report.created_at_generation
-    );
-    out
-}
-
 /// Run client commands interactively or as one-shot.
 pub fn run_client(
     node_id: u64,
@@ -577,72 +518,6 @@ pub fn run_client(
                 other => return Err(format!("unexpected response: {other:?}")),
             }
         }
-        "snapshot-create" => {
-            let name = args
-                .first()
-                .cloned()
-                .ok_or("usage: snapshot-create <snapshot-name>")?;
-            let resp = request(
-                node_id,
-                server_node_id,
-                server_addr,
-                Frame::SnapshotCreate {
-                    snapshot_name: name,
-                },
-                rdma,
-            )?;
-            match resp {
-                Frame::SnapshotCreateResponse { summary } => {
-                    print!("{}", render_snapshot_summary(&summary));
-                }
-                Frame::Error { message } => return Err(format!("server error: {message}")),
-                other => return Err(format!("unexpected response: {other:?}")),
-            }
-        }
-        "snapshot-destroy" => {
-            let name = args
-                .first()
-                .cloned()
-                .ok_or("usage: snapshot-destroy <snapshot-name>")?;
-            let resp = request(
-                node_id,
-                server_node_id,
-                server_addr,
-                Frame::SnapshotDestroy {
-                    snapshot_name: name,
-                },
-                rdma,
-            )?;
-            match resp {
-                Frame::SnapshotDestroyResponse { summary } => {
-                    print!("{}", render_snapshot_summary(&summary));
-                }
-                Frame::Error { message } => return Err(format!("server error: {message}")),
-                other => return Err(format!("unexpected response: {other:?}")),
-            }
-        }
-        "snapshot-rollback" => {
-            let name = args
-                .first()
-                .cloned()
-                .ok_or("usage: snapshot-rollback <snapshot-name>")?;
-            let resp = request(
-                node_id,
-                server_node_id,
-                server_addr,
-                Frame::SnapshotRollback {
-                    snapshot_name: name,
-                },
-                rdma,
-            )?;
-            match resp {
-                Frame::SnapshotRollbackResponse { report } => {
-                    print!("{}", render_snapshot_rollback(&report));
-                }
-                Frame::Error { message } => return Err(format!("server error: {message}")),
-                other => return Err(format!("unexpected response: {other:?}")),
-            }
-        }
         "send-chunked" => {
             let key = if args.first().map(|s| s.as_str()) == Some("--incremental") {
                 let hex = args
@@ -720,36 +595,9 @@ pub fn run_client(
                 other => return Err(format!("unexpected response: {other:?}")),
             }
         }
-        "snapshot-clone" => {
-            let clone_name = args
-                .first()
-                .cloned()
-                .ok_or("usage: snapshot-clone <clone-name> <source-snapshot>")?;
-            let source = args
-                .get(1)
-                .cloned()
-                .ok_or("usage: snapshot-clone <clone-name> <source-snapshot>")?;
-            let resp = request(
-                node_id,
-                server_node_id,
-                server_addr,
-                Frame::SnapshotClone {
-                    clone_name,
-                    source_snapshot: source,
-                },
-                rdma,
-            )?;
-            match resp {
-                Frame::SnapshotCloneResponse { summary } => {
-                    print!("{}", render_snapshot_clone(&summary));
-                }
-                Frame::Error { message } => return Err(format!("server error: {message}")),
-                other => return Err(format!("unexpected response: {other:?}")),
-            }
-        }
         _ => {
             return Err(format!(
-                "unknown command: {cmd}; commands: put <key> <value> | put --file <path> <key> | get <key> | del <key> | list | stats | health | snapshot-create <name> | snapshot-destroy <name> | snapshot-rollback <name> | snapshot-clone <clone-name> <source-snapshot> | send-chunked [--incremental <key>] | send-resume <cursor-hex>"
+                "unknown command: {cmd}; commands: put <key> <value> | put --file <path> <key> | get <key> | del <key> | list | stats | health | send-chunked [--incremental <key>] | send-resume <cursor-hex>"
             ));
         }
     }
