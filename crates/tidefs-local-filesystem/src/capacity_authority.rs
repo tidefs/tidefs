@@ -1,141 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Production capacity authority for mounted capacity decisions.
+//! Filesystem-dataset logical capacity, quota, reserve, and statfs projection.
 //!
-//! Reconstructed from committed-root state and pool geometry during mount
-//! recovery. Serves as the authoritative derivation source for FUSE statfs
-//! (via [`LocalFileSystem::statfs`]), kernel VFS statfs, object-store
-//! allocation, dataset quotas, block trim/discard, and ENOSPC enforcement.
+//! This module does not own Pool physical capacity. The opened
+//! `tidefs_local_object_store::Pool` inside `PoolRuntime` owns exact physical
+//! allocation and final no-space refusal across every dataset carrier.
+//! `DatasetCapacityProjection` tracks only one filesystem dataset's committed
+//! logical accounting plus its transient filesystem reservations.
 //!
-//! This authority is the mounted-filesystem facade over the committed
-//! `tidefs-space-accounting` counters plus transient in-flight holds.
-//! `SpaceBook` remains active for per-dataset write/delete auto-update
-//! tracking and persistence, but mounted ENOSPC and statfs decisions flow
-//! through [`tidefs_space_accounting::SpaceAccounting`] through this facade.
+//! Mounted admission and statfs use the restrictive combination of:
 //!
-//! # Relationship to existing layers
+//! - this dataset projection and quota hierarchy; and
+//! - `PoolRuntime::physical_capacity()`, reconstructed live from the one Pool.
 //!
-//! - [`tidefs_block_allocator::BlockAllocator`]: tracks individual block
-//!   allocations; the authority derives used-bytes from committed extent
-//!   allocations plus reserved blocks.
-//! - [`tidefs_local_object_store::pool::PoolCapacityStats`][]: pool-level
-//!   capacity snapshot; the authority uses total capacity bytes from the
-//!   pool and reconciles with allocator-level counters.
-//! - [`tidefs_space_accounting::SpaceAccounting`]: dataset-level logical
-//!   space tracking for per-dataset commit/rollback lifecycle. The authority
-//!   synchronizes the mounted filesystem view with this committed path and
-//!   delegates ENOSPC/statfs derivation to it.
-//! - [`tidefs_posix_filesystem_adapter_capacity::CapacityFacade`]:
-//!   retired adapter-local capacity bridge; removed from the production mount
-//!   and admission path as of #5938 and quarantined behind `#[cfg(test)]` as
-//!   of #6155.  Mounted FUSE statfs now derives block counters directly from
-//!   this authority through the engine, and no adapter-local reservation
-//!   lifecycle runs alongside the engine path.
-//!
-//! # Single-Authority Chain
-//!
-//! Mounted statfs and write admission derive from this documented facade.
-//! The chain below records the current runtime boundary: committed counters
-//! live in `SpaceAccounting`; transient reservations live here; allocator
-//! reports, `SpaceBook`, and physical pool counters are inputs, persistence,
-//! or projections rather than independent mounted availability authorities.
-//!
-//! ```text
-//! CapacityAuthority (single production source)
-//! ├── statfs (FUSE + POSIX)
-//! │   via LocalFileSystem::statfs() and derive_statfs()
-//! │   Wire: fuse_statfs::engine_statfs(), LocalFileSystem::statvfs()
-//! │
-//! ├── ENOSPC gating (write, create, mkdir, truncate, fallocate)
-//! │   via check_enospc()
-//! │   Wire: LocalFileSystem write/create/mkdir/truncate paths
-//! │
-//! ├── Block accounting (record_allocation, record_free)
-//! │   Wire: LocalFileSystem write, truncate, unlink, punch_hole paths
-//! │
-//! ├── Quota physical pool free bytes
-//! │   via pool_free_bytes_for_quota() -> capacity_authority.free_bytes()
-//! │   Wire: quota_table.check_delta(..., pool_free) at every mutation point
-//! │
-//! ├── Pool physical counters (PoolPhysicalCountersV1)
-//! │   via mounted_authority_projection() -> capacity_authority
-//! │   Wire: statfs() refresh and commit_space_delta() persistence
-//! │   Contract: only phys_total_bytes is an admitted mounted capacity input;
-//! │   physical free/reclaimable/watermark fields are lower-layer observations.
-//! │
-//! └── Transaction rollback
-//!     via snapshot_for_rollback() / restore_from_snapshot()
-//!     Wire: LocalFileSystem transaction commit/abort paths
-//! ```
-//!
-//! ## Retired Dual-Query Paths
-//!
-//! The former local fallback arithmetic path is retired; statfs uses
-//! [`CapacityAuthority::derive_statfs`], which delegates to
-//! [`tidefs_space_accounting::SpaceAccounting::statfs`].
-//! The former FUSE adapter `CapacityFacade` is quarantined behind
-//! `#[cfg(test)]` and excluded from the production mount path. The
-//! `pool_free_bytes_for_quota()` path previously queried the allocator
-//! report independently of the authority; the capacity-authority audit routes it
-//! through [`CapacityAuthority::free_bytes`]. Runtime TFR-007 follow-ups still
-//! track the remaining projection and persistence bridges. The
-//! `derive_pool_physical_counters()` path previously mixed
-//! `allocator_policy.content_capacity_bytes` with allocator free reports.
-//! Mounted refresh now consumes the sanitized
-//! `PoolPhysicalCountersV1::mounted_authority_projection()`: the lower
-//! physical-pool report may bound `phys_total_bytes`, while mounted free bytes
-//! and admission remain derived from committed accounting plus transient holds.
-
-//! # Production Call Graph
-//!
-//! ## Construction (mount / recovery)
-//!
-//! ```text
-//! LocalFileSystem::open()
-//!   -> pool_stats + allocator_policy
-//!   -> CapacityAuthority::from_committed_accounting(total, accounting, block_size, root_reserve)
-//!   -> stored as engine.capacity_authority field
-//! ```
-//!
-//! ## Statfs -- FUSE (engine trait path)
-//!
-//! ```text
-//! VfsEngineStatFs::statfs()                        [vfs_engine_impl.rs]
-//!   -> fuse_statfs::engine_statfs()                [fuse_statfs.rs]
-//!     -> LocalFileSystem::statfs()                 [lib.rs]
-//!       -> CapacityAuthority::set_total_bytes()     (live pool total)
-//!       -> CapacityAuthority::derive_statfs()       (block counters)
-//!       -> quota/effective-capacity clamp           (FUSE StatFs source)
-//! ```
-//!
-//! ## Statfs -- POSIX statvfs
-//!
-//! ```text
-//! LocalFileSystem::statvfs()                       [statfs.rs]
-//!   -> CapacityAuthority::derive_statfs()
-//! ```
-//!
-//! ## ENOSPC Gating (write, truncate, create, mkdir)
-//!
-//! ```text
-//! LocalFileSystem write/create/truncate/mkdir      [lib.rs]
-//!   -> CapacityAuthority::check_enospc(requested_bytes)
-//!   -> on success: CapacityAuthority::record_allocation(bytes)
-//! ```
-//!
-//! ## Free Accounting (truncate down, unlink, rmdir, punch hole)
-//!
-//! ```text
-//! LocalFileSystem truncate/unlink/rmdir/punch_hole [lib.rs]
-//!   -> CapacityAuthority::record_free(bytes)
-//! ```
-//!
-//! ## Admission Watermark (writeback gate)
-//!
-//! ```text
-//! LocalFileSystem::check_write_admission()         [lib.rs]
-//!   -> delegates to tidefs_local_object_store DeviceIoClass
-//!   (CapacityAuthority not directly used for this gate)
-//! ```
+//! Mounted filesystem and volume calls serialize through
+//! `SharedPoolDatasetOwner`, so the next filesystem decision observes volume
+//! consumption without copying physical counters into this projection.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -149,16 +28,15 @@ use tidefs_types_vfs_core::Errno;
 /// POSIX errno constants (no libc dependency).
 const ENOSPC: u16 = 28;
 
-// ── CapacityAuthority ───────────────────────────────────────────────────
+// ── DatasetCapacityProjection ───────────────────────────────────────────
 
-/// Mounted authority facade for filesystem capacity decisions.
+/// Logical capacity projection for one mounted filesystem dataset.
 ///
 /// The committed view is stored as `SpaceAccounting`. Atomic counters expose
-/// the mounted transient projection needed by the FUSE dispatch path,
-/// mount/recovery path, and background services. The authority is initialized
-/// during mount recovery and lives for the lifetime of the filesystem.
+/// dataset-local transient reservations needed by filesystem mutation and
+/// rollback. Pool physical bytes are deliberately absent.
 #[derive(Debug)]
-pub struct CapacityAuthority {
+pub struct DatasetCapacityProjection {
     total_bytes: AtomicU64,
     used_bytes: AtomicU64,
     reserved_bytes: AtomicU64,
@@ -168,11 +46,11 @@ pub struct CapacityAuthority {
     committed_accounting: RwLock<SpaceAccounting>,
 }
 
-impl CapacityAuthority {
-    /// Create an authority seeded with pool geometry and committed usage.
+impl DatasetCapacityProjection {
+    /// Create a projection seeded with a dataset ceiling and committed usage.
     ///
-    /// `total_bytes` is the pool's total capacity; `used_bytes` is the
-    /// sum of all committed extent allocations. Both must be <= `total_bytes`.
+    /// `total_bytes` is the dataset's configured logical ceiling; `used_bytes`
+    /// is the sum of its committed extent allocations.
     /// `block_size` is the statfs reporting block size, normally 4096 bytes.
     /// `root_reserve_bytes` is the number of bytes reserved for the
     /// root user (unprivileged callers see reduced availability).
@@ -621,8 +499,8 @@ impl CapacityAuthority {
 
     /// Capture a snapshot of the authority counters for transaction rollback.
     #[must_use]
-    pub(crate) fn snapshot_for_rollback(&self) -> CapacityAuthoritySnapshot {
-        CapacityAuthoritySnapshot {
+    pub(crate) fn snapshot_for_rollback(&self) -> DatasetCapacitySnapshot {
+        DatasetCapacitySnapshot {
             used_bytes: self.used_bytes.load(Ordering::Acquire),
             reserved_bytes: self.reserved_bytes(),
             pending_bytes: self.pending_bytes(),
@@ -635,7 +513,7 @@ impl CapacityAuthority {
     }
 
     /// Restore authority counters to a previously captured snapshot.
-    pub(crate) fn restore_from_snapshot(&self, snapshot: &CapacityAuthoritySnapshot) {
+    pub(crate) fn restore_from_snapshot(&self, snapshot: &DatasetCapacitySnapshot) {
         self.used_bytes
             .store(snapshot.used_bytes, Ordering::Release);
         self.reserved_bytes
@@ -653,7 +531,7 @@ impl CapacityAuthority {
 /// Snapshot of capacity counters captured at transaction start
 /// for restoration on rollback.
 #[derive(Clone, Debug)]
-pub(crate) struct CapacityAuthoritySnapshot {
+pub(crate) struct DatasetCapacitySnapshot {
     pub used_bytes: u64,
     pub reserved_bytes: u64,
     pub pending_bytes: u64,
@@ -686,7 +564,7 @@ pub struct CapacityStatfs {
 /// auto-releases.
 #[derive(Debug)]
 pub struct CapacityReservationHandle<'a> {
-    authority: &'a CapacityAuthority,
+    authority: &'a DatasetCapacityProjection,
     bytes: u64,
     resolved: bool,
 }
@@ -737,23 +615,23 @@ impl<'a> Drop for CapacityReservationHandle<'a> {
 mod tests {
     use super::*;
 
-    fn authority(total_mb: u64, used_mb: u64) -> CapacityAuthority {
+    fn authority(total_mb: u64, used_mb: u64) -> DatasetCapacityProjection {
         let block_size: u32 = 4096;
         let total = total_mb * 1024 * 1024;
         let used = used_mb * 1024 * 1024;
-        CapacityAuthority::new(total, used, block_size, 0)
+        DatasetCapacityProjection::new(total, used, block_size, 0)
     }
 
     fn authority_with_reserve(
         total_mb: u64,
         used_mb: u64,
         reserve_blocks: u64,
-    ) -> CapacityAuthority {
+    ) -> DatasetCapacityProjection {
         let block_size: u32 = 4096;
         let total = total_mb * 1024 * 1024;
         let used = used_mb * 1024 * 1024;
         let root_reserve = reserve_blocks * u64::from(block_size);
-        CapacityAuthority::new(total, used, block_size, root_reserve)
+        DatasetCapacityProjection::new(total, used, block_size, root_reserve)
     }
 
     #[test]
@@ -770,7 +648,7 @@ mod tests {
         // The constructor clamps used_bytes to total_bytes instead of
         // panicking, because this mismatch can occur legitimately after
         // crash recovery or pool-geometry reinterpretation.
-        let a = CapacityAuthority::new(100, 200, 4096, 0);
+        let a = DatasetCapacityProjection::new(100, 200, 4096, 0);
         assert_eq!(a.used_bytes(), 100);
         assert_eq!(a.total_bytes(), 100);
     }
@@ -778,12 +656,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "block_size must be positive")]
     fn new_rejects_zero_block_size() {
-        let _ = CapacityAuthority::new(100, 0, 0, 0);
+        let _ = DatasetCapacityProjection::new(100, 0, 0, 0);
     }
 
     #[test]
     fn new_at_exact_capacity() {
-        let a = CapacityAuthority::new(4096, 4096, 4096, 0);
+        let a = DatasetCapacityProjection::new(4096, 4096, 4096, 0);
         assert_eq!(a.free_bytes(), 0);
         assert_eq!(a.available_bytes(), 0);
     }
@@ -1010,7 +888,8 @@ mod tests {
             ..DatasetSpaceCountersV1::default()
         };
         let accounting = SpaceAccounting::new(counters, SpaceDomainId::NONE);
-        let a = CapacityAuthority::from_committed_accounting(total, &accounting, block_size, 0);
+        let a =
+            DatasetCapacityProjection::from_committed_accounting(total, &accounting, block_size, 0);
 
         let s = a.derive_statfs(1000, 900, 255);
 
@@ -1031,7 +910,7 @@ mod tests {
             ..DatasetSpaceCountersV1::default()
         };
         let accounting = SpaceAccounting::new(counters, SpaceDomainId::NONE);
-        let a = CapacityAuthority::new(total, 0, block_size, 0);
+        let a = DatasetCapacityProjection::new(total, 0, block_size, 0);
         let pool_snapshot = PoolPhysicalCountersV1 {
             phys_free_segments: (total - used) / u64::from(block_size),
             phys_free_bytes: total - used,
@@ -1060,7 +939,7 @@ mod tests {
             ..DatasetSpaceCountersV1::default()
         };
         let accounting = SpaceAccounting::new(counters, SpaceDomainId::NONE);
-        let a = CapacityAuthority::new(total, 0, block_size, 0);
+        let a = DatasetCapacityProjection::new(total, 0, block_size, 0);
         let stale_pool_snapshot = PoolPhysicalCountersV1 {
             phys_free_segments: u64::MAX,
             phys_free_bytes: u64::MAX,
@@ -1086,7 +965,7 @@ mod tests {
         let block_size: u32 = 4096;
         let accounting =
             SpaceAccounting::new(DatasetSpaceCountersV1::default(), SpaceDomainId::NONE);
-        let a = CapacityAuthority::new(100 * 1024 * 1024, 0, block_size, 0);
+        let a = DatasetCapacityProjection::new(100 * 1024 * 1024, 0, block_size, 0);
         let missing_total_snapshot = PoolPhysicalCountersV1 {
             phys_free_segments: u64::MAX,
             phys_free_bytes: u64::MAX,
@@ -1110,7 +989,7 @@ mod tests {
 
     #[test]
     fn derive_statfs_zero_total() {
-        let a = CapacityAuthority::new(0, 0, 4096, 0);
+        let a = DatasetCapacityProjection::new(0, 0, 4096, 0);
         let s = a.derive_statfs(0, 0, 255);
         assert_eq!(s.total_blocks, 0);
         assert_eq!(s.free_blocks, 0);
@@ -1144,7 +1023,12 @@ mod tests {
 
     #[test]
     fn from_pool_stats_preserves_geometry() {
-        let a = CapacityAuthority::from_pool_stats(1024 * 1024 * 1024, 512 * 1024 * 1024, 4096, 0);
+        let a = DatasetCapacityProjection::from_pool_stats(
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            4096,
+            0,
+        );
         assert_eq!(a.total_bytes(), 1024 * 1024 * 1024);
         assert_eq!(a.used_bytes(), 512 * 1024 * 1024);
         assert_eq!(a.block_size(), 4096);

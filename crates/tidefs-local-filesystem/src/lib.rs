@@ -408,7 +408,7 @@ use tidefs_local_object_store::{
 };
 use tidefs_orphan_index::OrphanIndex;
 pub use tidefs_pool_runtime::ExternalMutationDeadline;
-use tidefs_pool_runtime::{DatasetRootKind, PoolRuntime};
+use tidefs_pool_runtime::{DatasetRootKind, PoolRuntime, PoolRuntimeError};
 #[cfg(feature = "quorum-write")]
 use tidefs_quorum_write_runtime::{QuorumConfig, QuorumObjectStore};
 #[cfg(feature = "policy-observation")]
@@ -625,7 +625,7 @@ use crate::inode_cache::*;
 use crate::admission::{LocalAdmissionPermit, LocalWriteAdmission};
 use crate::background_cleaner::{BackgroundCleaner, BackgroundCleanerConfig};
 use crate::capacity_authority::{
-    CapacityAuthority, CapacityAuthoritySnapshot, CapacityReservationHandle, CapacityStatfs,
+    CapacityReservationHandle, CapacityStatfs, DatasetCapacityProjection, DatasetCapacitySnapshot,
 };
 pub(crate) use crate::commit_group::{
     CommitGroupConfig, CommitGroupPhase, CommitGroupStateMachine, TxnGroupId,
@@ -905,7 +905,7 @@ struct MutationDelta {
     old_buffered_write_base_records: BTreeMap<InodeId, InodeRecord>,
     old_quota_table: QuotaTable,
     old_space_accounting: SpaceAccounting,
-    old_capacity_authority: CapacityAuthoritySnapshot,
+    old_dataset_capacity: DatasetCapacitySnapshot,
     #[cfg(feature = "policy-observation")]
     old_obligation_ledger: Box<ObligationLedger>,
     old_dirty_pages: BTreeMap<InodeId, Vec<DirtyRange>>,
@@ -2136,12 +2136,9 @@ pub struct FilesystemDatasetEngine {
     /// reclamation. Initialised via [`with_cleanup_engine`](Self::with_cleanup_engine)
     /// and invoked after each successful commit_group commit.
     recovery_policy: RecoveryPolicy,
-    /// Production capacity authority: definitive used/free/reserved/pending
-    /// byte counters for the mounted filesystem. Reconstructed during mount
-    /// from pool geometry and committed usage. The sole derivation source
-    /// for FUSE statfs, object-store allocation, dataset quotas, block
-    /// trim/discard, and ENOSPC enforcement.
-    capacity_authority: CapacityAuthority,
+    /// Filesystem-dataset logical capacity, quota, reserve, and statfs
+    /// projection. PoolRuntime remains the separate physical authority.
+    dataset_capacity: DatasetCapacityProjection,
     /// Dataset ID of the mounted filesystem, used as the anchor for
     /// quota hierarchy ancestor-chain traversal during statfs and ENOSPC
     /// gating. Defaults to the root dataset when not explicitly set.
@@ -2775,10 +2772,6 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
         recovered_generation
     }
 
-    fn pool_stats(&self) -> tidefs_local_object_store::pool::PoolCapacityStats {
-        self.store.pool_stats()
-    }
-
     fn has_pending_device_removal(&self) -> Result<bool> {
         Ok(self.store.pending_device_removal_path()?.is_some())
     }
@@ -2811,14 +2804,17 @@ impl PoolDatasetOwner {
         self.filesystem.lifecycle.poison_notification()
     }
 
-    /// Return a reference to the production capacity authority.
-    ///
-    /// This is the single source of truth for used/free/reserved/pending
-    /// byte counters. All statfs, ENOSPC, and quota consumers should
-    /// derive their capacity view from this authority.
+    /// Return this filesystem dataset's logical capacity projection.
     #[must_use]
-    pub fn capacity_authority(&self) -> &CapacityAuthority {
-        &self.filesystem.capacity_authority
+    pub fn dataset_capacity(&self) -> &DatasetCapacityProjection {
+        &self.filesystem.dataset_capacity
+    }
+
+    /// Test-only compatibility accessor for dataset logical accounting.
+    #[cfg(test)]
+    #[must_use]
+    pub fn capacity_authority(&self) -> &DatasetCapacityProjection {
+        self.dataset_capacity()
     }
 
     /// Set the dataset ID for the currently mounted filesystem.
@@ -2922,20 +2918,22 @@ impl PoolDatasetOwner {
 
     /// Run a hierarchy-aware ENOSPC check for `requested_bytes`.
     ///
-    /// Checks both the pool-level capacity authority and (when configured)
-    /// the nested dataset quota hierarchy. Returns `Ok(())` if the write
-    /// is admitted, or `Err(Errno::ENOSPC)` if any layer refuses.
+    /// Checks Pool physical admission, this filesystem dataset's logical
+    /// projection, and (when configured) the nested dataset quota hierarchy.
+    /// Returns `Ok(())` if every layer admits the write, or
+    /// `Err(Errno::ENOSPC)` if any layer refuses.
     pub fn check_enospc_with_hierarchy(
         &self,
         requested_bytes: u64,
     ) -> std::result::Result<(), Errno> {
-        // Pool-level check first (fast path).
+        self.check_physical_capacity(requested_bytes)?;
+        // Dataset logical/quota projection is the second, independent limit.
         self.filesystem
-            .capacity_authority
+            .dataset_capacity
             .check_enospc(requested_bytes)?;
         // Hierarchy check when configured.
         if let Some(ref hierarchy) = self.filesystem.quota_hierarchy {
-            let pool_free = self.filesystem.capacity_authority.free_bytes();
+            let pool_free = self.filesystem.dataset_capacity.free_bytes();
             let decision = hierarchy.check_delta(
                 self.filesystem.mounted_dataset_id,
                 requested_bytes,
@@ -2966,18 +2964,21 @@ impl PoolDatasetOwner {
         // Fast path: zero-byte reservations are valid and inert.
         if requested_bytes == 0 {
             return self
-                .capacity_authority
+                .dataset_capacity
                 .reserve(0)
                 .map_err(|_| self.capacity_reservation_error(0));
         }
-        // Pool-level check first (fast path).
+        self.store
+            .ensure_physical_capacity(requested_bytes)
+            .map_err(|error| self.map_physical_capacity_error(error, requested_bytes))?;
+        // Check the dataset logical/quota projection independently.
         self.filesystem
-            .capacity_authority
+            .dataset_capacity
             .check_enospc(requested_bytes)
             .map_err(|_| self.capacity_reservation_error(requested_bytes))?;
         // Hierarchy check when configured.
         if let Some(ref hierarchy) = self.filesystem.quota_hierarchy {
-            let pool_free = self.filesystem.capacity_authority.free_bytes();
+            let pool_free = self.filesystem.dataset_capacity.free_bytes();
             let decision = hierarchy.check_delta(
                 self.filesystem.mounted_dataset_id,
                 requested_bytes,
@@ -2992,7 +2993,7 @@ impl PoolDatasetOwner {
         // Atomically reserve the bytes: this moves them from free to reserved
         // so concurrent operations cannot also claim them.
         self.filesystem
-            .capacity_authority
+            .dataset_capacity
             .reserve(requested_bytes)
             .map_err(|_| self.capacity_reservation_error(requested_bytes))
     }
@@ -3005,13 +3006,19 @@ impl PoolDatasetOwner {
         self.ensure_mutation_allowed("reserve replacement filesystem capacity")?;
         if requested_bytes == 0 {
             return self
-                .capacity_authority
+                .dataset_capacity
                 .reserve(0)
                 .map_err(|_| self.capacity_reservation_error(0));
         }
         let net_new_bytes = requested_bytes.saturating_sub(replacement_credit_bytes);
+        // Copy-on-write replacement needs physical room for the complete new
+        // object until its predecessor can be reclaimed. Dataset quota only
+        // grows by the net delta below.
+        self.store
+            .ensure_physical_capacity(requested_bytes)
+            .map_err(|error| self.map_physical_capacity_error(error, requested_bytes))?;
         if let Some(ref hierarchy) = self.filesystem.quota_hierarchy {
-            let pool_free = self.filesystem.capacity_authority.free_bytes();
+            let pool_free = self.filesystem.dataset_capacity.free_bytes();
             let decision = hierarchy.check_delta(
                 self.filesystem.mounted_dataset_id,
                 net_new_bytes,
@@ -3024,19 +3031,51 @@ impl PoolDatasetOwner {
             }
         }
         self.filesystem
-            .capacity_authority
+            .dataset_capacity
             .reserve_with_replacement_credit(requested_bytes, replacement_credit_bytes)
             .map_err(|_| self.capacity_reservation_error(requested_bytes))
     }
 
     fn capacity_reservation_error(&self, requested: u64) -> FileSystemError {
+        let dataset_available = self.filesystem.dataset_capacity.available_bytes();
+        let dataset_capacity = self.filesystem.dataset_capacity.total_bytes();
+        let (available, capacity) = self
+            .store
+            .physical_capacity()
+            .map(|physical| {
+                (
+                    dataset_available.min(physical.available_bytes),
+                    dataset_capacity.min(physical.total_bytes),
+                )
+            })
+            .unwrap_or((0, dataset_capacity));
         FileSystemError::NoSpace {
             resource: LocalStorageResource::ContentBytes,
             requested,
-            available: self.filesystem.capacity_authority.available_bytes(),
-            capacity: self.filesystem.capacity_authority.total_bytes(),
-            allocated: self.filesystem.capacity_authority.used_bytes(),
+            available,
+            capacity,
+            allocated: self.filesystem.dataset_capacity.used_bytes(),
         }
+    }
+
+    fn map_physical_capacity_error(
+        &self,
+        error: PoolRuntimeError,
+        requested: u64,
+    ) -> FileSystemError {
+        match error {
+            PoolRuntimeError::PhysicalNoSpace { .. } => self.capacity_reservation_error(requested),
+            other => FileSystemError::from(other),
+        }
+    }
+
+    fn check_physical_capacity(&self, requested_bytes: u64) -> std::result::Result<(), Errno> {
+        self.store
+            .ensure_physical_capacity(requested_bytes)
+            .map_err(|error| match error {
+                PoolRuntimeError::PhysicalNoSpace { .. } => Errno::ENOSPC,
+                _ => Errno::EIO,
+            })
     }
 
     /// Compute the effective capacity ceiling for the mounted dataset,
@@ -4604,29 +4643,18 @@ impl PoolDatasetOwner {
         let recovered_generation = open_recovery.recover_commit_group_generation(state.generation);
 
         let generation = recovered_generation;
-        // Construct the capacity authority from pool geometry and committed
-        // usage. This is the single production source for used/free/reserved/
-        // pending byte counters for the lifetime of this filesystem instance.
+        // Construct the filesystem dataset capacity projection from its
+        // configured logical ceiling and committed content usage. Physical
+        // capacity remains owned and queried live through PoolRuntime.
         let pending_device_removal_recovery = open_recovery.has_pending_device_removal()?;
         let pending_device_replacement_recovery =
             open_recovery.has_device_replacement_predecessor_resume();
         let pending_device_lifecycle_recovery =
             pending_device_removal_recovery || pending_device_replacement_recovery;
-        let capacity_authority = {
-            let pool_stats = open_recovery.pool_stats();
+        let dataset_capacity = {
             let block_size = StatfsResult::DEFAULT_BLOCK_SIZE as u32;
             let root_reserve_bytes = 0; // no root reserve in local-filesystem policy
-                                        // Cap total capacity to the allocator policy ceiling so
-                                        // statfs-derived block counts respect the configured policy limit.
-                                        // When the pool reports zero capacity (memory-backed or test store),
-                                        // fall back to the policy ceiling.
-            let total_bytes = if pool_stats.total_capacity_bytes > 0 {
-                pool_stats
-                    .total_capacity_bytes
-                    .min(allocator_policy.content_capacity_bytes)
-            } else {
-                allocator_policy.content_capacity_bytes
-            };
+            let total_bytes = allocator_policy.content_capacity_bytes;
             // Reconstruct committed content bytes from TideFS content objects
             // rather than raw object-store usage. The raw pool counter includes
             // metadata/log bytes, while LocalStorageAllocatorPolicy's capacity
@@ -4653,14 +4681,14 @@ impl PoolDatasetOwner {
                 counters.logical_used_bytes = used_bytes;
                 let provisional =
                     SpaceAccounting::new(counters, state.space_accounting.domain_id());
-                CapacityAuthority::from_committed_accounting(
+                DatasetCapacityProjection::from_committed_accounting(
                     total_bytes,
                     &provisional,
                     block_size,
                     root_reserve_bytes,
                 )
             } else {
-                CapacityAuthority::from_committed_accounting(
+                DatasetCapacityProjection::from_committed_accounting(
                     total_bytes,
                     &state.space_accounting,
                     block_size,
@@ -4857,7 +4885,7 @@ impl PoolDatasetOwner {
                 fsync_stats: FsyncStats::default(),
                 sync_gate: SyncGate::with_durable_commit_group(CommitGroupId(recovered_generation)),
                 recovery_policy,
-                capacity_authority,
+                dataset_capacity,
                 mounted_dataset_id: *mounted_dataset_id.as_bytes(),
                 mounted_dataset_path: dataset_path.to_string(),
                 quota_hierarchy: None,
@@ -6147,7 +6175,7 @@ impl PoolDatasetOwner {
             .space_accounting
             .track_physical_free(replaced_data_bytes);
         self.filesystem
-            .capacity_authority
+            .dataset_capacity
             .record_free(replaced_data_bytes);
     }
 
@@ -6826,7 +6854,7 @@ impl PoolDatasetOwner {
         // Update the capacity authority so statfs-derived block
         // counts reflect the new configured capacity ceiling.
         self.filesystem
-            .capacity_authority
+            .dataset_capacity
             .set_total_bytes(policy.content_capacity_bytes);
         // Recreate optional policy-observation state with the new capacity.
         #[cfg(feature = "policy-observation")]
@@ -7342,34 +7370,51 @@ impl PoolDatasetOwner {
     }
 
     pub fn statfs(&mut self) -> Result<FileSystemStatfs> {
-        // Refresh pool counters so statfs sees current physical state.
-        let phys = self.derive_pool_physical_counters();
+        let physical = self.store.physical_capacity()?;
+        let live_pool_counters = PoolPhysicalCountersV1::mounted_authority_from_capacity(
+            physical.total_bytes,
+            physical.used_bytes,
+            StatfsResult::DEFAULT_BLOCK_SIZE,
+        );
+        let dataset_capacity = self.derive_dataset_capacity_counters();
         // Keep store-layer SpaceBook updated for internal tracking
-        // (write/delete auto-updates, persistence). The statfs derivation
-        // no longer queries SpaceBook; it uses the single capacity authority.
+        // (write/delete auto-updates, persistence). Statfs does not query
+        // SpaceBook; it combines dataset accounting with live Pool capacity.
         // A read-only import projects the same counters in memory below but
         // must not request a mutable raw-store handle for this unused cache.
         if !self.store.pool().is_read_only() {
-            self.store.pool_mut().update_space_book_pool_counters(phys);
+            self.store
+                .pool_mut()
+                .update_space_book_pool_counters(live_pool_counters);
         }
-        // Refresh the mounted capacity facade from the committed
-        // tidefs-space-accounting authority. Statfs must not recompute
-        // free space from local capacity counters.
+        // Refresh only the dataset logical/quota projection. The physical
+        // limit remains the live Pool view above.
         self.filesystem
-            .capacity_authority
-            .refresh_committed_accounting(&self.filesystem.state.space_accounting, phys);
+            .dataset_capacity
+            .refresh_committed_accounting(
+                &self.filesystem.state.space_accounting,
+                dataset_capacity,
+            );
 
         let report = self.allocator_report()?;
         let ancestors = self.quota_ancestor_chain_for_parts(&[]);
-        let authority_free_bytes = self.filesystem.capacity_authority.free_bytes();
-        let authority_available_bytes = self.filesystem.capacity_authority.available_bytes();
+        let authority_free_bytes = self
+            .filesystem
+            .dataset_capacity
+            .free_bytes()
+            .min(physical.available_bytes);
+        let authority_available_bytes = self
+            .filesystem
+            .dataset_capacity
+            .available_bytes()
+            .min(physical.available_bytes);
         let quota_limited_available_bytes = self
             .state
             .quota_table
             .quota_limited_available(&ancestors, authority_available_bytes);
-        // Derive block counters from the single production capacity authority.
-        // This replaces the former SpaceBook/SpaceAccounting dual-query path.
-        let cs = self.filesystem.capacity_authority.derive_statfs(
+        // Derive dataset block counters once, then clamp them to Pool physical
+        // availability below. This replaces the former stale physical mirror.
+        let cs = self.filesystem.dataset_capacity.derive_statfs(
             report.policy.inode_capacity,
             report.free_inodes,
             MAX_NAME_BYTES as u32,
@@ -7379,9 +7424,10 @@ impl PoolDatasetOwner {
         fs.frsize = cs.block_size;
         let grain_bytes = u64::from(cs.block_size);
         let total_bytes_limit = self
-            .capacity_authority
+            .dataset_capacity
             .total_bytes()
-            .min(report.policy.content_capacity_bytes);
+            .min(report.policy.content_capacity_bytes)
+            .min(physical.total_bytes);
         let free_blocks_limit = if grain_bytes == 0 {
             0
         } else {
@@ -9634,17 +9680,17 @@ impl PoolDatasetOwner {
             .state
             .space_accounting
             .track_physical_free(bytes);
-        self.filesystem.capacity_authority.record_free(bytes);
+        self.filesystem.dataset_capacity.record_free(bytes);
     }
 
     fn ensure_content_write_not_over_capacity(&self, requested: u64) -> Result<()> {
-        let allocated = self.filesystem.capacity_authority.used_bytes();
-        let capacity = self.filesystem.capacity_authority.total_bytes();
+        let allocated = self.filesystem.dataset_capacity.used_bytes();
+        let capacity = self.filesystem.dataset_capacity.total_bytes();
         if requested > 0 && allocated > capacity {
             return Err(FileSystemError::NoSpace {
                 resource: LocalStorageResource::ContentBytes,
                 requested,
-                available: self.filesystem.capacity_authority.available_bytes(),
+                available: self.filesystem.dataset_capacity.available_bytes(),
                 capacity,
                 allocated,
             });
@@ -10023,7 +10069,7 @@ impl PoolDatasetOwner {
         if let Err(err) = self.try_admit_write(physical_admit_bytes, 1) {
             if mutation_was_active {
                 self.filesystem
-                    .capacity_authority
+                    .dataset_capacity
                     .record_free(physical_admit_bytes);
                 self.filesystem.mutation_recorded_commit_group_write =
                     mutation_had_commit_group_write;
@@ -10176,7 +10222,7 @@ impl PoolDatasetOwner {
 
         let result = self.inode(inode_id)?.clone();
         // Capacity reservation was committed inline before the write.
-        // On error paths the caller must rollback via capacity_authority.record_free.
+        // On error paths the caller must roll back dataset capacity via record_free.
         Ok(result)
     }
 
@@ -10318,7 +10364,7 @@ impl PoolDatasetOwner {
                 // post-reservation snapshot, so return that charge here while
                 // retaining any pre-existing dirty-buffer charge.
                 self.filesystem
-                    .capacity_authority
+                    .dataset_capacity
                     .record_free(physical_admit_bytes);
                 return Err(err);
             }
@@ -10489,9 +10535,9 @@ impl PoolDatasetOwner {
                 return Err(FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
                     requested: reserve_bytes,
-                    available: self.filesystem.capacity_authority.available_bytes(),
-                    capacity: self.filesystem.capacity_authority.total_bytes(),
-                    allocated: self.filesystem.capacity_authority.used_bytes(),
+                    available: self.filesystem.dataset_capacity.available_bytes(),
+                    capacity: self.filesystem.dataset_capacity.total_bytes(),
+                    allocated: self.filesystem.dataset_capacity.used_bytes(),
                 });
             }
         }
@@ -10675,9 +10721,9 @@ impl PoolDatasetOwner {
                 let err = FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
                     requested: reserve_bytes,
-                    available: self.filesystem.capacity_authority.available_bytes(),
-                    capacity: self.filesystem.capacity_authority.total_bytes(),
-                    allocated: self.filesystem.capacity_authority.used_bytes(),
+                    available: self.filesystem.dataset_capacity.available_bytes(),
+                    capacity: self.filesystem.dataset_capacity.total_bytes(),
+                    allocated: self.filesystem.dataset_capacity.used_bytes(),
                 };
                 self.rollback_mutation_delta();
                 return Err(err);
@@ -10815,7 +10861,7 @@ impl PoolDatasetOwner {
                         .extent_allocator
                         .free_extent(inode_id.0, size, truncated_len);
                     self.filesystem.state.dirty_extent_maps.insert(inode_id);
-                    self.filesystem.capacity_authority.record_free(freed_bytes);
+                    self.filesystem.dataset_capacity.record_free(freed_bytes);
                     self.filesystem
                         .state
                         .space_accounting
@@ -11063,8 +11109,8 @@ impl PoolDatasetOwner {
                     .state
                     .space_accounting
                     .track_physical_free(data_bytes);
-                // Track freed bytes in the production capacity authority.
-                self.filesystem.capacity_authority.record_free(freed_bytes);
+                // Track freed bytes in the filesystem dataset projection.
+                self.filesystem.dataset_capacity.record_free(freed_bytes);
             }
             // Intent-log: record punch_hole for crash-recovery replay.
             let _ = self.filesystem.intent_log_buffer.as_ref().map(|buf| {
@@ -11323,9 +11369,9 @@ impl PoolDatasetOwner {
                 return Err(FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
                     requested: newly_allocated_bytes,
-                    available: self.filesystem.capacity_authority.available_bytes(),
-                    capacity: self.filesystem.capacity_authority.total_bytes(),
-                    allocated: self.filesystem.capacity_authority.used_bytes(),
+                    available: self.filesystem.dataset_capacity.available_bytes(),
+                    capacity: self.filesystem.dataset_capacity.total_bytes(),
+                    allocated: self.filesystem.dataset_capacity.used_bytes(),
                 });
             }
         }
@@ -11539,9 +11585,9 @@ impl PoolDatasetOwner {
             .state
             .space_accounting
             .track_physical_free(effective_length);
-        // Track freed bytes in the production capacity authority
+        // Track freed bytes in the filesystem dataset projection.
         self.filesystem
-            .capacity_authority
+            .dataset_capacity
             .record_free(effective_length);
         // Intent-log: record collapse_range for crash-recovery replay.
         let _ = self.filesystem.intent_log_buffer.as_ref().map(|buf| {
@@ -11821,9 +11867,7 @@ impl PoolDatasetOwner {
                     .state
                     .space_accounting
                     .track_physical_free(physical_free);
-                self.filesystem
-                    .capacity_authority
-                    .record_free(physical_free);
+                self.filesystem.dataset_capacity.record_free(physical_free);
             }
         }
         // Re-verify parent exists after lock acquisition
@@ -11948,9 +11992,7 @@ impl PoolDatasetOwner {
                 .state
                 .space_accounting
                 .track_physical_free(physical_free);
-            self.filesystem
-                .capacity_authority
-                .record_free(physical_free);
+            self.filesystem.dataset_capacity.record_free(physical_free);
         }
     }
 
@@ -12337,9 +12379,7 @@ impl PoolDatasetOwner {
                                 .state
                                 .space_accounting
                                 .track_physical_free(physical_free);
-                            self.filesystem
-                                .capacity_authority
-                                .record_free(physical_free);
+                            self.filesystem.dataset_capacity.record_free(physical_free);
                         }
                     }
                     // Record nlink=0 in state so record_reclaim_delta can iterate
@@ -15067,14 +15107,7 @@ impl PoolDatasetOwner {
     /// Rebuild mounted admission and statfs authority after a device lifecycle
     /// recovery has reconciled every embedded content receipt generation.
     fn rebuild_capacity_authority_from_committed_content(&mut self) -> Result<()> {
-        let pool_stats = self.store.pool().pool_stats();
-        let total_bytes = if pool_stats.total_capacity_bytes > 0 {
-            pool_stats
-                .total_capacity_bytes
-                .min(self.filesystem.allocator_policy.content_capacity_bytes)
-        } else {
-            self.filesystem.allocator_policy.content_capacity_bytes
-        };
+        let total_bytes = self.filesystem.allocator_policy.content_capacity_bytes;
         let used_bytes = allocation_bytes(&content_allocation_entries_for_state_pool(
             self.store.pool(),
             &self.filesystem.state,
@@ -15086,7 +15119,7 @@ impl PoolDatasetOwner {
             self.filesystem.state.space_accounting =
                 SpaceAccounting::new(counters, self.filesystem.state.space_accounting.domain_id());
         }
-        self.filesystem.capacity_authority = CapacityAuthority::from_committed_accounting(
+        self.filesystem.dataset_capacity = DatasetCapacityProjection::from_committed_accounting(
             total_bytes,
             &self.filesystem.state.space_accounting,
             StatfsResult::DEFAULT_BLOCK_SIZE as u32,
@@ -15119,7 +15152,7 @@ impl PoolDatasetOwner {
                     .clone(),
                 old_quota_table: self.filesystem.state.quota_table.clone(),
                 old_space_accounting: self.filesystem.state.space_accounting.clone(),
-                old_capacity_authority: self.filesystem.capacity_authority.snapshot_for_rollback(),
+                old_dataset_capacity: self.filesystem.dataset_capacity.snapshot_for_rollback(),
                 #[cfg(feature = "policy-observation")]
                 old_obligation_ledger: self.filesystem.obligation_ledger.clone(),
                 old_dirty_pages,
@@ -15198,8 +15231,8 @@ impl PoolDatasetOwner {
             self.filesystem.state.quota_table = delta.old_quota_table;
             self.filesystem.state.space_accounting = delta.old_space_accounting;
             self.filesystem
-                .capacity_authority
-                .restore_from_snapshot(&delta.old_capacity_authority);
+                .dataset_capacity
+                .restore_from_snapshot(&delta.old_dataset_capacity);
             #[cfg(feature = "policy-observation")]
             {
                 self.filesystem.obligation_ledger = delta.old_obligation_ledger;
@@ -15502,15 +15535,10 @@ impl PoolDatasetOwner {
 
     // ── Space accounting ────────────────────────────────────────────
 
-    /// Derive the mounted-authority physical pool projection.
-    ///
-    /// The mounted consumer admits only total capacity from the lower
-    /// physical-pool boundary. Free/reclaimable/watermark fields are producer
-    /// observations, so this projection derives the mounted-capacity side from
-    /// committed [`SpaceAccounting`] consumption instead of exporting a raw
-    /// pool-free mirror.
-    fn derive_pool_physical_counters(&self) -> PoolPhysicalCountersV1 {
-        let total_bytes = self.filesystem.capacity_authority.total_bytes();
+    /// Derive the filesystem dataset capacity projection consumed by its
+    /// logical accounting model. This is not the Pool physical view.
+    fn derive_dataset_capacity_counters(&self) -> PoolPhysicalCountersV1 {
+        let total_bytes = self.filesystem.dataset_capacity.total_bytes();
         let consumed_bytes = self
             .state
             .space_accounting
@@ -15525,10 +15553,10 @@ impl PoolDatasetOwner {
 
     /// Apply and persist the accumulated space delta.
     fn commit_space_delta(&mut self) -> Result<()> {
-        let phys = self.derive_pool_physical_counters();
+        let phys = self.derive_dataset_capacity_counters();
         if !self.filesystem.state.space_accounting.has_pending_delta() {
             self.filesystem
-                .capacity_authority
+                .dataset_capacity
                 .refresh_committed_accounting_after_commit(
                     &self.filesystem.state.space_accounting,
                     phys,
@@ -15562,9 +15590,9 @@ impl PoolDatasetOwner {
                 counters.reserved_bytes,
             );
 
-        let refreshed_phys = self.derive_pool_physical_counters();
+        let refreshed_phys = self.derive_dataset_capacity_counters();
         self.filesystem
-            .capacity_authority
+            .dataset_capacity
             .refresh_committed_accounting_after_commit(
                 &self.filesystem.state.space_accounting,
                 refreshed_phys,
@@ -15637,7 +15665,15 @@ impl PoolDatasetOwner {
     }
 
     fn pool_free_bytes_for_quota(&self) -> u64 {
-        self.filesystem.capacity_authority.free_bytes()
+        self.store
+            .physical_capacity()
+            .map(|physical| {
+                self.filesystem
+                    .dataset_capacity
+                    .free_bytes()
+                    .min(physical.available_bytes)
+            })
+            .unwrap_or(0)
     }
 
     fn inode(&self, inode_id: InodeId) -> Result<InodeRecord> {
@@ -19803,7 +19839,7 @@ mod recovery_integration_tests {
             .expect("test setup mutation must be admitted");
 
         // Record pre-transaction capacity state.
-        let used_before = fs.capacity_authority.used_bytes();
+        let used_before = fs.dataset_capacity.used_bytes();
         let quota_table_before = fs.filesystem.state.quota_table.clone();
         let space_accounting_before = fs.filesystem.state.space_accounting.clone();
 
@@ -19844,7 +19880,7 @@ mod recovery_integration_tests {
         );
 
         // Capacity authority must be restored (no leaked allocation).
-        let used_after = fs.capacity_authority.used_bytes();
+        let used_after = fs.dataset_capacity.used_bytes();
         assert_eq!(
             used_before, used_after,
             "capacity used_bytes must be restored after rollback: before={used_before} after={used_after}",

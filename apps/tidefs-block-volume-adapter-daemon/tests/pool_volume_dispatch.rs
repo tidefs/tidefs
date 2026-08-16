@@ -135,10 +135,21 @@ fn pool_volume_backend_flushes_and_reopens_committed_data() {
 }
 
 #[test]
-fn mounted_pool_volume_backend_uses_shared_owner_and_preserves_mutation_fence() {
+fn mounted_pool_capacity_tracks_volume_and_preserves_mutation_fence() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut owner = PoolDatasetOwner::open_with_root_authentication_key(
+    let device = dir.path().join("mounted-capacity.img");
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&device)
+        .expect("create mounted capacity device")
+        .set_len(72 * 1024 * 1024)
+        .expect("size mounted capacity device");
+    let mut owner = PoolDatasetOwner::open_with_block_devices(
         dir.path(),
+        std::slice::from_ref(&device),
         StoreOptions::default(),
         RootAuthenticationKey::demo_key(),
     )
@@ -147,7 +158,7 @@ fn mounted_pool_volume_backend_uses_shared_owner_and_preserves_mutation_fence() 
         .create_volume_dataset(
             "vol",
             DatasetId::from_bytes([14; 16]),
-            4 * 1024 * 1024,
+            32 * 1024 * 1024,
             Vec::new(),
             DatasetFlags::NONE,
             SyncGuarantee::Local,
@@ -156,13 +167,24 @@ fn mounted_pool_volume_backend_uses_shared_owner_and_preserves_mutation_fence() 
     let shared_owner = SharedPoolDatasetOwner::new(owner);
     let mut backend = PoolVolumeBackend::open_mounted(shared_owner.clone(), "vol", false)
         .expect("open mounted Pool volume backend");
+    let statfs_before = shared_owner
+        .borrow_mut()
+        .statfs()
+        .expect("statfs before volume write");
 
+    let payload = vec![0x6d; 24 * 1024 * 1024];
     backend
-        .write_blocks(2, &[0x6d; 4096], 4096)
+        .write_blocks(0, &payload, 4096)
         .expect("write through mounted Pool owner");
     backend.flush().expect("flush through mounted Pool owner");
     {
-        let owner = shared_owner.borrow();
+        let mut owner = shared_owner.borrow_mut();
+        let statfs_after = owner.statfs().expect("statfs after volume write");
+        assert!(
+            statfs_after.bfree < statfs_before.bfree,
+            "committed volume bytes must reduce filesystem-visible physical free space"
+        );
+        assert!(statfs_after.bavail < statfs_before.bavail);
         let volume = owner
             .pool_runtime()
             .open_volume("vol")
@@ -194,6 +216,73 @@ fn mounted_pool_volume_backend_uses_shared_owner_and_preserves_mutation_fence() 
         backend.flush(),
         Err(BackendError::Other(message)) if message.contains("reopen")
     ));
+}
+
+#[test]
+fn mounted_pool_capacity_refusal_preserves_root_and_reservations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut owner = PoolDatasetOwner::open_with_root_authentication_key(
+        dir.path(),
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+    )
+    .expect("open mounted Pool owner");
+    let volume_id = DatasetId::from_bytes([15; 16]);
+    owner
+        .create_volume_dataset(
+            "vol",
+            volume_id,
+            4 * 1024 * 1024,
+            Vec::new(),
+            DatasetFlags::NONE,
+            SyncGuarantee::Local,
+        )
+        .expect("create mounted Pool volume");
+    let root_before = *owner
+        .pool_runtime()
+        .dataset_root(volume_id)
+        .expect("committed volume root");
+    let capacity_before = owner
+        .pool_runtime()
+        .physical_capacity()
+        .expect("physical capacity before refusal");
+    owner
+        .pool_runtime_mut("configure focused capacity refusal")
+        .expect("mutable runtime")
+        .pool_mut()
+        .set_low_watermark_bytes(u64::MAX);
+    let shared_owner = SharedPoolDatasetOwner::new(owner);
+    let mut backend = PoolVolumeBackend::open_mounted(shared_owner.clone(), "vol", false)
+        .expect("open mounted Pool volume backend");
+
+    assert!(matches!(
+        backend.write_blocks(0, &[0x7c; 4096], 4096),
+        Err(BackendError::NoSpace)
+    ));
+
+    let owner = shared_owner.borrow();
+    assert_eq!(
+        *owner
+            .pool_runtime()
+            .dataset_root(volume_id)
+            .expect("volume root after refusal"),
+        root_before
+    );
+    assert_eq!(
+        owner
+            .pool_runtime()
+            .physical_capacity()
+            .expect("capacity after refusal"),
+        capacity_before
+    );
+    assert_eq!(owner.dataset_capacity().reserved_bytes(), 0);
+    drop(owner);
+    shared_owner
+        .borrow_mut()
+        .pool_runtime_mut("reset focused capacity refusal")
+        .expect("mutable runtime")
+        .pool_mut()
+        .set_low_watermark_bytes(0);
 }
 
 #[test]
