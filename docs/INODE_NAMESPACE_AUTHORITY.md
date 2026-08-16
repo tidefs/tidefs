@@ -17,8 +17,9 @@ This decision covers:
   snapshots, committed roots, and replay;
 - dataset root identity and the current root dataset bridge;
 - FUSE lookup/forget references and adapter lookup caches;
-- the relationship between `LocalFileSystem`, `tidefs-namespace`,
-  `tidefs-inode-table`, and FUSE adapter registries;
+- the relationship between `LocalFileSystem`, the now-retired
+  `tidefs-namespace` package, `tidefs-inode-table`, and FUSE adapter
+  registries;
 - old pre-release catalog handling for inode and root dataset mismatches.
 
 This decision does not by itself prove crash consistency for rename, replay,
@@ -39,8 +40,9 @@ The selected local mounted carrier applies the decision as follows:
   namespace fallback, mirrored durable attributes, or merged directory view.
 - FUSE lookup counts, forget counts, and path/negative caches are derived
   kernel-reference state only. The selected adapter has no inode-table-backed
-  lookup/read/write batch, and `tidefs-namespace` remains outside the selected
-  mounted carrier.
+  lookup/read/write batch. The unattached `tidefs-namespace` package and its
+  validation-only self-smoke were removed after their last mounted consumer
+  disappeared.
 - The mounted pool lifecycle checks stable inode identity through rename,
   hard-link, unlink, clean export/reimport, and crash recovery.
 
@@ -52,9 +54,9 @@ is above and in `docs/ARCHITECTURE.md`.
 
 Documentation:
 
-- `docs/REVIEW_TODO_REGISTER.md` records TFR-004 split authority between
-  `LocalFileSystem`, `tidefs-namespace`, `tidefs-inode-table`, and FUSE
-  lookup/forget state.
+- `docs/REVIEW_TODO_REGISTER.md` originally recorded TFR-004 split authority
+  between `LocalFileSystem`, the former `tidefs-namespace` package,
+  `tidefs-inode-table`, and FUSE lookup/forget state.
 - `docs/REVIEW_TODO_REGISTER.md` records recent TFR-004 cleanup commits:
   root dataset ID alignment, fail-closed mismatched root catalogs, explicit
   namespace inode ID preservation, inode-table corruption fail-closed behavior,
@@ -82,21 +84,19 @@ Local filesystem:
   bitmap summaries. Recovery therefore already participates in allocator
   authority and cannot be outside the chosen boundary.
 
-Namespace:
+Former standalone namespace package, removed after #2397 and #2534:
 
-- `crates/tidefs-namespace/src/lib.rs` has `MemInodeTable`, an atomic bump
-  allocator with a `HashMap` and freed set. It is a namespace-local allocator,
-  not a durable mounted dataset authority.
-- `Namespace` delegates allocation to `PersistentInodeStore` when present and
-  otherwise falls back to `MemInodeTable`.
-- `crates/tidefs-namespace/src/persistence.rs` defines
-  `NamespaceDatasetIdentity` and persistent stores that are dataset-keyed and
-  preserve explicit IDs.
-- `crates/tidefs-namespace/src/local_fs_persist.rs` bridges namespace
-  allocation to `LocalFileSystem` by using explicit `attrs.inode` when present,
-  otherwise `fs.next_inode_id()`, and inserting with `fs.insert_inode_at()`.
-  It preserves `rdev` through the bridge, but generic replay still lacks a
-  device-number authority.
+- At decision time, `crates/tidefs-namespace/src/lib.rs` had `MemInodeTable`,
+  an atomic bump allocator with a `HashMap` and freed set. It was a
+  namespace-local allocator, not a durable mounted dataset authority.
+- `Namespace` delegated allocation to `PersistentInodeStore` when present and
+  otherwise fell back to `MemInodeTable`.
+- `crates/tidefs-namespace/src/persistence.rs` defined
+  `NamespaceDatasetIdentity` and dataset-keyed persistent stores.
+- `crates/tidefs-namespace/src/local_fs_persist.rs` bridged namespace
+  allocation to `LocalFileSystem`. After the selected carrier stopped using
+  that bridge, the package had only its own tests and one validation self-smoke;
+  #2534 removed both rather than preserving a second authority.
 
 Inode table:
 
@@ -201,9 +201,10 @@ All durable mounted inode allocation goes through `DatasetInodeAuthority`.
 Recovery reconstructs it from the selected durable inode IDs, and explicit ID
 insertion advances its reuse-prevention state.
 
-`Namespace` is not attached to the selected mounted carrier. Any other
-persistent namespace consumer must not allocate mounted IDs independently; the
-fallback `MemInodeTable` is only an in-memory non-carrier projection.
+The former standalone `Namespace` is not attached to the selected mounted
+carrier and its package has been retired. Any future persistent namespace
+consumer must obtain mounted IDs from `DatasetInodeAuthority`; it must not add
+another allocator or revive an in-memory fallback as durable truth.
 
 `tidefs-inode-table` must not allocate durable mounted inode IDs. Its state may
 remain useful for non-mounted tests or kernel-reference projections, but
@@ -295,6 +296,7 @@ The decision was implemented and then contracted through these bounded issues:
 | #666 | Settle old catalog policy. | Conflicting pre-release catalog identity fails closed unless a named external boundary authorizes migration. |
 | #667 | Replay special-node `rdev` through intent authority. | Device-number persistence does not change generic inode ownership. |
 | #2397 | Remove residual mounted namespace and inode-table fallbacks. | The selected VFS/FUSE carrier has one namespace identity and propagates engine results without a second mounted authority. |
+| #2534 | Retire the unattached standalone namespace package. | Validation self-smoke no longer preserves a second allocator, directory-state owner, or persistence bridge after its mounted consumers are gone. |
 
 ## Validation For This Decision
 

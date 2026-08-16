@@ -2347,7 +2347,6 @@ fn classify_library_family(name: &str) -> Family {
         || name.starts_with("tidefs-kmod-")
         || name.starts_with("tidefs-lease-")
         || name.starts_with("tidefs-lock-")
-        || name.starts_with("tidefs-namespace")
         || name.starts_with("tidefs-node-")
         || name.starts_with("tidefs-offload-")
         || name.starts_with("tidefs-object-")

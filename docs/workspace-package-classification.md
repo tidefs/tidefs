@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 165 |
+| Workspace packages | 164 |
 | Explicitly excluded package roots | 4 |
-| Discovered package manifests | 169 |
-| Classified package roots | 169 |
+| Discovered package manifests | 168 |
+| Classified package roots | 168 |
 
 ## TFR-002 Category Mapping
 
@@ -52,7 +52,7 @@ holding area.
 
 | Role | Count |
 | --- | ---: |
-| `product-code` | 130 |
+| `product-code` | 131 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
 | `proof-harness` | 10 |
@@ -145,7 +145,6 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-membership-live` | `tidefs-membership-live` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-membership-types` | `tidefs-membership-types` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-model-core` | `tidefs-model-core` | `workspace-member` | `proof-harness` | current proof harness for pure deterministic VFS model; 8 unit tests cover all 10 canonical VFS operations through ModelRequest and contract-envelope APIs with full invariant checking; 8 integration tests validate ModelRunReceipt serialization and field-level rejection; used by tidefs-crash-oracle, tidefs-env-fuse-model, and tidefs-trace-oracle; runtime claims remain separately gated. |
-| `crates/tidefs-namespace` | `tidefs-namespace` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-node-drain` | `tidefs-node-drain` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-node-join` | `tidefs-node-join` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-object-io` | `tidefs-object-io` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
