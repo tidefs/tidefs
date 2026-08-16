@@ -4,8 +4,8 @@
 
 //! Sparse I/O types and write-buffer staging for the POSIX filesystem adapter.
 //!
-//! This crate provides write payload staging, content hashing, read caching,
-//! and copy_file_range request/plan types used by the FUSE daemon dispatch path.
+//! This crate provides write payload staging, content hashing, and
+//! copy_file_range request/plan types used by the FUSE daemon dispatch path.
 
 extern crate alloc;
 
@@ -269,39 +269,6 @@ impl FuseCopyFileRangeRequest {
     }
 }
 
-// ── Read cache trait ───────────────────────────────────────────────────────
-
-/// Read cache contract needed by file-read workers.
-///
-/// Implementations may defer to an external page cache or provide a no-op
-/// fallback for testing and direct-I/O paths.
-pub trait ReadCache {
-    /// Look up cached data spanning `[offset, offset + length)` for `ino`.
-    ///
-    /// Returns `None` when no cached data covers the requested range.
-    fn lookup(&self, ino: u64, offset: u64, length: u64) -> Option<Vec<u8>>;
-
-    /// Insert data into the cache for `ino` at `offset`.
-    fn insert(&mut self, ino: u64, offset: u64, data: &[u8]);
-}
-
-/// A [`ReadCache`] that never caches data — every lookup is a miss.
-///
-/// Use this when page-cache acceleration is unavailable (e.g. direct-I/O
-/// mode or testing without a cache layer).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoopReadCache;
-
-impl ReadCache for NoopReadCache {
-    fn lookup(&self, _ino: u64, _offset: u64, _length: u64) -> Option<Vec<u8>> {
-        None
-    }
-
-    fn insert(&mut self, _ino: u64, _offset: u64, _data: &[u8]) {
-        // no-op: discard all cached data
-    }
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -402,18 +369,5 @@ mod tests {
         assert_eq!(plan.fh_out, 40);
         assert_eq!(plan.offset_out, 1024);
         assert_eq!(plan.len, 4096);
-    }
-
-    #[test]
-    fn noop_read_cache_always_misses() {
-        let cache = NoopReadCache;
-        assert!(cache.lookup(1, 0, 256).is_none());
-    }
-
-    #[test]
-    fn noop_read_cache_insert_is_noop() {
-        let mut cache = NoopReadCache;
-        cache.insert(1, 0, b"data");
-        assert!(cache.lookup(1, 0, 4).is_none());
     }
 }

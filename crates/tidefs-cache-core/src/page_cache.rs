@@ -1593,53 +1593,6 @@ impl PageCache {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// ReadCache bridge for workers-io integration
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "adapter-workers-io")]
-use tidefs_posix_filesystem_adapter_workers_io::ReadCache;
-
-#[cfg(feature = "adapter-workers-io")]
-impl ReadCache for PageCache {
-    fn lookup(&self, ino: u64, offset: u64, length: u64) -> Option<Vec<u8>> {
-        // Align offset down to page size
-        let page_size = self.page_size() as u64;
-        let page_offset = (offset / page_size) * page_size;
-        let handle = self.lookup(ino, page_offset)?;
-        let page_data = handle.data();
-        let start_in_page = (offset - page_offset) as usize;
-        let end_in_page = start_in_page
-            .saturating_add(length as usize)
-            .min(page_data.len());
-        if start_in_page >= page_data.len() {
-            return Some(Vec::new());
-        }
-        Some(page_data[start_in_page..end_in_page].to_vec())
-    }
-
-    fn insert(&mut self, ino: u64, offset: u64, data: &[u8]) {
-        let page_size = self.page_size() as u64;
-        let page_offset = (offset / page_size) * page_size;
-        let start_in_page = (offset - page_offset) as usize;
-
-        // Best-effort insert: if the page already exists we reuse it,
-        // otherwise we allocate a new page.
-        let _ = PageCache::insert(self, ino, page_offset);
-
-        // Acquire the page handle and copy data in.
-        if let Some(mut handle) = self.lookup(ino, page_offset) {
-            let dst = handle.data_mut();
-            let copy_end = start_in_page.saturating_add(data.len()).min(dst.len());
-            if start_in_page < copy_end {
-                let copy_len = copy_end - start_in_page;
-                dst[start_in_page..start_in_page + copy_len].copy_from_slice(&data[..copy_len]);
-            }
-            // Page stays clean since we are filling from authoritative storage.
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // CacheInvalidationSubscriber impl for PageCache
 // ---------------------------------------------------------------------------
 
