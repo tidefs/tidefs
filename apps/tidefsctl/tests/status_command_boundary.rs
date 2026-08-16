@@ -188,6 +188,12 @@ fn open_named_filesystem(
     .expect("open independently rooted filesystem")
 }
 
+struct IndependentFilesystemExpected {
+    current_payload: Vec<u8>,
+    snapshot_payload: Vec<u8>,
+    snapshot_name: &'static str,
+}
+
 fn prepare_independent_filesystem_lifecycle_graph(
     mut filesystem: LocalFileSystem,
     metadata_dir: &std::path::Path,
@@ -196,7 +202,7 @@ fn prepare_independent_filesystem_lifecycle_graph(
     redundancy_policy: PoolRedundancyPolicy,
     dataset_id_byte: u8,
     payload_byte: u8,
-) -> (LocalFileSystem, Vec<u8>) {
+) -> (LocalFileSystem, IndependentFilesystemExpected) {
     filesystem
         .create_filesystem_dataset(
             "other",
@@ -211,18 +217,32 @@ fn prepare_independent_filesystem_lifecycle_graph(
         .expect("commit root catalog before independent filesystem open");
     drop(filesystem);
 
-    let payload = vec![payload_byte; 8193];
+    let snapshot_payload = vec![payload_byte; 8193];
+    let current_payload = vec![payload_byte.wrapping_add(0x20); 8193];
+    let snapshot_name = "before-independent-overwrite";
     let mut independent =
         open_named_filesystem(metadata_dir, devices, pool_name, redundancy_policy, "other");
     independent
         .create_file("/independent.bin", 0o600)
         .expect("create independent lifecycle file");
     independent
-        .write_file("/independent.bin", 0, &payload)
+        .write_file("/independent.bin", 0, &snapshot_payload)
         .expect("write independent lifecycle bytes");
     independent
         .sync_all()
         .expect("commit independent lifecycle bytes");
+    independent
+        .create_snapshot(snapshot_name)
+        .expect("create independent filesystem snapshot");
+    independent
+        .create_clone("before-independent-overwrite-clone", snapshot_name)
+        .expect("create independent shared-root snapshot-table clone");
+    independent
+        .write_file("/independent.bin", 0, &current_payload)
+        .expect("overwrite current independent filesystem bytes");
+    independent
+        .sync_all()
+        .expect("commit current independent filesystem bytes");
     drop(independent);
 
     let root = LocalFileSystem::open_with_block_devices_and_recovery_policy(
@@ -235,7 +255,14 @@ fn prepare_independent_filesystem_lifecycle_graph(
         RecoveryPolicy::default(),
     )
     .expect("reopen root filesystem as sole Pool lifecycle owner");
-    (root, payload)
+    (
+        root,
+        IndependentFilesystemExpected {
+            current_payload,
+            snapshot_payload,
+            snapshot_name,
+        },
+    )
 }
 
 fn assert_reimported_independent_filesystem(
@@ -243,15 +270,31 @@ fn assert_reimported_independent_filesystem(
     devices: &[PathBuf],
     pool_name: &str,
     redundancy_policy: PoolRedundancyPolicy,
-    expected: &[u8],
+    expected: &IndependentFilesystemExpected,
 ) {
-    let independent =
+    let mut independent =
         open_named_filesystem(metadata_dir, devices, pool_name, redundancy_policy, "other");
+    assert_eq!(
+        independent
+            .list_snapshots_checked()
+            .expect("validate independent snapshot and clone authority")
+            .len(),
+        2
+    );
     assert_eq!(
         independent
             .read_file("/independent.bin")
             .expect("read independent filesystem after topology reimport"),
-        expected
+        expected.current_payload
+    );
+    independent
+        .rollback_to_snapshot(expected.snapshot_name)
+        .expect("rollback retained independent filesystem snapshot");
+    assert_eq!(
+        independent
+            .read_file("/independent.bin")
+            .expect("read independent snapshot bytes after rollback"),
+        expected.snapshot_payload
     );
 }
 
@@ -715,7 +758,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
     filesystem
         .sync_all()
         .expect("sync post-snapshot current bytes before removal");
-    let (mut filesystem, independent_payload) = prepare_independent_filesystem_lifecycle_graph(
+    let (mut filesystem, independent_expected) = prepare_independent_filesystem_lifecycle_graph(
         filesystem,
         &metadata_dir,
         &devices,
@@ -839,7 +882,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
         &survivor,
         &pool_name,
         redundancy_policy,
-        &independent_payload,
+        &independent_expected,
     );
 }
 
@@ -907,7 +950,7 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
     filesystem
         .sync_all()
         .expect("sync post-snapshot current bytes before replacement");
-    let (mut filesystem, independent_payload) = prepare_independent_filesystem_lifecycle_graph(
+    let (mut filesystem, independent_expected) = prepare_independent_filesystem_lifecycle_graph(
         filesystem,
         &metadata_dir,
         &devices,
@@ -1036,6 +1079,6 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
         &replacement_topology,
         &pool_name,
         redundancy_policy,
-        &independent_payload,
+        &independent_expected,
     );
 }
