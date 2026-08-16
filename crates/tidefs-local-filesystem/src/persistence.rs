@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use tidefs_dataset_lifecycle::DatasetId;
 use tidefs_local_object_store::{
     checksum64, pool::Pool, DeviceIoClass, LocalObjectStore, ObjectKey, StoreError,
 };
@@ -114,6 +115,30 @@ pub(crate) fn persist_state_with_runtime_at_transaction(
     transaction_id: u64,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RootCommitRecord> {
+    persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
+        runtime,
+        state,
+        transaction_id,
+        root_authentication_key,
+        &BTreeMap::new(),
+    )
+}
+
+/// Persist filesystem state while authorizing exact typed snapshot-root
+/// successors for a Pool device-lifecycle transaction.
+///
+/// Ordinary commits pass no predecessors and continue to fail closed if live
+/// snapshot state disagrees with the canonical Pool composition. Device
+/// removal/replacement supplies the exact roots authenticated before receipt
+/// relocation; only those roots may advance to references containing the new
+/// placement-receipt generations.
+pub(crate) fn persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
+    runtime: &mut PoolRuntime,
+    state: &FileSystemState,
+    transaction_id: u64,
+    root_authentication_key: RootAuthenticationKey,
+    expected_snapshot_predecessors: &BTreeMap<DatasetId, tidefs_pool_runtime::SnapshotRoot>,
+) -> Result<RootCommitRecord> {
     let source_dataset_id = state.dataset_id();
     let signed = prepare_state_with_pool_at_transaction(
         runtime.pool_mut(),
@@ -123,6 +148,7 @@ pub(crate) fn persist_state_with_runtime_at_transaction(
     )?;
     let bytes = encode_root_commit(&signed);
     let mut snapshot_roots = Vec::new();
+    let mut consumed_snapshot_predecessors = BTreeSet::new();
     for record in state
         .snapshots
         .values()
@@ -135,13 +161,32 @@ pub(crate) fn persist_state_with_runtime_at_transaction(
         if runtime.dataset_root(snapshot_dataset_id).is_some() {
             let stored = runtime.load_snapshot_root(snapshot_dataset_id)?;
             if stored != root {
+                if expected_snapshot_predecessors.get(&snapshot_dataset_id) != Some(&stored) {
+                    return Err(FileSystemError::CorruptState {
+                        reason:
+                            "canonical Pool snapshot root differs from filesystem snapshot state",
+                    });
+                }
+                consumed_snapshot_predecessors.insert(snapshot_dataset_id);
+                snapshot_roots.push((snapshot_dataset_id, root.snapshot_generation, root.encode()));
+            } else if expected_snapshot_predecessors.contains_key(&snapshot_dataset_id) {
                 return Err(FileSystemError::CorruptState {
-                    reason: "canonical Pool snapshot root differs from filesystem snapshot state",
+                    reason: "device lifecycle snapshot predecessor did not advance",
                 });
             }
         } else {
+            if expected_snapshot_predecessors.contains_key(&snapshot_dataset_id) {
+                return Err(FileSystemError::CorruptState {
+                    reason: "device lifecycle snapshot predecessor is missing",
+                });
+            }
             snapshot_roots.push((snapshot_dataset_id, root.snapshot_generation, root.encode()));
         }
+    }
+    if consumed_snapshot_predecessors.len() != expected_snapshot_predecessors.len() {
+        return Err(FileSystemError::CorruptState {
+            reason: "device lifecycle snapshot predecessor is not retained by filesystem state",
+        });
     }
     let mut updates = Vec::with_capacity(snapshot_roots.len().saturating_add(1));
     updates.push(DatasetRootUpdate {

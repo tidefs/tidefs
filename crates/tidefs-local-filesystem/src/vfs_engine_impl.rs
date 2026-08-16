@@ -3633,6 +3633,19 @@ struct DeviceLifecycleFilesystemState {
     root: RootCommitRecord,
 }
 
+struct DeviceLifecycleSnapshotState {
+    name: Vec<u8>,
+    dataset_id: DatasetId,
+    previous_typed_root: tidefs_pool_runtime::SnapshotRoot,
+    captured_state: FileSystemState,
+    captured_root: RootCommitRecord,
+}
+
+struct DeviceLifecycleRootAuthority {
+    unmounted_filesystems: Vec<DeviceLifecycleFilesystemState>,
+    mounted_snapshots: Vec<DeviceLifecycleSnapshotState>,
+}
+
 struct RelocatedContentReceiptReplacement {
     record: InodeRecord,
     manifest: crate::records::ContentManifestObject,
@@ -3647,7 +3660,7 @@ impl LocalFileSystem {
         &mut self,
         device_path: &std::path::Path,
     ) -> crate::Result<tidefs_local_object_store::device_removal::EvacuationResult> {
-        let mut unmounted_filesystems =
+        let mut root_authority =
             self.ensure_device_lifecycle_root_authority("remove device from mounted pool")?;
         let preparation = self
             .store
@@ -3661,7 +3674,8 @@ impl LocalFileSystem {
         // Preparation can fail after one or more replacement receipts became
         // current. Always repair every valid manifest reference that can now
         // be advanced before returning the preparation error.
-        self.reconcile_unmounted_filesystem_receipts(&mut unmounted_filesystems)?;
+        self.reconcile_unmounted_filesystem_receipts(&mut root_authority.unmounted_filesystems)?;
+        self.reconcile_mounted_snapshot_receipts(&mut root_authority.mounted_snapshots)?;
         self.reconcile_relocated_content_receipts()?;
         self.store.pool_mut().sync_all()?;
 
@@ -3708,7 +3722,7 @@ impl LocalFileSystem {
         old_device_path: &std::path::Path,
         new_device_path: &std::path::Path,
     ) -> crate::Result<tidefs_local_object_store::pool::DeviceReplacementResult> {
-        let mut unmounted_filesystems =
+        let mut root_authority =
             self.ensure_device_lifecycle_root_authority("replace device in mounted pool")?;
         let old_config = self
             .store
@@ -3758,7 +3772,8 @@ impl LocalFileSystem {
         // Preparation may have published a prefix of successor receipts.
         // Reconcile every valid content manifest before propagating an error,
         // preserving the same predecessor-root recovery rule as removal.
-        self.reconcile_unmounted_filesystem_receipts(&mut unmounted_filesystems)?;
+        self.reconcile_unmounted_filesystem_receipts(&mut root_authority.unmounted_filesystems)?;
+        self.reconcile_mounted_snapshot_receipts(&mut root_authority.mounted_snapshots)?;
         self.reconcile_relocated_content_receipts()?;
         self.store.pool_mut().sync_all()?;
         for _ in 0..crate::constants::FILESYSTEM_ROOT_SLOT_COUNT {
@@ -3782,23 +3797,39 @@ impl LocalFileSystem {
     fn ensure_device_lifecycle_root_authority(
         &self,
         operation: &'static str,
-    ) -> crate::Result<Vec<DeviceLifecycleFilesystemState>> {
-        if self
+    ) -> crate::Result<DeviceLifecycleRootAuthority> {
+        let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        self.ensure_snapshot_authority_consistent()?;
+        let mut mounted_snapshots = Vec::new();
+        for record in self
             .state
             .snapshots
             .values()
-            .any(crate::snapshot::snapshot_record_retains_data)
+            .filter(|record| crate::snapshot::snapshot_record_retains_data(record))
         {
-            return Err(FileSystemError::Unsupported {
-                operation,
-                reason: "data-retaining snapshots or clones require atomic receipt reconciliation of their immutable roots",
+            self.ensure_snapshot_record_authority(record)?;
+            let dataset_id =
+                crate::snapshot::snapshot_record_dataset_id_for_dataset(record, mounted_dataset_id);
+            let previous_typed_root = self.store.load_snapshot_root(dataset_id)?;
+            let captured_root = crate::root_commit_from_summary(&record.root);
+            let captured_state = crate::load_state_from_transaction_pool_for_dataset(
+                self.store.pool(),
+                mounted_dataset_id,
+                &captured_root,
+                self.root_authentication_key,
+            )?;
+            mounted_snapshots.push(DeviceLifecycleSnapshotState {
+                name: record.name.clone(),
+                dataset_id,
+                previous_typed_root,
+                captured_state,
+                captured_root,
             });
         }
 
-        let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
         let mut has_pool_owned_volume_roots = false;
         let mut unmounted_filesystems = Vec::new();
-        for (_, dataset_id, dataset_type, _, flags, lifecycle_state) in
+        for (path, dataset_id, dataset_type, _, flags, lifecycle_state) in
             self.dataset_catalog().list_all()
         {
             if dataset_id == mounted_dataset_id {
@@ -3831,6 +3862,15 @@ impl LocalFileSystem {
                     unmounted_filesystems.push(DeviceLifecycleFilesystemState { state, root });
                 }
                 DatasetType::Snapshot => {
+                    let source_dataset_id =
+                        self.dataset_catalog().lineage_parent(&path).map_err(|_| {
+                            FileSystemError::CorruptState {
+                                reason: "device lifecycle could not inspect snapshot lineage",
+                            }
+                        })?;
+                    if source_dataset_id == Some(mounted_dataset_id) {
+                        continue;
+                    }
                     let snapshot = self.store.load_snapshot_root(dataset_id)?;
                     if snapshot.source_reference.kind
                         != tidefs_pool_runtime::DatasetRootKind::Volume
@@ -3853,7 +3893,156 @@ impl LocalFileSystem {
             // those exact objects without rewriting their typed roots.
             let _ = self.store.canonical_root_object_keys()?;
         }
-        Ok(unmounted_filesystems)
+        Ok(DeviceLifecycleRootAuthority {
+            unmounted_filesystems,
+            mounted_snapshots,
+        })
+    }
+
+    fn reconcile_mounted_snapshot_receipts(
+        &mut self,
+        snapshots: &mut [DeviceLifecycleSnapshotState],
+    ) -> crate::Result<u64> {
+        if snapshots.is_empty() {
+            return Ok(0);
+        }
+
+        let reconcile = (|| {
+            let mut migrated = Vec::new();
+            let mut total_replacements = 0_u64;
+            for snapshot in snapshots {
+                let (replacement_count, obsolete_manifests) =
+                    Self::reconcile_relocated_content_receipts_for_state(
+                        self.store.pool_mut(),
+                        &mut snapshot.captured_state,
+                    )?;
+                if replacement_count == 0 {
+                    continue;
+                }
+
+                self.persist_device_lifecycle_reclaim_queue(
+                    snapshot.captured_state.dataset_id(),
+                    &obsolete_manifests,
+                )?;
+                let transaction_id = crate::next_mounted_commit_transaction_id(
+                    snapshot.captured_state.generation,
+                    &snapshot.captured_root.summary(),
+                )?;
+                let signed_root = crate::prepare_state_with_pool_at_transaction(
+                    self.store.pool_mut(),
+                    &snapshot.captured_state,
+                    transaction_id,
+                    self.root_authentication_key,
+                )?;
+                let root_bytes = crate::encoding::encode_root_commit(&signed_root);
+                let source_reference = self.store.prepare_snapshot_source_root(
+                    snapshot.captured_state.dataset_id(),
+                    tidefs_pool_runtime::DatasetRootKind::Filesystem,
+                    signed_root.generation,
+                    &root_bytes,
+                )?;
+                let next_typed_root = tidefs_pool_runtime::SnapshotRoot::new(
+                    snapshot.previous_typed_root.snapshot_generation,
+                    source_reference,
+                )?;
+                migrated.push((
+                    snapshot.name.clone(),
+                    snapshot.dataset_id,
+                    snapshot.previous_typed_root,
+                    snapshot.captured_root.summary(),
+                    signed_root.summary(),
+                    next_typed_root,
+                ));
+                total_replacements = total_replacements.saturating_add(replacement_count);
+            }
+
+            if migrated.is_empty() {
+                return Ok(0);
+            }
+
+            self.begin_mutation("reconcile mounted snapshot placement receipts")?;
+            self.bump_generation();
+            let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+            let mounted_dataset_path = self.mounted_dataset_path().to_string();
+            for (
+                name,
+                dataset_id,
+                previous_typed_root,
+                previous_source_root,
+                next_source_root,
+                next_typed_root,
+            ) in migrated
+            {
+                let previous_record = self.state.snapshots.get(&name).cloned().ok_or(
+                    FileSystemError::CorruptState {
+                        reason: "device lifecycle snapshot record disappeared before publication",
+                    },
+                )?;
+                if previous_record.root != previous_source_root
+                    || crate::snapshot::snapshot_record_dataset_id_for_dataset(
+                        &previous_record,
+                        mounted_dataset_id,
+                    ) != dataset_id
+                    || crate::snapshot::snapshot_record_typed_root_for_dataset(
+                        &previous_record,
+                        mounted_dataset_id,
+                    )? != previous_typed_root
+                {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "device lifecycle snapshot authority changed after preflight",
+                    });
+                }
+                let mut next_record = previous_record.clone();
+                next_record.root = next_source_root;
+                let expected_next = crate::snapshot::snapshot_record_typed_root_for_dataset(
+                    &next_record,
+                    mounted_dataset_id,
+                )?;
+                if expected_next != next_typed_root {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "device lifecycle snapshot successor changed before publication",
+                    });
+                }
+
+                let previous_traversal_root =
+                    crate::snapshot::snapshot_record_traversal_root(&previous_record)?;
+                let next_traversal_root =
+                    crate::snapshot::snapshot_record_traversal_root(&next_record)?;
+                self.lifecycle.unpin_root(previous_traversal_root);
+                self.lifecycle.pin_root(next_traversal_root).map_err(|_| {
+                    FileSystemError::CorruptState {
+                        reason: "device lifecycle snapshot successor pin set is full",
+                    }
+                })?;
+                crate::snapshot::reconcile_snapshot_record_catalog_entry(
+                    self.dataset_catalog_mut()?,
+                    &next_record,
+                    &mounted_dataset_path,
+                    mounted_dataset_id,
+                )?;
+                self.state.snapshots.insert(name, next_record);
+                if self
+                    .pending_snapshot_root_rewrites
+                    .insert(dataset_id, previous_typed_root)
+                    .is_some()
+                {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "device lifecycle snapshot predecessor was duplicated",
+                    });
+                }
+            }
+            self.mark_inode_metadata_dirty(ROOT_INODE_ID);
+            self.mark_dir_dirty(ROOT_INODE_ID);
+            Ok(total_replacements)
+        })();
+
+        match reconcile {
+            Ok(count) => Ok(count),
+            Err(error) => {
+                self.rollback_mutation_delta();
+                Err(error)
+            }
+        }
     }
 
     fn reconcile_unmounted_filesystem_receipts(
@@ -4055,6 +4244,9 @@ impl LocalFileSystem {
 
         let replacement_count = replacements.len() as u64;
         if replacements.is_empty() {
+            if !self.pending_snapshot_root_rewrites.is_empty() {
+                self.force_commit(())?;
+            }
             return Ok(0);
         }
 
@@ -9051,14 +9243,35 @@ mod tests {
     }
 
     #[test]
-    fn live_device_remove_preserves_independent_filesystem_and_refuses_snapshot_roots() {
+    fn live_device_remove_preserves_snapshot_roots_and_independent_filesystem() {
         let (snapshot_engine, snapshot_root, snapshot_devices) = temp_fs_with_block_devices(2);
-        snapshot_engine
-            .fs
-            .borrow_mut()
-            .create_snapshot("retained")
-            .expect("create data-retaining snapshot");
-        let snapshot_refusal = live_device_admin(
+        let snapshot_payload = vec![0x53; 8193];
+        let current_payload = vec![0x71; 8193];
+        {
+            let mut filesystem = snapshot_engine.fs.borrow_mut();
+            filesystem
+                .create_file("/snapshot.bin", 0o600)
+                .expect("create mounted snapshot file");
+            filesystem
+                .write_file("/snapshot.bin", 0, &snapshot_payload)
+                .expect("write mounted snapshot bytes");
+            filesystem
+                .sync_all()
+                .expect("commit mounted snapshot bytes");
+            filesystem
+                .create_snapshot("retained")
+                .expect("create data-retaining snapshot");
+            filesystem
+                .create_clone("retained-clone", "retained")
+                .expect("create shared-root snapshot-table clone");
+            filesystem
+                .write_file("/snapshot.bin", 0, &current_payload)
+                .expect("overwrite current bytes after snapshot");
+            filesystem
+                .sync_all()
+                .expect("commit current bytes after snapshot");
+        }
+        let snapshot_removal = live_device_admin(
             &snapshot_engine,
             "remove",
             json!({
@@ -9067,10 +9280,7 @@ mod tests {
             }),
             true,
         );
-        assert_eq!(snapshot_refusal["ok"], false, "{snapshot_refusal}");
-        assert!(snapshot_refusal["error"]
-            .as_str()
-            .is_some_and(|message| message.contains("data-retaining snapshots or clones")));
+        assert_eq!(snapshot_removal["ok"], true, "{snapshot_removal}");
         assert_legacy_device_lifecycle_files_absent(&snapshot_root.path().join("metadata"));
         assert_eq!(
             snapshot_engine
@@ -9080,8 +9290,68 @@ mod tests {
                 .pool()
                 .stats()
                 .device_count,
+            1
+        );
+        assert!(
+            snapshot_engine
+                .fs
+                .borrow()
+                .pending_snapshot_root_rewrites
+                .is_empty(),
+            "device lifecycle predecessor authorization must not leak past publication"
+        );
+        {
+            let mut filesystem = snapshot_engine.fs.borrow_mut();
+            filesystem
+                .create_file("/after-removal.bin", 0o600)
+                .expect("create file after snapshot-preserving removal");
+            filesystem
+                .write_file("/after-removal.bin", 0, b"ordinary successor commit")
+                .expect("write after snapshot-preserving removal");
+            filesystem
+                .sync_all()
+                .expect("ordinary commit after device lifecycle publication");
+        }
+        assert_eq!(
+            snapshot_engine
+                .fs
+                .borrow()
+                .read_file("/snapshot.bin")
+                .expect("read current bytes after snapshot-preserving removal"),
+            current_payload
+        );
+        let snapshot_metadata = snapshot_root.path().join("metadata");
+        drop(snapshot_engine);
+        let mut snapshot_reopened = LocalFileSystem::open_with_block_devices(
+            &snapshot_metadata,
+            std::slice::from_ref(&snapshot_devices[0]),
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("reopen survivor with retained filesystem snapshot");
+        assert_eq!(
+            snapshot_reopened
+                .list_snapshots_checked()
+                .expect("validate retained snapshot and clone authority")
+                .len(),
             2
         );
+        assert_eq!(
+            snapshot_reopened
+                .read_file("/snapshot.bin")
+                .expect("read current bytes after survivor reopen"),
+            current_payload
+        );
+        snapshot_reopened
+            .rollback_to_snapshot("retained")
+            .expect("rollback retained snapshot after survivor reopen");
+        assert_eq!(
+            snapshot_reopened
+                .read_file("/snapshot.bin")
+                .expect("read snapshot bytes after survivor rollback"),
+            snapshot_payload
+        );
+        drop(snapshot_reopened);
 
         let (corrupt_engine, corrupt_root, corrupt_devices) = temp_fs_with_block_devices(2);
         let corrupt_dataset_id = DatasetId::from_bytes([0xD4; 16]);
@@ -9198,8 +9468,61 @@ mod tests {
                 .expect("read independent bytes after survivor reopen"),
             independent_payload
         );
-        drop(snapshot_engine);
         drop(corrupt_engine);
+    }
+
+    #[test]
+    fn live_device_remove_refuses_corrupt_mounted_snapshot_before_topology_mutation() {
+        let (engine, _root, devices) = temp_fs_with_block_devices(2);
+        {
+            let mut filesystem = engine.fs.borrow_mut();
+            filesystem
+                .create_snapshot("corrupt-snapshot")
+                .expect("create mounted snapshot corruption fixture");
+            let mounted_dataset_id = DatasetId::from_bytes(filesystem.mounted_dataset_id());
+            let record = filesystem
+                .state
+                .snapshots
+                .get(b"corrupt-snapshot".as_slice())
+                .expect("snapshot record exists");
+            let snapshot_dataset_id =
+                crate::snapshot::snapshot_record_dataset_id_for_dataset(record, mounted_dataset_id);
+            let typed_root_key = filesystem
+                .store
+                .dataset_root(snapshot_dataset_id)
+                .expect("snapshot has canonical typed root")
+                .object_key;
+            assert!(filesystem
+                .store
+                .pool_mut()
+                .delete(DeviceIoClass::Data, typed_root_key)
+                .expect("delete snapshot typed-root fixture object"));
+            filesystem
+                .store
+                .pool_mut()
+                .sync_all()
+                .expect("sync corrupt snapshot fixture");
+        }
+
+        let refusal = live_device_admin(
+            &engine,
+            "remove",
+            json!({
+                "device_path": devices[1].display().to_string(),
+                "force": false,
+            }),
+            true,
+        );
+        assert_eq!(refusal["ok"], false, "{refusal}");
+        assert_eq!(engine.fs.borrow().store.pool().stats().device_count, 2);
+        assert!(engine
+            .fs
+            .borrow()
+            .store
+            .pool()
+            .pending_device_removal_path()
+            .expect("inspect removal marker")
+            .is_none());
     }
 
     #[cfg(feature = "replication-io")]

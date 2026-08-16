@@ -255,6 +255,28 @@ fn assert_reimported_independent_filesystem(
     );
 }
 
+fn assert_reimported_filesystem_snapshot(
+    filesystem: &mut LocalFileSystem,
+    snapshot_name: &str,
+    expected_files: &[(String, Vec<u8>)],
+) {
+    filesystem
+        .snapshot_summary(snapshot_name)
+        .expect("retained filesystem snapshot after topology reimport");
+    filesystem
+        .rollback_to_snapshot(snapshot_name)
+        .expect("rollback retained filesystem snapshot after topology reimport");
+    for (path, expected) in expected_files {
+        assert_eq!(
+            filesystem
+                .read_file(path)
+                .expect("read rolled-back filesystem snapshot bytes"),
+            *expected,
+            "snapshot rollback mismatch for {path}"
+        );
+    }
+}
+
 fn remove_legacy_device_lifecycle_files(metadata_dir: &std::path::Path) {
     for name in [
         ".tidefs_device_removal_pending",
@@ -681,6 +703,18 @@ fn live_device_remove_cli_commits_survivor_topology() {
     filesystem
         .sync_all()
         .expect("sync mounted files before removal");
+    let snapshot_name = "before-remove-overwrite";
+    let snapshot_files = expected_files.clone();
+    filesystem
+        .create_snapshot(snapshot_name)
+        .expect("create mounted filesystem snapshot before removal");
+    expected_files[0].1 = vec![0xa1; expected_files[0].1.len()];
+    filesystem
+        .write_file(&expected_files[0].0, 0, &expected_files[0].1)
+        .expect("overwrite current mounted bytes after snapshot");
+    filesystem
+        .sync_all()
+        .expect("sync post-snapshot current bytes before removal");
     let (mut filesystem, independent_payload) = prepare_independent_filesystem_lifecycle_graph(
         filesystem,
         &metadata_dir,
@@ -798,6 +832,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
         );
     }
     assert_reimported_volume_graph(&mut reopened, 0x31, 0x41, 0x51);
+    assert_reimported_filesystem_snapshot(&mut reopened, snapshot_name, &snapshot_files);
     drop(reopened);
     assert_reimported_independent_filesystem(
         &metadata_dir,
@@ -842,9 +877,12 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
     )
     .expect("create two-member replicated filesystem");
 
-    let expected_files = [
-        ("/replace-a.bin", vec![0x2a; 8193]),
-        ("/replace-b.bin", (0..=255).cycle().take(12289).collect()),
+    let mut expected_files = vec![
+        ("/replace-a.bin".to_string(), vec![0x2a; 8193]),
+        (
+            "/replace-b.bin".to_string(),
+            (0..=255).cycle().take(12289).collect(),
+        ),
     ];
     for (path, payload) in &expected_files {
         filesystem
@@ -857,6 +895,18 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
     filesystem
         .sync_all()
         .expect("sync mounted files before replacement");
+    let snapshot_name = "before-replace-overwrite";
+    let snapshot_files = expected_files.clone();
+    filesystem
+        .create_snapshot(snapshot_name)
+        .expect("create mounted filesystem snapshot before replacement");
+    expected_files[0].1 = vec![0xb2; expected_files[0].1.len()];
+    filesystem
+        .write_file(&expected_files[0].0, 0, &expected_files[0].1)
+        .expect("overwrite current mounted bytes after snapshot");
+    filesystem
+        .sync_all()
+        .expect("sync post-snapshot current bytes before replacement");
     let (mut filesystem, independent_payload) = prepare_independent_filesystem_lifecycle_graph(
         filesystem,
         &metadata_dir,
@@ -979,6 +1029,7 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
         );
     }
     assert_reimported_volume_graph(&mut reopened, 0x32, 0x42, 0x52);
+    assert_reimported_filesystem_snapshot(&mut reopened, snapshot_name, &snapshot_files);
     drop(reopened);
     assert_reimported_independent_filesystem(
         &metadata_dir,

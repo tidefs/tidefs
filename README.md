@@ -177,26 +177,31 @@ default mount authority.
 
 The current source also implements one bounded pilot lifecycle operation:
 `tidefsctl device remove` can route to the reachable mounted local owner of a
-Pool with one mounted filesystem and active unmounted independent filesystem
-datasets, evacuate receipt-backed objects, reconcile embedded content receipt
-generations through copy-on-write manifests, refresh every affected
-authenticated filesystem root, and publish a redundant survivor-only topology
-before reporting success. Before evacuation the owner authenticates every
-current filesystem root through the shared Pool runtime. It durably queues
-predecessor manifests and publishes each successor typed root before topology
-publication. Before mutation, redundant member labels record a versioned,
-checksummed removal intent bound to the Pool GUID, target member index and GUID,
-and successor topology generation; paths are descriptive runtime locators only.
+Pool with one mounted filesystem, its data-retaining snapshot-table snapshots
+and clones, and active unmounted independent filesystem datasets; evacuate
+receipt-backed objects; reconcile embedded content receipt generations through
+copy-on-write manifests; refresh every affected authenticated filesystem and
+snapshot root; and publish a redundant survivor-only topology before reporting
+success. Before evacuation the owner authenticates every current filesystem
+root plus each retained mounted-filesystem snapshot record, catalog entry,
+lifecycle pin, typed Pool snapshot root, exact captured filesystem root, and
+complete captured content graph through the shared Pool runtime. It durably
+queues predecessor manifests and publishes the mounted state plus every changed
+typed snapshot and independent-filesystem root before topology publication.
+Before mutation, redundant member labels record a versioned, checksummed
+removal intent bound to the Pool GUID, target member index and GUID, and
+successor topology generation; paths are descriptive runtime locators only.
 Reopen selects exact lifecycle agreement from the highest complete label
 topology before receipt recovery and resumes without a host-side marker file or
 runtime directory. Co-owned Pool-runtime volumes, volume snapshots, and volume
 clones survive because their immutable typed roots carry keys and digests while
 Pool lifecycle relocates their complete receipt-backed object graphs. Removal
-still refuses before evacuation for filesystem-sourced snapshots/clones,
-data-retaining mounted or independent filesystem snapshots, filesystem clones,
-or non-active filesystem datasets. This is current implementation behavior,
-not a production-readiness, failed-device, replacement, rebuild, secure-erase,
-media-remanence, sanitization, or decommissioning claim.
+still refuses before evacuation for data-retaining snapshots or clones owned by
+an independently rooted filesystem, independently mountable filesystem dataset
+clones, non-active filesystem datasets, or simultaneous multi-mounted
+ownership. This is current implementation behavior, not a production-readiness,
+failed-device, replacement, rebuild, secure-erase, media-remanence,
+sanitization, or decommissioning claim.
 
 The same carrier implements one bounded present-member replacement row:
 `tidefsctl device replace` routes only to the reachable mounted local owner of
@@ -211,12 +216,15 @@ same-cardinality labels. Replacement requires a distinct blank same-backing
 candidate with sufficient capacity. It preserves co-owned Pool-runtime
 volumes, volume snapshots, volume clones, and active unmounted independent
 filesystem roots through the same preflight, copy-on-write reconciliation, and
-typed-root publication order. It still refuses filesystem-sourced
-snapshots/clones, data-retaining filesystem snapshots, filesystem clones, and
-non-active filesystem datasets. This row does not claim failed-member rebuild,
-writable degraded operation, simultaneous multi-mounted filesystem atomicity,
-secure erase, media remanence, sanitization, decommissioning, or production
-readiness.
+typed-root publication order. Data-retaining snapshot-table snapshots and
+clones of the mounted filesystem also survive through exact captured-root
+authentication, captured-manifest copy-on-write, and one canonical publication
+of mounted state plus changed typed snapshot roots. It still refuses snapshots
+or clones owned by an independently rooted filesystem, independently mountable
+filesystem dataset clones, and non-active filesystem datasets. This row does
+not claim failed-member rebuild, writable degraded operation, simultaneous
+multi-mounted filesystem atomicity, secure erase, media remanence, sanitization,
+decommissioning, or production readiness.
 
 The offline local carrier implements one bounded Pool-destroy row for an exact
 exported Pool supplied with all member paths. `tidefsctl pool destroy` writes
