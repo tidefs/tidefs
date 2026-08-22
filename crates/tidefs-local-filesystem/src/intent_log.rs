@@ -1813,10 +1813,17 @@ fn replay_namespace_create_intent(
     // overwriting it or resurrecting the creation-time name. Recovery of a
     // missing create still takes the inode-absent branch above.
     if !inode_already_present && !entry_already_present {
-        Arc::make_mut(&mut state.directories)
+        let parent_size = {
+            let parent = Arc::make_mut(&mut state.directories)
+                .get_mut(&intent.parent_inode_id)
+                .expect("namespace create parent directory was validated before replay mutation");
+            parent.insert(intent.entry.name.clone(), intent.entry.clone());
+            parent.len() as u64
+        };
+        Arc::make_mut(&mut state.inodes)
             .get_mut(&intent.parent_inode_id)
-            .expect("namespace create parent directory was validated before replay mutation")
-            .insert(intent.entry.name.clone(), intent.entry.clone());
+            .expect("namespace create parent inode was validated before replay mutation")
+            .size = parent_size;
     }
 
     state.observe_explicit_inode_id(intent.inode.inode_id);
@@ -5110,6 +5117,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing entry for {name}"));
             assert_eq!(recovered_entry.inode_id, inode.inode_id);
             assert_eq!(recovered_entry.kind(), kind);
+            assert_eq!(
+                state.inodes.get(&ROOT_INODE_ID).expect("root inode").size,
+                root_dir.len() as u64,
+                "replayed create must preserve the directory size invariant for {name}"
+            );
             assert!(state.known_inode_ids.contains(&inode.inode_id));
             assert!(state.dirty_inodes.contains(&inode.inode_id));
         }

@@ -5,7 +5,8 @@
 # replay consistency verification:
 #   pool create -> import -> FUSE mount -> write/fsync/read ->
 #   unmount -> pool export -> reimport -> remount -> persist verify ->
-#   committed-root advance verify -> intent-log consistency verify.
+#   committed-root advance verify -> intent-log consistency verify ->
+#   mounted clean/corrupt integrity reports.
 #
 # Validation tier: qemu guest.
 {
@@ -23,6 +24,7 @@ let
     KERNEL_IMG="${linuxKernel_7_0}/bzImage"
     CPIO="${pkgs.cpio}/bin/cpio"
     GZIP="${pkgs.gzip}/bin/gzip"
+    BYTE_GREP="${pkgs.gnugrep}/bin/grep"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
     TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
 
@@ -59,7 +61,7 @@ USAGE
       esac
     done
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$TIDEFSCTL"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$BYTE_GREP" "$TIDEFSCTL"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ENVIRONMENT REFUSAL: dependency not found: $dep" >&2
         exit 2
@@ -134,6 +136,7 @@ USAGE
     }
 
     copy_binary_to_bin "$BUSYBOX" busybox
+    copy_binary_to_bin "$BYTE_GREP" bytegrep
     for applet in sh ls cat echo mount umount grep insmod rmmod dmesg sleep poweroff \
                     reboot mknod mkdir rmdir dd stat cp mv rm ln touch find wc sync \
                     expr head tail cut kill ps test seq blockdev mountpoint du \
@@ -215,7 +218,9 @@ if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
              crash_cycle_committed_pre_crash_read crash_cycle_sigkill \
              crash_cycle_stale_mount_detached crash_cycle_reimport_no_export \
              crash_cycle_recovery_remount crash_cycle_committed_survived \
-             crash_cycle_inode_stable crash_cycle_unfsynced_bounded; do
+             crash_cycle_inode_stable crash_cycle_unfsynced_bounded \
+             mounted_integrity_clean mounted_integrity_corruption_injected \
+             mounted_integrity_failure_reported; do
         blocked "$op" "virtio block devices missing"
     done
     echo "PASSED=$PASSED FAILED=$FAILED BLOCKED=$BLOCKED"
@@ -961,6 +966,76 @@ else
     blocked "crash_cycle_unfsynced_bounded" "crash-recovery remount failed"
 fi
 
+echo ""
+echo "--- Phase 16: Mounted integrity reports ---"
+
+INTEGRITY_CLEAN_OK=0
+if [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ]; then
+    if tidefsctl pool integrity-check "$POOL_NAME" --json \
+        > /tmp/integrity_clean.json 2>/tmp/integrity_clean.err \
+        && grep -q '"pass"[[:space:]]*:[[:space:]]*true' /tmp/integrity_clean.json \
+        && grep -q '"state_source"[[:space:]]*:[[:space:]]*"live-owner"' /tmp/integrity_clean.json; then
+        pass "mounted_integrity_clean"
+        INTEGRITY_CLEAN_OK=1
+    else
+        fail "mounted_integrity_clean" "$(cat /tmp/integrity_clean.err /tmp/integrity_clean.json 2>/dev/null)"
+    fi
+else
+    blocked "mounted_integrity_clean" "crash-recovery mount failed"
+fi
+
+INTEGRITY_CORRUPTED_MEMBERS=0
+if [ "$INTEGRITY_CLEAN_OK" -eq 1 ]; then
+    for dev in "$DEV0" "$DEV1"; do
+        root_offset=$(bytegrep -abo 'VFSROOT1' "$dev" 2>/tmp/integrity_bytegrep.err \
+            | tail -1 | cut -d: -f1)
+        case "$root_offset" in
+            ""|*[!0-9]*)
+                echo "  no committed-root payload offset found on $dev"
+                ;;
+            *)
+                if printf 'BADROOT!' \
+                    | dd of="$dev" bs=1 seek="$root_offset" conv=notrunc 2>/tmp/integrity_dd.err; then
+                    INTEGRITY_CORRUPTED_MEMBERS=$((INTEGRITY_CORRUPTED_MEMBERS + 1))
+                    echo "  corrupted newest committed-root record on $dev at byte $root_offset"
+                else
+                    echo "  corruption write failed on $dev: $(cat /tmp/integrity_dd.err 2>/dev/null)"
+                fi
+                ;;
+        esac
+    done
+    sync
+    if [ "$INTEGRITY_CORRUPTED_MEMBERS" -eq 2 ]; then
+        pass "mounted_integrity_corruption_injected"
+    else
+        fail "mounted_integrity_corruption_injected" \
+            "corrupted_members=$INTEGRITY_CORRUPTED_MEMBERS bytegrep=$(cat /tmp/integrity_bytegrep.err 2>/dev/null)"
+    fi
+else
+    blocked "mounted_integrity_corruption_injected" "clean integrity report unavailable"
+fi
+
+if [ "$INTEGRITY_CORRUPTED_MEMBERS" -eq 2 ]; then
+    if tidefsctl pool integrity-check "$POOL_NAME" --json \
+        > /tmp/integrity_failed.json 2>/tmp/integrity_failed.err; then
+        INTEGRITY_FAILED_RC=0
+    else
+        INTEGRITY_FAILED_RC=$?
+    fi
+    if [ "$INTEGRITY_FAILED_RC" -ne 0 ] \
+        && grep -q '"pass"[[:space:]]*:[[:space:]]*false' /tmp/integrity_failed.json \
+        && grep -q '"state_source"[[:space:]]*:[[:space:]]*"live-owner"' /tmp/integrity_failed.json \
+        && grep -q 'one or more verifier issues found' /tmp/integrity_failed.json \
+        && [ "$(cat "$CRASH_COMMITTED_FILE" 2>/dev/null || true)" = "$CRASH_COMMITTED_CONTENT" ]; then
+        pass "mounted_integrity_failure_reported"
+    else
+        fail "mounted_integrity_failure_reported" \
+            "exit=$INTEGRITY_FAILED_RC output=$(cat /tmp/integrity_failed.err /tmp/integrity_failed.json 2>/dev/null)"
+    fi
+else
+    blocked "mounted_integrity_failure_reported" "corruption injection failed"
+fi
+
 # Cleanup crash recovery daemon
 if [ -n "$CRP" ]; then
     kill "$CRP" 2>/dev/null || true
@@ -987,6 +1062,7 @@ echo "crash_committed_content=$CRASH_COMMITTED_CONTENT"
 echo "crash_uncommitted_content=$CRASH_UNCOMMITTED_CONTENT"
 echo "post_crash_committed=$POST_CRASH_COMMITTED"
 echo "post_crash_uncommitted=$POST_CRASH_UNCOMMITTED"
+echo "integrity_corrupted_members=$INTEGRITY_CORRUPTED_MEMBERS"
 echo "=== End ==="
 
 sync; sleep 1; poweroff -f
@@ -1038,6 +1114,8 @@ INITSCRIPT
       crash_cycle_stale_mount_detached crash_cycle_reimport_no_export \
       crash_cycle_recovery_remount crash_cycle_committed_survived \
       crash_cycle_inode_stable crash_cycle_unfsynced_bounded \
+      mounted_integrity_clean mounted_integrity_corruption_injected \
+      mounted_integrity_failure_reported \
       sync_done; do
       if grep -q "PASS: $op" "$VAL_LOG" 2>/dev/null; then
         echo "  PASS: $op"; PASSC=$((PASSC + 1))

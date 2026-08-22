@@ -2079,6 +2079,29 @@ impl LivePoolAdminResponse {
         }
     }
 
+    /// Return a completed human-readable command report with its process
+    /// status. A non-zero status means the command completed and found an
+    /// operator-visible problem; it is not a malformed request or protocol
+    /// refusal, so the report body must still reach the caller.
+    pub fn command_report_text(exit_code: i32, text: impl Into<String>) -> Self {
+        Self {
+            version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+            exit_code,
+            body: LivePoolAdminResponseBody::Text(text.into()),
+        }
+    }
+
+    /// Return a completed machine-readable command report with its process
+    /// status. This is the explicit `--json` counterpart to
+    /// [`Self::command_report_text`].
+    pub fn command_report_machine_json(exit_code: i32, json: impl Into<String>) -> Self {
+        Self {
+            version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+            exit_code,
+            body: LivePoolAdminResponseBody::MachineJson(json.into()),
+        }
+    }
+
     pub fn ok_bytes_hex(bytes_hex: impl Into<String>, bytes: usize) -> Self {
         Self {
             version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,

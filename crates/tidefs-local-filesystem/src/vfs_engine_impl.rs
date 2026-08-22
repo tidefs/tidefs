@@ -50,7 +50,10 @@ use crate::release_dispatch;
 #[cfg(feature = "replication-io")]
 use crate::types::CommittedRootSummary;
 use crate::types::CONTENT_MANIFEST_SPARSE_MAGIC;
-use crate::types::{InodeRecord, IntentLogReplyState, NamespaceEntry};
+use crate::types::{
+    InodeRecord, IntentLogReplyState, NamespaceEntry, OnlineVerifierIssue, OnlineVerifierIssueKind,
+    OnlineVerifierIssueSeverity, OnlineVerifierOutcome, OnlineVerifierReport,
+};
 use crate::xattr_dispatch;
 use tidefs_inode_attributes::timestamp::{TimestampPolicy, TimestampUpdate};
 use tidefs_posix_semantics::apply_setgid_inheritance_for_create;
@@ -2895,6 +2898,37 @@ impl VfsLocalFileSystem {
     }
 }
 
+fn mounted_canonical_verifier_report(fs: &mut PoolDatasetOwner) -> OnlineVerifierReport {
+    let dataset_id = DatasetId::from_bytes(fs.filesystem.mounted_dataset_id);
+    let root_authentication_key = fs.filesystem.root_authentication_key;
+    match crate::recovery::verify_online_canonical_dataset(
+        &mut fs.store,
+        dataset_id,
+        root_authentication_key,
+    ) {
+        Ok(report) => report,
+        Err(err) => {
+            let mut report = OnlineVerifierReport::empty();
+            report.root_slot_count = 1;
+            report.root_slots_seen = 1;
+            report.root_slot_records_seen = 1;
+            report.root_candidates_seen = 1;
+            report.invalid_root_candidates = 1;
+            report.issues.push(OnlineVerifierIssue {
+                severity: OnlineVerifierIssueSeverity::Error,
+                kind: OnlineVerifierIssueKind::RootCommitValidation,
+                slot: None,
+                location: None,
+                transaction_id: None,
+                generation: Some(fs.filesystem.state.generation),
+                reason: format!("canonical mounted verifier failed: {err}"),
+            });
+            report.outcome = OnlineVerifierOutcome::IssuesFound;
+            report
+        }
+    }
+}
+
 impl SharedPoolDatasetOwner {
     fn live_pool_get(&self, args: &Value) -> LivePoolAdminResponse {
         let property = match live_admin_arg(args, "property") {
@@ -3013,15 +3047,7 @@ impl SharedPoolDatasetOwner {
             .unwrap_or(0);
 
         let mut fs = self.borrow_mut();
-        let verifier = match fs.online_verifier_report() {
-            Ok(report) => report,
-            Err(err) => {
-                return live_admin_error(
-                    1,
-                    format!("pool integrity-check: live verifier failed for '{pool}': {err}"),
-                )
-            }
-        };
+        let verifier = mounted_canonical_verifier_report(&mut fs);
         let statfs = match fs.statfs() {
             Ok(statfs) => statfs,
             Err(err) => {
@@ -3066,7 +3092,7 @@ impl SharedPoolDatasetOwner {
                 })
                 .collect();
 
-            return live_admin_ok_json(json!({
+            let report = json!({
                 "pool": pool,
                 "pass": pass,
                 "state_source": "live-owner",
@@ -3144,7 +3170,12 @@ impl SharedPoolDatasetOwner {
                     "resolved": suspect_stats.resolved,
                     "oldest_unresolved_age": suspect_stats.oldest_unresolved_age,
                 },
-            }));
+            });
+            return if pass {
+                live_admin_ok_json(report)
+            } else {
+                live_admin_report_json(1, report)
+            };
         }
 
         let mut out = format!(
@@ -3205,7 +3236,11 @@ impl SharedPoolDatasetOwner {
                 let _ = write!(out, "\n    ... {} more", verifier.issues.len() - 8);
             }
         }
-        live_admin_ok_text(out)
+        if pass {
+            live_admin_ok_text(out)
+        } else {
+            live_admin_report_text(1, out)
+        }
     }
     /// Serve bounded Pool-wide administration through the one already-open
     /// mounted owner, without routing through VFS semantics.
@@ -5081,6 +5116,14 @@ fn live_admin_ok_text(text: impl Into<String>) -> LivePoolAdminResponse {
 
 fn live_admin_ok_json(value: Value) -> LivePoolAdminResponse {
     LivePoolAdminResponse::ok_machine_json(value.to_string())
+}
+
+fn live_admin_report_text(exit_code: i32, text: impl Into<String>) -> LivePoolAdminResponse {
+    LivePoolAdminResponse::command_report_text(exit_code, text)
+}
+
+fn live_admin_report_json(exit_code: i32, value: Value) -> LivePoolAdminResponse {
+    LivePoolAdminResponse::command_report_machine_json(exit_code, value.to_string())
 }
 
 fn live_admin_ok_bytes_hex(bytes: &[u8]) -> LivePoolAdminResponse {
@@ -8733,6 +8776,41 @@ mod tests {
         assert!(
             report["object_store"]["live_objects"].as_u64().unwrap_or(0) > 0,
             "live owner report should reflect mounted object-store state: {report}"
+        );
+
+        {
+            let mut fs = engine.fs.borrow_mut();
+            let generation = fs.stats().filesystem_generation.saturating_add(1);
+            fs.store
+                .publish_dataset_root(
+                    tidefs_pool_runtime::ROOT_DATASET_ID,
+                    tidefs_pool_runtime::DatasetRootKind::Filesystem,
+                    generation,
+                    b"invalid mounted canonical root",
+                )
+                .expect("publish invalid mounted canonical root");
+        }
+
+        let failed_json = live_pool_admin(&engine, "integrity-check", json!({}), true);
+        assert_eq!(failed_json["ok"], false, "failed response: {failed_json}");
+        assert_eq!(failed_json["json"]["pass"], false);
+        assert_eq!(failed_json["json"]["state_source"], "live-owner");
+        assert_eq!(failed_json["json"]["verifier"]["root_slot_count"], 1);
+        assert_eq!(failed_json["json"]["verifier"]["root_candidates_seen"], 1);
+        assert!(
+            failed_json["json"]["verifier"]["issues"]
+                .as_array()
+                .is_some_and(|issues| !issues.is_empty()),
+            "failed report should retain verifier issues: {failed_json}"
+        );
+
+        let failed_human = live_pool_admin(&engine, "integrity-check", json!({}), false);
+        assert_eq!(failed_human["ok"], false, "failed response: {failed_human}");
+        assert!(
+            failed_human["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("pass:          no") && text.contains("issues:")),
+            "human report should retain failed findings: {failed_human}"
         );
     }
 
