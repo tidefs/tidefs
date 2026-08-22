@@ -64,7 +64,7 @@ pub(crate) struct MissingLivePoolOwnerClient;
 impl LivePoolOwnerClient for MissingLivePoolOwnerClient {
     fn route_live_pool(self, route: LivePoolRoute<'_>) -> ! {
         match send_live_owner_request(&route) {
-            Ok(()) => process::exit(0),
+            Ok(exit_code) => process::exit(exit_code),
             Err(LiveOwnerRequestError::Unavailable(err)) => exit_unavailable(route, &err),
             Err(LiveOwnerRequestError::Owner {
                 exit_code,
@@ -716,14 +716,14 @@ fn live_owner_error_detail_json(
     out
 }
 
-fn send_live_owner_request(route: &LivePoolRoute<'_>) -> Result<(), LiveOwnerRequestError> {
+fn send_live_owner_request(route: &LivePoolRoute<'_>) -> Result<i32, LiveOwnerRequestError> {
     send_live_owner_request_at(&pool_runtime_root(), route)
 }
 
 fn send_live_owner_request_at(
     root: &Path,
     route: &LivePoolRoute<'_>,
-) -> Result<(), LiveOwnerRequestError> {
+) -> Result<i32, LiveOwnerRequestError> {
     let request = live_owner_request(route)?;
     let manifest = find_live_owner_manifest_at(root, route)?;
     let socket_path = manifest_socket_endpoint(&manifest, route)?;
@@ -760,6 +760,7 @@ fn send_live_owner_request_at(
     let response =
         decode_live_pool_admin_response(&line).map_err(live_admin_error_to_request_error)?;
     validate_live_owner_response_envelope(&response)?;
+    let exit_code = response.exit_code;
     match response.body {
         LivePoolAdminResponseBody::BytesHex {
             bytes_hex,
@@ -796,7 +797,7 @@ fn send_live_owner_request_at(
                         detail: None,
                     })?;
             }
-            Ok(())
+            Ok(exit_code)
         }
         LivePoolAdminResponseBody::MachineJson(machine_json) => {
             let mut value = parse_live_owner_machine_json(&machine_json)?;
@@ -818,7 +819,7 @@ fn send_live_owner_request_at(
                     println!("{line}");
                 }
             }
-            Ok(())
+            Ok(exit_code)
         }
         LivePoolAdminResponseBody::Text(text) => {
             let response_json = live_owner_status_text_json(route, &text);
@@ -837,7 +838,7 @@ fn send_live_owner_request_at(
                 print_live_owner_status_classification(route);
                 println!("{text}");
             }
-            Ok(())
+            Ok(exit_code)
         }
         LivePoolAdminResponseBody::Empty => {
             let response_json = live_owner_status_text_json(route, "");
@@ -855,7 +856,7 @@ fn send_live_owner_request_at(
             } else {
                 print_live_owner_status_classification(route);
             }
-            Ok(())
+            Ok(exit_code)
         }
         LivePoolAdminResponseBody::Error {
             message,
@@ -918,7 +919,12 @@ fn validate_live_owner_response_envelope(
     match &response.body {
         LivePoolAdminResponseBody::Error { .. } if response.exit_code == 0 => Err(malformed()),
         LivePoolAdminResponseBody::Error { .. } => Ok(()),
-        _ if response.exit_code != 0 => Err(malformed()),
+        LivePoolAdminResponseBody::BytesHex { .. } | LivePoolAdminResponseBody::Empty
+            if response.exit_code != 0 =>
+        {
+            Err(malformed())
+        }
+        LivePoolAdminResponseBody::Text(_) | LivePoolAdminResponseBody::MachineJson(_) => Ok(()),
         _ => Ok(()),
     }
 }
@@ -1886,50 +1892,64 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_success_live_owner_response_is_typed_malformed() {
+    fn nonzero_machine_report_preserves_body_and_exit_status() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("owner.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         write_owner_manifest(dir.path(), &socket_path);
-        let mut response = LivePoolAdminResponse::ok_text("ok");
-        response.exit_code = 1;
+        let response = LivePoolAdminResponse::command_report_machine_json(
+            1,
+            serde_json::json!({
+                "pass": false,
+                "state_source": "live-owner",
+                "verifier": {"issues": ["corrupt root"]},
+            })
+            .to_string(),
+        );
         let handle = spawn_owner_response(listener, response);
         let route = LivePoolRoute {
             command: "pool",
-            operation: "status",
+            operation: "integrity-check",
             pool: "tank",
             pool_uuid: Some([0x42; 16]),
             json: true,
             args: LivePoolAdminArgs::default(),
         };
 
-        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let exit_code = send_live_owner_request_at(dir.path(), &route).unwrap();
         let request = handle.join().unwrap();
 
-        assert_eq!(request.command, LivePoolAdminCommand::PoolStatus);
-        match err {
-            LiveOwnerRequestError::Owner {
-                exit_code,
-                message,
-                detail,
-            } => {
-                assert_eq!(exit_code, 2);
-                assert_eq!(
-                    message,
-                    "live-owner response exit code is inconsistent with response body"
-                );
-                assert_eq!(
-                    detail
-                        .as_ref()
-                        .and_then(|value| value.get("kind"))
-                        .and_then(serde_json::Value::as_str),
-                    Some("malformed")
-                );
-            }
-            LiveOwnerRequestError::Unavailable(message) => {
-                panic!("reachable owner should return typed malformed refusal, got {message}");
-            }
-        }
+        assert_eq!(request.command, LivePoolAdminCommand::PoolIntegrityCheck);
+        assert_eq!(exit_code, 1);
+    }
+
+    #[test]
+    fn nonzero_human_report_preserves_body_and_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let handle = spawn_owner_response(
+            listener,
+            LivePoolAdminResponse::command_report_text(
+                1,
+                "pool integrity-check: tank\n  pass: no\n  issues: corrupt root",
+            ),
+        );
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "integrity-check",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: false,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let exit_code = send_live_owner_request_at(dir.path(), &route).unwrap();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolIntegrityCheck);
+        assert_eq!(exit_code, 1);
     }
 
     #[test]
