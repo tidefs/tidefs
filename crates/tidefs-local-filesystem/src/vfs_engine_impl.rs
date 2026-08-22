@@ -651,11 +651,11 @@ impl VfsLocalFileSystem {
             return Ok(());
         }
 
-        // Metadata-only setattr must not persist write-buffer-adjusted size;
-        // content size/data_version change only when the buffer is flushed.
-        let record = fs
-            .committed_inode_record(inode_id)
-            .map_err(|e| map_errno(&e))?;
+        // Metadata-only setattr must mutate the live inode so it cannot
+        // restore the Pool predecessor's stale size or data version while a
+        // buffered write is pending. Content persistence still belongs to the
+        // write-buffer flush.
+        let record = fs.inode(inode_id).map_err(|e| map_errno(&e))?;
         let mut updated = record.clone();
 
         let now_ns = crate::types::current_posix_time_ns();
@@ -11004,19 +11004,63 @@ mod tests {
     #[test]
     fn lookup_regular_file_after_create() {
         let (engine, _td) = temp_fs();
+        {
+            let mut fs = engine.fs.borrow_mut();
+            fs.set_auto_commit(false).expect("defer mounted mutations");
+            fs.set_max_uncommitted_mutations(1_000_000)
+                .expect("keep the create/write group open");
+        }
         let root = engine.get_root_inode(&ctx()).unwrap();
+        let directory = engine.mkdir(root, b"lookup-dir", 0o750, &ctx()).unwrap();
         let (created, fh) = engine
-            .create(root, b"lookup-file.txt", 0o640, 0, &ctx())
+            .create(directory.inode_id, b"lookup-file.txt", 0o640, 0, &ctx())
             .unwrap();
-        engine.write(&fh, 0, b"lookup bytes", &ctx()).unwrap();
+        let payload = b"lookup bytes";
+        engine.write(&fh, 0, payload, &ctx()).unwrap();
+        let pending_data_version = engine
+            .fs
+            .borrow()
+            .get_inode_by_id(created.inode_id)
+            .expect("pending inode remains live")
+            .data_version;
 
-        let looked_up = engine.lookup(root, b"lookup-file.txt", &ctx()).unwrap();
+        let mut timestamps = SetAttr::new();
+        timestamps.valid = FATTR_ATIME | FATTR_MTIME;
+        timestamps.atime_ns = 1_778_800_000_000_000_000;
+        timestamps.mtime_ns = 1_778_800_000_100_000_000;
+        engine
+            .setattr(created.inode_id, &timestamps, None, &ctx())
+            .expect("timestamp setattr after buffered write");
+
+        let after_setattr = engine
+            .fs
+            .borrow()
+            .get_inode_by_id(created.inode_id)
+            .expect("setattr must retain the pending inode")
+            .clone();
+        assert_eq!(after_setattr.size, payload.len() as u64);
+        assert_eq!(after_setattr.data_version, pending_data_version);
+
+        engine.flush(&fh, &ctx()).expect("flush pending write");
+        engine
+            .getattr(directory.inode_id, None, &ctx())
+            .expect("parent directory remains reachable after flush");
+
+        let looked_up = engine
+            .lookup(directory.inode_id, b"lookup-file.txt", &ctx())
+            .unwrap();
 
         assert_eq!(looked_up.inode_id, created.inode_id);
         assert_eq!(looked_up.kind, NodeKind::File);
         assert!(looked_up.posix.is_file());
         assert_eq!(looked_up.posix.mode & !S_IFMT, 0o640);
-        assert_eq!(looked_up.posix.size, b"lookup bytes".len() as u64);
+        assert_eq!(looked_up.posix.size, payload.len() as u64);
+        assert_eq!(
+            engine
+                .read(&fh, 0, payload.len() as u32, &ctx())
+                .expect("read flushed file"),
+            payload
+        );
     }
 
     #[test]
