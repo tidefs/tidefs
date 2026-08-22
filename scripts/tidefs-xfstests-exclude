@@ -115,14 +115,6 @@ generic/263
 generic/244
 generic/383
 
-# --- Directory rename errno evidence pending ---
-#   generic/245 is not a quota row: it verifies rename over a non-empty
-#   directory returns EEXIST or ENOTEMPTY. The FUSE rename mapper currently
-#   maps NamespaceError::AlreadyExists to EEXIST and NamespaceError::NotEmpty
-#   to ENOTEMPTY in fuse_rename.rs, but the mounted row remains excluded until
-#   it is verified end-to-end.
-generic/245
-
 # --- Swapfile activation / kernel file mapping ---
 #   generic/472 exercises swapon oddities. TideFS FUSE does not currently
 #   provide a FUSE_BMAP mapping path for kernel swapfile activation; the
