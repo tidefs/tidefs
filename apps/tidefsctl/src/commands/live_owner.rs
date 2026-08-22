@@ -40,6 +40,12 @@ pub(crate) struct ImportedBackingDirOwner {
     pub(crate) reachable: bool,
 }
 
+#[cfg(feature = "block-volume")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct StaleUblkOwnerCandidate {
+    pub(crate) pid: u32,
+}
+
 impl ImportedBackingDirOwner {
     pub(crate) fn pool_uuid_hex(&self) -> String {
         hex_uuid(&self.pool_uuid)
@@ -209,6 +215,82 @@ pub(crate) fn route_or_refuse_active_for_uuid_with_args(
         false,
         args,
     );
+}
+
+/// Inspect the exact cached owner record as a ublk crash-recovery candidate.
+///
+/// The record is descriptive input only. Callers must independently match its
+/// dead PID to the canonical Pool import lock and to kernel GET_DEV_INFO2
+/// before issuing any recovery command.
+#[cfg(feature = "block-volume")]
+pub(crate) fn stale_ublk_owner_candidate(
+    pool: &str,
+    pool_uuid: [u8; 16],
+    volume: &str,
+) -> Result<Option<StaleUblkOwnerCandidate>, String> {
+    stale_ublk_owner_candidate_at(&pool_runtime_root(), pool, pool_uuid, volume)
+}
+
+#[cfg(feature = "block-volume")]
+fn stale_ublk_owner_candidate_at(
+    root: &Path,
+    pool: &str,
+    pool_uuid: [u8; 16],
+    volume: &str,
+) -> Result<Option<StaleUblkOwnerCandidate>, String> {
+    let manifest_path = owner_manifest_path(root, &pool_uuid);
+    let raw = match std::fs::read_to_string(&manifest_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "read cached ublk owner record {}: {error}",
+                manifest_path.display()
+            ));
+        }
+    };
+    let manifest: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "decode cached ublk owner record {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let expected_uuid = hex_uuid(&pool_uuid);
+    let expected_mountpoint = format!("ublk:{volume}");
+    if manifest_pool_name(&manifest) != Some(pool)
+        || manifest
+            .get("pool_uuid")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|uuid| !uuid.eq_ignore_ascii_case(&expected_uuid))
+        || manifest_owner_kind(&manifest) != Some("ublk")
+        || manifest
+            .get("mountpoint")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_mountpoint.as_str())
+    {
+        return Err(format!(
+            "cached owner record {} does not bind exact ublk owner {pool}/{volume} uuid {expected_uuid}",
+            manifest_path.display()
+        ));
+    }
+    if manifest_has_reachable_interface(&manifest) {
+        return Ok(None);
+    }
+    let pid = manifest
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| (2..=i32::MAX as u32).contains(pid))
+        .ok_or_else(|| {
+            format!(
+                "cached ublk owner record {} has no valid Linux process id",
+                manifest_path.display()
+            )
+        })?;
+    if Path::new(&format!("/proc/{pid}")).exists() {
+        return Ok(None);
+    }
+    Ok(Some(StaleUblkOwnerCandidate { pid }))
 }
 
 pub(crate) fn route_or_refuse_active_for_uuid_with_format_and_args(
@@ -1634,6 +1716,47 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
+    fn stale_ublk_owner_candidate_requires_exact_dead_pool_volume_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = [0x42; 16];
+        let manifest_path = owner_manifest_path(dir.path(), &uuid);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        let dead_pid = i32::MAX as u32;
+        assert!(!Path::new(&format!("/proc/{dead_pid}")).exists());
+
+        let write_manifest = |pid: u32, mountpoint: &str| {
+            std::fs::write(
+                &manifest_path,
+                serde_json::json!({
+                    "owner_kind": "ublk",
+                    "pool_name": "tank",
+                    "pool_uuid": hex_uuid(&uuid),
+                    "pid": pid,
+                    "mountpoint": mountpoint,
+                    "socket_path": dir.path().join("missing-owner.sock"),
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+
+        write_manifest(dead_pid, "ublk:vol");
+        assert_eq!(
+            stale_ublk_owner_candidate_at(dir.path(), "tank", uuid, "vol").unwrap(),
+            Some(StaleUblkOwnerCandidate { pid: dead_pid })
+        );
+
+        assert!(stale_ublk_owner_candidate_at(dir.path(), "tank", uuid, "foreign").is_err());
+
+        write_manifest(std::process::id(), "ublk:vol");
+        assert_eq!(
+            stale_ublk_owner_candidate_at(dir.path(), "tank", uuid, "vol").unwrap(),
+            None
+        );
     }
 
     fn spawn_owner_response(

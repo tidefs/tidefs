@@ -844,12 +844,12 @@ fn raw_decode_run_bounded_mixed_valid_and_malformed_results() {
 // ── Flush error-path tests ────────────────────────────────────────────
 
 #[test]
-fn raw_decode_flush_with_nonzero_start_sector_errors() {
+fn raw_decode_flush_with_actual_nonzero_start_sector_errors() {
     let (_dir, mut image) = test_image();
     let geom = test_geometry();
     let mut worker = DataQueueWorker::new(30, geom);
 
-    // Flush must have start_sector == 0 and count_or_zones == 0
+    // Linux's u64::MAX sentinel is accepted, but an actual range is not.
     let raw = raw_desc_bytes(UBLK_IO_OP_FLUSH, 0, 8, 0, 0);
     let desc = desc_from_raw_bytes(&raw);
 
@@ -858,6 +858,30 @@ fn raw_decode_flush_with_nonzero_start_sector_errors() {
     assert_eq!(err.linux_errno(), -22); // EINVAL
     assert_eq!(worker.error_ops, 1);
     assert_eq!(worker.flush_ops, 0);
+}
+
+#[test]
+fn raw_decode_flush_accepts_linux_synthetic_sector_sentinel() {
+    let (_dir, mut image) = test_image();
+    let geom = test_geometry();
+    let mut worker = DataQueueWorker::new(31, geom);
+
+    let raw = raw_desc_bytes(UBLK_IO_OP_FLUSH, 0, u64::MAX, 0, 0);
+    let desc = desc_from_raw_bytes(&raw);
+
+    let result = worker
+        .process_one(&mut image, 1, &desc)
+        .expect("Linux synthetic FLUSH sector sentinel should succeed");
+    assert_eq!(result.request_class, BlockVolumeRequestClass::Flush);
+    assert_eq!(
+        result.completion_class,
+        BlockVolumeCompletionClass::Completed
+    );
+    assert_eq!(result.io_cmd.result, UBLK_IO_RES_OK);
+    assert_eq!(result.byte_count, 0);
+    assert_eq!(worker.error_ops, 0);
+    assert_eq!(worker.flush_ops, 1);
+    assert_eq!(worker.barrier_audit.flush_count, 1);
 }
 
 #[test]
@@ -878,12 +902,12 @@ fn raw_decode_flush_with_nonzero_count_errors() {
 }
 
 #[test]
-fn raw_decode_flush_with_nonzero_addr_errors() {
+fn raw_decode_flush_with_nonzero_buffer_address_errors() {
     let (_dir, mut image) = test_image();
     let geom = test_geometry();
     let mut worker = DataQueueWorker::new(32, geom);
 
-    // Flush must have addr == 0
+    // USER_COPY FLUSH has no mapped payload buffer.
     let raw = raw_desc_bytes(UBLK_IO_OP_FLUSH, 0, 0, 0, 0x1000_0000);
     let desc = desc_from_raw_bytes(&raw);
 

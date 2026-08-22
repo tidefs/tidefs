@@ -223,28 +223,65 @@ fn handle_attach(
         ));
     }
     #[cfg(feature = "cluster")]
-    if !cluster {
-        super::live_owner::route_or_refuse_active_for_uuid_with_args(
-            "block",
-            "attach",
+    let standalone_attach = !cluster;
+    #[cfg(not(feature = "cluster"))]
+    let standalone_attach = true;
+    let active_label = config.state == tidefs_types_pool_label_core::PoolState::Active;
+    let recovery_predecessor_pid = if standalone_attach && active_label {
+        match super::live_owner::stale_ublk_owner_candidate(
             &target.pool,
             config.pool_uuid,
-            config.state == tidefs_types_pool_label_core::PoolState::Active,
-            live_args,
-        );
-    }
-    #[cfg(not(feature = "cluster"))]
-    super::live_owner::route_or_refuse_active_for_uuid_with_args(
-        "block",
-        "attach",
-        &target.pool,
-        config.pool_uuid,
-        config.state == tidefs_types_pool_label_core::PoolState::Active,
-        live_args,
-    );
+            &target.dataset,
+        )? {
+            Some(candidate) => {
+                let lock_dir = PathBuf::from("/run/tidefs/import");
+                match tidefs_pool_import::stale_import_lock_pid(&lock_dir, &config.pool_uuid)
+                    .map_err(|error| {
+                        format!("inspect Pool import lock for ublk recovery: {error}")
+                    })? {
+                    Some(lock_pid) if lock_pid == candidate.pid => Some(candidate.pid),
+                    Some(lock_pid) => {
+                        return Err(format!(
+                            "refuse ublk recovery for {}/{}: cached owner PID {} does not match stale Pool import-lock PID {lock_pid}",
+                            target.pool, target.dataset, candidate.pid
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "refuse ublk recovery for {}/{}: exact stale cached owner PID {} has no matching stale Pool import lock",
+                            target.pool, target.dataset, candidate.pid
+                        ));
+                    }
+                }
+            }
+            None => {
+                super::live_owner::route_or_refuse_active_for_uuid_with_args(
+                    "block",
+                    "attach",
+                    &target.pool,
+                    config.pool_uuid,
+                    true,
+                    live_args,
+                );
+                None
+            }
+        }
+    } else {
+        if standalone_attach {
+            super::live_owner::route_or_refuse_active_for_uuid_with_args(
+                "block",
+                "attach",
+                &target.pool,
+                config.pool_uuid,
+                active_label,
+                live_args,
+            );
+        }
+        None
+    };
 
     use tidefs_block_volume_adapter_daemon::storage_backend::{
-        PoolVolumeBackend, SharedPoolRuntime,
+        BlockVolumeStorageBackend, PoolVolumeBackend, SharedPoolRuntime,
     };
     use tidefs_block_volume_adapter_daemon::ublk_control_open::run_ublk_live_device;
     use tidefs_pool_runtime::PoolRuntime;
@@ -268,6 +305,7 @@ fn handle_attach(
     };
 
     let lock_dir = PathBuf::from("/run/tidefs/import");
+    let recovery_requested = recovery_predecessor_pid.is_some();
     let import_owner = match tidefs_pool_import::pool_import_owned(devices, &lock_dir, false, None)
     {
         Ok(owner) => owner,
@@ -299,7 +337,11 @@ fn handle_attach(
                 Some(lease) => append_lease_release_error(error, lease.release()),
                 None => error,
             };
-            return Err(combine_export_error(error, import_owner.export()));
+            return Err(finish_import_setup_error(
+                error,
+                import_owner,
+                recovery_requested,
+            ));
         }
     };
     let runtime = SharedPoolRuntime::new(std::sync::Mutex::new(runtime));
@@ -324,16 +366,67 @@ fn handle_attach(
         Ok(backend) => backend,
         Err(error) => {
             drop(runtime);
-            return Err(combine_export_error(
+            return Err(finish_import_setup_error(
                 format!("open Pool volume '{}': {error}", target.dataset),
-                import_owner.export(),
+                import_owner,
+                recovery_requested,
             ));
         }
     };
 
-    eprintln!(
-        "tidefsctl block attach: launching ublk live device (queues={nr_hw_queues} depth={queue_depth})"
-    );
+    let recovery_device = match recovery_predecessor_pid {
+        Some(predecessor_pid) => {
+            let expected_capacity_bytes = backend
+                .geometry()
+                .capacity_bytes()
+                .and_then(|capacity| u64::try_from(capacity).ok())
+                .ok_or_else(|| {
+                    format!(
+                        "canonical Pool volume '{}/{}' capacity exceeds the host recovery boundary",
+                        target.pool, target.dataset
+                    )
+                });
+            let selected = expected_capacity_bytes.and_then(|expected_capacity_bytes| {
+                probe_ublk_recovery_devices().and_then(|probes| {
+                    select_ublk_recovery_device(predecessor_pid, expected_capacity_bytes, &probes)
+                })
+            });
+            match selected {
+                Ok(device) => Some(device),
+                Err(error) => {
+                    drop(backend);
+                    drop(runtime);
+                    return Err(finish_import_setup_error(
+                        format!(
+                            "refuse ublk recovery for {}/{}: {error}",
+                            target.pool, target.dataset
+                        ),
+                        import_owner,
+                        true,
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+
+    let carrier_nr_hw_queues = recovery_device
+        .map(|device| device.nr_hw_queues)
+        .unwrap_or(nr_hw_queues);
+    let carrier_queue_depth = recovery_device
+        .map(|device| device.queue_depth)
+        .unwrap_or(queue_depth);
+
+    if let Some(device) = recovery_device {
+        eprintln!(
+            "tidefsctl block attach: recovering exact ublk device {} (queues={} depth={})",
+            device.dev_id, device.nr_hw_queues, device.queue_depth
+        );
+    } else {
+        eprintln!(
+            "tidefsctl block attach: launching ublk live device (queues={nr_hw_queues} depth={queue_depth})"
+        );
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_thread =
@@ -355,9 +448,10 @@ fn handle_attach(
                 let lease_release: Result<(), String> = Ok(());
                 drop(backend);
                 drop(runtime);
-                return Err(combine_export_error(
+                return Err(finish_import_setup_error(
                     append_lease_release_error(error, lease_release),
-                    import_owner.export(),
+                    import_owner,
+                    recovery_requested,
                 ));
             }
         };
@@ -391,22 +485,28 @@ fn handle_attach(
             let lease_release: Result<(), String> = Ok(());
             drop(backend);
             drop(runtime);
-            return Err(combine_export_error(
+            return Err(finish_import_setup_error(
                 append_lease_release_error(
                     format!("start ublk live owner: {error}"),
                     lease_release,
                 ),
-                import_owner.export(),
+                import_owner,
+                recovery_requested,
             ));
         }
     };
     let carrier_result = run_ublk_live_device(
-        None,
+        recovery_device.map(|device| {
+            (
+                device.dev_id,
+                recovery_predecessor_pid.expect("selected recovery retained predecessor PID"),
+            )
+        }),
         &mut backend,
         Arc::clone(&shutdown),
         false,
-        nr_hw_queues,
-        queue_depth,
+        carrier_nr_hw_queues,
+        carrier_queue_depth,
         drain_deadline_secs,
     );
     signal_thread.finish();
@@ -464,6 +564,172 @@ fn handle_attach(
     } else {
         Err(completion_errors.join("; additionally "))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UblkRecoveryDevice {
+    dev_id: u32,
+    nr_hw_queues: u16,
+    queue_depth: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UblkRecoveryProbe {
+    dev_id: u32,
+    ublksrv_pid: i32,
+    state: u16,
+    flags: u64,
+    nr_hw_queues: u16,
+    queue_depth: u16,
+    max_io_buf_bytes: u32,
+    capacity_bytes: u64,
+}
+
+fn select_ublk_recovery_device(
+    predecessor_pid: u32,
+    expected_capacity_bytes: u64,
+    probes: &[UblkRecoveryProbe],
+) -> Result<UblkRecoveryDevice, String> {
+    let predecessor_pid = i32::try_from(predecessor_pid)
+        .map_err(|_| "predecessor PID exceeds the Linux process-id range".to_string())?;
+    // Linux deliberately reports -1 from GET_DEV_INFO2 after the original
+    // ublksrv task disappears. The cached owner and stale import lock prove
+    // the predecessor PID; kernel selection must therefore require one
+    // unambiguous orphan rather than an impossible dead-PID equality.
+    let mut orphaned = probes.iter().filter(|probe| probe.ublksrv_pid == -1);
+    let probe = orphaned.next().ok_or_else(|| {
+        format!("no orphaned kernel ublk device remains for predecessor PID {predecessor_pid}")
+    })?;
+    if orphaned.next().is_some() {
+        return Err(format!(
+            "multiple orphaned kernel ublk devices make predecessor PID {predecessor_pid} ambiguous"
+        ));
+    }
+    if probe.state
+        != tidefs_block_volume_adapter_ublk_control_runtime::TIDEFS_UBLK_RECOVERY_QUIESCED_STATE
+    {
+        return Err(format!(
+            "kernel ublk device {} is in state {}, not the required quiesced state",
+            probe.dev_id, probe.state
+        ));
+    }
+    let required_features =
+        tidefs_block_volume_adapter_ublk_control_runtime::TIDEFS_UBLK_ADD_DEV_REQUIRED_FEATURES
+            .bits();
+    if probe.flags & required_features != required_features {
+        return Err(format!(
+            "kernel ublk device {} lacks required recovery flags 0x{:x}",
+            probe.dev_id,
+            required_features & !probe.flags
+        ));
+    }
+    let mut queue_input = tidefs_block_volume_adapter_ublk_control_runtime::UblkControlAddDevInput::from_nr_hw_queues_and_depth(
+        probe.nr_hw_queues,
+        probe.queue_depth,
+    );
+    queue_input.max_io_buf_bytes = probe.max_io_buf_bytes;
+    tidefs_block_volume_adapter_ublk_control_runtime::build_add_dev_spec(queue_input).map_err(
+        |error| {
+            format!(
+                "kernel ublk device {} has invalid queue geometry: {}",
+                probe.dev_id,
+                error.as_str()
+            )
+        },
+    )?;
+    if probe.capacity_bytes != expected_capacity_bytes {
+        return Err(format!(
+            "kernel ublk device {} capacity {} does not match canonical Pool volume capacity {expected_capacity_bytes}",
+            probe.dev_id, probe.capacity_bytes
+        ));
+    }
+    Ok(UblkRecoveryDevice {
+        dev_id: probe.dev_id,
+        nr_hw_queues: probe.nr_hw_queues,
+        queue_depth: probe.queue_depth,
+    })
+}
+
+fn probe_ublk_recovery_devices() -> Result<Vec<UblkRecoveryProbe>, String> {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileTypeExt;
+
+    let control_path = Path::new("/dev/ublk-control");
+    let metadata = std::fs::metadata(control_path)
+        .map_err(|error| format!("access {}: {error}", control_path.display()))?;
+    if !metadata.file_type().is_char_device() {
+        return Err(format!(
+            "{} is not a character device",
+            control_path.display()
+        ));
+    }
+    let control = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(control_path)
+        .map_err(|error| format!("open {}: {error}", control_path.display()))?;
+
+    let mut device_ids = Vec::new();
+    for entry in std::fs::read_dir("/sys/class/block")
+        .map_err(|error| format!("enumerate /sys/class/block: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("read /sys/class/block entry: {error}"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(raw_id) = name.strip_prefix("ublkb") else {
+            continue;
+        };
+        if raw_id.is_empty() || !raw_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let dev_id = raw_id
+            .parse::<u32>()
+            .map_err(|error| format!("parse kernel ublk device id from {name}: {error}"))?;
+        device_ids.push((dev_id, entry.path()));
+    }
+    device_ids.sort_unstable_by_key(|(dev_id, _)| *dev_id);
+
+    let mut probes = Vec::with_capacity(device_ids.len());
+    for (dev_id, sysfs_path) in device_ids {
+        let info = tidefs_block_volume_adapter_ublk_control_runtime::issue_get_dev_info2(
+            control.as_fd(),
+            dev_id,
+        )
+        .map_err(|error| {
+            format!(
+                "GET_DEV_INFO2 for kernel ublk device {dev_id}: {}",
+                error.as_str()
+            )
+        })?;
+        if info.dev_id != dev_id {
+            return Err(format!(
+                "GET_DEV_INFO2 returned device id {} while probing {dev_id}",
+                info.dev_id
+            ));
+        }
+        let sectors = std::fs::read_to_string(sysfs_path.join("size"))
+            .map_err(|error| format!("read ublk device {dev_id} capacity: {error}"))?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("parse ublk device {dev_id} capacity: {error}"))?;
+        let capacity_bytes = sectors
+            .checked_mul(512)
+            .ok_or_else(|| format!("ublk device {dev_id} capacity overflows bytes"))?;
+        probes.push(UblkRecoveryProbe {
+            dev_id,
+            ublksrv_pid: info.ublksrv_pid,
+            state: info.state,
+            flags: info.flags,
+            nr_hw_queues: info.nr_hw_queues,
+            queue_depth: info.queue_depth,
+            max_io_buf_bytes: info.max_io_buf_bytes,
+            capacity_bytes,
+        });
+    }
+    Ok(probes)
 }
 
 #[cfg(feature = "cluster")]
@@ -545,6 +811,19 @@ fn combine_export_error(
     }
 }
 
+fn finish_import_setup_error(
+    error: String,
+    import_owner: tidefs_pool_import::PoolImportOwner,
+    recovery_requested: bool,
+) -> String {
+    if recovery_requested {
+        drop(import_owner);
+        format!("{error}; Pool label export withheld because ublk recovery setup did not complete")
+    } else {
+        combine_export_error(error, import_owner.export())
+    }
+}
+
 // ── Detach ────────────────────────────────────────────────────────────
 
 fn handle_detach(device_id: u32) -> Result<(), String> {
@@ -623,6 +902,85 @@ fn read_block_device_size(dev_path: &Path) -> Result<u64, ()> {
 #[cfg(test)]
 mod block_path_tests {
     use super::*;
+
+    fn valid_recovery_probe() -> UblkRecoveryProbe {
+        UblkRecoveryProbe {
+            dev_id: 7,
+            ublksrv_pid: -1,
+            state: tidefs_block_volume_adapter_ublk_control_runtime::TIDEFS_UBLK_RECOVERY_QUIESCED_STATE,
+            flags: tidefs_block_volume_adapter_ublk_control_runtime::TIDEFS_UBLK_ADD_DEV_REQUIRED_FEATURES.bits(),
+            nr_hw_queues: 2,
+            queue_depth: 64,
+            max_io_buf_bytes: 1024 * 1024,
+            capacity_bytes: 8 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn block_recovery_selects_only_one_orphaned_kernel_device_and_volume() {
+        let probe = valid_recovery_probe();
+        assert_eq!(
+            select_ublk_recovery_device(4242, probe.capacity_bytes, &[probe]).unwrap(),
+            UblkRecoveryDevice {
+                dev_id: 7,
+                nr_hw_queues: 2,
+                queue_depth: 64,
+            }
+        );
+
+        let mut live = probe;
+        live.dev_id = 8;
+        live.ublksrv_pid = 4343;
+        assert_eq!(
+            select_ublk_recovery_device(4242, probe.capacity_bytes, &[live, probe]).unwrap(),
+            UblkRecoveryDevice {
+                dev_id: 7,
+                nr_hw_queues: 2,
+                queue_depth: 64,
+            }
+        );
+
+        assert!(
+            select_ublk_recovery_device(4242, live.capacity_bytes, &[live])
+                .unwrap_err()
+                .contains("no orphaned kernel ublk device")
+        );
+        assert!(
+            select_ublk_recovery_device(4242, probe.capacity_bytes, &[probe, probe])
+                .unwrap_err()
+                .contains("multiple orphaned kernel ublk devices")
+        );
+
+        let mut invalid = probe;
+        invalid.state = 1;
+        assert!(
+            select_ublk_recovery_device(4242, invalid.capacity_bytes, &[invalid])
+                .unwrap_err()
+                .contains("not the required quiesced state")
+        );
+
+        invalid = probe;
+        invalid.flags &= !tidefs_block_volume_adapter_ublk_control_runtime::TIDEFS_UBLK_ADD_DEV_REQUIRED_FEATURES.bits();
+        assert!(
+            select_ublk_recovery_device(4242, invalid.capacity_bytes, &[invalid])
+                .unwrap_err()
+                .contains("lacks required recovery flags")
+        );
+
+        invalid = probe;
+        invalid.queue_depth = 0;
+        assert!(
+            select_ublk_recovery_device(4242, invalid.capacity_bytes, &[invalid])
+                .unwrap_err()
+                .contains("invalid queue geometry")
+        );
+
+        assert!(
+            select_ublk_recovery_device(4242, probe.capacity_bytes + 512, &[probe])
+                .unwrap_err()
+                .contains("does not match canonical Pool volume capacity")
+        );
+    }
 
     #[test]
     fn block_attach_requires_named_volume_target() {

@@ -342,10 +342,6 @@ fn run() -> Result<(), Box<dyn Error>> {
             report.print();
             Ok(())
         }
-        Some("ublk-reconnect" | "ublk-device-reconnect") => {
-            run_ublk_reconnect()?;
-            Ok(())
-        }
         Some("ublk-enumerate-devices" | "ublk-device-enumerate") => {
             run_ublk_enumerate_devices()?;
             Ok(())
@@ -438,7 +434,6 @@ fn print_summary() {
     println!("command.ublk_data_commit_fetch=ublk-data-commit-fetch");
     println!("command.ublk_data_io_loop=ublk-data-queue-io-loop");
     println!("command.ublk_enumerate=ublk-enumerate-devices");
-    println!("command.ublk_reconnect=ublk-reconnect");
     println!("command.ublk_serve=ublk-serve");
     println!("command.ublk_acceptance_harness=ublk-acceptance-harness");
     println!("command.ublk_device_appearance_validation=ublk-device-appearance-validation");
@@ -475,9 +470,6 @@ fn print_help() {
     println!("  ublk-io-loop-boundary  alias for ublk-data-queue-io-loop");
     println!("  ublk-data-io-loop  alias for ublk-data-queue-io-loop");
     println!("  ublk-device-enumerate  alias for ublk-enumerate-devices");
-    println!(
-        "  ublk-reconnect  probe START_USER_RECOVERY + END_USER_RECOVERY on existing ublk devices"
-    );
     println!("  ublk-enumerate-devices  enumerate ublk devices and query capacity");
     println!("  ublk-serve  serve a live block device backed by a regular file or block device (SIGINT to stop)");
     println!("  ublk-live  alias for ublk-serve");
@@ -1341,92 +1333,6 @@ fn run_ublk_enumerate_devices() -> Result<(), AppError> {
     Ok(())
 }
 
-fn run_ublk_reconnect() -> Result<(), AppError> {
-    use std::os::fd::AsFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    use tidefs_block_volume_adapter_ublk_control_runtime::issue_end_user_recovery;
-    use tidefs_block_volume_adapter_ublk_control_runtime::issue_start_user_recovery;
-    use tidefs_block_volume_adapter_ublk_control_runtime::UblkControlEndUserRecoveryInput;
-    use tidefs_block_volume_adapter_ublk_control_runtime::UblkControlStartUserRecoveryInput;
-
-    // ── Enumerate existing ublk devices ──────────────────────────
-    let capacities = enumerate_device_capacities()
-        .map_err(|e| AppError::new(format!("enumerate ublk devices: {e}")))?;
-    if capacities.is_empty() {
-        eprintln!("ublk-reconnect: no existing ublk devices found, nothing to reconnect to");
-        eprintln!("ublk-reconnect: refusal=no_device_found (safe — no guest data corruption)");
-        return Ok(());
-    }
-
-    // ── Open control device ─────────────────────────────────────
-    let control_fd = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_CLOEXEC)
-        .open("/dev/ublk-control")
-        .map_err(|e| AppError::new(format!("open /dev/ublk-control: {e}")))?;
-
-    // ── Attempt START_USER_RECOVERY on the first device ─────────
-    let cap = &capacities[0];
-    eprintln!(
-        "ublk-reconnect: attempting START_USER_RECOVERY on ublkb{} ({} sectors x {}B)",
-        cap.dev_id, cap.sector_count, cap.sector_size,
-    );
-
-    let start_input = UblkControlStartUserRecoveryInput::from_kernel_dev_id(cap.dev_id);
-    match issue_start_user_recovery(control_fd.as_fd(), start_input) {
-        Ok(outcome) => {
-            eprintln!(
-                "ublk-reconnect: START_USER_RECOVERY succeeded on dev_id={}",
-                outcome.dev_id,
-            );
-            // ── END_USER_RECOVERY to complete the reconnect cycle ─
-            let end_input = UblkControlEndUserRecoveryInput::from_kernel_dev_id(cap.dev_id);
-            match issue_end_user_recovery(control_fd.as_fd(), end_input) {
-                Ok(end_outcome) => {
-                    eprintln!(
-                        "ublk-reconnect: END_USER_RECOVERY succeeded on dev_id={}",
-                        end_outcome.dev_id,
-                    );
-                    eprintln!(
-                        "ublk-reconnect: reconnect_probe=passed device=ublkb{}",
-                        cap.dev_id,
-                    );
-                    eprintln!("ublk-reconnect: note=io_serving_not_yet_wired (recovery commands verified)");
-                }
-                Err(e) => {
-                    eprintln!(
-                        "ublk-reconnect: END_USER_RECOVERY failed on dev_id={}: {} (errno={:?})",
-                        cap.dev_id,
-                        e.as_str(),
-                        e.errno(),
-                    );
-                    eprintln!("ublk-reconnect: refusal=end_user_recovery_failed (safe — guest data may be quiesced)");
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "ublk-reconnect: START_USER_RECOVERY refused on dev_id={}: {} (errno={:?})",
-                cap.dev_id,
-                e.as_str(),
-                e.errno(),
-            );
-            // This is a valid close-standard outcome: explicit refusal without corruption
-            eprintln!("ublk-reconnect: refusal=start_user_recovery_refused (safe — no guest data corruption)");
-
-            if capacities.len() > 1 {
-                eprintln!(
-                    "ublk-reconnect: {} additional device(s) present but not attempted",
-                    capacities.len() - 1,
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
 #[allow(unsafe_code)]
 fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), AppError> {
     let args: Vec<String> = std::env::args().collect();
@@ -1559,24 +1465,10 @@ fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), A
 
     let backend: &mut dyn BlockVolumeStorageBackend = &mut file_image;
 
-    // ── Reconnect detection: enumerate existing ublk devices and pass
-    // the first found dev_id to the I/O loop for reconnect. The I/O loop
-    // issues START_USER_RECOVERY / END_USER_RECOVERY internally; this
-    // outer probe only detects devices without touching them.
-    let mut reconnect_for_io_loop: Option<u32> = None;
-    {
-        let capacities = enumerate_device_capacities().unwrap_or_default();
-        if !capacities.is_empty() {
-            let cap = &capacities[0];
-            eprintln!(
-                "ublk-serve: existing device ublkb{} found, will attempt reconnect in I/O loop",
-                cap.dev_id,
-            );
-            reconnect_for_io_loop = Some(cap.dev_id);
-        } else {
-            eprintln!("ublk-serve: no existing devices, creating fresh");
-        }
-    }
+    // This development carrier always creates its own fresh device. Pool-bound
+    // crash recovery belongs exclusively to `tidefsctl block attach`, which can
+    // prove Pool, volume, stale-lock, predecessor PID, and kernel-device identity.
+    let reconnect_for_io_loop: Option<(u32, u32)> = None;
     // ── Live device I/O loop with resize restart ──
     // Remember the dev_id for UPDATE_SIZE (set during first I/O loop run)
     let mut saved_dev_id: u32 = 0;
@@ -1669,10 +1561,6 @@ fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), A
             } else {
                 eprintln!("tidefs ublk-serve: cannot determine dev_id for UPDATE_SIZE");
             }
-
-            // The I/O loop already issued DEL_DEV; set reconnect to None
-            // so the next iteration creates a fresh device with new params.
-            reconnect_for_io_loop = None;
 
             eprintln!("tidefs ublk-serve: resize complete, restarting I/O loop...");
             continue;
