@@ -1151,16 +1151,14 @@ if [ "$FUSE_READY" -eq 1 ]; then
     # Use the functional mount helper to mount on /mnt/tidefs.
     # This registers the mount with a source distinct from the xfstests
     # TEST_DEV/SCRATCH_DEV names, so xfstests source checks stay unambiguous.
-    /bin/tidefs-preview "$MNT" > /tmp/mount-helper.log 2>&1 &
-    HELPER_PID=$!
-    # Wait for mount (up to 30s)
-    for i in $(seq 1 30); do
+    # The helper creates the Pool before starting its bounded 30-second mount
+    # readiness check. Wait for that single readiness owner instead of racing
+    # Pool creation with a second parent-side timeout.
+    if /bin/tidefs-preview "$MNT" > /tmp/mount-helper.log 2>&1; then
         if mountpoint -q "$MNT" 2>/dev/null; then
             MOUNTED=1
-            break
         fi
-        sleep 1
-    done
+    fi
     if [ "$MOUNTED" -eq 1 ]; then
         pass "fuse_mount"
         echo "  Mounted: $MNT"
@@ -1169,9 +1167,8 @@ if [ "$FUSE_READY" -eq 1 ]; then
         MOUNT_OWNER_PID=$(cat "/tmp/tidefs-mount-$MNT_TAG.pid" 2>/dev/null || true)
         [ -n "$MOUNT_OWNER_PID" ] && echo "  Mount owner PID: $MOUNT_OWNER_PID"
     else
-        fail "fuse_mount" "mount did not appear within 30s; helper log: $(tail -5 /tmp/mount-helper.log 2>/dev/null)"
+        fail "fuse_mount" "mount helper did not produce a mounted filesystem: $(tail -40 /tmp/mount-helper.log 2>/dev/null)"
     fi
-    wait "$HELPER_PID" 2>/dev/null || true
 else
     blocked "fuse_mount" "/dev/fuse not available"
 fi
