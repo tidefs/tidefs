@@ -51,6 +51,13 @@
           xfstests = pkgs.xfstests.overrideAttrs (old: {
             buildInputs = (old.buildInputs or []) ++ [ pkgs.gdbm ];
             NIX_CFLAGS_COMPILE = (old.NIX_CFLAGS_COMPILE or "") + " -std=gnu99 -Wno-error=incompatible-pointer-types";
+            src = pkgs.applyPatches {
+              src = old.src;
+              patches = [ (pkgs.fetchpatch {
+                url = "https://github.com/kdave/xfstests/commit/d9323ad7a05e2705fbd31d5e7c6031bba23b1706.diff";
+                hash = "sha256-gsDeo4c577KtukZLgbJDw9sfbhcuI1vdedK6GECVVow=";
+              }) ];
+            };
             postInstall = (old.postInstall or "") + ''
               substituteInPlace "$out/bin/xfstests-check" \
                 --replace-fail "  ln -s $out/lib/xfstests/\$f \$f" "  if [ \"\$f\" = tests ] || [ \"\$f\" = common ]; then
