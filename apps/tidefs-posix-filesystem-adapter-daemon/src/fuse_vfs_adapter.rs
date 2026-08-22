@@ -53,7 +53,6 @@ use tidefs_background_scheduler::{BackgroundScheduler, BackgroundService};
 use tidefs_cache_core::page_cache::PageCache;
 use tidefs_cache_core::path_lookup_cache::PathLookupCache;
 use tidefs_cache_core::{BackpressureSignal, BudgetCategory, Governor, GovernorConfig};
-use tidefs_local_filesystem::fuse_fsync::DirtyFlush;
 use tidefs_permission::{
     check_access, InodeAttr as PermissionInodeAttr, MountIdentity, PosixAclEntry, ACCESS_EXECUTE,
     ACCESS_READ, ACCESS_WRITE,
@@ -3089,6 +3088,46 @@ fn strongest_backpressure(
 
 const MAX_PRUNE_CANDIDATES_PER_TICK: usize = 128;
 
+const WRITE_CACHE_RECONCILIATION_STRIPES: usize = 256;
+
+/// Extends lower write ordering through adapter dirty-mirror reconciliation
+/// for the same inode. Stripe collisions only reduce concurrency; the fixed
+/// array cannot grow with inode churn.
+struct WriteCacheReconciliationGates {
+    stripes: [Mutex<()>; WRITE_CACHE_RECONCILIATION_STRIPES],
+}
+
+impl Default for WriteCacheReconciliationGates {
+    fn default() -> Self {
+        Self {
+            stripes: std::array::from_fn(|_| Mutex::new(())),
+        }
+    }
+}
+
+impl WriteCacheReconciliationGates {
+    fn stripe(&self, ino: u64) -> &Mutex<()> {
+        let index = (ino % WRITE_CACHE_RECONCILIATION_STRIPES as u64) as usize;
+        &self.stripes[index]
+    }
+
+    fn lock(&self, ino: u64) -> MutexGuard<'_, ()> {
+        self.stripe(ino).lock().unwrap()
+    }
+
+    fn lock_all(&self) -> Vec<MutexGuard<'_, ()>> {
+        self.stripes
+            .iter()
+            .map(|stripe| stripe.lock().unwrap())
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn try_lock(&self, ino: u64) -> std::sync::TryLockResult<MutexGuard<'_, ()>> {
+        self.stripe(ino).try_lock()
+    }
+}
+
 pub type FusePruneUnavailableReason = crate::observability::FusePruneNotificationUnavailableReason;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3171,6 +3210,9 @@ pub struct FuseVfsAdapter {
     writeback_page_cache: Option<Arc<PageCache>>,
     /// Page-cache for write-path dirty tracking and writeback coordination.
     pub(crate) write_page_cache: Arc<PageCache>,
+    /// Serializes a same-inode write through dirty-mirror publication and the
+    /// corresponding flush/fsync completion decision.
+    write_cache_reconciliation: Arc<WriteCacheReconciliationGates>,
     write_dispatch: Mutex<DaemonWriteDispatch<256>>,
     /// Short-lived getattr result cache: (FuseAttrOut, expiry). Invalidation
     /// on setattr or write to the same inode.
@@ -3287,6 +3329,7 @@ impl FuseVfsAdapter {
             page_cache: Arc::new(Mutex::new(ReadCache::new(256))),
             writeback_page_cache: None,
             write_page_cache: Arc::new(PageCache::new(1024, 4096)),
+            write_cache_reconciliation: Arc::new(WriteCacheReconciliationGates::default()),
             write_dispatch: Mutex::new(DaemonWriteDispatch::new()),
             getattr_cache: Arc::new(Mutex::new(HashMap::new())),
             path_lookup_cache: Arc::new(Mutex::new(PathLookupCache::new(
@@ -5963,6 +6006,11 @@ impl FuseVfsAdapter {
             }
             false => return Err(Errno::EBADF),
         }
+        // Keep append resolution, the authoritative engine write, and every
+        // adapter dirty projection ordered with flush/fsync completion for
+        // this inode. A synchronous write drops the gate only after its dirty
+        // ownership is published, then enters the normal barrier path.
+        let write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
         // O_APPEND: atomically resolve current file size for append-only
         // writes. POSIX requires all writes to an O_APPEND file descriptor
         // to land at end-of-file regardless of any prior lseek or concurrent
@@ -6243,6 +6291,7 @@ impl FuseVfsAdapter {
             // O_SYNC/O_DSYNC remains the durability boundary here.
             if !posix_direct_io {
                 if let Some(datasync) = sync_datasync {
+                    drop(write_cache_reconciliation_guard);
                     let sync_result =
                         self.dispatch_fsync_file_handle(ctx, ino, &sync_efh, datasync);
                     if let Some(fallback) = fallback_to_release.take() {
@@ -6349,6 +6398,7 @@ impl FuseVfsAdapter {
             // O_SYNC/O_DSYNC remains the durability boundary here.
             if !posix_direct_io && write_result.is_ok() {
                 if let Some(datasync) = sync_datasync {
+                    drop(write_cache_reconciliation_guard);
                     self.dispatch_fsync_file(ctx, ino, fh, datasync)?;
                 }
             }
@@ -7041,6 +7091,71 @@ impl FuseVfsAdapter {
         }
     }
 
+    fn take_worker_dirty_boundary(
+        &self,
+    ) -> (
+        Arc<Mutex<crate::workers_writeback::DirtyPageTracker>>,
+        crate::workers_writeback::FsyncBoundaryToken,
+    ) {
+        let tracker = self.write_dispatch.lock().unwrap().dirty_page_tracker_arc();
+        let boundary = tracker.lock().unwrap().take_boundary();
+        (tracker, boundary)
+    }
+
+    fn retire_page_cache_mirrors(&self, ino: u64) {
+        if let Some(ref writeback_page_cache) = self.writeback_page_cache {
+            writeback_page_cache.clear_dirty_for_inode(ino);
+        }
+        self.write_page_cache.clear_dirty_for_inode(ino);
+    }
+
+    fn retire_dirty_state_snapshot(&self, ino: u64, snapshot: &DirtyRanges) {
+        let mut dirty_state = self.dirty_state.lock().unwrap();
+        if let Some(current) = dirty_state.get_mut(&ino) {
+            for &(start, end) in snapshot.ranges() {
+                current.clear_range(start, end.saturating_sub(start));
+            }
+            if current.is_empty() {
+                dirty_state.remove(&ino);
+            }
+        }
+    }
+
+    fn inode_has_dirty_owners(&self, ino: u64) -> bool {
+        if self
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .is_some_and(|ranges| !ranges.is_empty())
+        {
+            return true;
+        }
+        if self
+            .writeback_range_tracker
+            .as_ref()
+            .is_some_and(|tracker| tracker.lock().unwrap().is_dirty(InodeId::new(ino)))
+        {
+            return true;
+        }
+        let worker_tracker = self.write_dispatch.lock().unwrap().dirty_page_tracker_arc();
+        if worker_tracker.lock().unwrap().has_dirty_ranges(ino) {
+            return true;
+        }
+        if self.write_page_cache.has_dirty_pages_for_inode(ino) {
+            return true;
+        }
+        self.writeback_page_cache
+            .as_ref()
+            .is_some_and(|cache| cache.has_dirty_pages_for_inode(ino))
+    }
+
+    fn reconcile_writeback_inode_cache(&self, ino: u64) {
+        if !self.inode_has_dirty_owners(ino) {
+            self.writeback_cache.lock().unwrap().mark_clean(ino);
+        }
+    }
+
     #[tracing::instrument(skip(self, ctx), fields(ino = %ino, fh = %fh, op = "flush"))]
     pub fn dispatch_flush(
         &mut self,
@@ -7061,6 +7176,7 @@ impl FuseVfsAdapter {
             }
             Err(errno) => return Err(errno),
         };
+        let write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
 
         // Delegate writeback and engine.flush() through the
         // local-filesystem dispatch layer via PageCacheDirtyFlush.  This
@@ -7068,12 +7184,7 @@ impl FuseVfsAdapter {
         // contract while TFR-008 remains the broader writeback authority.
         let flush_result = {
             let engine = self.engine.lock().unwrap();
-            let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-                self.writeback_page_cache.as_ref(),
-                &**engine,
-                &efh,
-                ctx,
-            );
+            let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(&**engine, &efh, ctx);
             tidefs_local_filesystem::fuse_fsync::dispatch_namespace_fsync(
                 &bridge,
                 efh.inode_id,
@@ -7089,15 +7200,12 @@ impl FuseVfsAdapter {
         flush_result?;
         release_result?;
         self.invalidate_inode_metadata_after_engine_write(ino);
-        self.writeback_cache.lock().unwrap().mark_clean(ino);
-        self.write_page_cache.clear_dirty_for_inode(ino);
+        // FUSE flush is weaker than the final durability boundary. It may
+        // push bytes toward the engine, but it must not retire any adapter,
+        // worker, shared-tracker, page-cache, or reclaim dirty ownership.
+        self.reconcile_writeback_inode_cache(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
-
-        // Drain the DirtyPageTracker for this inode after writeback so
-        // the background flush service (#4657) sees a clean inode.
-        if let Some(ref tracker) = self.writeback_range_tracker {
-            tracker.lock().unwrap().flush_inode(InodeId::new(ino));
-        }
+        drop(write_cache_reconciliation_guard);
 
         // Release POSIX locks owned by this lock_owner after flush
         // completes.  Per FUSE protocol, close() releases locks; flush()
@@ -7144,6 +7252,16 @@ impl FuseVfsAdapter {
         self.dispatch_fsync_file_handle(ctx, ino, &efh, datasync)
     }
 
+    fn complete_shared_writeback_range_after_barrier(
+        tracker: &mut tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker,
+        inode: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> bool {
+        tracker.complete_writeback_success(inode, offset, length);
+        !tracker.overlaps_range(inode, offset, length)
+    }
+
     fn dispatch_fsync_file_handle(
         &self,
         ctx: &RequestCtx,
@@ -7155,53 +7273,57 @@ impl FuseVfsAdapter {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        // Phase 1: Writeback dirty pages through the local-filesystem
-        // dispatch layer via PageCacheDirtyFlush.  This bridges the adapter
-        // daemon's PageCache mirror into the DirtyFlush contract while
-        // TFR-008 remains the broader writeback authority.
-        {
-            let engine = self.engine.lock().unwrap();
-            let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-                self.writeback_page_cache.as_ref(),
-                &**engine,
-                efh,
-                ctx,
-            );
-            tidefs_local_filesystem::fuse_fsync::dispatch_namespace_fsync(
-                &bridge,
-                efh.inode_id,
-                datasync,
-            )?;
-        }
-        self.writeback_cache.lock().unwrap().mark_clean(ino);
-        self.write_page_cache.clear_dirty_for_inode(ino);
-        self.writeback_cache_stats.lock().unwrap().record_flush();
+        // Serialize the selected dirty boundary and its final cleanup with the
+        // same-inode write path that publishes every adapter projection.
+        let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
+        let (worker_dirty_tracker, worker_dirty_boundary) = self.take_worker_dirty_boundary();
+        let tracked_ranges = if let Some(ref tracker) = self.writeback_range_tracker {
+            let mut tracker = tracker.lock().unwrap();
+            let selected = tracker
+                .collect_dirty_ranges()
+                .into_iter()
+                .find_map(|(inode, ranges)| (inode == efh.inode_id).then_some(ranges))
+                .unwrap_or_default();
+            for range in &selected {
+                let _ = tracker.start_writeback_range(efh.inode_id, range.offset, range.length);
+            }
+            selected
+        } else {
+            Vec::new()
+        };
+        let dirty_state_snapshot = self
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .cloned()
+            .unwrap_or_default();
 
-        // Drain the DirtyPageTracker for this inode after writeback so
-        // the background flush service (#4657) sees a clean inode.
-        if let Some(ref tracker) = self.writeback_range_tracker {
-            tracker.lock().unwrap().flush_inode(InodeId::new(ino));
-        }
+        let sync_result = (|| {
+            // Move the selected bytes toward the engine without allowing this
+            // weaker flush stage to clean any adapter mirror.
+            {
+                let engine = self.engine.lock().unwrap();
+                let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(&**engine, efh, ctx);
+                tidefs_local_filesystem::fuse_fsync::dispatch_namespace_fsync(
+                    &bridge,
+                    efh.inode_id,
+                    datasync,
+                )?;
+            }
 
-        // Phase 2: Block-volume dirty-range writes (when configured).
-        {
-            let mut bv_guard = self.block_volume.lock().unwrap();
-            if let Some(bv) = bv_guard.as_mut() {
-                let snapshot = {
-                    let ds = self.dirty_state.lock().unwrap();
-                    ds.get(&ino).map(|dr| dr.ranges().to_vec())
-                };
-                if let Some(ranges) = snapshot {
+            // Copy the snapshotted adapter ranges to the optional block-volume
+            // carrier, but retain their dirty ownership until the final engine
+            // barrier below succeeds.
+            {
+                let mut bv_guard = self.block_volume.lock().unwrap();
+                if let Some(bv) = bv_guard.as_mut() {
                     let e = self.engine.lock().unwrap();
-                    for &(start, end) in &ranges {
+                    for &(start, end) in dirty_state_snapshot.ranges() {
                         let len = u32::try_from(end - start).map_err(|_| Errno::EFBIG)?;
                         let data = e.read(efh, start, len, ctx)?;
-                        // Resolve extent map for this range and write each
-                        // data chunk to the block volume at its physical offset.
                         let entries = e.lookup_extents(efh.inode_id, start, len as u64);
                         if entries.is_empty() {
-                            // No extent allocation yet — fall back to logical
-                            // offset write (the extent will be allocated later).
                             bv.write_bytes(start, &data)?;
                         } else {
                             for entry in entries {
@@ -7218,31 +7340,17 @@ impl FuseVfsAdapter {
                                         clip_start - entry.logical_offset + entry.locator_id.0;
                                     bv.write_bytes(phys_off, chunk)?;
                                 }
-                                // Holes and UNWRITTEN extents are not written
-                                // to the block volume; they stay as engine-resident.
                             }
                         }
                     }
-                    drop(e);
-                    let mut ds = self.dirty_state.lock().unwrap();
-                    if let Some(dr) = ds.get_mut(&ino) {
-                        dr.clear_all();
-                        ds.remove(&ino);
-                    }
                 }
             }
-        }
-        // Phase 3: one engine durability call chooses fsync or fdatasync and
-        // publishes through LocalFileSystem's canonical root authority.
-        // Record storage-sync latency separately from dispatch/protocol overhead.
-        {
-            // Use try_lock with bounded retry to avoid blocking indefinitely
-            // on the engine lock when a background thread (commit_group,
-            // background-scrub) holds it.  FUSE kernel will return EIO if the
-            // request handler stalls too long.  Returning EINTR tells the
-            // kernel to retry (via FUSE_INTERRUPT path).
+
+            // The engine fsync/fdatasync is the final caller-visible durability
+            // boundary. Its exact errno decides whether the snapshots below
+            // may be retired.
             const MAX_RETRIES: u32 = 10;
-            const RETRY_SLEEP_US: u64 = 10_000; // 10ms per retry, 100ms total
+            const RETRY_SLEEP_US: u64 = 10_000;
             let mut engine_guard = None;
             for _attempt in 0..MAX_RETRIES {
                 match self.engine.try_lock() {
@@ -7261,10 +7369,51 @@ impl FuseVfsAdapter {
             let e = engine_guard.ok_or(Errno::EINTR)?;
             let _storage_timer =
                 crate::observability::LatencyTimer::new(&crate::observability::HIST_FSYNC_STORAGE);
-            let fs_res = e.fsync(efh, datasync, ctx);
-            fs_res?;
+            e.fsync(efh, datasync, ctx)
+        })();
+
+        let mut tracker_completion_failed = false;
+        if let Some(ref tracker) = self.writeback_range_tracker {
+            let mut tracker = tracker.lock().unwrap();
+            match &sync_result {
+                Ok(()) => {
+                    for range in &tracked_ranges {
+                        if !Self::complete_shared_writeback_range_after_barrier(
+                            &mut tracker,
+                            efh.inode_id,
+                            range.offset,
+                            range.length,
+                        ) {
+                            tracker_completion_failed = true;
+                        }
+                    }
+                }
+                Err(errno) => {
+                    let op = if datasync { "fdatasync" } else { "fsync" };
+                    for range in &tracked_ranges {
+                        tracker.record_writeback_error(
+                            efh.inode_id,
+                            range.offset,
+                            range.length,
+                            format!("adapter {op} barrier failed: {errno:?}"),
+                        );
+                    }
+                }
+            }
+        }
+        sync_result?;
+        if tracker_completion_failed {
+            return Err(Errno::EIO);
         }
 
+        worker_dirty_tracker
+            .lock()
+            .unwrap()
+            .clear_until_boundary(ino, worker_dirty_boundary);
+        self.retire_dirty_state_snapshot(ino, &dirty_state_snapshot);
+        self.retire_page_cache_mirrors(ino);
+        self.reconcile_writeback_inode_cache(ino);
+        self.writeback_cache_stats.lock().unwrap().record_flush();
         self.invalidate_inode_metadata_after_engine_write(ino);
         Ok(())
     }
@@ -7287,39 +7436,80 @@ impl FuseVfsAdapter {
         fh: u64,
         datasync: bool,
     ) -> Result<(), Errno> {
+        let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
+        let (worker_dirty_tracker, worker_dirty_boundary) = self.take_worker_dirty_boundary();
         let e = self.engine.lock().unwrap();
         let handle = self.resolve_dir_handle(ino, fh, ctx, &**e)?;
+        let tracked_ranges = if let Some(ref tracker) = self.writeback_range_tracker {
+            let mut tracker = tracker.lock().unwrap();
+            let selected = tracker
+                .collect_dirty_ranges()
+                .into_iter()
+                .find_map(|(inode, ranges)| (inode == handle.dh.inode_id).then_some(ranges))
+                .unwrap_or_default();
+            for range in &selected {
+                let _ =
+                    tracker.start_writeback_range(handle.dh.inode_id, range.offset, range.length);
+            }
+            selected
+        } else {
+            Vec::new()
+        };
+        let dirty_state_snapshot = self
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .cloned()
+            .unwrap_or_default();
 
-        // Flush dirty page-cache pages for the directory inode through the
-        // PageCacheDirtyFlush bridge. Construct a synthetic EngineFileHandle
-        // since the bridge requires one.
-        let synthetic_fh = EngineFileHandle::new(
-            handle.dh.inode_id,
-            0, // O_RDONLY
-            FileHandleId::new(0),
-            0,
-        );
-        let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-            self.writeback_page_cache.as_ref(),
-            &**e,
-            &synthetic_fh,
-            ctx,
-        );
-        let _ = tidefs_local_filesystem::fuse_fsync::dispatch_namespace_fsync(
-            &bridge,
-            handle.dh.inode_id,
-            datasync,
-        );
+        // Directory handles have their own final engine barrier. A fabricated
+        // file handle is not durability authority for directory metadata.
+        let sync_result = e.fsyncdir(&handle.dh, datasync, ctx);
+        drop(e);
 
-        // Persist directory metadata through the engine.
-        let result = e.fsyncdir(&handle.dh, datasync, ctx);
-
-        // Drain the DirtyPageTracker for this directory inode after
-        // writeback so the background flush service sees a clean inode.
+        let mut tracker_completion_failed = false;
         if let Some(ref tracker) = self.writeback_range_tracker {
-            tracker.lock().unwrap().flush_inode(handle.dh.inode_id);
+            let mut tracker = tracker.lock().unwrap();
+            match &sync_result {
+                Ok(()) => {
+                    for range in &tracked_ranges {
+                        if !Self::complete_shared_writeback_range_after_barrier(
+                            &mut tracker,
+                            handle.dh.inode_id,
+                            range.offset,
+                            range.length,
+                        ) {
+                            tracker_completion_failed = true;
+                        }
+                    }
+                }
+                Err(errno) => {
+                    for range in &tracked_ranges {
+                        tracker.record_writeback_error(
+                            handle.dh.inode_id,
+                            range.offset,
+                            range.length,
+                            format!("adapter fsyncdir barrier failed: {errno:?}"),
+                        );
+                    }
+                }
+            }
         }
-        result
+        sync_result?;
+        if tracker_completion_failed {
+            return Err(Errno::EIO);
+        }
+
+        let directory_ino = handle.dh.inode_id.get();
+        worker_dirty_tracker
+            .lock()
+            .unwrap()
+            .clear_until_boundary(directory_ino, worker_dirty_boundary);
+        self.retire_dirty_state_snapshot(directory_ino, &dirty_state_snapshot);
+        self.retire_page_cache_mirrors(directory_ino);
+        self.reconcile_writeback_inode_cache(directory_ino);
+        Ok(())
     }
 
     /// Dispatch a filesystem-wide syncfs operation.
@@ -7333,41 +7523,156 @@ impl FuseVfsAdapter {
     /// and does not require a file handle.
     pub fn dispatch_syncfs(&self, ctx: &RequestCtx) -> Result<(), Errno> {
         let _start = std::time::Instant::now();
-        let e = self.engine.lock().unwrap();
-
-        // Phase 1: drain all dirty page-cache pages across all inodes
-        // through the PageCacheDirtyFlush::flush_all() bridge.
-        let synthetic_fh = EngineFileHandle::new(
-            InodeId::new(0),
-            0, // O_RDONLY — flush_all uses engine.write, handle unused for permission check
-            FileHandleId::new(0),
-            0,
+        // The mount-wide barrier owns every reconciliation stripe so no FUSE
+        // write can publish a dirty projection between the snapshots and their
+        // post-barrier retirement.
+        let _write_cache_reconciliation_guards = self.write_cache_reconciliation.lock_all();
+        let (worker_dirty_tracker, worker_dirty_boundary) = self.take_worker_dirty_boundary();
+        let worker_dirty_ranges = worker_dirty_tracker.lock().unwrap().all_dirty_ranges();
+        let dirty_state_snapshots = self.dirty_state.lock().unwrap().clone();
+        let mut dirty_projection_inodes: HashSet<u64> =
+            dirty_state_snapshots.keys().copied().collect();
+        dirty_projection_inodes.extend(worker_dirty_ranges.iter().map(|(ino, _, _)| *ino));
+        dirty_projection_inodes.extend(
+            self.write_page_cache
+                .dirty_pages()
+                .into_iter()
+                .map(|page| page.inode),
         );
-        let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-            self.writeback_page_cache.as_ref(),
-            &**e,
-            &synthetic_fh,
-            ctx,
-        );
-        tidefs_local_filesystem::fuse_fsync::map_cache_error(bridge.flush_all())?;
+        if let Some(ref cache) = self.writeback_page_cache {
+            dirty_projection_inodes.extend(cache.dirty_pages().into_iter().map(|page| page.inode));
+        }
+        let tracked_ranges = if let Some(ref tracker) = self.writeback_range_tracker {
+            let mut tracker = tracker.lock().unwrap();
+            let selected = tracker.collect_dirty_ranges();
+            for (inode, ranges) in &selected {
+                for range in ranges {
+                    let _ = tracker.start_writeback_range(*inode, range.offset, range.length);
+                }
+            }
+            selected
+        } else {
+            Vec::new()
+        };
+        dirty_projection_inodes.extend(tracked_ranges.iter().map(|(inode, _)| inode.get()));
 
-        // Phase 2: filesystem-wide durability barrier through the engine.
-        e.syncfs(ctx)?;
-        drop(e);
+        let sync_result = (|| {
+            // Mirror every snapshotted regular-file range into the optional
+            // block-volume carrier before the final mount-wide engine barrier.
+            {
+                let mut block_volume = self.block_volume.lock().unwrap();
+                if let Some(block_volume) = block_volume.as_mut() {
+                    let engine = self.engine.lock().unwrap();
+                    for (&ino, ranges) in &dirty_state_snapshots {
+                        let attr = engine.getattr(InodeId::new(ino), None, ctx)?;
+                        if attr.kind != NodeKind::File {
+                            continue;
+                        }
+                        let handle = engine.open(InodeId::new(ino), libc::O_RDONLY as u32, ctx)?;
+                        let copy_result = (|| {
+                            let file_size = attr.posix.size;
+                            for &(start, dirty_end) in ranges.ranges() {
+                                let end = dirty_end.min(file_size);
+                                if start >= end {
+                                    continue;
+                                }
+                                let length = end.saturating_sub(start);
+                                let length_u32 = u32::try_from(length).map_err(|_| Errno::EFBIG)?;
+                                let data =
+                                    engine.read_for_cache_fill(&handle, start, length_u32, ctx)?;
+                                if data.len() != length as usize {
+                                    return Err(Errno::EIO);
+                                }
+                                let extents = engine.lookup_extents(handle.inode_id, 0, end);
+                                let mut found_extent = false;
+                                for extent in extents {
+                                    let clip_start = extent.logical_offset.max(start);
+                                    let clip_end = extent.end_offset().min(end);
+                                    if clip_start >= clip_end {
+                                        continue;
+                                    }
+                                    found_extent = true;
+                                    if !extent.is_data() {
+                                        continue;
+                                    }
+                                    let clip_length = (clip_end - clip_start) as usize;
+                                    let data_offset = (clip_start - start) as usize;
+                                    let data_end =
+                                        data_offset.checked_add(clip_length).ok_or(Errno::EIO)?;
+                                    let chunk =
+                                        data.get(data_offset..data_end).ok_or(Errno::EIO)?;
+                                    let physical_offset = clip_start
+                                        .checked_sub(extent.logical_offset)
+                                        .and_then(|relative| {
+                                            relative.checked_add(extent.locator_id.0)
+                                        })
+                                        .ok_or(Errno::EIO)?;
+                                    block_volume.write_bytes(physical_offset, chunk)?;
+                                }
+                                if !found_extent {
+                                    block_volume.write_bytes(start, &data)?;
+                                }
+                            }
+                            Ok(())
+                        })();
+                        let release_result = engine.release(&handle);
+                        copy_result?;
+                        release_result?;
+                    }
+                }
+            }
 
-        // Drain all inodes from the writeback range tracker after
-        // filesystem-wide flush so the background flush service (#4657)
-        // sees a clean slate.
+            let engine = self.engine.lock().unwrap();
+            engine.syncfs(ctx)
+        })();
+
+        let mut tracker_completion_failed = false;
         if let Some(ref tracker) = self.writeback_range_tracker {
             let mut tracker = tracker.lock().unwrap();
-            let dirty_inodes: Vec<InodeId> = tracker
-                .collect_dirty_ranges()
-                .into_iter()
-                .map(|(inode, _)| inode)
-                .collect();
-            for inode in dirty_inodes {
-                tracker.flush_inode(inode);
+            match &sync_result {
+                Ok(()) => {
+                    for (inode, ranges) in &tracked_ranges {
+                        for range in ranges {
+                            if !Self::complete_shared_writeback_range_after_barrier(
+                                &mut tracker,
+                                *inode,
+                                range.offset,
+                                range.length,
+                            ) {
+                                tracker_completion_failed = true;
+                            }
+                        }
+                    }
+                }
+                Err(errno) => {
+                    for (inode, ranges) in &tracked_ranges {
+                        for range in ranges {
+                            tracker.record_writeback_error(
+                                *inode,
+                                range.offset,
+                                range.length,
+                                format!("adapter syncfs barrier failed: {errno:?}"),
+                            );
+                        }
+                    }
+                }
             }
+        }
+        sync_result?;
+        if tracker_completion_failed {
+            return Err(Errno::EIO);
+        }
+
+        worker_dirty_tracker
+            .lock()
+            .unwrap()
+            .clear_all_until_boundary(worker_dirty_boundary);
+        for (&ino, snapshot) in &dirty_state_snapshots {
+            self.retire_dirty_state_snapshot(ino, snapshot);
+        }
+        for ino in dirty_projection_inodes {
+            self.retire_page_cache_mirrors(ino);
+            self.reconcile_writeback_inode_cache(ino);
         }
 
         self.writeback_cache_stats.lock().unwrap().record_flush();
@@ -7869,6 +8174,12 @@ impl FuseVfsAdapter {
         lock_owner: Option<u64>,
         flush: bool,
     ) -> Result<(), Errno> {
+        // Close may push bytes toward the engine and remove the last handle.
+        // Keep both actions ordered with same-inode dirty publication, but do
+        // not treat this weaker flush as the final durability boundary.
+        let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
+        let mut release_error = None;
+        let mut release_flush_succeeded = false;
         // If the kernel requested flush-on-close and the inode has
         // dirty pages tracked by the adapter writeback layer,
         // trigger writeback before releasing the handle.
@@ -7895,18 +8206,12 @@ impl FuseVfsAdapter {
                 }
                 Err(errno) => return Err(errno),
             };
-            let is_dirty = {
-                let ds = self.dirty_state.lock().unwrap();
-                ds.get(&ino).map(|dr| !dr.is_empty()).unwrap_or(false)
-            };
+            let has_dirty_owners = self.inode_has_dirty_owners(ino);
             let direct_flush = (efh.open_flags & libc::O_DIRECT as u32) != 0
                 || (flags & libc::O_DIRECT as u32) != 0;
-            if is_dirty || direct_flush {
+            if has_dirty_owners || direct_flush {
                 let e = self.engine.lock().unwrap();
-                // Ignore flush errors during release; the kernel already
-                // decided to close the file. Engine-level errors are logged
-                // by the engine implementation.
-                let _ = e.flush(
+                match e.flush(
                     &efh,
                     &RequestCtx {
                         uid: 0,
@@ -7915,11 +8220,18 @@ impl FuseVfsAdapter {
                         umask: 0,
                         groups: vec![0],
                     },
-                );
+                ) {
+                    Ok(()) => release_flush_succeeded = true,
+                    Err(errno) => release_error = Some(errno),
+                }
             }
             if let Some(fallback) = fallback_to_release.take() {
                 let e = self.engine.lock().unwrap();
-                let _ = e.release(&fallback);
+                if let Err(errno) = e.release(&fallback) {
+                    if release_error.is_none() {
+                        release_error = Some(errno);
+                    }
+                }
             }
         }
 
@@ -7967,11 +8279,7 @@ impl FuseVfsAdapter {
             self.mmap_coherency.deregister(ino);
         }
         if is_last_close || (!removed_registered_handle && self.writeback_cache_enabled) {
-            let is_dirty = {
-                let ds = self.dirty_state.lock().unwrap();
-                ds.get(&ino).map(|dr| !dr.is_empty()).unwrap_or(false)
-            };
-            if is_dirty {
+            if !release_flush_succeeded && self.inode_has_dirty_owners(ino) {
                 let e = self.engine.lock().unwrap();
                 let flush_ctx = RequestCtx {
                     uid: 0,
@@ -7989,16 +8297,29 @@ impl FuseVfsAdapter {
                                 fallback_to_release = Some(fallback);
                                 Some(fallback)
                             }
-                            Err(_) => None,
+                            Err(errno) => {
+                                if release_error.is_none() {
+                                    release_error = Some(errno);
+                                }
+                                None
+                            }
                         }
                     }
                     None => None,
                 };
                 if let Some(flush_handle) = flush_handle.as_ref() {
-                    let _ = e.flush(flush_handle, &flush_ctx);
+                    if let Err(errno) = e.flush(flush_handle, &flush_ctx) {
+                        if release_error.is_none() {
+                            release_error = Some(errno);
+                        }
+                    }
                 }
                 if let Some(fallback) = fallback_to_release.take() {
-                    let _ = e.release(&fallback);
+                    if let Err(errno) = e.release(&fallback) {
+                        if release_error.is_none() {
+                            release_error = Some(errno);
+                        }
+                    }
                 }
             }
         }
@@ -8009,7 +8330,11 @@ impl FuseVfsAdapter {
         // which is satisfied here by flushing above when requested.
         if let Some(efh) = efh.as_ref() {
             let e = self.engine.lock().unwrap();
-            e.release(efh)?;
+            if let Err(errno) = e.release(efh) {
+                if release_error.is_none() {
+                    release_error = Some(errno);
+                }
+            }
         }
         if let Some(open_flags) = release_read_open_flags {
             // Kernel writeback-cache reads can be satisfied without a daemon
@@ -8018,14 +8343,10 @@ impl FuseVfsAdapter {
             let ctx = Self::system_request_ctx();
             self.finish_successful_writeback_read_handle_atime(ino, open_flags, &ctx);
         }
-        self.writeback_cache.lock().unwrap().mark_clean(ino);
-
-        // Drain the DirtyPageTracker for this inode after writeback so
-        // the background flush service (#4657) sees a clean inode.
-        if let Some(ref tracker) = self.writeback_range_tracker {
-            tracker.lock().unwrap().flush_inode(InodeId::new(ino));
+        self.reconcile_writeback_inode_cache(ino);
+        if !self.inode_has_dirty_owners(ino) {
+            self.writeback_cache.lock().unwrap().invalidate(ino);
         }
-        self.writeback_cache.lock().unwrap().invalidate(ino);
 
         // Release POSIX locks owned by this lock_owner on close.
         // Per FUSE protocol, close() releases locks; release() is
@@ -8054,10 +8375,11 @@ impl FuseVfsAdapter {
                 );
             }
             // Release from the DaemonLockDispatch (adapter-level POSIX lock tracker).
-            self.lock_dispatch
-                .lock()
-                .map_err(|_| Errno::EIO)?
-                .release_by_owner_and_inode(lock_owner, ino);
+            match self.lock_dispatch.lock() {
+                Ok(mut dispatch) => dispatch.release_by_owner_and_inode(lock_owner, ino),
+                Err(_) if release_error.is_none() => release_error = Some(Errno::EIO),
+                Err(_) => {}
+            }
         }
         if let Some(efh) = efh {
             Self::emit_open_lifecycle_observation(OpenLifecycleObservation::released(ino, fh, efh));
@@ -8067,7 +8389,7 @@ impl FuseVfsAdapter {
         // alter release semantics based on open flags at this layer.
         let _ = flags;
 
-        Ok(())
+        release_error.map_or(Ok(()), Err)
     }
 
     pub fn dispatch_poll_file(
@@ -31773,7 +32095,7 @@ mod tests {
         }
         {
             let ds = fixture.adapter.dirty_state.lock().unwrap();
-            assert!(ds.contains_key(&inode.get()));
+            assert!(!ds.contains_key(&inode.get()));
         }
     }
 
@@ -34478,7 +34800,7 @@ mod tests {
     }
 
     #[test]
-    fn pagecache_writeback_dispatch_write_dirty_then_flush_clears() {
+    fn pagecache_writeback_dispatch_write_flush_preserves_until_fsync() {
         let (mut fixture, page_cache) = writeback_fixture(64);
         let ctx = root_ctx();
         let (inode, adapter_fh, _efh) = create_adapter_file_handle(
@@ -34507,13 +34829,22 @@ mod tests {
         );
         drop(first_page);
 
-        // Flush must write back and clear dirty.
+        // Flush may push bytes but cannot retire final-barrier ownership.
         fixture
             .adapter
             .dispatch_flush(&ctx, inode.get(), adapter_fh, 0)
             .expect("dispatch_flush");
         let dirty_after = page_cache.dirty_pages_for_inode(inode.get());
-        assert!(dirty_after.is_empty(), "flush must clear all dirty pages");
+        assert!(!dirty_after.is_empty(), "flush must preserve dirty pages");
+
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+            .expect("dispatch_fsync");
+        assert!(
+            page_cache.dirty_pages_for_inode(inode.get()).is_empty(),
+            "fsync must retire the dirty pages covered by its barrier"
+        );
     }
 
     #[test]
@@ -34605,7 +34936,7 @@ mod tests {
     }
 
     #[test]
-    fn pagecache_writeback_multiple_writes_accumulate_dirty_then_flush() {
+    fn pagecache_writeback_multiple_writes_flush_preserves_until_fsync() {
         let (mut fixture, page_cache) = writeback_fixture(64);
         let ctx = root_ctx();
         let (inode, adapter_fh, _efh) = create_adapter_file_handle(
@@ -34633,23 +34964,28 @@ mod tests {
         let dirty = page_cache.dirty_pages_for_inode(inode.get());
         assert_eq!(dirty.len(), 3, "all 3 written pages must be dirty");
 
-        // Flush must clear all dirty flags.
+        // Flush pushes bytes without retiring final-barrier ownership.
         fixture
             .adapter
             .dispatch_flush(&ctx, inode.get(), adapter_fh, 0)
             .expect("dispatch_flush");
-        assert!(page_cache.dirty_pages_for_inode(inode.get()).is_empty());
+        assert_eq!(page_cache.dirty_pages_for_inode(inode.get()).len(), 3);
 
-        // After flush, pages should be clean but still resident
-        // (not evicted).
+        // The pages remain resident while the later fsync owns retirement.
         assert!(
             page_cache.len() >= 3,
             "pages should remain resident after flush"
         );
+
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+            .expect("dispatch_fsync");
+        assert!(page_cache.dirty_pages_for_inode(inode.get()).is_empty());
     }
 
     #[test]
-    fn pagecache_writeback_overwrite_same_page_only_one_dirty_entry() {
+    fn pagecache_writeback_overwrite_flush_preserves_one_dirty_entry_until_fsync() {
         let (mut fixture, page_cache) = writeback_fixture(64);
         let ctx = root_ctx();
         let (inode, adapter_fh, _efh) = create_adapter_file_handle(
@@ -34673,18 +35009,23 @@ mod tests {
         let dirty = page_cache.dirty_pages_for_inode(inode.get());
         assert_eq!(dirty.len(), 1);
 
-        // Flush.
+        // Flush preserves the single final-barrier dirty owner.
         fixture
             .adapter
             .dispatch_flush(&ctx, inode.get(), adapter_fh, 0)
             .expect("flush");
-        assert!(page_cache.dirty_pages_for_inode(inode.get()).is_empty());
+        assert_eq!(page_cache.dirty_pages_for_inode(inode.get()).len(), 1);
 
-        // Page is still resident (clean, evictable).
+        // Page is still resident until the final barrier retires it.
         assert!(
             !page_cache.is_empty(),
             "page should remain resident after flush"
         );
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+            .expect("fsync");
+        assert!(page_cache.dirty_pages_for_inode(inode.get()).is_empty());
     }
 
     // ── dispatch_tmpfile tests ───────────────────────────────────────────
@@ -36231,6 +36572,10 @@ mod tests {
         open_result: Result<EngineFileHandle, Errno>,
         write_result: Result<u32, Errno>,
         flush_result: Result<(), Errno>,
+        fsync_result: Result<(), Errno>,
+        fsync_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+        syncfs_result: Result<(), Errno>,
+        fsyncdir_result: Result<(), Errno>,
         create_result: Result<(InodeAttr, EngineFileHandle), Errno>,
         mkdir_result: Result<InodeAttr, Errno>,
     }
@@ -36245,6 +36590,10 @@ mod tests {
                 open_result: Err(Errno::ENOSYS),
                 write_result: Err(Errno::ENOSYS),
                 flush_result: Err(Errno::ENOSYS),
+                fsync_result: Err(Errno::ENOSYS),
+                fsync_observer: None,
+                syncfs_result: Err(Errno::ENOSYS),
+                fsyncdir_result: Err(Errno::ENOSYS),
                 create_result: Err(Errno::ENOSYS),
                 mkdir_result: Err(Errno::ENOSYS),
             }
@@ -36331,6 +36680,36 @@ mod tests {
 
         fn with_flush_error(mut self, errno: Errno) -> Self {
             self.flush_result = Err(errno);
+            self
+        }
+
+        fn with_flush_ok(mut self) -> Self {
+            self.flush_result = Ok(());
+            self
+        }
+
+        fn with_fsync_error(mut self, errno: Errno) -> Self {
+            self.fsync_result = Err(errno);
+            self
+        }
+
+        fn with_fsync_ok(mut self) -> Self {
+            self.fsync_result = Ok(());
+            self
+        }
+
+        fn with_fsync_observer(mut self, observer: Arc<dyn Fn() + Send + Sync>) -> Self {
+            self.fsync_observer = Some(observer);
+            self
+        }
+
+        fn with_syncfs_error(mut self, errno: Errno) -> Self {
+            self.syncfs_result = Err(errno);
+            self
+        }
+
+        fn with_fsyncdir_error(mut self, errno: Errno) -> Self {
+            self.fsyncdir_result = Err(errno);
             self
         }
 
@@ -36509,7 +36888,13 @@ mod tests {
             datasync: bool,
             ctx: &RequestCtx,
         ) -> Result<(), Errno> {
-            Err(Errno::ENOSYS)
+            if let Some(observer) = self.fsync_observer.as_ref() {
+                observer();
+            }
+            self.fsync_result
+        }
+        fn syncfs(&self, ctx: &RequestCtx) -> Result<(), Errno> {
+            self.syncfs_result
         }
         fn fallocate(
             &self,
@@ -36550,7 +36935,7 @@ mod tests {
             datasync: bool,
             ctx: &RequestCtx,
         ) -> Result<(), Errno> {
-            Err(Errno::ENOSYS)
+            self.fsyncdir_result
         }
         fn getlk(
             &self,
@@ -36629,6 +37014,379 @@ mod tests {
 
     fn make_adapter(engine: AclMockEngine) -> FuseVfsAdapter {
         FuseVfsAdapter::new(Box::new(engine)).expect("create test adapter")
+    }
+
+    fn seed_worker_dirty_range(
+        adapter: &FuseVfsAdapter,
+        ino: u64,
+        offset: u64,
+        length: u64,
+    ) -> Arc<Mutex<crate::workers_writeback::DirtyPageTracker>> {
+        let tracker = adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino, offset, length)
+            .expect("seed worker dirty range");
+        tracker
+    }
+
+    #[test]
+    fn final_fsync_error_preserves_every_dirty_projection_and_errno() {
+        let shared_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+        let engine = AclMockEngine::new()
+            .with_root(1)
+            .with_flush_ok()
+            .with_fsync_error(Errno::ENOSPC);
+        let adapter = make_adapter(engine)
+            .with_writeback_range_tracker(Arc::clone(&shared_tracker))
+            .with_writeback_page_cache(Arc::clone(&writeback_page_cache));
+        let ino = 41;
+        let inode = InodeId::new(ino);
+        let length = 4096;
+        let efh = EngineFileHandle::new(inode, libc::O_RDWR as u32, FileHandleId::new(7), 0);
+
+        adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, length);
+        for cache in [&writeback_page_cache, &adapter.write_page_cache] {
+            cache.insert(ino, 0).expect("insert dirty page mirror");
+            cache.mark_dirty(ino, 0);
+        }
+        shared_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(inode, 0, u64::from(length));
+        let worker_tracker = seed_worker_dirty_range(&adapter, ino, 0, u64::from(length));
+        {
+            let mut reclaim = adapter.writeback_cache.lock().unwrap();
+            reclaim.insert(ino);
+            reclaim.mark_dirty(ino, u64::from(length));
+        }
+
+        assert_eq!(
+            adapter.dispatch_fsync_file_handle(&root_ctx(), ino, &efh, false),
+            Err(Errno::ENOSPC)
+        );
+
+        assert!(adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .is_some_and(|ranges| !ranges.is_empty()));
+        assert!(writeback_page_cache.has_dirty_pages_for_inode(ino));
+        assert!(adapter.write_page_cache.has_dirty_pages_for_inode(ino));
+        assert!(worker_tracker.lock().unwrap().has_dirty_ranges(ino));
+        assert_eq!(
+            adapter.writeback_cache.lock().unwrap().is_dirty(ino),
+            Some(true)
+        );
+        let tracker = shared_tracker.lock().unwrap();
+        let ranges = tracker
+            .dirty_ranges(inode)
+            .expect("failed fsync retains shared dirty ownership");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].lifecycle_state(),
+            tidefs_local_filesystem::dirty_page_tracker::DirtyLifecycleState::ErrorPoisoned
+        );
+        assert!(ranges[0].writeback_error().is_some());
+    }
+
+    #[test]
+    fn fsync_write_cache_reconciliation_blocks_same_inode_write_then_later_write_stays_dirty() {
+        let gates = Arc::new(WriteCacheReconciliationGates::default());
+        let barrier_state = Arc::new((
+            std::sync::Mutex::new((false, false)),
+            std::sync::Condvar::new(),
+        ));
+        let observer_gates = Arc::clone(&gates);
+        let observer_state = Arc::clone(&barrier_state);
+        let engine = AclMockEngine::new()
+            .with_root(1)
+            .with_attr(0, 0, 0o666)
+            .with_no_acl()
+            .with_open_ok()
+            .with_write_ok(4)
+            .with_flush_ok()
+            .with_fsync_ok()
+            .with_fsync_observer(Arc::new(move || {
+                assert!(matches!(
+                    observer_gates.try_lock(1),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                assert!(observer_gates.try_lock(2).is_ok());
+                let (lock, wake) = &*observer_state;
+                let mut state = lock.lock().unwrap();
+                state.0 = true;
+                wake.notify_all();
+                while !state.1 {
+                    state = wake.wait(state).unwrap();
+                }
+            }));
+        let mut adapter = make_adapter(engine);
+        adapter.write_cache_reconciliation = Arc::clone(&gates);
+        let open = adapter
+            .dispatch_open_entry(&root_ctx(), 1, libc::O_RDWR as u32)
+            .expect("open writable file");
+        let adapter = Arc::new(adapter);
+
+        let fsync_adapter = Arc::clone(&adapter);
+        let adapter_fh = open.adapter_fh;
+        let fsync_thread =
+            std::thread::spawn(move || fsync_adapter.dispatch_fsync(&root_ctx(), 1, adapter_fh));
+        {
+            let (lock, wake) = &*barrier_state;
+            let mut state = lock.lock().unwrap();
+            while !state.0 {
+                state = wake.wait(state).unwrap();
+            }
+        }
+
+        let (write_started_tx, write_started_rx) = std::sync::mpsc::channel();
+        let (write_done_tx, write_done_rx) = std::sync::mpsc::channel();
+        let write_adapter = Arc::clone(&adapter);
+        let write_thread = std::thread::spawn(move || {
+            write_started_tx.send(()).unwrap();
+            let result = write_adapter.dispatch_write(&root_ctx(), 1, adapter_fh, 0, b"late", 0);
+            write_done_tx.send(result).unwrap();
+        });
+        write_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("later write starts");
+        assert!(matches!(
+            write_done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        {
+            let (lock, wake) = &*barrier_state;
+            let mut state = lock.lock().unwrap();
+            state.1 = true;
+            wake.notify_all();
+        }
+        assert_eq!(fsync_thread.join().expect("join fsync"), Ok(()));
+        assert_eq!(
+            write_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("later write completes after fsync"),
+            Ok(4)
+        );
+        write_thread.join().expect("join later write");
+
+        assert!(adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&1)
+            .is_some_and(|ranges| ranges.contains(0, 4)));
+        assert!(adapter.write_page_cache.has_dirty_pages_for_inode(1));
+        assert!(adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc()
+            .lock()
+            .unwrap()
+            .has_dirty_ranges(1));
+    }
+
+    #[test]
+    fn successful_flush_preserves_dirty_ownership_for_final_barrier() {
+        let shared_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+        let engine = AclMockEngine::new()
+            .with_root(1)
+            .with_attr(0, 0, 0o666)
+            .with_no_acl()
+            .with_open_ok()
+            .with_flush_ok();
+        let mut adapter = make_adapter(engine)
+            .with_writeback_range_tracker(Arc::clone(&shared_tracker))
+            .with_writeback_page_cache(Arc::clone(&writeback_page_cache));
+        let open = adapter
+            .dispatch_open_entry(&root_ctx(), 1, libc::O_RDWR as u32)
+            .expect("open writable file");
+        let length = 4096;
+        adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(1)
+            .or_default()
+            .mark_dirty(0, length);
+        for cache in [&writeback_page_cache, &adapter.write_page_cache] {
+            cache.insert(1, 0).expect("insert dirty page mirror");
+            cache.mark_dirty(1, 0);
+        }
+        shared_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(InodeId::new(1), 0, u64::from(length));
+        let worker_tracker = seed_worker_dirty_range(&adapter, 1, 0, u64::from(length));
+        {
+            let mut reclaim = adapter.writeback_cache.lock().unwrap();
+            reclaim.insert(1);
+            reclaim.mark_dirty(1, u64::from(length));
+        }
+
+        adapter
+            .dispatch_flush(&root_ctx(), 1, open.adapter_fh, 0)
+            .expect("weaker flush succeeds");
+
+        assert!(adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&1)
+            .is_some_and(|ranges| !ranges.is_empty()));
+        assert!(writeback_page_cache.has_dirty_pages_for_inode(1));
+        assert!(adapter.write_page_cache.has_dirty_pages_for_inode(1));
+        assert!(shared_tracker.lock().unwrap().is_dirty(InodeId::new(1)));
+        assert!(worker_tracker.lock().unwrap().has_dirty_ranges(1));
+        assert_eq!(
+            adapter.writeback_cache.lock().unwrap().is_dirty(1),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn syncfs_error_preserves_every_dirty_projection_and_errno() {
+        let shared_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+        let engine = AclMockEngine::new()
+            .with_root(1)
+            .with_syncfs_error(Errno::EDQUOT);
+        let adapter = make_adapter(engine)
+            .with_writeback_range_tracker(Arc::clone(&shared_tracker))
+            .with_writeback_page_cache(Arc::clone(&writeback_page_cache));
+        let ino = 41;
+        let inode = InodeId::new(ino);
+        let length = 4096;
+        adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, length);
+        for cache in [&writeback_page_cache, &adapter.write_page_cache] {
+            cache.insert(ino, 0).expect("insert dirty page mirror");
+            cache.mark_dirty(ino, 0);
+        }
+        shared_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(inode, 0, u64::from(length));
+        let worker_tracker = seed_worker_dirty_range(&adapter, ino, 0, u64::from(length));
+        {
+            let mut reclaim = adapter.writeback_cache.lock().unwrap();
+            reclaim.insert(ino);
+            reclaim.mark_dirty(ino, u64::from(length));
+        }
+
+        assert_eq!(adapter.dispatch_syncfs(&root_ctx()), Err(Errno::EDQUOT));
+        assert!(adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .is_some_and(|ranges| !ranges.is_empty()));
+        assert!(writeback_page_cache.has_dirty_pages_for_inode(ino));
+        assert!(adapter.write_page_cache.has_dirty_pages_for_inode(ino));
+        assert!(worker_tracker.lock().unwrap().has_dirty_ranges(ino));
+        assert_eq!(
+            adapter.writeback_cache.lock().unwrap().is_dirty(ino),
+            Some(true)
+        );
+        let tracker = shared_tracker.lock().unwrap();
+        let ranges = tracker
+            .dirty_ranges(inode)
+            .expect("failed syncfs retains shared dirty ownership");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].lifecycle_state(),
+            tidefs_local_filesystem::dirty_page_tracker::DirtyLifecycleState::ErrorPoisoned
+        );
+    }
+
+    #[test]
+    fn fsyncdir_error_preserves_directory_dirty_ownership_and_errno() {
+        let shared_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+        let engine = AclMockEngine::new()
+            .with_root(1)
+            .with_fsyncdir_error(Errno::EIO);
+        let adapter = make_adapter(engine)
+            .with_writeback_range_tracker(Arc::clone(&shared_tracker))
+            .with_writeback_page_cache(Arc::clone(&writeback_page_cache));
+        let ino = 41;
+        let inode = InodeId::new(ino);
+        let dh = EngineDirHandle::new(inode, DirHandleId::new(7));
+        adapter.dir_handles.lock().unwrap().insert(dh);
+        adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, 4096);
+        for cache in [&writeback_page_cache, &adapter.write_page_cache] {
+            cache.insert(ino, 0).expect("insert dirty directory mirror");
+            cache.mark_dirty(ino, 0);
+        }
+        shared_tracker.lock().unwrap().mark_dirty(inode, 0, 4096);
+        let worker_tracker = seed_worker_dirty_range(&adapter, ino, 0, 4096);
+        {
+            let mut reclaim = adapter.writeback_cache.lock().unwrap();
+            reclaim.insert(ino);
+            reclaim.mark_dirty(ino, 4096);
+        }
+
+        assert_eq!(
+            adapter.dispatch_fsyncdir(&root_ctx(), ino, dh.dh_id.get(), false),
+            Err(Errno::EIO)
+        );
+        assert!(adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .is_some_and(|ranges| !ranges.is_empty()));
+        assert!(writeback_page_cache.has_dirty_pages_for_inode(ino));
+        assert!(adapter.write_page_cache.has_dirty_pages_for_inode(ino));
+        assert!(worker_tracker.lock().unwrap().has_dirty_ranges(ino));
+        assert_eq!(
+            adapter.writeback_cache.lock().unwrap().is_dirty(ino),
+            Some(true)
+        );
+        let tracker = shared_tracker.lock().unwrap();
+        let ranges = tracker
+            .dirty_ranges(inode)
+            .expect("failed fsyncdir retains shared dirty ownership");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].lifecycle_state(),
+            tidefs_local_filesystem::dirty_page_tracker::DirtyLifecycleState::ErrorPoisoned
+        );
     }
 
     #[test]
@@ -38788,7 +39546,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_flush_drains_writeback_range_tracker() {
+    fn dispatch_flush_preserves_writeback_range_tracker_until_fsync() {
         let (mut fixture, tracker) = adapter_fixture_with_writeback_tracker();
         let ctx = root_ctx();
 
@@ -38822,11 +39580,17 @@ mod tests {
             .dispatch_flush(&ctx, ino, adapter_fh, 0)
             .expect("flush");
 
-        // Tracker should be drained for this inode.
+        // Flush is weaker than the final durability barrier.
         assert!(
-            !tracker.lock().unwrap().is_dirty(inode),
-            "tracker should be clean after flush"
+            tracker.lock().unwrap().is_dirty(inode),
+            "tracker should remain dirty after flush"
         );
+
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, ino, adapter_fh)
+            .expect("fsync");
+        assert!(!tracker.lock().unwrap().is_dirty(inode));
     }
 
     #[test]
@@ -38896,7 +39660,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_release_drains_writeback_range_tracker_on_last_close() {
+    fn dispatch_release_preserves_writeback_range_tracker_on_last_close_until_syncfs() {
         let (mut fixture, tracker) = adapter_fixture_with_writeback_tracker();
         let ctx = root_ctx();
 
@@ -38926,6 +39690,12 @@ mod tests {
             .dispatch_release(ino, adapter_fh, libc::O_RDWR as u32, Some(0), true)
             .expect("release");
 
+        assert!(tracker.lock().unwrap().is_dirty(inode));
+
+        fixture
+            .adapter
+            .dispatch_syncfs(&ctx)
+            .expect("syncfs after release");
         assert!(!tracker.lock().unwrap().is_dirty(inode));
     }
 
@@ -39027,7 +39797,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_flush_drains_only_target_inode() {
+    fn dispatch_flush_preserves_all_trackers_then_fsync_retires_only_target_inode() {
         let (mut fixture, tracker) = adapter_fixture_with_writeback_tracker();
         let ctx = root_ctx();
 
@@ -39065,6 +39835,13 @@ mod tests {
             .dispatch_flush(&ctx, ino_a.get(), fh_a, 0)
             .expect("flush A");
 
+        assert!(tracker.lock().unwrap().is_dirty(ino_a));
+        assert!(tracker.lock().unwrap().is_dirty(ino_b));
+
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, ino_a.get(), fh_a)
+            .expect("fsync A");
         assert!(!tracker.lock().unwrap().is_dirty(ino_a));
         assert!(tracker.lock().unwrap().is_dirty(ino_b));
     }
