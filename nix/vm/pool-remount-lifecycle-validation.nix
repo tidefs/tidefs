@@ -988,12 +988,11 @@ else
 fi
 
 SCRUB_CLEAN_OK=0
-SCRUB_CONTENT="TideFS-Live-Owner-Scrub-$(date +%s 2>/dev/null || echo 0)"
-SCRUB_FILE="$MNT/live_owner_scrub.txt"
-if [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ]; then
-    printf '%s\n' "$SCRUB_CONTENT" > "$SCRUB_FILE" 2>/tmp/scrub_write.err
-    if sync "$SCRUB_FILE" 2>/tmp/scrub_fsync.err \
-        && tidefsctl pool scrub "$POOL_NAME" --json \
+SCRUB_CONTENT="$CRASH_COMMITTED_CONTENT"
+SCRUB_FILE="$CRASH_COMMITTED_FILE"
+if [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ] \
+    && [ "$POST_CRASH_COMMITTED" = "$SCRUB_CONTENT" ]; then
+    if tidefsctl pool scrub "$POOL_NAME" --json \
             > /tmp/scrub_clean.json 2>/tmp/scrub_clean.err \
         && grep -q '"pass"[[:space:]]*:[[:space:]]*true' /tmp/scrub_clean.json \
         && grep -q '"state_source"[[:space:]]*:[[:space:]]*"live-owner"' /tmp/scrub_clean.json \
@@ -1004,10 +1003,10 @@ if [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ]; then
         SCRUB_CLEAN_OK=1
     else
         fail "mounted_scrub_clean" \
-            "$(cat /tmp/scrub_write.err /tmp/scrub_fsync.err /tmp/scrub_clean.err /tmp/scrub_clean.json 2>/dev/null)"
+            "$(cat /tmp/scrub_clean.err /tmp/scrub_clean.json 2>/dev/null)"
     fi
 else
-    blocked "mounted_scrub_clean" "crash-recovery mount failed"
+    blocked "mounted_scrub_clean" "recovered committed content unavailable"
 fi
 
 INTEGRITY_CORRUPTED_MEMBERS=0
