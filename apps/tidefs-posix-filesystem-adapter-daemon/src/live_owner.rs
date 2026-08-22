@@ -575,6 +575,7 @@ fn dispatch_request(
         | LivePoolAdminCommand::PoolSet
         | LivePoolAdminCommand::PoolListProps
         | LivePoolAdminCommand::PoolIntegrityCheck
+        | LivePoolAdminCommand::PoolScrub
         | LivePoolAdminCommand::DeviceStatus
         | LivePoolAdminCommand::DeviceRemove
         | LivePoolAdminCommand::DeviceReplace => match admin {

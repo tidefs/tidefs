@@ -1915,6 +1915,7 @@ pub enum LivePoolAdminCommand {
     PoolSet,
     PoolListProps,
     PoolIntegrityCheck,
+    PoolScrub,
     DatasetCreate,
     DatasetList,
     DatasetResize,
@@ -1957,6 +1958,7 @@ const LIVE_POOL_ADMIN_COMMAND_ROUTES: &[(LivePoolAdminCommand, &str, &str)] = &[
         "pool",
         "integrity-check",
     ),
+    (LivePoolAdminCommand::PoolScrub, "pool", "scrub"),
     (LivePoolAdminCommand::DatasetCreate, "dataset", "create"),
     (LivePoolAdminCommand::DatasetList, "dataset", "list"),
     (LivePoolAdminCommand::DatasetResize, "dataset", "resize"),
@@ -2252,6 +2254,14 @@ mod tests {
             .expect("device replace has a typed live-owner route");
         assert_eq!(command, LivePoolAdminCommand::DeviceReplace);
         assert_eq!(command.parts(), ("device", "replace"));
+    }
+
+    #[test]
+    fn live_pool_admin_pool_scrub_route_is_typed() {
+        let command = LivePoolAdminCommand::from_parts("pool", "scrub")
+            .expect("pool scrub has a typed live-owner route");
+        assert_eq!(command, LivePoolAdminCommand::PoolScrub);
+        assert_eq!(command.parts(), ("pool", "scrub"));
     }
 
     #[test]
