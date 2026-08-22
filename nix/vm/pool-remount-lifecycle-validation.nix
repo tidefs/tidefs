@@ -1188,7 +1188,7 @@ INITSCRIPT
 
     echo ""
     echo "  === Booting qemu guest ==="
-    timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
+    timeout --foreground "$TIMEOUT_SEC" "$QEMU_BIN" \
       "''${QEMU_ACCEL[@]}" \
       -kernel "$KERNEL_IMG" \
       -initrd "$WORK_DIR/initrd.img.gz" \
