@@ -4,7 +4,7 @@
 // This module implements the `tidefsctl pool` subcommand group, delegating
 // to the respective production crates for each operation.  The verb surface
 // mirrors the operator/UAPI lifecycle: create, owner-mediated import/export,
-// destroy, mount, scan, status, and integrity-check.
+// destroy, mount, scan, status, integrity-check, and scrub.
 //
 // # Pool create
 //
@@ -311,6 +311,17 @@ pub enum PoolCommand {
         devices: Option<Vec<PathBuf>>,
     },
 
+    /// Scrub current mounted filesystem content through the live Pool owner
+    Scrub {
+        /// Pool name. A reachable live owner is required.
+        #[arg(value_parser = parse_pool_name)]
+        pool: String,
+
+        /// Output the completed scrub report as JSON
+        #[arg(long = "json")]
+        json: bool,
+    },
+
     /// Get a typed pool property value with source annotation
     Get {
         /// Pool name (imported-pool identity; routed through the live owner)
@@ -495,6 +506,7 @@ pub fn handle_pool(cmd: PoolCommand) {
         } => {
             handle_pool_integrity_check(pool, backing_dir, json, max_records, max_bytes, devices);
         }
+        PoolCommand::Scrub { pool, json } => handle_pool_scrub(pool, json),
         PoolCommand::Get {
             property,
             pool,
@@ -511,6 +523,10 @@ pub fn handle_pool(cmd: PoolCommand) {
             family,
         } => handle_pool_list_props(&pool, devices.as_deref(), family.as_deref()),
     }
+}
+
+fn handle_pool_scrub(pool: String, json: bool) -> ! {
+    super::live_owner::route_with_format("pool", "scrub", &pool, json)
 }
 
 // ---------------------------------------------------------------------------
@@ -2422,5 +2438,16 @@ mod tests {
             PoolCommand::try_parse_from(args).is_err(),
             "pool integrity-check backing-dir must be retired"
         );
+    }
+
+    #[test]
+    fn scrub_parses_live_owner_pool_and_json_output() {
+        use clap::Parser;
+        let command = PoolCommand::try_parse_from(["pool", "scrub", "tank", "--json"])
+            .expect("parse pool scrub");
+        assert!(matches!(
+            command,
+            PoolCommand::Scrub { pool, json: true } if pool == "tank"
+        ));
     }
 }
