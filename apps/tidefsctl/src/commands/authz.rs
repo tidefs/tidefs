@@ -157,6 +157,7 @@ const UNGUARDED_COMMANDS: &[&str] = &[
     "mount",
     "pool mount",
     "pool integrity-check",
+    "pool scrub",
     "kernel status",
     "cluster status",
     "device status",
@@ -427,6 +428,7 @@ mod tests {
             #[cfg(feature = "storage-intent")]
             "storage-intent explain",
             "pool integrity-check",
+            "pool scrub",
             #[cfg(feature = "diagnostics")]
             "kernel status",
             #[cfg(feature = "cluster")]

@@ -5366,6 +5366,23 @@ impl PoolDatasetOwner {
         self.mounted_raw_store_diagnostics().suspect_log_stats()
     }
 
+    /// Scan current committed mounted content through this owner's Pool.
+    ///
+    /// The pass uses the filesystem's live inode state, dataset keyspace, and
+    /// current Pool placement receipts. It is deliberately read-only: it does
+    /// not schedule repair work, mutate the suspect log, or write replacement
+    /// content.
+    pub(crate) fn scrub_mounted_content(&self) -> Result<crate::scrub::ScrubReport> {
+        let keyspace = self.object_keyspace();
+        let pool = self.store.pool();
+        crate::scrub::scrub_inodes_content_with_pool_in_keyspace(
+            pool.raw_primary_store(),
+            &self.filesystem.state.inodes,
+            Some(pool),
+            keyspace,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn transaction_superblock_exists_for_test(&self, transaction_id: u64) -> bool {
         self.mounted_raw_store_diagnostics()

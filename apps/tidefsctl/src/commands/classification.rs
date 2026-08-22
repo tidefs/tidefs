@@ -335,6 +335,12 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         summary: "list pool property definitions and effective values",
     },
     CommandSurface {
+        path: "pool scrub",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwner,
+        summary: "scan current mounted Pool-backed filesystem content through the live owner",
+    },
+    CommandSurface {
         path: "snapshot create",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
@@ -923,6 +929,7 @@ mod tests {
             "pool get",
             "pool set",
             "pool list-props",
+            "pool scrub",
             "dataset create",
             "dataset resize",
             "snapshot create",

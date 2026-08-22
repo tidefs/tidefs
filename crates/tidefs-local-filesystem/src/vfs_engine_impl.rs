@@ -1341,6 +1341,7 @@ impl VfsLocalFileSystem {
             | LivePoolAdminCommand::PoolSet
             | LivePoolAdminCommand::PoolListProps
             | LivePoolAdminCommand::PoolIntegrityCheck
+            | LivePoolAdminCommand::PoolScrub
             | LivePoolAdminCommand::DatasetList
             | LivePoolAdminCommand::DatasetGet
             | LivePoolAdminCommand::DatasetListProps
@@ -2929,6 +2930,147 @@ fn mounted_canonical_verifier_report(fs: &mut PoolDatasetOwner) -> OnlineVerifie
     }
 }
 
+fn mounted_scrub_block_kind(kind: crate::types::ScrubBlockKind) -> (&'static str, Option<u64>) {
+    match kind {
+        crate::types::ScrubBlockKind::InlineContent => ("inline-content", None),
+        crate::types::ScrubBlockKind::ContentManifest => ("content-manifest", None),
+        crate::types::ScrubBlockKind::ContentChunk { chunk_index } => {
+            ("content-chunk", Some(chunk_index))
+        }
+    }
+}
+
+fn mounted_scrub_checksum_layer(layer: crate::types::MountedContentChecksumLayer) -> &'static str {
+    match layer {
+        crate::types::MountedContentChecksumLayer::InlineContentBody => "inline-content-body",
+        crate::types::MountedContentChecksumLayer::EncodedContentChunk => "encoded-content-chunk",
+        crate::types::MountedContentChecksumLayer::SparseHole => "sparse-hole",
+    }
+}
+
+fn mounted_scrub_digest(digest: tidefs_local_object_store::IntegrityDigest64) -> String {
+    format!("{:016x}", digest.get())
+}
+
+fn mounted_scrub_placement_json(evidence: &crate::types::MountedContentPlacementEvidence) -> Value {
+    match evidence {
+        crate::types::MountedContentPlacementEvidence::SparseHole => {
+            json!({"state": "sparse-hole"})
+        }
+        #[cfg(feature = "distributed-repair")]
+        crate::types::MountedContentPlacementEvidence::ReceiptVerified { generation, .. } => {
+            json!({"state": "receipt-verified", "generation": generation})
+        }
+        crate::types::MountedContentPlacementEvidence::ReceiptObservedButUnbound { generation } => {
+            json!({
+                "state": "receipt-observed-but-unbound",
+                "generation": generation,
+            })
+        }
+        crate::types::MountedContentPlacementEvidence::ReceiptMissing {
+            expected_generation,
+        } => json!({
+            "state": "receipt-missing",
+            "expected_generation": expected_generation,
+        }),
+        crate::types::MountedContentPlacementEvidence::ReceiptStale {
+            expected_generation,
+            observed_generation,
+        } => json!({
+            "state": "receipt-stale",
+            "expected_generation": expected_generation,
+            "observed_generation": observed_generation,
+        }),
+        crate::types::MountedContentPlacementEvidence::ReceiptUnavailable {
+            expected_generation,
+        } => json!({
+            "state": "receipt-unavailable",
+            "expected_generation": expected_generation,
+        }),
+    }
+}
+
+fn mounted_scrub_finding_json(
+    report: &crate::scrub::ScrubReport,
+    violation: &crate::scrub::ScrubViolation,
+) -> Value {
+    let (kind, chunk_index) = mounted_scrub_block_kind(violation.block_id.kind);
+    let evidence = report.block_evidence.get(&violation.block_id);
+    let outcome = match &violation.outcome {
+        crate::scrub::ScrubBlockOutcome::Clean => json!({"kind": "clean"}),
+        crate::scrub::ScrubBlockOutcome::Corrupt { expected, actual } => json!({
+            "kind": "corrupt",
+            "expected_checksum": mounted_scrub_digest(*expected),
+            "actual_checksum": mounted_scrub_digest(*actual),
+        }),
+        crate::scrub::ScrubBlockOutcome::Unreadable(reason) => json!({
+            "kind": "unreadable",
+            "reason": reason,
+        }),
+        crate::scrub::ScrubBlockOutcome::NoChecksum => json!({"kind": "no-checksum"}),
+    };
+    let checksum = evidence
+        .and_then(|entry| entry.checksum_layer.as_ref())
+        .map(|checksum| {
+            json!({
+                "layer": mounted_scrub_checksum_layer(checksum.layer),
+                "expected": checksum.expected.map(mounted_scrub_digest),
+                "actual": mounted_scrub_digest(checksum.actual),
+                "encoded_len": checksum.encoded_len,
+                "matches": checksum.matches_expected(),
+            })
+        });
+    let placement = evidence.map(|entry| mounted_scrub_placement_json(&entry.placement_evidence));
+
+    json!({
+        "block_id": {
+            "inode_id": violation.block_id.inode_id,
+            "data_version": violation.block_id.data_version,
+            "kind": kind,
+            "chunk_index": chunk_index,
+        },
+        "object_key": evidence
+            .and_then(|entry| entry.raw_media_diagnostic.object_key_hex.as_deref())
+            .unwrap_or(violation.key_hex.as_str()),
+        "outcome": outcome,
+        "plaintext": {
+            "expected_len": evidence.map(|entry| entry.plaintext_identity.expected_plaintext_len),
+            "observed_len": evidence.and_then(|entry| entry.plaintext_identity.observed_plaintext_len),
+        },
+        "checksum": checksum,
+        "placement": placement,
+        "media_reason": evidence.and_then(|entry| entry.raw_media_diagnostic.reason.as_deref()),
+    })
+}
+
+fn mounted_scrub_finding_text(violation: &crate::scrub::ScrubViolation) -> String {
+    let (kind, chunk_index) = mounted_scrub_block_kind(violation.block_id.kind);
+    let block = chunk_index.map_or_else(
+        || kind.to_string(),
+        |chunk_index| format!("{kind}[{chunk_index}]"),
+    );
+    let outcome = match &violation.outcome {
+        crate::scrub::ScrubBlockOutcome::Clean => "clean".to_string(),
+        crate::scrub::ScrubBlockOutcome::Corrupt { expected, actual } => format!(
+            "corrupt expected={} actual={}",
+            mounted_scrub_digest(*expected),
+            mounted_scrub_digest(*actual),
+        ),
+        crate::scrub::ScrubBlockOutcome::Unreadable(reason) => {
+            format!("unreadable reason={reason}")
+        }
+        crate::scrub::ScrubBlockOutcome::NoChecksum => "no-checksum".to_string(),
+    };
+    format!(
+        "inode={} data_version={} block={} object={} outcome={}",
+        violation.block_id.inode_id,
+        violation.block_id.data_version,
+        block,
+        violation.key_hex,
+        outcome,
+    )
+}
+
 impl SharedPoolDatasetOwner {
     fn live_pool_get(&self, args: &Value) -> LivePoolAdminResponse {
         let property = match live_admin_arg(args, "property") {
@@ -3024,6 +3166,96 @@ impl SharedPoolDatasetOwner {
         let family = live_admin_optional_arg(args, "family");
         let fs = self.borrow();
         live_property_table("pool list-props", fs.pool_properties(), family)
+    }
+
+    fn live_pool_scrub(&self, pool: &str, wants_json: bool) -> LivePoolAdminResponse {
+        let fs = self.borrow();
+        let report = match fs.scrub_mounted_content() {
+            Ok(report) => report,
+            Err(err) => {
+                let message = format!("pool scrub: mounted content scan failed: {err}");
+                if wants_json {
+                    return live_admin_report_json(
+                        1,
+                        json!({
+                            "pool": pool,
+                            "pass": false,
+                            "state_source": "live-owner",
+                            "owner_state": "mounted PoolDatasetOwner",
+                            "repair_attempted": false,
+                            "repair_writeback": false,
+                            "blocks_scanned": 0,
+                            "blocks_clean": 0,
+                            "blocks_corrupt": 0,
+                            "blocks_unreadable": 0,
+                            "blocks_no_checksum": 0,
+                            "findings": [],
+                            "scan_error": message,
+                        }),
+                    );
+                }
+                return live_admin_report_text(
+                    1,
+                    format!(
+                        "pool scrub: {pool}\n  source:      live owner (mounted PoolDatasetOwner)\n  pass:        no\n  repair:      not attempted\n  scan error:  {message}"
+                    ),
+                );
+            }
+        };
+        let pass = report.is_clean() && report.blocks_no_checksum == 0;
+
+        if wants_json {
+            let findings = report
+                .violations
+                .iter()
+                .map(|violation| mounted_scrub_finding_json(&report, violation))
+                .collect::<Vec<_>>();
+            let output = json!({
+                "pool": pool,
+                "pass": pass,
+                "state_source": "live-owner",
+                "owner_state": "mounted PoolDatasetOwner",
+                "repair_attempted": false,
+                "repair_writeback": false,
+                "blocks_scanned": report.blocks_scanned,
+                "blocks_clean": report.blocks_clean,
+                "blocks_corrupt": report.blocks_corrupt,
+                "blocks_unreadable": report.blocks_unreadable,
+                "blocks_no_checksum": report.blocks_no_checksum,
+                "findings": findings,
+            });
+            return if pass {
+                live_admin_ok_json(output)
+            } else {
+                live_admin_report_json(1, output)
+            };
+        }
+
+        let mut output = format!(
+            "pool scrub: {pool}\n  source:      live owner (mounted PoolDatasetOwner)\n  pass:        {}\n  repair:      not attempted\n  blocks:      scanned={} clean={} corrupt={} unreadable={} no-checksum={}\n  findings:    {}",
+            if pass { "yes" } else { "no" },
+            report.blocks_scanned,
+            report.blocks_clean,
+            report.blocks_corrupt,
+            report.blocks_unreadable,
+            report.blocks_no_checksum,
+            report.violations.len(),
+        );
+        for violation in &report.violations {
+            let _ = write!(output, "\n    - {}", mounted_scrub_finding_text(violation));
+        }
+        if report.blocks_no_checksum > 0 {
+            let _ = write!(
+                output,
+                "\n    - {} scanned block(s) had no applicable checksum",
+                report.blocks_no_checksum,
+            );
+        }
+        if pass {
+            live_admin_ok_text(output)
+        } else {
+            live_admin_report_text(1, output)
+        }
     }
 
     fn live_pool_integrity_check(
@@ -3261,6 +3493,7 @@ impl SharedPoolDatasetOwner {
             LivePoolAdminCommand::PoolIntegrityCheck => {
                 self.live_pool_integrity_check(&request.pool, &args, wants_json)
             }
+            LivePoolAdminCommand::PoolScrub => self.live_pool_scrub(&request.pool, wants_json),
             LivePoolAdminCommand::DeviceStatus => self.live_device_status(wants_json),
             LivePoolAdminCommand::DeviceRemove => self.live_device_remove(&args, wants_json),
             LivePoolAdminCommand::DeviceReplace => self.live_device_replace(&args, wants_json),
@@ -8022,6 +8255,44 @@ mod tests {
         (VfsLocalFileSystem::new(fs), root, devices)
     }
 
+    fn corrupt_current_scrub_content(engine: &VfsLocalFileSystem, path: &str, payload: &[u8]) {
+        assert!(!payload.is_empty(), "corruption payload must be non-empty");
+        let mut fs = engine.fs.borrow_mut();
+        let record = fs.stat(path).expect("stat committed scrub fixture");
+        let keyspace = fs.object_keyspace();
+        let manifest_key = keyspace.content(record.inode_id, record.data_version);
+        let (manifest_bytes, _) = fs
+            .store
+            .pool()
+            .get_with_current_receipt(DeviceIoClass::Data, manifest_key)
+            .expect("read scrub content manifest")
+            .expect("scrub content manifest exists");
+        let manifest = crate::encoding::decode_content_manifest(&manifest_bytes)
+            .expect("decode scrub content manifest");
+        let chunk = manifest
+            .chunks
+            .iter()
+            .find(|chunk| !chunk.is_hole())
+            .expect("scrub content chunk");
+        let chunk_key =
+            keyspace.content_chunk(record.inode_id, chunk.data_version, chunk.chunk_index);
+        let (mut encoded, _) = fs
+            .store
+            .pool()
+            .get_with_current_receipt(DeviceIoClass::Data, chunk_key)
+            .expect("read scrub content chunk")
+            .expect("scrub content chunk exists");
+        let payload_offset = encoded
+            .windows(payload.len())
+            .position(|candidate| candidate == payload)
+            .expect("scrub payload appears in encoded chunk");
+        encoded[payload_offset] = b'X';
+        fs.store
+            .pool_mut()
+            .put_with_receipt(DeviceIoClass::Data, chunk_key, &encoded)
+            .expect("write checksum-invalid scrub content through Pool fixture");
+    }
+
     fn open_named_test_filesystem(
         metadata: &std::path::Path,
         devices: &[PathBuf],
@@ -8123,6 +8394,7 @@ mod tests {
             (LivePoolAdminCommand::PoolSet, "set"),
             (LivePoolAdminCommand::PoolListProps, "list-props"),
             (LivePoolAdminCommand::PoolIntegrityCheck, "integrity-check"),
+            (LivePoolAdminCommand::PoolScrub, "scrub"),
         ] {
             let request = LivePoolAdminRequest::new(command, "tank");
             let vfs_response = engine
@@ -8811,6 +9083,75 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.contains("pass:          no") && text.contains("issues:")),
             "human report should retain failed findings: {failed_human}"
+        );
+    }
+
+    #[test]
+    fn live_pool_scrub_scans_current_pool_content_and_reports_corruption() {
+        let (engine, _td, _devices) = temp_fs_with_block_devices(2);
+        let payload = b"TideFS-live-owner-scrub-corruption-fixture";
+        {
+            let mut fs = engine.fs.borrow_mut();
+            fs.create_file("/scrub.txt", 0o644)
+                .expect("create scrub fixture");
+            fs.write_file("/scrub.txt", 0, payload)
+                .expect("write scrub fixture");
+            fs.sync_all().expect("commit scrub fixture");
+        }
+
+        let clean = live_pool_admin(&engine, "scrub", json!({}), true);
+        assert_eq!(clean["ok"], true, "clean scrub response: {clean}");
+        let clean_report = &clean["json"];
+        assert_eq!(clean_report["pass"], true);
+        assert_eq!(clean_report["state_source"], "live-owner");
+        assert_eq!(clean_report["repair_attempted"], false);
+        assert_eq!(clean_report["repair_writeback"], false);
+        assert!(
+            clean_report["blocks_scanned"].as_u64().unwrap_or(0) > 0,
+            "clean scrub must scan committed content: {clean}"
+        );
+
+        corrupt_current_scrub_content(&engine, "/scrub.txt", payload);
+
+        let failed = live_pool_admin(&engine, "scrub", json!({}), true);
+        assert_eq!(failed["ok"], false, "corrupt scrub response: {failed}");
+        let failed_report = &failed["json"];
+        assert_eq!(failed_report["pass"], false);
+        assert_eq!(failed_report["state_source"], "live-owner");
+        assert_eq!(failed_report["repair_attempted"], false);
+        assert_eq!(failed_report["repair_writeback"], false);
+        assert!(
+            failed_report["blocks_corrupt"].as_u64().unwrap_or(0)
+                + failed_report["blocks_unreadable"].as_u64().unwrap_or(0)
+                > 0,
+            "corrupt scrub must retain failed counters: {failed}"
+        );
+        let finding = failed_report["findings"]
+            .as_array()
+            .and_then(|findings| findings.first())
+            .expect("corrupt scrub finding");
+        assert!(finding["block_id"]["inode_id"].as_u64().unwrap_or(0) > 0);
+        assert!(finding["object_key"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty()));
+        assert!(
+            finding["outcome"]["kind"] == "corrupt" || finding["outcome"]["kind"] == "unreadable",
+            "corrupt scrub must classify its finding: {finding}"
+        );
+
+        let failed_human = live_pool_admin(&engine, "scrub", json!({}), false);
+        assert_eq!(
+            failed_human["ok"], false,
+            "human scrub response: {failed_human}"
+        );
+        assert!(
+            failed_human["text"].as_str().is_some_and(|text| {
+                text.contains("pool scrub: tank")
+                    && text.contains("pass:        no")
+                    && text.contains("repair:      not attempted")
+                    && text.contains("inode=")
+            }),
+            "human scrub must preserve detailed failed findings: {failed_human}"
         );
     }
 

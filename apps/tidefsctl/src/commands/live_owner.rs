@@ -1924,6 +1924,42 @@ mod tests {
     }
 
     #[test]
+    fn pool_scrub_machine_report_preserves_findings_and_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let response = LivePoolAdminResponse::command_report_machine_json(
+            1,
+            serde_json::json!({
+                "pass": false,
+                "state_source": "live-owner",
+                "blocks_scanned": 1,
+                "findings": [{
+                    "block_id": {"inode_id": 7, "data_version": 3, "kind": "content-chunk"},
+                    "outcome": {"kind": "corrupt"},
+                }],
+            })
+            .to_string(),
+        );
+        let handle = spawn_owner_response(listener, response);
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "scrub",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let exit_code = send_live_owner_request_at(dir.path(), &route).unwrap();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolScrub);
+        assert_eq!(exit_code, 1);
+    }
+
+    #[test]
     fn nonzero_human_report_preserves_body_and_exit_status() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("owner.sock");

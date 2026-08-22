@@ -6,7 +6,7 @@
 #   pool create -> import -> FUSE mount -> write/fsync/read ->
 #   unmount -> pool export -> reimport -> remount -> persist verify ->
 #   committed-root advance verify -> intent-log consistency verify ->
-#   mounted clean/corrupt integrity reports.
+#   mounted clean/corrupt integrity and live-owner content-scrub reports.
 #
 # Validation tier: qemu guest.
 {
@@ -220,7 +220,9 @@ if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
              crash_cycle_recovery_remount crash_cycle_committed_survived \
              crash_cycle_inode_stable crash_cycle_unfsynced_bounded \
              mounted_integrity_clean mounted_integrity_corruption_injected \
-             mounted_integrity_failure_reported; do
+             mounted_integrity_failure_reported \
+             mounted_scrub_clean mounted_scrub_corruption_injected \
+             mounted_scrub_failure_reported mounted_scrub_no_repair_writeback; do
         blocked "$op" "virtio block devices missing"
     done
     echo "PASSED=$PASSED FAILED=$FAILED BLOCKED=$BLOCKED"
@@ -245,7 +247,8 @@ POOL_UUID=""
 POOL_CREATED=0
 
 if command -v tidefsctl >/dev/null 2>&1; then
-    COUT=$(tidefsctl pool create "$POOL_NAME" --devices "$DEV0" "$DEV1" --json 2>&1); RC=$?
+    COUT=$(tidefsctl pool create "$POOL_NAME" --devices "$DEV0" "$DEV1" \
+        --redundancy replicated=2 --json 2>&1); RC=$?
     echo "  exit=$RC"
     echo "  $COUT"
     if [ "$RC" -eq 0 ]; then
@@ -984,6 +987,28 @@ else
     blocked "mounted_integrity_clean" "crash-recovery mount failed"
 fi
 
+SCRUB_CLEAN_OK=0
+SCRUB_CONTENT="$CRASH_COMMITTED_CONTENT"
+SCRUB_FILE="$CRASH_COMMITTED_FILE"
+if [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ] \
+    && [ "$POST_CRASH_COMMITTED" = "$SCRUB_CONTENT" ]; then
+    if tidefsctl pool scrub "$POOL_NAME" --json \
+            > /tmp/scrub_clean.json 2>/tmp/scrub_clean.err \
+        && grep -q '"pass"[[:space:]]*:[[:space:]]*true' /tmp/scrub_clean.json \
+        && grep -q '"state_source"[[:space:]]*:[[:space:]]*"live-owner"' /tmp/scrub_clean.json \
+        && grep -q '"blocks_scanned"[[:space:]]*:[[:space:]]*[1-9]' /tmp/scrub_clean.json \
+        && grep -q '"repair_attempted"[[:space:]]*:[[:space:]]*false' /tmp/scrub_clean.json \
+        && grep -q '"repair_writeback"[[:space:]]*:[[:space:]]*false' /tmp/scrub_clean.json; then
+        pass "mounted_scrub_clean"
+        SCRUB_CLEAN_OK=1
+    else
+        fail "mounted_scrub_clean" \
+            "$(cat /tmp/scrub_clean.err /tmp/scrub_clean.json 2>/dev/null)"
+    fi
+else
+    blocked "mounted_scrub_clean" "recovered committed content unavailable"
+fi
+
 INTEGRITY_CORRUPTED_MEMBERS=0
 if [ "$INTEGRITY_CLEAN_OK" -eq 1 ]; then
     for dev in "$DEV0" "$DEV1"; do
@@ -1036,6 +1061,90 @@ else
     blocked "mounted_integrity_failure_reported" "corruption injection failed"
 fi
 
+SCRUB_CORRUPTED_MEMBERS=0
+SCRUB_CORRUPTED_RECORDS=0
+if [ "$SCRUB_CLEAN_OK" -eq 1 ]; then
+    for dev in "$DEV0" "$DEV1"; do
+        scrub_offsets=$(bytegrep -Fabo "$SCRUB_CONTENT" "$dev" 2>/tmp/scrub_bytegrep.err \
+            | cut -d: -f1)
+        scrub_member_records=0
+        for scrub_offset in $scrub_offsets; do
+            case "$scrub_offset" in
+                ""|*[!0-9]*) ;;
+                *)
+                    if printf 'X' \
+                        | dd of="$dev" bs=1 seek="$scrub_offset" conv=notrunc \
+                            2>/tmp/scrub_dd.err; then
+                        scrub_member_records=$((scrub_member_records + 1))
+                        SCRUB_CORRUPTED_RECORDS=$((SCRUB_CORRUPTED_RECORDS + 1))
+                    fi
+                    ;;
+            esac
+        done
+        if [ "$scrub_member_records" -gt 0 ]; then
+            SCRUB_CORRUPTED_MEMBERS=$((SCRUB_CORRUPTED_MEMBERS + 1))
+            echo "  corrupted $scrub_member_records committed content record(s) on $dev"
+        else
+            echo "  no committed scrub content offset found on $dev"
+        fi
+    done
+    sync
+    if [ "$SCRUB_CORRUPTED_MEMBERS" -eq 2 ]; then
+        pass "mounted_scrub_corruption_injected"
+    else
+        fail "mounted_scrub_corruption_injected" \
+            "corrupted_members=$SCRUB_CORRUPTED_MEMBERS corrupted_records=$SCRUB_CORRUPTED_RECORDS bytegrep=$(cat /tmp/scrub_bytegrep.err 2>/dev/null) dd=$(cat /tmp/scrub_dd.err 2>/dev/null)"
+    fi
+else
+    blocked "mounted_scrub_corruption_injected" "clean mounted scrub unavailable"
+fi
+
+SCRUB_HASH_BEFORE=""
+if [ "$SCRUB_CORRUPTED_MEMBERS" -eq 2 ]; then
+    SCRUB_HASH_BEFORE=$(sha256sum "$DEV0" "$DEV1" 2>/dev/null || true)
+    if tidefsctl pool scrub "$POOL_NAME" --json \
+        > /tmp/scrub_failed.json 2>/tmp/scrub_failed.err; then
+        SCRUB_FAILED_RC=0
+    else
+        SCRUB_FAILED_RC=$?
+    fi
+    if tidefsctl pool scrub "$POOL_NAME" \
+        > /tmp/scrub_failed_human.out 2>/tmp/scrub_failed_human.err; then
+        SCRUB_FAILED_HUMAN_RC=0
+    else
+        SCRUB_FAILED_HUMAN_RC=$?
+    fi
+    if [ "$SCRUB_FAILED_RC" -ne 0 ] \
+        && [ "$SCRUB_FAILED_HUMAN_RC" -ne 0 ] \
+        && grep -q '"pass"[[:space:]]*:[[:space:]]*false' /tmp/scrub_failed.json \
+        && grep -q '"state_source"[[:space:]]*:[[:space:]]*"live-owner"' /tmp/scrub_failed.json \
+        && grep -Eq '"blocks_(corrupt|unreadable)"[[:space:]]*:[[:space:]]*[1-9]' /tmp/scrub_failed.json \
+        && grep -q '"block_id"' /tmp/scrub_failed.json \
+        && grep -q '"object_key"' /tmp/scrub_failed.json \
+        && grep -Eq '"kind"[[:space:]]*:[[:space:]]*"(corrupt|unreadable)"' /tmp/scrub_failed.json \
+        && grep -q '"repair_attempted"[[:space:]]*:[[:space:]]*false' /tmp/scrub_failed.json \
+        && grep -q '"repair_writeback"[[:space:]]*:[[:space:]]*false' /tmp/scrub_failed.json \
+        && grep -q 'pool scrub:' /tmp/scrub_failed_human.out \
+        && grep -q 'pass:[[:space:]]*no' /tmp/scrub_failed_human.out \
+        && grep -q 'repair:[[:space:]]*not attempted' /tmp/scrub_failed_human.out \
+        && grep -q 'inode=' /tmp/scrub_failed_human.out; then
+        pass "mounted_scrub_failure_reported"
+    else
+        fail "mounted_scrub_failure_reported" \
+            "json_exit=$SCRUB_FAILED_RC human_exit=$SCRUB_FAILED_HUMAN_RC output=$(cat /tmp/scrub_failed.err /tmp/scrub_failed.json /tmp/scrub_failed_human.err /tmp/scrub_failed_human.out 2>/dev/null)"
+    fi
+
+    SCRUB_HASH_AFTER=$(sha256sum "$DEV0" "$DEV1" 2>/dev/null || true)
+    if [ -n "$SCRUB_HASH_BEFORE" ] && [ "$SCRUB_HASH_AFTER" = "$SCRUB_HASH_BEFORE" ]; then
+        pass "mounted_scrub_no_repair_writeback"
+    else
+        fail "mounted_scrub_no_repair_writeback" "member bytes changed during read-only scrub"
+    fi
+else
+    blocked "mounted_scrub_failure_reported" "content corruption injection failed"
+    blocked "mounted_scrub_no_repair_writeback" "content corruption injection failed"
+fi
+
 # Cleanup crash recovery daemon
 if [ -n "$CRP" ]; then
     kill "$CRP" 2>/dev/null || true
@@ -1063,6 +1172,8 @@ echo "crash_uncommitted_content=$CRASH_UNCOMMITTED_CONTENT"
 echo "post_crash_committed=$POST_CRASH_COMMITTED"
 echo "post_crash_uncommitted=$POST_CRASH_UNCOMMITTED"
 echo "integrity_corrupted_members=$INTEGRITY_CORRUPTED_MEMBERS"
+echo "scrub_corrupted_members=$SCRUB_CORRUPTED_MEMBERS"
+echo "scrub_corrupted_records=$SCRUB_CORRUPTED_RECORDS"
 echo "=== End ==="
 
 sync; sleep 1; poweroff -f
@@ -1076,7 +1187,7 @@ INITSCRIPT
 
     echo ""
     echo "  === Booting qemu guest ==="
-    timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
+    timeout --foreground "$TIMEOUT_SEC" "$QEMU_BIN" \
       "''${QEMU_ACCEL[@]}" \
       -kernel "$KERNEL_IMG" \
       -initrd "$WORK_DIR/initrd.img.gz" \
@@ -1116,6 +1227,8 @@ INITSCRIPT
       crash_cycle_inode_stable crash_cycle_unfsynced_bounded \
       mounted_integrity_clean mounted_integrity_corruption_injected \
       mounted_integrity_failure_reported \
+      mounted_scrub_clean mounted_scrub_corruption_injected \
+      mounted_scrub_failure_reported mounted_scrub_no_repair_writeback \
       sync_done; do
       if grep -q "PASS: $op" "$VAL_LOG" 2>/dev/null; then
         echo "  PASS: $op"; PASSC=$((PASSC + 1))
