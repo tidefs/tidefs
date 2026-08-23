@@ -761,7 +761,7 @@ impl VfsLocalFileSystem {
         updated.metadata_version = updated.metadata_version.max(tick);
         updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
 
-        let intent_state = match fs.metadata_setattr_intent(&updated) {
+        let intent_state = match fs.metadata_setattr_group_commit_intent(&updated) {
             Ok(state) => state,
             Err(err) => {
                 fs.rollback_mutation_delta();
@@ -904,7 +904,7 @@ impl VfsLocalFileSystem {
             let _frame = buf.append(record, 0);
         });
         let create_intent_state =
-            match fs.namespace_create_intent(parent_id, entry.clone(), &record) {
+            match fs.namespace_create_group_commit_intent(parent_id, entry.clone(), &record) {
                 Ok(state) => state,
                 Err(err) => {
                     fs.rollback_mutation_delta();
@@ -1168,7 +1168,7 @@ impl VfsLocalFileSystem {
             mode: new_mode,
         };
         let create_intent_state =
-            match fs.namespace_create_intent(parent_id, entry.clone(), &record) {
+            match fs.namespace_create_group_commit_intent(parent_id, entry.clone(), &record) {
                 Ok(state) => state,
                 Err(err) => {
                     fs.rollback_mutation_delta();

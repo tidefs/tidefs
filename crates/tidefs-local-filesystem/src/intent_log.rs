@@ -1099,6 +1099,19 @@ impl IntentLog {
         self.log_device.is_some()
     }
 
+    /// Keep intent-log pressure aligned with the owning deferred-mutation
+    /// window. A pressure fallback may force a whole-state commit, so a
+    /// smaller independent limit would defeat the caller's commit-group
+    /// bound.
+    pub(crate) fn set_pressure_depth_threshold(&mut self, threshold: usize) {
+        self.config.pressure_depth_threshold = threshold;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pressure_depth_threshold(&self) -> usize {
+        self.config.pressure_depth_threshold
+    }
+
     /// Load the intent log from the object store during mount/recovery
     /// using the default config. Use `load_with_config` for a custom config.
     pub fn load(store: &LocalObjectStore) -> Result<Self> {
