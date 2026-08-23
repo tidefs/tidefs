@@ -49,11 +49,11 @@ use serde::{Deserialize, Serialize};
 use tidefs_types_pool_label_core::{
     decode_label, decode_pool_lifecycle_v1, decode_topology_roster_v1, features, DeviceClass,
     LabelError, PoolLabelV1, PoolLifecycleKindV1, PoolRedundancyPolicy, PoolState,
-    POOL_LABEL_LIFECYCLE_V1_CHECKSUM_SIZE, POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE, POOL_LABEL_MAGIC,
-    POOL_LABEL_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE,
-    POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE,
-    POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET, POOL_LABEL_V1_EXT_WIRE_SIZE,
-    POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
+    DEVICE_HEALTH_ADMIN_OFFLINE, DEVICE_HEALTH_STATE_MASK, POOL_LABEL_LIFECYCLE_V1_CHECKSUM_SIZE,
+    POOL_LABEL_LIFECYCLE_V1_HEADER_SIZE, POOL_LABEL_MAGIC, POOL_LABEL_SIZE,
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_CHECKSUM_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_HEADER_SIZE,
+    POOL_LABEL_TOPOLOGY_ROSTER_V1_MEMBER_SIZE, POOL_LABEL_TOPOLOGY_ROSTER_V1_OFFSET,
+    POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 
 #[cfg(any(feature = "distributed-repair", test))]
@@ -366,7 +366,10 @@ impl DeviceHealth {
     /// Decode from the `device_health` u8 field in a pool label.
     #[must_use]
     pub const fn from_label_health(v: u8) -> Self {
-        match v {
+        if v & DEVICE_HEALTH_ADMIN_OFFLINE != 0 {
+            return Self::Offline;
+        }
+        match v & DEVICE_HEALTH_STATE_MASK {
             0 => Self::Online,
             1 => Self::Degraded,
             2 => Self::Faulted,
@@ -381,7 +384,7 @@ impl DeviceHealth {
             Self::Online => 0,
             Self::Degraded => 1,
             Self::Faulted => 2,
-            Self::Offline => 3,
+            Self::Offline => DEVICE_HEALTH_ADMIN_OFFLINE,
         }
     }
 
@@ -1972,12 +1975,26 @@ impl PoolConfig {
     #[must_use]
     pub fn to_labels(&self) -> Vec<PoolLabelV1> {
         let mut labels = Vec::with_capacity(self.device_count as usize);
-        self.collect_labels(&self.device_tree, &mut labels);
+        let has_administratively_offline_member = self
+            .device_tree
+            .collect_leaves()
+            .iter()
+            .any(|leaf| leaf.health == DeviceHealth::Offline);
+        self.collect_labels(
+            &self.device_tree,
+            has_administratively_offline_member,
+            &mut labels,
+        );
         labels
     }
 
     /// Recursively walk the device tree, collecting labels for each leaf.
-    fn collect_labels(&self, node: &DeviceType, out: &mut Vec<PoolLabelV1>) {
+    fn collect_labels(
+        &self,
+        node: &DeviceType,
+        has_administratively_offline_member: bool,
+        out: &mut Vec<PoolLabelV1>,
+    ) {
         match node {
             DeviceType::Leaf {
                 device_guid,
@@ -2003,13 +2020,16 @@ impl PoolConfig {
                 label.device_checksum_errors = *checksum_errors;
                 label.redundancy_policy = self.redundancy_policy;
                 label.features_compat = self.feature_flags;
+                if has_administratively_offline_member {
+                    label.features_incompat |= features::DEVICE_ADMIN_OFFLINE_INCOMPAT;
+                }
                 out.push(label);
             }
             DeviceType::PoolWideData { children }
             | DeviceType::Mirror { children }
             | DeviceType::ParityRaid { children, .. } => {
                 for child in children {
-                    self.collect_labels(child, out);
+                    self.collect_labels(child, has_administratively_offline_member, out);
                 }
             }
         }
@@ -4088,6 +4108,18 @@ mod tests {
         assert_eq!(DeviceHealth::from_label_health(0), DeviceHealth::Online);
         assert_eq!(DeviceHealth::from_label_health(1), DeviceHealth::Degraded);
         assert_eq!(DeviceHealth::from_label_health(2), DeviceHealth::Faulted);
+        assert_eq!(
+            DeviceHealth::from_label_health(DEVICE_HEALTH_ADMIN_OFFLINE),
+            DeviceHealth::Offline
+        );
+        assert_eq!(
+            DeviceHealth::from_label_health(DEVICE_HEALTH_ADMIN_OFFLINE | 1),
+            DeviceHealth::Offline
+        );
+        assert_eq!(
+            DeviceHealth::Offline.to_label_health(),
+            DEVICE_HEALTH_ADMIN_OFFLINE
+        );
         // Unknown values default to Online.
         assert_eq!(DeviceHealth::from_label_health(99), DeviceHealth::Online);
     }
@@ -4186,6 +4218,46 @@ mod tests {
             removing_device_indices: vec![],
             completed_evacuations: vec![],
         }
+    }
+
+    #[test]
+    fn pool_labels_gate_administrative_offline_state_on_every_member() {
+        let mut config = make_single_device_config();
+        config.device_tree = DeviceType::PoolWideData {
+            children: vec![
+                DeviceType::Leaf {
+                    device_path: PathBuf::from("/dev/test/disk0"),
+                    device_guid: [0x01; 16],
+                    device_index: 0,
+                    capacity_bytes: 1024 * 1024 * 1024,
+                    device_class: DeviceClass::Hdd,
+                    health: DeviceHealth::Offline,
+                    read_errors: 0,
+                    write_errors: 0,
+                    checksum_errors: 0,
+                },
+                DeviceType::Leaf {
+                    device_path: PathBuf::from("/dev/test/disk1"),
+                    device_guid: [0x02; 16],
+                    device_index: 1,
+                    capacity_bytes: 1024 * 1024 * 1024,
+                    device_class: DeviceClass::Hdd,
+                    health: DeviceHealth::Online,
+                    read_errors: 0,
+                    write_errors: 0,
+                    checksum_errors: 0,
+                },
+            ],
+        };
+        config.device_count = 2;
+
+        let labels = config.to_labels();
+        assert_eq!(labels.len(), 2);
+        assert!(labels.iter().all(|label| {
+            label.features_incompat & features::DEVICE_ADMIN_OFFLINE_INCOMPAT != 0
+        }));
+        assert_eq!(labels[0].device_health, DEVICE_HEALTH_ADMIN_OFFLINE);
+        assert_eq!(labels[1].device_health, 0);
     }
 
     #[test]

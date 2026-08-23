@@ -228,6 +228,30 @@ datasets. This row does not claim failed-member rebuild, writable degraded
 operation, simultaneous multi-mounted filesystem atomicity, secure erase,
 media remanence, sanitization, decommissioning, or production readiness.
 
+The same live owner implements one bounded administrative availability row for
+an exact writable two-member `Replicated { copies: 2 }` Pool. `tidefsctl device
+offline <pool> <device-guid>` names one present member by its full durable GUID,
+syncs mounted state, advances the topology generation, and writes and rereads a
+complete backup label family before the primary family. The labels preserve
+the member's underlying health, record administrative offline separately, and
+set a Pool-wide incompatibility bit so a reader that does not understand the
+exclusion refuses the topology. The offline member is excluded from allocation,
+placement capacity, and intent-log routing; Pool and per-member status report
+`Degraded` and `Offline`; and an exact two-copy write that cannot retain its
+width refuses before payload or receipt mutation. Existing authenticated data
+remains readable. Offline state survives export and reimport.
+
+`tidefsctl device online <pool> <device-guid>` clears that exclusion only after
+the live owner verifies the exact durable GUID/index and selected topology,
+every current placement-receipt copy, every receipt-bound payload or shard, and
+stable receipt authority. It then publishes and rereads a higher complete
+label generation before ordinary two-copy writes resume. This row is
+administrative availability control for one present member; it does not detach
+media, recover device loss, admit general degraded writes, replace or rebuild a
+member, activate a spare, cover erasure or clustered placement, establish
+secure erase or media-remanence behavior, make a mode support-admitted, or make
+TideFS production-ready.
+
 The same live-owner boundary also implements one bounded missing-member
 rebuild row for an exact two-member `Replicated { copies: 2 }` Pool.
 `tidefsctl pool mount <pool> <mountpoint> --devices <survivor> --read-only

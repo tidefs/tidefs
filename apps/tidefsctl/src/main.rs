@@ -742,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn command_help_hides_removed_surfaces_and_exposes_rebuild() {
+    fn command_help_hides_removed_surfaces_and_exposes_device_lifecycle() {
         let pool_command = commands::pool::PoolCommand::command();
         assert!(pool_command
             .get_subcommands()
@@ -764,6 +764,12 @@ mod tests {
         assert!(device_help
             .lines()
             .any(|line| line.trim_start().starts_with("rebuild ")));
+        assert!(device_help
+            .lines()
+            .any(|line| line.trim_start().starts_with("offline ")));
+        assert!(device_help
+            .lines()
+            .any(|line| line.trim_start().starts_with("online ")));
     }
 
     #[cfg(feature = "full")]

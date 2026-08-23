@@ -67,6 +67,32 @@ pub enum DeviceCommand {
         surviving_dirs: Vec<PathBuf>,
     },
 
+    /// Administratively exclude one exact present member from allocation.
+    Offline {
+        /// Pool whose mounted live owner has device-state authority.
+        pool_name: String,
+
+        /// Exact durable member GUID (32 hexadecimal digits).
+        device_guid: String,
+
+        /// Output the typed transition result as JSON.
+        #[arg(long = "json")]
+        json: bool,
+    },
+
+    /// Verify and administratively readmit one exact offline member.
+    Online {
+        /// Pool whose mounted live owner has device-state authority.
+        pool_name: String,
+
+        /// Exact durable member GUID (32 hexadecimal digits).
+        device_guid: String,
+
+        /// Output the typed transition result as JSON.
+        #[arg(long = "json")]
+        json: bool,
+    },
+
     /// Query live device status with source classification.
     ///
     /// Imported pools route to the live owner; fail closed when
@@ -153,6 +179,24 @@ pub fn handle_device(cmd: DeviceCommand) {
             handle_device_status(pool_name, json);
         }
 
+        DeviceCommand::Offline {
+            pool_name,
+            device_guid,
+            json,
+        } => {
+            let _guard = super::authz::require_local_only("device offline");
+            route_administrative_state("offline", &pool_name, device_guid, json);
+        }
+
+        DeviceCommand::Online {
+            pool_name,
+            device_guid,
+            json,
+        } => {
+            let _guard = super::authz::require_local_only("device online");
+            route_administrative_state("online", &pool_name, device_guid, json);
+        }
+
         DeviceCommand::Rebuild {
             pool_name,
             missing_device_guid,
@@ -180,6 +224,24 @@ pub fn handle_device(cmd: DeviceCommand) {
             );
         }
     }
+}
+
+fn route_administrative_state(
+    operation: &'static str,
+    pool_name: &str,
+    device_guid: String,
+    json: bool,
+) {
+    super::live_owner::route_with_format_and_args(
+        "device",
+        operation,
+        pool_name,
+        json,
+        super::live_owner::live_admin_args([(
+            "device_guid",
+            tidefs_vfs_engine::LivePoolAdminArg::String(device_guid),
+        )]),
+    );
 }
 
 fn handle_remove(

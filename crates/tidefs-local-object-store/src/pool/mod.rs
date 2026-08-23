@@ -357,6 +357,7 @@ pub struct PoolMemberStatus {
     pub device_index: u32,
     pub device_guid: [u8; 16],
     pub present: bool,
+    pub operational_state: Option<DeviceState>,
 }
 
 /// Truthful topology projection for operator-visible Pool status.
@@ -368,6 +369,17 @@ pub struct PoolTopologyStatus {
     pub present_members: u32,
     pub missing_members: u32,
     pub members: Vec<PoolMemberStatus>,
+}
+
+/// Result of one durable administrative member-state transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceAdministrativeStateResult {
+    pub device_index: u32,
+    pub device_guid: [u8; 16],
+    pub state: DeviceState,
+    pub pool_health: PoolHealth,
+    pub topology_generation: u64,
+    pub verified_receipts: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -3187,6 +3199,9 @@ impl PoolLabelCopy {
             && self.label.pool_name_len == other.label.pool_name_len
             && self.label.pool_name == other.label.pool_name
             && self.label.redundancy_policy == other.label.redundancy_policy
+            && self.label.features_incompat == other.label.features_incompat
+            && self.label.features_ro_compat == other.label.features_ro_compat
+            && self.label.features_compat == other.label.features_compat
             && self.topology_roster == other.topology_roster
             && self.lifecycle == other.lifecycle
     }
@@ -4038,8 +4053,9 @@ impl Pool {
             // All pool-level feature bits understood by this software version.
             // When a new version adds pool-level feature bits, this mask must be
             // extended.
-            const POOL_SUPPORTED_FEATURES_INCOMPAT: u64 =
-                features::POOL_LABEL_V1 | features::ENCRYPTION_INCOMPAT;
+            const POOL_SUPPORTED_FEATURES_INCOMPAT: u64 = features::POOL_LABEL_V1
+                | features::ENCRYPTION_INCOMPAT
+                | features::DEVICE_ADMIN_OFFLINE_INCOMPAT;
             const POOL_SUPPORTED_FEATURES_RO_COMPAT: u64 = 0;
 
             let unsupported_incompat = saved_features_incompat & !POOL_SUPPORTED_FEATURES_INCOMPAT;
@@ -4435,37 +4451,26 @@ impl Pool {
         }
     }
 
-    /// Recompute pool health from per-device DeviceHealth states.
+    /// Recompute Pool health from operational device states, including
+    /// administrative offline exclusion.
     pub fn recompute_health_from_devices(&mut self) -> PoolHealth {
-        let mut degraded = false;
-        let mut faulted = false;
-        for device in &self.devices {
-            if let Some(hs) = device.health_state() {
-                match hs.health {
-                    DeviceHealth::Online => {}
-                    DeviceHealth::Degraded => degraded = true,
-                    DeviceHealth::Faulted => faulted = true,
-                }
-            }
-        }
-        let h = if faulted {
-            PoolHealth::Faulted
-        } else if degraded {
-            PoolHealth::Degraded
-        } else {
-            PoolHealth::Online
-        };
+        let h = compute_health(&self.devices);
         self.health = h;
         h
     }
 
-    /// Encode [`DeviceHealth`] as a u8 for the pool label wire format.
-    /// 0=Online, 1=Degraded, 2=Faulted.
-    fn device_health_for_label(hs: Option<DeviceHealthState>) -> u8 {
-        match hs.map(|h| h.health) {
+    /// Encode the underlying health plus administrative-offline state for the
+    /// Pool label wire format.
+    fn device_health_for_label(state: DeviceState, hs: Option<DeviceHealthState>) -> u8 {
+        let health = match hs.map(|h| h.health) {
             Some(DeviceHealth::Online) | None => 0,
             Some(DeviceHealth::Degraded) => 1,
             Some(DeviceHealth::Faulted) => 2,
+        };
+        if state == DeviceState::Offline {
+            health | pool_label::DEVICE_HEALTH_ADMIN_OFFLINE
+        } else {
+            health
         }
     }
 
@@ -4511,9 +4516,19 @@ impl Pool {
                 if self.devices.iter().any(|d| d.is_encrypted()) {
                     flags |= features::ENCRYPTION_INCOMPAT;
                 }
+                if self
+                    .devices
+                    .iter()
+                    .any(|d| d.status().state == DeviceState::Offline)
+                {
+                    flags |= features::DEVICE_ADMIN_OFFLINE_INCOMPAT;
+                }
                 flags
             },
-            device_health: Self::device_health_for_label(device.health_state()),
+            device_health: Self::device_health_for_label(
+                device.status().state,
+                device.health_state(),
+            ),
             device_read_errors: device.health_state().map_or(0, |hs| hs.total_read_errors),
             device_write_errors: device.health_state().map_or(0, |hs| hs.total_write_errors),
             device_checksum_errors: device
@@ -4991,6 +5006,48 @@ impl Pool {
         Ok(())
     }
 
+    fn publish_administrative_device_state(&mut self) -> Result<()> {
+        let lifecycle = self.label_lifecycle.clone();
+        for target in [PoolLabelCopyTarget::Backup, PoolLabelCopyTarget::Primary] {
+            for (device_index, device) in self.devices.iter().enumerate() {
+                let config =
+                    self.config
+                        .devices
+                        .get(device_index)
+                        .ok_or(StoreError::InvalidOptions {
+                            reason: "administrative device state is missing a member configuration",
+                        })?;
+                let label = self.build_label_with_state(device_index, device, PoolState::Active);
+                write_pool_label_copies_with_lifecycle(
+                    config,
+                    label,
+                    self.device_layouts.get(device_index),
+                    &self.device_guids,
+                    lifecycle.as_ref(),
+                    target,
+                    "administrative-device-state",
+                )?;
+            }
+
+            let required_matches = if matches!(target, PoolLabelCopyTarget::Backup) {
+                1
+            } else {
+                2
+            };
+            self.verify_active_topology_label_copies(
+                required_matches,
+                "administrative-device-state",
+                lifecycle.as_ref(),
+            )?;
+        }
+
+        self.persisted_label_epoch = Some(self.placement_epoch);
+        self.durable_device_guids.clone_from(&self.device_guids);
+        self.expected_device_count = self.device_guids.len() as u32;
+        self.device_label_indices = (0..self.expected_device_count).collect();
+        Ok(())
+    }
+
     fn publish_pending_removal_topology(&mut self) -> Result<()> {
         let marker =
             self.device_removal_marker
@@ -5071,6 +5128,13 @@ impl Pool {
                 &self.devices[device_index],
                 PoolState::Active,
             );
+            let sealed_features_compat =
+                expected.features_compat | features::POOL_REDUNDANCY_POLICY;
+            let expected_features_compat = if expected_lifecycle.is_some() {
+                sealed_features_compat | features::POOL_LIFECYCLE_V1
+            } else {
+                sealed_features_compat & !features::POOL_LIFECYCLE_V1
+            };
             let matching = read_pool_label_copies(config)?
                 .into_iter()
                 .filter(|copy| {
@@ -5083,6 +5147,13 @@ impl Pool {
                         && copy.label.device_count == expected.device_count
                         && copy.label.topology_generation == expected.topology_generation
                         && copy.label.redundancy_policy == expected.redundancy_policy
+                        && copy.label.features_incompat == expected.features_incompat
+                        && copy.label.features_ro_compat == expected.features_ro_compat
+                        && copy.label.features_compat == expected_features_compat
+                        && copy.label.device_health == expected.device_health
+                        && copy.label.device_read_errors == expected.device_read_errors
+                        && copy.label.device_write_errors == expected.device_write_errors
+                        && copy.label.device_checksum_errors == expected.device_checksum_errors
                         && copy.topology_roster.as_deref() == Some(self.device_guids.as_slice())
                         && copy.lifecycle.as_ref() == expected_lifecycle
                 })
@@ -5097,6 +5168,9 @@ impl Pool {
                     reason: match operation {
                         "replacement" | "replacement-lifecycle" => {
                             "replacement topology label readback did not verify every required copy"
+                        }
+                        "administrative-device-state" => {
+                            "administrative device state label readback did not verify every required copy"
                         }
                         _ => "removal topology label readback did not verify every required copy",
                     },
@@ -5143,7 +5217,9 @@ impl Pool {
             .copied()
             .filter(|idx| {
                 let state = self.devices[*idx].status().state;
-                state != DeviceState::Faulted && state != DeviceState::Removed
+                state != DeviceState::Faulted
+                    && state != DeviceState::Offline
+                    && state != DeviceState::Removed
             })
             .collect()
     }
@@ -5607,7 +5683,7 @@ impl Pool {
         device.used_bytes = used_bytes;
         device.healthy = !matches!(
             self.devices[idx].status().state,
-            DeviceState::Faulted | DeviceState::Removed
+            DeviceState::Faulted | DeviceState::Offline | DeviceState::Removed
         );
         device
     }
@@ -6917,7 +6993,10 @@ impl Pool {
                 let mut last_err: Option<StoreError> = None;
                 for &idx in &indices {
                     let state = self.devices[idx].status().state;
-                    if state == DeviceState::Faulted || state == DeviceState::Removed {
+                    if state == DeviceState::Faulted
+                        || state == DeviceState::Offline
+                        || state == DeviceState::Removed
+                    {
                         continue;
                     }
                     match self.devices[idx].put(key, payload) {
@@ -10399,10 +10478,17 @@ impl Pool {
             .enumerate()
             .filter_map(|(index, &device_guid)| {
                 let device_index = u32::try_from(index).ok()?;
+                let operational_state = self
+                    .device_guids
+                    .iter()
+                    .position(|guid| *guid == device_guid)
+                    .and_then(|runtime_index| self.devices.get(runtime_index))
+                    .map(|device| device.status().state);
                 Some(PoolMemberStatus {
                     device_index,
                     device_guid,
                     present: present_indices.contains(&device_index),
+                    operational_state,
                 })
             })
             .collect();
@@ -10414,6 +10500,170 @@ impl Pool {
             missing_members: expected_members.saturating_sub(present_members),
             members,
         }
+    }
+
+    fn administrative_device_index(&self, device_guid: [u8; 16]) -> Result<usize> {
+        self.ensure_writable("administrative device state transition")?;
+        if self.missing_member_rebuild_only
+            || self.devices.len() != self.expected_device_count as usize
+            || self.device_guids != self.durable_device_guids
+            || self.device_label_indices != (0..self.expected_device_count).collect::<Vec<_>>()
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "administrative device state requires one complete writable topology",
+            });
+        }
+        if self.properties.redundancy_policy != (PoolRedundancyPolicy::Replicated { copies: 2 })
+            || self.devices.len() != 2
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "administrative device state currently requires an exact two-copy replicated Pool",
+            });
+        }
+        if self.device_removal_marker.is_some()
+            || self
+                .replacement_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.state.is_active())
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "administrative device state refuses an active removal or replacement",
+            });
+        }
+        self.device_guids
+            .iter()
+            .position(|guid| *guid == device_guid)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "administrative device state requires an exact present member GUID",
+            })
+    }
+
+    fn verify_device_online_readmission(&self, device_index: usize) -> Result<u64> {
+        let device_guid =
+            *self
+                .device_guids
+                .get(device_index)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "online readmission target is outside the current topology",
+                })?;
+        if self.durable_device_guids.get(device_index) != Some(&device_guid)
+            || self.device_label_indices.get(device_index) != Some(&(device_index as u32))
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "online readmission target does not match its durable GUID and index",
+            });
+        }
+        self.verify_active_topology_label_copies(
+            1,
+            "administrative-device-state",
+            self.label_lifecycle.as_ref(),
+        )?;
+
+        let inventory = discover_placement_receipt_inventory(&self.devices)?;
+        let indices: Vec<usize> = (0..self.devices.len()).collect();
+        for (key, expected_receipt) in &inventory.latest_by_object {
+            let (_, actual_receipt) = self
+                .get_with_current_receipt_from_indices(IoClass::Data, *key, &indices)?
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "online readmission could not verify a current receipt-bound payload",
+                })?;
+            if &actual_receipt != expected_receipt {
+                return Err(StoreError::InvalidOptions {
+                    reason: "online readmission observed changing placement receipt authority",
+                });
+            }
+        }
+        u64::try_from(inventory.latest_by_object.len()).map_err(|_| StoreError::InvalidOptions {
+            reason: "online readmission receipt count exceeds operator status range",
+        })
+    }
+
+    fn finish_administrative_device_state(
+        &mut self,
+        device_index: usize,
+        verified_receipts: u64,
+    ) -> Result<DeviceAdministrativeStateResult> {
+        if let Err(error) = self.publish_administrative_device_state() {
+            // A complete old or new label family remains crash authority, but
+            // this live owner must not allocate until reopen selects it.
+            self.read_only = true;
+            self.health = compute_health(&self.devices);
+            return Err(error);
+        }
+        self.health = compute_health(&self.devices);
+        Ok(DeviceAdministrativeStateResult {
+            device_index: device_index as u32,
+            device_guid: self.device_guids[device_index],
+            state: self.devices[device_index].status().state,
+            pool_health: self.health,
+            topology_generation: self.placement_epoch,
+            verified_receipts,
+        })
+    }
+
+    /// Durably take one exact present member out of allocation service.
+    pub fn device_offline(
+        &mut self,
+        device_guid: [u8; 16],
+    ) -> Result<DeviceAdministrativeStateResult> {
+        let device_index = self.administrative_device_index(device_guid)?;
+        match self.devices[device_index].status().state {
+            DeviceState::Offline => {}
+            DeviceState::Online | DeviceState::Degraded => {
+                let successor = checked_successor_topology_generation(self.placement_epoch).ok_or(
+                    StoreError::InvalidOptions {
+                        reason: "administrative offline topology generation exhausted",
+                    },
+                )?;
+                self.sync_all()?;
+                self.devices[device_index].set_administratively_offline(true)?;
+                self.placement_epoch = successor;
+                self.health = compute_health(&self.devices);
+            }
+            DeviceState::Faulted | DeviceState::Removed => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "administrative offline requires an online or degraded present member",
+                });
+            }
+        }
+        self.finish_administrative_device_state(device_index, 0)
+    }
+
+    /// Readmit one exact administratively-offline member only after strict
+    /// topology, receipt-copy, and receipt-bound payload verification.
+    pub fn device_online(
+        &mut self,
+        device_guid: [u8; 16],
+    ) -> Result<DeviceAdministrativeStateResult> {
+        let device_index = self.administrative_device_index(device_guid)?;
+        let verified_receipts = self.verify_device_online_readmission(device_index)?;
+        match self.devices[device_index].status().state {
+            DeviceState::Offline => {
+                if self.devices[device_index]
+                    .health_state()
+                    .is_some_and(|state| state.health == DeviceHealth::Faulted)
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason:
+                            "online readmission refuses a faulted underlying device health state",
+                    });
+                }
+                let successor = checked_successor_topology_generation(self.placement_epoch).ok_or(
+                    StoreError::InvalidOptions {
+                        reason: "administrative online topology generation exhausted",
+                    },
+                )?;
+                self.devices[device_index].set_administratively_offline(false)?;
+                self.placement_epoch = successor;
+            }
+            DeviceState::Online | DeviceState::Degraded => {}
+            DeviceState::Faulted | DeviceState::Removed => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "administrative online requires an offline present member",
+                });
+            }
+        }
+        self.finish_administrative_device_state(device_index, verified_receipts)
     }
 
     /// Number of dedicated intent-log (LOG_DEVICE) devices.
@@ -10435,7 +10685,10 @@ impl Pool {
     pub fn log_device_healthy(&self) -> bool {
         self.classes.iter().enumerate().any(|(i, c)| {
             matches!(c, DeviceClass::IntentLog)
-                && self.devices[i].status().state != DeviceState::Faulted
+                && matches!(
+                    self.devices[i].status().state,
+                    DeviceState::Online | DeviceState::Degraded
+                )
         })
     }
 
@@ -12055,8 +12308,8 @@ fn compute_health(devices: &[Device]) -> PoolHealth {
 
     for device in devices {
         match device.status().state {
-            DeviceState::Online | DeviceState::Offline => {}
-            DeviceState::Degraded => has_degraded = true,
+            DeviceState::Online => {}
+            DeviceState::Degraded | DeviceState::Offline => has_degraded = true,
             DeviceState::Faulted => has_faulted = true,
             DeviceState::Removed => {}
         }
@@ -12410,6 +12663,17 @@ mod tests {
             name: "testpool-file-dev".into(),
             root_path: root.join("metadata"),
             devices: vec![regular_file_device_config(root.join("pool0.img"))],
+        }
+    }
+
+    fn two_regular_file_pool_config(root: &Path) -> PoolConfig {
+        PoolConfig {
+            name: "testpool-file-replicated".into(),
+            root_path: root.join("metadata"),
+            devices: vec![
+                regular_file_device_config(root.join("pool0.img")),
+                regular_file_device_config(root.join("pool1.img")),
+            ],
         }
     }
 
@@ -12774,6 +13038,239 @@ mod tests {
     }
 
     #[test]
+    fn administrative_device_offline_refuses_underwidth_writes_and_persists() {
+        let root = temp_dir("administrative-device-offline-persists");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = two_regular_file_pool_config(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let options = test_options();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options).unwrap();
+        let existing_key = ObjectKey::from_name(b"administrative-offline-existing");
+        let existing_payload = b"receipt-backed payload remains readable";
+        let (_, existing_receipt) = pool
+            .put_with_receipt(IoClass::Data, existing_key, existing_payload)
+            .unwrap();
+        pool.sync_all().unwrap();
+        let target_guid = pool.device_guids[0];
+        let predecessor_epoch = pool.placement_epoch();
+
+        let offline = pool.device_offline(target_guid).unwrap();
+        assert_eq!(offline.device_index, 0);
+        assert_eq!(offline.device_guid, target_guid);
+        assert_eq!(offline.state, DeviceState::Offline);
+        assert_eq!(offline.pool_health, PoolHealth::Degraded);
+        assert_eq!(offline.topology_generation, predecessor_epoch + 1);
+        assert_eq!(pool.devices[0].status().state, DeviceState::Offline);
+        assert_eq!(pool.health(), PoolHealth::Degraded);
+        assert_eq!(
+            pool.get_with_current_receipt(IoClass::Data, existing_key)
+                .unwrap(),
+            Some((existing_payload.to_vec(), existing_receipt.clone()))
+        );
+        assert_eq!(
+            pool.topology_status().members[0].operational_state,
+            Some(DeviceState::Offline)
+        );
+
+        let refused_key = ObjectKey::from_name(b"administrative-offline-refused-write");
+        assert!(matches!(
+            pool.put_with_receipt(IoClass::Data, refused_key, b"must not land"),
+            Err(StoreError::InvalidOptions {
+                reason: "not enough eligible pool devices for redundancy policy"
+            })
+        ));
+        let refused_receipt_key = placement_receipt_object_key(refused_key);
+        for device in &pool.devices {
+            assert_eq!(device.get(refused_key).unwrap(), None);
+            assert_eq!(device.get(refused_receipt_key).unwrap(), None);
+        }
+        drop(pool);
+
+        let mut reopened = Pool::open(config.clone(), properties.clone(), &options).unwrap();
+        assert_eq!(reopened.health(), PoolHealth::Degraded);
+        assert_eq!(reopened.devices[0].status().state, DeviceState::Offline);
+        assert!(matches!(
+            reopened.put_with_receipt(IoClass::Data, refused_key, b"still refused"),
+            Err(StoreError::InvalidOptions { .. })
+        ));
+
+        let online = reopened.device_online(target_guid).unwrap();
+        assert_eq!(online.state, DeviceState::Online);
+        assert_eq!(online.pool_health, PoolHealth::Online);
+        assert_eq!(online.verified_receipts, 1);
+        reopened
+            .put_with_receipt(IoClass::Data, refused_key, b"now admitted")
+            .unwrap();
+        reopened.sync_all().unwrap();
+        drop(reopened);
+
+        let reopened = Pool::open(config, properties, &options).unwrap();
+        assert_eq!(reopened.health(), PoolHealth::Online);
+        assert_eq!(reopened.devices[0].status().state, DeviceState::Online);
+        assert_eq!(
+            reopened.get(IoClass::Data, refused_key).unwrap(),
+            Some(b"now admitted".to_vec())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn administrative_device_label_family_crash_cuts_select_complete_state() {
+        let root = temp_dir("administrative-device-label-crash-cuts");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = two_regular_file_pool_config(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let options = test_options();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options).unwrap();
+        pool.sync_all().unwrap();
+        let target_guid = pool.device_guids[0];
+        let old_epoch = pool.placement_epoch;
+        pool.devices[0].set_administratively_offline(true).unwrap();
+        pool.placement_epoch = old_epoch + 1;
+        let first_label = pool.build_label_with_state(0, &pool.devices[0], PoolState::Active);
+        write_pool_label_copies_with_lifecycle(
+            &pool.config.devices[0],
+            first_label,
+            pool.device_layouts.get(0),
+            &pool.device_guids,
+            pool.label_lifecycle.as_ref(),
+            PoolLabelCopyTarget::Backup,
+            "test_administrative_offline_partial_backup",
+        )
+        .unwrap();
+        drop(pool);
+
+        let mut reopened = Pool::open(config.clone(), properties.clone(), &options).unwrap();
+        assert_eq!(reopened.placement_epoch, old_epoch);
+        assert_eq!(reopened.devices[0].status().state, DeviceState::Online);
+        reopened.device_offline(target_guid).unwrap();
+        drop(reopened);
+
+        let mut offline = Pool::open(config.clone(), properties.clone(), &options).unwrap();
+        assert_eq!(offline.devices[0].status().state, DeviceState::Offline);
+        let offline_epoch = offline.placement_epoch;
+
+        // Model an online crash cut with a complete successor backup family
+        // but an older offline primary family. Reopen must select the complete
+        // online backup and an idempotent retry must finish both copies.
+        offline.verify_device_online_readmission(0).unwrap();
+        offline.devices[0]
+            .set_administratively_offline(false)
+            .unwrap();
+        offline.placement_epoch = offline_epoch + 1;
+        let online_epoch = offline.placement_epoch;
+        for device_index in 0..offline.devices.len() {
+            let label = offline.build_label_with_state(
+                device_index,
+                &offline.devices[device_index],
+                PoolState::Active,
+            );
+            write_pool_label_copies_with_lifecycle(
+                &offline.config.devices[device_index],
+                label,
+                offline.device_layouts.get(device_index),
+                &offline.device_guids,
+                offline.label_lifecycle.as_ref(),
+                PoolLabelCopyTarget::Backup,
+                "test_administrative_online_complete_backup",
+            )
+            .unwrap();
+        }
+        drop(offline);
+
+        let mut resumed = Pool::open(config.clone(), properties.clone(), &options).unwrap();
+        assert_eq!(resumed.placement_epoch, online_epoch);
+        assert_eq!(resumed.devices[0].status().state, DeviceState::Online);
+        resumed.device_online(target_guid).unwrap();
+        for device in &resumed.config.devices {
+            let copies = read_pool_label_copies(device).unwrap();
+            assert_eq!(copies.len(), 2);
+            assert!(copies.iter().all(|copy| {
+                copy.label.topology_generation == online_epoch
+                    && copy.label.features_incompat & features::DEVICE_ADMIN_OFFLINE_INCOMPAT == 0
+            }));
+        }
+        drop(resumed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn administrative_device_online_refuses_corrupt_receipt_payload() {
+        let root = temp_dir("administrative-device-online-verification");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = two_regular_file_pool_config(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        let key = ObjectKey::from_name(b"administrative-online-payload");
+        let payload = b"verified payload";
+        pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        pool.sync_all().unwrap();
+        let target_guid = pool.device_guids[0];
+        pool.device_offline(target_guid).unwrap();
+        let offline_epoch = pool.placement_epoch;
+
+        pool.devices[0].put(key, b"corrupt payload").unwrap();
+        assert!(matches!(
+            pool.device_online(target_guid),
+            Err(StoreError::InvalidOptions { .. })
+        ));
+        assert_eq!(pool.devices[0].status().state, DeviceState::Offline);
+        assert_eq!(pool.placement_epoch, offline_epoch);
+
+        pool.devices[0].put(key, payload).unwrap();
+        let online = pool.device_online(target_guid).unwrap();
+        assert_eq!(online.state, DeviceState::Online);
+        assert_eq!(online.verified_receipts, 1);
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn administrative_device_generation_exhaustion_refuses_before_state_change() {
+        let root = temp_dir("administrative-device-generation-exhaustion");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = two_regular_file_pool_config(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        let target_guid = pool.device_guids[0];
+
+        pool.placement_epoch = u64::MAX;
+        assert_invalid_options_reason_contains(
+            pool.device_offline(target_guid),
+            "administrative offline topology generation exhausted",
+        );
+        assert_eq!(pool.placement_epoch, u64::MAX);
+        assert_eq!(pool.devices[0].status().state, DeviceState::Online);
+
+        pool.placement_epoch = u64::MAX - 1;
+        pool.device_offline(target_guid).unwrap();
+        assert_eq!(pool.placement_epoch, u64::MAX);
+        assert_eq!(pool.devices[0].status().state, DeviceState::Offline);
+        assert_invalid_options_reason_contains(
+            pool.device_online(target_guid),
+            "administrative online topology generation exhausted",
+        );
+        assert_eq!(pool.placement_epoch, u64::MAX);
+        assert_eq!(pool.devices[0].status().state, DeviceState::Offline);
+        assert_eq!(pool.health(), PoolHealth::Degraded);
+
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn read_only_geometry_accepts_committed_root_extent_inside_layout_system_area() {
         let layout = DeviceLayoutPolicy::Slice0Small
             .compute(300 * 1024 * 1024)
@@ -12918,11 +13415,13 @@ mod tests {
                         device_index: 0,
                         device_guid: first_device_guid,
                         present: false,
+                        operational_state: None,
                     },
                     PoolMemberStatus {
                         device_index: 1,
                         device_guid: removal_target_guid,
                         present: true,
+                        operational_state: Some(DeviceState::Online),
                     },
                 ],
             }
@@ -13731,11 +14230,13 @@ mod tests {
                     device_index: 0,
                     device_guid: device_guids[0],
                     present: false,
+                    operational_state: None,
                 },
                 PoolMemberStatus {
                     device_index: 1,
                     device_guid: device_guids[1],
                     present: true,
+                    operational_state: Some(DeviceState::Online),
                 },
             ]
         );

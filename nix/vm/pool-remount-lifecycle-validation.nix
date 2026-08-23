@@ -1302,6 +1302,202 @@ else
     blocked "mounted_repair_reopen_readback" "repaired pool did not reopen"
 fi
 
+ADMIN_DEVICE_GUID=""
+ADMIN_DEVICE_OFFLINE_OK=0
+ADMIN_DEVICE_READ_OK=0
+ADMIN_DEVICE_WRITE_REFUSED_OK=0
+ADMIN_DEVICE_EXPORTED_OK=0
+ADMIN_DEVICE_REOPENED_OK=0
+ADMIN_DEVICE_PERSISTED_OK=0
+ADMIN_DEVICE_ONLINE_OK=0
+ADMIN_DEVICE_WRITE_OK=0
+
+if [ "$REPAIR_REOPEN_READBACK_OK" -eq 1 ]; then
+    if tidefsctl device status "$POOL_NAME" --json \
+        > /tmp/admin_device_initial_status.json 2>/tmp/admin_device_initial_status.err; then
+        ADMIN_DEVICE_GUID=$(jq -r \
+            '.members[] | select(.device_index == 0) | .device_guid' \
+            /tmp/admin_device_initial_status.json 2>/dev/null | head -1)
+    fi
+    case "$ADMIN_DEVICE_GUID" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+            pass "administrative_device_identity"
+            ;;
+        *)
+            fail "administrative_device_identity" \
+                "guid=$ADMIN_DEVICE_GUID output=$(cat /tmp/admin_device_initial_status.err /tmp/admin_device_initial_status.json 2>/dev/null)"
+            ;;
+    esac
+else
+    blocked "administrative_device_identity" "normal repaired owner is not readable"
+fi
+
+if [ -n "$ADMIN_DEVICE_GUID" ]; then
+    if tidefsctl device offline "$POOL_NAME" "$ADMIN_DEVICE_GUID" --json \
+        > /tmp/admin_device_offline.json 2>/tmp/admin_device_offline.err \
+        && jq -e --arg guid "$ADMIN_DEVICE_GUID" '
+            .status == "completed"
+            and .operation == "offline"
+            and .device_guid == $guid
+            and .device_index == 0
+            and .operational_state == "Offline"
+            and .pool_health == "Degraded"
+        ' /tmp/admin_device_offline.json >/dev/null \
+        && tidefsctl device status "$POOL_NAME" --json \
+            > /tmp/admin_device_offline_status.json 2>/tmp/admin_device_offline_status.err \
+        && jq -e --arg guid "$ADMIN_DEVICE_GUID" '
+            .health == "Degraded"
+            and any(.members[];
+                .device_guid == $guid
+                and .device_index == 0
+                and .present == true
+                and .operational_state == "Offline")
+        ' /tmp/admin_device_offline_status.json >/dev/null; then
+        ADMIN_DEVICE_OFFLINE_OK=1
+        pass "administrative_device_offline"
+    else
+        fail "administrative_device_offline" \
+            "$(cat /tmp/admin_device_offline.err /tmp/admin_device_offline.json /tmp/admin_device_offline_status.err /tmp/admin_device_offline_status.json 2>/dev/null)"
+    fi
+else
+    blocked "administrative_device_offline" "device identity unavailable"
+fi
+
+if [ "$ADMIN_DEVICE_OFFLINE_OK" -eq 1 ]; then
+    if [ "$(cat "$SCRUB_FILE" 2>/dev/null || true)" = "$SCRUB_CONTENT" ]; then
+        ADMIN_DEVICE_READ_OK=1
+        pass "administrative_device_offline_read"
+    else
+        fail "administrative_device_offline_read" \
+            "read=$(cat "$SCRUB_FILE" 2>/dev/null || true)"
+    fi
+
+    if printf 'must-refuse\n' > "$MNT/administrative-offline-write" \
+        2>/tmp/admin_device_write_refused.err; then
+        fail "administrative_device_offline_write_refused" \
+            "mounted write unexpectedly succeeded"
+    elif [ ! -e "$MNT/administrative-offline-write" ]; then
+        ADMIN_DEVICE_WRITE_REFUSED_OK=1
+        pass "administrative_device_offline_write_refused"
+    else
+        fail "administrative_device_offline_write_refused" \
+            "refused write left a visible entry: $(cat /tmp/admin_device_write_refused.err 2>/dev/null)"
+    fi
+else
+    blocked "administrative_device_offline_read" "offline transition failed"
+    blocked "administrative_device_offline_write_refused" "offline transition failed"
+fi
+
+if [ "$ADMIN_DEVICE_READ_OK" -eq 1 ] && [ "$ADMIN_DEVICE_WRITE_REFUSED_OK" -eq 1 ]; then
+    ADMIN_EXPORT_RC=1
+    ADMIN_DAEMON_RC=1
+    if tidefsctl pool export "$POOL_NAME" --devices "$DEV0" "$DEV1" \
+        > /tmp/admin_device_export.out 2>/tmp/admin_device_export.err; then
+        ADMIN_EXPORT_RC=0
+    else
+        ADMIN_EXPORT_RC=$?
+    fi
+    if wait "$CRP"; then
+        ADMIN_DAEMON_RC=0
+    else
+        ADMIN_DAEMON_RC=$?
+    fi
+    CRP=""
+    if [ "$ADMIN_EXPORT_RC" -eq 0 ] && [ "$ADMIN_DAEMON_RC" -eq 0 ] \
+        && ! mountpoint -q "$MNT" 2>/dev/null; then
+        ADMIN_DEVICE_EXPORTED_OK=1
+        pass "administrative_device_offline_export"
+    else
+        fail "administrative_device_offline_export" \
+            "export_rc=$ADMIN_EXPORT_RC daemon_rc=$ADMIN_DAEMON_RC output=$(cat /tmp/admin_device_export.err /tmp/admin_device_export.out 2>/dev/null)"
+    fi
+else
+    blocked "administrative_device_offline_export" "offline read/refusal boundary failed"
+fi
+
+if [ "$ADMIN_DEVICE_EXPORTED_OK" -eq 1 ]; then
+    tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV0" "$DEV1" \
+        > /tmp/admin_device_reopen.log 2>&1 &
+    CRP=$!
+    for _ in $(seq 1 45); do
+        mountpoint -q "$MNT" 2>/dev/null && { ADMIN_DEVICE_REOPENED_OK=1; break; }
+        sleep 1
+    done
+    if [ "$ADMIN_DEVICE_REOPENED_OK" -eq 1 ]; then
+        pass "administrative_device_offline_reimport"
+    else
+        fail "administrative_device_offline_reimport" \
+            "$(tail -40 /tmp/admin_device_reopen.log 2>/dev/null)"
+    fi
+else
+    blocked "administrative_device_offline_reimport" "offline Pool did not export cleanly"
+fi
+
+if [ "$ADMIN_DEVICE_REOPENED_OK" -eq 1 ]; then
+    if tidefsctl device status "$POOL_NAME" --json \
+        > /tmp/admin_device_persisted_status.json 2>/tmp/admin_device_persisted_status.err \
+        && jq -e --arg guid "$ADMIN_DEVICE_GUID" '
+            .health == "Degraded"
+            and any(.members[];
+                .device_guid == $guid
+                and .operational_state == "Offline")
+        ' /tmp/admin_device_persisted_status.json >/dev/null \
+        && [ "$(cat "$SCRUB_FILE" 2>/dev/null || true)" = "$SCRUB_CONTENT" ]; then
+        ADMIN_DEVICE_PERSISTED_OK=1
+        pass "administrative_device_offline_persisted"
+    else
+        fail "administrative_device_offline_persisted" \
+            "$(cat /tmp/admin_device_persisted_status.err /tmp/admin_device_persisted_status.json 2>/dev/null)"
+    fi
+else
+    blocked "administrative_device_offline_persisted" "offline Pool did not reimport"
+fi
+
+if [ "$ADMIN_DEVICE_PERSISTED_OK" -eq 1 ]; then
+    if tidefsctl device online "$POOL_NAME" "$ADMIN_DEVICE_GUID" --json \
+        > /tmp/admin_device_online.json 2>/tmp/admin_device_online.err \
+        && jq -e --arg guid "$ADMIN_DEVICE_GUID" '
+            .status == "completed"
+            and .operation == "online"
+            and .device_guid == $guid
+            and .device_index == 0
+            and .operational_state == "Online"
+            and .pool_health == "Online"
+            and .verified_receipts >= 1
+        ' /tmp/admin_device_online.json >/dev/null \
+        && tidefsctl device status "$POOL_NAME" --json \
+            > /tmp/admin_device_online_status.json 2>/tmp/admin_device_online_status.err \
+        && jq -e --arg guid "$ADMIN_DEVICE_GUID" '
+            .health == "Online"
+            and any(.members[];
+                .device_guid == $guid
+                and .operational_state == "Online")
+        ' /tmp/admin_device_online_status.json >/dev/null; then
+        ADMIN_DEVICE_ONLINE_OK=1
+        pass "administrative_device_online"
+    else
+        fail "administrative_device_online" \
+            "$(cat /tmp/admin_device_online.err /tmp/admin_device_online.json /tmp/admin_device_online_status.err /tmp/admin_device_online_status.json 2>/dev/null)"
+    fi
+else
+    blocked "administrative_device_online" "offline state did not persist through reimport"
+fi
+
+if [ "$ADMIN_DEVICE_ONLINE_OK" -eq 1 ]; then
+    if printf 'online-write-admitted\n' > "$MNT/administrative-online-write" \
+        && sync \
+        && [ "$(cat "$MNT/administrative-online-write" 2>/dev/null || true)" \
+            = "online-write-admitted" ]; then
+        ADMIN_DEVICE_WRITE_OK=1
+        pass "administrative_device_online_write"
+    else
+        fail "administrative_device_online_write" \
+            "read=$(cat "$MNT/administrative-online-write" 2>/dev/null || true)"
+    fi
+else
+    blocked "administrative_device_online_write" "verified readmission failed"
+fi
+
 MISSING_REBUILD_IDENTITY_OK=0
 MISSING_REBUILD_OWNER_STOPPED_OK=0
 MISSING_REBUILD_DEVICE_REMOVED_OK=0
@@ -1316,7 +1512,7 @@ MISSING_REBUILD_GUID=""
 MISSING_DEVICE="$DEV0"
 RBP=""
 
-if [ "$REPAIR_REOPEN_READBACK_OK" -eq 1 ]; then
+if [ "$ADMIN_DEVICE_WRITE_OK" -eq 1 ]; then
     if tidefsctl pool status "$POOL_NAME" --json \
         > /tmp/missing_rebuild_status.json 2>/tmp/missing_rebuild_status.err; then
         MISSING_REBUILD_GUID=$(jq -r \
@@ -1334,7 +1530,7 @@ if [ "$REPAIR_REOPEN_READBACK_OK" -eq 1 ]; then
             ;;
     esac
 else
-    blocked "missing_rebuild_identity" "normal repaired owner is not readable"
+    blocked "missing_rebuild_identity" "administrative online recovery did not complete"
 fi
 
 if [ "$MISSING_REBUILD_IDENTITY_OK" -eq 1 ]; then
@@ -1695,6 +1891,7 @@ if [ "$INTEGRITY_CLEAN_OK" -eq 1 ] \
     && [ "$REPAIR_STALE_MOUNT_DETACHED_OK" -eq 1 ] \
     && [ "$REPAIR_REOPENED" -eq 1 ] \
     && [ "$REPAIR_REOPEN_READBACK_OK" -eq 1 ] \
+    && [ "$ADMIN_DEVICE_WRITE_OK" -eq 1 ] \
     && [ "$MISSING_REBUILD_IDENTITY_OK" -eq 1 ] \
     && [ "$MISSING_REBUILD_OWNER_STOPPED_OK" -eq 1 ] \
     && [ "$MISSING_REBUILD_DEVICE_REMOVED_OK" -eq 1 ] \
@@ -1873,6 +2070,13 @@ INITSCRIPT
       mounted_repair_single_completed mounted_repair_file_readable \
       mounted_repair_crash_sigkill mounted_repair_stale_mount_detached \
       mounted_repair_reopen mounted_repair_reopen_readback \
+      administrative_device_identity administrative_device_offline \
+      administrative_device_offline_read \
+      administrative_device_offline_write_refused \
+      administrative_device_offline_export \
+      administrative_device_offline_reimport \
+      administrative_device_offline_persisted administrative_device_online \
+      administrative_device_online_write \
       missing_rebuild_identity missing_rebuild_owner_stopped \
       missing_rebuild_device_removed missing_rebuild_mount \
       missing_rebuild_namespace_ro missing_rebuild_completed \

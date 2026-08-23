@@ -1940,6 +1940,8 @@ pub enum LivePoolAdminCommand {
     SnapshotSend,
     PerformanceAdmissionSnapshot,
     DeviceStatus,
+    DeviceOffline,
+    DeviceOnline,
     DeviceRemove,
     DeviceReplace,
     DeviceRebuild,
@@ -2017,6 +2019,8 @@ const LIVE_POOL_ADMIN_COMMAND_ROUTES: &[(LivePoolAdminCommand, &str, &str)] = &[
         "admission-snapshot",
     ),
     (LivePoolAdminCommand::DeviceStatus, "device", "status"),
+    (LivePoolAdminCommand::DeviceOffline, "device", "offline"),
+    (LivePoolAdminCommand::DeviceOnline, "device", "online"),
     (LivePoolAdminCommand::DeviceRemove, "device", "remove"),
     (LivePoolAdminCommand::DeviceReplace, "device", "replace"),
     (LivePoolAdminCommand::DeviceRebuild, "device", "rebuild"),
@@ -2258,6 +2262,19 @@ mod tests {
             .expect("device replace has a typed live-owner route");
         assert_eq!(command, LivePoolAdminCommand::DeviceReplace);
         assert_eq!(command.parts(), ("device", "replace"));
+    }
+
+    #[test]
+    fn live_pool_admin_device_offline_and_online_routes_are_typed() {
+        let offline = LivePoolAdminCommand::from_parts("device", "offline")
+            .expect("device offline has a typed live-owner route");
+        assert_eq!(offline, LivePoolAdminCommand::DeviceOffline);
+        assert_eq!(offline.parts(), ("device", "offline"));
+
+        let online = LivePoolAdminCommand::from_parts("device", "online")
+            .expect("device online has a typed live-owner route");
+        assert_eq!(online, LivePoolAdminCommand::DeviceOnline);
+        assert_eq!(online.parts(), ("device", "online"));
     }
 
     #[test]
