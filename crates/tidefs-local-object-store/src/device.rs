@@ -3594,8 +3594,58 @@ impl Device {
         }
     }
 
+    fn pool_internal_copy_candidates_for_key(&self, key: ObjectKey) -> Result<Vec<Vec<u8>>> {
+        let copy_slots = |store: &LocalObjectStore| {
+            Ok(store
+                .get_pool_internal_copy_slots(key)?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>())
+        };
+        match self {
+            Self::Single(device) => copy_slots(&device.store),
+            Self::Mirror(device) => {
+                let mut candidates = Vec::new();
+                for member in &device.members {
+                    candidates.extend(copy_slots(&member.store)?);
+                }
+                Ok(candidates)
+            }
+            Self::Compressed(device) => device.inner.pool_internal_copy_candidates_for_key(key),
+            Self::Encrypted(device) => device.inner.pool_internal_copy_candidates_for_key(key),
+            Self::LogDevice(device) => copy_slots(&device.store),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                Ok(
+                    parity_pool_internal_candidates(device, crate::is_pool_placement_receipt_key)?
+                        .into_iter()
+                        .filter_map(|(candidate_key, payload)| {
+                            (candidate_key == key).then_some(payload)
+                        })
+                        .collect(),
+                )
+            }
+        }
+    }
+
     pub(crate) fn placement_receipt_candidates(&self) -> Result<Vec<(ObjectKey, Vec<u8>)>> {
         self.pool_internal_candidates(crate::is_pool_placement_receipt_key)
+    }
+
+    /// Read every physical copy slot for one exact placement-receipt key.
+    ///
+    /// Strict object reads need all copies of their own receipt to agree, but
+    /// do not need to enumerate or decode unrelated receipt keys.
+    pub(crate) fn placement_receipt_candidates_for_key(
+        &self,
+        receipt_key: ObjectKey,
+    ) -> Result<Vec<Vec<u8>>> {
+        if !crate::is_pool_placement_receipt_key(receipt_key) {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement receipt copy lookup requires a receipt key",
+            });
+        }
+        self.pool_internal_copy_candidates_for_key(receipt_key)
     }
 
     pub(crate) fn pending_deletion_candidates(&self) -> Result<Vec<(ObjectKey, Vec<u8>)>> {
