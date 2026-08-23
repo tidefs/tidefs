@@ -307,6 +307,21 @@ pub enum IntentLogEntryKind {
     CrashReplayReconcile,
 }
 impl IntentLogEntryKind {
+    /// Whether this entry kind owns a separately stored replay payload.
+    ///
+    /// Metadata, namespace, barrier, and marker entries carry all of their
+    /// replay state in the entry record itself.  Treating them as if they had
+    /// a data object manufactures an absent-key tombstone during clean log
+    /// retirement for every such entry.
+    fn owns_data_payload(&self) -> bool {
+        matches!(
+            self,
+            IntentLogEntryKind::SyncWriteRange { .. }
+                | IntentLogEntryKind::OdsyncDataRange { .. }
+                | IntentLogEntryKind::SharedMmapMsync { .. }
+        )
+    }
+
     /// Whether this entry kind carries replayable data bytes for `inode_id`.
     ///
     /// Covers SyncWriteRange, OdsyncDataRange, and SharedMmapMsync only.
@@ -1543,11 +1558,13 @@ impl IntentLog {
         // intent into a false commit failure.
         for entry in &self.entries {
             let _ = IntentLogRawStateAuthority::delete_entry(store, entry.entry_id, self.keyspace);
-            let _ = IntentLogRawStateAuthority::delete_data_payload(
-                store,
-                entry.entry_id,
-                self.keyspace,
-            );
+            if entry.entry_kind.owns_data_payload() {
+                let _ = IntentLogRawStateAuthority::delete_data_payload(
+                    store,
+                    entry.entry_id,
+                    self.keyspace,
+                );
+            }
         }
         let _ = IntentLogRawStateAuthority::sync_all(store);
         self.entries.clear();
@@ -4148,6 +4165,86 @@ mod tests {
         assert!(log.is_empty());
         assert_eq!(log.pending_flush_count(), 0);
         assert_eq!(log.next_entry_id, 0);
+    }
+
+    #[test]
+    fn clear_metadata_entries_does_not_tombstone_absent_payloads() {
+        let (mut store, _dir) = test_store();
+        let mut log = IntentLog::with_config(IntentLogConfig {
+            max_batch_entries: 8,
+            adaptive_flush: false,
+            flush_interval_us: 0,
+            pressure_depth_threshold: 1024,
+            log_max_bytes: 0,
+            pressure_warning_threshold: 0.50,
+            pressure_sync_threshold: 0.75,
+            pressure_critical_threshold: 0.90,
+        });
+
+        for entry_id in 0..4 {
+            assert!(log
+                .append(
+                    &mut store,
+                    IntentLogEntryKind::NamespaceSyncIntent {
+                        parent_inode_id: ROOT_INODE_ID,
+                        affected_inode_ids: vec![InodeId::new(100 + entry_id)],
+                        link_count_deltas: Vec::new(),
+                    },
+                    test_root_anchor(),
+                    test_timestamp(),
+                )
+                .expect("append metadata intent"));
+        }
+        log.flush(&mut store).expect("flush metadata intents");
+        let tombstones_before = store.stats().tombstone_count;
+
+        log.clear(&mut store).expect("clear metadata intents");
+
+        let tombstones_after = store.stats().tombstone_count;
+        assert_eq!(
+            tombstones_after - tombstones_before,
+            5,
+            "clear should tombstone four entry records plus the durable head"
+        );
+        for entry_id in 0..4 {
+            assert!(
+                store
+                    .get(intent_log_data_object_key(entry_id))
+                    .expect("read absent payload")
+                    .is_none(),
+                "metadata-only intent must not own a replay payload"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_data_entry_retires_its_replay_payload() {
+        let (mut store, _dir) = test_store();
+        let mut log = IntentLog::new();
+        let payload_key = intent_log_data_object_key(0);
+        IntentLogRawStateAuthority::write_data_payload(
+            &mut store,
+            0,
+            b"replay payload",
+            log.keyspace,
+        )
+        .expect("write replay payload");
+        sync_write_entry(&mut log, &mut store, 0);
+        log.flush(&mut store).expect("flush data intent");
+        assert!(store
+            .get(payload_key)
+            .expect("read replay payload")
+            .is_some());
+
+        log.clear(&mut store).expect("clear data intent");
+
+        assert!(
+            store
+                .get(payload_key)
+                .expect("read retired replay payload")
+                .is_none(),
+            "a data-bearing intent must retire its replay payload"
+        );
     }
 
     #[test]
