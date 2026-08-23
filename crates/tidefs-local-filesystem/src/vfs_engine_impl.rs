@@ -239,7 +239,10 @@ impl VfsLocalFileSystem {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        Ok(())
+        self.fs
+            .borrow()
+            .check_write_admission(0)
+            .map_err(|error| map_errno(&FileSystemError::from(error)))
     }
 
     #[inline]
@@ -8132,7 +8135,7 @@ impl VfsEngine for VfsLocalFileSystem {
         self.fs
             .borrow()
             .check_write_admission(byte_count)
-            .map_err(|_| Errno::ENOSPC)
+            .map_err(|error| map_errno(&FileSystemError::from(error)))
     }
 
     fn defrag_file(
@@ -10047,6 +10050,13 @@ mod tests {
         let target_guid = filesystem.store.pool().topology_status().members[0].device_guid;
         let target_guid_hex = live_admin_hex_encode(&target_guid);
         let engine = VfsLocalFileSystem::new(filesystem);
+        let root = engine.get_root_inode(&ctx()).expect("administrative root");
+        let existing = engine
+            .lookup(root, b"offline.bin", &ctx())
+            .expect("lookup administrative test file");
+        let existing_fh = engine
+            .open(existing.inode_id, O_RDWR, &ctx())
+            .expect("open administrative test file");
 
         let offline = live_device_admin(
             &engine,
@@ -10066,19 +10076,25 @@ mod tests {
                 .expect("read mounted bytes with one member offline"),
             payload
         );
-        let refused_key =
-            tidefs_local_object_store::ObjectKey::from_name(b"live-device-offline-refused-write");
-        assert!(engine
-            .fs
-            .borrow_mut()
-            .store
-            .pool_mut()
-            .put_with_receipt(
-                tidefs_local_object_store::DeviceIoClass::Data,
-                refused_key,
-                b"must refuse",
-            )
-            .is_err());
+        assert_eq!(engine.check_write_admission(1), Err(Errno::EIO));
+        assert!(matches!(
+            engine.create(root, b"offline-refused.bin", 0o600, O_RDWR, &ctx()),
+            Err(Errno::EIO)
+        ));
+        assert!(matches!(
+            engine.lookup(root, b"offline-refused.bin", &ctx()),
+            Err(Errno::ENOENT)
+        ));
+        assert_eq!(
+            engine.write(&existing_fh, 0, b"must refuse", &ctx()),
+            Err(Errno::EIO)
+        );
+        assert_eq!(
+            engine
+                .read(&existing_fh, 0, payload.len() as u32, &ctx())
+                .expect("read unchanged mounted bytes after refused write"),
+            payload
+        );
 
         let status = live_device_admin(&engine, "status", json!({}), true);
         assert_eq!(status["ok"], true, "status response: {status}");
@@ -10095,17 +10111,15 @@ mod tests {
         assert_eq!(online["json"]["operational_state"], "Online");
         assert_eq!(online["json"]["pool_health"], "Online");
         assert!(online["json"]["verified_receipts"].as_u64().unwrap() > 0);
-        engine
-            .fs
-            .borrow_mut()
-            .store
-            .pool_mut()
-            .put_with_receipt(
-                tidefs_local_object_store::DeviceIoClass::Data,
-                refused_key,
-                b"now admitted",
-            )
-            .expect("replicated write resumes after verified readmission");
+        let (_, resumed_fh) = engine
+            .create(root, b"online-admitted.bin", 0o600, O_RDWR, &ctx())
+            .expect("create resumes after verified readmission");
+        assert_eq!(
+            engine
+                .write(&resumed_fh, 0, b"now admitted", &ctx())
+                .expect("write resumes after verified readmission"),
+            b"now admitted".len() as u32
+        );
     }
 
     #[test]
@@ -20430,7 +20444,7 @@ mod tests {
     }
 
     #[test]
-    fn write_admission_pool_put_rejects_after_watermark_set() {
+    fn write_admission_refuses_before_buffering_after_watermark_set() {
         let (engine, root) = watermark_temp_fs();
         let ctx = RequestCtx {
             uid: 0,
@@ -20460,16 +20474,16 @@ mod tests {
         // check_write_admission should reject.
         assert_eq!(engine.check_write_admission(1), Err(Errno::ENOSPC));
 
-        // A subsequent write buffers and succeeds at the VFS level
-        // (buffered write goes into write buffer, not pool).
-        // The pool-level enforcement happens at flush time.
-        assert!(engine.write(&fh, 10, b"buffered", &ctx).is_ok());
-
-        // Flush should fail because the pool watermark rejects the put.
-        let flush_result = engine.flush(&fh, &ctx);
-        assert!(
-            flush_result.is_err(),
-            "flush should fail after watermark set"
+        // Mounted admission fails before bytes enter the write buffer, so the
+        // existing committed content remains the complete readable state.
+        assert_eq!(engine.write(&fh, 10, b"buffered", &ctx), Err(Errno::ENOSPC));
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_file("/test.bin")
+                .expect("read content after refused mounted write"),
+            b"hello"
         );
 
         let _ = std::fs::remove_dir_all(&root);

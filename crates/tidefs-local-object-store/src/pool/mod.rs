@@ -5199,15 +5199,25 @@ impl Pool {
     // I/O: device-class-aware put / get / delete
     // ------------------------------------------------------------------
 
-    /// Check whether a data write of `payload_len` bytes is admitted
-    /// under the configured low-watermark policy.
+    /// Check whether a data write of `payload_len` bytes is admitted by the
+    /// current topology and configured low-watermark policy.
     ///
-    /// Returns `Ok(())` when the write is allowed or when the class is not
-    /// `IoClass::Data` (metadata and intent-log always bypass the watermark).
-    /// Returns `Err(StoreError::NoSpace)` when the write would push available
-    /// capacity below the configured reserve.
+    /// Data writes first require enough currently usable candidates to retain
+    /// the Pool's exact redundancy width. They then apply the free-space
+    /// watermark. Metadata and intent-log writes bypass only the watermark so
+    /// reclaim, compaction, and allocator forward progress remain possible.
     pub fn check_write_admission(&self, class: IoClass, payload_len: u64) -> Result<()> {
         self.ensure_writable("pool write admission")?;
+        if class == IoClass::Data {
+            let required = self.properties.redundancy_policy.total_targets()?;
+            let indices = self.class_map.get(class);
+            let candidates = self.placement_candidates_for_targets(class, indices, required);
+            if candidates.len() < required {
+                return Err(StoreError::InvalidOptions {
+                    reason: "not enough eligible pool devices for redundancy policy",
+                });
+            }
+        }
         if self.properties.low_watermark_bytes == 0 {
             // Watermark disabled; always admit.
             return Ok(());
@@ -13089,6 +13099,12 @@ mod tests {
             pool.topology_status().members[0].operational_state,
             Some(DeviceState::Offline)
         );
+        assert!(matches!(
+            pool.check_write_admission(IoClass::Data, 1),
+            Err(StoreError::InvalidOptions {
+                reason: "not enough eligible pool devices for redundancy policy"
+            })
+        ));
 
         let refused_key = ObjectKey::from_name(b"administrative-offline-refused-write");
         assert!(matches!(
