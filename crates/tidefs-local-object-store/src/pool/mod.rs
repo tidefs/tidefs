@@ -678,6 +678,200 @@ pub struct PlacementReceipt {
     pub planner_replay_receipt: Option<PlacementReplayReceipt>,
 }
 
+/// Receipt-bound observation of one physical replicated target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplicatedTargetReadOutcome {
+    /// The target returned the exact length and BLAKE3 payload digest named by
+    /// the current receipt.
+    Clean,
+    /// The target returned bytes that do not match the current receipt.
+    Corrupt {
+        actual_len: u64,
+        actual_digest: [u8; 32],
+    },
+    /// The current receipt target has no object at the receipt-bound key.
+    Missing,
+    /// The target could not return bytes through its ordinary checked read.
+    Unreadable,
+}
+
+/// Current-receipt evidence for one replicated target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicatedTargetEvidence {
+    pub target: PlacementReceiptTarget,
+    pub outcome: ReplicatedTargetReadOutcome,
+    payload: Option<Vec<u8>>,
+}
+
+impl ReplicatedTargetEvidence {
+    /// Bytes returned by this exact target, when its checked read completed.
+    #[must_use]
+    pub fn payload(&self) -> Option<&[u8]> {
+        self.payload.as_deref()
+    }
+}
+
+/// Target-by-target evidence under one exact current replicated receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicatedReceiptEvidence {
+    pub receipt: PlacementReceipt,
+    pub targets: Vec<ReplicatedTargetEvidence>,
+}
+
+/// Completed two-copy repair with durable replacement placement authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicatedRepairResult {
+    pub previous_receipt: PlacementReceipt,
+    pub replacement_receipt: PlacementReceipt,
+    pub source_device_index: u32,
+    pub repaired_device_index: u32,
+}
+
+/// Durable evidence that a newer receipt came from one target-only repair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicatedRepairReconciliationEvidence {
+    /// Receipt generation still embedded in the unreconciled filesystem root.
+    pub embedded_predecessor_generation: u64,
+    /// Clean, current Pool receipt that superseded the embedded generation.
+    pub current_receipt: PlacementReceipt,
+    /// Exact receipt target whose predecessor physical object is queued.
+    pub repaired_target: PlacementReceiptTarget,
+    /// Whether reclaim evidence for the current receipt is already attached.
+    pub replacement_receipt_attached: bool,
+    /// Exact physical predecessor lifetime retained for receipt-bound reclaim.
+    reclaim_object_id: ReclaimObjectKey,
+}
+
+/// Durable receipt-copy state for one interrupted target-only repair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingReplicatedRepairReceiptCopies {
+    /// Every receipt carrier still names the predecessor generation.
+    Predecessor,
+    /// Receipt publication stopped with exact predecessor and replacement
+    /// generations on different physical carriers.
+    Mixed,
+    /// Every receipt carrier names the replacement generation.
+    Replacement,
+}
+
+/// Physical state of the exact target named by a pending repair transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingReplicatedRepairTargetState {
+    /// The target remains corrupt or unreadable and must be rewritten from the
+    /// authenticated clean source before receipt convergence.
+    NeedsRewrite,
+    /// The target already contains the receipt-bound bytes, so only receipt
+    /// convergence and reclaim attachment remain.
+    Clean,
+}
+
+/// Read-only discovery evidence for one interrupted replicated-target repair.
+///
+/// This value does not authorize mutation by itself. A filesystem owner must
+/// first authenticate an exact predecessor root and object reference using the
+/// clean source payload, then pass the unchanged value back to the Pool's
+/// completion boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingReplicatedRepairRecoveryEvidence {
+    pub predecessor_receipt: PlacementReceipt,
+    pub replacement_receipt: PlacementReceipt,
+    pub repaired_target: PlacementReceiptTarget,
+    pub clean_source: PlacementReceiptTarget,
+    pub receipt_copies: PendingReplicatedRepairReceiptCopies,
+    pub target_state: PendingReplicatedRepairTargetState,
+    /// Exact durable reclaim-row identity for the predecessor target bytes.
+    reclaim_object_id: ReclaimObjectKey,
+    clean_source_payload: Vec<u8>,
+}
+
+impl PendingReplicatedRepairRecoveryEvidence {
+    /// Exact receipt-clean bytes used to authenticate the predecessor root.
+    #[must_use]
+    pub fn clean_source_payload(&self) -> &[u8] {
+        &self.clean_source_payload
+    }
+}
+
+/// Durable receipt-publication truth when replicated repair returns an error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplicatedRepairReceiptPublicationState {
+    /// Repair did not call the receipt-publication boundary.
+    NotAttempted,
+    /// Receipt publication returned success before the later failure.
+    Completed,
+    /// Receipt publication was attempted but did not return success.
+    Uncertain,
+}
+
+impl std::fmt::Display for ReplicatedRepairReceiptPublicationState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotAttempted => "not-attempted",
+            Self::Completed => "completed",
+            Self::Uncertain => "uncertain",
+        })
+    }
+}
+
+/// Phase-accurate failure from one exact replicated-target repair.
+#[derive(Debug)]
+pub struct ReplicatedRepairFailure {
+    /// Underlying Pool or device failure.
+    pub error: StoreError,
+    /// Whether any persistent repair writeback began, including durable
+    /// pre-publication reclaim intent.
+    pub writeback_started: bool,
+    /// Allocated replacement generation, when allocation completed.
+    pub replacement_generation: Option<u64>,
+    /// Durable replacement-receipt publication state at failure time.
+    pub receipt_publication: ReplicatedRepairReceiptPublicationState,
+}
+
+impl std::fmt::Display for ReplicatedRepairFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (writeback_started={}, replacement_generation={:?}, receipt_publication={})",
+            self.error,
+            self.writeback_started,
+            self.replacement_generation,
+            self.receipt_publication
+        )
+    }
+}
+
+impl std::error::Error for ReplicatedRepairFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReplicatedRepairProgress {
+    writeback_started: bool,
+    replacement_generation: Option<u64>,
+    receipt_publication: ReplicatedRepairReceiptPublicationState,
+}
+
+impl ReplicatedRepairProgress {
+    const fn new() -> Self {
+        Self {
+            writeback_started: false,
+            replacement_generation: None,
+            receipt_publication: ReplicatedRepairReceiptPublicationState::NotAttempted,
+        }
+    }
+
+    fn failure(self, error: StoreError) -> ReplicatedRepairFailure {
+        ReplicatedRepairFailure {
+            error,
+            writeback_started: self.writeback_started,
+            replacement_generation: self.replacement_generation,
+            receipt_publication: self.receipt_publication,
+        }
+    }
+}
+
 /// Receipt publication state for a mutable erasure-coded read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ErasureReadRepairStatus {
@@ -1171,12 +1365,9 @@ fn planner_replay_receipt_matches_receipt(receipt: &PlacementReceipt) -> bool {
     true
 }
 
-fn reclaim_object_key(key: ObjectKey) -> ReclaimObjectKey {
-    ReclaimObjectKey(key.as_bytes32())
-}
-
 fn dead_object_replacement_receipt_for_object(
-    object_key: ObjectKey,
+    _object_key: ObjectKey,
+    reclaim_object_id: ReclaimObjectKey,
     receipt: &PlacementReceipt,
 ) -> Result<DeadObjectReplacementReceipt> {
     let target_count =
@@ -1196,7 +1387,7 @@ fn dead_object_replacement_receipt_for_object(
         },
     };
     Ok(DeadObjectReplacementReceipt::new(
-        reclaim_object_key(object_key),
+        reclaim_object_id,
         receipt.epoch,
         receipt.generation,
         redundancy_policy,
@@ -1552,6 +1743,7 @@ enum PoolOpenMode {
 struct ObsoletePhysicalPlacement {
     device_index: usize,
     object_key: ObjectKey,
+    reclaim_object_id: ReclaimObjectKey,
 }
 
 /// A TideFS storage pool, analogous to a ZFS zpool.
@@ -1663,6 +1855,12 @@ pub struct Pool {
     fail_post_deletion_publication_cleanup_once: bool,
     #[cfg(test)]
     fail_placement_receipt_verification_once: bool,
+    #[cfg(test)]
+    fail_replicated_repair_after_generation_allocation_once: bool,
+    #[cfg(test)]
+    fail_replicated_repair_after_reclaim_intent_once: bool,
+    #[cfg(test)]
+    fail_replicated_repair_after_receipt_publication_once: bool,
 }
 
 /// Versioned, checksummed replacement evidence published before an in-memory
@@ -3219,6 +3417,12 @@ impl Pool {
             fail_post_deletion_publication_cleanup_once: false,
             #[cfg(test)]
             fail_placement_receipt_verification_once: false,
+            #[cfg(test)]
+            fail_replicated_repair_after_generation_allocation_once: false,
+            #[cfg(test)]
+            fail_replicated_repair_after_reclaim_intent_once: false,
+            #[cfg(test)]
+            fail_replicated_repair_after_receipt_publication_once: false,
         };
 
         pool.persist_active_labels_if_needed()?;
@@ -3893,6 +4097,12 @@ impl Pool {
             fail_post_deletion_publication_cleanup_once: false,
             #[cfg(test)]
             fail_placement_receipt_verification_once: false,
+            #[cfg(test)]
+            fail_replicated_repair_after_generation_allocation_once: false,
+            #[cfg(test)]
+            fail_replicated_repair_after_reclaim_intent_once: false,
+            #[cfg(test)]
+            fail_replicated_repair_after_receipt_publication_once: false,
         };
 
         // Locked imports cannot decode encrypted placement or deletion
@@ -4715,6 +4925,16 @@ impl Pool {
     }
 
     fn allocate_placement_receipt_generation(&mut self) -> Result<u64> {
+        let mut persistent_write_started = false;
+        self.allocate_placement_receipt_generation_reporting_writeback(
+            &mut persistent_write_started,
+        )
+    }
+
+    fn allocate_placement_receipt_generation_reporting_writeback(
+        &mut self,
+        persistent_write_started: &mut bool,
+    ) -> Result<u64> {
         let generation = self.next_placement_receipt_generation;
         if generation == 0 {
             self.ensure_receipt_generation_authority_converged()?;
@@ -4751,6 +4971,11 @@ impl Pool {
                     self.ensure_receipt_generation_authority_converged()?;
                 }
             }
+            // Reservation publication changes durable device authority even
+            // when the caller never reaches its later payload write. Mark the
+            // mutation boundary before entering the fallible publisher so a
+            // partial reservation cannot be reported as a no-write refusal.
+            *persistent_write_started = true;
             publish_receipt_generation_high_water(
                 &mut self.devices,
                 self.pool_guid,
@@ -6036,7 +6261,7 @@ impl Pool {
     fn obsolete_physical_placements(
         &self,
         receipt: &PlacementReceipt,
-    ) -> Vec<ObsoletePhysicalPlacement> {
+    ) -> Result<Vec<ObsoletePhysicalPlacement>> {
         let mut placements = BTreeSet::new();
         match receipt.policy {
             PoolRedundancyPolicy::Replicated { .. } => {
@@ -6044,9 +6269,14 @@ impl Pool {
                     let Some(device_index) = self.resolve_receipt_target(target) else {
                         continue;
                     };
+                    let object_key = receipt.object_key;
+                    let lifetime = self.devices[device_index]
+                        .store()
+                        .current_receipt_bound_physical_lifetime_pool_internal(object_key)?;
                     placements.insert(ObsoletePhysicalPlacement {
                         device_index,
-                        object_key: receipt.object_key,
+                        object_key,
+                        reclaim_object_id: lifetime.reclaim_object_id,
                     });
                 }
             }
@@ -6055,17 +6285,20 @@ impl Pool {
                     let Some(device_index) = self.resolve_receipt_target(target) else {
                         continue;
                     };
+                    let object_key =
+                        placement_shard_object_key(receipt.object_key, target.shard_index);
+                    let lifetime = self.devices[device_index]
+                        .store()
+                        .current_receipt_bound_physical_lifetime_pool_internal(object_key)?;
                     placements.insert(ObsoletePhysicalPlacement {
                         device_index,
-                        object_key: placement_shard_object_key(
-                            receipt.object_key,
-                            target.shard_index,
-                        ),
+                        object_key,
+                        reclaim_object_id: lifetime.reclaim_object_id,
                     });
                 }
             }
         }
-        placements.into_iter().collect()
+        Ok(placements.into_iter().collect())
     }
 
     fn persist_pending_obsolete_placements(
@@ -6073,20 +6306,34 @@ impl Pool {
         old_receipt: &PlacementReceipt,
         replacement_generation: u64,
     ) -> Result<Vec<ObsoletePhysicalPlacement>> {
-        let placements = self.obsolete_physical_placements(old_receipt);
-        for placement in &placements {
+        let placements = self.obsolete_physical_placements(old_receipt)?;
+        self.persist_pending_obsolete_placement_set(
+            &placements,
+            replacement_generation,
+            replacement_generation,
+        )?;
+        Ok(placements)
+    }
+
+    fn persist_pending_obsolete_placement_set(
+        &mut self,
+        placements: &[ObsoletePhysicalPlacement],
+        death_generation: u64,
+        enqueued_generation: u64,
+    ) -> Result<()> {
+        for placement in placements {
             let entry = DeadObjectEntry::new(
-                reclaim_object_key(placement.object_key),
+                placement.reclaim_object_id,
                 self.pool_guid,
-                replacement_generation,
+                death_generation,
                 true,
-                replacement_generation,
+                enqueued_generation,
             );
             self.devices[placement.device_index]
                 .store_mut()
                 .enqueue_pending_receipt_bound_dead_object_pool_internal(entry)?;
         }
-        Ok(placements)
+        Ok(())
     }
 
     fn attach_obsolete_placement_receipt(
@@ -6102,9 +6349,10 @@ impl Pool {
         }
 
         for placement in placements {
-            let object_id = reclaim_object_key(placement.object_key);
+            let object_id = placement.reclaim_object_id;
             let replacement = dead_object_replacement_receipt_for_object(
                 placement.object_key,
+                object_id,
                 replacement_receipt,
             )?;
             let _updated = self.devices[placement.device_index]
@@ -6120,11 +6368,17 @@ impl Pool {
         object_key: ObjectKey,
         replacement_receipt: &PlacementReceipt,
     ) -> Result<()> {
-        let replacement =
-            dead_object_replacement_receipt_for_object(object_key, replacement_receipt)?;
+        let lifetime = self.devices[device_index]
+            .store()
+            .current_receipt_bound_physical_lifetime_pool_internal(object_key)?;
+        let replacement = dead_object_replacement_receipt_for_object(
+            object_key,
+            lifetime.reclaim_object_id,
+            replacement_receipt,
+        )?;
         let death_txg = replacement.receipt_generation;
         let entry = DeadObjectEntry::new(
-            reclaim_object_key(object_key),
+            lifetime.reclaim_object_id,
             self.pool_guid,
             death_txg,
             true,
@@ -13849,7 +14103,7 @@ mod tests {
             .iter()
             .map(|target| reopened.resolve_receipt_target(target).unwrap())
             .collect();
-        let queued: usize = target_indices
+        let drained = target_indices
             .into_iter()
             .map(|idx| {
                 reopened.devices[idx]
@@ -13860,10 +14114,18 @@ mod tests {
                         16,
                     )
                     .expect("drain reloaded block reclaim")
-                    .reclaim_queue_depth
             })
-            .sum();
-        assert_eq!(queued, receipt.targets.len());
+            .collect::<Vec<_>>();
+        assert_eq!(
+            drained
+                .iter()
+                .map(|stats| stats.entries_processed)
+                .sum::<usize>(),
+            receipt.targets.len()
+        );
+        assert!(drained.iter().all(|stats| stats.reclaim_queue_depth == 0));
+        assert!(drained.iter().all(|stats| stats.segments_reclaimed == 0));
+        assert!(drained.iter().all(|stats| stats.blocks_freed == 0));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -15368,7 +15630,9 @@ mod tests {
         let (_, old_receipt) = pool
             .put_with_receipt(IoClass::Data, key, b"old payload")
             .unwrap();
-        let old_placements = pool.obsolete_physical_placements(&old_receipt);
+        let old_placements = pool
+            .obsolete_physical_placements(&old_receipt)
+            .expect("capture old physical placements");
         assert_eq!(old_placements.len(), 1);
         pool.fail_post_publication_reclaim_attachment_once = true;
 
@@ -15381,9 +15645,10 @@ mod tests {
             Some((replacement_payload.to_vec(), replacement_receipt.clone()))
         );
         for placement in &old_placements {
-            let object_id = reclaim_object_key(placement.object_key);
+            let object_id = placement.reclaim_object_id;
             let replacement = dead_object_replacement_receipt_for_object(
                 placement.object_key,
+                object_id,
                 &replacement_receipt,
             )
             .unwrap();
@@ -20452,5 +20717,2467 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    struct PendingReplicatedRepairFixture {
+        root: PathBuf,
+        pool: Pool,
+        key: ObjectKey,
+        payload: Vec<u8>,
+        predecessor: PlacementReceipt,
+        replacement: PlacementReceipt,
+        source_index: usize,
+        repaired_index: usize,
+    }
+
+    fn replicated_repair_pending_prepublication_fixture(
+        label: &str,
+    ) -> PendingReplicatedRepairFixture {
+        let root = temp_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(
+            multi_data_device_config(&root, 2),
+            properties,
+            &test_options(),
+        )
+        .unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(label.as_bytes());
+        let payload = format!("pending replicated repair fixture: {label}").into_bytes();
+        let (_, predecessor) = pool
+            .put_with_receipt(IoClass::Data, key, &payload)
+            .expect("publish predecessor repair receipt");
+        let source_index = pool
+            .resolve_receipt_target(&predecessor.targets[0])
+            .expect("resolve repair source");
+        let repaired_index = pool
+            .resolve_receipt_target(&predecessor.targets[1])
+            .expect("resolve repair target");
+        let mut corrupt = payload.clone();
+        corrupt[0] ^= 0x5a;
+        pool.devices[repaired_index]
+            .put(key, &corrupt)
+            .expect("corrupt pending repair target");
+        pool.devices[repaired_index]
+            .sync_strict_pool_authority()
+            .expect("sync pending repair corruption");
+        pool.fail_replicated_repair_after_reclaim_intent_once = true;
+        let failure = pool
+            .repair_current_replicated_target(
+                IoClass::Data,
+                key,
+                &predecessor,
+                predecessor.targets[0].device_index,
+                predecessor.targets[1].device_index,
+            )
+            .expect_err("fixture stops after the durable reclaim intent");
+        assert_eq!(
+            failure.receipt_publication,
+            ReplicatedRepairReceiptPublicationState::NotAttempted
+        );
+        let mut replacement = predecessor.clone();
+        replacement.generation = failure
+            .replacement_generation
+            .expect("pending repair owns a burned replacement generation");
+        assert!(replacement.generation > predecessor.generation);
+        assert_replicated_repair_receipt_copies(&pool, &predecessor);
+        PendingReplicatedRepairFixture {
+            root,
+            pool,
+            key,
+            payload,
+            predecessor,
+            replacement,
+            source_index,
+            repaired_index,
+        }
+    }
+
+    fn replicated_repair_pending_postpublication_fixture(
+        label: &str,
+    ) -> PendingReplicatedRepairFixture {
+        let root = temp_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(
+            multi_data_device_config(&root, 2),
+            properties,
+            &test_options(),
+        )
+        .unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(label.as_bytes());
+        let payload = format!("published pending replicated repair: {label}").into_bytes();
+        let (_, predecessor) = pool
+            .put_with_receipt(IoClass::Data, key, &payload)
+            .expect("publish predecessor repair receipt");
+        let source_index = pool
+            .resolve_receipt_target(&predecessor.targets[0])
+            .expect("resolve repair source");
+        let repaired_index = pool
+            .resolve_receipt_target(&predecessor.targets[1])
+            .expect("resolve repair target");
+        let mut corrupt = payload.clone();
+        corrupt[0] ^= 0x5a;
+        pool.devices[repaired_index]
+            .put(key, &corrupt)
+            .expect("corrupt repair target before publication");
+        pool.devices[repaired_index]
+            .sync_strict_pool_authority()
+            .expect("sync repair target corruption");
+        pool.fail_replicated_repair_after_receipt_publication_once = true;
+        let failure = pool
+            .repair_current_replicated_target(
+                IoClass::Data,
+                key,
+                &predecessor,
+                predecessor.targets[0].device_index,
+                predecessor.targets[1].device_index,
+            )
+            .expect_err("fixture stops after replacement receipt publication");
+        assert_eq!(
+            failure.receipt_publication,
+            ReplicatedRepairReceiptPublicationState::Completed
+        );
+        let mut replacement = predecessor.clone();
+        replacement.generation = failure
+            .replacement_generation
+            .expect("published repair reports its replacement generation");
+        assert_replicated_repair_receipt_copies(&pool, &replacement);
+        PendingReplicatedRepairFixture {
+            root,
+            pool,
+            key,
+            payload,
+            predecessor,
+            replacement,
+            source_index,
+            repaired_index,
+        }
+    }
+
+    fn assert_replicated_repair_receipt_copies(pool: &Pool, expected: &PlacementReceipt) {
+        let receipt_key = placement_receipt_object_key(expected.object_key);
+        let encoded = expected.encode().expect("encode expected repair receipt");
+        for &index in pool.class_map.get(IoClass::Data) {
+            let visible = pool.devices[index]
+                .get(receipt_key)
+                .expect("read visible repair receipt")
+                .expect("repair receipt remains visible");
+            assert_eq!(
+                visible, encoded,
+                "visible receipt differs on carrier {index}"
+            );
+            let physical = pool.devices[index]
+                .placement_receipt_candidates()
+                .expect("scan physical repair receipt copies")
+                .into_iter()
+                .filter(|(key, _)| *key == receipt_key)
+                .map(|(_, payload)| payload)
+                .collect::<Vec<_>>();
+            assert!(
+                !physical.is_empty(),
+                "carrier {index} must retain a physical receipt copy"
+            );
+            assert!(
+                physical.iter().all(|payload| payload == &encoded),
+                "carrier {index} has a non-converged physical receipt copy"
+            );
+        }
+    }
+
+    fn replicated_repair_payload_locations(
+        pool: &Pool,
+        key: ObjectKey,
+    ) -> Vec<Option<ObjectLocation>> {
+        pool.devices
+            .iter()
+            .map(|device| device.store().location_of(key))
+            .collect()
+    }
+
+    fn assert_completed_pending_replicated_repair(
+        fixture: &PendingReplicatedRepairFixture,
+        completed: &ReplicatedRepairReconciliationEvidence,
+    ) {
+        assert_eq!(
+            completed.embedded_predecessor_generation,
+            fixture.predecessor.generation
+        );
+        assert_eq!(completed.current_receipt, fixture.replacement);
+        assert_eq!(completed.repaired_target, fixture.predecessor.targets[1]);
+        assert!(completed.replacement_receipt_attached);
+        assert_eq!(
+            fixture
+                .pool
+                .replicated_repair_reconciliation_evidence(
+                    IoClass::Data,
+                    fixture.key,
+                    fixture.predecessor.generation,
+                )
+                .expect("read completed repair reconciliation evidence"),
+            Some(completed.clone())
+        );
+        assert_replicated_repair_receipt_copies(&fixture.pool, &fixture.replacement);
+        let targets = fixture
+            .pool
+            .replicated_receipt_evidence(IoClass::Data, fixture.key)
+            .expect("read completed repair target evidence")
+            .expect("completed repair receipt exists");
+        assert_eq!(targets.receipt, fixture.replacement);
+        assert!(targets
+            .targets
+            .iter()
+            .all(|target| matches!(target.outcome, ReplicatedTargetReadOutcome::Clean)));
+        assert!(fixture
+            .pool
+            .pending_replicated_repair_recovery_evidence(IoClass::Data)
+            .expect("rescan completed pending repairs")
+            .is_none());
+    }
+
+    #[test]
+    fn replicated_repair_recovery_completes_all_predecessor_copies_with_bad_target() {
+        let mut fixture = replicated_repair_pending_prepublication_fixture(
+            "replicated-repair-recovery-all-predecessor-bad",
+        );
+        let discovered = fixture
+            .pool
+            .pending_replicated_repair_recovery_evidence(IoClass::Data)
+            .expect("discover all-predecessor pending repair")
+            .expect("pending repair evidence");
+        assert_eq!(
+            discovered.receipt_copies,
+            PendingReplicatedRepairReceiptCopies::Predecessor
+        );
+        assert_eq!(
+            discovered.target_state,
+            PendingReplicatedRepairTargetState::NeedsRewrite
+        );
+        assert_eq!(discovered.predecessor_receipt, fixture.predecessor);
+        assert_eq!(discovered.replacement_receipt, fixture.replacement);
+        assert_eq!(discovered.clean_source, fixture.predecessor.targets[0]);
+        assert_eq!(discovered.repaired_target, fixture.predecessor.targets[1]);
+        let locations_before = replicated_repair_payload_locations(&fixture.pool, fixture.key);
+
+        let completed = fixture
+            .pool
+            .complete_pending_replicated_repair_before_owner(IoClass::Data, &discovered)
+            .expect("complete bad pending repair target");
+
+        let locations_after = replicated_repair_payload_locations(&fixture.pool, fixture.key);
+        for (index, before) in locations_before.iter().enumerate() {
+            if index == fixture.repaired_index {
+                assert_ne!(
+                    &locations_after[index], before,
+                    "bad pending target must be rewritten exactly once"
+                );
+            } else {
+                assert_eq!(
+                    &locations_after[index], before,
+                    "completion must not rewrite an unrelated target"
+                );
+            }
+        }
+        assert_eq!(
+            fixture.pool.devices[fixture.source_index]
+                .get(fixture.key)
+                .unwrap(),
+            Some(fixture.payload.clone())
+        );
+        assert_completed_pending_replicated_repair(&fixture, &completed);
+        let root = fixture.root.clone();
+        drop(fixture);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replicated_repair_recovery_publishes_all_predecessor_copies_with_clean_target() {
+        let mut fixture = replicated_repair_pending_prepublication_fixture(
+            "replicated-repair-recovery-all-predecessor-clean",
+        );
+        fixture.pool.devices[fixture.repaired_index]
+            .put(fixture.key, &fixture.payload)
+            .expect("simulate completed target write before crash");
+        fixture.pool.devices[fixture.repaired_index]
+            .sync_strict_pool_authority()
+            .expect("sync simulated completed target write");
+        let discovered = fixture
+            .pool
+            .pending_replicated_repair_recovery_evidence(IoClass::Data)
+            .expect("discover clean all-predecessor repair")
+            .expect("pending repair evidence");
+        assert_eq!(
+            discovered.receipt_copies,
+            PendingReplicatedRepairReceiptCopies::Predecessor
+        );
+        assert_eq!(
+            discovered.target_state,
+            PendingReplicatedRepairTargetState::Clean
+        );
+        let locations_before = replicated_repair_payload_locations(&fixture.pool, fixture.key);
+
+        let completed = fixture
+            .pool
+            .complete_pending_replicated_repair_before_owner(IoClass::Data, &discovered)
+            .expect("publish burned generation for already-clean target");
+
+        assert_eq!(
+            replicated_repair_payload_locations(&fixture.pool, fixture.key),
+            locations_before,
+            "already-clean completion must not rewrite either target"
+        );
+        assert_completed_pending_replicated_repair(&fixture, &completed);
+        let root = fixture.root.clone();
+        drop(fixture);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replicated_repair_recovery_converges_mixed_receipt_copies_without_payload_rewrite() {
+        let mut fixture = replicated_repair_pending_prepublication_fixture(
+            "replicated-repair-recovery-mixed-copies",
+        );
+        fixture.pool.devices[fixture.repaired_index]
+            .put(fixture.key, &fixture.payload)
+            .expect("simulate completed target write before partial publication");
+        fixture.pool.devices[fixture.repaired_index]
+            .sync_strict_pool_authority()
+            .expect("sync simulated completed target write");
+        let receipt_key = placement_receipt_object_key(fixture.key);
+        fixture.pool.devices[fixture.source_index]
+            .put_pool_internal(receipt_key, &fixture.replacement.encode().unwrap())
+            .expect("publish one replacement receipt carrier");
+        fixture.pool.devices[fixture.source_index]
+            .sync_strict_pool_authority()
+            .expect("sync one replacement receipt carrier");
+        let discovered = fixture
+            .pool
+            .pending_replicated_repair_recovery_evidence(IoClass::Data)
+            .expect("discover mixed repair receipt copies")
+            .expect("mixed pending repair evidence");
+        assert_eq!(
+            discovered.receipt_copies,
+            PendingReplicatedRepairReceiptCopies::Mixed
+        );
+        assert_eq!(
+            discovered.target_state,
+            PendingReplicatedRepairTargetState::Clean
+        );
+        let locations_before = replicated_repair_payload_locations(&fixture.pool, fixture.key);
+
+        let completed = fixture
+            .pool
+            .complete_pending_replicated_repair_before_owner(IoClass::Data, &discovered)
+            .expect("converge mixed repair receipt copies");
+
+        assert_eq!(
+            replicated_repair_payload_locations(&fixture.pool, fixture.key),
+            locations_before,
+            "mixed receipt convergence must not rewrite either clean target"
+        );
+        assert_completed_pending_replicated_repair(&fixture, &completed);
+        let root = fixture.root.clone();
+        drop(fixture);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replicated_repair_recovery_attaches_all_replacement_copies_without_payload_rewrite() {
+        let mut fixture = replicated_repair_pending_postpublication_fixture(
+            "replicated-repair-recovery-all-replacement-clean",
+        );
+        let discovered = fixture
+            .pool
+            .pending_replicated_repair_recovery_evidence(IoClass::Data)
+            .expect("discover fully published pending repair")
+            .expect("published pending repair evidence");
+        assert_eq!(
+            discovered.receipt_copies,
+            PendingReplicatedRepairReceiptCopies::Replacement
+        );
+        assert_eq!(
+            discovered.target_state,
+            PendingReplicatedRepairTargetState::Clean
+        );
+        let locations_before = replicated_repair_payload_locations(&fixture.pool, fixture.key);
+
+        let completed = fixture
+            .pool
+            .complete_pending_replicated_repair_before_owner(IoClass::Data, &discovered)
+            .expect("attach fully published pending repair");
+
+        assert_eq!(
+            replicated_repair_payload_locations(&fixture.pool, fixture.key),
+            locations_before,
+            "attachment-only completion must not rewrite either target"
+        );
+        assert_completed_pending_replicated_repair(&fixture, &completed);
+        let root = fixture.root.clone();
+        drop(fixture);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replicated_repair_recovery_refuses_new_corruption_after_full_publication() {
+        let mut fixture = replicated_repair_pending_postpublication_fixture(
+            "replicated-repair-recovery-all-replacement-corrupt",
+        );
+        let mut corrupt = fixture.payload.clone();
+        corrupt[0] ^= 0xa5;
+        fixture.pool.devices[fixture.repaired_index]
+            .put(fixture.key, &corrupt)
+            .expect("inject new corruption after full receipt publication");
+        fixture.pool.devices[fixture.repaired_index]
+            .sync_strict_pool_authority()
+            .expect("sync post-publication corruption");
+        let locations_before = replicated_repair_payload_locations(&fixture.pool, fixture.key);
+
+        assert_invalid_options_reason_contains(
+            fixture
+                .pool
+                .pending_replicated_repair_recovery_evidence(IoClass::Data),
+            "fully published repair receipt has new target corruption",
+        );
+
+        assert_eq!(
+            replicated_repair_payload_locations(&fixture.pool, fixture.key),
+            locations_before,
+            "post-publication refusal must not mutate either target"
+        );
+        assert_replicated_repair_receipt_copies(&fixture.pool, &fixture.replacement);
+        let root = fixture.root.clone();
+        drop(fixture);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replicated_repair_recovery_refuses_opposite_target_failure() {
+        let mut fixture = replicated_repair_pending_prepublication_fixture(
+            "replicated-repair-recovery-opposite-target-failure",
+        );
+        fixture.pool.devices[fixture.repaired_index]
+            .put(fixture.key, &fixture.payload)
+            .expect("simulate clean pending target before source failure");
+        fixture.pool.devices[fixture.repaired_index]
+            .sync_strict_pool_authority()
+            .expect("sync clean pending target");
+        let mut corrupt_source = fixture.payload.clone();
+        corrupt_source[0] ^= 0x3c;
+        fixture.pool.devices[fixture.source_index]
+            .put(fixture.key, &corrupt_source)
+            .expect("inject opposite-target failure");
+        fixture.pool.devices[fixture.source_index]
+            .sync_strict_pool_authority()
+            .expect("sync opposite-target failure");
+        let locations_before = replicated_repair_payload_locations(&fixture.pool, fixture.key);
+
+        assert_invalid_options_reason_contains(
+            fixture
+                .pool
+                .pending_replicated_repair_recovery_evidence(IoClass::Data),
+            "pending replicated repair has a second failed target",
+        );
+
+        assert_eq!(
+            replicated_repair_payload_locations(&fixture.pool, fixture.key),
+            locations_before,
+            "opposite-target refusal must not mutate either target"
+        );
+        assert_replicated_repair_receipt_copies(&fixture.pool, &fixture.predecessor);
+        let root = fixture.root.clone();
+        drop(fixture);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replicated_repair_requires_current_two_copy_pool_policy() {
+        let root = temp_dir("replicated-repair-current-pool-policy");
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(3),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(
+            multi_data_device_config(&root, 3),
+            properties,
+            &test_options(),
+        )
+        .unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"replicated-repair-current-pool-policy");
+        pool.put(IoClass::Data, key, b"three-copy policy payload")
+            .unwrap();
+
+        assert_invalid_options_reason_contains(
+            pool.replicated_receipt_evidence(IoClass::Data, key),
+            "exact two-copy current pool policy",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replicated_repair_in_three_member_pool_changes_only_corrupt_target() {
+        let root = temp_dir("replicated-repair-current-receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(
+            multi_data_device_config(&root, 3),
+            properties,
+            &test_options(),
+        )
+        .unwrap();
+        set_deterministic_device_guids(&mut pool);
+        pool.put_with_receipt(
+            IoClass::Data,
+            ObjectKey::from_name(b"replicated-repair-predecessor-generation-primer"),
+            b"advance the global receipt allocator before the repair fixture",
+        )
+        .unwrap();
+        let key = ObjectKey::from_name(b"replicated-repair-current-receipt");
+        let payload = b"receipt-authorized repair payload";
+        let (_, receipt) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        assert_eq!(pool.class_map.get(IoClass::Data).len(), 3);
+        assert_eq!(receipt.targets.len(), 2);
+        let source_device_index = receipt.targets[0].device_index;
+        let corrupt_device_index = receipt.targets[1].device_index;
+        let corrupt_idx = pool.resolve_receipt_target(&receipt.targets[1]).unwrap();
+        let source_idx = pool.resolve_receipt_target(&receipt.targets[0]).unwrap();
+        let non_target_idx = (0..pool.devices.len())
+            .find(|idx| *idx != source_idx && *idx != corrupt_idx)
+            .expect("three-member pool has one non-target receipt carrier");
+        assert_eq!(pool.devices[non_target_idx].get(key).unwrap(), None);
+        let mut corrupt = payload.to_vec();
+        corrupt[0] ^= 0x5a;
+        pool.devices[corrupt_idx].put(key, &corrupt).unwrap();
+        let locations_before_repair = pool
+            .devices
+            .iter()
+            .map(|device| device.store().location_of(key))
+            .collect::<Vec<_>>();
+
+        let before = pool
+            .replicated_receipt_evidence(IoClass::Data, key)
+            .unwrap()
+            .expect("current receipt evidence");
+        assert_eq!(before.receipt, receipt);
+        assert!(matches!(
+            before
+                .targets
+                .iter()
+                .find(|target| target.target.device_index == source_device_index)
+                .unwrap()
+                .outcome,
+            ReplicatedTargetReadOutcome::Clean
+        ));
+        assert!(matches!(
+            before
+                .targets
+                .iter()
+                .find(|target| target.target.device_index == corrupt_device_index)
+                .unwrap()
+                .outcome,
+            ReplicatedTargetReadOutcome::Corrupt { .. }
+        ));
+
+        let repaired = pool
+            .repair_current_replicated_target(
+                IoClass::Data,
+                key,
+                &receipt,
+                source_device_index,
+                corrupt_device_index,
+            )
+            .unwrap();
+        assert_eq!(repaired.previous_receipt, receipt);
+        assert!(repaired.replacement_receipt.generation > receipt.generation);
+        assert_eq!(
+            repaired.replacement_receipt.targets, receipt.targets,
+            "target-only repair must retain the exact physical target set"
+        );
+        assert_eq!(repaired.source_device_index, source_device_index);
+        assert_eq!(repaired.repaired_device_index, corrupt_device_index);
+        for (idx, location_before) in locations_before_repair.iter().enumerate() {
+            let location_after = pool.devices[idx].store().location_of(key);
+            if idx == corrupt_idx {
+                assert_ne!(
+                    &location_after, location_before,
+                    "targeted repair must replace the post-corruption target location"
+                );
+            } else {
+                assert_eq!(
+                    &location_after, location_before,
+                    "targeted repair must not rewrite a clean or non-target payload"
+                );
+            }
+        }
+        assert_eq!(pool.devices[non_target_idx].get(key).unwrap(), None);
+        let reconciliation = pool
+            .replicated_repair_reconciliation_evidence(IoClass::Data, key, receipt.generation)
+            .unwrap()
+            .expect("successful target-only repair retains reconciliation evidence");
+        assert_eq!(
+            reconciliation.embedded_predecessor_generation,
+            receipt.generation
+        );
+        assert_eq!(
+            pool.replicated_repair_reconciliation_evidence(
+                IoClass::Data,
+                key,
+                receipt.generation - 1,
+            )
+            .unwrap(),
+            None,
+            "durable target-only evidence must reject any other lower generation"
+        );
+        assert_eq!(reconciliation.current_receipt, repaired.replacement_receipt);
+        assert_eq!(
+            reconciliation.repaired_target.device_index,
+            corrupt_device_index
+        );
+        assert!(reconciliation.replacement_receipt_attached);
+        for idx in 0..pool.devices.len() {
+            let reclaim = pool.devices[idx]
+                .store_mut()
+                .drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
+                    u64::MAX,
+                    repaired.replacement_receipt.generation,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(
+                reclaim.reclaim_queue_depth,
+                if idx == corrupt_idx { 1 } else { 0 },
+                "only the corrupt payload target may enter receipt-bound reclaim"
+            );
+        }
+        assert_eq!(
+            pool.get_with_current_receipt(IoClass::Data, key)
+                .unwrap()
+                .map(|(payload, _)| payload),
+            Some(payload.to_vec())
+        );
+        let after = pool
+            .replicated_receipt_evidence(IoClass::Data, key)
+            .unwrap()
+            .expect("replacement receipt evidence");
+        assert!(after
+            .targets
+            .iter()
+            .all(|target| matches!(target.outcome, ReplicatedTargetReadOutcome::Clean)));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replicated_repair_refuses_without_one_clean_target() {
+        let root = temp_dir("replicated-repair-no-clean-target");
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(
+            multi_data_device_config(&root, 2),
+            properties,
+            &test_options(),
+        )
+        .unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"replicated-repair-no-clean-target");
+        let payload = b"both replicas lose source authority";
+        let (_, receipt) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        for (position, target) in receipt.targets.iter().enumerate() {
+            let idx = pool.resolve_receipt_target(target).unwrap();
+            let mut corrupt = payload.to_vec();
+            corrupt[0] ^= (position as u8) + 1;
+            pool.devices[idx].put(key, &corrupt).unwrap();
+        }
+        let payloads_before = pool
+            .devices
+            .iter()
+            .map(|device| device.get(key).unwrap())
+            .collect::<Vec<_>>();
+        let error = pool
+            .repair_current_replicated_target(
+                IoClass::Data,
+                key,
+                &receipt,
+                receipt.targets[0].device_index,
+                receipt.targets[1].device_index,
+            )
+            .unwrap_err();
+        assert!(!error.writeback_started);
+        assert_eq!(error.replacement_generation, None);
+        assert_eq!(
+            error.receipt_publication,
+            ReplicatedRepairReceiptPublicationState::NotAttempted
+        );
+        assert!(matches!(
+            &error.error,
+            StoreError::InvalidOptions {
+                reason: "replicated repair selected source is not receipt-clean"
+            }
+        ));
+        assert_eq!(
+            pool.devices
+                .iter()
+                .map(|device| device.get(key).unwrap())
+                .collect::<Vec<_>>(),
+            payloads_before,
+            "refused repair must not mutate either target"
+        );
+        assert_eq!(
+            pool.placement_receipt_for_key(IoClass::Data, key).unwrap(),
+            Some(receipt)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replicated_repair_can_repair_the_same_target_again() {
+        let root = temp_dir("replicated-repair-same-target-again");
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(
+            multi_data_device_config(&root, 2),
+            properties,
+            &test_options(),
+        )
+        .unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"replicated-repair-same-target-again");
+        let payload = b"one physical target may fail more than once";
+        let (_, first_receipt) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        let source_device_index = first_receipt.targets[0].device_index;
+        let corrupt_device_index = first_receipt.targets[1].device_index;
+        let corrupt_idx = pool
+            .resolve_receipt_target(&first_receipt.targets[1])
+            .unwrap();
+
+        let mut corrupt = payload.to_vec();
+        corrupt[0] ^= 0x5a;
+        pool.devices[corrupt_idx].put(key, &corrupt).unwrap();
+        let first_repair = pool
+            .repair_current_replicated_target(
+                IoClass::Data,
+                key,
+                &first_receipt,
+                source_device_index,
+                corrupt_device_index,
+            )
+            .expect("first target repair");
+
+        let mut corrupt_again = payload.to_vec();
+        corrupt_again[0] ^= 0xa5;
+        pool.devices[corrupt_idx].put(key, &corrupt_again).unwrap();
+        let second_repair = pool
+            .repair_current_replicated_target(
+                IoClass::Data,
+                key,
+                &first_repair.replacement_receipt,
+                source_device_index,
+                corrupt_device_index,
+            )
+            .expect("second repair preserves a second exact target lifetime");
+
+        assert!(
+            second_repair.replacement_receipt.generation
+                > first_repair.replacement_receipt.generation
+        );
+        assert_eq!(
+            pool.devices[corrupt_idx].get(key).unwrap(),
+            Some(payload.to_vec())
+        );
+        assert_eq!(
+            pool.replicated_repair_reconciliation_evidence(
+                IoClass::Data,
+                key,
+                first_repair.replacement_receipt.generation,
+            )
+            .unwrap()
+            .map(|evidence| evidence.current_receipt),
+            Some(second_repair.replacement_receipt.clone())
+        );
+        assert_eq!(
+            pool.replicated_repair_reconciliation_evidence(
+                IoClass::Data,
+                key,
+                first_receipt.generation,
+            )
+            .unwrap(),
+            None,
+            "newer transition evidence must not impersonate the retired transition"
+        );
+        let reclaim_rows = pool.devices[corrupt_idx]
+            .store()
+            .receipt_bound_dead_object_lifetimes_for_logical_key_pool_internal(key)
+            .expect("resolve same-key repair lifetimes");
+        assert_eq!(reclaim_rows.len(), 2);
+        assert_ne!(reclaim_rows[0].0.object_id, reclaim_rows[1].0.object_id);
+        assert_ne!(reclaim_rows[0].1.location, reclaim_rows[1].1.location);
+        assert!(reclaim_rows
+            .iter()
+            .all(|(entry, _)| entry.replacement_receipt.is_some()));
+        let reclaim = pool.devices[corrupt_idx]
+            .store_mut()
+            .drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
+                u64::MAX,
+                second_repair.replacement_receipt.generation,
+                0,
+            )
+            .unwrap();
+        assert_eq!(reclaim.reclaim_queue_depth, 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replicated_repair_generation_reservation_failure_reports_writeback() {
+        let root = temp_dir("replicated-repair-generation-reservation-writeback");
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(
+            multi_data_device_config(&root, 2),
+            properties,
+            &test_options(),
+        )
+        .unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"replicated-repair-generation-reservation-writeback");
+        let payload = b"generation reservation is durable repair writeback";
+        let (_, receipt) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        let corrupt_idx = pool.resolve_receipt_target(&receipt.targets[1]).unwrap();
+        let mut corrupt = payload.to_vec();
+        corrupt[0] ^= 0x5a;
+        pool.devices[corrupt_idx].put(key, &corrupt).unwrap();
+
+        let reserved_before = pool.reserved_placement_receipt_generation_through;
+        pool.next_placement_receipt_generation = reserved_before + 1;
+        pool.fail_replicated_repair_after_generation_allocation_once = true;
+        let error = pool
+            .repair_current_replicated_target(
+                IoClass::Data,
+                key,
+                &receipt,
+                receipt.targets[0].device_index,
+                receipt.targets[1].device_index,
+            )
+            .unwrap_err();
+
+        assert!(error.writeback_started);
+        assert_eq!(error.replacement_generation, Some(reserved_before + 1));
+        assert!(pool.reserved_placement_receipt_generation_through > reserved_before);
+        assert_eq!(
+            error.receipt_publication,
+            ReplicatedRepairReceiptPublicationState::NotAttempted
+        );
+        assert!(matches!(
+            error.error,
+            StoreError::InvalidOptions {
+                reason: "test fault: replicated repair failed after generation allocation"
+            }
+        ));
+        assert_eq!(pool.devices[corrupt_idx].get(key).unwrap(), Some(corrupt));
+        assert_eq!(
+            pool.placement_receipt_for_key(IoClass::Data, key).unwrap(),
+            Some(receipt)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replicated_repair_failure_after_reclaim_intent_reports_writeback_started() {
+        let root = temp_dir("replicated-repair-after-reclaim-intent");
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(
+            multi_data_device_config(&root, 2),
+            properties,
+            &test_options(),
+        )
+        .unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"replicated-repair-after-reclaim-intent");
+        let payload = b"reclaim intent is persistent repair writeback";
+        let (_, receipt) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        let source_idx = pool.resolve_receipt_target(&receipt.targets[0]).unwrap();
+        let corrupt_idx = pool.resolve_receipt_target(&receipt.targets[1]).unwrap();
+        let mut corrupt = payload.to_vec();
+        corrupt[0] ^= 0x5a;
+        pool.devices[corrupt_idx].put(key, &corrupt).unwrap();
+        let locations_before_repair = pool
+            .devices
+            .iter()
+            .map(|device| device.store().location_of(key))
+            .collect::<Vec<_>>();
+        pool.fail_replicated_repair_after_reclaim_intent_once = true;
+
+        let error = pool
+            .repair_current_replicated_target(
+                IoClass::Data,
+                key,
+                &receipt,
+                receipt.targets[0].device_index,
+                receipt.targets[1].device_index,
+            )
+            .unwrap_err();
+        let replacement_generation = error
+            .replacement_generation
+            .expect("replacement generation allocated before reclaim intent");
+        assert!(error.writeback_started);
+        assert!(replacement_generation > receipt.generation);
+        assert_eq!(
+            error.receipt_publication,
+            ReplicatedRepairReceiptPublicationState::NotAttempted
+        );
+        assert!(matches!(
+            &error.error,
+            StoreError::InvalidOptions {
+                reason: "test fault: replicated repair failed after reclaim intent"
+            }
+        ));
+        for (idx, location_before) in locations_before_repair.iter().enumerate() {
+            assert_eq!(
+                &pool.devices[idx].store().location_of(key),
+                location_before,
+                "reclaim-intent failure must precede payload replacement"
+            );
+        }
+        assert_eq!(
+            pool.devices[source_idx].get(key).unwrap(),
+            Some(payload.to_vec())
+        );
+        assert_eq!(pool.devices[corrupt_idx].get(key).unwrap(), Some(corrupt));
+        let reclaim = pool.devices[corrupt_idx]
+            .store_mut()
+            .drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
+                u64::MAX,
+                replacement_generation,
+                0,
+            )
+            .unwrap();
+        assert_eq!(reclaim.reclaim_queue_depth, 1);
+        assert_eq!(
+            pool.placement_receipt_for_key(IoClass::Data, key).unwrap(),
+            Some(receipt.clone())
+        );
+
+        let repaired = pool
+            .repair_current_replicated_target(
+                IoClass::Data,
+                key,
+                &receipt,
+                receipt.targets[0].device_index,
+                receipt.targets[1].device_index,
+            )
+            .expect("retry resumes the exact durable reclaim intent");
+        assert_eq!(
+            repaired.replacement_receipt.generation, replacement_generation,
+            "retry must reuse the generation owned by the pending transition"
+        );
+        assert_eq!(
+            pool.devices[source_idx].get(key).unwrap(),
+            Some(payload.to_vec())
+        );
+        assert_eq!(
+            pool.devices[corrupt_idx].get(key).unwrap(),
+            Some(payload.to_vec())
+        );
+        let reconciliation = pool
+            .replicated_repair_reconciliation_evidence(IoClass::Data, key, receipt.generation)
+            .unwrap()
+            .expect("resumed target repair retains exact reconciliation evidence");
+        assert_eq!(reconciliation.current_receipt, repaired.replacement_receipt);
+        assert!(reconciliation.replacement_receipt_attached);
+        let reclaim = pool.devices[corrupt_idx]
+            .store_mut()
+            .drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
+                u64::MAX,
+                replacement_generation,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            reclaim.reclaim_queue_depth, 1,
+            "resume must not allocate a second object-key reclaim row"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replicated_repair_receipt_publication_error_reports_uncertain() {
+        let root = temp_dir("replicated-repair-publication-uncertain");
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(
+            multi_data_device_config(&root, 2),
+            properties,
+            &test_options(),
+        )
+        .unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"replicated-repair-publication-uncertain");
+        let payload = b"target bytes can change before publication fails";
+        let (_, receipt) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        let source_idx = pool.resolve_receipt_target(&receipt.targets[0]).unwrap();
+        let corrupt_idx = pool.resolve_receipt_target(&receipt.targets[1]).unwrap();
+        let mut corrupt = payload.to_vec();
+        corrupt[0] ^= 0x5a;
+        pool.devices[corrupt_idx].put(key, &corrupt).unwrap();
+        let source_location_before = pool.devices[source_idx].store().location_of(key);
+        let corrupt_location_before = pool.devices[corrupt_idx].store().location_of(key);
+        pool.fail_placement_receipt_verification_once = true;
+
+        let error = pool
+            .repair_current_replicated_target(
+                IoClass::Data,
+                key,
+                &receipt,
+                receipt.targets[0].device_index,
+                receipt.targets[1].device_index,
+            )
+            .unwrap_err();
+        let replacement_generation = error
+            .replacement_generation
+            .expect("replacement generation allocated before target writeback");
+        assert!(error.writeback_started);
+        assert!(replacement_generation > receipt.generation);
+        assert_eq!(
+            error.receipt_publication,
+            ReplicatedRepairReceiptPublicationState::Uncertain
+        );
+        assert!(matches!(
+            &error.error,
+            StoreError::InvalidOptions {
+                reason: "test fault: placement receipt verification failed"
+            }
+        ));
+        assert_eq!(
+            pool.devices[source_idx].store().location_of(key),
+            source_location_before
+        );
+        assert_ne!(
+            pool.devices[corrupt_idx].store().location_of(key),
+            corrupt_location_before,
+            "target writeback must remain visible even though publication returned an error"
+        );
+        assert_eq!(
+            pool.get_with_current_receipt(IoClass::Data, key).unwrap(),
+            Some((payload.to_vec(), receipt.clone()))
+        );
+        assert_eq!(
+            pool.placement_receipt_for_key(IoClass::Data, key).unwrap(),
+            Some(receipt)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replicated_repair_post_publication_error_reports_completed() {
+        let root = temp_dir("replicated-repair-publication-completed");
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let config = multi_data_device_config(&root, 2);
+        let options = test_options();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"replicated-repair-publication-completed");
+        let payload = b"published receipt remains authoritative after later failure";
+        let (_, receipt) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        let corrupt_idx = pool.resolve_receipt_target(&receipt.targets[1]).unwrap();
+        let mut corrupt = payload.to_vec();
+        corrupt[0] ^= 0x5a;
+        pool.devices[corrupt_idx].put(key, &corrupt).unwrap();
+        pool.fail_replicated_repair_after_receipt_publication_once = true;
+
+        let error = pool
+            .repair_current_replicated_target(
+                IoClass::Data,
+                key,
+                &receipt,
+                receipt.targets[0].device_index,
+                receipt.targets[1].device_index,
+            )
+            .unwrap_err();
+        let replacement_generation = error
+            .replacement_generation
+            .expect("published repair carries its replacement generation");
+        assert!(error.writeback_started);
+        assert!(replacement_generation > receipt.generation);
+        assert_eq!(
+            error.receipt_publication,
+            ReplicatedRepairReceiptPublicationState::Completed
+        );
+        assert!(matches!(
+            &error.error,
+            StoreError::InvalidOptions {
+                reason: "test fault: replicated repair failed after receipt publication"
+            }
+        ));
+        let (repaired_payload, current_receipt) = pool
+            .get_with_current_receipt(IoClass::Data, key)
+            .unwrap()
+            .expect("published replacement receipt remains current");
+        assert_eq!(repaired_payload, payload);
+        assert_eq!(current_receipt.generation, replacement_generation);
+        assert_eq!(
+            pool.placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .map(|current| current.generation),
+            Some(replacement_generation)
+        );
+        let reconciliation = pool
+            .replicated_repair_reconciliation_evidence(IoClass::Data, key, receipt.generation)
+            .unwrap()
+            .expect("published repair with pending attachment is resumable");
+        assert_eq!(
+            reconciliation.current_receipt.generation,
+            replacement_generation
+        );
+        assert_eq!(
+            reconciliation.repaired_target.device_index,
+            receipt.targets[1].device_index
+        );
+        assert!(!reconciliation.replacement_receipt_attached);
+        drop(pool);
+
+        let mut pool = Pool::open(config, properties, &options)
+            .expect("reopen published repair with pending reclaim attachment");
+        let reopened = pool
+            .replicated_repair_reconciliation_evidence(IoClass::Data, key, receipt.generation)
+            .unwrap()
+            .expect("pending repair attachment survives reopen");
+        assert_eq!(reopened, reconciliation);
+        let completed = pool
+            .complete_replicated_repair_reclaim_attachment(IoClass::Data, key, receipt.generation)
+            .unwrap()
+            .expect("exact published repair can complete pending reclaim attachment");
+        assert!(completed.replacement_receipt_attached);
+        assert_eq!(completed.current_receipt.generation, replacement_generation);
+        assert_eq!(
+            pool.complete_replicated_repair_reclaim_attachment(
+                IoClass::Data,
+                key,
+                receipt.generation,
+            )
+            .unwrap(),
+            Some(completed),
+            "reclaim attachment completion must be idempotent"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replicated_repair_reconciliation_refuses_ordinary_rewrite() {
+        let root = temp_dir("replicated-repair-reconciliation-ordinary-rewrite");
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(
+            multi_data_device_config(&root, 3),
+            properties,
+            &test_options(),
+        )
+        .unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"replicated-repair-reconciliation-ordinary-rewrite");
+        let payload = b"ordinary rewrite is not target-only repair evidence";
+        let (_, predecessor) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        let (_, current) = pool.put_with_receipt(IoClass::Data, key, payload).unwrap();
+        assert!(current.generation > predecessor.generation);
+
+        assert_eq!(
+            pool.replicated_repair_reconciliation_evidence(
+                IoClass::Data,
+                key,
+                predecessor.generation,
+            )
+            .unwrap(),
+            None,
+            "two-target ordinary rewrite reclaim evidence must not authorize repair retry"
+        );
+        assert_invalid_options_reason_contains(
+            pool.replicated_repair_reconciliation_evidence(IoClass::Data, key, 0),
+            "nonzero embedded predecessor generation",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exact replicated-target repair and interrupted-transition recovery
+// ---------------------------------------------------------------------------
+
+impl Pool {
+    /// Read every target of one exact current two-copy replicated receipt.
+    ///
+    /// This is the local Pool evidence boundary used before mounted repair.
+    /// It never falls back to receiptless device scanning and it keeps missing,
+    /// unreadable, and digest-mismatched targets distinct.
+    pub fn replicated_receipt_evidence(
+        &self,
+        class: IoClass,
+        key: ObjectKey,
+    ) -> Result<Option<ReplicatedReceiptEvidence>> {
+        if self.locked {
+            return Err(StoreError::InvalidOptions {
+                reason: "replicated repair evidence requires an unlocked pool",
+            });
+        }
+        if self.allocation_fenced_device_guid.is_some() {
+            return Err(StoreError::InvalidOptions {
+                reason: "replicated repair evidence refuses an active device lifecycle fence",
+            });
+        }
+        let exact_policy = PoolRedundancyPolicy::Replicated { copies: 2 };
+        if self.properties.redundancy_policy != exact_policy {
+            return Err(StoreError::InvalidOptions {
+                reason: "replicated repair requires an exact two-copy current pool policy",
+            });
+        }
+        let indices = self.class_map.get(class).to_vec();
+        if indices.len() < 2 {
+            return Err(StoreError::InvalidOptions {
+                reason: "replicated repair requires at least two current class members",
+            });
+        }
+        let Some(receipt) = self.load_current_placement_receipt_strict(&indices, key)? else {
+            return Ok(None);
+        };
+        if receipt.policy != exact_policy || receipt.targets.len() != 2 {
+            return Err(StoreError::InvalidOptions {
+                reason: "replicated repair requires an exact two-copy current receipt",
+            });
+        }
+        self.verify_strict_receipt_target_copies(&receipt)?;
+
+        self.replicated_receipt_evidence_for_exact_receipt(class, receipt)
+            .map(Some)
+    }
+
+    fn replicated_receipt_evidence_for_exact_receipt(
+        &self,
+        class: IoClass,
+        receipt: PlacementReceipt,
+    ) -> Result<ReplicatedReceiptEvidence> {
+        let exact_policy = PoolRedundancyPolicy::Replicated { copies: 2 };
+        if receipt.policy != exact_policy || receipt.targets.len() != 2 {
+            return Err(StoreError::InvalidOptions {
+                reason: "replicated repair recovery requires an exact two-copy receipt",
+            });
+        }
+        let indices = self.class_map.get(class).to_vec();
+        let mut targets = Vec::with_capacity(receipt.targets.len());
+        for target in &receipt.targets {
+            let Some(idx) = self.resolve_receipt_target(target) else {
+                targets.push(ReplicatedTargetEvidence {
+                    target: target.clone(),
+                    outcome: ReplicatedTargetReadOutcome::Missing,
+                    payload: None,
+                });
+                continue;
+            };
+            if !indices.contains(&idx) {
+                return Err(StoreError::InvalidOptions {
+                    reason: "replicated repair receipt target is outside the current class members",
+                });
+            }
+            let (outcome, payload) = match self.devices[idx].get(receipt.object_key) {
+                Ok(Some(payload)) => {
+                    let actual_digest = digest32(&payload);
+                    let actual_len = payload.len() as u64;
+                    let clean = actual_len == receipt.payload_len
+                        && actual_digest == receipt.payload_digest
+                        && actual_digest == target.stored_digest;
+                    if clean {
+                        (ReplicatedTargetReadOutcome::Clean, Some(payload))
+                    } else {
+                        (
+                            ReplicatedTargetReadOutcome::Corrupt {
+                                actual_len,
+                                actual_digest,
+                            },
+                            Some(payload),
+                        )
+                    }
+                }
+                Ok(None) => (ReplicatedTargetReadOutcome::Missing, None),
+                Err(_) => (ReplicatedTargetReadOutcome::Unreadable, None),
+            };
+            targets.push(ReplicatedTargetEvidence {
+                target: target.clone(),
+                outcome,
+                payload,
+            });
+        }
+        targets.sort_by_key(|target| target.target.device_index);
+        Ok(ReplicatedReceiptEvidence { receipt, targets })
+    }
+
+    /// Prove that a newer current receipt is the durable result of exactly one
+    /// target-only replicated repair whose filesystem root is not reconciled.
+    ///
+    /// General rewrites and receipt states without exact one-target reclaim
+    /// evidence return `None`; higher layers still authenticate the embedded
+    /// predecessor root whose generation they supply.
+    pub fn replicated_repair_reconciliation_evidence(
+        &self,
+        class: IoClass,
+        key: ObjectKey,
+        embedded_predecessor_generation: u64,
+    ) -> Result<Option<ReplicatedRepairReconciliationEvidence>> {
+        if embedded_predecessor_generation == 0 {
+            return Err(StoreError::InvalidOptions {
+                reason: "replicated repair reconciliation requires a nonzero embedded predecessor generation",
+            });
+        }
+        let Some(evidence) = self.replicated_receipt_evidence(class, key)? else {
+            return Ok(None);
+        };
+        if evidence.receipt.generation <= embedded_predecessor_generation
+            || evidence.targets.len() != 2
+            || !evidence
+                .targets
+                .iter()
+                .all(|target| matches!(target.outcome, ReplicatedTargetReadOutcome::Clean))
+        {
+            return Ok(None);
+        }
+
+        let mut entries = Vec::new();
+        for &idx in self.class_map.get(class) {
+            for (entry, lifetime) in self.devices[idx]
+                .store()
+                .receipt_bound_dead_object_lifetimes_for_logical_key_pool_internal(key)?
+            {
+                if entry.dataset_uuid == self.pool_guid
+                    && entry.eligible
+                    && entry.death_commit_group == evidence.receipt.generation
+                    && entry.enqueued_at_txg == embedded_predecessor_generation
+                {
+                    entries.push((idx, entry, lifetime));
+                }
+            }
+        }
+        let [(repaired_runtime_index, entry, lifetime)] = entries.as_slice() else {
+            return Ok(None);
+        };
+
+        let Some(repaired_target) = evidence
+            .receipt
+            .targets
+            .iter()
+            .find(|target| self.resolve_receipt_target(target) == Some(*repaired_runtime_index))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let replacement_receipt_attached = match entry.replacement_receipt {
+            None => false,
+            Some(attached)
+                if attached
+                    == dead_object_replacement_receipt_for_object(
+                        key,
+                        lifetime.reclaim_object_id,
+                        &evidence.receipt,
+                    )? =>
+            {
+                true
+            }
+            Some(_) => return Ok(None),
+        };
+
+        Ok(Some(ReplicatedRepairReconciliationEvidence {
+            embedded_predecessor_generation,
+            current_receipt: evidence.receipt,
+            repaired_target,
+            replacement_receipt_attached,
+            reclaim_object_id: entry.object_id,
+        }))
+    }
+
+    /// Discover every completed current-receipt repair transition that may
+    /// still be referenced by a predecessor filesystem root.
+    ///
+    /// Older attached rows remain ordinary reclaim history. Only a row whose
+    /// replacement generation is the exact current receipt can become
+    /// reconciliation work.
+    pub fn replicated_repair_reconciliation_evidence_all(
+        &self,
+        class: IoClass,
+    ) -> Result<Vec<(ObjectKey, ReplicatedRepairReconciliationEvidence)>> {
+        let mut pending_keys = BTreeSet::new();
+        for device in &self.devices {
+            for (entry, lifetime) in device
+                .store()
+                .receipt_bound_dead_object_physical_lifetimes_pool_internal()?
+            {
+                if entry.dataset_uuid == self.pool_guid
+                    && entry.eligible
+                    && entry.replacement_receipt.is_none()
+                    && entry.enqueued_at_txg < entry.death_commit_group
+                {
+                    pending_keys.insert(lifetime.logical_object_key);
+                }
+            }
+        }
+
+        let mut subjects = BTreeSet::new();
+        for &idx in self.class_map.get(class) {
+            for (entry, lifetime) in self.devices[idx]
+                .store()
+                .receipt_bound_dead_object_physical_lifetimes_pool_internal()?
+            {
+                if entry.dataset_uuid == self.pool_guid
+                    && entry.eligible
+                    && entry.replacement_receipt.is_some()
+                    && entry.enqueued_at_txg > 0
+                    && entry.enqueued_at_txg < entry.death_commit_group
+                    && !pending_keys.contains(&lifetime.logical_object_key)
+                {
+                    subjects.insert((lifetime.logical_object_key, entry.enqueued_at_txg));
+                }
+            }
+        }
+
+        let mut evidence = Vec::new();
+        for (object_key, embedded_generation) in subjects {
+            if let Some(candidate) = self.replicated_repair_reconciliation_evidence(
+                class,
+                object_key,
+                embedded_generation,
+            )? {
+                evidence.push((object_key, candidate));
+            }
+        }
+        evidence.sort_by_key(|(object_key, candidate)| {
+            (
+                *object_key,
+                candidate.embedded_predecessor_generation,
+                candidate.current_receipt.generation,
+            )
+        });
+        Ok(evidence)
+    }
+
+    /// Idempotently attach the current replacement receipt to the exact
+    /// target-only repair reclaim entry used for reconciliation-only retry.
+    ///
+    /// This never rewrites payload data or publishes a placement receipt.  It
+    /// succeeds only when [`Self::replicated_repair_reconciliation_evidence`]
+    /// first proves the exact predecessor-to-current transition and rechecks
+    /// that same evidence after the durable queue update.
+    pub fn complete_replicated_repair_reclaim_attachment(
+        &mut self,
+        class: IoClass,
+        key: ObjectKey,
+        embedded_predecessor_generation: u64,
+    ) -> Result<Option<ReplicatedRepairReconciliationEvidence>> {
+        self.ensure_writable("complete replicated repair reclaim attachment")?;
+        let Some(evidence) = self.replicated_repair_reconciliation_evidence(
+            class,
+            key,
+            embedded_predecessor_generation,
+        )?
+        else {
+            return Ok(None);
+        };
+        if evidence.replacement_receipt_attached {
+            return Ok(Some(evidence));
+        }
+
+        let repaired_index = self
+            .resolve_receipt_target(&evidence.repaired_target)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "replicated repair reconciliation target is no longer attached",
+            })?;
+        let obsolete_target = ObsoletePhysicalPlacement {
+            device_index: repaired_index,
+            object_key: key,
+            reclaim_object_id: evidence.reclaim_object_id,
+        };
+        self.attach_obsolete_placement_receipt(
+            std::slice::from_ref(&obsolete_target),
+            &evidence.current_receipt,
+        )?;
+
+        let Some(refreshed) = self.replicated_repair_reconciliation_evidence(
+            class,
+            key,
+            embedded_predecessor_generation,
+        )?
+        else {
+            return Err(StoreError::InvalidOptions {
+                reason:
+                    "replicated repair reconciliation evidence disappeared after reclaim attachment",
+            });
+        };
+        if !refreshed.replacement_receipt_attached
+            || refreshed.current_receipt != evidence.current_receipt
+            || refreshed.repaired_target != evidence.repaired_target
+            || refreshed.reclaim_object_id != evidence.reclaim_object_id
+        {
+            return Err(StoreError::InvalidOptions {
+                reason:
+                    "replicated repair reclaim attachment did not preserve exact repair evidence",
+            });
+        }
+        Ok(Some(refreshed))
+    }
+
+    /// Discover one interrupted target-only repair without changing media.
+    ///
+    /// The pending reclaim row binds predecessor generation `G`, burned
+    /// replacement generation `G2`, and one exact physical target. Receipt
+    /// carriers may all contain `G`, be split between `G` and `G2`, or all
+    /// contain `G2`; no other candidate is admitted. The returned evidence is
+    /// intentionally not mutation authority. A higher layer must authenticate
+    /// an exact predecessor filesystem root and object reference first.
+    pub fn pending_replicated_repair_recovery_evidence(
+        &self,
+        class: IoClass,
+    ) -> Result<Option<PendingReplicatedRepairRecoveryEvidence>> {
+        Ok(self
+            .pending_replicated_repair_recovery_evidence_all(class)?
+            .into_iter()
+            .next())
+    }
+
+    /// Discover every interrupted target-only repair in deterministic logical
+    /// object and exact physical-lifetime order without changing media.
+    pub fn pending_replicated_repair_recovery_evidence_all(
+        &self,
+        class: IoClass,
+    ) -> Result<Vec<PendingReplicatedRepairRecoveryEvidence>> {
+        if self.pending_device_removal_path()?.is_some()
+            || self.has_device_replacement_predecessor_resume()
+        {
+            return Err(StoreError::InvalidOptions {
+                reason:
+                    "pending replicated repair cannot recover during a device lifecycle transition",
+            });
+        }
+
+        let mut pending = Vec::new();
+        for (device_index, device) in self.devices.iter().enumerate() {
+            for (entry, lifetime) in device
+                .store()
+                .receipt_bound_dead_object_physical_lifetimes_pool_internal()?
+            {
+                if entry.dataset_uuid == self.pool_guid
+                    && entry.eligible
+                    && entry.replacement_receipt.is_none()
+                    && entry.enqueued_at_txg < entry.death_commit_group
+                {
+                    pending.push((device_index, entry, lifetime));
+                }
+            }
+        }
+        pending.sort_by_key(|(device_index, entry, lifetime)| {
+            (
+                lifetime.logical_object_key,
+                lifetime.reclaim_object_id,
+                entry.enqueued_at_txg,
+                entry.death_commit_group,
+                *device_index,
+            )
+        });
+        pending
+            .into_iter()
+            .map(|(pending_index, entry, lifetime)| {
+                self.pending_replicated_repair_recovery_evidence_for_row(
+                    class,
+                    pending_index,
+                    entry,
+                    lifetime,
+                )
+            })
+            .collect()
+    }
+
+    /// Stage one exact interrupted target-only repair for cross-crate crash
+    /// recovery tests.
+    ///
+    /// This is a fault-cut helper, not repair authority: it deliberately
+    /// stops before reclaim attachment and leaves the filesystem root
+    /// unreconciled. The caller must first corrupt `repaired_device_index`
+    /// under the exact current two-copy receipt. `Predecessor` leaves that
+    /// target corrupt and every receipt copy unchanged. `Mixed` rewrites the
+    /// target and publishes the replacement receipt on that carrier only.
+    /// `Replacement` rewrites the target and publishes the replacement on
+    /// every receipt carrier. All three forms durably enqueue the exact
+    /// predecessor physical lifetime first.
+    #[doc(hidden)]
+    pub fn stage_pending_replicated_repair_for_recovery_test(
+        &mut self,
+        class: IoClass,
+        key: ObjectKey,
+        source_device_index: u32,
+        repaired_device_index: u32,
+        receipt_copies: PendingReplicatedRepairReceiptCopies,
+    ) -> Result<PendingReplicatedRepairRecoveryEvidence> {
+        self.ensure_writable("stage pending replicated repair fault cut")?;
+        let evidence =
+            self.replicated_receipt_evidence(class, key)?
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "pending repair fault cut requires a current placement receipt",
+                })?;
+        let predecessor_receipt = evidence.receipt.clone();
+        if predecessor_receipt.policy != (PoolRedundancyPolicy::Replicated { copies: 2 })
+            || predecessor_receipt.targets.len() != 2
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending repair fault cut requires an exact two-copy receipt",
+            });
+        }
+
+        let source = evidence
+            .targets
+            .iter()
+            .find(|target| target.target.device_index == source_device_index)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "pending repair fault cut source is absent from the current receipt",
+            })?;
+        if !matches!(source.outcome, ReplicatedTargetReadOutcome::Clean) {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending repair fault cut source is not receipt-clean",
+            });
+        }
+        let source_payload = source.payload.clone().ok_or(StoreError::InvalidOptions {
+            reason: "pending repair fault cut source payload is absent",
+        })?;
+        let repaired = evidence
+            .targets
+            .iter()
+            .find(|target| target.target.device_index == repaired_device_index)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "pending repair fault cut target is absent from the current receipt",
+            })?;
+        if !matches!(
+            repaired.outcome,
+            ReplicatedTargetReadOutcome::Corrupt { .. } | ReplicatedTargetReadOutcome::Unreadable
+        ) {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending repair fault cut target is not corrupt or unreadable",
+            });
+        }
+
+        let source_index =
+            self.resolve_receipt_target(&source.target)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "pending repair fault cut source is no longer attached",
+                })?;
+        let repaired_index =
+            self.resolve_receipt_target(&repaired.target)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "pending repair fault cut target is no longer attached",
+                })?;
+        let indices = self.class_map.get(class).to_vec();
+        if source_index == repaired_index
+            || !indices.contains(&source_index)
+            || !indices.contains(&repaired_index)
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending repair fault cut source or target is outside class authority",
+            });
+        }
+        if self
+            .pending_replicated_repair_recovery_evidence_all(class)?
+            .iter()
+            .any(|pending| pending.predecessor_receipt.object_key == key)
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending repair fault cut found an unfinished transition for this object",
+            });
+        }
+
+        let lifetime = self.devices[repaired_index]
+            .store()
+            .current_receipt_bound_physical_lifetime_pool_internal(key)?;
+        let mut writeback_started = false;
+        let replacement_generation =
+            self.allocate_placement_receipt_generation_reporting_writeback(&mut writeback_started)?;
+        let mut replacement_receipt = predecessor_receipt.clone();
+        replacement_receipt.generation = replacement_generation;
+        self.ensure_receipt_replay_authority(&replacement_receipt)?;
+        validate_strict_receipt_structure(&replacement_receipt)?;
+        let pending_entry = DeadObjectEntry::new(
+            lifetime.reclaim_object_id,
+            self.pool_guid,
+            replacement_generation,
+            true,
+            predecessor_receipt.generation,
+        );
+        if !self.devices[repaired_index]
+            .store_mut()
+            .enqueue_pending_receipt_bound_dead_object_pool_internal(pending_entry)?
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending repair fault cut collided with existing physical lifetime state",
+            });
+        }
+
+        if receipt_copies != PendingReplicatedRepairReceiptCopies::Predecessor {
+            self.devices[repaired_index].put(key, &source_payload)?;
+            self.devices[repaired_index].sync_strict_pool_authority()?;
+            match self.devices[repaired_index].get(key)? {
+                Some(payload)
+                    if payload == source_payload
+                        && payload.len() as u64 == replacement_receipt.payload_len
+                        && digest32(&payload) == replacement_receipt.payload_digest => {}
+                _ => {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "pending repair fault cut target rewrite did not verify",
+                    })
+                }
+            }
+        }
+
+        match receipt_copies {
+            PendingReplicatedRepairReceiptCopies::Predecessor => {}
+            PendingReplicatedRepairReceiptCopies::Mixed => {
+                let receipt_key = placement_receipt_object_key(key);
+                let encoded = replacement_receipt.encode()?;
+                self.devices[repaired_index].put_pool_internal(receipt_key, &encoded)?;
+                self.devices[repaired_index].sync_strict_pool_authority()?;
+            }
+            PendingReplicatedRepairReceiptCopies::Replacement => {
+                self.write_placement_receipt(&indices, &replacement_receipt)?;
+            }
+        }
+        self.sync_all()?;
+
+        let staged = self
+            .pending_replicated_repair_recovery_evidence_all(class)?
+            .into_iter()
+            .find(|pending| {
+                pending.predecessor_receipt.object_key == key
+                    && pending.predecessor_receipt.generation == predecessor_receipt.generation
+                    && pending.replacement_receipt.generation == replacement_generation
+            })
+            .ok_or(StoreError::InvalidOptions {
+                reason: "pending repair fault cut did not produce discoverable exact evidence",
+            })?;
+        if staged.receipt_copies != receipt_copies {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending repair fault cut did not preserve requested receipt-copy state",
+            });
+        }
+        Ok(staged)
+    }
+
+    fn pending_replicated_repair_recovery_evidence_for_row(
+        &self,
+        class: IoClass,
+        pending_index: usize,
+        entry: DeadObjectEntry,
+        lifetime: crate::store::ReceiptBoundPhysicalLifetime,
+    ) -> Result<PendingReplicatedRepairRecoveryEvidence> {
+        if entry.enqueued_at_txg == 0 || entry.death_commit_group == 0 {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending replicated repair has a zero receipt generation",
+            });
+        }
+
+        self.validate_loaded_receipt_generation_high_water()?;
+        if entry.death_commit_group > self.reserved_placement_receipt_generation_through {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending replicated repair exceeds durable receipt generation authority",
+            });
+        }
+
+        if lifetime.reclaim_object_id != entry.object_id
+            || lifetime.location.key != lifetime.logical_object_key
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending replicated repair has inconsistent physical lifetime identity",
+            });
+        }
+        let object_key = lifetime.logical_object_key;
+        let receipt_key = placement_receipt_object_key(object_key);
+        let indices = self.class_map.get(class).to_vec();
+        if indices.len() < 2 || !indices.contains(&pending_index) {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending replicated repair target is outside current class authority",
+            });
+        }
+
+        let mut predecessor = None;
+        let mut replacement = None;
+        let mut saw_predecessor = false;
+        let mut saw_replacement = false;
+        for &idx in &indices {
+            let physical = self.devices[idx]
+                .placement_receipt_candidates()?
+                .into_iter()
+                .filter(|(candidate_key, _)| *candidate_key == receipt_key)
+                .map(|(_, raw)| raw)
+                .collect::<Vec<_>>();
+            if physical.is_empty() {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pending replicated repair has no physical receipt copy on a carrier",
+                });
+            }
+            for raw in physical {
+                let receipt = PlacementReceipt::decode(&raw).ok_or(StoreError::InvalidOptions {
+                    reason: "pending replicated repair has a corrupt physical receipt copy",
+                })?;
+                if receipt.object_key != object_key
+                    || placement_receipt_object_key(receipt.object_key) != receipt_key
+                    || (receipt.generation != entry.enqueued_at_txg
+                        && receipt.generation != entry.death_commit_group)
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "pending replicated repair found unrelated receipt authority",
+                    });
+                }
+                self.ensure_receipt_replay_authority(&receipt)?;
+                validate_strict_receipt_structure(&receipt)?;
+                let slot = if receipt.generation == entry.enqueued_at_txg {
+                    saw_predecessor = true;
+                    &mut predecessor
+                } else {
+                    saw_replacement = true;
+                    &mut replacement
+                };
+                if slot.as_ref().is_some_and(|known| known != &receipt) {
+                    return Err(StoreError::InvalidOptions {
+                        reason:
+                            "pending replicated repair receipt generation is internally conflicting",
+                    });
+                }
+                slot.get_or_insert(receipt);
+            }
+        }
+
+        let (predecessor_receipt, replacement_receipt) = match (predecessor, replacement) {
+            (Some(predecessor), Some(replacement)) => (predecessor, replacement),
+            (Some(predecessor), None) => {
+                let mut replacement = predecessor.clone();
+                replacement.generation = entry.death_commit_group;
+                (predecessor, replacement)
+            }
+            (None, Some(replacement)) => {
+                let mut predecessor = replacement.clone();
+                predecessor.generation = entry.enqueued_at_txg;
+                (predecessor, replacement)
+            }
+            (None, None) => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pending replicated repair has no exact receipt authority",
+                })
+            }
+        };
+        let mut normalized_predecessor = predecessor_receipt.clone();
+        normalized_predecessor.generation = replacement_receipt.generation;
+        if normalized_predecessor != replacement_receipt
+            || predecessor_receipt.generation != entry.enqueued_at_txg
+            || replacement_receipt.generation != entry.death_commit_group
+            || replacement_receipt.generation <= predecessor_receipt.generation
+            || predecessor_receipt.policy != (PoolRedundancyPolicy::Replicated { copies: 2 })
+            || predecessor_receipt.targets.len() != 2
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending replicated repair receipts do not form one exact two-copy generation transition",
+            });
+        }
+        self.ensure_receipt_replay_authority(&predecessor_receipt)?;
+        self.ensure_receipt_replay_authority(&replacement_receipt)?;
+        validate_strict_receipt_structure(&predecessor_receipt)?;
+        validate_strict_receipt_structure(&replacement_receipt)?;
+
+        let receipt_copies = match (saw_predecessor, saw_replacement) {
+            (true, false) => PendingReplicatedRepairReceiptCopies::Predecessor,
+            (true, true) => PendingReplicatedRepairReceiptCopies::Mixed,
+            (false, true) => PendingReplicatedRepairReceiptCopies::Replacement,
+            (false, false) => unreachable!("receipt candidates were required above"),
+        };
+        let repaired_target = predecessor_receipt
+            .targets
+            .iter()
+            .find(|target| self.resolve_receipt_target(target) == Some(pending_index))
+            .cloned()
+            .ok_or(StoreError::InvalidOptions {
+                reason: "pending replicated repair row does not bind one receipt target",
+            })?;
+
+        let mut target_evidence = Vec::with_capacity(2);
+        for target in &predecessor_receipt.targets {
+            let idx = self
+                .resolve_receipt_target(target)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "pending replicated repair receipt target is no longer attached",
+                })?;
+            if !indices.contains(&idx) {
+                return Err(StoreError::InvalidOptions {
+                    reason:
+                        "pending replicated repair receipt target is outside current class members",
+                });
+            }
+            let (outcome, payload) = match self.devices[idx].get(object_key) {
+                Ok(Some(payload)) => {
+                    let actual_digest = digest32(&payload);
+                    let actual_len = payload.len() as u64;
+                    if actual_len == predecessor_receipt.payload_len
+                        && actual_digest == predecessor_receipt.payload_digest
+                        && actual_digest == target.stored_digest
+                    {
+                        (ReplicatedTargetReadOutcome::Clean, Some(payload))
+                    } else {
+                        (
+                            ReplicatedTargetReadOutcome::Corrupt {
+                                actual_len,
+                                actual_digest,
+                            },
+                            Some(payload),
+                        )
+                    }
+                }
+                Ok(None) => (ReplicatedTargetReadOutcome::Missing, None),
+                Err(_) => (ReplicatedTargetReadOutcome::Unreadable, None),
+            };
+            target_evidence.push(ReplicatedTargetEvidence {
+                target: target.clone(),
+                outcome,
+                payload,
+            });
+        }
+        let repaired = target_evidence
+            .iter()
+            .find(|target| target.target == repaired_target)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "pending replicated repair target evidence is absent",
+            })?;
+        let source = target_evidence
+            .iter()
+            .find(|target| target.target != repaired_target)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "pending replicated repair clean source target is absent",
+            })?;
+        if !matches!(source.outcome, ReplicatedTargetReadOutcome::Clean) {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending replicated repair has a second failed target",
+            });
+        }
+        let clean_source_payload = source.payload.clone().ok_or(StoreError::InvalidOptions {
+            reason: "pending replicated repair clean source payload is absent",
+        })?;
+        let target_state = match repaired.outcome {
+            ReplicatedTargetReadOutcome::Clean => PendingReplicatedRepairTargetState::Clean,
+            ReplicatedTargetReadOutcome::Corrupt { .. }
+            | ReplicatedTargetReadOutcome::Unreadable
+                if receipt_copies != PendingReplicatedRepairReceiptCopies::Replacement =>
+            {
+                PendingReplicatedRepairTargetState::NeedsRewrite
+            }
+            ReplicatedTargetReadOutcome::Corrupt { .. }
+            | ReplicatedTargetReadOutcome::Unreadable => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "fully published repair receipt has new target corruption",
+                })
+            }
+            ReplicatedTargetReadOutcome::Missing => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pending replicated repair target is missing rather than repairable",
+                })
+            }
+        };
+
+        Ok(PendingReplicatedRepairRecoveryEvidence {
+            predecessor_receipt,
+            replacement_receipt,
+            repaired_target,
+            clean_source: source.target.clone(),
+            receipt_copies,
+            target_state,
+            reclaim_object_id: entry.object_id,
+            clean_source_payload,
+        })
+    }
+
+    /// Complete one previously discovered repair transition after the caller
+    /// authenticates the exact predecessor filesystem root and object
+    /// reference. The discovery evidence is refreshed byte-for-byte before
+    /// any write. Receipt convergence always verifies every carrier.
+    pub fn complete_pending_replicated_repair_before_owner(
+        &mut self,
+        class: IoClass,
+        expected: &PendingReplicatedRepairRecoveryEvidence,
+    ) -> Result<ReplicatedRepairReconciliationEvidence> {
+        self.ensure_writable("complete pending replicated repair")?;
+        let current = self
+            .pending_replicated_repair_recovery_evidence(class)?
+            .ok_or(StoreError::InvalidOptions {
+                reason: "pending replicated repair disappeared after root authentication",
+            })?;
+        if &current != expected {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending replicated repair changed after root authentication",
+            });
+        }
+
+        let indices = self.class_map.get(class).to_vec();
+        let repaired_index = self
+            .resolve_receipt_target(&current.repaired_target)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "pending replicated repair target detached before completion",
+            })?;
+        if current.target_state == PendingReplicatedRepairTargetState::NeedsRewrite {
+            let target_write = self.devices[repaired_index].put(
+                current.predecessor_receipt.object_key,
+                current.clean_source_payload(),
+            );
+            self.record_device_write_result(
+                repaired_index,
+                current.clean_source_payload().len(),
+                &target_write,
+            );
+            target_write?;
+            self.devices[repaired_index].sync_strict_pool_authority()?;
+            match self.devices[repaired_index].get(current.predecessor_receipt.object_key)? {
+                Some(payload)
+                    if payload == current.clean_source_payload()
+                        && payload.len() as u64 == current.replacement_receipt.payload_len
+                        && digest32(&payload) == current.replacement_receipt.payload_digest => {}
+                _ => {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "pending replicated repair target failed recovery verification",
+                    })
+                }
+            }
+        }
+
+        if current.receipt_copies == PendingReplicatedRepairReceiptCopies::Replacement {
+            self.verify_placement_receipt_publication(&indices, &current.replacement_receipt)?;
+        } else {
+            self.write_placement_receipt(&indices, &current.replacement_receipt)?;
+        }
+        self.verify_placement_receipt_publication(&indices, &current.replacement_receipt)?;
+
+        let obsolete_target = ObsoletePhysicalPlacement {
+            device_index: repaired_index,
+            object_key: current.predecessor_receipt.object_key,
+            reclaim_object_id: current.reclaim_object_id,
+        };
+        self.attach_obsolete_placement_receipt(
+            std::slice::from_ref(&obsolete_target),
+            &current.replacement_receipt,
+        )?;
+
+        let evidence = self
+            .replicated_repair_reconciliation_evidence(
+                class,
+                current.predecessor_receipt.object_key,
+                current.predecessor_receipt.generation,
+            )?
+            .ok_or(StoreError::InvalidOptions {
+                reason: "completed pending repair has no exact reconciliation evidence",
+            })?;
+        if evidence.current_receipt != current.replacement_receipt
+            || evidence.repaired_target != current.repaired_target
+            || evidence.reclaim_object_id != current.reclaim_object_id
+            || !evidence.replacement_receipt_attached
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "completed pending repair evidence changed during convergence",
+            });
+        }
+        Ok(evidence)
+    }
+
+    /// Repair one corrupt target from the other clean target under an exact
+    /// current two-copy receipt and publish a replacement receipt.
+    ///
+    /// The caller supplies the comparison-selected source and target, but this
+    /// method rechecks the complete current receipt evidence immediately before
+    /// writeback. Missing evidence, a stale receipt, and anything other than one
+    /// clean plus one corrupt/unreadable target fail closed.
+    pub fn repair_current_replicated_target(
+        &mut self,
+        class: IoClass,
+        key: ObjectKey,
+        expected_receipt: &PlacementReceipt,
+        source_device_index: u32,
+        corrupt_device_index: u32,
+    ) -> std::result::Result<ReplicatedRepairResult, ReplicatedRepairFailure> {
+        let mut progress = ReplicatedRepairProgress::new();
+        self.ensure_writable("pool replicated repair")
+            .map_err(|error| progress.failure(error))?;
+        let evidence = self
+            .replicated_receipt_evidence(class, key)
+            .map_err(|error| progress.failure(error))?
+            .ok_or_else(|| {
+                progress.failure(StoreError::InvalidOptions {
+                    reason: "replicated repair requires a current placement receipt",
+                })
+            })?;
+        if evidence.receipt != *expected_receipt {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason: "replicated repair evidence is stale relative to current receipt authority",
+            }));
+        }
+        if source_device_index == corrupt_device_index {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason: "replicated repair source and corrupt target must be distinct",
+            }));
+        }
+
+        let mut source = None;
+        let mut corrupt_target = None;
+        for target in &evidence.targets {
+            if target.target.device_index == source_device_index {
+                if !matches!(target.outcome, ReplicatedTargetReadOutcome::Clean) {
+                    return Err(progress.failure(StoreError::InvalidOptions {
+                        reason: "replicated repair selected source is not receipt-clean",
+                    }));
+                }
+                let payload = target.payload.clone().ok_or_else(|| {
+                    progress.failure(StoreError::InvalidOptions {
+                        reason: "replicated repair clean source payload is missing",
+                    })
+                })?;
+                source = Some((target.target.clone(), payload));
+            } else if target.target.device_index == corrupt_device_index {
+                if matches!(
+                    target.outcome,
+                    ReplicatedTargetReadOutcome::Corrupt { .. }
+                        | ReplicatedTargetReadOutcome::Unreadable
+                ) {
+                    corrupt_target = Some(target.target.clone());
+                } else {
+                    return Err(progress.failure(StoreError::InvalidOptions {
+                        reason: "replicated repair selected target is not corrupt",
+                    }));
+                }
+            } else {
+                return Err(progress.failure(StoreError::InvalidOptions {
+                    reason: "replicated repair evidence contains an unexpected third target",
+                }));
+            }
+        }
+        let (source_target, source_payload) = source.ok_or_else(|| {
+            progress.failure(StoreError::InvalidOptions {
+                reason: "replicated repair clean source evidence is missing",
+            })
+        })?;
+        let corrupt_target = corrupt_target.ok_or_else(|| {
+            progress.failure(StoreError::InvalidOptions {
+                reason: "replicated repair corrupt target evidence is missing",
+            })
+        })?;
+        if source_payload.len() as u64 != expected_receipt.payload_len
+            || digest32(&source_payload) != expected_receipt.payload_digest
+        {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason:
+                    "replicated repair clean source no longer matches receipt payload authority",
+            }));
+        }
+
+        let indices = self.class_map.get(class).to_vec();
+        let source_index = self.resolve_receipt_target(&source_target).ok_or_else(|| {
+            progress.failure(StoreError::InvalidOptions {
+                reason: "replicated repair source GUID is no longer attached",
+            })
+        })?;
+        let corrupt_index = self
+            .resolve_receipt_target(&corrupt_target)
+            .ok_or_else(|| {
+                progress.failure(StoreError::InvalidOptions {
+                    reason: "replicated repair target GUID is no longer attached",
+                })
+            })?;
+        if source_index == corrupt_index {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason: "replicated repair source and target resolve to the same device",
+            }));
+        }
+        if !indices.contains(&source_index) || !indices.contains(&corrupt_index) {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason: "replicated repair source or target is outside current class members",
+            }));
+        }
+
+        self.check_write_admission(class, source_payload.len() as u64)
+            .map_err(|error| progress.failure(error))?;
+        let target_lifetime = self.devices[corrupt_index]
+            .store()
+            .current_receipt_bound_physical_lifetime_pool_internal(key)
+            .map_err(|error| progress.failure(error))?;
+        let reclaim_object_id = target_lifetime.reclaim_object_id;
+        let mut existing_reclaim_entries = Vec::new();
+        for &idx in &indices {
+            for (entry, lifetime) in self.devices[idx]
+                .store()
+                .receipt_bound_dead_object_lifetimes_for_logical_key_pool_internal(key)
+                .map_err(|error| progress.failure(error))?
+            {
+                existing_reclaim_entries.push((idx, entry, lifetime));
+            }
+        }
+        let pending_repair_entries = existing_reclaim_entries
+            .iter()
+            .copied()
+            .filter(|(_, entry, _)| {
+                entry.dataset_uuid == self.pool_guid
+                    && entry.eligible
+                    && entry.replacement_receipt.is_none()
+                    && entry.enqueued_at_txg == expected_receipt.generation
+                    && entry.death_commit_group > expected_receipt.generation
+            })
+            .collect::<Vec<_>>();
+        if pending_repair_entries.len() > 1 {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason: "replicated repair found multiple pending transitions for one predecessor receipt",
+            }));
+        }
+        let pending_repair_entry = pending_repair_entries.first().copied();
+        if pending_repair_entry.is_some_and(|(idx, entry, _)| {
+            idx != corrupt_index || entry.object_id != reclaim_object_id
+        }) {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason: "replicated repair pending transition targets a different current member",
+            }));
+        }
+        if existing_reclaim_entries.iter().any(|(_, entry, _)| {
+            entry.replacement_receipt.is_none()
+                && entry.enqueued_at_txg < entry.death_commit_group
+                && Some(*entry) != pending_repair_entry.map(|(_, entry, _)| entry)
+        }) {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason: "replicated repair found an unrelated unfinished target transition",
+            }));
+        }
+
+        let mut replacement_receipt = expected_receipt.clone();
+        let replacement_generation = if let Some((_, pending, _)) = pending_repair_entry {
+            // The durable pending entry exclusively owns this already-burned
+            // generation. Reusing it resumes the exact enqueue-before-publish
+            // transition instead of allocating a second generation that can
+            // never match the idempotent object-key queue row.
+            progress.writeback_started = true;
+            pending.death_commit_group
+        } else {
+            self.allocate_placement_receipt_generation_reporting_writeback(
+                &mut progress.writeback_started,
+            )
+            .map_err(|error| progress.failure(error))?
+        };
+        progress.replacement_generation = Some(replacement_generation);
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_replicated_repair_after_generation_allocation_once) {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason: "test fault: replicated repair failed after generation allocation",
+            }));
+        }
+        replacement_receipt.generation = replacement_generation;
+        self.ensure_receipt_replay_authority(&replacement_receipt)
+            .map_err(|error| progress.failure(error))?;
+        validate_strict_receipt_structure(&replacement_receipt)
+            .map_err(|error| progress.failure(error))?;
+        if replacement_receipt.generation <= expected_receipt.generation
+            || replacement_receipt.payload_digest != expected_receipt.payload_digest
+            || replacement_receipt.payload_len != expected_receipt.payload_len
+        {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason:
+                    "replicated repair replacement receipt did not advance exact payload authority",
+            }));
+        }
+
+        // Only the corrupt target's old physical record is superseded.  The
+        // clean source remains the same physical authority under the advanced
+        // receipt and must neither be rewritten nor queued for reclaim.
+        let obsolete_target = ObsoletePhysicalPlacement {
+            device_index: corrupt_index,
+            object_key: key,
+            reclaim_object_id,
+        };
+        let pending_entry = DeadObjectEntry::new(
+            reclaim_object_id,
+            self.pool_guid,
+            replacement_receipt.generation,
+            true,
+            expected_receipt.generation,
+        );
+        // The durable reclaim-intent enqueue is the first repair writeback
+        // unless generation-reservation publication already crossed that
+        // boundary. A retry reuses the exact durable row. A later repair of
+        // the same logical target receives a different physical-lifetime ID,
+        // so every completed predecessor remains independently reclaimable.
+        // It is enqueued while the predecessor receipt is still current, so
+        // `enqueued_at_txg` binds that exact predecessor generation; the death
+        // generation binds the replacement receipt under which this target's
+        // old physical record becomes obsolete.  The pair is the durable
+        // transition evidence used by reconciliation-only retry.
+        if let Some((_, existing, lifetime)) = pending_repair_entry {
+            if existing != pending_entry || lifetime != target_lifetime {
+                return Err(progress.failure(StoreError::InvalidOptions {
+                    reason: "replicated repair pending transition changed before resume",
+                }));
+            }
+        } else {
+            progress.writeback_started = true;
+            let target_store = self.devices[corrupt_index].store_mut();
+            if !target_store
+                .enqueue_pending_receipt_bound_dead_object_pool_internal(pending_entry)
+                .map_err(|error| progress.failure(error))?
+            {
+                return Err(progress.failure(StoreError::InvalidOptions {
+                    reason: "replicated repair reclaim intent collided with existing target state",
+                }));
+            }
+        }
+        let repair_reclaim_entries = indices
+            .iter()
+            .filter_map(|idx| {
+                self.devices[*idx]
+                    .store()
+                    .receipt_bound_dead_object_entry_pool_internal(&reclaim_object_id)
+                    .map(|entry| (*idx, entry))
+            })
+            .filter(|(_, entry)| {
+                entry.dataset_uuid == self.pool_guid
+                    && entry.death_commit_group == replacement_receipt.generation
+                    && entry.enqueued_at_txg == expected_receipt.generation
+                    && entry.eligible
+                    && entry.replacement_receipt.is_none()
+            })
+            .collect::<Vec<_>>();
+        let [(queued_index, queued_entry)] = repair_reclaim_entries.as_slice() else {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason: "replicated repair could not establish unique target-only reclaim evidence",
+            }));
+        };
+        if *queued_index != corrupt_index || *queued_entry != pending_entry {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason: "replicated repair reclaim evidence does not bind the exact target and receipt transition",
+            }));
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_replicated_repair_after_reclaim_intent_once) {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason: "test fault: replicated repair failed after reclaim intent",
+            }));
+        }
+        self.persist_active_labels_if_needed()
+            .map_err(|error| progress.failure(error))?;
+
+        let target_write = self.devices[corrupt_index].put(key, &source_payload);
+        self.record_device_write_result(corrupt_index, source_payload.len(), &target_write);
+        target_write.map_err(|error| progress.failure(error))?;
+        self.devices[corrupt_index]
+            .sync_strict_pool_authority()
+            .map_err(|error| progress.failure(error))?;
+        match self.devices[corrupt_index]
+            .get(key)
+            .map_err(|error| progress.failure(error))?
+        {
+            Some(payload)
+                if payload == source_payload
+                    && payload.len() as u64 == replacement_receipt.payload_len
+                    && digest32(&payload) == replacement_receipt.payload_digest => {}
+            _ => {
+                return Err(progress.failure(StoreError::InvalidOptions {
+                    reason: "replicated repair target failed pre-publication verification",
+                }))
+            }
+        }
+
+        progress.receipt_publication = ReplicatedRepairReceiptPublicationState::Uncertain;
+        self.write_placement_receipt(&indices, &replacement_receipt)
+            .map_err(|error| progress.failure(error))?;
+        progress.receipt_publication = ReplicatedRepairReceiptPublicationState::Completed;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_replicated_repair_after_receipt_publication_once) {
+            return Err(progress.failure(StoreError::InvalidOptions {
+                reason: "test fault: replicated repair failed after receipt publication",
+            }));
+        }
+        if let Err(error) = self.attach_obsolete_placement_receipt(
+            std::slice::from_ref(&obsolete_target),
+            &replacement_receipt,
+        ) {
+            eprintln!(
+                "tidefs: targeted repair receipt generation {} committed for {key:?}; obsolete target reclaim remains pending: {error}",
+                replacement_receipt.generation
+            );
+        }
+
+        let prior_deletions = self
+            .pending_deletions
+            .values()
+            .filter(|pending| {
+                pending.class == class
+                    && pending.receipt.object_key == key
+                    && pending.receipt.generation < replacement_receipt.generation
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for pending in prior_deletions {
+            if let Err(error) = self.reconcile_one_pending_deletion(&pending) {
+                eprintln!(
+                    "tidefs: targeted repair generation {} is current for {key:?}; prior deletion cleanup remains pending: {error}",
+                    replacement_receipt.generation
+                );
+            }
+        }
+        self.health = compute_health(&self.devices);
+        self.record_health_transitions();
+
+        match self
+            .get_with_current_receipt(class, key)
+            .map_err(|error| progress.failure(error))?
+        {
+            Some((payload, current))
+                if payload == source_payload && current == replacement_receipt => {}
+            _ => {
+                return Err(progress.failure(StoreError::InvalidOptions {
+                    reason: "replicated repair replacement receipt failed strict verification",
+                }))
+            }
+        }
+
+        Ok(ReplicatedRepairResult {
+            previous_receipt: expected_receipt.clone(),
+            replacement_receipt,
+            source_device_index,
+            repaired_device_index: corrupt_device_index,
+        })
     }
 }

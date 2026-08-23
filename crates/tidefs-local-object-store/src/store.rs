@@ -137,6 +137,15 @@ const BLOCK_DATA_FORMAT_CHECKSUM_OFFSET: usize = 48;
 const FORMAT_MANIFEST_FILE_NAME: &str = "format_manifest";
 /// Well-known object name for committed compaction publication manifests.
 const COMPACTION_PUBLISH_MANIFEST_OBJECT_NAME: &str = "tidefs-compaction-publish-manifest";
+/// Hidden block-log record that preserves the globally unique physical put
+/// sequence after compaction removes every record that previously carried the
+/// maximum. It is rewritten only as part of the verified compacted prefix.
+const PHYSICAL_LIFETIME_SEQUENCE_HIGH_WATER_OBJECT_NAME: &str =
+    "tidefs-physical-lifetime-sequence-high-water-v1";
+/// `sync_all()` records dirty reclaim authority through `put_named()`, which
+/// opens one commit group, then publishes its chained root on block media as
+/// the exact 48-byte payload produced by `encode_root_with_digest()`.
+const CHAINED_COMMITTED_ROOT_PAYLOAD_LEN: u64 = 48;
 /// Well-known object name for the mounted filesystem's exact deferred-reclaim queue.
 ///
 /// This is distinct from the object-store's physical reclaim queues: the
@@ -199,11 +208,32 @@ impl tidefs_reclaim::SegmentResolver for DeadObjectDrainSegmentResolver {
     }
 }
 
+/// Non-mutating first phase of receipt-bound physical reclaim.
+///
+/// The reclaim consumer owns liveness and gate evaluation, but durable receipt
+/// and queue acknowledgement must precede allocator or segment-file mutation.
+/// Record its exact decision here, then apply it only after both authorities
+/// have crossed their durability barriers.
+#[derive(Debug, Default)]
+struct RecordingSegmentFreer {
+    segment_ids: BTreeSet<u64>,
+}
+
+impl tidefs_reclaim::SegmentFreer for RecordingSegmentFreer {
+    type Error = PoolAllocatorError;
+
+    fn free_segment(&mut self, segment_id: u64) -> std::result::Result<(), Self::Error> {
+        self.segment_ids.insert(segment_id);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct ReceiptBoundDeadObjectDrainPlan {
     resolver: DeadObjectDrainSegmentResolver,
     dead_segments: Vec<u64>,
     eligible_object_ids: BTreeSet<ReclaimObjectKey>,
+    logical_object_ids: BTreeMap<ReclaimObjectKey, ReclaimObjectKey>,
 }
 
 impl ReceiptBoundDeadObjectDrainPlan {
@@ -256,6 +286,7 @@ struct PersistedCompactionPublishEntry {
 #[derive(Clone, Debug)]
 struct CommittedDeadObjectReclaimGate {
     eligible_object_ids: BTreeSet<ReclaimObjectKey>,
+    logical_object_ids: BTreeMap<ReclaimObjectKey, ReclaimObjectKey>,
     stable_committed_txg: u64,
     snapshot_extent_pin_set: SnapshotExtentPinSet,
 }
@@ -266,7 +297,10 @@ impl ReclaimGate for CommittedDeadObjectReclaimGate {
             return GateDecision::Deny(GateDenyReason::DeadlistReferenced);
         }
 
-        if self.snapshot_extent_pin_set.is_pinned(extent_key) {
+        let Some(logical_object_id) = self.logical_object_ids.get(extent_key) else {
+            return GateDecision::Deny(GateDenyReason::DeadlistReferenced);
+        };
+        if self.snapshot_extent_pin_set.is_pinned(logical_object_id) {
             return GateDecision::Deny(GateDenyReason::SnapshotPinned);
         }
 
@@ -275,6 +309,74 @@ impl ReclaimGate for CommittedDeadObjectReclaimGate {
             pin_clearance_epoch: self.snapshot_extent_pin_set.epoch(),
         })
     }
+}
+
+/// Exact append-log lifetime owned by one receipt-bound reclaim row.
+///
+/// The logical key remains the snapshot-pin identity. `reclaim_object_id` is a
+/// deterministic identity for these exact physical bytes, so repeated writes
+/// of the same logical object can coexist in the durable reclaim queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReceiptBoundPhysicalLifetime {
+    pub logical_object_key: ObjectKey,
+    pub location: ObjectLocation,
+    pub reclaim_object_id: ReclaimObjectKey,
+}
+
+fn receipt_bound_physical_lifetime_id(
+    logical_object_key: ObjectKey,
+    location: ObjectLocation,
+) -> ReclaimObjectKey {
+    let mut evidence = Vec::with_capacity(2 * 32 + 4 * 8 + 40);
+    evidence.extend_from_slice(b"tidefs-receipt-bound-physical-lifetime-v2");
+    evidence.extend_from_slice(logical_object_key.as_bytes());
+    evidence.extend_from_slice(location.key.as_bytes());
+    evidence.extend_from_slice(&location.payload_len.to_le_bytes());
+    evidence.extend_from_slice(&location.sequence.to_le_bytes());
+    evidence.extend_from_slice(&location.payload_checksum.get().to_le_bytes());
+    ReclaimObjectKey(*blake3::hash(&evidence).as_bytes())
+}
+
+fn build_receipt_bound_physical_lifetime_index(
+    history: &BTreeMap<ObjectKey, Vec<ObjectLocation>>,
+) -> Result<BTreeMap<ReclaimObjectKey, ReceiptBoundPhysicalLifetime>> {
+    let mut lifetimes = BTreeMap::new();
+    for (logical_object_key, locations) in history {
+        for location in locations {
+            let reclaim_object_id =
+                receipt_bound_physical_lifetime_id(*logical_object_key, *location);
+            let candidate = ReceiptBoundPhysicalLifetime {
+                logical_object_key: *logical_object_key,
+                location: *location,
+                reclaim_object_id,
+            };
+            if let Some(known) = lifetimes.get(&reclaim_object_id) {
+                if *known != candidate {
+                    return Err(StoreError::InvalidDeadObjectReceipt {
+                        reason: "receipt-bound physical lifetime identity collision",
+                    });
+                }
+            } else {
+                lifetimes.insert(reclaim_object_id, candidate);
+            }
+        }
+    }
+    Ok(lifetimes)
+}
+
+fn next_put_sequence_after_history(
+    history: &BTreeMap<ObjectKey, Vec<ObjectLocation>>,
+) -> Result<u64> {
+    history
+        .values()
+        .flat_map(|locations| locations.iter())
+        .map(|location| location.sequence)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(StoreError::InvalidOptions {
+            reason: "object-store physical lifetime sequence exhausted",
+        })
 }
 
 /// Error returned by the receipt-bound dead-object drain entry point.
@@ -482,6 +584,7 @@ pub struct LocalObjectStore {
     segment_write_count: u64,
     index: BTreeMap<ObjectKey, ObjectLocation>,
     history: BTreeMap<ObjectKey, Vec<ObjectLocation>>,
+    receipt_bound_physical_lifetimes: BTreeMap<ReclaimObjectKey, ReceiptBoundPhysicalLifetime>,
     pub(crate) next_sequence: u64,
     replay: ReplayReport,
     current_io_class: IoClass,
@@ -495,6 +598,10 @@ pub struct LocalObjectStore {
     reclaim_scheduler: ReclaimScheduler,
     reclaim_queue: BPlusTreeReclaimQueue,
     dead_object_reclaim_queue: DeadObjectReclaimQueue,
+    /// Last queue contents known to have crossed this store's durability
+    /// barrier. The current index may already point at an unsynced append, so
+    /// retry compaction must not infer old durable authority from that index.
+    durable_dead_object_reclaim_queue: DeadObjectReclaimQueue,
     dead_object_reclaim_queue_dirty: bool,
     reclaim_receipts: Vec<ReclaimReceipt>,
     reclaim_receipts_dirty: bool,
@@ -663,6 +770,13 @@ fn compaction_publish_manifest_key() -> ObjectKey {
         .get_or_init(|| ObjectKey::from_name(COMPACTION_PUBLISH_MANIFEST_OBJECT_NAME.as_bytes()))
 }
 
+fn physical_lifetime_sequence_high_water_key() -> ObjectKey {
+    static KEY: OnceLock<ObjectKey> = OnceLock::new();
+    *KEY.get_or_init(|| {
+        ObjectKey::from_name(PHYSICAL_LIFETIME_SEQUENCE_HIGH_WATER_OBJECT_NAME.as_bytes())
+    })
+}
+
 fn is_compaction_target_key(key: ObjectKey) -> bool {
     key.as_bytes()[..8] == COMPACTION_TARGET_KEY_PREFIX
 }
@@ -681,8 +795,8 @@ fn is_pool_store_internal_key(key: ObjectKey) -> bool {
     crate::is_pool_placement_scan_internal_key(key) || is_pool_pending_deletion_key(key)
 }
 
-fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 7] {
-    static KEYS: OnceLock<[ObjectKey; 7]> = OnceLock::new();
+fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 8] {
+    static KEYS: OnceLock<[ObjectKey; 8]> = OnceLock::new();
     KEYS.get_or_init(|| {
         [
             ObjectKey::from_name(RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
@@ -692,6 +806,7 @@ fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 7] {
             ObjectKey::from_name(SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME.as_bytes()),
             ObjectKey::from_name(FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
             compaction_publish_manifest_key(),
+            physical_lifetime_sequence_high_water_key(),
         ]
     })
 }
@@ -1075,9 +1190,7 @@ impl LocalObjectStore {
                 }
             }
 
-            if !is_public_scan_internal_key(record.key) {
-                next_sequence = next_sequence.max(record.sequence + 1);
-            }
+            next_sequence = next_sequence.max(record.sequence.saturating_add(1));
             cursor = record_range.end_offset;
 
             if cursor >= device_end {
@@ -1092,6 +1205,46 @@ impl LocalObjectStore {
         }
 
         Ok((index, history, next_sequence, cursor))
+    }
+
+    fn load_physical_lifetime_sequence_high_water(
+        index: &BTreeMap<ObjectKey, ObjectLocation>,
+        file: &mut File,
+        device_path: &Path,
+        device_end: u64,
+    ) -> Result<u64> {
+        let Some(location) = index
+            .get(&physical_lifetime_sequence_high_water_key())
+            .copied()
+        else {
+            return Ok(1);
+        };
+        file.seek(SeekFrom::Start(location.record_offset))
+            .map_err(|source| io_error("read sequence high-water seek", device_path, source))?;
+        let mut header = [0_u8; RECORD_HEADER_LEN];
+        file.read_exact(&mut header)
+            .map_err(|source| io_error("read sequence high-water header", device_path, source))?;
+        let decoded = decode_stored_record_after_header(
+            file,
+            device_path,
+            location.segment_id,
+            location.record_offset,
+            device_end,
+            header,
+        )?;
+        let (payload, _) = validate_location_record(location, decoded)?;
+        if payload.len() != 8 {
+            return Err(StoreError::InvalidOptions {
+                reason: "physical lifetime sequence high-water record is malformed",
+            });
+        }
+        let sequence = u64::from_le_bytes(payload.try_into().unwrap());
+        if sequence == 0 {
+            return Err(StoreError::InvalidOptions {
+                reason: "physical lifetime sequence high-water record is zero",
+            });
+        }
+        Ok(sequence)
     }
 
     fn encode_block_format_header(identity: BlockStoreIdentity) -> [u8; 80] {
@@ -1624,9 +1777,17 @@ impl LocalObjectStore {
         }
 
         if visible_swap_applied {
-            let versions = self.history.entry(entry.key).or_default();
-            if !versions.contains(&entry.target_location) {
-                versions.push(entry.target_location);
+            let inserted = {
+                let versions = self.history.entry(entry.key).or_default();
+                if versions.contains(&entry.target_location) {
+                    false
+                } else {
+                    versions.push(entry.target_location);
+                    true
+                }
+            };
+            if inserted {
+                self.index_receipt_bound_physical_lifetime(entry.key, entry.target_location)?;
             }
             self.checksums
                 .insert(entry.key, compaction_read_verify_digest(&payload));
@@ -2016,11 +2177,20 @@ impl LocalObjectStore {
             Self::validate_block_format_identity(header, expected)?;
         }
 
-        let (index, history, next_sequence, current_offset) = Self::scan_block_device_for_index(
+        let device_end = capacity.saturating_sub(POOL_LABEL_SIZE as u64);
+        let (index, history, next_sequence, current_offset) =
+            Self::scan_block_device_for_index(&mut file, data_start, device_end)?;
+        let persisted_next_sequence = Self::load_physical_lifetime_sequence_high_water(
+            &index,
             &mut file,
-            data_start,
-            capacity.saturating_sub(POOL_LABEL_SIZE as u64),
+            &device_path,
+            device_end,
         )?;
+        let next_sequence = next_sequence
+            .max(next_put_sequence_after_history(&history)?)
+            .max(persisted_next_sequence);
+        let receipt_bound_physical_lifetimes =
+            build_receipt_bound_physical_lifetime_index(&history)?;
 
         let root = device_path.clone();
         let segments_dir = device_path;
@@ -2046,6 +2216,7 @@ impl LocalObjectStore {
             segment_write_count: 0,
             index,
             history,
+            receipt_bound_physical_lifetimes,
             next_sequence,
             replay: ReplayReport::default(),
             current_io_class: IoClass::AsyncData,
@@ -2059,6 +2230,7 @@ impl LocalObjectStore {
             reclaim_scheduler: ReclaimScheduler::new(ReclaimConfig::default()),
             reclaim_queue: BPlusTreeReclaimQueue::default(),
             dead_object_reclaim_queue: DeadObjectReclaimQueue::default(),
+            durable_dead_object_reclaim_queue: DeadObjectReclaimQueue::default(),
             dead_object_reclaim_queue_dirty: false,
             reclaim_receipts: Vec::new(),
             reclaim_receipts_dirty: false,
@@ -2098,7 +2270,8 @@ impl LocalObjectStore {
         // required so a close/reopen cannot forget a deletion handoff or make
         // one physical generation eligible twice.
         store.reclaim_queue = load_reclaim_queue_entries(&store);
-        store.dead_object_reclaim_queue = load_dead_object_reclaim_queue(&store);
+        store.dead_object_reclaim_queue = load_dead_object_reclaim_queue(&store)?;
+        store.durable_dead_object_reclaim_queue = store.dead_object_reclaim_queue.clone();
         store.reclaim_receipts = load_reclaim_receipts(&store)?;
         store.snapshot_extent_pin_set = load_snapshot_extent_pin_set(&store)?;
 
@@ -2359,6 +2532,9 @@ impl LocalObjectStore {
         let commit_group = init_commit_group(&root);
         let txg_coordinator = init_txg_coordinator(&root);
         let initial_free_count = free_map.free_count();
+        let next_sequence = next_sequence.max(next_put_sequence_after_history(&history)?);
+        let receipt_bound_physical_lifetimes =
+            build_receipt_bound_physical_lifetime_index(&history)?;
         let mut store = Self {
             root,
             segments_dir,
@@ -2373,6 +2549,7 @@ impl LocalObjectStore {
             block_device_capacity: None,
             index,
             history,
+            receipt_bound_physical_lifetimes,
             current_io_class: IoClass::AsyncData,
             next_sequence,
             io_scheduler: IoScheduler::new(&IoSchedulerConfig::default()),
@@ -2396,6 +2573,7 @@ impl LocalObjectStore {
             reclaim_scheduler: ReclaimScheduler::new(ReclaimConfig::default()),
             reclaim_queue: BPlusTreeReclaimQueue::new(),
             dead_object_reclaim_queue: DeadObjectReclaimQueue::new(),
+            durable_dead_object_reclaim_queue: DeadObjectReclaimQueue::new(),
             dead_object_reclaim_queue_dirty: false,
             reclaim_receipts: Vec::new(),
             reclaim_receipts_dirty: false,
@@ -2421,13 +2599,28 @@ impl LocalObjectStore {
             checksums: BTreeMap::new(),
             block_device_mode: false,
         };
+        if let Some(payload) = store.get(physical_lifetime_sequence_high_water_key())? {
+            if payload.len() != 8 {
+                return Err(StoreError::InvalidOptions {
+                    reason: "physical lifetime sequence high-water record is malformed",
+                });
+            }
+            let sequence = u64::from_le_bytes(payload.try_into().unwrap());
+            if sequence == 0 {
+                return Err(StoreError::InvalidOptions {
+                    reason: "physical lifetime sequence high-water record is zero",
+                });
+            }
+            store.next_sequence = store.next_sequence.max(sequence);
+        }
         // Restore persisted per-object checksums for read-path verification.
         store.checksums = load_checksums(&store.segments_dir);
         store.reconcile_loaded_checksums_with_index()?;
         // Restore persisted reclaim-queue entries.
         store.reclaim_queue = load_reclaim_queue_entries(&store);
         // Restore persisted receipt-bound dead-object reclaim entries.
-        store.dead_object_reclaim_queue = load_dead_object_reclaim_queue(&store);
+        store.dead_object_reclaim_queue = load_dead_object_reclaim_queue(&store)?;
+        store.durable_dead_object_reclaim_queue = store.dead_object_reclaim_queue.clone();
         // Restore committed reclaim receipt evidence.
         store.reclaim_receipts = load_reclaim_receipts(&store)?;
         // Restore snapshot extent pins before any reclaim authority observes
@@ -3482,6 +3675,43 @@ impl LocalObjectStore {
             }
         }
 
+        // Read-only open validates the receipt log but must not acknowledge
+        // queue rows, remove segment files, or change allocator state.
+        if self.read_only {
+            return Ok(());
+        }
+
+        // A crash can leave the receipt durable while its exact queue rows are
+        // still present. Acknowledge only rows whose physical lifetime resolves
+        // to the segment named by that receipt, and persist the acknowledgement
+        // before replay performs any physical free.
+        let mut receipt_covered_queue_ids = BTreeSet::new();
+        for entry in self.dead_object_reclaim_queue.all_entries() {
+            let Some((resolved_segment, _)) =
+                self.resolve_receipt_bound_reclaim_target(&entry.object_id)?
+            else {
+                continue;
+            };
+            if receipt_extents_by_segment
+                .get(&resolved_segment)
+                .is_some_and(|extent_keys| extent_keys.contains(&entry.object_id))
+            {
+                receipt_covered_queue_ids.insert(entry.object_id);
+            }
+        }
+        if !receipt_covered_queue_ids.is_empty() {
+            let ack_object_ids = receipt_covered_queue_ids.into_iter().collect::<Vec<_>>();
+            if self
+                .dead_object_reclaim_queue
+                .ack_reclaimed(&ack_object_ids)
+                > 0
+            {
+                self.dead_object_reclaim_queue_dirty = true;
+                self.sync_all()?;
+            }
+        }
+
+        let mut physical_state_changed = false;
         for (segment_id, extent_keys) in receipt_extents_by_segment {
             if segment_id == self.current_segment_id
                 || self
@@ -3493,26 +3723,14 @@ impl LocalObjectStore {
             }
 
             let seg_path = segment_path(&self.segments_dir, segment_id);
-            if seg_path.exists() {
-                if !self.receipt_replay_extents_match_dead_history(segment_id, &extent_keys) {
-                    continue;
-                }
-                if self.read_only {
-                    continue;
-                }
-                fs::remove_file(&seg_path).map_err(|source| {
-                    io_error("remove reclaim receipt segment", &seg_path, source)
-                })?;
-                sync_directory(&self.segments_dir)?;
+            if !self.receipt_replay_extents_match_dead_history(segment_id, &extent_keys) {
+                continue;
             }
-
-            if !self.free_map.is_free(segment_id) {
-                self.free_map
-                    .add_free(segment_id)
-                    .map_err(reclaim_receipt_replay_allocator_error)?;
-                self.free_segment_counter.freed();
-            }
-            self.reclaim_consumer.live_counts_mut().remove(segment_id);
+            physical_state_changed |= seg_path.exists() || !self.free_map.is_free(segment_id);
+            self.free_receipt_authorized_segment(segment_id)?;
+        }
+        if physical_state_changed {
+            self.sync_all()?;
         }
 
         Ok(())
@@ -3524,14 +3742,40 @@ impl LocalObjectStore {
         extent_keys: &BTreeSet<ReclaimObjectKey>,
     ) -> bool {
         extent_keys.iter().all(|extent_key| {
-            let store_key = ObjectKey::from_bytes(extent_key.0);
-            let live_location = self.index.get(&store_key).copied();
-            self.history.get(&store_key).is_some_and(|locations| {
-                locations.iter().any(|location| {
-                    location.segment_id == segment_id && Some(*location) != live_location
-                })
-            })
+            self.resolve_receipt_bound_reclaim_target(extent_key)
+                .ok()
+                .flatten()
+                .is_some_and(|(resolved_segment, _)| resolved_segment == segment_id)
         })
+    }
+
+    fn resolve_receipt_bound_reclaim_target(
+        &self,
+        reclaim_object_id: &ReclaimObjectKey,
+    ) -> Result<Option<(u64, ReclaimObjectKey)>> {
+        if let Some(lifetime) = self.resolve_receipt_bound_physical_lifetime(reclaim_object_id)? {
+            if self.index.get(&lifetime.logical_object_key).copied() == Some(lifetime.location) {
+                return Ok(None);
+            }
+            return Ok(Some((
+                lifetime.location.segment_id,
+                ReclaimObjectKey(*lifetime.logical_object_key.as_bytes()),
+            )));
+        }
+
+        // Compatibility for ordinary logical-key reclaim rows that have not
+        // yet moved to exact physical-lifetime identity.
+        let logical_object_key = ObjectKey::from_bytes(reclaim_object_id.0);
+        let live_location = self.index.get(&logical_object_key).copied();
+        let dead_segment = self.history.get(&logical_object_key).and_then(|locations| {
+            locations
+                .iter()
+                .rev()
+                .copied()
+                .find(|location| Some(*location) != live_location)
+                .map(|location| location.segment_id)
+        });
+        Ok(dead_segment.map(|segment_id| (segment_id, *reclaim_object_id)))
     }
 
     /// Snapshot extent pins consulted by receipt-bound physical reclaim.
@@ -3602,17 +3846,16 @@ impl LocalObjectStore {
         for candidate in &candidates {
             Self::ensure_public_pool_reclaim_key_allowed(candidate.object_id)?;
         }
+        let mut candidate_queue = self.dead_object_reclaim_queue.clone();
         let mut inserted = 0usize;
         for candidate in candidates {
-            if self
-                .dead_object_reclaim_queue
-                .enqueue(candidate.into_dead_object_entry())
-            {
-                self.dead_object_reclaim_queue_dirty = true;
+            if candidate_queue.enqueue(candidate.into_dead_object_entry()) {
                 inserted += 1;
             }
         }
-        if self.dead_object_reclaim_queue_dirty {
+        if inserted != 0 {
+            self.persist_dead_object_reclaim_queue_candidate(candidate_queue)?;
+        } else if self.dead_object_reclaim_queue_dirty {
             self.sync_all()?;
         }
         Ok(inserted)
@@ -3647,11 +3890,11 @@ impl LocalObjectStore {
             });
         }
 
-        let inserted = self.dead_object_reclaim_queue.enqueue(entry);
+        let mut candidate_queue = self.dead_object_reclaim_queue.clone();
+        let inserted = candidate_queue.enqueue(entry);
         if inserted {
-            self.dead_object_reclaim_queue_dirty = true;
-        }
-        if self.dead_object_reclaim_queue_dirty {
+            self.persist_dead_object_reclaim_queue_candidate(candidate_queue)?;
+        } else if self.dead_object_reclaim_queue_dirty {
             self.sync_all()?;
         }
         Ok(inserted)
@@ -3680,6 +3923,137 @@ impl LocalObjectStore {
         self.enqueue_pending_receipt_bound_dead_object_authorized(entry)
     }
 
+    /// Capture the exact current append-log lifetime for a Pool-owned object.
+    ///
+    /// The returned identity is stable across reopen because it is derived
+    /// entirely from the logical key and persisted [`ObjectLocation`].
+    pub(crate) fn current_receipt_bound_physical_lifetime_pool_internal(
+        &self,
+        logical_object_key: ObjectKey,
+    ) -> Result<ReceiptBoundPhysicalLifetime> {
+        let location = self.index.get(&logical_object_key).copied().ok_or(
+            StoreError::InvalidDeadObjectReceipt {
+                reason: "receipt-bound reclaim cannot capture a missing current physical lifetime",
+            },
+        )?;
+        let lifetime = ReceiptBoundPhysicalLifetime {
+            logical_object_key,
+            location,
+            reclaim_object_id: receipt_bound_physical_lifetime_id(logical_object_key, location),
+        };
+        if self
+            .receipt_bound_physical_lifetimes
+            .get(&lifetime.reclaim_object_id)
+            .copied()
+            != Some(lifetime)
+        {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "receipt-bound current physical lifetime is not uniquely indexed",
+            });
+        }
+        Ok(lifetime)
+    }
+
+    fn index_receipt_bound_physical_lifetime(
+        &mut self,
+        logical_object_key: ObjectKey,
+        location: ObjectLocation,
+    ) -> Result<()> {
+        let reclaim_object_id = receipt_bound_physical_lifetime_id(logical_object_key, location);
+        let candidate = ReceiptBoundPhysicalLifetime {
+            logical_object_key,
+            location,
+            reclaim_object_id,
+        };
+        if let Some(known) = self
+            .receipt_bound_physical_lifetimes
+            .get(&reclaim_object_id)
+        {
+            if *known != candidate {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "receipt-bound physical lifetime identity collision",
+                });
+            }
+        } else {
+            self.receipt_bound_physical_lifetimes
+                .insert(reclaim_object_id, candidate);
+        }
+        Ok(())
+    }
+
+    fn resolve_receipt_bound_physical_lifetime(
+        &self,
+        reclaim_object_id: &ReclaimObjectKey,
+    ) -> Result<Option<ReceiptBoundPhysicalLifetime>> {
+        Ok(self
+            .receipt_bound_physical_lifetimes
+            .get(reclaim_object_id)
+            .copied())
+    }
+
+    fn persist_dead_object_reclaim_queue_candidate(
+        &mut self,
+        candidate_queue: DeadObjectReclaimQueue,
+    ) -> Result<()> {
+        if self.block_device_mode {
+            self.ensure_block_device_authority_append_space(Some(&candidate_queue))?;
+        }
+        self.dead_object_reclaim_queue = candidate_queue;
+        self.dead_object_reclaim_queue_dirty = true;
+        self.sync_all()
+    }
+
+    /// Return every Pool-owned reclaim row that resolves to `logical_key`.
+    /// Multiple completed physical lifetimes intentionally coexist.
+    pub(crate) fn receipt_bound_dead_object_lifetimes_for_logical_key_pool_internal(
+        &self,
+        logical_key: ObjectKey,
+    ) -> Result<Vec<(DeadObjectEntry, ReceiptBoundPhysicalLifetime)>> {
+        let mut rows = Vec::new();
+        for entry in self.dead_object_reclaim_queue.all_entries() {
+            let Some(lifetime) = self.resolve_receipt_bound_physical_lifetime(&entry.object_id)?
+            else {
+                continue;
+            };
+            if lifetime.logical_object_key == logical_key {
+                rows.push((entry, lifetime));
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Return all exactly resolved physical-lifetime rows for Pool recovery.
+    pub(crate) fn receipt_bound_dead_object_physical_lifetimes_pool_internal(
+        &self,
+    ) -> Result<Vec<(DeadObjectEntry, ReceiptBoundPhysicalLifetime)>> {
+        let mut rows = Vec::new();
+        for entry in self.dead_object_reclaim_queue.all_entries() {
+            if let Some(lifetime) =
+                self.resolve_receipt_bound_physical_lifetime(&entry.object_id)?
+            {
+                rows.push((entry, lifetime));
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Return the exact durable reclaim entry for a Pool-owned physical
+    /// object, without advancing or rewriting the queue.
+    ///
+    /// This narrow inspection lets the Pool prove that a newer receipt belongs
+    /// to an interrupted target-only repair before a higher layer resumes root
+    /// reconciliation.  The queue remains the sole decoder and authority for
+    /// its persisted format.
+    pub(crate) fn receipt_bound_dead_object_entry_pool_internal(
+        &self,
+        object_id: &ReclaimObjectKey,
+    ) -> Option<DeadObjectEntry> {
+        self.dead_object_reclaim_queue
+            .all_entries()
+            .into_iter()
+            .find(|entry| &entry.object_id == object_id)
+    }
+
     fn enqueue_pending_receipt_bound_dead_object_authorized(
         &mut self,
         entry: DeadObjectEntry,
@@ -3691,11 +4065,11 @@ impl LocalObjectStore {
             });
         }
 
-        let inserted = self.dead_object_reclaim_queue.enqueue(entry);
+        let mut candidate_queue = self.dead_object_reclaim_queue.clone();
+        let inserted = candidate_queue.enqueue(entry);
         if inserted {
-            self.dead_object_reclaim_queue_dirty = true;
-        }
-        if self.dead_object_reclaim_queue_dirty {
+            self.persist_dead_object_reclaim_queue_candidate(candidate_queue)?;
+        } else if self.dead_object_reclaim_queue_dirty {
             self.sync_all()?;
         }
         Ok(inserted)
@@ -3742,13 +4116,11 @@ impl LocalObjectStore {
                 reason: "replacement receipt does not authorize this object",
             });
         }
-        let updated = self
-            .dead_object_reclaim_queue
-            .publish_replacement_receipt(object_id, receipt);
+        let mut candidate_queue = self.dead_object_reclaim_queue.clone();
+        let updated = candidate_queue.publish_replacement_receipt(object_id, receipt);
         if updated {
-            self.dead_object_reclaim_queue_dirty = true;
-        }
-        if self.dead_object_reclaim_queue_dirty {
+            self.persist_dead_object_reclaim_queue_candidate(candidate_queue)?;
+        } else if self.dead_object_reclaim_queue_dirty {
             self.sync_all()?;
         }
         Ok(updated)
@@ -3805,20 +4177,23 @@ impl LocalObjectStore {
                 Self::ensure_public_pool_reclaim_key_allowed(entry.object_id)?;
             }
         }
-        // A block backing is one virtual segment containing labels, recovery
-        // state, and every live record. It cannot be handed to segment-file
-        // reclamation; physical recovery waits for block compaction authority.
-        if self.block_device_mode {
+        if self.dead_object_reclaim_queue_dirty
+            || self.snapshot_extent_pin_set_dirty
+            || self.reclaim_receipts_dirty
+        {
             return Ok(tidefs_reclaim::ReclaimConsumerStats {
                 reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
                 ..tidefs_reclaim::ReclaimConsumerStats::ZERO
             });
         }
-        if self.dead_object_reclaim_queue_dirty {
-            return Ok(tidefs_reclaim::ReclaimConsumerStats {
-                reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
-                ..tidefs_reclaim::ReclaimConsumerStats::ZERO
-            });
+        if self.block_device_mode {
+            return self
+                .acknowledge_block_device_receipt_bound_dead_objects(
+                    stable_committed_txg,
+                    stable_committed_generation,
+                    max_count,
+                )
+                .map_err(Into::into);
         }
 
         let plan = self.receipt_bound_dead_object_drain_plan(
@@ -3858,6 +4233,7 @@ impl LocalObjectStore {
         let queue_snapshot = self.dead_object_reclaim_queue.clone();
         let gate = CommittedDeadObjectReclaimGate {
             eligible_object_ids: plan.eligible_object_ids.clone(),
+            logical_object_ids: plan.logical_object_ids.clone(),
             stable_committed_txg,
             snapshot_extent_pin_set: self.snapshot_extent_pin_set.clone(),
         };
@@ -3865,43 +4241,118 @@ impl LocalObjectStore {
             &mut self.reclaim_consumer,
             ReclaimConsumerService::new(ReclaimConsumerConfig::default(), SegmentLiveCounts::new()),
         );
+        let mut recording_freer = RecordingSegmentFreer::default();
         let drain_result = reclaim_consumer.drain_receipt_bound_dead_objects(
             &queue_snapshot,
             stable_committed_txg,
             stable_committed_generation,
             max_count,
             &plan.resolver,
-            self,
+            &mut recording_freer,
             &gate,
         );
         self.reclaim_consumer = reclaim_consumer;
         let drain = drain_result?;
 
         if drain.ack_object_ids.is_empty() {
-            debug_assert!(drain.receipt.is_none());
+            if drain.receipt.is_some()
+                || !drain.reclaimed_segment_ids.is_empty()
+                || !recording_freer.segment_ids.is_empty()
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "receipt-bound reclaim consumer returned physical-free authority without queue acknowledgement",
+                }
+                .into());
+            }
             return Ok(tidefs_reclaim::ReclaimConsumerStats {
                 reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
                 ..drain.stats
             });
         }
 
-        if let Some(receipt) = drain.receipt {
-            self.reclaim_receipts.push(receipt);
-            self.reclaim_receipts_dirty = true;
+        let ack_object_ids = drain
+            .ack_object_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let reclaimed_segment_ids = drain
+            .reclaimed_segment_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let Some(receipt) = drain.receipt.clone() else {
+            return Err(StoreError::InvalidOptions {
+                reason: "receipt-bound reclaim consumer returned queue acknowledgement without a durable receipt",
+            }
+            .into());
+        };
+        let receipt_object_ids = receipt
+            .freed_segment_extents
+            .iter()
+            .map(|extent| extent.extent_key)
+            .collect::<BTreeSet<_>>();
+        let receipt_segment_ids = receipt
+            .freed_segment_extents
+            .iter()
+            .map(|extent| extent.segment_id)
+            .collect::<BTreeSet<_>>();
+        let receipt_freed_ids = receipt
+            .freed_extents
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let queued_object_ids = self
+            .dead_object_reclaim_queue
+            .all_entries()
+            .into_iter()
+            .map(|entry| entry.object_id)
+            .collect::<BTreeSet<_>>();
+        if ack_object_ids.len() != drain.ack_object_ids.len()
+            || reclaimed_segment_ids.len() != drain.reclaimed_segment_ids.len()
+            || receipt_object_ids.len() != receipt.freed_segment_extents.len()
+            || receipt_freed_ids.len() != receipt.freed_extents.len()
+            || receipt_freed_ids != receipt_object_ids
+            || ack_object_ids != receipt_object_ids
+            || reclaimed_segment_ids != receipt_segment_ids
+            || reclaimed_segment_ids != recording_freer.segment_ids
+            || !receipt.freed_segment_extents.iter().all(|extent| {
+                plan.resolver.segments.get(&extent.extent_key).copied() == Some(extent.segment_id)
+            })
+            || !ack_object_ids.is_subset(&queued_object_ids)
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "receipt-bound reclaim consumer returned inconsistent receipt, acknowledgement, or physical-free authority",
+            }
+            .into());
         }
+        self.reclaim_receipts.push(receipt);
+        self.reclaim_receipts_dirty = true;
 
+        // Phase one: the exact physical-free receipt becomes durable while
+        // every source queue row is still present. A crash here leaves replay
+        // enough authority to acknowledge and finish the same decision.
+        self.sync_all()?;
         let removed = self
             .dead_object_reclaim_queue
             .ack_reclaimed(&drain.ack_object_ids);
-        if removed > 0 {
-            self.dead_object_reclaim_queue_dirty = true;
-        }
-
-        if !self.block_device_mode {
-            for segment_id in &drain.reclaimed_segment_ids {
-                let seg_path = segment_path(&self.segments_dir, *segment_id);
-                let _ = std::fs::remove_file(&seg_path);
+        if removed != drain.ack_object_ids.len() {
+            return Err(StoreError::InvalidOptions {
+                reason: "receipt-bound reclaim queue acknowledgement was not exact",
             }
+            .into());
+        }
+        self.dead_object_reclaim_queue_dirty = true;
+
+        // Phase two: make the exact receipt-covered acknowledgement durable
+        // before allocator or segment-file state can change. A crash after
+        // this barrier replays the durable receipt idempotently.
+        self.sync_all()?;
+
+        // Phase three: only now expose the reclaimed segment to the allocator
+        // and release its file capacity. Keep the lock-free counter exact by
+        // incrementing it only on a used-to-free transition.
+        for segment_id in recording_freer.segment_ids {
+            self.free_receipt_authorized_segment(segment_id)?;
         }
 
         self.sync_all()?;
@@ -3909,6 +4360,82 @@ impl LocalObjectStore {
         Ok(tidefs_reclaim::ReclaimConsumerStats {
             reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
             ..drain.stats
+        })
+    }
+
+    fn acknowledge_block_device_receipt_bound_dead_objects(
+        &mut self,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+        max_count: usize,
+    ) -> Result<tidefs_reclaim::ReclaimConsumerStats> {
+        debug_assert!(self.block_device_mode);
+        let limit = max_count.min(self.reclaim_consumer.config().max_entries_per_drain);
+        let entries = self
+            .dead_object_reclaim_queue
+            .dequeue_receipt_bound_batch_with_stable_generation(
+                limit,
+                stable_committed_txg,
+                stable_committed_generation,
+            );
+        let mut acknowledged = Vec::new();
+        let mut denied = 0_u64;
+        for entry in &entries {
+            let Some(lifetime) = self.resolve_receipt_bound_physical_lifetime(&entry.object_id)?
+            else {
+                // A logical-key compatibility row does not identify one
+                // physical block-log lifetime and cannot authorize omission.
+                denied = denied.saturating_add(1);
+                continue;
+            };
+            if self.index.get(&lifetime.logical_object_key).copied() == Some(lifetime.location)
+                || self
+                    .snapshot_extent_pin_set
+                    .is_pinned(&ReclaimObjectKey(*lifetime.logical_object_key.as_bytes()))
+            {
+                denied = denied.saturating_add(1);
+                continue;
+            }
+            acknowledged.push(entry.object_id);
+        }
+
+        if acknowledged.is_empty() {
+            return Ok(tidefs_reclaim::ReclaimConsumerStats {
+                entries_processed: entries.len(),
+                reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
+                gate_segments_skipped: u64::from(denied != 0),
+                gate_extents_denied: denied,
+                ..tidefs_reclaim::ReclaimConsumerStats::ZERO
+            });
+        }
+
+        let mut acknowledged_queue = self.dead_object_reclaim_queue.clone();
+        if acknowledged_queue.ack_reclaimed(&acknowledged) != acknowledged.len() {
+            return Err(StoreError::InvalidOptions {
+                reason: "block-device reclaim queue acknowledgement was not exact",
+            });
+        }
+
+        // If the acknowledgement record itself cannot append, compact first
+        // while the old durable queue is still installed. That rewrite must
+        // retain every row we are about to acknowledge. Only after enough
+        // headroom exists do we publish the smaller queue and cross its sync
+        // barrier. A crash before a later compaction is a conservative leak.
+        self.ensure_block_device_authority_append_space(Some(&acknowledged_queue))?;
+        self.dead_object_reclaim_queue = acknowledged_queue;
+        self.dead_object_reclaim_queue_dirty = true;
+        self.sync_all()?;
+
+        Ok(tidefs_reclaim::ReclaimConsumerStats {
+            entries_processed: entries.len(),
+            reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
+            gate_segments_skipped: u64::from(denied != 0),
+            gate_extents_denied: denied,
+            // Block mode has authorized later compaction omission, but has
+            // not freed virtual segment 0 or any physical block yet.
+            segments_reclaimed: 0,
+            blocks_freed: 0,
+            checkpoint_batches: 0,
         })
     }
 
@@ -3928,21 +4455,20 @@ impl LocalObjectStore {
             );
         let mut resolver = DeadObjectDrainSegmentResolver::default();
         let mut eligible_object_ids = BTreeSet::new();
+        let mut logical_object_ids = BTreeMap::new();
         let mut segment_refdrops: std::collections::HashMap<u64, u64> =
             std::collections::HashMap::new();
         let mut segment_queued_entries: std::collections::HashMap<u64, u64> =
             std::collections::HashMap::new();
 
         for entry in self.dead_object_reclaim_queue.all_entries() {
-            let Ok(Some(segment_id)) =
-                <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
-                    self,
-                    &entry.object_id,
-                )
+            let Ok(Some((segment_id, logical_object_id))) =
+                self.resolve_receipt_bound_reclaim_target(&entry.object_id)
             else {
                 continue;
             };
             resolver.segments.insert(entry.object_id, segment_id);
+            logical_object_ids.insert(entry.object_id, logical_object_id);
             *segment_queued_entries.entry(segment_id).or_default() += 1;
         }
 
@@ -3970,6 +4496,7 @@ impl LocalObjectStore {
             resolver,
             dead_segments,
             eligible_object_ids,
+            logical_object_ids,
         }
     }
 
@@ -4255,11 +4782,30 @@ impl LocalObjectStore {
 
         let checksum = checksum64(payload);
         let internal_metadata = is_public_scan_internal_key(key);
-        let sequence = if internal_metadata {
-            0
-        } else {
-            self.next_sequence
-        };
+        let sequence = self.next_sequence;
+        let next_sequence = sequence.checked_add(1).ok_or(StoreError::InvalidOptions {
+            reason: "object-store physical lifetime sequence exhausted",
+        })?;
+        let candidate_lifetime_id = receipt_bound_physical_lifetime_id(
+            key,
+            ObjectLocation {
+                key,
+                segment_id: 0,
+                record_offset: 0,
+                payload_offset: 0,
+                payload_len,
+                sequence,
+                payload_checksum: checksum,
+            },
+        );
+        if self
+            .receipt_bound_physical_lifetimes
+            .contains_key(&candidate_lifetime_id)
+        {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "receipt-bound physical lifetime identity collision",
+            });
+        }
         self.enospc_bytes_written = self.enospc_bytes_written.saturating_add(payload_len);
         let location = self.append_record(
             RecordKind::Put,
@@ -4304,10 +4850,9 @@ impl LocalObjectStore {
             self.record_test_current_dataset_write(payload_len);
         }
         self.history.entry(key).or_default().push(location);
+        self.index_receipt_bound_physical_lifetime(key, location)?;
         self.index.insert(key, location);
-        if !internal_metadata {
-            self.next_sequence = self.next_sequence.saturating_add(1);
-        }
+        self.next_sequence = next_sequence;
 
         // Fan out to all replica stores.
         let total_replicas = self.replicas.len();
@@ -4524,11 +5069,11 @@ impl LocalObjectStore {
         self.ensure_writable("delete_direct")?;
         let existed = self.index.contains_key(&key);
         let sequence = self.next_sequence;
+        let next_sequence = sequence.checked_add(1).ok_or(StoreError::InvalidOptions {
+            reason: "object-store physical lifetime sequence exhausted",
+        })?;
         let empty_checksum = checksum64(&[]);
         self.append_record(RecordKind::Delete, key, &[], empty_checksum, sequence, 0)?;
-        if let Some(loc) = self.index.get(&key).copied() {
-            self.history.entry(key).or_default().push(loc);
-        }
         self.index.remove(&key);
         self.checksums.remove(&key);
         let reclaim_key = tidefs_types_reclaim_queue_core::ObjectKey(key.0);
@@ -4538,7 +5083,7 @@ impl LocalObjectStore {
             tidefs_types_reclaim_queue_core::QueueFamily::Extent,
         );
         self.reclaim_queue.insert(reclaim_entry);
-        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.next_sequence = next_sequence;
         self.tombstone_count = self.tombstone_count.saturating_add(1);
 
         // Fan out delete to all replicas.
@@ -4922,18 +5467,16 @@ impl LocalObjectStore {
             });
         }
         let existed = self.index.contains_key(&key);
-        let sequence = if pool_metadata_family {
-            0
-        } else {
-            self.next_sequence
-        };
+        let sequence = self.next_sequence;
+        let next_sequence = sequence.checked_add(1).ok_or(StoreError::InvalidOptions {
+            reason: "object-store physical lifetime sequence exhausted",
+        })?;
         let empty_checksum = checksum64(&[]);
         self.append_record(RecordKind::Delete, key, &[], empty_checksum, sequence, 0)?;
-        // Record the last-known location in history so the reclaim-queue
-        // consumer's SegmentResolver can resolve the segment during drain
-        // after the index entry is removed.
+        // Put history already contains the last-known location. Keep it there
+        // after removing the live index entry so receipt-bound reclaim can
+        // still resolve the exact dead lifetime without duplicating it.
         if let Some(loc) = self.index.get(&key).copied() {
-            self.history.entry(key).or_default().push(loc);
             if !pool_metadata_family {
                 // Record the old segment liveness so the background reclaim
                 // process can track dead space and prioritize cleaning.
@@ -4947,11 +5490,11 @@ impl LocalObjectStore {
 
         self.index.remove(&key);
         self.checksums.remove(&key);
+        self.next_sequence = next_sequence;
         if !pool_metadata_family {
             // Enqueue a reclaim entry so the background drain loop can
             // eventually free the segment when all objects in it are dead.
             self.enqueue_reclaim_entry(key);
-            self.next_sequence = self.next_sequence.saturating_add(1);
             self.tombstone_count = self.tombstone_count.saturating_add(1);
         }
 
@@ -5039,16 +5582,44 @@ impl LocalObjectStore {
             return self.compact_block_device_retaining(protected_keys, protected_exact_locations);
         }
 
+        let mut protected_exact_locations: BTreeSet<ObjectLocation> =
+            protected_exact_locations.iter().copied().collect();
+        for entry in self.dead_object_reclaim_queue.all_entries() {
+            if let Some(lifetime) =
+                self.resolve_receipt_bound_physical_lifetime(&entry.object_id)?
+            {
+                protected_exact_locations.insert(lifetime.location);
+                continue;
+            }
+
+            // Compatibility rows use the logical object key as their queue
+            // identity and cannot distinguish repeated physical lifetimes.
+            // Preserve every known lifetime for that key. Any other
+            // unresolved durable row makes compaction fail closed instead of
+            // retiring history that may still be required for receipt-bound
+            // clearance.
+            let logical_object_key = ObjectKey::from_bytes(entry.object_id.0);
+            let Some(locations) = self
+                .history
+                .get(&logical_object_key)
+                .filter(|locations| !locations.is_empty())
+            else {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "compaction cannot resolve a pending receipt-bound physical lifetime",
+                });
+            };
+            protected_exact_locations.extend(locations.iter().copied());
+        }
+        let protected_exact_locations = protected_exact_locations.into_iter().collect::<Vec<_>>();
+
         let segment_ids_before = discover_segment_ids(&self.segments_dir)?;
         let live_objects_before = stats_counted_index_len(&self.index);
         let protected_keys: BTreeSet<ObjectKey> = protected_keys.iter().copied().collect();
-        let exact_location_keys: BTreeSet<ObjectKey> = protected_exact_locations
-            .iter()
-            .map(|location| location.key)
-            .collect();
+        let exact_locations: BTreeSet<ObjectLocation> =
+            protected_exact_locations.iter().copied().collect();
         let mut retained_segments: BTreeSet<u64> = BTreeSet::new();
 
-        for location in protected_exact_locations {
+        for location in &protected_exact_locations {
             self.read_location(*location)?;
             retained_segments.insert(location.segment_id);
         }
@@ -5062,17 +5633,16 @@ impl LocalObjectStore {
             self.index
                 .keys()
                 .copied()
-                .filter(|key| is_pool_store_internal_key(*key)),
+                .filter(|key| is_public_scan_internal_key(*key)),
         );
         let mut retained_copies = Vec::new();
         for key in retained_keys {
-            if exact_location_keys.contains(&key) {
-                continue;
-            }
             let Some(location) = self.index.get(&key).copied() else {
                 continue;
             };
-            if retained_segments.contains(&location.segment_id) {
+            if exact_locations.contains(&location)
+                || retained_segments.contains(&location.segment_id)
+            {
                 continue;
             }
             retained_copies.push((
@@ -5116,6 +5686,17 @@ impl LocalObjectStore {
         for key in tombstone_keys {
             self.delete(key)?;
         }
+
+        let next_sequence =
+            self.next_sequence
+                .checked_add(1)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "object-store physical lifetime sequence exhausted",
+                })?;
+        self.put_direct(
+            physical_lifetime_sequence_high_water_key(),
+            &next_sequence.to_le_bytes(),
+        )?;
 
         self.sync_all()?;
         // Segment retirement can remove the history that suppresses
@@ -5182,7 +5763,7 @@ impl LocalObjectStore {
             }
         }
         self.rotate_segment()?;
-        for location in protected_exact_locations {
+        for location in &protected_exact_locations {
             self.read_location(*location)?;
         }
 
@@ -5437,29 +6018,32 @@ impl LocalObjectStore {
     pub fn sync_all(&mut self) -> Result<()> {
         self.ensure_pool_raw_mutation_allowed()?;
         self.ensure_writable("sync_all")?;
-        if self.dead_object_reclaim_queue_dirty {
-            let queue = std::mem::replace(
-                &mut self.dead_object_reclaim_queue,
-                DeadObjectReclaimQueue::new(),
-            );
-            let result = store_dead_object_reclaim_queue(&queue, self);
-            self.dead_object_reclaim_queue = queue;
-            result?;
-            self.dead_object_reclaim_queue_dirty = false;
+        if self.block_device_mode
+            && (self.dead_object_reclaim_queue_dirty
+                || self.reclaim_receipts_dirty
+                || self.snapshot_extent_pin_set_dirty)
+        {
+            self.ensure_block_device_authority_append_space(None)?;
+        }
+        let dead_object_reclaim_queue_dirty = self.dead_object_reclaim_queue_dirty;
+        let reclaim_receipts_dirty = self.reclaim_receipts_dirty;
+        let snapshot_extent_pin_set_dirty = self.snapshot_extent_pin_set_dirty;
+        if dead_object_reclaim_queue_dirty {
+            // Keep the complete queue installed while its named-object update
+            // appends. In particular, an ENOSPC path must never observe an
+            // empty in-memory queue and compact away a still-durable row.
+            let queue = self.dead_object_reclaim_queue.clone();
+            store_dead_object_reclaim_queue(&queue, self)?;
         }
 
-        if self.reclaim_receipts_dirty {
-            let receipts = std::mem::take(&mut self.reclaim_receipts);
-            let result = store_reclaim_receipts(&receipts, self);
-            self.reclaim_receipts = receipts;
-            result?;
-            self.reclaim_receipts_dirty = false;
+        if reclaim_receipts_dirty {
+            let receipts = self.reclaim_receipts.clone();
+            store_reclaim_receipts(&receipts, self)?;
         }
 
-        if self.snapshot_extent_pin_set_dirty {
+        if snapshot_extent_pin_set_dirty {
             let pin_set = self.snapshot_extent_pin_set.clone();
             store_snapshot_extent_pin_set(&pin_set, self)?;
-            self.snapshot_extent_pin_set_dirty = false;
         }
 
         let path = segment_path(&self.segments_dir, self.current_segment_id);
@@ -5467,6 +6051,20 @@ impl LocalObjectStore {
             .sync_all()
             .map_err(|source| io_error("sync_all", &path, source))?;
         sync_directory(&self.segments_dir)?;
+        // Authority dirtiness remains set until the appended queue, receipt,
+        // and pin objects cross this barrier. Auto-compaction is suppressed
+        // while any of these flags is set, so omission can only consume a
+        // queue acknowledgement that is already durable.
+        if dead_object_reclaim_queue_dirty {
+            self.durable_dead_object_reclaim_queue = self.dead_object_reclaim_queue.clone();
+            self.dead_object_reclaim_queue_dirty = false;
+        }
+        if reclaim_receipts_dirty {
+            self.reclaim_receipts_dirty = false;
+        }
+        if snapshot_extent_pin_set_dirty {
+            self.snapshot_extent_pin_set_dirty = false;
+        }
         // Explicit sync only needs a spacemap checkpoint after allocation/free
         // state changed since the last successful checkpoint.
         let spacemap_dirty = !self.free_map.dirty_segment_groups().is_empty();
@@ -5904,7 +6502,11 @@ impl LocalObjectStore {
             compression_algorithm,
         ) {
             Err(StoreError::NoSpace)
-                if self.block_device_mode && !is_strict_pool_authority_key(key) =>
+                if self.block_device_mode
+                    && !is_strict_pool_authority_key(key)
+                    && !self.dead_object_reclaim_queue_dirty
+                    && !self.reclaim_receipts_dirty
+                    && !self.snapshot_extent_pin_set_dirty =>
             {
                 self.compact_block_device_live_records()?;
                 self.append_record_once(
@@ -5968,6 +6570,9 @@ impl LocalObjectStore {
         self.current_file
             .write_all(&trailer)
             .map_err(|source| io_error("write production integrity trailer", &path, source))?;
+        if self.block_device_mode {
+            self.write_and_verify_block_device_tail_terminator(record_range.end_offset)?;
+        }
         if self.options.sync_on_write {
             self.current_file
                 .sync_data()
@@ -5995,24 +6600,155 @@ impl LocalObjectStore {
 
     fn compact_block_device_locations(
         &mut self,
-        mut retained_locations: Vec<(ObjectKey, ObjectLocation)>,
+        retained_locations: Vec<(ObjectKey, ObjectLocation)>,
     ) -> Result<()> {
         debug_assert!(self.block_device_mode);
         self.ensure_writable("compact_block_device_locations")?;
-        retained_locations.sort_by_key(|(key, loc)| (loc.record_offset, *key));
+        if self.dead_object_reclaim_queue_dirty
+            || self.reclaim_receipts_dirty
+            || self.snapshot_extent_pin_set_dirty
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "block-device compaction refuses uncommitted reclaim authority",
+            });
+        }
+
+        let pending_reclaim_object_ids = self
+            .dead_object_reclaim_queue
+            .all_entries()
+            .into_iter()
+            .map(|entry| entry.object_id)
+            .collect();
+        self.compact_block_device_locations_with_pending_reclaim(
+            retained_locations,
+            &pending_reclaim_object_ids,
+        )
+    }
+
+    fn compact_block_device_locations_with_pending_reclaim(
+        &mut self,
+        retained_locations: Vec<(ObjectKey, ObjectLocation)>,
+        pending_reclaim_object_ids: &BTreeSet<ReclaimObjectKey>,
+    ) -> Result<()> {
+        debug_assert!(self.block_device_mode);
+        self.ensure_writable("compact_block_device_locations")?;
+
+        let mut desired_live_locations = BTreeMap::new();
+        let mut retained_location_set = BTreeSet::new();
+        for (key, location) in retained_locations {
+            if key != location.key || self.index.get(&key).copied() != Some(location) {
+                return Err(StoreError::InvalidOptions {
+                    reason: "block-device compaction received a noncurrent live location",
+                });
+            }
+            if key == physical_lifetime_sequence_high_water_key() {
+                continue;
+            }
+            desired_live_locations.insert(key, location);
+            retained_location_set.insert(location);
+        }
+
+        let mut exact_pending_ids = BTreeSet::new();
+        let mut compatibility_pending_keys = BTreeSet::new();
+        for object_id in pending_reclaim_object_ids {
+            if let Some(lifetime) = self
+                .receipt_bound_physical_lifetimes
+                .get(object_id)
+                .copied()
+            {
+                if lifetime.logical_object_key == physical_lifetime_sequence_high_water_key() {
+                    return Err(StoreError::InvalidDeadObjectReceipt {
+                        reason:
+                            "physical lifetime sequence high-water cannot be queued for reclaim",
+                    });
+                }
+                exact_pending_ids.insert(*object_id);
+                retained_location_set.insert(lifetime.location);
+                continue;
+            }
+
+            // A pre-exact queue row identifies only a logical key. Preserve
+            // all of its put history rather than guessing one generation.
+            let logical_key = ObjectKey::from_bytes(object_id.0);
+            let Some(locations) = self
+                .history
+                .get(&logical_key)
+                .filter(|locations| !locations.is_empty())
+            else {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "block-device compaction cannot resolve pending reclaim lifetime",
+                });
+            };
+            compatibility_pending_keys.insert(logical_key);
+            retained_location_set.extend(locations.iter().copied());
+        }
+
+        let mut retained_locations = retained_location_set.into_iter().collect::<Vec<_>>();
+        retained_locations.sort_by_key(|location| (location.record_offset, location.key));
+        for (key, desired) in &desired_live_locations {
+            if retained_locations
+                .iter()
+                .filter(|location| location.key == *key)
+                .next_back()
+                .copied()
+                != Some(*desired)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "block-device compaction live record is not the last retained version",
+                });
+            }
+        }
 
         let retained_records: Vec<(ObjectKey, ObjectLocation, Vec<u8>, u8)> = retained_locations
             .into_iter()
-            .map(|(key, old_location)| {
+            .map(|old_location| {
                 self.read_location_stored_payload(old_location).map(
                     |(payload, compression_algorithm)| {
-                        (key, old_location, payload, compression_algorithm)
+                        (
+                            old_location.key,
+                            old_location,
+                            payload,
+                            compression_algorithm,
+                        )
                     },
                 )
             })
             .collect::<Result<_>>()?;
+        let sequence_high_water_payload = self.next_sequence.to_le_bytes();
+        let tombstone_keys = retained_records
+            .iter()
+            .map(|(key, _, _, _)| *key)
+            .filter(|key| !desired_live_locations.contains_key(key))
+            .collect::<BTreeSet<_>>();
 
         let data_start = Self::block_device_data_start();
+        let usable_end = self.block_device_usable_end()?;
+        let records_end = retained_records
+            .iter()
+            .try_fold(data_start, |offset, record| {
+                offset
+                    .checked_add(Self::checked_record_total_len_u64(record.2.len() as u64))
+                    .ok_or(StoreError::NoSpace)
+            })?;
+        let high_water_end = records_end
+            .checked_add(Self::checked_record_total_len_u64(
+                sequence_high_water_payload.len() as u64,
+            ))
+            .ok_or(StoreError::NoSpace)?;
+        let tombstones_end = tombstone_keys
+            .iter()
+            .try_fold(high_water_end, |offset, _| {
+                offset
+                    .checked_add(Self::checked_record_total_len_u64(0))
+                    .ok_or(StoreError::NoSpace)
+            })?;
+        if tombstones_end
+            .checked_add(RECORD_HEADER_LEN_U64)
+            .is_none_or(|end| end > usable_end)
+        {
+            return Err(StoreError::NoSpace);
+        }
+
         self.current_file
             .seek(SeekFrom::Start(data_start))
             .map_err(|source| io_error("block_device_compact_seek_start", &self.root, source))?;
@@ -6025,38 +6761,114 @@ impl LocalObjectStore {
 
         let mut compacted_index: BTreeMap<ObjectKey, ObjectLocation> = BTreeMap::new();
         let mut compacted_history: BTreeMap<ObjectKey, Vec<ObjectLocation>> = BTreeMap::new();
+        let mut relocated_locations: BTreeMap<ObjectLocation, ObjectLocation> = BTreeMap::new();
+        let mut tombstone_locations: BTreeMap<ObjectKey, ObjectLocation> = BTreeMap::new();
 
         let compact_result = (|| -> Result<()> {
-            for (key, old_location, payload, compression_algorithm) in retained_records {
+            for (key, old_location, payload, compression_algorithm) in &retained_records {
                 let new_location = self.append_record_once(
                     RecordKind::Put,
-                    key,
-                    &payload,
+                    *key,
+                    payload,
                     old_location.payload_checksum,
                     old_location.sequence,
-                    compression_algorithm,
+                    *compression_algorithm,
                 )?;
-                compacted_history.entry(key).or_default().push(new_location);
-                compacted_index.insert(key, new_location);
+                compacted_history
+                    .entry(*key)
+                    .or_default()
+                    .push(new_location);
+                relocated_locations.insert(*old_location, new_location);
+            }
+            let high_water_key = physical_lifetime_sequence_high_water_key();
+            let high_water_location = self.append_record_once(
+                RecordKind::Put,
+                high_water_key,
+                &sequence_high_water_payload,
+                checksum64(&sequence_high_water_payload),
+                0,
+                0,
+            )?;
+            compacted_history
+                .entry(high_water_key)
+                .or_default()
+                .push(high_water_location);
+            compacted_index.insert(high_water_key, high_water_location);
+            for key in &tombstone_keys {
+                let tombstone_location =
+                    self.append_record_once(RecordKind::Delete, *key, &[], checksum64(&[]), 0, 0)?;
+                tombstone_locations.insert(*key, tombstone_location);
+            }
+            for (key, old_location) in &desired_live_locations {
+                let new_location = relocated_locations.get(old_location).copied().ok_or(
+                    StoreError::InvalidOptions {
+                        reason: "block-device compaction lost a live relocation",
+                    },
+                )?;
+                compacted_index.insert(*key, new_location);
+            }
+
+            let (high_water_payload, high_water_algorithm) =
+                self.read_location_stored_payload(high_water_location)?;
+            if high_water_payload != sequence_high_water_payload || high_water_algorithm != 0 {
+                return Err(StoreError::InvalidOptions {
+                    reason: "block-device compaction sequence high-water verification failed",
+                });
+            }
+
+            // Verify every rewritten record before clearing the old tail. No
+            // durability barrier is issued until the blank terminator is also
+            // present.
+            for (key, old_location, expected_payload, expected_algorithm) in &retained_records {
+                let new_location = relocated_locations[old_location];
+                let (payload, algorithm) = self.read_location_stored_payload(new_location)?;
+                if payload != *expected_payload
+                    || algorithm != *expected_algorithm
+                    || receipt_bound_physical_lifetime_id(*key, *old_location)
+                        != receipt_bound_physical_lifetime_id(*key, new_location)
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "block-device compaction candidate verification failed",
+                    });
+                }
+            }
+            for (key, location) in &tombstone_locations {
+                self.verify_block_device_delete_record(*key, *location)?;
             }
             Ok(())
         })();
         self.options.sync_on_write = sync_on_write;
         compact_result?;
 
+        let compacted_lifetimes = build_receipt_bound_physical_lifetime_index(&compacted_history)?;
+        if !exact_pending_ids
+            .iter()
+            .all(|object_id| compacted_lifetimes.contains_key(object_id))
+            || !compatibility_pending_keys.iter().all(|key| {
+                compacted_history
+                    .get(key)
+                    .is_some_and(|locations| !locations.is_empty())
+            })
+        {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "block-device compaction did not retain pending reclaim authority",
+            });
+        }
+
         self.clear_block_device_compacted_tail()?;
+        // The inherited rewrite is in-place and has no atomic arena-swap
+        // boundary. One sync avoids an intentional durable new-prefix/old-tail
+        // interval; it is not a power-cut atomicity claim for this format.
         self.current_file
             .sync_all()
             .map_err(|source| io_error("block_device_compact_sync_all", &self.root, source))?;
 
         self.index = compacted_index;
         self.history = compacted_history;
+        self.receipt_bound_physical_lifetimes = compacted_lifetimes;
+        self.checksums.retain(|key, _| self.index.contains_key(key));
         self.reclaim_queue.clear();
         self.segment_liveness.clear();
-        if !self.dead_object_reclaim_queue.is_empty() {
-            self.dead_object_reclaim_queue.clear();
-            self.dead_object_reclaim_queue_dirty = true;
-        }
 
         let live_count = self.index.len() as u64;
         self.reclaim_consumer.live_counts_mut().remove(0);
@@ -6069,29 +6881,202 @@ impl LocalObjectStore {
         Ok(())
     }
 
+    fn verify_block_device_delete_record(
+        &self,
+        expected_key: ObjectKey,
+        location: ObjectLocation,
+    ) -> Result<()> {
+        let data_end = self
+            .block_device_capacity
+            .unwrap_or(0)
+            .saturating_sub(POOL_LABEL_SIZE as u64);
+        let mut header = [0_u8; RECORD_HEADER_LEN];
+        self.current_file
+            .read_exact_at(&mut header, location.record_offset)
+            .map_err(|source| {
+                io_error("block_device_compact_read_tombstone", &self.root, source)
+            })?;
+        let record = decode_header(&header, location.segment_id, location.record_offset)?;
+        let range = checked_record_range(record, location.segment_id, location.record_offset)?;
+        let tail_len = usize::try_from(range.end_offset - range.payload_offset).map_err(|_| {
+            StoreError::PayloadTooLarge {
+                len: record.payload_len,
+                max: usize::MAX as u64,
+            }
+        })?;
+        let mut tail = vec![0_u8; tail_len];
+        self.current_file
+            .read_exact_at(&mut tail, range.payload_offset)
+            .map_err(|source| {
+                io_error(
+                    "block_device_compact_read_tombstone_tail",
+                    &self.root,
+                    source,
+                )
+            })?;
+        let mut tail = io::Cursor::new(tail);
+        let decoded = decode_stored_record_after_header(
+            &mut tail,
+            &self.root,
+            location.segment_id,
+            location.record_offset,
+            data_end,
+            header,
+        )?;
+        if decoded.header.kind != RecordKind::Delete
+            || decoded.header.key != expected_key
+            || decoded.header.sequence != location.sequence
+            || decoded.header.payload_len != 0
+            || decoded.header.payload_checksum != checksum64(&[])
+            || decoded.header.compression_algorithm != 0
+            || !decoded.payload.is_empty()
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "block-device compaction tombstone verification failed",
+            });
+        }
+        Ok(())
+    }
+
     fn clear_block_device_compacted_tail(&mut self) -> Result<()> {
         let usable_end = self.block_device_usable_end()?;
-        if self.current_offset >= usable_end {
-            return Ok(());
+        if self
+            .current_offset
+            .checked_add(RECORD_HEADER_LEN_U64)
+            .is_none_or(|end| end > usable_end)
+        {
+            return Err(StoreError::NoSpace);
         }
+        self.write_and_verify_block_device_tail_terminator(self.current_offset)
+    }
 
-        let clear_len = (usable_end - self.current_offset).min(RECORD_HEADER_LEN_U64);
-        if clear_len == 0 {
-            return Ok(());
-        }
-
-        let clear_len = usize::try_from(clear_len).map_err(|_| StoreError::PayloadTooLarge {
-            len: clear_len,
-            max: usize::MAX as u64,
-        })?;
-        let zeros = vec![0_u8; clear_len];
+    fn write_and_verify_block_device_tail_terminator(&mut self, offset: u64) -> Result<()> {
+        debug_assert!(self.block_device_mode);
         self.current_file
-            .seek(SeekFrom::Start(self.current_offset))
+            .seek(SeekFrom::Start(offset))
             .map_err(|source| io_error("block_device_compact_seek_tail", &self.root, source))?;
         self.current_file
-            .write_all(&zeros)
+            .write_all(&[0_u8; RECORD_HEADER_LEN])
             .map_err(|source| io_error("block_device_compact_clear_tail", &self.root, source))?;
+        let mut terminator = [0xff_u8; RECORD_HEADER_LEN];
+        self.current_file
+            .read_exact_at(&mut terminator, offset)
+            .map_err(|source| {
+                io_error(
+                    "block_device_compact_read_tail_terminator",
+                    &self.root,
+                    source,
+                )
+            })?;
+        if terminator != [0_u8; RECORD_HEADER_LEN] {
+            return Err(StoreError::InvalidOptions {
+                reason: "block-device compaction tail terminator verification failed",
+            });
+        }
         Ok(())
+    }
+
+    fn block_device_authority_payload_lengths(
+        &self,
+        dead_object_queue: Option<&DeadObjectReclaimQueue>,
+    ) -> Result<Vec<u64>> {
+        let mut payload_lengths = Vec::new();
+        if let Some(queue) = dead_object_queue {
+            payload_lengths.push(queue.encode().len() as u64);
+        } else if self.dead_object_reclaim_queue_dirty {
+            payload_lengths.push(self.dead_object_reclaim_queue.encode().len() as u64);
+        }
+        if self.reclaim_receipts_dirty {
+            let payload_len = self
+                .reclaim_receipts
+                .iter()
+                .try_fold(12_u64, |len, receipt| {
+                    len.checked_add(4)
+                        .and_then(|len| len.checked_add(receipt.encode().len() as u64))
+                        .ok_or(StoreError::NoSpace)
+                })?;
+            payload_lengths.push(payload_len);
+        }
+        if self.snapshot_extent_pin_set_dirty {
+            let payload_len =
+                self.snapshot_extent_pin_set
+                    .pins()
+                    .try_fold(20_u64, |len, (snapshot_id, _)| {
+                        len.checked_add(4)
+                            .and_then(|len| len.checked_add(snapshot_id.len() as u64))
+                            .and_then(|len| len.checked_add(32))
+                            .ok_or(StoreError::NoSpace)
+                    })?;
+            payload_lengths.push(payload_len);
+        }
+        Ok(payload_lengths)
+    }
+
+    fn ensure_block_device_authority_append_space(
+        &mut self,
+        candidate_dead_object_queue: Option<&DeadObjectReclaimQueue>,
+    ) -> Result<()> {
+        debug_assert!(self.block_device_mode);
+        let payload_lengths =
+            self.block_device_authority_payload_lengths(candidate_dead_object_queue)?;
+        if payload_lengths.is_empty() {
+            return Ok(());
+        }
+        let mut append_reserve =
+            Self::checked_record_total_len_u64(CHAINED_COMMITTED_ROOT_PAYLOAD_LEN)
+                .checked_add(RECORD_HEADER_LEN_U64)
+                .ok_or(StoreError::NoSpace)?;
+        for payload_len in payload_lengths {
+            if payload_len > self.options.max_object_bytes() {
+                return Err(StoreError::PayloadTooLarge {
+                    len: payload_len,
+                    max: self.options.max_object_bytes(),
+                });
+            }
+            append_reserve = append_reserve
+                .checked_add(Self::checked_record_total_len_u64(payload_len))
+                .ok_or(StoreError::NoSpace)?;
+        }
+        let usable_end = self.block_device_usable_end()?;
+        if self
+            .current_offset
+            .checked_add(append_reserve)
+            .is_some_and(|end| end <= usable_end)
+        {
+            return Ok(());
+        }
+
+        // Retain the union of the old durable queue, current in-memory queue,
+        // and a not-yet-installed candidate queue. This lets authority growth
+        // recover append space without either dropping the new lifetime or
+        // consuming an acknowledgement that has not reached durable media.
+        let mut pending_reclaim_object_ids = BTreeSet::new();
+        for entry in self.durable_dead_object_reclaim_queue.all_entries() {
+            pending_reclaim_object_ids.insert(entry.object_id);
+        }
+        for entry in self.dead_object_reclaim_queue.all_entries() {
+            pending_reclaim_object_ids.insert(entry.object_id);
+        }
+        if let Some(queue) = candidate_dead_object_queue {
+            for entry in queue.all_entries() {
+                pending_reclaim_object_ids.insert(entry.object_id);
+            }
+        }
+        let live_locations = self.index.iter().map(|(key, loc)| (*key, *loc)).collect();
+        self.compact_block_device_locations_with_pending_reclaim(
+            live_locations,
+            &pending_reclaim_object_ids,
+        )?;
+        let usable_end = self.block_device_usable_end()?;
+        if self
+            .current_offset
+            .checked_add(append_reserve)
+            .is_some_and(|end| end <= usable_end)
+        {
+            Ok(())
+        } else {
+            Err(StoreError::NoSpace)
+        }
     }
 
     /// Compute total record length from payload_len
@@ -6108,7 +7093,12 @@ impl LocalObjectStore {
         // whether the record fits in the remaining device capacity.
         if self.block_device_mode {
             let usable_end = self.block_device_usable_end()?;
-            if self.current_offset + record_len > usable_end {
+            if self
+                .current_offset
+                .checked_add(record_len)
+                .and_then(|end| end.checked_add(RECORD_HEADER_LEN_U64))
+                .is_none_or(|end| end > usable_end)
+            {
                 return Err(StoreError::NoSpace);
             }
             return Ok(());
@@ -6970,9 +7960,7 @@ fn replay_segment(request: ReplaySegmentRequest<'_>, state: ReplaySegmentState<'
                 _ => {}
             }
         }
-        if !internal_record {
-            *next_sequence = (*next_sequence).max(record.sequence.saturating_add(1));
-        }
+        *next_sequence = (*next_sequence).max(record.sequence.saturating_add(1));
         match record.kind {
             RecordKind::Put => {
                 if !internal_record {
@@ -8889,10 +9877,6 @@ mod block_device_open_tests {
         options
     }
 
-    fn reclaim_key(key: ObjectKey) -> ReclaimObjectKey {
-        ReclaimObjectKey(*key.as_bytes())
-    }
-
     fn dead_object_receipt(
         key: ReclaimObjectKey,
     ) -> tidefs_types_reclaim_queue_core::DeadObjectReplacementReceipt {
@@ -9272,7 +10256,10 @@ mod block_device_open_tests {
     fn block_device_delete_churn_reuses_append_space() {
         let dir = tempdir().expect("tempdir");
         let image = create_block_image(&dir);
-        let record_bytes = 80 * 1024;
+        // Five live records still fit in the fixed 1 MiB data region, while
+        // the two superseded records plus delete markers force the later
+        // appends through block-log compaction.
+        let record_bytes = 192 * 1024;
         let options = block_options(record_bytes);
         let payload_len = options.max_object_bytes() as usize;
         let mut store = LocalObjectStore::open_block_device_writable_unbound(&image, options)
@@ -9311,9 +10298,12 @@ mod block_device_open_tests {
         for key in live_keys {
             assert!(store.get(key).expect("get live").is_some());
         }
+        let compacted_live_bound = LocalObjectStore::block_device_data_start()
+            + 5 * record_bytes
+            + LocalObjectStore::checked_record_total_len_u64(std::mem::size_of::<u64>() as u64);
         assert!(
-            store.current_offset <= LocalObjectStore::block_device_data_start() + 5 * record_bytes,
-            "delete churn should compact away obsolete records"
+            store.current_offset <= compacted_live_bound,
+            "delete churn should retain only live records plus the physical-lifetime sequence high-water"
         );
         store.sync_all().expect("sync compacted block image");
         drop(store);
@@ -9406,7 +10396,114 @@ mod block_device_open_tests {
     }
 
     #[test]
-    fn block_device_receipt_bound_drain_keeps_backing_image() {
+    fn block_device_append_after_compaction_clears_valid_stale_successor_header() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let mut store =
+            LocalObjectStore::open_block_device_writable_unbound(&image, block_options(80 * 1024))
+                .expect("open block image");
+        let live_key = ObjectKey::from_name(b"block-device/terminator/live");
+        let append_key = ObjectKey::from_name(b"block-device/terminator/append");
+        let stale_key = ObjectKey::from_name(b"block-device/terminator/stale-tail");
+        let append_payload = b"append consumes compacted terminator";
+        let stale_payload = b"valid but obsolete tail record";
+
+        store.put(live_key, b"live payload").expect("put live");
+        let live_keys = store.list_keys();
+        store
+            .compact_retaining(&live_keys, &[])
+            .expect("compact block prefix");
+        let append_record_len =
+            LocalObjectStore::checked_record_total_len_u64(append_payload.len() as u64);
+        let stale_offset = store
+            .current_offset
+            .checked_add(append_record_len)
+            .expect("stale successor offset");
+        let stale_record = RecordHeader {
+            format_version: RECORD_FORMAT_VERSION,
+            kind: RecordKind::Put,
+            sequence: store.next_sequence + 100,
+            key: stale_key,
+            payload_len: stale_payload.len() as u64,
+            payload_checksum: checksum64(stale_payload),
+            compression_algorithm: 0,
+        };
+        let stale_range =
+            checked_record_range(stale_record, 0, stale_offset).expect("stale record range");
+        assert!(
+            stale_range.end_offset + RECORD_HEADER_LEN_U64
+                <= store.block_device_usable_end().expect("block usable end")
+        );
+        let mut stale_header = [0_u8; RECORD_HEADER_LEN];
+        encode_header(&mut stale_header, stale_record);
+        let stale_footer = encode_footer(stale_record);
+        let stale_trailer = encode_integrity_trailer_v2(&build_integrity_trailer_v2(
+            stale_record,
+            &stale_header,
+            stale_payload,
+            &stale_footer,
+        ));
+        let mut backing = OpenOptions::new()
+            .write(true)
+            .open(&image)
+            .expect("open block image for stale tail");
+        backing
+            .seek(SeekFrom::Start(stale_offset))
+            .expect("seek stale tail");
+        backing
+            .write_all(&stale_header)
+            .expect("write stale header");
+        backing
+            .write_all(stale_payload)
+            .expect("write stale payload");
+        backing
+            .write_all(&stale_footer)
+            .expect("write stale footer");
+        backing
+            .write_all(&stale_trailer)
+            .expect("write stale trailer");
+        backing.sync_all().expect("sync valid stale tail");
+        drop(backing);
+
+        let mut observed_stale_header = [0_u8; RECORD_HEADER_LEN];
+        store
+            .current_file
+            .read_exact_at(&mut observed_stale_header, stale_offset)
+            .expect("read valid stale header");
+        assert_eq!(
+            decode_header(&observed_stale_header, 0, stale_offset)
+                .expect("decode valid stale header")
+                .key,
+            stale_key
+        );
+
+        store
+            .put_direct(append_key, append_payload)
+            .expect("append after compaction");
+        let mut successor_header = [0xff_u8; RECORD_HEADER_LEN];
+        store
+            .current_file
+            .read_exact_at(&mut successor_header, stale_offset)
+            .expect("read successor terminator");
+        assert_eq!(successor_header, [0_u8; RECORD_HEADER_LEN]);
+        store.sync_all().expect("sync successor terminator");
+        drop(store);
+
+        let reopened = LocalObjectStore::open_block_device(&image, block_options(80 * 1024))
+            .expect("reopen compacted and appended image");
+        assert_eq!(
+            reopened.get(live_key).expect("get reopened live"),
+            Some(b"live payload".to_vec())
+        );
+        assert_eq!(
+            reopened.get(append_key).expect("get reopened append"),
+            Some(append_payload.to_vec())
+        );
+        assert_eq!(reopened.get(stale_key).expect("get stale tail"), None);
+    }
+
+    #[test]
+    fn block_device_receipt_bound_drain_acknowledges_without_physical_free() {
         let dir = tempdir().expect("tempdir");
         let image = create_block_image(&dir);
         {
@@ -9432,33 +10529,38 @@ mod block_device_open_tests {
             block_options(RECLAIM_SEGMENT_BYTES),
         )
         .expect("open block image");
-        let key = ObjectKey::from_name(b"block-device/receipt-bound/delete");
+        let discarded_prefix = ObjectKey::from_name(b"block-device/receipt-bound/prefix");
+        let key = ObjectKey::from_name(b"block-device/receipt-bound/replace");
         let live_key = ObjectKey::from_name(b"block-device/receipt-bound/live");
         let live_payload = b"live append-log payload";
-        let reclaim_key = reclaim_key(key);
+        store
+            .put(discarded_prefix, &vec![0xc3; 64 * 1024])
+            .expect("put disposable prefix");
+        store.put(key, b"obsolete payload").expect("put obsolete");
+        let obsolete = store
+            .current_receipt_bound_physical_lifetime_pool_internal(key)
+            .expect("capture obsolete physical lifetime");
+        store
+            .put(key, b"replacement payload")
+            .expect("replace obsolete payload");
+        assert!(store.delete(discarded_prefix).expect("delete prefix"));
+        store
+            .put_direct(live_key, live_payload)
+            .expect("put live record");
         let entry = tidefs_types_reclaim_queue_core::DeadObjectEntry::new(
-            reclaim_key,
+            obsolete.reclaim_object_id,
             [0x5a; 16],
             1,
             true,
             1,
         )
-        .with_replacement_receipt(dead_object_receipt(reclaim_key));
-
-        store.put(key, b"receipt-bound payload").expect("put");
-        // Keep one live append-log record without changing the segment-level
-        // liveness count, so the pre-fix drain still selects virtual segment 0.
-        store
-            .put_direct(live_key, live_payload)
-            .expect("put live record");
-        assert!(store.delete(key).expect("delete"));
+        .with_replacement_receipt(dead_object_receipt(obsolete.reclaim_object_id));
         assert!(store
             .enqueue_receipt_bound_dead_object(entry)
             .expect("enqueue receipt-bound dead object"));
 
         let protected_image = std::fs::read(&image).expect("read protected block image");
         let free_segments_before = store.free_segment_count();
-
         store.release_segment_file_capacity_best_effort(0);
         assert_eq!(
             std::fs::read(&image).expect("read block image after defensive release"),
@@ -9466,36 +10568,426 @@ mod block_device_open_tests {
             "block-mode capacity-release backstop must not punch the pool member"
         );
 
+        let compact_live_keys = store.list_keys();
+        store
+            .compact_retaining(&compact_live_keys, &[])
+            .expect("block compaction retains queued exact lifetime");
+        let relocated = store
+            .resolve_receipt_bound_physical_lifetime(&obsolete.reclaim_object_id)
+            .expect("resolve relocated lifetime")
+            .expect("queued exact lifetime remains indexed");
+        assert_eq!(relocated.reclaim_object_id, obsolete.reclaim_object_id);
+        assert_ne!(
+            relocated.location.record_offset, obsolete.location.record_offset,
+            "discarding the prefix must relocate the queued lifetime"
+        );
+        assert_eq!(
+            store
+                .read_location(relocated.location)
+                .expect("read relocated queued lifetime"),
+            b"obsolete payload"
+        );
+        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
+        drop(store);
+
+        let mut store = LocalObjectStore::open_block_device_writable_unbound(
+            &image,
+            block_options(RECLAIM_SEGMENT_BYTES),
+        )
+        .expect("reopen relocated queue lifetime");
+        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
+        let reopened_lifetime = store
+            .resolve_receipt_bound_physical_lifetime(&obsolete.reclaim_object_id)
+            .expect("resolve reopened queued lifetime")
+            .expect("reopened queued lifetime remains indexed");
+        assert_eq!(
+            reopened_lifetime.reclaim_object_id,
+            obsolete.reclaim_object_id
+        );
+
         let stats = store
-            .drain_receipt_bound_dead_objects_at_stable_generation(2, 1, 16)
+            .drain_receipt_bound_dead_objects_at_stable_generation(2, 7, 16)
             .expect("drain receipt-bound dead object");
 
-        assert_eq!(stats.entries_processed, 0);
+        assert_eq!(stats.entries_processed, 1);
         assert_eq!(stats.segments_reclaimed, 0);
         assert_eq!(stats.blocks_freed, 0);
-        assert_eq!(stats.reclaim_queue_depth, 1);
+        assert_eq!(stats.reclaim_queue_depth, 0);
         assert_eq!(store.free_segment_count(), free_segments_before);
-        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
+        assert!(store.dead_object_reclaim_queue.is_empty());
         assert!(store.reclaim_receipts().is_empty());
         assert_eq!(
             store.get(live_key).expect("get live record after drain"),
             Some(live_payload.to_vec())
         );
+        let drained_image = std::fs::read(&image).expect("read block image after drain");
         assert_eq!(
-            std::fs::read(&image).expect("read block image after drain"),
-            protected_image,
-            "receipt-bound drain must preserve labels, bootstrap/header bytes, live records, and the trailing label reservation"
+            &drained_image[..BLOCK_DEVICE_DATA_REGION_OFFSET as usize],
+            &protected_image[..BLOCK_DEVICE_DATA_REGION_OFFSET as usize],
+            "receipt-bound drain must preserve the primary label and bootstrap region"
+        );
+        assert_eq!(
+            &drained_image[drained_image.len() - POOL_LABEL_SIZE..],
+            &protected_image[protected_image.len() - POOL_LABEL_SIZE..],
+            "receipt-bound drain must preserve the trailing label reservation"
         );
         assert!(image.exists(), "block backing image must not be unlinked");
+
+        let live_keys = store.list_keys();
+        store
+            .compact_retaining(&live_keys, &[])
+            .expect("compaction reclaims acknowledged history");
+        assert!(store
+            .resolve_receipt_bound_physical_lifetime(&obsolete.reclaim_object_id)
+            .expect("resolve reclaimed lifetime")
+            .is_none());
         drop(store);
 
         let reopened =
             LocalObjectStore::open_block_device(&image, block_options(RECLAIM_SEGMENT_BYTES))
                 .expect("reopen block image");
-        assert_eq!(reopened.get(key).expect("get reopened deleted"), None);
+        assert_eq!(
+            reopened.get(key).expect("get reopened replacement"),
+            Some(b"replacement payload".to_vec())
+        );
         assert_eq!(
             reopened.get(live_key).expect("get reopened live record"),
             Some(live_payload.to_vec())
+        );
+        assert!(reopened.dead_object_reclaim_queue.is_empty());
+    }
+
+    #[test]
+    fn block_device_open_refuses_corrupt_persisted_dead_object_queue() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let queue_key = ObjectKey::from_name(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes());
+        let queue_location = {
+            let mut store = LocalObjectStore::open_block_device_writable_unbound(
+                &image,
+                StoreOptions::test_fast(),
+            )
+            .expect("open block image");
+            let encoded = DeadObjectReclaimQueue::new().encode();
+            store
+                .put_direct(queue_key, &encoded)
+                .expect("persist valid empty dead-object queue");
+            store.sync_all().expect("sync valid dead-object queue");
+            store.location_of(queue_key).expect("queue location")
+        };
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image)
+            .expect("open queue image for corruption");
+        file.seek(SeekFrom::Start(queue_location.payload_offset))
+            .expect("seek queue payload");
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).expect("read queue payload byte");
+        byte[0] ^= 0xff;
+        file.seek(SeekFrom::Start(queue_location.payload_offset))
+            .expect("reseek queue payload");
+        file.write_all(&byte).expect("corrupt queue payload");
+        file.sync_all().expect("sync corrupt queue payload");
+        drop(file);
+
+        let error = match LocalObjectStore::open_block_device(&image, StoreOptions::test_fast()) {
+            Ok(_) => panic!("corrupt dead-object queue must refuse block-store open"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            StoreError::ChecksumMismatch { .. }
+                | StoreError::InvalidDeadObjectReceipt {
+                    reason: "persisted dead-object reclaim queue is corrupt or unverifiable"
+                }
+        ));
+    }
+
+    #[test]
+    fn block_device_enospc_queue_growth_compacts_before_dirtying_authority() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let mut store = LocalObjectStore::open_block_device_writable_unbound(
+            &image,
+            block_options(1024 * 1024),
+        )
+        .expect("open block image");
+        let disposable = ObjectKey::from_name(b"block-device/enospc/disposable");
+        let logical_key = ObjectKey::from_name(b"block-device/enospc/queued-lifetime");
+        let filler_key = ObjectKey::from_name(b"block-device/enospc/live-filler");
+
+        store
+            .put(disposable, &vec![0xd1; 128 * 1024])
+            .expect("put reclaimable prefix");
+        store.put(logical_key, b"obsolete").expect("put obsolete");
+        let obsolete = store
+            .current_receipt_bound_physical_lifetime_pool_internal(logical_key)
+            .expect("capture obsolete lifetime");
+        store
+            .put(logical_key, b"replacement")
+            .expect("put replacement");
+        assert!(store.delete(disposable).expect("delete reclaimable prefix"));
+
+        let entry = DeadObjectEntry::new(obsolete.reclaim_object_id, [0x91; 16], 1, true, 1)
+            .with_replacement_receipt(dead_object_receipt(obsolete.reclaim_object_id));
+        let mut candidate_queue = store.dead_object_reclaim_queue.clone();
+        assert!(candidate_queue.enqueue(entry));
+        let required_authority_append =
+            LocalObjectStore::checked_record_total_len_u64(candidate_queue.encode().len() as u64)
+                .checked_add(LocalObjectStore::checked_record_total_len_u64(
+                    CHAINED_COMMITTED_ROOT_PAYLOAD_LEN,
+                ))
+                .and_then(|len| len.checked_add(RECORD_HEADER_LEN_U64))
+                .expect("authority append reserve");
+        let usable_end = store.block_device_usable_end().expect("block usable end");
+        let available = usable_end - store.current_offset;
+        let record_overhead = LocalObjectStore::checked_record_total_len_u64(0);
+        let desired_remaining = required_authority_append - 1;
+        let filler_payload_len = available
+            .checked_sub(desired_remaining)
+            .and_then(|len| len.checked_sub(record_overhead))
+            .expect("enough room to manufacture append ENOSPC");
+        assert!(filler_payload_len <= store.options.max_object_bytes());
+        store
+            .put_direct(filler_key, &vec![0xf2; filler_payload_len as usize])
+            .expect("fill append tail without crossing capacity");
+        assert!(usable_end - store.current_offset < required_authority_append);
+        assert!(!store.dead_object_reclaim_queue_dirty);
+
+        assert!(store
+            .enqueue_receipt_bound_dead_object(entry)
+            .expect("queue enqueue compacts before installing dirty authority"));
+        assert!(!store.dead_object_reclaim_queue_dirty);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
+        assert_eq!(
+            load_dead_object_reclaim_queue(&store)
+                .expect("load durable ENOSPC queue")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.get(logical_key).unwrap(),
+            Some(b"replacement".to_vec())
+        );
+        assert_eq!(
+            store.get(filler_key).unwrap().map(|payload| payload.len()),
+            Some(filler_payload_len as usize)
+        );
+        assert!(store
+            .resolve_receipt_bound_physical_lifetime(&obsolete.reclaim_object_id)
+            .expect("resolve ENOSPC queued lifetime")
+            .is_some());
+        drop(store);
+
+        let reopened = LocalObjectStore::open_block_device(&image, StoreOptions::test_fast())
+            .expect("reopen ENOSPC-compacted queue");
+        assert_eq!(reopened.dead_object_reclaim_queue.len(), 1);
+        assert_eq!(
+            reopened.get(logical_key).unwrap(),
+            Some(b"replacement".to_vec())
+        );
+        assert!(reopened
+            .resolve_receipt_bound_physical_lifetime(&obsolete.reclaim_object_id)
+            .expect("resolve reopened ENOSPC queued lifetime")
+            .is_some());
+    }
+
+    #[test]
+    fn block_device_same_payload_lifetimes_keep_unique_sequences_across_compaction() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let options = StoreOptions::test_fast();
+        let logical_key = ObjectKey::from_name(b"block-device/lifetime/same-payload");
+        let payload = b"identical physical payload";
+        let mut internal_key_bytes = [0x6b; 32];
+        internal_key_bytes[..8].copy_from_slice(&crate::POOL_PLACEMENT_RECEIPT_KEY_PREFIX);
+        let internal_key = ObjectKey(internal_key_bytes);
+        let mut store =
+            LocalObjectStore::open_block_device_writable_unbound(&image, options.clone())
+                .expect("open block image");
+
+        store.put(logical_key, payload).expect("put first lifetime");
+        let first = store
+            .current_receipt_bound_physical_lifetime_pool_internal(logical_key)
+            .expect("capture first lifetime");
+        store
+            .put(logical_key, payload)
+            .expect("put identical second lifetime");
+        let second = store
+            .current_receipt_bound_physical_lifetime_pool_internal(logical_key)
+            .expect("capture second lifetime");
+        assert_ne!(first.location.sequence, second.location.sequence);
+        assert_ne!(first.reclaim_object_id, second.reclaim_object_id);
+
+        store
+            .put_direct(internal_key, payload)
+            .expect("put first internal lifetime");
+        let first_internal = store
+            .current_receipt_bound_physical_lifetime_pool_internal(internal_key)
+            .expect("capture first internal lifetime");
+        store
+            .put_direct(internal_key, payload)
+            .expect("put identical second internal lifetime");
+        let second_internal = store
+            .current_receipt_bound_physical_lifetime_pool_internal(internal_key)
+            .expect("capture second internal lifetime");
+        assert_ne!(
+            first_internal.location.sequence,
+            second_internal.location.sequence
+        );
+        assert_ne!(
+            first_internal.reclaim_object_id,
+            second_internal.reclaim_object_id
+        );
+
+        let entry = DeadObjectEntry::new(first.reclaim_object_id, [0x72; 16], 1, true, 1)
+            .with_replacement_receipt(dead_object_receipt(first.reclaim_object_id));
+        assert!(store
+            .enqueue_receipt_bound_dead_object(entry)
+            .expect("queue first exact lifetime"));
+        let live_keys = store.list_keys();
+        store
+            .compact_retaining(&live_keys, &[])
+            .expect("compact same-payload lifetimes");
+        drop(store);
+
+        let mut reopened = LocalObjectStore::open_block_device_writable_unbound(&image, options)
+            .expect("reopen compacted same-payload lifetimes");
+        let reopened_first = reopened
+            .resolve_receipt_bound_physical_lifetime(&first.reclaim_object_id)
+            .expect("resolve queued first lifetime")
+            .expect("queued first lifetime survives compaction");
+        let reopened_second = reopened
+            .current_receipt_bound_physical_lifetime_pool_internal(logical_key)
+            .expect("capture reopened second lifetime");
+        assert_eq!(reopened_first.reclaim_object_id, first.reclaim_object_id);
+        assert_eq!(reopened_second.reclaim_object_id, second.reclaim_object_id);
+        assert_eq!(
+            reopened
+                .read_location(reopened_first.location)
+                .expect("read queued first lifetime"),
+            payload
+        );
+        assert_eq!(reopened.get(logical_key).unwrap(), Some(payload.to_vec()));
+        let reopened_internal = reopened
+            .current_receipt_bound_physical_lifetime_pool_internal(internal_key)
+            .expect("capture reopened internal lifetime");
+        assert_eq!(
+            reopened_internal.reclaim_object_id,
+            second_internal.reclaim_object_id
+        );
+
+        reopened
+            .put(logical_key, payload)
+            .expect("put identical third lifetime after reopen");
+        let third = reopened
+            .current_receipt_bound_physical_lifetime_pool_internal(logical_key)
+            .expect("capture third lifetime");
+        reopened
+            .put_direct(internal_key, payload)
+            .expect("put identical third internal lifetime after reopen");
+        let third_internal = reopened
+            .current_receipt_bound_physical_lifetime_pool_internal(internal_key)
+            .expect("capture third internal lifetime");
+        assert!(third.location.sequence > second.location.sequence);
+        assert_ne!(third.reclaim_object_id, second.reclaim_object_id);
+        assert!(third_internal.location.sequence > second_internal.location.sequence);
+        assert_ne!(
+            third_internal.reclaim_object_id,
+            second_internal.reclaim_object_id
+        );
+    }
+
+    #[test]
+    fn block_device_retry_preflight_preserves_last_durable_queue_after_unsynced_ack_append() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let mut store = LocalObjectStore::open_block_device_writable_unbound(
+            &image,
+            block_options(1024 * 1024),
+        )
+        .expect("open block image");
+        let disposable = ObjectKey::from_name(b"block-device/retry/disposable");
+        let logical_key = ObjectKey::from_name(b"block-device/retry/queued-lifetime");
+        let filler_key = ObjectKey::from_name(b"block-device/retry/live-filler");
+
+        store
+            .put(disposable, &vec![0x31; 128 * 1024])
+            .expect("put reclaimable prefix");
+        store.put(logical_key, b"obsolete").expect("put obsolete");
+        let obsolete = store
+            .current_receipt_bound_physical_lifetime_pool_internal(logical_key)
+            .expect("capture obsolete lifetime");
+        store
+            .put(logical_key, b"replacement")
+            .expect("put replacement");
+        assert!(store.delete(disposable).expect("delete reclaimable prefix"));
+        let entry = DeadObjectEntry::new(obsolete.reclaim_object_id, [0x41; 16], 1, true, 1)
+            .with_replacement_receipt(dead_object_receipt(obsolete.reclaim_object_id));
+        assert!(store
+            .enqueue_receipt_bound_dead_object(entry)
+            .expect("persist old queue authority"));
+        assert_eq!(store.durable_dead_object_reclaim_queue.len(), 1);
+
+        let mut acknowledged_queue = store.dead_object_reclaim_queue.clone();
+        assert_eq!(
+            acknowledged_queue.ack_reclaimed(&[obsolete.reclaim_object_id]),
+            1
+        );
+        let queue_record_len = LocalObjectStore::checked_record_total_len_u64(
+            acknowledged_queue.encode().len() as u64,
+        );
+        let retry_reserve = queue_record_len
+            .checked_add(LocalObjectStore::checked_record_total_len_u64(
+                CHAINED_COMMITTED_ROOT_PAYLOAD_LEN,
+            ))
+            .and_then(|len| len.checked_add(RECORD_HEADER_LEN_U64))
+            .expect("retry reserve");
+        let usable_end = store.block_device_usable_end().expect("block usable end");
+        let available = usable_end - store.current_offset;
+        let desired_before_ack_append = queue_record_len + retry_reserve - 1;
+        let filler_payload_len = available
+            .checked_sub(desired_before_ack_append)
+            .and_then(|len| len.checked_sub(LocalObjectStore::checked_record_total_len_u64(0)))
+            .expect("enough room to manufacture retry compaction");
+        assert!(filler_payload_len <= store.options.max_object_bytes());
+        store
+            .put_direct(filler_key, &vec![0x51; filler_payload_len as usize])
+            .expect("fill before unsynced acknowledgement append");
+
+        // Model the exact post-append/pre-barrier cut: the live index points
+        // at the smaller queue, but the last successfully synced snapshot
+        // still contains the old row and remains compaction authority.
+        store.dead_object_reclaim_queue = acknowledged_queue.clone();
+        store.dead_object_reclaim_queue_dirty = true;
+        store_dead_object_reclaim_queue(&acknowledged_queue, &mut store)
+            .expect("append acknowledgement without crossing barrier");
+        assert!(usable_end - store.current_offset < retry_reserve);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 0);
+        assert_eq!(store.durable_dead_object_reclaim_queue.len(), 1);
+
+        store
+            .ensure_block_device_authority_append_space(None)
+            .expect("retry compaction retains last durable queue authority");
+        assert!(store
+            .resolve_receipt_bound_physical_lifetime(&obsolete.reclaim_object_id)
+            .expect("resolve durable queue lifetime after retry compaction")
+            .is_some());
+        assert_eq!(store.durable_dead_object_reclaim_queue.len(), 1);
+
+        store
+            .sync_all()
+            .expect("make acknowledgement durable after retry compaction");
+        assert!(store.durable_dead_object_reclaim_queue.is_empty());
+        assert_eq!(
+            store.get(logical_key).unwrap(),
+            Some(b"replacement".to_vec())
+        );
+        assert_eq!(
+            store.get(filler_key).unwrap().map(|payload| payload.len()),
+            Some(filler_payload_len as usize)
         );
     }
 }
@@ -10431,6 +11923,9 @@ mod reclaim_queue_production_tests {
         );
 
         assert_eq!(store.release_snapshot_extent_pins(snapshot_id), 1);
+        store
+            .sync_all()
+            .expect("persist snapshot-deadlist pin clearance");
         let freed = store
             .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
             .expect("released snapshot-deadlist drain");
@@ -10563,6 +12058,149 @@ mod reclaim_queue_production_tests {
     }
 
     #[test]
+    fn repeated_physical_lifetimes_remain_distinct_and_logically_snapshot_pinned() {
+        let (mut store, dir) = temp_store();
+        let logical_key = ObjectKey::from_name(b"receipt-bound/repeated-physical-lifetimes");
+        let logical_reclaim_key = reclaim_key(logical_key);
+
+        store
+            .put(logical_key, b"first lifetime")
+            .expect("put first");
+        store.sync_all().expect("sync first");
+        let first = store
+            .current_receipt_bound_physical_lifetime_pool_internal(logical_key)
+            .expect("capture first lifetime");
+        store.rotate_segment().expect("rotate after first");
+        store
+            .put(logical_key, b"second lifetime")
+            .expect("put second");
+        store.sync_all().expect("sync second");
+        let second = store
+            .current_receipt_bound_physical_lifetime_pool_internal(logical_key)
+            .expect("capture second lifetime");
+        assert_ne!(first.reclaim_object_id, second.reclaim_object_id);
+        assert_ne!(first.location.segment_id, second.location.segment_id);
+
+        let first_entry = DeadObjectEntry::new(first.reclaim_object_id, [0x61; 16], 1, true, 1)
+            .with_replacement_receipt(dead_object_receipt(first.reclaim_object_id, 1));
+        assert!(store.dead_object_reclaim_queue.enqueue(first_entry));
+        store.dead_object_reclaim_queue_dirty = true;
+        store.sync_all().expect("persist first reclaim lifetime");
+
+        store.rotate_segment().expect("rotate after second");
+        store
+            .put(logical_key, b"third live lifetime")
+            .expect("put third");
+        store.sync_all().expect("sync third");
+        let second_entry = DeadObjectEntry::new(second.reclaim_object_id, [0x61; 16], 2, true, 2)
+            .with_replacement_receipt(dead_object_receipt(second.reclaim_object_id, 2));
+        assert!(store.dead_object_reclaim_queue.enqueue(second_entry));
+        store.dead_object_reclaim_queue_dirty = true;
+        store.sync_all().expect("persist second reclaim lifetime");
+        assert_eq!(
+            load_dead_object_reclaim_queue(&store)
+                .expect("load durable reclaim queue")
+                .len(),
+            2
+        );
+        assert_eq!(store.dead_object_reclaim_queue.len(), 2);
+
+        for lifetime in [first, second] {
+            assert_eq!(
+                store
+                    .resolve_receipt_bound_reclaim_target(&lifetime.reclaim_object_id)
+                    .expect("resolve exact physical lifetime"),
+                Some((lifetime.location.segment_id, logical_reclaim_key))
+            );
+        }
+
+        store.pin_snapshot_extent("snap-repeated", logical_reclaim_key);
+        store.sync_all().expect("persist logical snapshot pin");
+        let held = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(3, 2, 16)
+            .expect("pinned repeated lifetime drain");
+        assert_eq!(held.segments_reclaimed, 0);
+        assert_eq!(held.gate_extents_denied, 2);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 2);
+
+        let compacted = store
+            .compact_retaining(&[logical_key], &[])
+            .expect("compaction preserves queued physical lifetimes");
+        assert!(compacted
+            .retained_segments
+            .contains(&first.location.segment_id));
+        assert!(compacted
+            .retained_segments
+            .contains(&second.location.segment_id));
+        assert_eq!(
+            store
+                .read_location(first.location)
+                .expect("read first lifetime"),
+            b"first lifetime"
+        );
+        assert_eq!(
+            store
+                .read_location(second.location)
+                .expect("read second lifetime"),
+            b"second lifetime"
+        );
+        assert_eq!(store.dead_object_reclaim_queue.len(), 2);
+        assert_eq!(
+            load_dead_object_reclaim_queue(&store)
+                .expect("load durable reclaim queue")
+                .len(),
+            2
+        );
+        for lifetime in [first, second] {
+            assert_eq!(
+                store
+                    .resolve_receipt_bound_reclaim_target(&lifetime.reclaim_object_id)
+                    .expect("resolve compacted physical lifetime"),
+                Some((lifetime.location.segment_id, logical_reclaim_key))
+            );
+        }
+
+        assert_eq!(store.release_snapshot_extent_pins("snap-repeated"), 1);
+        let dirty_clearance = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(3, 2, 16)
+            .expect("dirty pin clearance is refused");
+        assert_eq!(dirty_clearance.entries_processed, 0);
+        assert_eq!(dirty_clearance.segments_reclaimed, 0);
+        assert_eq!(dirty_clearance.reclaim_queue_depth, 2);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 2);
+        store
+            .sync_all()
+            .expect("persist released logical snapshot pin");
+        let freed = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(3, 2, 16)
+            .expect("released repeated lifetime drain");
+        assert_eq!(freed.segments_reclaimed, 2);
+        assert_eq!(freed.blocks_freed, 2);
+        assert!(store.dead_object_reclaim_queue.is_empty());
+        let committed_receipts = store.reclaim_receipts().to_vec();
+        assert!(committed_receipts
+            .iter()
+            .flat_map(|receipt| &receipt.freed_segment_extents)
+            .any(|extent| extent.extent_key == first.reclaim_object_id
+                && extent.segment_id == first.location.segment_id));
+        assert!(committed_receipts
+            .iter()
+            .flat_map(|receipt| &receipt.freed_segment_extents)
+            .any(|extent| extent.extent_key == second.reclaim_object_id
+                && extent.segment_id == second.location.segment_id));
+        drop(store);
+
+        let reopened = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+            .expect("reopen after repeated lifetime reclaim");
+        assert!(reopened.dead_object_reclaim_queue.is_empty());
+        assert_eq!(reopened.reclaim_receipts(), committed_receipts);
+        assert_eq!(
+            reopened.get(logical_key).expect("read current lifetime"),
+            Some(b"third live lifetime".to_vec())
+        );
+    }
+
+    #[test]
     fn receipt_bound_dead_object_drain_refuses_unflushed_publication() {
         let (mut store, _dir) = temp_store();
         let key = ObjectKey::from_name(b"receipt-bound/dead-object/dirty-publication");
@@ -10610,6 +12248,7 @@ mod reclaim_queue_production_tests {
             .enqueue_receipt_bound_dead_object(entry)
             .expect("enqueue receipt-bound dead object"));
         store.pin_snapshot_extent(snapshot_id, reclaim_key);
+        store.sync_all().expect("persist snapshot pin");
 
         let held = store
             .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
@@ -10628,6 +12267,17 @@ mod reclaim_queue_production_tests {
         );
 
         assert_eq!(store.release_snapshot_extent_pins(snapshot_id), 1);
+
+        let dirty_clearance = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .expect("dirty snapshot-pin clearance is refused");
+        assert_eq!(dirty_clearance.entries_processed, 0);
+        assert_eq!(dirty_clearance.segments_reclaimed, 0);
+        assert_eq!(dirty_clearance.reclaim_queue_depth, 1);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
+        assert!(store.reclaim_receipts().is_empty());
+        assert!(segment_path(&store.segments_dir, old_segment_id).exists());
+        store.sync_all().expect("persist snapshot-pin clearance");
 
         let freed = store
             .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
@@ -10701,6 +12351,9 @@ mod reclaim_queue_production_tests {
         );
 
         assert_eq!(reopened.release_snapshot_extent_pins(snapshot_id), 1);
+        reopened
+            .sync_all()
+            .expect("persist reopened snapshot-pin clearance");
         let freed = reopened
             .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
             .expect("released drain after reopen");
@@ -10748,6 +12401,7 @@ mod reclaim_queue_production_tests {
                 .expect("enqueue receipt-bound dead object"));
             store.pin_snapshot_extent(snapshot_id, reclaim_key);
         }
+        store.sync_all().expect("persist partial snapshot pins");
 
         let partial = store
             .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 1)
@@ -10779,6 +12433,9 @@ mod reclaim_queue_production_tests {
         );
 
         assert_eq!(store.release_snapshot_extent_pins(snapshot_id), 2);
+        store
+            .sync_all()
+            .expect("persist partial snapshot-pin clearance");
         let freed = store
             .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
             .expect("released full drain");
@@ -10905,6 +12562,154 @@ mod reclaim_queue_production_tests {
         assert!(!segment_path(&segments_dir, old_segment_id).exists());
         assert!(segment_path(&segments_dir, replacement_segment_id).exists());
         assert_eq!(reopened.get(key).unwrap(), Some(new_payload));
+    }
+
+    #[test]
+    fn reclaim_receipt_sync_cut_acks_queue_before_replayed_physical_free() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = ObjectKey::from_name(b"receipt-bound/replay/receipt-sync-cut");
+        let old_payload = vec![0xA5; 1536];
+        let new_payload = vec![0x5A; 1536];
+        let reclaim_key = reclaim_key(key);
+
+        let (segments_dir, old_segment_id, replacement_segment_id, free_before_replay) = {
+            let mut store =
+                LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+                    .expect("open store");
+            store.put(key, &old_payload).expect("old put");
+            let old_segment_id = store.index.get(&key).expect("old location").segment_id;
+            store.put(key, &new_payload).expect("replacement put");
+            let replacement_segment_id = store
+                .index
+                .get(&key)
+                .expect("replacement location")
+                .segment_id;
+            assert_ne!(old_segment_id, replacement_segment_id);
+            assert!(store
+                .enqueue_receipt_bound_dead_object(dead_object_entry_for_key(
+                    reclaim_key,
+                    5,
+                    true,
+                    1,
+                ))
+                .expect("persist receipt-bound queue row"));
+
+            // Exact crash cut after phase one: the receipt is durable while
+            // the source queue row and physical segment are still present.
+            store.reclaim_receipts.push(ReclaimReceipt::new(
+                vec![ReclaimReceiptExtent::new(old_segment_id, reclaim_key)],
+                6,
+                0,
+            ));
+            store.reclaim_receipts_dirty = true;
+            store.sync_all().expect("persist receipt before queue ack");
+            assert_eq!(
+                load_dead_object_reclaim_queue(&store)
+                    .expect("load durable reclaim queue")
+                    .len(),
+                1
+            );
+            assert!(segment_path(&store.segments_dir, old_segment_id).exists());
+            assert!(!store.free_map.is_free(old_segment_id));
+            (
+                store.segments_dir.clone(),
+                old_segment_id,
+                replacement_segment_id,
+                store.free_segment_count(),
+            )
+        };
+
+        let reopened = LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+            .expect("reopen receipt-sync cut");
+        assert!(reopened.dead_object_reclaim_queue.is_empty());
+        assert!(load_dead_object_reclaim_queue(&reopened)
+            .expect("load reopened durable reclaim queue")
+            .is_empty());
+        assert!(reopened.free_map.is_free(old_segment_id));
+        assert_eq!(reopened.free_segment_count(), free_before_replay + 1);
+        assert!(!segment_path(&segments_dir, old_segment_id).exists());
+        assert!(segment_path(&segments_dir, replacement_segment_id).exists());
+        assert_eq!(reopened.get(key).unwrap(), Some(new_payload));
+    }
+
+    #[test]
+    fn reclaim_queue_ack_sync_cut_replays_physical_free_idempotently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = ObjectKey::from_name(b"receipt-bound/replay/queue-ack-sync-cut");
+        let old_payload = vec![0xA5; 1536];
+        let new_payload = vec![0x5A; 1536];
+        let reclaim_key = reclaim_key(key);
+
+        let (segments_dir, old_segment_id, replacement_segment_id, free_before_replay) = {
+            let mut store =
+                LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+                    .expect("open store");
+            store.put(key, &old_payload).expect("old put");
+            let old_segment_id = store.index.get(&key).expect("old location").segment_id;
+            store.put(key, &new_payload).expect("replacement put");
+            let replacement_segment_id = store
+                .index
+                .get(&key)
+                .expect("replacement location")
+                .segment_id;
+            assert_ne!(old_segment_id, replacement_segment_id);
+            assert!(store
+                .enqueue_receipt_bound_dead_object(dead_object_entry_for_key(
+                    reclaim_key,
+                    5,
+                    true,
+                    1,
+                ))
+                .expect("persist receipt-bound queue row"));
+            store.reclaim_receipts.push(ReclaimReceipt::new(
+                vec![ReclaimReceiptExtent::new(old_segment_id, reclaim_key)],
+                6,
+                0,
+            ));
+            store.reclaim_receipts_dirty = true;
+            store.sync_all().expect("persist receipt before queue ack");
+
+            // Exact crash cut after phase two: both the receipt and queue
+            // acknowledgement are durable, but no physical state changed.
+            assert_eq!(
+                store
+                    .dead_object_reclaim_queue
+                    .ack_reclaimed(&[reclaim_key]),
+                1
+            );
+            store.dead_object_reclaim_queue_dirty = true;
+            store.sync_all().expect("persist queue acknowledgement");
+            assert!(load_dead_object_reclaim_queue(&store)
+                .expect("load durable reclaim queue")
+                .is_empty());
+            assert!(segment_path(&store.segments_dir, old_segment_id).exists());
+            assert!(!store.free_map.is_free(old_segment_id));
+            (
+                store.segments_dir.clone(),
+                old_segment_id,
+                replacement_segment_id,
+                store.free_segment_count(),
+            )
+        };
+
+        {
+            let reopened =
+                LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+                    .expect("reopen queue-ack-sync cut");
+            assert!(reopened.dead_object_reclaim_queue.is_empty());
+            assert!(reopened.free_map.is_free(old_segment_id));
+            assert_eq!(reopened.free_segment_count(), free_before_replay + 1);
+            assert!(!segment_path(&segments_dir, old_segment_id).exists());
+            assert!(segment_path(&segments_dir, replacement_segment_id).exists());
+            assert_eq!(reopened.get(key).unwrap(), Some(new_payload.clone()));
+        }
+
+        let reopened_again =
+            LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+                .expect("reopen queue-ack-sync cut again");
+        assert!(reopened_again.free_map.is_free(old_segment_id));
+        assert_eq!(reopened_again.free_segment_count(), free_before_replay + 1);
+        assert_eq!(reopened_again.get(key).unwrap(), Some(new_payload));
     }
 
     #[test]
@@ -11693,19 +13498,11 @@ impl tidefs_reclaim::SegmentResolver for LocalObjectStore {
         &self,
         key: &tidefs_types_reclaim_queue_core::ObjectKey,
     ) -> std::result::Result<Option<u64>, Self::Error> {
-        let store_key = ObjectKey(key.0);
-        let live_location = self.index.get(&store_key).copied();
-        if let Some(locations) = self.history.get(&store_key) {
-            if let Some(dead_location) = locations
-                .iter()
-                .rev()
-                .copied()
-                .find(|location| Some(*location) != live_location)
-            {
-                return Ok(Some(dead_location.segment_id));
-            }
-        }
-        Ok(None)
+        Ok(self
+            .resolve_receipt_bound_reclaim_target(key)
+            .ok()
+            .flatten()
+            .map(|(segment_id, _)| segment_id))
     }
 }
 
@@ -11713,8 +13510,11 @@ impl tidefs_reclaim::SegmentFreer for LocalObjectStore {
     type Error = tidefs_pool_allocator::PoolAllocatorError;
 
     fn free_segment(&mut self, segment_id: u64) -> std::result::Result<(), Self::Error> {
+        let was_used = !self.free_map.is_free(segment_id);
         self.free_map.add_free(segment_id)?;
-        self.free_segment_counter.freed();
+        if was_used {
+            self.free_segment_counter.freed();
+        }
         // Capacity-only sparse-file hint. This must not be reported as
         // discard, secure erase, sanitization, or remanence evidence.
         self.release_segment_file_capacity_best_effort(segment_id);
@@ -11723,6 +13523,27 @@ impl tidefs_reclaim::SegmentFreer for LocalObjectStore {
 }
 
 impl LocalObjectStore {
+    fn free_receipt_authorized_segment(&mut self, segment_id: u64) -> Result<()> {
+        if !self.block_device_mode {
+            let seg_path = segment_path(&self.segments_dir, segment_id);
+            if seg_path.exists() {
+                fs::remove_file(&seg_path).map_err(|source| {
+                    io_error("remove reclaim receipt segment", &seg_path, source)
+                })?;
+                sync_directory(&self.segments_dir)?;
+            }
+        }
+        let was_used = !self.free_map.is_free(segment_id);
+        if was_used {
+            self.free_map
+                .add_free(segment_id)
+                .map_err(reclaim_receipt_replay_allocator_error)?;
+            self.free_segment_counter.freed();
+        }
+        self.reclaim_consumer.live_counts_mut().remove(segment_id);
+        Ok(())
+    }
+
     /// Best-effort sparse-file capacity release for a freed segment file.
     ///
     /// This is only a local space-reclamation hint. It does not prove discard

@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use tidefs_dataset_lifecycle::{DatasetId, DatasetType};
 use tidefs_local_object_store::{
     checksum64,
-    pool::{is_strict_read_authority_error, Pool},
+    pool::{
+        is_strict_read_authority_error, PendingReplicatedRepairRecoveryEvidence, PlacementReceipt,
+        Pool, ReplicatedTargetReadOutcome,
+    },
     CrashInjectionPoint, DeviceIoClass, IntegrityDigest64, LocalObjectStore, ObjectKey,
     ObjectLocation, StoreError, FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME,
 };
@@ -380,12 +383,11 @@ pub(crate) fn load_latest_committed_state_pool(
                         transaction_id,
                         root_authentication_key,
                     )?;
-                    let generation = state.generation;
                     for inode_id in state.dirty_inodes.iter().copied() {
-                        state.last_inode_write_tx.insert(inode_id, generation);
+                        state.last_inode_write_tx.insert(inode_id, transaction_id);
                     }
                     for inode_id in state.dirty_dirs.iter().copied() {
-                        state.last_dir_write_tx.insert(inode_id, generation);
+                        state.last_dir_write_tx.insert(inode_id, transaction_id);
                     }
                     state.dirty_content.clear();
                     state.dirty_inodes.clear();
@@ -463,19 +465,6 @@ pub(crate) fn load_canonical_committed_state_for_dataset(
     Ok((state, root))
 }
 
-pub(crate) fn recover_canonical_committed_state(
-    runtime: &mut PoolRuntime,
-    root_authentication_key: RootAuthenticationKey,
-    policy: RecoveryPolicy,
-) -> Result<(FileSystemState, RootCommitRecord)> {
-    recover_canonical_committed_state_for_dataset(
-        runtime,
-        tidefs_pool_runtime::ROOT_DATASET_ID,
-        root_authentication_key,
-        policy,
-    )
-}
-
 pub(crate) fn recover_canonical_committed_state_for_dataset(
     runtime: &mut PoolRuntime,
     dataset_id: DatasetId,
@@ -503,12 +492,11 @@ pub(crate) fn recover_canonical_committed_state_for_dataset(
                 transaction_id,
                 root_authentication_key,
             )?;
-            let generation = state.generation;
             for inode_id in state.dirty_inodes.iter().copied() {
-                state.last_inode_write_tx.insert(inode_id, generation);
+                state.last_inode_write_tx.insert(inode_id, transaction_id);
             }
             for inode_id in state.dirty_dirs.iter().copied() {
-                state.last_dir_write_tx.insert(inode_id, generation);
+                state.last_dir_write_tx.insert(inode_id, transaction_id);
             }
             state.dirty_content.clear();
             state.dirty_inodes.clear();
@@ -523,6 +511,173 @@ pub(crate) fn recover_canonical_committed_state_for_dataset(
         log.clear(runtime.pool_mut().raw_primary_store_mut())?;
     }
     Ok((state, root))
+}
+
+/// Exact target-repair transition that must be reconciled before a mounted
+/// owner or carrier is published.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingReplicatedRepairReconciliation {
+    pub(crate) object_key: ObjectKey,
+    pub(crate) evidence: tidefs_local_object_store::pool::ReplicatedRepairReconciliationEvidence,
+}
+
+fn completed_replicated_repair_reconciliations(
+    pool: &Pool,
+) -> Result<Vec<PendingReplicatedRepairReconciliation>> {
+    pool.replicated_repair_reconciliation_evidence_all(DeviceIoClass::Data)?
+        .into_iter()
+        .map(|(object_key, evidence)| {
+            Ok(PendingReplicatedRepairReconciliation {
+                object_key,
+                evidence,
+            })
+        })
+        .collect()
+}
+
+fn filter_replicated_repair_reconciliations(
+    candidates: Vec<PendingReplicatedRepairReconciliation>,
+    admitted: &BTreeSet<ObjectKey>,
+) -> Vec<PendingReplicatedRepairReconciliation> {
+    candidates
+        .into_iter()
+        .filter(|transition| admitted.contains(&transition.object_key))
+        .collect()
+}
+
+/// Recover the canonical dataset while admitting an exact, durably evidenced
+/// batch of target-only repair transitions for pre-owner reconciliation.
+///
+/// Ordinary recovery remains strict.  This exception is considered only when
+/// the canonical root fails on one stale embedded receipt, no device-lifecycle
+/// transition is active, the Pool proves the exact predecessor-to-current
+/// target repair, and the same authenticated root contains that exact chunk
+/// reference.  The caller must reconcile and republish the root before it
+/// exposes a live owner or mounted carrier.
+pub(crate) fn recover_canonical_committed_state_for_dataset_admitting_pending_replicated_repair(
+    runtime: &mut PoolRuntime,
+    dataset_id: DatasetId,
+    root_authentication_key: RootAuthenticationKey,
+    policy: RecoveryPolicy,
+) -> Result<(
+    FileSystemState,
+    RootCommitRecord,
+    Vec<PendingReplicatedRepairReconciliation>,
+)> {
+    let pending = runtime
+        .pool()
+        .pending_replicated_repair_recovery_evidence_all(DeviceIoClass::Data)?;
+    if !pending.is_empty() {
+        if !policy.allows_any_mutation() {
+            return Err(FileSystemError::CorruptState {
+                reason: "read-only open refuses an unfinished replicated repair transition",
+            });
+        }
+        let intent_log =
+            IntentLog::load_for_dataset(runtime.pool().raw_primary_store(), dataset_id)?;
+        if !intent_log.is_empty() {
+            return Err(FileSystemError::CorruptState {
+                reason: "replicated repair recovery requires an empty dataset intent log before writeback",
+            });
+        }
+        // Discovery is deliberately read-only. Authenticate the exact
+        // predecessor root and its selected chunk reference before the
+        // Pool may rewrite a target or converge any receipt copy.
+        let bytes = runtime.load_dataset_root(dataset_id, DatasetRootKind::Filesystem)?;
+        let root = decode_root_commit(&bytes)?;
+        let completed_candidates = completed_replicated_repair_reconciliations(runtime.pool())?;
+        let (_, _, admitted) = load_replicated_repair_recovery_root(
+            runtime.pool(),
+            dataset_id,
+            &root,
+            root_authentication_key,
+            &pending,
+            &completed_candidates,
+            false,
+        )?;
+        if !pending
+            .iter()
+            .all(|transition| admitted.contains(&transition.predecessor_receipt.object_key))
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "canonical root does not reference every unfinished replicated repair",
+            });
+        }
+        let completed_referenced =
+            filter_replicated_repair_reconciliations(completed_candidates, &admitted);
+        let (predecessor_state, _, _) = load_replicated_repair_recovery_root(
+            runtime.pool(),
+            dataset_id,
+            &root,
+            root_authentication_key,
+            &pending,
+            &completed_referenced,
+            true,
+        )?;
+        authenticate_pending_replicated_repair_retained_roots(
+            runtime,
+            dataset_id,
+            &predecessor_state,
+            root_authentication_key,
+            &pending,
+            &completed_referenced,
+        )?;
+        for transition in &pending {
+            runtime
+                .pool_mut()
+                .complete_pending_replicated_repair_before_owner(DeviceIoClass::Data, transition)?;
+            runtime.pool_mut().sync_all()?;
+        }
+    }
+    match recover_canonical_committed_state_for_dataset(
+        runtime,
+        dataset_id,
+        root_authentication_key,
+        policy,
+    ) {
+        Ok((state, root)) => return Ok((state, root, Vec::new())),
+        Err(error) => {
+            if !matches!(error, FileSystemError::ReceiptAuthorityStale { .. }) {
+                return Err(error);
+            }
+            if !policy.allows_any_mutation()
+                || runtime.pool().pending_device_removal_path()?.is_some()
+                || runtime.pool().has_device_replacement_predecessor_resume()
+            {
+                return Err(error);
+            }
+            let completed_candidates = completed_replicated_repair_reconciliations(runtime.pool())?;
+            if completed_candidates.is_empty() {
+                return Err(error);
+            }
+
+            let bytes = runtime.load_dataset_root(dataset_id, DatasetRootKind::Filesystem)?;
+            let root = decode_root_commit(&bytes)?;
+            let (_, _, admitted) = load_replicated_repair_recovery_root(
+                runtime.pool(),
+                dataset_id,
+                &root,
+                root_authentication_key,
+                &[],
+                &completed_candidates,
+                false,
+            )?;
+            if admitted.is_empty() {
+                return Err(error);
+            }
+            let reconciliations =
+                filter_replicated_repair_reconciliations(completed_candidates, &admitted);
+            let mut state = load_state_from_transaction_pool_for_replicated_repair_reconciliations_requiring_references(
+                runtime.pool(),
+                dataset_id,
+                &root,
+                root_authentication_key,
+                &reconciliations,
+            )?;
+            state.set_inode_authority_dataset_id(*dataset_id.as_bytes());
+            Ok((state, root, reconciliations))
+        }
+    }
 }
 
 pub(crate) fn recovery_probe_pool(
@@ -2379,6 +2534,1255 @@ pub(crate) fn load_state_from_transaction_pool_for_dataset(
     )?;
     state.set_inode_authority_dataset_id(*dataset_id.as_bytes());
     Ok(state)
+}
+
+/// Authenticate one committed root immediately before a comparison-selected
+/// replicated chunk repair.
+///
+/// The current Pool receipt and both target outcomes are refreshed here.  The
+/// one selected clean target may supply only the exact content chunk named by
+/// that receipt; every metadata object, content manifest, dedup target, and
+/// unrelated chunk still uses ordinary strict Pool authority.  The current
+/// mounted root uses this form so a comparison cannot authorize writeback for
+/// an object absent from the authenticated root.
+pub(crate) fn load_replicated_repair_prewrite_root_requiring_reference(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    object_key: ObjectKey,
+    expected_receipt: &PlacementReceipt,
+    source_device_index: u32,
+    corrupt_device_index: u32,
+) -> Result<(FileSystemState, RootCommitRecord)> {
+    load_replicated_repair_prewrite_root_inner(
+        pool,
+        dataset_id,
+        root,
+        root_authentication_key,
+        object_key,
+        expected_receipt,
+        source_device_index,
+        corrupt_device_index,
+        true,
+    )
+}
+
+fn load_replicated_repair_recovery_root(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    pending: &[PendingReplicatedRepairRecoveryEvidence],
+    completed: &[PendingReplicatedRepairReconciliation],
+    require_every_reference: bool,
+) -> Result<(FileSystemState, RootCommitRecord, BTreeSet<ObjectKey>)> {
+    if pending.is_empty() && completed.is_empty() {
+        return Err(FileSystemError::CorruptState {
+            reason: "replicated repair recovery authentication batch is empty",
+        });
+    }
+    let mut pending_by_key = BTreeMap::new();
+    let mut previous_order = None;
+    for transition in pending {
+        let object_key = transition.predecessor_receipt.object_key;
+        let order = (
+            object_key,
+            transition.predecessor_receipt.generation,
+            transition.replacement_receipt.generation,
+        );
+        let selected_payload = transition.clean_source_payload();
+        if previous_order.is_some_and(|previous| previous >= order)
+            || selected_payload.len() as u64 != transition.predecessor_receipt.payload_len
+            || *blake3::hash(selected_payload).as_bytes()
+                != transition.predecessor_receipt.payload_digest
+            || transition.clean_source == transition.repaired_target
+            || transition.replacement_receipt.object_key != object_key
+            || transition.replacement_receipt.generation
+                <= transition.predecessor_receipt.generation
+            || pending_by_key.insert(object_key, transition).is_some()
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "pending replicated repair authentication batch is invalid or unordered",
+            });
+        }
+        previous_order = Some(order);
+    }
+    let mut completed_by_key = BTreeMap::new();
+    previous_order = None;
+    for transition in completed {
+        let order = (
+            transition.object_key,
+            transition.evidence.embedded_predecessor_generation,
+            transition.evidence.current_receipt.generation,
+        );
+        if previous_order.is_some_and(|previous| previous >= order)
+            || pending_by_key.contains_key(&transition.object_key)
+            || transition.evidence.current_receipt.object_key != transition.object_key
+            || transition.evidence.current_receipt.generation
+                <= transition.evidence.embedded_predecessor_generation
+            || completed_by_key
+                .insert(transition.object_key, transition)
+                .is_some()
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "completed replicated repair recovery batch is invalid or unordered",
+            });
+        }
+        let current = pool
+            .replicated_repair_reconciliation_evidence(
+                DeviceIoClass::Data,
+                transition.object_key,
+                transition.evidence.embedded_predecessor_generation,
+            )?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "completed replicated repair recovery evidence disappeared",
+            })?;
+        if current != transition.evidence {
+            return Err(FileSystemError::CorruptState {
+                reason: "completed replicated repair recovery evidence changed",
+            });
+        }
+        previous_order = Some(order);
+    }
+
+    let keyspace = FilesystemObjectKeyspace::new(dataset_id);
+    let candidate =
+        read_pool_transaction_candidate_objects(pool, root, root_authentication_key, keyspace)?;
+    let superblock = decode_candidate_superblock(root, &candidate.superblock_bytes)?;
+    let mut state = load_state_from_superblock_for_content_inspection(
+        pool.raw_primary_store(),
+        &superblock,
+        root.transaction_id,
+        &candidate.manifest.entries,
+        Some(&candidate.objects),
+        keyspace,
+    )?;
+
+    let mut authenticated_content_checksums = BTreeMap::new();
+    for entry in &candidate.manifest.entries {
+        if entry.role != TransactionManifestObjectRole::VersionedContent {
+            continue;
+        }
+        if authenticated_content_checksums
+            .insert(entry.object_key, entry.checksum)
+            .is_some()
+            || pending_by_key.contains_key(&entry.object_key)
+            || completed_by_key.contains_key(&entry.object_key)
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "pending replicated repair predecessor root has invalid content authority",
+            });
+        }
+    }
+
+    let mut admitted_references = BTreeSet::new();
+    validate_transaction_manifest_matches_loaded_state_with_content(
+        pool.raw_primary_store(),
+        root,
+        &state,
+        &candidate.manifest,
+        &candidate.superblock_bytes,
+        Some(&candidate.objects),
+        |inode| {
+            replicated_repair_recovery_transaction_content_entries(
+                pool,
+                inode,
+                keyspace,
+                &authenticated_content_checksums,
+                &pending_by_key,
+                &completed_by_key,
+                &mut admitted_references,
+            )
+        },
+        keyspace,
+    )?;
+    if require_every_reference
+        && !pending_by_key
+            .keys()
+            .all(|object_key| admitted_references.contains(object_key))
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "replicated repair predecessor root does not reference every unfinished batch object",
+        });
+    }
+    state.set_inode_authority_dataset_id(*dataset_id.as_bytes());
+    Ok((state, root.clone(), admitted_references))
+}
+
+fn replicated_repair_recovery_transaction_content_entries(
+    pool: &Pool,
+    inode: &InodeRecord,
+    keyspace: FilesystemObjectKeyspace,
+    authenticated_content_checksums: &BTreeMap<ObjectKey, IntegrityDigest64>,
+    pending_by_key: &BTreeMap<ObjectKey, &PendingReplicatedRepairRecoveryEvidence>,
+    completed_by_key: &BTreeMap<ObjectKey, &PendingReplicatedRepairReconciliation>,
+    admitted_references: &mut BTreeSet<ObjectKey>,
+) -> Result<Vec<TransactionManifestEntry>> {
+    if inode.size == 0 {
+        return Ok(Vec::new());
+    }
+    let authority = MountedContentReadAuthority::for_dataset(pool, keyspace.dataset_id());
+    let logical_content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+    let content_key = keyspace.scope(logical_content_key);
+    let expected_checksum = authenticated_content_checksums
+        .get(&content_key)
+        .copied()
+        .ok_or(FileSystemError::CorruptState {
+            reason: "pending replicated repair root is missing authenticated content bytes",
+        })?;
+    let (content_bytes, _receipt) = authority.read_current_object(logical_content_key)?.ok_or(
+        FileSystemError::CorruptState {
+            reason: "pending replicated repair root is missing strict content authority",
+        },
+    )?;
+    if checksum64(&content_bytes) != expected_checksum {
+        return Err(FileSystemError::CorruptState {
+            reason: "pending replicated repair content bytes changed from the authenticated root",
+        });
+    }
+    let layout = crate::content::decode_content_layout(&content_bytes)?;
+    crate::content::validate_content_layout(inode.inode_id, inode, &layout)?;
+    let mut entries = vec![TransactionManifestEntry {
+        role: TransactionManifestObjectRole::VersionedContent,
+        object_key: content_key,
+        checksum: expected_checksum,
+    }];
+    let ContentLayout::Chunked(manifest) = layout else {
+        return Ok(entries);
+    };
+
+    for authenticated_ref in &manifest.chunks {
+        if authenticated_ref.is_hole() {
+            continue;
+        }
+        let logical_chunk_key = content_chunk_object_key_for_version(
+            manifest.inode_id,
+            authenticated_ref.data_version,
+            authenticated_ref.chunk_index,
+        );
+        let chunk_key = keyspace.scope(logical_chunk_key);
+        if let Some(transition) = pending_by_key.get(&chunk_key) {
+            let selected_payload = transition.clean_source_payload();
+            if !admitted_references.insert(chunk_key)
+                || authenticated_ref.placement_receipt_generation
+                    != transition.predecessor_receipt.generation
+                || checksum64(selected_payload) != authenticated_ref.checksum
+                || !replicated_repair_prewrite_chunk_payload_matches_ref(
+                    &authority,
+                    manifest.inode_id,
+                    authenticated_ref,
+                    selected_payload,
+                )?
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "pending replicated repair source does not match a unique authenticated batch reference",
+                });
+            }
+        } else if let Some(transition) = completed_by_key.get(&chunk_key) {
+            if authenticated_ref.placement_receipt_generation
+                == transition.evidence.embedded_predecessor_generation
+            {
+                if !admitted_references.insert(chunk_key) {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "completed replicated repair does not match a unique authenticated batch reference",
+                    });
+                }
+                let (_bytes, observed_receipt) = authority
+                    .read_current_object(logical_chunk_key)?
+                    .ok_or(FileSystemError::ReceiptAuthorityUnavailable {
+                        object_key: chunk_key,
+                        expected_generation: transition.evidence.current_receipt.generation,
+                    })?;
+                if observed_receipt != transition.evidence.current_receipt {
+                    return Err(FileSystemError::CorruptState {
+                        reason:
+                            "completed replicated repair receipt changed during batch authentication",
+                    });
+                }
+                let mut current_ref = authenticated_ref.clone();
+                current_ref.placement_receipt_generation =
+                    transition.evidence.current_receipt.generation;
+                let _ = authority.read_chunk(manifest.inode_id, &current_ref)?;
+            } else {
+                // A completed transition is an authentication exception only
+                // while this root still embeds its exact predecessor.  A root
+                // that already names the current receipt has no reconciliation
+                // obligation, and every other generation must fail through
+                // ordinary strict-current receipt authentication.
+                let _ = authority.read_chunk(manifest.inode_id, authenticated_ref)?;
+            }
+        } else {
+            let _ = authority.read_chunk(manifest.inode_id, authenticated_ref)?;
+        }
+        entries.push(TransactionManifestEntry {
+            role: TransactionManifestObjectRole::VersionedContentChunk,
+            object_key: chunk_key,
+            checksum: authenticated_ref.checksum,
+        });
+    }
+    Ok(entries)
+}
+
+/// Authenticate every data-retaining snapshot/clone root owned by the
+/// predecessor filesystem before completing a pending Pool repair. This is
+/// the reopen equivalent of the live repair's retained-root preflight: Pool
+/// receipt authority must not advance and only then discover that an admitted
+/// fallback root was already invalid.
+fn authenticate_pending_replicated_repair_retained_roots(
+    runtime: &PoolRuntime,
+    source_dataset_id: DatasetId,
+    predecessor_state: &FileSystemState,
+    root_authentication_key: RootAuthenticationKey,
+    pending: &[PendingReplicatedRepairRecoveryEvidence],
+    completed: &[PendingReplicatedRepairReconciliation],
+) -> Result<()> {
+    let Some((source_dataset_path, _parent, dataset_type, _txg, _flags, lifecycle_state)) =
+        runtime.dataset_catalog().get_by_id(&source_dataset_id)
+    else {
+        return Err(FileSystemError::CorruptState {
+            reason: "pending replicated repair source dataset is absent from the catalog",
+        });
+    };
+    if dataset_type != DatasetType::Filesystem || lifecycle_state.to_u8() != 0 {
+        return Err(FileSystemError::CorruptState {
+            reason: "pending replicated repair source dataset is not an active filesystem",
+        });
+    }
+
+    let mut expected_catalog_names = BTreeSet::new();
+    for record in predecessor_state
+        .snapshots
+        .values()
+        .filter(|record| crate::snapshot::snapshot_record_retains_data(record))
+    {
+        if !crate::snapshot::snapshot_catalog_entry_matches(
+            runtime.dataset_catalog(),
+            record,
+            &source_dataset_path,
+            source_dataset_id,
+        ) {
+            return Err(FileSystemError::CorruptState {
+                reason: "pending replicated repair snapshot catalog authority is inconsistent",
+            });
+        }
+        let snapshot_dataset_id =
+            crate::snapshot::snapshot_record_dataset_id_for_dataset(record, source_dataset_id);
+        let stored_root = runtime.load_snapshot_root(snapshot_dataset_id)?;
+        let expected_root =
+            crate::snapshot::snapshot_record_typed_root_for_dataset(record, source_dataset_id)?;
+        if stored_root != expected_root {
+            return Err(FileSystemError::CorruptState {
+                reason: "pending replicated repair snapshot typed root is inconsistent",
+            });
+        }
+        let stored_source = runtime.load_root_reference(stored_root.source_reference)?;
+        if PoolRuntime::dataset_root_reference(
+            stored_root.source_reference.dataset_id,
+            stored_root.source_reference.kind,
+            stored_root.source_reference.semantic_generation,
+            &stored_source,
+        ) != stored_root.source_reference
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "pending replicated repair snapshot source reference is inconsistent",
+            });
+        }
+        let captured_root = root_commit_from_summary(&record.root);
+        if stored_source != encode_root_commit(&captured_root) {
+            return Err(FileSystemError::CorruptState {
+                reason: "pending replicated repair snapshot source bytes changed",
+            });
+        }
+        let (captured_state, authenticated_root, _) = load_replicated_repair_recovery_root(
+            runtime.pool(),
+            source_dataset_id,
+            &captured_root,
+            root_authentication_key,
+            pending,
+            completed,
+            false,
+        )?;
+        if authenticated_root != captured_root
+            || captured_state.generation != captured_root.generation
+            || authenticated_root.next_inode_id != captured_root.next_inode_id
+            || authenticated_root.inode_count != captured_root.inode_count
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "pending replicated repair retained root failed exact authentication",
+            });
+        }
+        expected_catalog_names.insert(crate::snapshot::snapshot_record_catalog_name_for_dataset(
+            record,
+            &source_dataset_path,
+        ));
+    }
+
+    for (entry_name, _dataset_id, entry_type, _txg, _flags, _state) in
+        runtime.dataset_catalog().list_all()
+    {
+        if entry_type == DatasetType::Snapshot
+            && runtime
+                .dataset_catalog()
+                .lineage_parent(&entry_name)
+                .map_err(|_| FileSystemError::CorruptState {
+                    reason: "pending replicated repair snapshot lineage is invalid",
+                })?
+                == Some(source_dataset_id)
+            && !expected_catalog_names.contains(&entry_name)
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "pending replicated repair catalog has an unauthenticated retained root",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Authenticate a retained root before a comparison-selected replicated
+/// chunk repair.  A retained snapshot may legitimately omit the current-file
+/// chunk, but if it references the selected key it receives the same exact
+/// clean-source validation as the mounted root.
+pub(crate) fn load_replicated_repair_prewrite_root(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    object_key: ObjectKey,
+    expected_receipt: &PlacementReceipt,
+    source_device_index: u32,
+    corrupt_device_index: u32,
+) -> Result<(FileSystemState, RootCommitRecord)> {
+    load_replicated_repair_prewrite_root_inner(
+        pool,
+        dataset_id,
+        root,
+        root_authentication_key,
+        object_key,
+        expected_receipt,
+        source_device_index,
+        corrupt_device_index,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_replicated_repair_prewrite_root_inner(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    object_key: ObjectKey,
+    expected_receipt: &PlacementReceipt,
+    source_device_index: u32,
+    corrupt_device_index: u32,
+    require_repaired_reference: bool,
+) -> Result<(FileSystemState, RootCommitRecord)> {
+    let selected_payload = replicated_repair_prewrite_clean_payload(
+        pool,
+        object_key,
+        expected_receipt,
+        source_device_index,
+        corrupt_device_index,
+    )?;
+    let keyspace = FilesystemObjectKeyspace::new(dataset_id);
+    let candidate =
+        read_pool_transaction_candidate_objects(pool, root, root_authentication_key, keyspace)?;
+    let superblock = decode_candidate_superblock(root, &candidate.superblock_bytes)?;
+    let mut state = load_state_from_superblock_for_content_inspection(
+        pool.raw_primary_store(),
+        &superblock,
+        root.transaction_id,
+        &candidate.manifest.entries,
+        Some(&candidate.objects),
+        keyspace,
+    )?;
+
+    let mut authenticated_content_checksums = BTreeMap::new();
+    for entry in &candidate.manifest.entries {
+        if entry.role != TransactionManifestObjectRole::VersionedContent {
+            continue;
+        }
+        if authenticated_content_checksums
+            .insert(entry.object_key, entry.checksum)
+            .is_some()
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "replicated repair prewrite root repeats a versioned-content key",
+            });
+        }
+        if entry.object_key == object_key {
+            return Err(FileSystemError::CorruptState {
+                reason: "replicated repair prewrite refuses inline-content or manifest repair",
+            });
+        }
+    }
+
+    let mut admitted_reference = false;
+    validate_transaction_manifest_matches_loaded_state_with_content(
+        pool.raw_primary_store(),
+        root,
+        &state,
+        &candidate.manifest,
+        &candidate.superblock_bytes,
+        Some(&candidate.objects),
+        |inode| {
+            replicated_repair_prewrite_transaction_content_entries(
+                pool,
+                inode,
+                keyspace,
+                &authenticated_content_checksums,
+                object_key,
+                expected_receipt,
+                &selected_payload,
+                &mut admitted_reference,
+            )
+        },
+        keyspace,
+    )?;
+    if require_repaired_reference && !admitted_reference {
+        return Err(FileSystemError::CorruptState {
+            reason: "replicated repair prewrite root does not contain the selected content chunk",
+        });
+    }
+    state.set_inode_authority_dataset_id(*dataset_id.as_bytes());
+    Ok((state, root.clone()))
+}
+
+fn replicated_repair_prewrite_clean_payload(
+    pool: &Pool,
+    object_key: ObjectKey,
+    expected_receipt: &PlacementReceipt,
+    source_device_index: u32,
+    corrupt_device_index: u32,
+) -> Result<Vec<u8>> {
+    if source_device_index == corrupt_device_index
+        || expected_receipt.object_key != object_key
+        || expected_receipt.generation == 0
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "replicated repair prewrite selection does not match receipt authority",
+        });
+    }
+    let evidence = pool
+        .replicated_receipt_evidence(DeviceIoClass::Data, object_key)?
+        .ok_or(FileSystemError::CorruptState {
+            reason: "replicated repair prewrite has no current receipt evidence",
+        })?;
+    if evidence.receipt != *expected_receipt || evidence.targets.len() != 2 {
+        return Err(FileSystemError::CorruptState {
+            reason: "replicated repair prewrite receipt evidence changed after comparison",
+        });
+    }
+
+    let mut clean_payload = None;
+    let mut corrupt_target_seen = false;
+    for target in evidence.targets {
+        if target.target.device_index == source_device_index {
+            if clean_payload.is_some()
+                || !matches!(target.outcome, ReplicatedTargetReadOutcome::Clean)
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "replicated repair prewrite selected source is not uniquely clean",
+                });
+            }
+            clean_payload = target.payload().map(ToOwned::to_owned);
+        } else if target.target.device_index == corrupt_device_index {
+            if corrupt_target_seen
+                || !matches!(
+                    target.outcome,
+                    ReplicatedTargetReadOutcome::Corrupt { .. }
+                        | ReplicatedTargetReadOutcome::Unreadable
+                )
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "replicated repair prewrite selected target is not uniquely corrupt",
+                });
+            }
+            corrupt_target_seen = true;
+        } else {
+            return Err(FileSystemError::CorruptState {
+                reason: "replicated repair prewrite evidence contains an unselected target",
+            });
+        }
+    }
+    if !corrupt_target_seen {
+        return Err(FileSystemError::CorruptState {
+            reason: "replicated repair prewrite selected corrupt target is absent",
+        });
+    }
+    clean_payload.ok_or(FileSystemError::CorruptState {
+        reason: "replicated repair prewrite selected clean payload is absent",
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replicated_repair_prewrite_transaction_content_entries(
+    pool: &Pool,
+    inode: &InodeRecord,
+    keyspace: FilesystemObjectKeyspace,
+    authenticated_content_checksums: &BTreeMap<ObjectKey, IntegrityDigest64>,
+    selected_object_key: ObjectKey,
+    expected_receipt: &PlacementReceipt,
+    selected_payload: &[u8],
+    admitted_reference: &mut bool,
+) -> Result<Vec<TransactionManifestEntry>> {
+    if inode.size == 0 {
+        return Ok(Vec::new());
+    }
+    let authority = MountedContentReadAuthority::for_dataset(pool, keyspace.dataset_id());
+    let logical_content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+    let content_key = keyspace.scope(logical_content_key);
+    let expected_checksum = authenticated_content_checksums
+        .get(&content_key)
+        .copied()
+        .ok_or(FileSystemError::CorruptState {
+            reason: "replicated repair prewrite root is missing authenticated content bytes",
+        })?;
+    let (content_bytes, _receipt) = authority.read_current_object(logical_content_key)?.ok_or(
+        FileSystemError::CorruptState {
+            reason: "replicated repair prewrite root is missing strict content authority",
+        },
+    )?;
+    if checksum64(&content_bytes) != expected_checksum {
+        return Err(FileSystemError::CorruptState {
+            reason: "replicated repair prewrite content bytes changed from the authenticated root",
+        });
+    }
+    let layout = crate::content::decode_content_layout(&content_bytes)?;
+    crate::content::validate_content_layout(inode.inode_id, inode, &layout)?;
+    let mut entries = vec![TransactionManifestEntry {
+        role: TransactionManifestObjectRole::VersionedContent,
+        object_key: content_key,
+        checksum: expected_checksum,
+    }];
+    let ContentLayout::Chunked(manifest) = layout else {
+        return Ok(entries);
+    };
+
+    for authenticated_ref in &manifest.chunks {
+        if authenticated_ref.is_hole() {
+            continue;
+        }
+        let logical_chunk_key = content_chunk_object_key_for_version(
+            manifest.inode_id,
+            authenticated_ref.data_version,
+            authenticated_ref.chunk_index,
+        );
+        let chunk_key = keyspace.scope(logical_chunk_key);
+        if chunk_key == selected_object_key {
+            if *admitted_reference
+                || authenticated_ref.placement_receipt_generation != expected_receipt.generation
+                || checksum64(selected_payload) != authenticated_ref.checksum
+                || !replicated_repair_prewrite_chunk_payload_matches_ref(
+                    &authority,
+                    manifest.inode_id,
+                    authenticated_ref,
+                    selected_payload,
+                )?
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "replicated repair prewrite clean payload does not match the authenticated chunk reference",
+                });
+            }
+            *admitted_reference = true;
+        } else {
+            let _ = authority.read_chunk(manifest.inode_id, authenticated_ref)?;
+        }
+        entries.push(TransactionManifestEntry {
+            role: TransactionManifestObjectRole::VersionedContentChunk,
+            object_key: chunk_key,
+            checksum: authenticated_ref.checksum,
+        });
+    }
+    Ok(entries)
+}
+
+fn replicated_repair_prewrite_chunk_payload_matches_ref(
+    authority: &MountedContentReadAuthority<'_>,
+    inode_id: InodeId,
+    chunk_ref: &ContentChunkRef,
+    payload: &[u8],
+) -> Result<bool> {
+    let decoded_bytes;
+    let (chunk_bytes, dedup) = if is_dedup_redirect(payload) {
+        let canonical_key = decode_dedup_redirect(payload)?;
+        let Some((canonical, _receipt)) = authority.read_current_object(canonical_key)? else {
+            return Ok(false);
+        };
+        decoded_bytes = canonical;
+        if content_dedup_object_key(&compute_content_fingerprint(
+            &decode_content_chunk(&decoded_bytes)?.bytes,
+        )) != canonical_key
+        {
+            return Ok(false);
+        }
+        (decoded_bytes.as_slice(), true)
+    } else {
+        (payload, false)
+    };
+    let chunk = decode_content_chunk(chunk_bytes)?;
+    Ok(chunk.bytes.len() == chunk_ref.len as usize
+        && (dedup
+            || (chunk.inode_id == inode_id
+                && chunk.data_version == chunk_ref.data_version
+                && chunk.chunk_index == chunk_ref.chunk_index)))
+}
+
+#[cfg(test)]
+mod replicated_repair_prewrite_tests {
+    use super::*;
+    use crate::{LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy, PoolDatasetOwner};
+    use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
+
+    struct CorruptedChunk {
+        object_key: ObjectKey,
+        receipt: PlacementReceipt,
+        source_device_index: u32,
+        corrupt_device_index: u32,
+    }
+
+    fn replicated_owner() -> (tempfile::TempDir, PoolDatasetOwner) {
+        let root = tempfile::tempdir().expect("create replicated repair prewrite tempdir");
+        let metadata = root.path().join("metadata");
+        std::fs::create_dir_all(&metadata).expect("create metadata directory");
+        let mut devices = Vec::new();
+        for index in 0..2 {
+            let path = root.path().join(format!("device-{index}.img"));
+            let file = std::fs::File::create(&path).expect("create block-device image");
+            file.set_len(8 * 1024 * 1024)
+                .expect("size block-device image");
+            devices.push(path);
+        }
+        let owner = PoolDatasetOwner::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+            &metadata,
+            "tank",
+            PoolRedundancyPolicy::Replicated { copies: 2 },
+            "root",
+            LocalFileSystemOpenConfig {
+                options: StoreOptions::default(),
+                allocator_policy: LocalStorageAllocatorPolicy::default(),
+                root_authentication_key: RootAuthenticationKey::demo_key(),
+                encryption: None,
+                compression: None,
+                log_device_device_path: None,
+                recovery_policy: RecoveryPolicy::default(),
+                block_devices: Some(&devices),
+            },
+        )
+        .expect("open replicated PoolDatasetOwner");
+        (root, owner)
+    }
+
+    fn current_root(owner: &PoolDatasetOwner) -> RootCommitRecord {
+        let dataset_id = DatasetId::from_bytes(owner.mounted_dataset_id());
+        let bytes = owner
+            .store
+            .load_dataset_root(dataset_id, DatasetRootKind::Filesystem)
+            .expect("load current filesystem root");
+        decode_root_commit(&bytes).expect("decode current filesystem root")
+    }
+
+    fn write_chunked_file(owner: &mut PoolDatasetOwner, path: &str, marker: u8) {
+        owner
+            .create_file(path, 0o644)
+            .expect("create chunk fixture");
+        owner
+            .write_file(path, 0, &vec![marker; 4096])
+            .expect("write chunk fixture");
+        owner.sync_all().expect("commit chunk fixture");
+    }
+
+    fn corrupt_primary_chunk(owner: &mut PoolDatasetOwner, path: &str) -> CorruptedChunk {
+        let inode_id = owner.lookup(path).expect("lookup chunk fixture");
+        let record = owner
+            .filesystem
+            .state
+            .inodes
+            .get(&inode_id)
+            .expect("current chunk inode")
+            .clone();
+        let keyspace =
+            FilesystemObjectKeyspace::new(DatasetId::from_bytes(owner.mounted_dataset_id()));
+        let content_key = keyspace.content(inode_id, record.data_version);
+        let (manifest_bytes, _) = owner
+            .store
+            .pool()
+            .get_with_current_receipt(DeviceIoClass::Data, content_key)
+            .expect("read content manifest")
+            .expect("content manifest exists");
+        let manifest = decode_content_manifest(&manifest_bytes).expect("decode content manifest");
+        let chunk = manifest
+            .chunks
+            .iter()
+            .find(|chunk| !chunk.is_hole())
+            .expect("non-hole content chunk");
+        let object_key = keyspace.content_chunk(inode_id, chunk.data_version, chunk.chunk_index);
+        let (mut encoded, receipt) = owner
+            .store
+            .pool()
+            .get_with_current_receipt(DeviceIoClass::Data, object_key)
+            .expect("read current content chunk")
+            .expect("content chunk exists");
+        let last = encoded.last_mut().expect("encoded chunk is nonempty");
+        *last ^= 0x5a;
+        owner
+            .store
+            .pool_mut()
+            .raw_primary_store_mut()
+            .put(object_key, &encoded)
+            .expect("corrupt one physical chunk target");
+        owner
+            .store
+            .pool_mut()
+            .sync_all()
+            .expect("sync one-target corruption");
+
+        let evidence = owner
+            .store
+            .pool()
+            .replicated_receipt_evidence(DeviceIoClass::Data, object_key)
+            .expect("read corrupt chunk receipt evidence")
+            .expect("corrupt chunk has current receipt");
+        assert_eq!(evidence.receipt, receipt);
+        let source_device_index = evidence
+            .targets
+            .iter()
+            .find(|target| matches!(target.outcome, ReplicatedTargetReadOutcome::Clean))
+            .expect("one receipt target remains clean")
+            .target
+            .device_index;
+        let corrupt_device_index = evidence
+            .targets
+            .iter()
+            .find(|target| matches!(target.outcome, ReplicatedTargetReadOutcome::Corrupt { .. }))
+            .expect("one receipt target is corrupt")
+            .target
+            .device_index;
+        CorruptedChunk {
+            object_key,
+            receipt,
+            source_device_index,
+            corrupt_device_index,
+        }
+    }
+
+    #[test]
+    fn replicated_repair_prewrite_authenticates_only_selected_chunk_source() {
+        let (_root, mut owner) = replicated_owner();
+        let root_without_selected_chunk = current_root(&owner);
+        write_chunked_file(&mut owner, "/selected", 0x41);
+        let selected_root = current_root(&owner);
+        let selected = corrupt_primary_chunk(&mut owner, "/selected");
+        let dataset_id = DatasetId::from_bytes(owner.mounted_dataset_id());
+
+        assert!(load_state_from_transaction_pool_for_dataset(
+            owner.store.pool(),
+            dataset_id,
+            &selected_root,
+            RootAuthenticationKey::demo_key(),
+        )
+        .is_err());
+        let (state, authenticated_root) = load_replicated_repair_prewrite_root_requiring_reference(
+            owner.store.pool(),
+            dataset_id,
+            &selected_root,
+            RootAuthenticationKey::demo_key(),
+            selected.object_key,
+            &selected.receipt,
+            selected.source_device_index,
+            selected.corrupt_device_index,
+        )
+        .expect("authenticate selected clean chunk source");
+        assert_eq!(state.generation, owner.filesystem.state.generation);
+        assert_eq!(authenticated_root, selected_root);
+
+        load_replicated_repair_prewrite_root(
+            owner.store.pool(),
+            dataset_id,
+            &root_without_selected_chunk,
+            RootAuthenticationKey::demo_key(),
+            selected.object_key,
+            &selected.receipt,
+            selected.source_device_index,
+            selected.corrupt_device_index,
+        )
+        .expect("retained root may omit the selected current chunk");
+        assert!(load_replicated_repair_prewrite_root_requiring_reference(
+            owner.store.pool(),
+            dataset_id,
+            &root_without_selected_chunk,
+            RootAuthenticationKey::demo_key(),
+            selected.object_key,
+            &selected.receipt,
+            selected.source_device_index,
+            selected.corrupt_device_index,
+        )
+        .is_err());
+        assert!(load_replicated_repair_prewrite_root_requiring_reference(
+            owner.store.pool(),
+            dataset_id,
+            &selected_root,
+            RootAuthenticationKey::demo_key(),
+            selected.object_key,
+            &selected.receipt,
+            selected.corrupt_device_index,
+            selected.source_device_index,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn replicated_repair_prewrite_keeps_unselected_chunks_strict() {
+        let (_root, mut owner) = replicated_owner();
+        write_chunked_file(&mut owner, "/selected", 0x51);
+        write_chunked_file(&mut owner, "/unselected", 0x52);
+        let selected_root = current_root(&owner);
+        let selected = corrupt_primary_chunk(&mut owner, "/selected");
+        let _unselected = corrupt_primary_chunk(&mut owner, "/unselected");
+        let dataset_id = DatasetId::from_bytes(owner.mounted_dataset_id());
+
+        assert!(load_replicated_repair_prewrite_root_requiring_reference(
+            owner.store.pool(),
+            dataset_id,
+            &selected_root,
+            RootAuthenticationKey::demo_key(),
+            selected.object_key,
+            &selected.receipt,
+            selected.source_device_index,
+            selected.corrupt_device_index,
+        )
+        .is_err());
+    }
+}
+
+/// Load one authenticated predecessor root after a replicated target repair
+/// has advanced exactly one content chunk's Pool receipt.
+///
+/// This is a reconciliation-only boundary. It reauthenticates the unchanged
+/// root, superblock, transaction manifest, metadata, and content-manifest
+/// bytes, then admits the newer receipt only for the exact chunk reference and
+/// embedded generation named by durable target-only repair evidence. Ordinary
+/// recovery and every other content reference remain strict.
+pub(crate) fn load_state_from_transaction_pool_for_replicated_repair_reconciliation(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    object_key: ObjectKey,
+    embedded_generation: u64,
+) -> Result<FileSystemState> {
+    load_state_from_transaction_pool_for_replicated_repair_reconciliation_inner(
+        pool,
+        dataset_id,
+        root,
+        root_authentication_key,
+        object_key,
+        embedded_generation,
+        false,
+    )
+}
+
+/// Load an authenticated predecessor root and require it to contain the exact
+/// evidence-bound repaired reference.
+///
+/// The mounted current root must satisfy this stronger form. Retained snapshot
+/// roots use the permissive wrapper above because a valid retained snapshot may
+/// not reference the repaired current-file chunk at all.
+pub(crate) fn load_state_from_transaction_pool_for_replicated_repair_reconciliation_requiring_reference(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    object_key: ObjectKey,
+    embedded_generation: u64,
+) -> Result<FileSystemState> {
+    load_state_from_transaction_pool_for_replicated_repair_reconciliation_inner(
+        pool,
+        dataset_id,
+        root,
+        root_authentication_key,
+        object_key,
+        embedded_generation,
+        true,
+    )
+}
+
+fn load_state_from_transaction_pool_for_replicated_repair_reconciliation_inner(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    object_key: ObjectKey,
+    embedded_generation: u64,
+    require_repaired_reference: bool,
+) -> Result<FileSystemState> {
+    let evidence = pool
+        .replicated_repair_reconciliation_evidence(
+            DeviceIoClass::Data,
+            object_key,
+            embedded_generation,
+        )?
+        .ok_or(FileSystemError::CorruptState {
+            reason: "replicated repair reconciliation lacks exact durable target-only evidence",
+        })?;
+    if evidence.embedded_predecessor_generation != embedded_generation
+        || evidence.current_receipt.object_key != object_key
+        || evidence.current_receipt.generation <= embedded_generation
+    {
+        return Err(FileSystemError::CorruptState {
+            reason:
+                "replicated repair reconciliation evidence does not match the requested transition",
+        });
+    }
+
+    let transition = PendingReplicatedRepairReconciliation {
+        object_key,
+        evidence,
+    };
+    load_state_from_transaction_pool_for_replicated_repair_reconciliations_inner(
+        pool,
+        dataset_id,
+        root,
+        root_authentication_key,
+        std::slice::from_ref(&transition),
+        require_repaired_reference,
+    )
+}
+
+/// Authenticate a predecessor root while admitting an exact deterministic set
+/// of completed target-only repair receipt transitions.
+pub(crate) fn load_state_from_transaction_pool_for_replicated_repair_reconciliations(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    transitions: &[PendingReplicatedRepairReconciliation],
+) -> Result<FileSystemState> {
+    load_state_from_transaction_pool_for_replicated_repair_reconciliations_inner(
+        pool,
+        dataset_id,
+        root,
+        root_authentication_key,
+        transitions,
+        false,
+    )
+}
+
+/// Current-root form of the batch reconciliation loader. Every supplied
+/// transition must be referenced exactly once; missing or extra stale receipt
+/// authority fails closed.
+pub(crate) fn load_state_from_transaction_pool_for_replicated_repair_reconciliations_requiring_references(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    transitions: &[PendingReplicatedRepairReconciliation],
+) -> Result<FileSystemState> {
+    load_state_from_transaction_pool_for_replicated_repair_reconciliations_inner(
+        pool,
+        dataset_id,
+        root,
+        root_authentication_key,
+        transitions,
+        true,
+    )
+}
+
+fn load_state_from_transaction_pool_for_replicated_repair_reconciliations_inner(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    transitions: &[PendingReplicatedRepairReconciliation],
+    require_every_reference: bool,
+) -> Result<FileSystemState> {
+    if transitions.is_empty() {
+        return Err(FileSystemError::CorruptState {
+            reason: "replicated repair reconciliation batch is empty",
+        });
+    }
+    let mut transitions_by_key = BTreeMap::new();
+    let mut previous_order = None;
+    for transition in transitions {
+        let order = (
+            transition.object_key,
+            transition.evidence.embedded_predecessor_generation,
+            transition.evidence.current_receipt.generation,
+        );
+        if previous_order.is_some_and(|previous| previous >= order)
+            || transition.evidence.current_receipt.object_key != transition.object_key
+            || transition.evidence.current_receipt.generation
+                <= transition.evidence.embedded_predecessor_generation
+            || transitions_by_key
+                .insert(transition.object_key, transition)
+                .is_some()
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "replicated repair reconciliation batch is not uniquely ordered",
+            });
+        }
+        let current = pool
+            .replicated_repair_reconciliation_evidence(
+                DeviceIoClass::Data,
+                transition.object_key,
+                transition.evidence.embedded_predecessor_generation,
+            )?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "replicated repair reconciliation batch evidence disappeared",
+            })?;
+        if current != transition.evidence {
+            return Err(FileSystemError::CorruptState {
+                reason: "replicated repair reconciliation batch evidence changed",
+            });
+        }
+        previous_order = Some(order);
+    }
+
+    let keyspace = FilesystemObjectKeyspace::new(dataset_id);
+    let candidate =
+        read_pool_transaction_candidate_objects(pool, root, root_authentication_key, keyspace)?;
+    let superblock = decode_candidate_superblock(root, &candidate.superblock_bytes)?;
+    let mut state = load_state_from_superblock_for_content_inspection(
+        pool.raw_primary_store(),
+        &superblock,
+        root.transaction_id,
+        &candidate.manifest.entries,
+        Some(&candidate.objects),
+        keyspace,
+    )?;
+
+    let mut authenticated_content_checksums = BTreeMap::new();
+    for entry in &candidate.manifest.entries {
+        if entry.role != TransactionManifestObjectRole::VersionedContent {
+            continue;
+        }
+        if authenticated_content_checksums
+            .insert(entry.object_key, entry.checksum)
+            .is_some()
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "replicated repair predecessor manifest repeats a versioned-content key",
+            });
+        }
+    }
+
+    let mut admitted_transitions = BTreeSet::new();
+    validate_transaction_manifest_matches_loaded_state_with_content(
+        pool.raw_primary_store(),
+        root,
+        &state,
+        &candidate.manifest,
+        &candidate.superblock_bytes,
+        Some(&candidate.objects),
+        |inode| {
+            replicated_repair_reconciliations_transaction_content_entries(
+                pool,
+                inode,
+                keyspace,
+                &authenticated_content_checksums,
+                &transitions_by_key,
+                &mut admitted_transitions,
+            )
+        },
+        keyspace,
+    )?;
+    if require_every_reference && admitted_transitions.len() != transitions.len() {
+        return Err(FileSystemError::CorruptState {
+            reason: "replicated repair predecessor root does not contain every evidence-bound content chunk",
+        });
+    }
+    state.set_inode_authority_dataset_id(*dataset_id.as_bytes());
+    Ok(state)
+}
+
+fn replicated_repair_reconciliations_transaction_content_entries(
+    pool: &Pool,
+    inode: &InodeRecord,
+    keyspace: FilesystemObjectKeyspace,
+    authenticated_content_checksums: &BTreeMap<ObjectKey, IntegrityDigest64>,
+    transitions_by_key: &BTreeMap<ObjectKey, &PendingReplicatedRepairReconciliation>,
+    admitted_transitions: &mut BTreeSet<ObjectKey>,
+) -> Result<Vec<TransactionManifestEntry>> {
+    if inode.size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let authority = MountedContentReadAuthority::for_dataset(pool, keyspace.dataset_id());
+    let logical_content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+    let content_key = keyspace.scope(logical_content_key);
+    let expected_checksum = authenticated_content_checksums
+        .get(&content_key)
+        .copied()
+        .ok_or(FileSystemError::CorruptState {
+            reason: "replicated repair predecessor root is missing its authenticated content-manifest checksum",
+        })?;
+    let (content_bytes, _content_receipt) = authority
+        .read_current_object(logical_content_key)?
+        .ok_or(FileSystemError::CorruptState {
+            reason: "replicated repair predecessor root is missing authenticated content-manifest bytes",
+        })?;
+    if checksum64(&content_bytes) != expected_checksum {
+        return Err(FileSystemError::CorruptState {
+            reason: "replicated repair changed authenticated predecessor content-manifest bytes",
+        });
+    }
+    let layout = crate::content::decode_content_layout(&content_bytes)?;
+    crate::content::validate_content_layout(inode.inode_id, inode, &layout)?;
+
+    let mut entries = vec![TransactionManifestEntry {
+        role: TransactionManifestObjectRole::VersionedContent,
+        object_key: content_key,
+        checksum: expected_checksum,
+    }];
+    let ContentLayout::Chunked(manifest) = layout else {
+        return Ok(entries);
+    };
+
+    for authenticated_ref in &manifest.chunks {
+        if authenticated_ref.is_hole() {
+            continue;
+        }
+        let logical_chunk_key = content_chunk_object_key_for_version(
+            manifest.inode_id,
+            authenticated_ref.data_version,
+            authenticated_ref.chunk_index,
+        );
+        let chunk_key = keyspace.scope(logical_chunk_key);
+        if let Some(transition) = transitions_by_key.get(&chunk_key) {
+            if authenticated_ref.placement_receipt_generation
+                != transition.evidence.embedded_predecessor_generation
+                || !admitted_transitions.insert(chunk_key)
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "replicated repair predecessor root repeats or changes a batch-bound content chunk",
+                });
+            }
+            let (_bytes, observed_receipt) = authority
+                .read_current_object(logical_chunk_key)?
+                .ok_or(FileSystemError::ReceiptAuthorityUnavailable {
+                    object_key: chunk_key,
+                    expected_generation: transition.evidence.current_receipt.generation,
+                })?;
+            if observed_receipt != transition.evidence.current_receipt {
+                return Err(FileSystemError::CorruptState {
+                    reason: "replicated repair receipt changed after batch reconciliation evidence was established",
+                });
+            }
+            let mut current_ref = authenticated_ref.clone();
+            current_ref.placement_receipt_generation =
+                transition.evidence.current_receipt.generation;
+            let _ = authority.read_chunk(manifest.inode_id, &current_ref)?;
+        } else {
+            let _ = authority.read_chunk(manifest.inode_id, authenticated_ref)?;
+        }
+        entries.push(TransactionManifestEntry {
+            role: TransactionManifestObjectRole::VersionedContentChunk,
+            object_key: chunk_key,
+            checksum: authenticated_ref.checksum,
+        });
+    }
+    Ok(entries)
 }
 
 /// Load an authenticated committed state while durable removal or replacement

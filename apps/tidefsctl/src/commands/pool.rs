@@ -4,7 +4,7 @@
 // This module implements the `tidefsctl pool` subcommand group, delegating
 // to the respective production crates for each operation.  The verb surface
 // mirrors the operator/UAPI lifecycle: create, owner-mediated import/export,
-// destroy, mount, scan, status, integrity-check, and scrub.
+// destroy, mount, scan, status, integrity-check, scrub, and repair.
 //
 // # Pool create
 //
@@ -322,6 +322,17 @@ pub enum PoolCommand {
         json: bool,
     },
 
+    /// Repair one receipt-authorized corrupt replica through the live Pool owner
+    Repair {
+        /// Pool name. A reachable local-mounted owner is required.
+        #[arg(value_parser = parse_pool_name)]
+        pool: String,
+
+        /// Output the completed or refused repair report as JSON
+        #[arg(long = "json")]
+        json: bool,
+    },
+
     /// Get a typed pool property value with source annotation
     Get {
         /// Pool name (imported-pool identity; routed through the live owner)
@@ -507,6 +518,7 @@ pub fn handle_pool(cmd: PoolCommand) {
             handle_pool_integrity_check(pool, backing_dir, json, max_records, max_bytes, devices);
         }
         PoolCommand::Scrub { pool, json } => handle_pool_scrub(pool, json),
+        PoolCommand::Repair { pool, json } => handle_pool_repair(pool, json),
         PoolCommand::Get {
             property,
             pool,
@@ -527,6 +539,11 @@ pub fn handle_pool(cmd: PoolCommand) {
 
 fn handle_pool_scrub(pool: String, json: bool) -> ! {
     super::live_owner::route_with_format("pool", "scrub", &pool, json)
+}
+
+fn handle_pool_repair(pool: String, json: bool) -> ! {
+    let _guard = super::authz::require_local_only("pool repair");
+    super::live_owner::route_unique_reachable_owner_with_format("pool", "repair", &pool, json)
 }
 
 // ---------------------------------------------------------------------------
@@ -2448,6 +2465,17 @@ mod tests {
         assert!(matches!(
             command,
             PoolCommand::Scrub { pool, json: true } if pool == "tank"
+        ));
+    }
+
+    #[test]
+    fn pool_repair_parses_live_owner_pool_and_json_output() {
+        use clap::Parser;
+        let command = PoolCommand::try_parse_from(["pool", "repair", "tank", "--json"])
+            .expect("parse pool repair");
+        assert!(matches!(
+            command,
+            PoolCommand::Repair { pool, json: true } if pool == "tank"
         ));
     }
 }

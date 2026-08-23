@@ -15,6 +15,9 @@ use std::collections::BTreeMap;
 
 #[cfg(test)]
 use tidefs_local_object_store::checksum64;
+use tidefs_local_object_store::pool::{
+    ReplicatedReceiptEvidence, ReplicatedTargetEvidence, ReplicatedTargetReadOutcome,
+};
 use tidefs_local_object_store::{
     DeviceIoClass, IntegrityDigest64, LocalObjectStore, ObjectKey, Pool,
 };
@@ -127,6 +130,385 @@ impl ScrubReport {
     pub(crate) fn is_clean(&self) -> bool {
         self.violations.is_empty()
     }
+}
+
+/// Mounted-checksum outcome for one exact target of the current local Pool
+/// receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MountedRepairTargetChecksumOutcome {
+    Clean {
+        checksum: IntegrityDigest64,
+    },
+    Mismatch {
+        expected: IntegrityDigest64,
+        actual: IntegrityDigest64,
+    },
+    /// Bytes are readable and satisfy the mounted checksum, but fail the
+    /// current placement receipt's physical payload digest.
+    ReceiptMismatch {
+        checksum: IntegrityDigest64,
+    },
+    Missing,
+    Unreadable,
+    NoChecksum,
+}
+
+/// Deterministic mounted-checksum evidence for one local receipt target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MountedRepairTargetOutcome {
+    pub device_index: u32,
+    pub outcome: MountedRepairTargetChecksumOutcome,
+}
+
+/// Local two-target classification used by the mounted Pool repair carrier.
+///
+/// These identities are Pool device indices from the exact current placement
+/// receipt. They are not distributed membership node ids or membership
+/// epochs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MountedRepairClassification {
+    CleanAgreement,
+    SingleReplicaCorruption {
+        corrupt_target: u32,
+        clean_sources: Vec<u32>,
+    },
+    IncompleteComparison {
+        missing_targets: Vec<u32>,
+    },
+    ReceiptTargetDisagreement,
+    ChecksumAuthorityDisagreement,
+    MissingChecksumEvidence {
+        targets_without_checksum: Vec<u32>,
+    },
+}
+
+/// Receipt- and checksum-bound comparison for one mounted repair candidate.
+///
+/// The Pool evidence retains physical BLAKE3 identity while
+/// `target_outcomes` records the mounted checksum layer. Neither authority
+/// substitutes for the other.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MountedReplicatedRepairComparison {
+    pub block_id: ScrubBlockId,
+    pub object_key: ObjectKey,
+    pub receipt_evidence: ReplicatedReceiptEvidence,
+    pub checksum_layer: MountedContentChecksumLayer,
+    pub target_outcomes: Vec<MountedRepairTargetOutcome>,
+    pub classification: MountedRepairClassification,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MountedRepairPlanningError {
+    pub code: &'static str,
+    pub message: String,
+    pub object_key: Option<ObjectKey>,
+    pub embedded_receipt_generation: Option<u64>,
+}
+
+impl MountedRepairPlanningError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            object_key: None,
+            embedded_receipt_generation: None,
+        }
+    }
+
+    fn with_receipt_context(mut self, object_key: ObjectKey, generation: u64) -> Self {
+        self.object_key = Some(object_key);
+        self.embedded_receipt_generation = Some(generation);
+        self
+    }
+}
+
+fn target_mounted_read_outcome(
+    kind: ScrubBlockKind,
+    target: &ReplicatedTargetEvidence,
+    expected: Option<IntegrityDigest64>,
+) -> MountedRepairTargetChecksumOutcome {
+    match &target.outcome {
+        ReplicatedTargetReadOutcome::Missing => {
+            return MountedRepairTargetChecksumOutcome::Missing;
+        }
+        ReplicatedTargetReadOutcome::Unreadable => {
+            return MountedRepairTargetChecksumOutcome::Unreadable;
+        }
+        ReplicatedTargetReadOutcome::Clean | ReplicatedTargetReadOutcome::Corrupt { .. } => {}
+    }
+
+    let Some(payload) = target.payload() else {
+        return MountedRepairTargetChecksumOutcome::Unreadable;
+    };
+    let actual = match kind {
+        ScrubBlockKind::InlineContent => match split_inline_checksum(payload) {
+            Ok((body, Some(_))) => FastBlockChecksum::compute(body),
+            Ok((_body, None)) => return MountedRepairTargetChecksumOutcome::NoChecksum,
+            Err(_) => return MountedRepairTargetChecksumOutcome::Unreadable,
+        },
+        ScrubBlockKind::ContentChunk { .. } => FastBlockChecksum::compute(payload),
+        ScrubBlockKind::ContentManifest => return MountedRepairTargetChecksumOutcome::NoChecksum,
+    };
+    let Some(expected) = expected else {
+        return MountedRepairTargetChecksumOutcome::NoChecksum;
+    };
+
+    if actual != expected {
+        MountedRepairTargetChecksumOutcome::Mismatch { expected, actual }
+    } else if matches!(&target.outcome, ReplicatedTargetReadOutcome::Corrupt { .. }) {
+        MountedRepairTargetChecksumOutcome::ReceiptMismatch { checksum: actual }
+    } else {
+        MountedRepairTargetChecksumOutcome::Clean { checksum: actual }
+    }
+}
+
+fn classify_mounted_repair_targets(
+    target_outcomes: &[MountedRepairTargetOutcome],
+) -> MountedRepairClassification {
+    debug_assert_eq!(target_outcomes.len(), 2);
+
+    let missing_targets = target_outcomes
+        .iter()
+        .filter(|target| matches!(&target.outcome, MountedRepairTargetChecksumOutcome::Missing))
+        .map(|target| target.device_index)
+        .collect::<Vec<_>>();
+    if !missing_targets.is_empty() {
+        return MountedRepairClassification::IncompleteComparison { missing_targets };
+    }
+
+    let targets_without_checksum = target_outcomes
+        .iter()
+        .filter(|target| {
+            matches!(
+                &target.outcome,
+                MountedRepairTargetChecksumOutcome::NoChecksum
+            )
+        })
+        .map(|target| target.device_index)
+        .collect::<Vec<_>>();
+    if !targets_without_checksum.is_empty() {
+        return MountedRepairClassification::MissingChecksumEvidence {
+            targets_without_checksum,
+        };
+    }
+
+    let clean_sources = target_outcomes
+        .iter()
+        .filter(|target| {
+            matches!(
+                &target.outcome,
+                MountedRepairTargetChecksumOutcome::Clean { .. }
+            )
+        })
+        .map(|target| target.device_index)
+        .collect::<Vec<_>>();
+    let corrupt_targets = target_outcomes
+        .iter()
+        .filter(|target| {
+            matches!(
+                &target.outcome,
+                MountedRepairTargetChecksumOutcome::Mismatch { .. }
+                    | MountedRepairTargetChecksumOutcome::ReceiptMismatch { .. }
+                    | MountedRepairTargetChecksumOutcome::Unreadable
+            )
+        })
+        .map(|target| target.device_index)
+        .collect::<Vec<_>>();
+
+    if clean_sources.len() == 2 {
+        return MountedRepairClassification::CleanAgreement;
+    }
+    if let ([clean_source], [corrupt_target]) =
+        (clean_sources.as_slice(), corrupt_targets.as_slice())
+    {
+        return MountedRepairClassification::SingleReplicaCorruption {
+            corrupt_target: *corrupt_target,
+            clean_sources: vec![*clean_source],
+        };
+    }
+
+    if corrupt_targets.len() == 2 {
+        let mismatch_actuals = target_outcomes
+            .iter()
+            .filter_map(|target| match &target.outcome {
+                MountedRepairTargetChecksumOutcome::Mismatch { actual, .. } => Some(*actual),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if mismatch_actuals.len() == 2 && mismatch_actuals[0] == mismatch_actuals[1] {
+            return MountedRepairClassification::ChecksumAuthorityDisagreement;
+        }
+    }
+
+    MountedRepairClassification::ReceiptTargetDisagreement
+}
+
+/// Compare every target of one current two-copy receipt at the mounted
+/// checksum layer for the exact scrub finding named by `block_id`.
+///
+/// All current devices are owned by this local Pool owner. Target identity and
+/// ordering come only from the exact current receipt. Classification never
+/// changes that order and never manufactures distributed membership evidence.
+pub(crate) fn compare_mounted_replicated_repair(
+    pool: &Pool,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    keyspace: FilesystemObjectKeyspace,
+    block_id: &ScrubBlockId,
+) -> std::result::Result<MountedReplicatedRepairComparison, MountedRepairPlanningError> {
+    let inode_id = InodeId::new(block_id.inode_id);
+    let record = inodes.get(&inode_id).ok_or_else(|| {
+        MountedRepairPlanningError::new(
+            "missing-current-inode",
+            format!(
+                "mounted repair inode {} is no longer current",
+                block_id.inode_id
+            ),
+        )
+    })?;
+
+    let (object_key, checksum_layer, expected_checksum, expected_receipt_generation) =
+        match block_id.kind {
+            ScrubBlockKind::InlineContent => {
+                return Err(MountedRepairPlanningError::new(
+                    "unsupported-inline-content-repair",
+                    "mounted inline-content repair has no crash-safe receipt/root reconciliation path",
+                ));
+            }
+            ScrubBlockKind::ContentChunk { chunk_index } => {
+                let manifest = read_content_manifest_for_scrub(
+                    pool.raw_primary_store(),
+                    inode_id,
+                    record,
+                    Some(pool),
+                    keyspace,
+                )
+                .map_err(|error| {
+                    MountedRepairPlanningError::new(
+                        "content-manifest-unavailable",
+                        format!("mounted repair could not read current content manifest: {error}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    MountedRepairPlanningError::new(
+                        "content-layout-changed",
+                        "mounted repair finding no longer names chunked content",
+                    )
+                })?;
+                let chunk = manifest
+                    .chunks
+                    .iter()
+                    .find(|chunk| {
+                        chunk.chunk_index == chunk_index
+                            && chunk.data_version == block_id.data_version
+                            && !chunk.is_hole()
+                    })
+                    .ok_or_else(|| {
+                        MountedRepairPlanningError::new(
+                            "stale-content-generation",
+                            "mounted content chunk identity changed after scrub",
+                        )
+                    })?;
+                if chunk.placement_receipt_generation == 0 {
+                    return Err(MountedRepairPlanningError::new(
+                        "missing-content-receipt-generation",
+                        "mounted content chunk manifest has no placement receipt generation",
+                    ));
+                }
+                (
+                    keyspace.content_chunk(inode_id, chunk.data_version, chunk.chunk_index),
+                    MountedContentChecksumLayer::EncodedContentChunk,
+                    Some(chunk.checksum),
+                    Some(chunk.placement_receipt_generation),
+                )
+            }
+            ScrubBlockKind::ContentManifest => {
+                return Err(MountedRepairPlanningError::new(
+                    "unsupported-content-manifest-repair",
+                    "mounted content-manifest repair has no current checksum-layer mapping",
+                ));
+            }
+        };
+
+    let receipt_evidence = pool
+        .replicated_receipt_evidence(DeviceIoClass::Data, object_key)
+        .map_err(|error| {
+            MountedRepairPlanningError::new(
+                "receipt-evidence-refused",
+                format!("mounted repair could not establish current receipt evidence: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            MountedRepairPlanningError::new(
+                "missing-current-receipt",
+                "mounted repair candidate has no current placement receipt",
+            )
+        })?;
+    let receipt = &receipt_evidence.receipt;
+    if let Some(expected_generation) = expected_receipt_generation {
+        if expected_generation != receipt.generation {
+            return Err(MountedRepairPlanningError::new(
+                    "stale-content-receipt-generation",
+                    format!(
+                        "mounted content chunk manifest receipt generation {expected_generation} does not match current Pool receipt generation {}",
+                        receipt.generation
+                    ),
+                )
+                .with_receipt_context(object_key, expected_generation));
+        }
+    }
+    if receipt.object_key != object_key
+        || receipt.policy
+            != (tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 })
+        || receipt.targets.len() != 2
+        || receipt_evidence.targets.len() != 2
+    {
+        return Err(MountedRepairPlanningError::new(
+            "invalid-current-receipt-evidence",
+            "mounted repair requires one exact current two-copy Pool receipt and both target outcomes",
+        ));
+    }
+
+    let mut receipt_target_ids = receipt
+        .targets
+        .iter()
+        .map(|target| target.device_index)
+        .collect::<Vec<_>>();
+    receipt_target_ids.sort_unstable();
+    let mut evidence_target_ids = receipt_evidence
+        .targets
+        .iter()
+        .map(|target| target.target.device_index)
+        .collect::<Vec<_>>();
+    evidence_target_ids.sort_unstable();
+    if receipt_target_ids[0] == receipt_target_ids[1]
+        || evidence_target_ids[0] == evidence_target_ids[1]
+        || evidence_target_ids != receipt_target_ids
+    {
+        return Err(MountedRepairPlanningError::new(
+            "invalid-receipt-target-identities",
+            "mounted repair receipt evidence does not name two distinct exact Pool targets",
+        ));
+    }
+
+    let mut target_outcomes = receipt_evidence
+        .targets
+        .iter()
+        .map(|target| MountedRepairTargetOutcome {
+            device_index: target.target.device_index,
+            outcome: target_mounted_read_outcome(block_id.kind, target, expected_checksum),
+        })
+        .collect::<Vec<_>>();
+    target_outcomes.sort_by_key(|target| target.device_index);
+    let classification = classify_mounted_repair_targets(&target_outcomes);
+
+    Ok(MountedReplicatedRepairComparison {
+        block_id: block_id.clone(),
+        object_key,
+        receipt_evidence,
+        checksum_layer,
+        target_outcomes,
+        classification,
+    })
 }
 
 // ── Scrub implementation ──────────────────────────────────────────────
@@ -685,12 +1067,12 @@ pub(crate) fn resolve_violation(violation: &ScrubViolation) -> RepairStrategy {
 mod tests {
     use super::*;
 
-    use crate::encoding::encode_content_chunk;
+    use crate::encoding::{encode_content_chunk, encode_content_manifest};
     use crate::object_keys::content_chunk_object_key_for_version;
     use crate::types::ContentCompressionPolicy;
     use crate::LocalFileSystem;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tidefs_local_object_store::pool::{PoolConfig, PoolProperties};
+    use tidefs_local_object_store::pool::{PoolConfig, PoolProperties, PoolRedundancyPolicy};
     use tidefs_local_object_store::{
         DeviceBacking, DeviceClass, DeviceConfig, DeviceKind, StoreOptions,
     };
@@ -742,6 +1124,170 @@ mod tests {
         .expect("create temp pool")
     }
 
+    fn temp_replicated_pool(label: &str) -> Pool {
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-scrub-replicated-pool-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let devices = (0..2)
+            .map(|device_index| {
+                let data_dir = root.join(format!("data-{device_index}"));
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: data_dir.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path: data_dir },
+                    encryption: None,
+                    compression: None,
+                }
+            })
+            .collect();
+        Pool::create(
+            PoolConfig {
+                name: "scrub-replicated-test-pool".into(),
+                root_path: root,
+                devices,
+            },
+            PoolProperties {
+                redundancy_policy: PoolRedundancyPolicy::Replicated { copies: 2 },
+                ..PoolProperties::default()
+            },
+            &StoreOptions::test_fast(),
+        )
+        .expect("create replicated temp pool")
+    }
+
+    struct RepairComparisonGenerationFixture {
+        pool: Pool,
+        inodes: BTreeMap<InodeId, InodeRecord>,
+        keyspace: FilesystemObjectKeyspace,
+        block_id: ScrubBlockId,
+        manifest_key: ObjectKey,
+        chunk_key: ObjectKey,
+        embedded_generation: u64,
+        current_generation: u64,
+    }
+
+    fn repair_comparison_generation_fixture(
+        label: &str,
+        embedded_generation: impl FnOnce(u64, u64) -> u64,
+    ) -> RepairComparisonGenerationFixture {
+        let mut pool = temp_replicated_pool(label);
+        let payload = b"receipt-generation comparison fixture".to_vec();
+        let record = test_file_record(27, 9, payload.len() as u64);
+        let keyspace = FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID);
+        let chunk_key = keyspace.content_chunk(record.inode_id, record.data_version, 0);
+        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off())
+            .expect("encode comparison chunk");
+        let checksum = FastBlockChecksum::compute(&encoded);
+        let (_, previous_receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, chunk_key, &encoded)
+            .expect("write previous comparison chunk receipt");
+        let (_, current_receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, chunk_key, &encoded)
+            .expect("rotate current comparison chunk receipt");
+        assert!(
+            current_receipt.generation > previous_receipt.generation,
+            "fixture must retain a nonzero stale generation"
+        );
+        let embedded_generation =
+            embedded_generation(previous_receipt.generation, current_receipt.generation);
+        let manifest = ContentManifestObject {
+            inode_id: record.inode_id,
+            data_version: record.data_version,
+            file_size: record.size,
+            chunk_size: crate::content_chunk_size(),
+            chunks: vec![ContentChunkRef {
+                chunk_index: 0,
+                data_version: record.data_version,
+                len: payload.len() as u32,
+                checksum,
+                placement_receipt_generation: embedded_generation,
+            }],
+        };
+        let manifest_key = keyspace.content(record.inode_id, record.data_version);
+        pool.put_with_receipt(
+            DeviceIoClass::Data,
+            manifest_key,
+            &encode_content_manifest(&manifest),
+        )
+        .expect("write comparison content manifest");
+        let block_id = ScrubBlockId {
+            inode_id: record.inode_id.get(),
+            data_version: record.data_version,
+            kind: ScrubBlockKind::ContentChunk { chunk_index: 0 },
+        };
+        let inodes = BTreeMap::from([(record.inode_id, record)]);
+
+        RepairComparisonGenerationFixture {
+            pool,
+            inodes,
+            keyspace,
+            block_id,
+            manifest_key,
+            chunk_key,
+            embedded_generation,
+            current_generation: current_receipt.generation,
+        }
+    }
+
+    fn repair_comparison_refusal_without_mutation(
+        fixture: &RepairComparisonGenerationFixture,
+    ) -> MountedRepairPlanningError {
+        let receipts_before = fixture
+            .pool
+            .placement_receipts(DeviceIoClass::Data)
+            .expect("snapshot placement receipts before refusal");
+        let manifest_before = fixture
+            .pool
+            .get_with_current_receipt(DeviceIoClass::Data, fixture.manifest_key)
+            .expect("snapshot manifest before refusal");
+        let chunk_before = fixture
+            .pool
+            .get_with_current_receipt(DeviceIoClass::Data, fixture.chunk_key)
+            .expect("snapshot chunk before refusal");
+
+        let error = compare_mounted_replicated_repair(
+            &fixture.pool,
+            &fixture.inodes,
+            fixture.keyspace,
+            &fixture.block_id,
+        )
+        .expect_err("receipt generation mismatch must refuse comparison planning");
+
+        assert_eq!(
+            fixture
+                .pool
+                .placement_receipts(DeviceIoClass::Data)
+                .expect("read placement receipts after refusal"),
+            receipts_before,
+            "planning refusal must not rotate or replace Pool receipts"
+        );
+        assert_eq!(
+            fixture
+                .pool
+                .get_with_current_receipt(DeviceIoClass::Data, fixture.manifest_key)
+                .expect("read manifest after refusal"),
+            manifest_before,
+            "planning refusal must not rewrite the content manifest"
+        );
+        assert_eq!(
+            fixture
+                .pool
+                .get_with_current_receipt(DeviceIoClass::Data, fixture.chunk_key)
+                .expect("read chunk after refusal"),
+            chunk_before,
+            "planning refusal must not rewrite the content chunk"
+        );
+        error
+    }
+
     fn test_file_record(inode_id: u64, data_version: u64, size: u64) -> InodeRecord {
         InodeRecord {
             dir_storage_kind: 0,
@@ -762,6 +1308,39 @@ mod tests {
             subtree_rev: 0,
             rdev: 0,
         }
+    }
+
+    #[test]
+    fn repair_comparison_refuses_missing_manifest_receipt_generation_without_mutation() {
+        let fixture = repair_comparison_generation_fixture("missing-manifest-receipt", |_, _| 0);
+        assert_eq!(fixture.embedded_generation, 0);
+
+        let error = repair_comparison_refusal_without_mutation(&fixture);
+
+        assert_eq!(error.code, "missing-content-receipt-generation");
+        assert!(error
+            .message
+            .contains("has no placement receipt generation"));
+    }
+
+    #[test]
+    fn repair_comparison_refuses_stale_manifest_receipt_generation_without_mutation() {
+        let fixture = repair_comparison_generation_fixture(
+            "stale-manifest-receipt",
+            |previous_generation, _| previous_generation,
+        );
+        assert!(fixture.embedded_generation > 0);
+        assert!(fixture.embedded_generation < fixture.current_generation);
+
+        let error = repair_comparison_refusal_without_mutation(&fixture);
+
+        assert_eq!(error.code, "stale-content-receipt-generation");
+        assert!(error
+            .message
+            .contains(&fixture.embedded_generation.to_string()));
+        assert!(error
+            .message
+            .contains(&fixture.current_generation.to_string()));
     }
 
     #[test]
@@ -1049,6 +1628,86 @@ mod tests {
             kind: ScrubBlockKind::ContentChunk { chunk_index: 1 },
         };
         assert!(a < b);
+    }
+
+    #[test]
+    fn mounted_repair_classifies_later_receipt_target_without_reordering() {
+        let expected = IntegrityDigest64(0x11);
+        let target_outcomes = vec![
+            MountedRepairTargetOutcome {
+                device_index: 4,
+                outcome: MountedRepairTargetChecksumOutcome::Clean { checksum: expected },
+            },
+            MountedRepairTargetOutcome {
+                device_index: 9,
+                outcome: MountedRepairTargetChecksumOutcome::Mismatch {
+                    expected,
+                    actual: IntegrityDigest64(0x22),
+                },
+            },
+        ];
+        let stable_outcomes = target_outcomes.clone();
+
+        assert_eq!(
+            classify_mounted_repair_targets(&target_outcomes),
+            MountedRepairClassification::SingleReplicaCorruption {
+                corrupt_target: 9,
+                clean_sources: vec![4],
+            }
+        );
+        assert_eq!(target_outcomes, stable_outcomes);
+
+        let receipt_mismatch = vec![
+            target_outcomes[0].clone(),
+            MountedRepairTargetOutcome {
+                device_index: 9,
+                outcome: MountedRepairTargetChecksumOutcome::ReceiptMismatch { checksum: expected },
+            },
+        ];
+        assert_eq!(
+            classify_mounted_repair_targets(&receipt_mismatch),
+            MountedRepairClassification::SingleReplicaCorruption {
+                corrupt_target: 9,
+                clean_sources: vec![4],
+            }
+        );
+    }
+
+    #[test]
+    fn mounted_repair_dual_bad_targets_have_truthful_local_classification() {
+        let expected = IntegrityDigest64(0x11);
+        let same_bad = vec![
+            MountedRepairTargetOutcome {
+                device_index: 4,
+                outcome: MountedRepairTargetChecksumOutcome::Mismatch {
+                    expected,
+                    actual: IntegrityDigest64(0x22),
+                },
+            },
+            MountedRepairTargetOutcome {
+                device_index: 9,
+                outcome: MountedRepairTargetChecksumOutcome::Mismatch {
+                    expected,
+                    actual: IntegrityDigest64(0x22),
+                },
+            },
+        ];
+        assert_eq!(
+            classify_mounted_repair_targets(&same_bad),
+            MountedRepairClassification::ChecksumAuthorityDisagreement
+        );
+
+        let unreadable = vec![
+            same_bad[0].clone(),
+            MountedRepairTargetOutcome {
+                device_index: 9,
+                outcome: MountedRepairTargetChecksumOutcome::Unreadable,
+            },
+        ];
+        assert_eq!(
+            classify_mounted_repair_targets(&unreadable),
+            MountedRepairClassification::ReceiptTargetDisagreement
+        );
     }
 
     #[test]

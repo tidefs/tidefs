@@ -2035,6 +2035,11 @@ pub struct FilesystemDatasetEngine {
     /// Armed when this mounted instance cannot determine whether its latest
     /// root publication became durable. Only reopen may clear this fence.
     mutation_requires_reopen: bool,
+    /// Armed after replicated repair durably reserves or queues a
+    /// pre-publication transition but returns before publishing its
+    /// replacement receipt. Only the same live-owner repair carrier may
+    /// resume that exact transition; every unrelated mutation must wait.
+    replicated_repair_retry_only: bool,
     /// Exact canonical snapshot roots that a device-lifecycle transaction
     /// authenticated before Pool placement receipts changed. Ordinary
     /// commits leave this empty; while populated, only these predecessors may
@@ -3916,6 +3921,7 @@ impl PoolDatasetOwner {
     /// adapter from the live mounted state.
     fn arm_mutation_reopen_fence(&mut self) {
         self.filesystem.mutation_requires_reopen = true;
+        self.filesystem.replicated_repair_retry_only = false;
         self.filesystem.writeback_range_tracker = Arc::new(Mutex::new(
             crate::dirty_page_tracker::DirtyPageTracker::new(),
         ));
@@ -4538,7 +4544,9 @@ impl PoolDatasetOwner {
         let background_scrub_pool_properties = store.properties().clone();
         let mut store = PoolRuntime::open(store)?;
         check_crash_hook(CrashInjectionPoint::RecoveryBeforeRootSelect);
-        let (mut state, mounted_dataset_id) = if store.is_unpublished() {
+        let (mut state, mounted_dataset_id, pending_replicated_repair_reconciliations) = if store
+            .is_unpublished()
+        {
             if dataset_path != "root" {
                 return Err(FileSystemError::CorruptState {
                     reason: "named filesystem dataset is absent from an unpublished Pool",
@@ -4567,7 +4575,7 @@ impl PoolDatasetOwner {
                 signed.generation,
                 &root_bytes,
             )?;
-            (state, tidefs_pool_runtime::ROOT_DATASET_ID)
+            (state, tidefs_pool_runtime::ROOT_DATASET_ID, Vec::new())
         } else {
             let dataset_id = store
                 .dataset_catalog()
@@ -4592,21 +4600,14 @@ impl PoolDatasetOwner {
                     reason: "mounted filesystem dataset is not active",
                 });
             }
-            let (state, _root) = if dataset_id == tidefs_pool_runtime::ROOT_DATASET_ID {
-                recover_canonical_committed_state(
-                    &mut store,
-                    root_authentication_key,
-                    recovery_policy,
-                )?
-            } else {
-                recover_canonical_committed_state_for_dataset(
+            let (state, _root, pending_repair) =
+                recover_canonical_committed_state_for_dataset_admitting_pending_replicated_repair(
                     &mut store,
                     dataset_id,
                     root_authentication_key,
                     recovery_policy,
-                )?
-            };
-            (state, dataset_id)
+                )?;
+            (state, dataset_id, pending_repair)
         };
         let open_recovery = MountedOpenRecoveryAuthority::raw_only_for_dataset(
             store.pool_mut(),
@@ -4675,6 +4676,8 @@ impl PoolDatasetOwner {
             open_recovery.has_device_replacement_predecessor_resume();
         let pending_device_lifecycle_recovery =
             pending_device_removal_recovery || pending_device_replacement_recovery;
+        let pending_replicated_repair_recovery =
+            !pending_replicated_repair_reconciliations.is_empty();
         let dataset_capacity = {
             let block_size = StatfsResult::DEFAULT_BLOCK_SIZE as u32;
             let root_reserve_bytes = 0; // no root reserve in local-filesystem policy
@@ -4683,25 +4686,30 @@ impl PoolDatasetOwner {
             // rather than raw object-store usage. The raw pool counter includes
             // metadata/log bytes, while LocalStorageAllocatorPolicy's capacity
             // is the user-content ceiling enforced by fallocate/write paths.
-            let used_bytes = if pending_device_lifecycle_recovery {
-                // The authenticated predecessor state can temporarily carry
-                // older embedded receipt generations after Pool evacuation.
-                // Keep admission conservatively closed until mounted recovery
-                // copy-on-writes those manifests and then rebuilds capacity
-                // from ordinary exact receipt authority below.
-                total_bytes
-            } else {
-                open_recovery
-                    .committed_content_used_bytes(&state)?
-                    .min(total_bytes)
-            };
+            let used_bytes =
+                if pending_device_lifecycle_recovery || pending_replicated_repair_recovery {
+                    // The authenticated predecessor state can temporarily carry
+                    // older embedded receipt generations during Pool lifecycle
+                    // or replicated-repair recovery.
+                    // Keep admission conservatively closed until mounted recovery
+                    // copy-on-writes those manifests and then rebuilds capacity
+                    // from ordinary exact receipt authority below.
+                    total_bytes
+                } else {
+                    open_recovery
+                        .committed_content_used_bytes(&state)?
+                        .min(total_bytes)
+                };
             let mut counters = *state.space_accounting.counters();
-            if !pending_device_lifecycle_recovery && counters.logical_used_bytes < used_bytes {
+            if !pending_device_lifecycle_recovery
+                && !pending_replicated_repair_recovery
+                && counters.logical_used_bytes < used_bytes
+            {
                 counters.logical_used_bytes = used_bytes;
                 state.space_accounting =
                     SpaceAccounting::new(counters, state.space_accounting.domain_id());
             }
-            if pending_device_lifecycle_recovery {
+            if pending_device_lifecycle_recovery || pending_replicated_repair_recovery {
                 counters.logical_used_bytes = used_bytes;
                 let provisional =
                     SpaceAccounting::new(counters, state.space_accounting.domain_id());
@@ -4843,6 +4851,7 @@ impl PoolDatasetOwner {
                 max_uncommitted_mutations: DEFAULT_MAX_UNCOMMITTED_MUTATIONS,
                 in_transaction: false,
                 mutation_requires_reopen: false,
+                replicated_repair_retry_only: false,
                 pending_snapshot_root_rewrites: BTreeMap::new(),
                 mutation_delta: None,
                 mutation_recorded_commit_group_write: false,
@@ -4920,6 +4929,13 @@ impl PoolDatasetOwner {
                 cleanup_engine: None,
             },
         };
+
+        if !pending_replicated_repair_reconciliations.is_empty() {
+            fs.reconcile_pending_replicated_repairs_before_owner(
+                pending_replicated_repair_reconciliations,
+            )?;
+            fs.rebuild_capacity_authority_from_committed_content()?;
+        }
 
         if fs.store.pool().pending_device_removal_path()?.is_some() {
             if !recovery_policy.allows_any_mutation() {
@@ -14633,8 +14649,25 @@ impl PoolDatasetOwner {
         // generation owned by logical mutations.
         let transaction_id = if must_persist {
             let previous_root = self.selected_committed_root_summary()?;
+            let transaction_floor = self
+                .filesystem
+                .state
+                .snapshots
+                .values()
+                .filter(|snapshot| snapshot::snapshot_record_retains_data(snapshot))
+                .try_fold(
+                    self.filesystem.state.generation,
+                    |floor, snapshot| -> Result<u64> {
+                        let successor = snapshot.root.transaction_id.checked_add(1).ok_or(
+                            FileSystemError::CorruptState {
+                                reason: "mounted transaction id space is exhausted by retained snapshot roots",
+                            },
+                        )?;
+                        Ok(floor.max(successor))
+                    },
+                )?;
             Some(next_mounted_commit_transaction_id(
-                self.filesystem.state.generation,
+                transaction_floor,
                 &previous_root,
             )?)
         } else {
@@ -14907,6 +14940,60 @@ impl PoolDatasetOwner {
             || !self.filesystem.state.dirty_dirs.is_empty()
     }
 
+    /// Return why mounted replica repair cannot begin from read-only state.
+    ///
+    /// Repair must not flush or otherwise commit unrelated mounted mutations
+    /// merely to manufacture a stable comparison point.  The live owner holds
+    /// the operation lock while checking this state, so an accepted repair can
+    /// keep the same quiescent authority through its final pre-write
+    /// revalidation.
+    pub(crate) fn mounted_repair_quiescence_failure(&self) -> Option<&'static str> {
+        if self.is_state_dirty() {
+            return Some("mounted filesystem state is dirty");
+        }
+        if self.filesystem.intent_log.pending_flush_count() != 0 {
+            return Some("mounted intent log has unflushed entries");
+        }
+        if !self.filesystem.intent_log.is_empty() {
+            return Some("mounted intent log has uncleared durable entries");
+        }
+        if self.filesystem.mutation_delta.is_some()
+            || self.filesystem.in_transaction
+            || self.filesystem.uncommitted_mutation_count != 0
+        {
+            return Some("mounted mutation state is not quiescent");
+        }
+        if !self.filesystem.pending_permits.is_empty()
+            || !self.filesystem.write_buffers.is_empty()
+            || !self.filesystem.buffered_write_base_records.is_empty()
+        {
+            return Some("mounted writeback state is not quiescent");
+        }
+        let writeback_ranges_dirty = match self.filesystem.writeback_range_tracker.lock() {
+            Ok(tracker) => tracker.dirty_inode_count() != 0,
+            Err(_) => return Some("mounted writeback tracker lock is unavailable"),
+        };
+        if self
+            .filesystem
+            .dirty_page_tracker
+            .borrow()
+            .dirty_page_count()
+            != 0
+            || writeback_ranges_dirty
+        {
+            return Some("mounted page-cache writeback is not quiescent");
+        }
+        if self.filesystem.commit_group.phase != CommitGroupPhase::Open
+            || self.filesystem.commit_group.inflight_writes != 0
+        {
+            return Some("mounted commit group is not quiescent");
+        }
+        if !self.filesystem.pending_snapshot_root_rewrites.is_empty() {
+            return Some("mounted snapshot root publication is pending");
+        }
+        None
+    }
+
     fn mark_inode_content_dirty(&mut self, inode_id: InodeId) {
         // Register with sync gate: this inode has dirty data in the current TXG.
         // When the TXG commits, notify_committed will wake any fsync waiter for this inode.
@@ -15115,9 +15202,26 @@ impl PoolDatasetOwner {
         if self.filesystem.mutation_requires_reopen {
             return Err(FileSystemError::MutationRequiresReopen { operation });
         }
+        if self.filesystem.replicated_repair_retry_only
+            && operation != "repair mounted pool replica"
+        {
+            return Err(FileSystemError::Unsupported {
+                operation,
+                reason:
+                    "complete or reopen the pending replicated repair before another mounted mutation",
+            });
+        }
         self.store
             .ensure_external_mutation_authority(operation)
             .map_err(|_| FileSystemError::MutationRequiresReopen { operation })
+    }
+
+    pub(crate) fn arm_replicated_repair_retry_only(&mut self) {
+        self.filesystem.replicated_repair_retry_only = true;
+    }
+
+    pub(crate) fn clear_replicated_repair_retry_only(&mut self) {
+        self.filesystem.replicated_repair_retry_only = false;
     }
 
     /// Attach the renewable deadline of an external clustered writer lease.

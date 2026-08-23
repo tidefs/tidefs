@@ -585,6 +585,17 @@ fn dispatch_request(
             #[cfg(feature = "block-volume")]
             LiveOwnerAdmin::StandaloneBlock { .. } => unsupported_admin_command_response(&request),
         },
+        LivePoolAdminCommand::PoolRepair => match admin {
+            LiveOwnerAdmin::Fuse { pool_owner, .. } => {
+                if let Some(response) = read_only_pool_repair_gate(&request, manifest) {
+                    response
+                } else {
+                    pool_owner.handle_live_pool_owner_admin_request(&request)
+                }
+            }
+            #[cfg(feature = "block-volume")]
+            LiveOwnerAdmin::StandaloneBlock { .. } => unsupported_admin_command_response(&request),
+        },
         #[cfg(feature = "block-volume")]
         LivePoolAdminCommand::BlockAttach => match admin {
             LiveOwnerAdmin::Fuse { pool_owner, .. } => block_attach(
@@ -612,6 +623,59 @@ fn dispatch_request(
         #[cfg(not(feature = "block-volume"))]
         LivePoolAdminCommand::BlockAttach => unsupported_admin_command_response(&request),
     }
+}
+
+fn read_only_pool_repair_gate(
+    request: &LivePoolAdminRequest,
+    manifest: &LiveOwnerManifest,
+) -> Option<LivePoolAdminResponse> {
+    if request.command != LivePoolAdminCommand::PoolRepair || !manifest.read_only {
+        return None;
+    }
+
+    let message = format!(
+        "mounted Pool owner for '{}' is read-only; remount it writable before repair",
+        manifest.pool_name
+    );
+    if request.output.wants_json() {
+        return Some(LivePoolAdminResponse::command_report_machine_json(
+            1,
+            json!({
+                "pool": manifest.pool_name,
+                "pass": false,
+                "state_source": "live-owner",
+                "owner_state": "mounted PoolDatasetOwner",
+                "outcome": "refused",
+                "repair_attempted": false,
+                "repair_completed": false,
+                "repair_writeback": false,
+                "receipt_publication": "not-attempted",
+                "refusal": {
+                    "code": "read-only-owner",
+                    "message": message,
+                },
+                "failure": serde_json::Value::Null,
+                "initial_scrub": serde_json::Value::Null,
+                "comparison": serde_json::Value::Null,
+                "previous_receipt_generation": serde_json::Value::Null,
+                "replacement_receipt_generation": serde_json::Value::Null,
+                "clean_source": serde_json::Value::Null,
+                "corrupt_target": serde_json::Value::Null,
+                "authenticated_root_published": false,
+                "authenticated_root_state": "not-started",
+                "re_scrub": serde_json::Value::Null,
+            })
+            .to_string(),
+        ));
+    }
+
+    Some(LivePoolAdminResponse::command_report_text(
+        1,
+        format!(
+            "pool repair: {}\n  source:                 live owner (mounted PoolDatasetOwner)\n  outcome:                refused\n  repair attempt:         no\n  writeback:              none\n  receipt publication:    not-attempted\n  comparison:             not established\n  subject:                not established\n  object:                 not established\n  clean source:           device not established\n  corrupt target:         device not established\n  receipt generation:     not established -> not established\n  authenticated root:     not-started\n  re-scrub:               not run\n  refusal:                read-only-owner: {message}",
+            manifest.pool_name
+        ),
+    ))
 }
 
 #[cfg(feature = "block-volume")]
@@ -2436,6 +2500,63 @@ mod tests {
 
         assert!(err.contains("owns uuid 0123456789abcdeffedcba9876543210"));
         assert!(err.contains("not requested uuid aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn read_only_pool_repair_gate_is_exact_and_reports_live_owner_truth() {
+        let mut manifest = manifest();
+        manifest.read_only = true;
+        let mut request = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolRepair, "tank");
+        request.output = LivePoolAdminOutput::MachineJson;
+
+        let response = read_only_pool_repair_gate(&request, &manifest)
+            .expect("read-only repair must be refused before Pool-owner dispatch");
+
+        assert_eq!(response.exit_code, 1);
+        let LivePoolAdminResponseBody::MachineJson(machine_json) = response.body else {
+            panic!("read-only repair refusal should remain a command report");
+        };
+        let report: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+        assert_eq!(report["pool"], "tank");
+        assert_eq!(report["state_source"], "live-owner");
+        assert_eq!(report["outcome"], "refused");
+        assert_eq!(report["repair_attempted"], false);
+        assert_eq!(report["repair_completed"], false);
+        assert_eq!(report["repair_writeback"], false);
+        assert_eq!(report["receipt_publication"], "not-attempted");
+        assert_eq!(
+            report["previous_receipt_generation"],
+            serde_json::Value::Null
+        );
+        assert_eq!(report["clean_source"], serde_json::Value::Null);
+        assert_eq!(report["corrupt_target"], serde_json::Value::Null);
+        assert_eq!(report["authenticated_root_published"], false);
+        assert_eq!(report["authenticated_root_state"], "not-started");
+        assert_eq!(report["re_scrub"], serde_json::Value::Null);
+        assert_eq!(report["refusal"]["code"], "read-only-owner");
+
+        request.output = LivePoolAdminOutput::Human;
+        let response = read_only_pool_repair_gate(&request, &manifest)
+            .expect("read-only repair must carry a human refusal report");
+        assert_eq!(response.exit_code, 1);
+        let LivePoolAdminResponseBody::Text(text) = response.body else {
+            panic!("human read-only repair refusal should remain a command report");
+        };
+        assert!(text.contains("pool repair: tank"));
+        assert!(text.contains("source:                 live owner (mounted PoolDatasetOwner)"));
+        assert!(text.contains("outcome:                refused"));
+        assert!(text.contains("repair attempt:         no"));
+        assert!(text.contains("writeback:              none"));
+        assert!(text.contains("receipt publication:    not-attempted"));
+        assert!(text.contains("authenticated root:     not-started"));
+        assert!(text.contains("re-scrub:               not run"));
+        assert!(text.contains("refusal:                read-only-owner:"));
+
+        manifest.read_only = false;
+        assert!(read_only_pool_repair_gate(&request, &manifest).is_none());
+        manifest.read_only = true;
+        request.command = LivePoolAdminCommand::PoolScrub;
+        assert!(read_only_pool_repair_gate(&request, &manifest).is_none());
     }
 
     fn assert_typed_malformed(response: LivePoolAdminResponse) -> String {

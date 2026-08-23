@@ -302,11 +302,6 @@ pub(crate) fn read_mounted_content_scrub_block_in_keyspace(
             read_mounted_inline_content_scrub_block(store, inode_id, record, pool, keyspace)
         }
         MountedContentScrubReadTarget::ContentChunk(chunk_ref) => {
-            if chunk_ref.data_version != record.data_version {
-                return Err(FileSystemError::CorruptState {
-                    reason: "mounted content scrub authority stale chunk data version",
-                });
-            }
             read_mounted_chunk_content_scrub_block(store, inode_id, chunk_ref, pool, keyspace)
         }
     }
@@ -3764,39 +3759,51 @@ mod tests {
     }
 
     #[test]
-    fn mounted_content_scrub_authority_rejects_stale_chunk_ref() {
-        let mut store = temp_store("mounted-stale-chunk-ref");
-        let payload = b"stale chunk reference".to_vec();
-        let stale_record = test_record(13, 6, payload.len() as u64);
+    fn mounted_content_scrub_authority_accepts_manifest_retained_chunk_version() {
+        let mut store = temp_store("mounted-retained-chunk-version");
+        let payload = b"retained chunk reference".to_vec();
+        let chunk_record = test_record(13, 6, payload.len() as u64);
         let current_record = test_record(13, 7, payload.len() as u64);
         let key = content_chunk_object_key_for_version(
-            stale_record.inode_id,
-            stale_record.data_version,
+            chunk_record.inode_id,
+            chunk_record.data_version,
             0,
         );
         let encoded =
-            encode_content_chunk(&stale_record, 0, &payload, &ContentCompressionPolicy::off())
-                .expect("encode stale chunk");
+            encode_content_chunk(&chunk_record, 0, &payload, &ContentCompressionPolicy::off())
+                .expect("encode retained chunk");
         let checksum = FastBlockChecksum::compute(&encoded);
-        store.put(key, &encoded).expect("write stale chunk");
+        store.put(key, &encoded).expect("write retained chunk");
         let chunk_ref = ContentChunkRef {
             chunk_index: 0,
-            data_version: stale_record.data_version,
+            data_version: chunk_record.data_version,
             len: payload.len() as u32,
             checksum,
             placement_receipt_generation: 0,
         };
+        let manifest = ContentManifestObject {
+            inode_id: current_record.inode_id,
+            data_version: current_record.data_version,
+            file_size: current_record.size,
+            chunk_size: content_chunk_size(),
+            chunks: vec![chunk_ref.clone()],
+        };
+        validate_content_manifest(current_record.inode_id, &current_record, &manifest)
+            .expect("current manifest may retain an unchanged older chunk version");
 
-        let err = read_mounted_content_scrub_block(
+        let read = read_mounted_content_scrub_block(
             &store,
             current_record.inode_id,
             &current_record,
             MountedContentScrubReadTarget::ContentChunk(&chunk_ref),
             None,
         )
-        .expect_err("stale chunk refs must fail closed");
+        .expect("scrub must follow the chunk identity bound by the current manifest");
 
-        assert!(matches!(err, FileSystemError::CorruptState { .. }));
+        assert_eq!(read.object_key, Some(key));
+        assert_eq!(read.plaintext_bytes, payload);
+        assert_eq!(read.block_id.data_version, chunk_record.data_version);
+        assert!(read.checksum_evidence.matches_expected());
     }
 
     #[test]
