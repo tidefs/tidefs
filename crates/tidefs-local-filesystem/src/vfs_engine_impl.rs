@@ -12915,13 +12915,54 @@ mod tests {
         }
 
         engine.fs.borrow_mut().sync_all().unwrap();
-        let report =
-            crate::inspect_filesystem_content_objects(dir.path(), crate::StoreOptions::default())
+        let committed_state = {
+            let mut fs = engine.fs.borrow_mut();
+            let dataset_id = DatasetId::from_bytes(fs.filesystem.mounted_dataset_id);
+            let root_authentication_key = fs.filesystem.root_authentication_key;
+            let root_bytes = fs
+                .store
+                .load_dataset_root(dataset_id, tidefs_pool_runtime::DatasetRootKind::Filesystem)
                 .unwrap();
-        assert_eq!(report.file_like_inodes, 512);
-        assert_eq!(report.referenced_objects.len(), 0);
-        assert_eq!(report.missing_objects, 0);
-        assert_eq!(report.malformed_records, 0);
+            let root = crate::encoding::decode_root_commit(&root_bytes).unwrap();
+            crate::recovery::load_state_from_transaction_pool_for_dataset(
+                fs.store.pool_mut(),
+                dataset_id,
+                &root,
+                root_authentication_key,
+            )
+            .unwrap()
+        };
+        let committed_files = committed_state
+            .inodes
+            .values()
+            .filter(|inode| inode.is_file_like())
+            .collect::<Vec<_>>();
+        assert_eq!(committed_files.len(), 512);
+        {
+            let fs = engine.fs.borrow();
+            let keyspace = fs.object_keyspace();
+            for inode in committed_files {
+                let content_key =
+                    keyspace.scope(crate::object_keys::content_object_key_for_version(
+                        inode.inode_id,
+                        inode.data_version,
+                    ));
+                assert_eq!(
+                    fs.store
+                        .pool()
+                        .placement_receipt_for_key(DeviceIoClass::Data, content_key)
+                        .unwrap(),
+                    None,
+                );
+                assert_eq!(
+                    fs.store
+                        .pool()
+                        .get(DeviceIoClass::Data, content_key)
+                        .unwrap(),
+                    None,
+                );
+            }
+        }
 
         let first_fh = first_fh.unwrap();
         assert_eq!(engine.read(&first_fh, 0, 1, &caller).unwrap(), b"");

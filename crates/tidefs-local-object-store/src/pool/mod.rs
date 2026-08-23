@@ -5915,10 +5915,7 @@ impl Pool {
         let mut receipts: BTreeMap<(u64, u64), PlacementReceipt> = BTreeMap::new();
 
         for &idx in indices {
-            for (candidate_key, raw) in self.devices[idx].placement_receipt_candidates()? {
-                if candidate_key != receipt_key {
-                    continue;
-                }
+            for raw in self.devices[idx].placement_receipt_candidates_for_key(receipt_key)? {
                 let receipt = PlacementReceipt::decode(&raw).ok_or(StoreError::InvalidOptions {
                     reason: "strict read found a corrupt or unverifiable placement receipt",
                 })?;
@@ -6037,12 +6034,7 @@ impl Pool {
                         "placement receipt publication verification found a non-identical receipt copy",
                 });
             }
-            let physical = self.devices[idx]
-                .placement_receipt_candidates()?
-                .into_iter()
-                .filter(|(key, _)| *key == receipt_key)
-                .map(|(_, payload)| payload)
-                .collect::<Vec<_>>();
+            let physical = self.devices[idx].placement_receipt_candidates_for_key(receipt_key)?;
             if physical.is_empty() || physical.iter().any(|payload| payload != &encoded) {
                 return Err(StoreError::InvalidOptions {
                     reason: "placement receipt publication did not converge across physical copies",
@@ -14949,8 +14941,8 @@ mod tests {
     }
 
     #[test]
-    fn strict_read_classifies_receipt_scan_io_as_object_authority_failure() {
-        let root = temp_dir("strict-read-receipt-scan-io");
+    fn strict_read_classifies_replicated_target_io_as_object_authority_failure() {
+        let root = temp_dir("strict-read-replicated-target-io");
         let _ = std::fs::remove_dir_all(&root);
         let mut pool = Pool::create(
             single_mirror_device_config(&root),
@@ -14964,14 +14956,17 @@ mod tests {
         pool.devices[0].set_fail_next_read(true);
         let error = pool
             .get_with_current_receipt(IoClass::Data, key)
-            .expect_err("receipt-copy read I/O must invalidate this object's strict authority");
+            .expect_err("replicated-target read I/O must invalidate this object's authority");
         assert!(is_strict_read_authority_error(&error));
-        assert!(matches!(
-            error,
-            StoreError::InvalidOptions {
-                reason: "strict read could not inspect every placement receipt copy"
-            }
-        ));
+        assert!(
+            matches!(
+                error,
+                StoreError::InvalidOptions {
+                    reason: "strict read could not read every replicated placement target"
+                }
+            ),
+            "unexpected strict-read fault classification: {error:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -23214,12 +23209,8 @@ mod tests {
                 "visible receipt differs on carrier {index}"
             );
             let physical = pool.devices[index]
-                .placement_receipt_candidates()
-                .expect("scan physical repair receipt copies")
-                .into_iter()
-                .filter(|(key, _)| *key == receipt_key)
-                .map(|(_, payload)| payload)
-                .collect::<Vec<_>>();
+                .placement_receipt_candidates_for_key(receipt_key)
+                .expect("read exact physical repair receipt copies");
             assert!(
                 !physical.is_empty(),
                 "carrier {index} must retain a physical receipt copy"
