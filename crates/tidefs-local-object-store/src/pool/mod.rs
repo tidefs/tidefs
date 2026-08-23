@@ -3215,6 +3215,20 @@ impl PoolLabelCopy {
     }
 }
 
+fn written_pool_label_features_compat(features_compat: u64, has_lifecycle: bool) -> u64 {
+    let mut written = features_compat
+        | features::DEVICE_HEALTH_STATE
+        | features::POOL_REDUNDANCY_POLICY
+        | features::DEVICE_LAYOUT_V1
+        | features::TOPOLOGY_ROSTER_V1;
+    if has_lifecycle {
+        written |= features::POOL_LIFECYCLE_V1;
+    } else {
+        written &= !features::POOL_LIFECYCLE_V1;
+    }
+    written
+}
+
 fn pool_state_transition_rank(state: PoolState) -> u8 {
     match state {
         PoolState::Destroyed => 2,
@@ -4845,6 +4859,10 @@ impl Pool {
                 let mut expected_copy = copy.clone();
                 expected_copy.label = upgraded_label.clone();
                 expected_copy.topology_roster = Some(self.device_guids.clone());
+                expected_copy.label.features_compat = written_pool_label_features_compat(
+                    expected_copy.label.features_compat,
+                    expected_copy.lifecycle.is_some(),
+                );
                 let write = if copy.topology_roster.is_some()
                     && copy.label.topology_generation == self.placement_epoch
                 {
@@ -5128,13 +5146,10 @@ impl Pool {
                 &self.devices[device_index],
                 PoolState::Active,
             );
-            let sealed_features_compat =
-                expected.features_compat | features::POOL_REDUNDANCY_POLICY;
-            let expected_features_compat = if expected_lifecycle.is_some() {
-                sealed_features_compat | features::POOL_LIFECYCLE_V1
-            } else {
-                sealed_features_compat & !features::POOL_LIFECYCLE_V1
-            };
+            let expected_features_compat = written_pool_label_features_compat(
+                expected.features_compat,
+                expected_lifecycle.is_some(),
+            );
             let matching = read_pool_label_copies(config)?
                 .into_iter()
                 .filter(|copy| {
