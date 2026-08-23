@@ -27,6 +27,92 @@ use crate::object_keys::{
 use crate::records::ContentLayout;
 use crate::types::*;
 use crate::{FileSystemState, Result};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AuthenticatedContentIdentity {
+    inode_id: InodeId,
+    size: u64,
+    data_version: u64,
+}
+
+impl From<&InodeRecord> for AuthenticatedContentIdentity {
+    fn from(record: &InodeRecord) -> Self {
+        Self {
+            inode_id: record.inode_id,
+            size: record.size,
+            data_version: record.data_version,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AuthenticatedInodeAllocation {
+    identity: AuthenticatedContentIdentity,
+    entries: BTreeMap<ObjectKey, u64>,
+}
+
+/// Mount-local allocation maps already authenticated through current Pool
+/// receipt authority.
+///
+/// Capacity planning keys live entries by the complete content identity, not
+/// metadata generation, so unrelated chmod/link/timestamp changes do not make
+/// the filesystem reread payloads. A size or data-version change is a cache
+/// miss and must pass the normal Pool-backed layout and chunk reads before its
+/// entries can be reused. Retained-root entries are reusable only for the
+/// exact ordered root set that was authenticated.
+#[derive(Debug, Default)]
+pub(crate) struct AuthenticatedContentAllocationCache {
+    live_inodes: BTreeMap<InodeId, AuthenticatedInodeAllocation>,
+    retained_roots: Option<Vec<CommittedRootSummary>>,
+    retained_entries: BTreeMap<ObjectKey, u64>,
+}
+
+impl AuthenticatedContentAllocationCache {
+    pub(crate) fn live_entries(&self, record: &InodeRecord) -> Option<&BTreeMap<ObjectKey, u64>> {
+        let cached = self.live_inodes.get(&record.inode_id)?;
+        (cached.identity == AuthenticatedContentIdentity::from(record)).then_some(&cached.entries)
+    }
+
+    pub(crate) fn record_live_entries(
+        &mut self,
+        record: &InodeRecord,
+        entries: BTreeMap<ObjectKey, u64>,
+    ) {
+        self.live_inodes.insert(
+            record.inode_id,
+            AuthenticatedInodeAllocation {
+                identity: AuthenticatedContentIdentity::from(record),
+                entries,
+            },
+        );
+    }
+
+    pub(crate) fn retain_live_inodes(&mut self, live_inodes: &std::collections::BTreeSet<InodeId>) {
+        self.live_inodes
+            .retain(|inode_id, _| live_inodes.contains(inode_id));
+    }
+
+    pub(crate) fn retained_entries(
+        &self,
+        retained_roots: &[CommittedRootSummary],
+    ) -> Option<&BTreeMap<ObjectKey, u64>> {
+        (self.retained_roots.as_deref() == Some(retained_roots)).then_some(&self.retained_entries)
+    }
+
+    pub(crate) fn record_retained_entries(
+        &mut self,
+        retained_roots: Vec<CommittedRootSummary>,
+        entries: BTreeMap<ObjectKey, u64>,
+    ) {
+        self.retained_roots = Some(retained_roots);
+        self.retained_entries = entries;
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        *self = Self::default();
+    }
+}
+
 pub(crate) fn content_allocation_entries_for_state_pool(
     pool: &Pool,
     state: &FileSystemState,
@@ -1240,6 +1326,44 @@ mod tests {
             subtree_rev: 0,
             rdev: 0,
         }
+    }
+
+    #[test]
+    fn authenticated_allocation_cache_reuses_only_exact_content_identity() {
+        let record = test_record(42, 7, 123);
+        let key = content_object_key_for_version(record.inode_id, record.data_version);
+        let entries = BTreeMap::from([(key, u64::from(content_chunk_size()))]);
+        let mut cache = AuthenticatedContentAllocationCache::default();
+
+        assert!(cache.retained_entries(&[]).is_none());
+        cache.record_retained_entries(Vec::new(), BTreeMap::new());
+        assert_eq!(cache.retained_entries(&[]), Some(&BTreeMap::new()));
+
+        cache.record_live_entries(&record, entries.clone());
+        assert_eq!(cache.live_entries(&record), Some(&entries));
+
+        let mut metadata_only_change = record.clone();
+        metadata_only_change.metadata_version += 1;
+        metadata_only_change.nlink += 1;
+        assert_eq!(
+            cache.live_entries(&metadata_only_change),
+            Some(&entries),
+            "metadata-only changes must not reread unchanged payloads"
+        );
+
+        let mut changed_content = record.clone();
+        changed_content.data_version += 1;
+        assert!(cache.live_entries(&changed_content).is_none());
+        changed_content = record.clone();
+        changed_content.size += 1;
+        assert!(cache.live_entries(&changed_content).is_none());
+
+        cache.retain_live_inodes(&std::collections::BTreeSet::new());
+        assert!(cache.live_entries(&record).is_none());
+        cache.record_live_entries(&record, entries);
+        cache.invalidate();
+        assert!(cache.live_entries(&record).is_none());
+        assert!(cache.retained_entries(&[]).is_none());
     }
 
     fn receipted_chunk(
