@@ -246,6 +246,11 @@ impl VfsLocalFileSystem {
     }
 
     #[inline]
+    fn automatic_read_timestamp_admitted(&self) -> bool {
+        !self.read_only && self.ensure_writable().is_ok()
+    }
+
+    #[inline]
     fn ensure_mounted_mutation_allowed(
         &self,
         operation: &'static str,
@@ -4515,7 +4520,7 @@ impl PoolDatasetOwner {
         &self,
         operation: &'static str,
     ) -> crate::Result<DeviceLifecycleRootAuthority> {
-        if let Some(reason) = self.mounted_repair_quiescence_failure() {
+        if let Some(reason) = self.mounted_mutation_quiescence_failure() {
             return Err(FileSystemError::Unsupported { operation, reason });
         }
         let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
@@ -6485,7 +6490,7 @@ impl VfsLocalFileSystem {
                 return Err(errno);
             }
         };
-        if record_access {
+        if record_access && self.automatic_read_timestamp_admitted() {
             let _ = self.fs.borrow_mut().apply_deferred_timestamp_update(
                 fh.inode_id,
                 TimestampUpdate::Read,
@@ -7269,7 +7274,7 @@ impl VfsEngine for VfsLocalFileSystem {
         inode: InodeId,
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
-        if self.read_only {
+        if !self.automatic_read_timestamp_admitted() {
             return Ok(());
         }
         self.fs
@@ -10095,11 +10100,46 @@ mod tests {
                 .expect("read unchanged mounted bytes after refused write"),
             payload
         );
+        assert_eq!(
+            engine.fs.borrow().mounted_mutation_quiescence_failure(),
+            None,
+            "offline read and refused mutations must leave a clean exportable owner"
+        );
 
         let status = live_device_admin(&engine, "status", json!({}), true);
         assert_eq!(status["ok"], true, "status response: {status}");
         assert_eq!(status["json"]["members"][0]["device_guid"], target_guid_hex);
         assert_eq!(status["json"]["members"][0]["operational_state"], "Offline");
+
+        let mut filesystem = engine.into_inner();
+        filesystem
+            .close_mounted()
+            .expect("clean offline owner closes without manufacturing a write");
+        drop(filesystem);
+        let filesystem = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &devices,
+            "live-device-offline",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("reopen clean offline owner");
+        let engine = VfsLocalFileSystem::new(filesystem);
+        let persisted = live_device_admin(&engine, "status", json!({}), true);
+        assert_eq!(
+            persisted["ok"], true,
+            "reopened status response: {persisted}"
+        );
+        assert_eq!(
+            persisted["json"]["members"][0]["device_guid"],
+            target_guid_hex
+        );
+        assert_eq!(
+            persisted["json"]["members"][0]["operational_state"],
+            "Offline"
+        );
 
         let online = live_device_admin(
             &engine,
@@ -23741,7 +23781,7 @@ impl SharedPoolDatasetOwner {
                 LivePoolRepairProgress::default(),
             );
         }
-        if let Some(reason) = fs.mounted_repair_quiescence_failure() {
+        if let Some(reason) = fs.mounted_mutation_quiescence_failure() {
             return live_pool_repair_failure(
                 pool,
                 wants_json,
@@ -24463,7 +24503,7 @@ impl PoolDatasetOwner {
         evidence: tidefs_local_object_store::pool::ReplicatedRepairReconciliationEvidence,
     ) -> std::result::Result<MountedRepairReconciliationOutcome, MountedRepairReconciliationFailure>
     {
-        if let Some(reason) = self.mounted_repair_quiescence_failure() {
+        if let Some(reason) = self.mounted_mutation_quiescence_failure() {
             return Err(MountedRepairReconciliationFailure::new(
                 "mounted-state-not-quiescent",
                 format!("repair reconciliation requires clean quiescent state: {reason}"),
@@ -24728,7 +24768,7 @@ impl PoolDatasetOwner {
                 reason: "pending replicated repair reconciliation batch is empty",
             });
         }
-        if let Some(reason) = self.mounted_repair_quiescence_failure() {
+        if let Some(reason) = self.mounted_mutation_quiescence_failure() {
             return Err(crate::FileSystemError::CorruptState { reason });
         }
 

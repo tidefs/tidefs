@@ -3891,8 +3891,10 @@ impl PoolDatasetOwner {
     ///
     /// The mounted carrier calls this after it has stopped admitting work and
     /// joined the FUSE session, but before it exports Pool labels.  A successful
-    /// close commits and syncs writable state, then fences this in-process owner
-    /// so neither a stale carrier handle nor [`Drop`] can publish after export.
+    /// close commits and syncs pending writable state, or only syncs the devices
+    /// when the mounted owner is already mutation-quiescent. It then fences this
+    /// in-process owner so neither a stale carrier handle nor [`Drop`] can publish
+    /// after export.
     /// On failure the same fence forces recovery through a fresh reopen instead
     /// of giving the destructor an unreportable second publication attempt.
     pub fn close_mounted(&mut self) -> Result<()> {
@@ -3903,7 +3905,14 @@ impl PoolDatasetOwner {
         }
 
         let result = if self.filesystem.recovery_policy.allows_any_mutation() {
-            self.fsync_all()
+            if self.mounted_mutation_quiescence_failure().is_none() {
+                self.store
+                    .pool_mut()
+                    .sync_all()
+                    .map_err(FileSystemError::from)
+            } else {
+                self.fsync_all()
+            }
         } else {
             Ok(())
         };
@@ -14942,14 +14951,12 @@ impl PoolDatasetOwner {
             || !self.filesystem.state.dirty_dirs.is_empty()
     }
 
-    /// Return why mounted replica repair cannot begin from read-only state.
+    /// Return why the mounted owner cannot be treated as mutation-quiescent.
     ///
-    /// Repair must not flush or otherwise commit unrelated mounted mutations
-    /// merely to manufacture a stable comparison point.  The live owner holds
-    /// the operation lock while checking this state, so an accepted repair can
-    /// keep the same quiescent authority through its final pre-write
-    /// revalidation.
-    pub(crate) fn mounted_repair_quiescence_failure(&self) -> Option<&'static str> {
+    /// A clean shutdown may sync the devices without manufacturing a new
+    /// filesystem commit. Repair uses the same boundary so it cannot flush
+    /// unrelated mutations merely to manufacture a stable comparison point.
+    pub(crate) fn mounted_mutation_quiescence_failure(&self) -> Option<&'static str> {
         if self.is_state_dirty() {
             return Some("mounted filesystem state is dirty");
         }
