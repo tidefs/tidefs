@@ -5,11 +5,11 @@
 //! ## Media authority
 //!
 //! Device status routes to the live owner before this module opens any store.
-//! Device removal and replacement route only to the reachable mounted pool
-//! owner, which owns receipt-backed evacuation/rebuild and durable
-//! topology-label publication. Retired directory object-store
-//! evacuation/rebuild arguments fail closed instead of acting as operator pool
-//! media.
+//! Device removal, present-member replacement, and missing-member rebuild route
+//! only to the reachable mounted pool owner, which owns receipt-backed
+//! evacuation/rebuild and durable topology-label publication. Retired directory
+//! object-store evacuation arguments fail closed instead of acting as operator
+//! pool media.
 
 use std::path::PathBuf;
 
@@ -79,26 +79,23 @@ pub enum DeviceCommand {
         #[arg(long = "json")]
         json: bool,
     },
-    /// Retired directory object-store device rebuild mode.
-    #[command(hide = true)]
+    /// Rebuild one exact absent member through a recovery-only mounted owner.
+    ///
+    /// The Pool must already be mounted with `--read-only --rebuild-only` from
+    /// its one surviving member. The mounted namespace remains read-only.
     Rebuild {
-        /// Retired directory object-store survivor mode.
-        #[arg(
-            short = 'S',
-            long = "surviving-dir",
-            hide = true,
-            value_parser = crate::commands::reject_directory_pool_media_value
-        )]
-        surviving_dir: std::path::PathBuf,
+        /// Pool whose recovery-only mounted owner has rebuild authority.
+        pool_name: String,
 
-        /// Retired directory object-store replacement mode.
-        #[arg(
-            short = 'r',
-            long = "replacement-dir",
-            hide = true,
-            value_parser = crate::commands::reject_directory_pool_media_value
-        )]
-        replacement_dir: std::path::PathBuf,
+        /// Exact durable GUID of the absent member (32 hexadecimal digits).
+        missing_device_guid: String,
+
+        /// Distinct blank replacement device path.
+        new_device_path: std::path::PathBuf,
+
+        /// Output the typed rebuild result or refusal as JSON.
+        #[arg(long = "json")]
+        json: bool,
     },
 }
 
@@ -157,29 +154,32 @@ pub fn handle_device(cmd: DeviceCommand) {
         }
 
         DeviceCommand::Rebuild {
-            surviving_dir,
-            replacement_dir,
+            pool_name,
+            missing_device_guid,
+            new_device_path,
+            json,
         } => {
-            if let Err(e) = handle_rebuild(&surviving_dir, &replacement_dir) {
-                eprintln!("tidefsctl device rebuild: {e}");
-                std::process::exit(1);
-            }
+            let _guard = super::authz::require_local_only("device rebuild");
+            super::live_owner::route_with_format_and_args(
+                "device",
+                "rebuild",
+                &pool_name,
+                json,
+                super::live_owner::live_admin_args([
+                    (
+                        "missing_device_guid",
+                        tidefs_vfs_engine::LivePoolAdminArg::String(missing_device_guid),
+                    ),
+                    (
+                        "new_device_path",
+                        tidefs_vfs_engine::LivePoolAdminArg::String(
+                            new_device_path.display().to_string(),
+                        ),
+                    ),
+                ]),
+            );
         }
     }
-}
-
-fn handle_rebuild(
-    surviving_dir: &std::path::PathBuf,
-    replacement_dir: &std::path::PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
-    Err(format!(
-        "offline directory object-store device rebuild is retired \
-         (surviving={}, replacement={}); use live pool repair/rebuild authority \
-         over block devices or explicit regular-file development devices",
-        surviving_dir.display(),
-        replacement_dir.display()
-    )
-    .into())
 }
 
 fn handle_remove(
@@ -316,26 +316,6 @@ mod tests {
             msg.contains("requires a reachable live owner")
                 && msg.contains("no device state was changed"),
             "retired mode must report the shared no-mutation boundary: {msg}"
-        );
-    }
-
-    #[test]
-    fn rebuild_command_fails_closed_before_store_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let surviving_dir = dir.path().join("surviving-missing");
-        let replacement_dir = dir.path().join("replacement-missing");
-
-        let result = handle_rebuild(&surviving_dir, &replacement_dir);
-
-        assert!(result.is_err(), "offline rebuild must fail closed");
-        assert!(
-            !surviving_dir.exists() && !replacement_dir.exists(),
-            "retired rebuild must not create directory-backed stores"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("offline directory object-store device rebuild is retired"),
-            "unexpected error: {msg}"
         );
     }
 }

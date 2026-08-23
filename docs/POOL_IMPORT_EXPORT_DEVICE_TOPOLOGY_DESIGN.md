@@ -32,8 +32,9 @@ The current source-backed pool import/export boundary is:
 - `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` and `recovery.rs`:
   mounted-owner receipt reconciliation, authenticated-root refresh, and
   label-intent-bound interrupted lifecycle recovery.
-- `apps/tidefsctl/src/commands/device.rs`: live-owner-only local removal and
-  replacement routing with truthful operator projection.
+- `apps/tidefsctl/src/commands/device.rs`: live-owner-only local removal,
+  present-member replacement, and recovery-only missing-member rebuild routing
+  with truthful operator projection.
 
 This document does not supersede source. If source and this summary disagree,
 source plus focused validation wins and this file must be corrected.
@@ -55,8 +56,10 @@ cluster membership.
 
 The mounted local Pool projects this authority to live-owner `pool status` as
 health, read-only/read-write access, expected/present/missing counts, and an
-indexed GUID/presence list. This boundary adds truthful read-only degraded
-status only; it does not authorize writable degraded import or rebuild.
+indexed GUID/presence list. Ordinary read-only degraded import remains
+side-effect-free. Only the explicit `--read-only --rebuild-only` owner may arm
+the exact scoped rebuild below; no path authorizes general writable degraded
+import.
 
 ## Durable Device-Lifecycle Authority
 
@@ -203,13 +206,63 @@ sanitization, or decommissioning. Absent or unreadable old members, writable
 degraded replacement, erasure coding, filesystem dataset clones, simultaneous
 multi-mounted filesystem atomicity, and hot-spare policy remain separate work.
 
+## Mounted Missing-Member Rebuild Boundary
+
+The bounded missing-member path belongs to an explicitly recovery-only local
+mounted owner. It admits exactly one surviving member of an exact two-member
+`Replicated { copies: 2 }` byte-addressable Pool through `pool mount
+--read-only --rebuild-only --devices <survivor>`. The FUSE namespace,
+ordinary recovery, timestamps, writeback, background work, reclaim, and every
+ordinary VFS mutation remain read-only. Cluster ownership, snapshot mounts,
+and broader mutation or fault tuning are refused. `device rebuild` is the one
+typed local-only command routed to that live owner.
+
+The request names the full missing GUID from the durable ordered roster and a
+distinct blank same-backing candidate at least as large as the survivor. The
+owner refuses wrong GUIDs, complete or non-two-copy topology, candidate
+identity/capacity/backing mismatch, missing or corrupt survivor receipts or
+payloads, unresolved lifecycle state, and any ordinary read-only owner before
+unauthorized candidate mutation. Before candidate initialization, redundant
+versioned checksummed lifecycle evidence binds the Pool GUID, missing
+index/GUID, new GUID and path, predecessor and successor topology generations,
+subject inventory and progress, and terminal state. Paths remain descriptive
+runtime locators; GUID/index label authority selects the lifecycle.
+
+With a scoped Pool mutation capability armed only for the command, every
+current receipt that named the absent member must have one authenticated clean
+survivor target with matching length, digest, and payload. The Pool publishes
+a higher two-target receipt to survivor plus replacement. The mounted owner
+then applies the same authenticated preflight, copy-on-write content-manifest
+reconciliation, durable predecessor queueing, independent-filesystem and
+snapshot-table typed-root publication, Pool-runtime volume-graph preservation,
+and complete mounted-root-ring rotation used by present-member lifecycle.
+Only after those roots are durable may Pool authority publish and reread both
+same-cardinality label families with the fresh replacement GUID at the missing
+member's durable index and commit terminal evidence.
+
+Reopen restores evidence from the selected label family before receipt
+recovery. An interruption before candidate or receipt publication resumes the
+same new GUID and candidate locator; an interruption during mounted root
+reconciliation accepts only authenticated predecessor/successor root
+transitions; and an interruption after successor topology publication binds
+the operator's original missing GUID to the exact new GUID/index transition
+until terminal evidence commits. No host marker file or runtime directory is
+recovery authority. Success allows a normal writable reopen from survivor plus
+replacement while the recovery owner itself remains read-only.
+
+This row does not recover data missing or corrupt on the survivor, admit
+general writable degraded operation, rebuild erasure-coded or clustered
+placement, activate hot spares, support simultaneous multi-mounted owners,
+establish media-remanence or decommissioning guarantees, make a mode
+support-admitted, or make TideFS production-ready.
+
 ## Authority Limits
 
 This file is not product-readiness evidence for hot spares, general evacuation,
 cluster-aware pool ownership, arbitrary online topology conversion, hardware
 failure survival, availability, operational safety, or incumbent comparison
-claims. The mounted sections describe only the exact present-member,
-single-filesystem local boundaries above.
+claims. The mounted sections describe only the exact local present-member and
+one-missing-member boundaries above.
 Those scopes require current source evidence, runtime validation, and claim IDs
 where they become publishing-facing claims.
 

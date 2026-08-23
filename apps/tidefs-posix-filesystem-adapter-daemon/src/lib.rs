@@ -276,6 +276,9 @@ pub struct MountConfig {
     /// Mount the live filesystem through read-only storage, recovery, VFS,
     /// adapter, and kernel FUSE authorities.
     pub read_only: bool,
+    /// Open exactly one surviving two-copy Pool member with only the scoped
+    /// missing-member rebuild capability. The namespace remains read-only.
+    pub rebuild_only: bool,
     /// Enable FUSE writeback cache for mmap support.
     /// When true, FUSE_WRITE_CACHE flagged writes are accepted and
     /// the kernel page cache is used for buffered writes, enabling
@@ -503,7 +506,7 @@ struct EffectiveMountMode {
 }
 
 fn effective_mount_mode(config: &MountConfig) -> EffectiveMountMode {
-    let read_only = config.read_only || config.snapshot_name.is_some();
+    let read_only = config.read_only || config.rebuild_only || config.snapshot_name.is_some();
     EffectiveMountMode {
         read_only,
         writeback_cache: config.writeback_cache && !read_only,
@@ -513,6 +516,49 @@ fn effective_mount_mode(config: &MountConfig) -> EffectiveMountMode {
             config.runtime.background_scrub_interval_secs
         },
     }
+}
+
+fn validate_rebuild_only_config(config: &MountConfig) -> Result<(), String> {
+    if !config.rebuild_only {
+        return Ok(());
+    }
+    if !config.read_only {
+        return Err("rebuild-only mount requires explicit read-only mode".to_string());
+    }
+    if config.snapshot_name.is_some() {
+        return Err("rebuild-only mount does not support snapshot export".to_string());
+    }
+    if config.mount_authority.is_cluster_authorized() {
+        return Err("rebuild-only mount refuses cluster authority".to_string());
+    }
+    if config.block_devices.as_deref().map(<[_]>::len) != Some(1) {
+        return Err(
+            "rebuild-only mount requires exactly one explicit surviving Pool member".to_string(),
+        );
+    }
+    let runtime_defaults = MountRuntimeOptions::default();
+    if config.writeback_cache
+        || config.runtime.mount_options != runtime_defaults.mount_options
+        || config.runtime.sync_guarantee != runtime_defaults.sync_guarantee
+        || config.runtime.content_capacity_bytes != runtime_defaults.content_capacity_bytes
+        || config.runtime.writeback_cache_timeout_secs
+            != runtime_defaults.writeback_cache_timeout_secs
+        || config.runtime.background_scrub_interval_secs != 0
+        || config.runtime.compression.is_some()
+        || config.encryption.is_some()
+        || config.runtime.enable_dedup
+        || config.runtime.enable_reclaim
+        || config.runtime.enable_repair_writeback
+        || config.runtime.fault_inject_corruption.is_some()
+        || config.runtime.queue_depth_artifact.is_some()
+        || config.coherency_profile != crate::coherency_profile::CoherencyProfile::default()
+    {
+        return Err(
+            "rebuild-only mount refuses writeback, mount-option, capacity, transform, background mutation, repair writeback, reclaim, dedup, fault-injection, and validation-artifact tuning"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cluster")]
@@ -541,6 +587,7 @@ mod effective_mount_mode_tests {
             foreground: true,
             debug: false,
             read_only,
+            rebuild_only: false,
             writeback_cache,
             coherency_profile: crate::coherency_profile::CoherencyProfile::Writeback,
             block_devices: None,
@@ -588,6 +635,58 @@ mod effective_mount_mode_tests {
                 background_scrub_interval_secs: 0,
             }
         );
+    }
+
+    #[test]
+    fn rebuild_only_mode_keeps_namespace_and_background_work_read_only() {
+        let mut config = config(true, None, false);
+        config.rebuild_only = true;
+        config.block_devices = Some(vec![PathBuf::from("/dev/survivor")]);
+
+        assert!(validate_rebuild_only_config(&config).is_ok());
+        assert_eq!(
+            effective_mount_mode(&config),
+            EffectiveMountMode {
+                read_only: true,
+                writeback_cache: false,
+                background_scrub_interval_secs: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rebuild_only_mode_refuses_broader_mutation_tuning() {
+        let mut config = config(false, None, false);
+        config.rebuild_only = true;
+        config.block_devices = Some(vec![PathBuf::from("/dev/survivor")]);
+        assert!(validate_rebuild_only_config(&config)
+            .unwrap_err()
+            .contains("explicit read-only"));
+
+        config.read_only = true;
+        config.runtime.enable_reclaim = true;
+        assert!(validate_rebuild_only_config(&config)
+            .unwrap_err()
+            .contains("refuses writeback"));
+
+        config.runtime.enable_reclaim = false;
+        config.runtime.content_capacity_bytes = config
+            .runtime
+            .content_capacity_bytes
+            .checked_add(1)
+            .unwrap();
+        assert!(validate_rebuild_only_config(&config)
+            .unwrap_err()
+            .contains("capacity"));
+
+        config.runtime.content_capacity_bytes =
+            MountRuntimeOptions::default().content_capacity_bytes;
+        config.encryption = Some(tidefs_local_object_store::encrypt::EncryptionConfig::new(
+            tidefs_local_object_store::encrypt::StoreEncryptionKey::generate(),
+        ));
+        assert!(validate_rebuild_only_config(&config)
+            .unwrap_err()
+            .contains("transform"));
     }
 
     #[test]
@@ -1478,6 +1577,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
 
     let snapshot_export = config.snapshot_name.is_some();
     let effective_mode = effective_mount_mode(config);
+    validate_rebuild_only_config(config)?;
     if snapshot_export && config.mount_authority.is_cluster_authorized() {
         return Err(
             "snapshot export mount is not supported with cluster mount authority".to_string(),
@@ -1575,7 +1675,9 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         if config.encryption.is_some() {
             eprintln!("tidefsctl: encryption enabled (key fingerprint not logged)");
         }
-        let recovery_policy = if effective_mode.read_only {
+        let recovery_policy = if config.rebuild_only {
+            RecoveryPolicy::DeviceRebuildOnly
+        } else if effective_mode.read_only {
             RecoveryPolicy::ReadOnly
         } else if config.runtime.enable_repair_writeback {
             RecoveryPolicy::RepairWriteback
@@ -1912,6 +2014,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                     mountpoint: config.mountpoint.clone(),
                     runtime_dir,
                     read_only: effective_mode.read_only,
+                    rebuild_only: config.rebuild_only,
                 };
                 let owner = match live_owner::start_fuse_owner(
                     owner_config,

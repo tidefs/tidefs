@@ -1347,7 +1347,8 @@ impl VfsLocalFileSystem {
             | LivePoolAdminCommand::SnapshotList
             | LivePoolAdminCommand::DeviceStatus
             | LivePoolAdminCommand::DeviceRemove
-            | LivePoolAdminCommand::DeviceReplace => false,
+            | LivePoolAdminCommand::DeviceReplace
+            | LivePoolAdminCommand::DeviceRebuild => false,
         }
     }
 
@@ -3503,6 +3504,7 @@ impl SharedPoolDatasetOwner {
             LivePoolAdminCommand::DeviceStatus => self.live_device_status(wants_json),
             LivePoolAdminCommand::DeviceRemove => self.live_device_remove(&args, wants_json),
             LivePoolAdminCommand::DeviceReplace => self.live_device_replace(&args, wants_json),
+            LivePoolAdminCommand::DeviceRebuild => self.live_device_rebuild(&args, wants_json),
             command => {
                 let (command_name, operation) = command.parts();
                 live_admin_typed_error(LivePoolAdminError::unsupported_command(
@@ -3775,6 +3777,229 @@ impl SharedPoolDatasetOwner {
                     "secure_erase_claimed": false,
                     "sanitization_claimed": false,
                     "decommissioning_claimed": false,
+                    "message": message,
+                })
+                .to_string(),
+            )
+        } else {
+            live_admin_ok_text(message)
+        }
+    }
+
+    fn live_device_rebuild(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
+        let missing_device_guid =
+            match live_admin_arg(args, "missing_device_guid").and_then(live_admin_exact_guid) {
+                Ok(value) => value,
+                Err(err) => return live_admin_error(2, format!("device rebuild: {err}")),
+            };
+        let new_device_path = match live_admin_arg(args, "new_device_path") {
+            Ok(value) => std::path::PathBuf::from(value),
+            Err(err) => return live_admin_error(2, format!("device rebuild: {err}")),
+        };
+        let missing_guid_hex = live_admin_hex_encode(&missing_device_guid);
+        let refusal = |exit_code: i32,
+                       message: String,
+                       evidence: Option<
+            tidefs_local_object_store::pool::DeviceReplacementResult,
+        >| {
+            if wants_json {
+                return LivePoolAdminResponse::error_machine_json(
+                    exit_code,
+                    message.clone(),
+                    json!({
+                        "status": "refused",
+                        "recovery_mode": "device-rebuild-only",
+                        "namespace_read_only": true,
+                        "missing_device_guid": missing_guid_hex,
+                        "new_device_path": new_device_path.display().to_string(),
+                        "durable_device_index": evidence.as_ref().map(|result| result.device_index),
+                        "new_device_guid": evidence.as_ref().map(|result| live_admin_hex_encode(&result.new_device_guid)),
+                        "objects_total": evidence.as_ref().map(|result| result.objects_total),
+                        "objects_rebuilt": evidence.as_ref().map(|result| result.objects_rebuilt),
+                        "objects_failed": evidence.as_ref().map(|result| result.objects_failed),
+                        "verified_receipt_count": evidence.as_ref().map(|result| result.verified_receipt_count),
+                        "bytes_rebuilt": evidence.as_ref().map(|result| result.bytes_rebuilt),
+                        "topology_generation": evidence.as_ref().map(|result| result.topology_generation),
+                        "topology_committed": false,
+                        "message": message,
+                    })
+                    .to_string(),
+                );
+            }
+            let evidence = evidence.as_ref();
+            live_admin_error(
+                exit_code,
+                format!(
+                    "{message} (recovery_mode=device-rebuild-only, missing_device_guid={missing_guid_hex}, new_device_path='{}', durable_device_index={}, new_device_guid={}, objects_total={}, objects_rebuilt={}, objects_failed={}, verified_receipts={}, bytes_rebuilt={}, topology_generation={}, topology_committed=false, namespace_read_only=true)",
+                    new_device_path.display(),
+                    evidence
+                        .map(|result| result.device_index.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    evidence
+                        .map(|result| live_admin_hex_encode(&result.new_device_guid))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    evidence
+                        .map(|result| result.objects_total.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    evidence
+                        .map(|result| result.objects_rebuilt.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    evidence
+                        .map(|result| result.objects_failed.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    evidence
+                        .map(|result| result.verified_receipt_count.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    evidence
+                        .map(|result| result.bytes_rebuilt.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    evidence
+                        .map(|result| result.topology_generation.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+            )
+        };
+
+        {
+            let fs = self.borrow();
+            if !fs.filesystem.recovery_policy.allows_device_rebuild()
+                || !fs.store.pool().is_read_only()
+            {
+                return refusal(
+                    1,
+                    "device rebuild: command requires an explicit --read-only --rebuild-only mounted owner"
+                        .to_string(),
+                    fs.store.pool().device_replacement_result(),
+                );
+            }
+            let topology = fs.store.pool().topology_status();
+            let exact_missing_member = topology
+                .members
+                .iter()
+                .any(|member| !member.present && member.device_guid == missing_device_guid);
+            // A crash can leave the successor roster durable while the
+            // terminal lifecycle record is still pending. In that state the
+            // roster names the new GUID, but the retry remains bound to the
+            // operator's original missing GUID through the exact label
+            // evidence. Admit only that one old/new/index transition.
+            let successor_topology_resume = fs
+                .store
+                .pool()
+                .device_replacement_result()
+                .is_some_and(|evidence| {
+                    !evidence.old_member_present
+                        && !evidence.complete
+                        && evidence.old_device_guid == missing_device_guid
+                        && topology.members.iter().any(|member| {
+                            !member.present
+                                && member.device_index as usize == evidence.device_index
+                                && member.device_guid == evidence.new_device_guid
+                        })
+                });
+            if topology.expected_members != 2
+                || topology.present_members != 1
+                || topology.missing_members != 1
+                || (!exact_missing_member && !successor_topology_resume)
+            {
+                return refusal(
+                    1,
+                    format!(
+                        "device rebuild: GUID {missing_guid_hex} is not the one durable missing member of an exact two-member Pool"
+                    ),
+                    fs.store.pool().device_replacement_result(),
+                );
+            }
+        }
+
+        let mut fs = self.borrow_mut();
+        let result = match fs
+            .complete_mounted_missing_member_rebuild(missing_device_guid, &new_device_path)
+        {
+            Ok(result) => result,
+            Err(err) => {
+                let evidence = fs.store.pool().device_replacement_result();
+                return refusal(
+                    1,
+                    format!(
+                        "device rebuild: recovery-only mounted owner could not rebuild missing member {missing_guid_hex} onto '{}': {err}",
+                        new_device_path.display(),
+                    ),
+                    evidence,
+                );
+            }
+        };
+        if !result.complete || result.objects_failed > 0 {
+            let message = format!(
+                "device rebuild: rebuild of missing member {} at durable index {} onto '{}' ({}) remains incomplete (recovery_mode=device-rebuild-only, objects_rebuilt={}, objects_total={}, objects_failed={}, verified_receipts={}, bytes_rebuilt={}, topology_generation={}, topology_committed=false, namespace_read_only=true)",
+                missing_guid_hex,
+                result.device_index,
+                new_device_path.display(),
+                live_admin_hex_encode(&result.new_device_guid),
+                result.objects_rebuilt,
+                result.objects_total,
+                result.objects_failed,
+                result.verified_receipt_count,
+                result.bytes_rebuilt,
+                result.topology_generation,
+            );
+            return if wants_json {
+                LivePoolAdminResponse::error_machine_json(
+                    1,
+                    message.clone(),
+                    json!({
+                        "status": "incomplete",
+                        "recovery_mode": "device-rebuild-only",
+                        "namespace_read_only": true,
+                        "missing_device_guid": missing_guid_hex,
+                        "new_device_path": new_device_path.display().to_string(),
+                        "new_device_guid": live_admin_hex_encode(&result.new_device_guid),
+                        "durable_device_index": result.device_index,
+                        "objects_total": result.objects_total,
+                        "objects_rebuilt": result.objects_rebuilt,
+                        "objects_failed": result.objects_failed,
+                        "verified_receipt_count": result.verified_receipt_count,
+                        "bytes_rebuilt": result.bytes_rebuilt,
+                        "topology_generation": result.topology_generation,
+                        "topology_committed": false,
+                        "message": message,
+                    })
+                    .to_string(),
+                )
+            } else {
+                live_admin_error(1, message)
+            };
+        }
+
+        let message = format!(
+            "device rebuild: rebuilt missing member {} at durable index {} onto '{}' ({}) through the recovery-only owner after durable same-cardinality topology commit (recovery_mode=device-rebuild-only, objects_rebuilt={}, objects_total={}, objects_failed={}, verified_receipts={}, bytes_rebuilt={}, topology_generation={}, topology_committed=true, namespace_read_only=true)",
+            missing_guid_hex,
+            result.device_index,
+            new_device_path.display(),
+            live_admin_hex_encode(&result.new_device_guid),
+            result.objects_rebuilt,
+            result.objects_total,
+            result.objects_failed,
+            result.verified_receipt_count,
+            result.bytes_rebuilt,
+            result.topology_generation,
+        );
+        if wants_json {
+            LivePoolAdminResponse::ok_machine_json(
+                json!({
+                    "status": "completed",
+                    "recovery_mode": "device-rebuild-only",
+                    "namespace_read_only": true,
+                    "missing_device_guid": missing_guid_hex,
+                    "new_device_path": new_device_path.display().to_string(),
+                    "new_device_guid": live_admin_hex_encode(&result.new_device_guid),
+                    "durable_device_index": result.device_index,
+                    "objects_total": result.objects_total,
+                    "objects_rebuilt": result.objects_rebuilt,
+                    "objects_failed": result.objects_failed,
+                    "verified_receipt_count": result.verified_receipt_count,
+                    "bytes_rebuilt": result.bytes_rebuilt,
+                    "topology_generation": result.topology_generation,
+                    "topology_committed": true,
                     "message": message,
                 })
                 .to_string(),
@@ -4057,11 +4282,126 @@ impl PoolDatasetOwner {
         Ok(result)
     }
 
+    /// Rebuild one absent member through the explicitly recovery-only owner.
+    ///
+    /// Root and retained-dataset authority is authenticated before the Pool
+    /// capability is armed. The capability remains scoped to this call and is
+    /// dropped on every returned success or error; the mounted namespace and
+    /// all ordinary recovery mutation remain read-only throughout.
+    pub(crate) fn complete_mounted_missing_member_rebuild(
+        &mut self,
+        missing_device_guid: [u8; 16],
+        new_device_path: &std::path::Path,
+    ) -> crate::Result<tidefs_local_object_store::pool::DeviceReplacementResult> {
+        if !self.filesystem.recovery_policy.allows_device_rebuild()
+            || !self.store.pool().is_read_only()
+        {
+            return Err(FileSystemError::Unsupported {
+                operation: "rebuild missing mounted Pool member",
+                reason: "missing-member rebuild requires an explicit recovery-only owner",
+            });
+        }
+        let mut root_authority =
+            self.ensure_device_lifecycle_root_authority("rebuild missing mounted Pool member")?;
+        let survivor_config = self.store.pool().config().devices.first().cloned().ok_or(
+            FileSystemError::Unsupported {
+                operation: "rebuild missing mounted Pool member",
+                reason: "recovery-only Pool has no surviving member configuration",
+            },
+        )?;
+        if !matches!(
+            survivor_config.kind,
+            tidefs_local_object_store::DeviceKind::Block { .. }
+        ) {
+            return Err(FileSystemError::Unsupported {
+                operation: "rebuild missing mounted Pool member",
+                reason: "missing-member rebuild supports only byte-addressable Pool members",
+            });
+        }
+        let replacement_backing = Self::byte_addressable_device_backing(new_device_path)?;
+        if replacement_backing != survivor_config.backing {
+            return Err(FileSystemError::Unsupported {
+                operation: "rebuild missing mounted Pool member",
+                reason: "missing-member rebuild candidate backing does not match the survivor",
+            });
+        }
+        let mut replacement_config = survivor_config;
+        replacement_config.path = new_device_path.to_path_buf();
+        replacement_config.backing = replacement_backing;
+        replacement_config.kind = tidefs_local_object_store::DeviceKind::Block {
+            path: new_device_path.to_path_buf(),
+        };
+
+        self.store
+            .pool_mut()
+            .begin_missing_member_rebuild_mutation()?;
+        let outcome = (|| {
+            let preparation = self.store.pool_mut().rebuild_missing_member(
+                missing_device_guid,
+                replacement_config,
+                &tidefs_local_object_store::StoreOptions::default(),
+            );
+
+            // Evidence is deliberately durable before candidate mutation. If
+            // candidate admission failed, no successor receipt exists and the
+            // one-member Pool cannot publish roots; preserve the evidence and
+            // return the admission error without manufacturing another write.
+            if self.store.pool().config().devices.len() != 2 {
+                return preparation.map_err(FileSystemError::from);
+            }
+
+            // A candidate-backed preparation can fail after publishing a
+            // prefix of successor receipts. Reconcile every admitted root and
+            // rotate the complete fallback ring before returning that error.
+            self.reconcile_unmounted_filesystem_receipts(
+                &mut root_authority.unmounted_filesystems,
+            )?;
+            self.reconcile_mounted_snapshot_receipts(&mut root_authority.mounted_snapshots)?;
+            self.reconcile_relocated_content_receipts()?;
+            self.store.pool_mut().sync_all()?;
+            for _ in 0..crate::constants::FILESYSTEM_ROOT_SLOT_COUNT {
+                self.persist_dataset_catalog()?;
+            }
+            self.store.pool_mut().sync_all()?;
+
+            let preparation = preparation.map_err(FileSystemError::from)?;
+            if preparation.objects_failed > 0 {
+                return Ok(preparation);
+            }
+            let result = self
+                .store
+                .pool_mut()
+                .finish_missing_member_rebuild(missing_device_guid)?;
+            self.store.pool_mut().sync_all()?;
+            self.rebuild_capacity_authority_from_committed_content()?;
+            Ok(result)
+        })();
+        self.store.pool_mut().end_missing_member_rebuild_mutation();
+        outcome
+    }
+
     fn ensure_device_lifecycle_root_authority(
         &self,
         operation: &'static str,
     ) -> crate::Result<DeviceLifecycleRootAuthority> {
+        if let Some(reason) = self.mounted_repair_quiescence_failure() {
+            return Err(FileSystemError::Unsupported { operation, reason });
+        }
         let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        let (persisted_state, persisted_root) = crate::load_canonical_committed_state_for_dataset(
+            &self.store,
+            mounted_dataset_id,
+            self.root_authentication_key,
+        )?;
+        if persisted_root.generation != self.state.generation
+            || persisted_state.generation != self.state.generation
+            || persisted_root.next_inode_id != self.state.next_inode_id_raw()
+            || persisted_root.inode_count != self.state.inodes.len() as u64
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "authenticated mounted root no longer matches the quiescent live owner",
+            });
+        }
         self.ensure_snapshot_authority_consistent()?;
         let mut mounted_snapshots = Vec::new();
         for record in self
@@ -4075,12 +4415,13 @@ impl PoolDatasetOwner {
                 crate::snapshot::snapshot_record_dataset_id_for_dataset(record, mounted_dataset_id);
             let previous_typed_root = self.store.load_snapshot_root(dataset_id)?;
             let captured_root = crate::root_commit_from_summary(&record.root);
-            let captured_state = crate::load_state_from_transaction_pool_for_dataset(
-                self.store.pool(),
-                mounted_dataset_id,
-                &captured_root,
-                self.root_authentication_key,
-            )?;
+            let captured_state =
+                crate::load_state_from_transaction_pool_admitting_pending_device_lifecycle(
+                    self.store.pool(),
+                    mounted_dataset_id,
+                    &captured_root,
+                    self.root_authentication_key,
+                )?;
             mounted_snapshots.push(DeviceLifecycleSnapshotState {
                 name: record.name.clone(),
                 dataset_id,
@@ -4204,12 +4545,13 @@ impl PoolDatasetOwner {
             }
             let _ = crate::snapshot::snapshot_record_traversal_root(record)?;
             let captured_root = crate::root_commit_from_summary(&record.root);
-            let captured_state = crate::load_state_from_transaction_pool_for_dataset(
-                self.store.pool(),
-                dataset_id,
-                &captured_root,
-                self.root_authentication_key,
-            )?;
+            let captured_state =
+                crate::load_state_from_transaction_pool_admitting_pending_device_lifecycle(
+                    self.store.pool(),
+                    dataset_id,
+                    &captured_root,
+                    self.root_authentication_key,
+                )?;
             expected_catalog_names.insert(
                 crate::snapshot::snapshot_record_catalog_name_for_dataset(record, dataset_path),
             );
@@ -4648,7 +4990,7 @@ impl PoolDatasetOwner {
                 candidate.placement_receipt_generation = current_chunk_receipt.generation;
                 if current_chunk_receipt.generation == 0
                     || current_chunk_receipt.generation < chunk_ref.placement_receipt_generation
-                    || !crate::allocation::pending_removal_chunk_payload_matches_ref(
+                    || !crate::allocation::pending_device_lifecycle_chunk_payload_matches_ref(
                         pool,
                         &candidate,
                         chunk_key,
@@ -4822,6 +5164,20 @@ fn live_admin_optional_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
+}
+
+fn live_admin_exact_guid(raw: &str) -> Result<[u8; 16], String> {
+    if raw.len() != 32 {
+        return Err("device GUID must contain exactly 32 hexadecimal digits".to_string());
+    }
+    let mut guid = [0_u8; 16];
+    for (index, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
+        let byte = std::str::from_utf8(chunk)
+            .map_err(|_| "device GUID must contain exactly 32 hexadecimal digits".to_string())?;
+        guid[index] = u8::from_str_radix(byte, 16)
+            .map_err(|_| "device GUID must contain exactly 32 hexadecimal digits".to_string())?;
+    }
+    Ok(guid)
 }
 
 fn live_performance_admission_snapshot_args(
@@ -9656,6 +10012,420 @@ mod tests {
                 .expect("read independent bytes after replacement reimport"),
             independent_payload
         );
+    }
+
+    #[test]
+    fn missing_member_rebuild_is_scoped_to_recovery_only_read_only_owner() {
+        let td = tempfile::tempdir().expect("missing-member rebuild fixture");
+        let metadata = td.path().join("metadata");
+        std::fs::create_dir_all(&metadata).expect("create rebuild metadata dir");
+        let old_devices = [td.path().join("dev0.img"), td.path().join("dev1.img")];
+        let replacement = td.path().join("replacement.img");
+        for path in old_devices.iter().chain(std::iter::once(&replacement)) {
+            let file = std::fs::File::create(path).expect("create rebuild device image");
+            file.set_len(16 * 1024 * 1024)
+                .expect("size rebuild device image");
+        }
+        let policy = tidefs_local_object_store::pool::PoolRedundancyPolicy::replicated(2);
+        let mut filesystem = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &old_devices,
+            "missing-member-rebuild",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("create two-copy mounted filesystem");
+        let payload = b"recovery-only rebuild preserves exact mounted bytes";
+        filesystem
+            .create_file("/rebuild.bin", 0o600)
+            .expect("create rebuild file");
+        filesystem
+            .write_file("/rebuild.bin", 0, payload)
+            .expect("write rebuild file");
+        filesystem.sync_all().expect("commit rebuild file");
+        filesystem
+            .create_snapshot("retained")
+            .expect("retain rebuild snapshot");
+        let missing_guid = filesystem
+            .store
+            .pool()
+            .topology_status()
+            .members
+            .into_iter()
+            .find(|member| member.device_index == 0)
+            .expect("durable member zero")
+            .device_guid;
+        drop(filesystem);
+
+        std::fs::remove_file(&old_devices[0]).expect("remove exact failed member fixture");
+        let survivor = vec![old_devices[1].clone()];
+
+        let ordinary_read_only = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &survivor,
+            "missing-member-rebuild",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::ReadOnly,
+        )
+        .expect("open ordinary read-only survivor");
+        let ordinary_engine = VfsLocalFileSystem::new(ordinary_read_only).with_read_only();
+        let refused = live_device_admin(
+            &ordinary_engine,
+            "rebuild",
+            json!({
+                "missing_device_guid": live_admin_hex_encode(&missing_guid),
+                "new_device_path": replacement.display().to_string(),
+            }),
+            true,
+        );
+        assert_eq!(
+            refused["ok"], false,
+            "ordinary read-only refusal: {refused}"
+        );
+        assert_eq!(refused["json"]["status"], "refused");
+        assert_eq!(refused["json"]["recovery_mode"], "device-rebuild-only");
+        assert_eq!(refused["json"]["namespace_read_only"], true);
+        assert!(refused["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("--read-only --rebuild-only")));
+        let human_refused = live_device_admin(
+            &ordinary_engine,
+            "rebuild",
+            json!({
+                "missing_device_guid": live_admin_hex_encode(&missing_guid),
+                "new_device_path": replacement.display().to_string(),
+            }),
+            false,
+        );
+        assert_eq!(human_refused["ok"], false);
+        assert!(human_refused["error"].as_str().is_some_and(|message| {
+            message.contains("recovery_mode=device-rebuild-only")
+                && message.contains("topology_committed=false")
+                && message.contains("namespace_read_only=true")
+                && message.contains(&live_admin_hex_encode(&missing_guid))
+        }));
+        drop(ordinary_engine);
+
+        let recovery = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &survivor,
+            "missing-member-rebuild",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::DeviceRebuildOnly,
+        )
+        .expect("open recovery-only survivor");
+        let recovery_engine = VfsLocalFileSystem::new(recovery).with_read_only();
+        assert_eq!(
+            recovery_engine.create(ROOT_INODE_ID, b"forbidden", 0o600, 0, &ctx()),
+            Err(Errno::EROFS),
+            "recovery-only namespace mutation must remain read-only"
+        );
+        assert_eq!(
+            recovery_engine
+                .fs
+                .borrow()
+                .read_file("/rebuild.bin")
+                .expect("read mounted bytes before rebuild"),
+            payload
+        );
+
+        let wrong_guid = [0xEE; 16];
+        assert_ne!(wrong_guid, missing_guid);
+        let wrong = live_device_admin(
+            &recovery_engine,
+            "rebuild",
+            json!({
+                "missing_device_guid": live_admin_hex_encode(&wrong_guid),
+                "new_device_path": replacement.display().to_string(),
+            }),
+            true,
+        );
+        assert_eq!(wrong["ok"], false, "wrong GUID refusal: {wrong}");
+        assert_eq!(wrong["json"]["status"], "refused");
+        assert_eq!(wrong["json"]["topology_committed"], false);
+
+        let wrong_backing = td.path().join("replacement-directory");
+        std::fs::create_dir(&wrong_backing).expect("create wrong-backing candidate");
+        let wrong_backing_refusal = live_device_admin(
+            &recovery_engine,
+            "rebuild",
+            json!({
+                "missing_device_guid": live_admin_hex_encode(&missing_guid),
+                "new_device_path": wrong_backing.display().to_string(),
+            }),
+            true,
+        );
+        assert_eq!(
+            wrong_backing_refusal["ok"], false,
+            "wrong-backing refusal: {wrong_backing_refusal}"
+        );
+        assert_eq!(wrong_backing_refusal["json"]["status"], "refused");
+        assert_eq!(wrong_backing_refusal["json"]["topology_committed"], false);
+        assert!(recovery_engine
+            .fs
+            .borrow()
+            .store
+            .pool()
+            .device_replacement_result()
+            .is_none());
+
+        let rebuilt = live_device_admin(
+            &recovery_engine,
+            "rebuild",
+            json!({
+                "missing_device_guid": live_admin_hex_encode(&missing_guid),
+                "new_device_path": replacement.display().to_string(),
+            }),
+            true,
+        );
+        assert_eq!(rebuilt["ok"], true, "rebuild response: {rebuilt}");
+        assert_eq!(rebuilt["json"]["status"], "completed");
+        assert_eq!(rebuilt["json"]["recovery_mode"], "device-rebuild-only");
+        assert_eq!(rebuilt["json"]["namespace_read_only"], true);
+        assert_eq!(rebuilt["json"]["durable_device_index"], 0);
+        assert_eq!(rebuilt["json"]["objects_failed"], 0);
+        assert_eq!(rebuilt["json"]["topology_committed"], true);
+        assert!(rebuilt["json"]["message"].as_str().is_some_and(|message| {
+            message.contains("durable same-cardinality topology commit")
+                && message.contains("recovery_mode=device-rebuild-only")
+                && message.contains("topology_committed=true")
+                && message.contains("namespace_read_only=true")
+        }));
+        assert_eq!(
+            recovery_engine.create(ROOT_INODE_ID, b"still-forbidden", 0o600, 0, &ctx()),
+            Err(Errno::EROFS),
+            "completed rebuild must not widen mounted namespace authority"
+        );
+        assert_eq!(
+            recovery_engine
+                .fs
+                .borrow()
+                .read_file("/rebuild.bin")
+                .expect("read mounted bytes after rebuild"),
+            payload
+        );
+        drop(recovery_engine);
+
+        let reopened = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &[replacement.clone(), old_devices[1].clone()],
+            "missing-member-rebuild",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("reopen normal writable survivor-plus-replacement topology");
+        assert_eq!(
+            reopened
+                .read_file("/rebuild.bin")
+                .expect("read rebuilt bytes after normal reopen"),
+            payload
+        );
+        assert_eq!(
+            reopened
+                .list_snapshots_checked()
+                .expect("list retained snapshot after rebuild")
+                .len(),
+            1
+        );
+        let scrub = reopened
+            .scrub_mounted_content()
+            .expect("scrub rebuilt topology");
+        assert!(scrub.is_clean(), "rebuilt topology scrub: {scrub:?}");
+    }
+
+    #[test]
+    fn missing_member_rebuild_resumes_during_mounted_root_reconciliation() {
+        let td = tempfile::tempdir().expect("missing-member reconciliation fixture");
+        let metadata = td.path().join("metadata");
+        std::fs::create_dir_all(&metadata).expect("create rebuild metadata dir");
+        let old_devices = [td.path().join("dev0.img"), td.path().join("dev1.img")];
+        let replacement = td.path().join("replacement.img");
+        for path in old_devices.iter().chain(std::iter::once(&replacement)) {
+            let file = std::fs::File::create(path).expect("create rebuild device image");
+            file.set_len(16 * 1024 * 1024)
+                .expect("size rebuild device image");
+        }
+        let policy = tidefs_local_object_store::pool::PoolRedundancyPolicy::replicated(2);
+        let mut filesystem = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &old_devices,
+            "missing-member-rebuild-reconciliation",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("create two-copy mounted filesystem");
+        let snapshot_payload = b"snapshot bytes survive rebuild reconciliation";
+        filesystem
+            .create_file("/reconcile.bin", 0o600)
+            .expect("create reconciliation file");
+        filesystem
+            .write_file("/reconcile.bin", 0, snapshot_payload)
+            .expect("write snapshot reconciliation bytes");
+        filesystem
+            .sync_all()
+            .expect("commit snapshot reconciliation bytes");
+        filesystem
+            .create_snapshot("before-reconcile-overwrite")
+            .expect("retain reconciliation snapshot");
+        let current_payload = b"current bytes survive interrupted root reconciliation";
+        filesystem
+            .write_file("/reconcile.bin", 0, current_payload)
+            .expect("write current reconciliation bytes");
+        filesystem
+            .sync_all()
+            .expect("commit current reconciliation bytes");
+        let missing_guid = filesystem
+            .store
+            .pool()
+            .topology_status()
+            .members
+            .into_iter()
+            .find(|member| member.device_index == 0)
+            .expect("durable member zero")
+            .device_guid;
+        drop(filesystem);
+
+        std::fs::remove_file(&old_devices[0]).expect("remove exact failed member fixture");
+        let survivor = vec![old_devices[1].clone()];
+        let mut recovery = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &survivor,
+            "missing-member-rebuild-reconciliation",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::DeviceRebuildOnly,
+        )
+        .expect("open recovery-only survivor");
+        let mut root_authority = recovery
+            .ensure_device_lifecycle_root_authority(
+                "test interrupted missing-member root reconciliation",
+            )
+            .expect("authenticate current and retained roots");
+        let survivor_config = recovery
+            .store
+            .pool()
+            .config()
+            .devices
+            .first()
+            .cloned()
+            .expect("surviving member configuration");
+        let replacement_config = tidefs_local_object_store::DeviceConfig {
+            media_class: survivor_config.media_class,
+            path: replacement.clone(),
+            backing: survivor_config.backing,
+            class: survivor_config.class,
+            kind: tidefs_local_object_store::DeviceKind::Block {
+                path: replacement.clone(),
+            },
+            encryption: survivor_config.encryption,
+            compression: survivor_config.compression,
+        };
+        recovery
+            .store
+            .pool_mut()
+            .begin_missing_member_rebuild_mutation()
+            .expect("arm exact rebuild mutation");
+        let prepared = recovery
+            .store
+            .pool_mut()
+            .rebuild_missing_member(
+                missing_guid,
+                replacement_config,
+                &tidefs_local_object_store::StoreOptions::default(),
+            )
+            .expect("publish successor receipts before root reconciliation");
+        assert_eq!(prepared.objects_failed, 0);
+        assert!(!prepared.complete);
+
+        // Follow the production ordering through retained mounted snapshots,
+        // then crash before current-root reconciliation and before successor
+        // topology publication. Reopen must accept the already advanced
+        // snapshot root and the predecessor current root together.
+        recovery
+            .reconcile_mounted_snapshot_receipts(&mut root_authority.mounted_snapshots)
+            .expect("reconcile retained snapshot before crash cut");
+        recovery
+            .store
+            .pool_mut()
+            .sync_all()
+            .expect("sync partial root reconciliation");
+        assert_legacy_device_lifecycle_files_absent(&metadata);
+        drop(recovery);
+
+        let resumed = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &survivor,
+            "missing-member-rebuild-reconciliation",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::DeviceRebuildOnly,
+        )
+        .expect("reopen interrupted root reconciliation from label authority");
+        let resumed_engine = VfsLocalFileSystem::new(resumed).with_read_only();
+        let result = live_device_admin(
+            &resumed_engine,
+            "rebuild",
+            json!({
+                "missing_device_guid": live_admin_hex_encode(&missing_guid),
+                "new_device_path": replacement.display().to_string(),
+            }),
+            true,
+        );
+        assert_eq!(result["ok"], true, "reconciliation resume: {result}");
+        assert_eq!(result["json"]["status"], "completed");
+        assert_eq!(result["json"]["topology_committed"], true);
+        assert_eq!(
+            resumed_engine
+                .fs
+                .borrow()
+                .read_file("/reconcile.bin")
+                .expect("read current bytes after reconciliation resume"),
+            current_payload
+        );
+        drop(resumed_engine);
+
+        let mut reopened = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &[replacement.clone(), old_devices[1].clone()],
+            "missing-member-rebuild-reconciliation",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("reopen completed topology after reconciliation resume");
+        assert_eq!(
+            reopened
+                .read_file("/reconcile.bin")
+                .expect("read current bytes after normal reopen"),
+            current_payload
+        );
+        reopened
+            .rollback_to_snapshot("before-reconcile-overwrite")
+            .expect("rollback retained snapshot after rebuild resume");
+        assert_eq!(
+            reopened
+                .read_file("/reconcile.bin")
+                .expect("read retained snapshot bytes after rebuild resume"),
+            snapshot_payload
+        );
+        let scrub = reopened
+            .scrub_mounted_content()
+            .expect("scrub resumed rebuilt topology");
+        assert!(scrub.is_clean(), "resumed rebuild scrub: {scrub:?}");
+        assert_legacy_device_lifecycle_files_absent(&metadata);
     }
 
     #[test]

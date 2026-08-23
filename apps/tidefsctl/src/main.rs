@@ -242,6 +242,7 @@ fn handle_mount(
         foreground,
         debug,
         read_only: false,
+        rebuild_only: false,
         writeback_cache: false,
         coherency_profile: CoherencyProfile::Writeback,
         block_devices: None,
@@ -741,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn command_help_hides_removed_surfaces() {
+    fn command_help_hides_removed_surfaces_and_exposes_rebuild() {
         let pool_command = commands::pool::PoolCommand::command();
         assert!(pool_command
             .get_subcommands()
@@ -760,7 +761,7 @@ mod tests {
         }
 
         let device_help = render_long_help(DeviceHelpCli::command());
-        assert!(!device_help
+        assert!(device_help
             .lines()
             .any(|line| line.trim_start().starts_with("rebuild ")));
     }
@@ -1374,6 +1375,55 @@ mod tests {
             assert!(
                 Cli::try_parse_from(args).is_err(),
                 "device replace must not admit offline or incomplete inputs"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_parse_device_rebuild_keeps_only_recovery_owner_inputs() {
+        use clap::Parser;
+        let parsed = Cli::try_parse_from([
+            "tidefsctl",
+            "device",
+            "rebuild",
+            "mypool",
+            "00112233445566778899aabbccddeeff",
+            "/dev/sdd",
+            "--json",
+        ]);
+        assert!(parsed.is_ok(), "device rebuild --json should parse");
+
+        for args in [
+            vec![
+                "tidefsctl",
+                "device",
+                "rebuild",
+                "--surviving-dir",
+                "/var/lib/tidefs/survivor",
+                "--replacement-dir",
+                "/var/lib/tidefs/replacement",
+            ],
+            vec![
+                "tidefsctl",
+                "device",
+                "rebuild",
+                "mypool",
+                "00112233445566778899aabbccddeeff",
+            ],
+            vec![
+                "tidefsctl",
+                "device",
+                "rebuild",
+                "mypool",
+                "00112233445566778899aabbccddeeff",
+                "/dev/sdd",
+                "--devices",
+                "/dev/sdb",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "device rebuild must reject retired directory or incomplete inputs"
             );
         }
     }
@@ -2029,6 +2079,46 @@ mod tests {
             "--read-only",
         ]);
         assert!(args.is_ok(), "pool mount --read-only should parse");
+    }
+
+    #[test]
+    fn cli_parse_pool_mount_rebuild_only_requires_read_only_survivor() {
+        use clap::Parser;
+        let valid = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--devices",
+            "/dev/survivor",
+            "--read-only",
+            "--rebuild-only",
+        ]);
+        assert!(valid.is_ok(), "guarded rebuild-only mount should parse");
+
+        let missing_read_only = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--devices",
+            "/dev/survivor",
+            "--rebuild-only",
+        ]);
+        assert!(missing_read_only.is_err());
+
+        let missing_survivor = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--read-only",
+            "--rebuild-only",
+        ]);
+        assert!(missing_survivor.is_err());
     }
 
     #[test]

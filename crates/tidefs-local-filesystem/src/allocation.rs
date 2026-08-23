@@ -676,7 +676,7 @@ fn dedup_canonical_chunk_is_current(
     content_dedup_object_key(&fingerprint) == canonical_key
 }
 
-pub(crate) fn pending_removal_chunk_payload_matches_ref(
+pub(crate) fn pending_device_lifecycle_chunk_payload_matches_ref(
     pool: &tidefs_local_object_store::pool::Pool,
     chunk_ref: &crate::records::ContentChunkRef,
     object_key: ObjectKey,
@@ -695,13 +695,13 @@ pub(crate) fn pending_removal_chunk_payload_matches_ref(
             return false;
         };
         let scoped_key = keyspace.scope(canonical_key);
-        let canonical = match pool.get_with_removal_survivor_receipt(
+        let canonical = match pool.get_with_device_lifecycle_survivor_receipt(
             tidefs_local_object_store::DeviceIoClass::Data,
             scoped_key,
         ) {
             Ok(Some(current)) => Some(current),
             Ok(None) => pool
-                .get_with_removal_predecessor_receipt(
+                .get_with_device_lifecycle_predecessor_receipt(
                     tidefs_local_object_store::DeviceIoClass::Data,
                     scoped_key,
                 )
