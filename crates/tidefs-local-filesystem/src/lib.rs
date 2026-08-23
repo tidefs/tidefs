@@ -2131,6 +2131,11 @@ pub struct FilesystemDatasetEngine {
     /// and writeback anchored to the last materialized Pool object until the
     /// complete inode buffer is written under that pending version.
     buffered_write_base_records: BTreeMap<InodeId, InodeRecord>,
+    /// Receipt-authenticated allocation maps for unchanged live content and
+    /// the exact retained-root set. This is derived mount-local state; content
+    /// identity changes and explicit Pool-authority invalidation force the
+    /// normal strict reads before an entry can be reused.
+    authenticated_content_allocation_cache: AuthenticatedContentAllocationCache,
     write_buffer_config: WriteBufferConfig,
     fsync_stats: FsyncStats,
     /// Sync gate for TXG group commit durability fence coordination.
@@ -4924,6 +4929,8 @@ impl PoolDatasetOwner {
                 dataset_mount_id,
                 write_buffers: BTreeMap::new(),
                 buffered_write_base_records: BTreeMap::new(),
+                authenticated_content_allocation_cache:
+                    AuthenticatedContentAllocationCache::default(),
                 write_buffer_config: WriteBufferConfig::default(),
                 pool_uuid,
                 fsync_stats: FsyncStats::default(),
@@ -15261,6 +15268,12 @@ impl PoolDatasetOwner {
     /// Rebuild mounted admission and statfs authority after a device lifecycle
     /// recovery has reconciled every embedded content receipt generation.
     fn rebuild_capacity_authority_from_committed_content(&mut self) -> Result<()> {
+        // Pool lifecycle and repair recovery can replace receipt generations
+        // without changing an inode content identity. Do not carry an older
+        // authentication result across that authority boundary.
+        self.filesystem
+            .authenticated_content_allocation_cache
+            .invalidate();
         let total_bytes = self.filesystem.allocator_policy.content_capacity_bytes;
         let used_bytes = allocation_bytes(&content_allocation_entries_for_state_pool(
             self.store.pool(),
@@ -15454,28 +15467,56 @@ impl PoolDatasetOwner {
     ) -> Result<()> {
         let keyspace = self.object_keyspace();
         let mut current_entries = BTreeMap::new();
-        for live_record in self.filesystem.state.inodes.values() {
-            if !live_record.is_file_like() {
-                continue;
-            }
-            // Accepted buffered writes are immediately visible through
-            // state.inodes, but their new content identity is not Pool-readable
-            // until writeback. Capacity projection and replaced-content
-            // validation must therefore use the last materialized record.
-            let pool_readable_record = self
-                .buffered_write_base_records
-                .get(&live_record.inode_id)
-                .unwrap_or(live_record);
-            let inode_entries = content_allocation_entries_for_inode_pool_in_keyspace(
-                self.store.pool(),
-                pool_readable_record,
-                keyspace,
-            )?;
+        let pool_readable_records: Vec<InodeRecord> = self
+            .filesystem
+            .state
+            .inodes
+            .values()
+            .filter(|record| record.is_file_like())
+            .map(|live_record| {
+                // Accepted buffered writes are immediately visible through
+                // state.inodes, but their new content identity is not Pool-readable
+                // until writeback. Capacity projection and replaced-content
+                // validation must therefore use the last materialized record.
+                self.filesystem
+                    .buffered_write_base_records
+                    .get(&live_record.inode_id)
+                    .unwrap_or(live_record)
+                    .clone()
+            })
+            .collect();
+        let live_inode_ids = pool_readable_records
+            .iter()
+            .map(|record| record.inode_id)
+            .collect();
+        self.filesystem
+            .authenticated_content_allocation_cache
+            .retain_live_inodes(&live_inode_ids);
+        for pool_readable_record in pool_readable_records {
+            let inode_entries = match self
+                .filesystem
+                .authenticated_content_allocation_cache
+                .live_entries(&pool_readable_record)
+                .cloned()
+            {
+                Some(entries) => entries,
+                None => {
+                    let entries = content_allocation_entries_for_inode_pool_in_keyspace(
+                        self.store.pool(),
+                        &pool_readable_record,
+                        keyspace,
+                    )?;
+                    self.filesystem
+                        .authenticated_content_allocation_cache
+                        .record_live_entries(&pool_readable_record, entries.clone());
+                    entries
+                }
+            };
             // A replacement does not reserve both the old and planned live
-            // inode images, but it still must prove every current chunk
-            // through strict Pool receipt authority before the old image can
-            // be superseded.
-            if Some(live_record.inode_id) == replaced_inode {
+            // inode images. Its exact old content identity must already have
+            // passed strict Pool receipt authority above before the old image
+            // can be superseded.
+            if Some(pool_readable_record.inode_id) == replaced_inode {
                 continue;
             }
             merge_allocation_entries(&mut current_entries, inode_entries);
@@ -15494,11 +15535,26 @@ impl PoolDatasetOwner {
         &mut self,
         current_entries: BTreeMap<ObjectKey, u64>,
     ) -> Result<()> {
-        let mut reserved_entries = protected_committed_content_entries_pool(
-            self.store.pool_mut(),
-            self.filesystem.root_authentication_key,
-            &self.filesystem.state,
-        )?;
+        let retained_roots = snapshot_retained_roots(&self.filesystem.state);
+        let mut reserved_entries = match self
+            .filesystem
+            .authenticated_content_allocation_cache
+            .retained_entries(&retained_roots)
+            .cloned()
+        {
+            Some(entries) => entries,
+            None => {
+                let entries = protected_committed_content_entries_pool(
+                    self.store.pool_mut(),
+                    self.filesystem.root_authentication_key,
+                    &self.filesystem.state,
+                )?;
+                self.filesystem
+                    .authenticated_content_allocation_cache
+                    .record_retained_entries(retained_roots, entries.clone());
+                entries
+            }
+        };
         merge_allocation_entries(&mut reserved_entries, current_entries);
         let allocated = allocation_bytes(&reserved_entries)?;
         if allocated > self.filesystem.allocator_policy.content_capacity_bytes {
