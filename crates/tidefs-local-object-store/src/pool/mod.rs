@@ -4310,9 +4310,7 @@ impl Pool {
             restore_device_replacement_evidence(&mut pool)?;
             // Resume interrupted device removal if a pending marker exists.
             resume_device_removal_if_pending(&mut pool)?;
-            if topology_roster_label_count == 0 {
-                pool.persist_bootstrap_topology_roster()?;
-            }
+            pool.persist_bootstrap_topology_roster()?;
         } else if mode == PoolOpenMode::MissingMemberRebuild {
             restore_missing_member_rebuild_evidence(&mut pool)?;
         }
@@ -4789,17 +4787,33 @@ impl Pool {
     }
 
     fn persist_bootstrap_topology_roster(&mut self) -> Result<()> {
-        for (device_index, config) in self.config.devices.iter().enumerate() {
-            let copies = read_pool_label_copies(config)?;
+        // Publish a complete backup family before touching the primary family.
+        // A crash at any cut therefore leaves either the rosterless primary or
+        // the upgraded backup complete; a later writable open resumes partial
+        // family upgrades without changing that copy's ACTIVE/EXPORTED state.
+        for (copy_index, fixed_target) in [
+            (1usize, PoolLabelCopyTarget::Backup),
+            (0usize, PoolLabelCopyTarget::Primary),
+        ] {
             let mut expected = Vec::new();
-            for (copy_index, copy) in copies.iter().enumerate() {
+            let mut family_complete = true;
+            for (device_index, config) in self.config.devices.iter().enumerate() {
+                if copy_index == 1 && !config.backing.uses_fixed_offset_pool_labels() {
+                    continue;
+                }
+                let copies = read_pool_label_copies(config)?;
+                let Some(copy) = copies.get(copy_index) else {
+                    family_complete = false;
+                    break;
+                };
                 if copy.label.pool_guid != self.pool_guid
                     || copy.label.device_guid != self.device_guids[device_index]
                     || copy.label.device_index != device_index as u32
                     || copy.label.device_count != self.device_guids.len() as u32
                     || copy.label.topology_generation.max(1) != self.placement_epoch
                 {
-                    continue;
+                    family_complete = false;
+                    break;
                 }
                 if copy
                     .topology_roster
@@ -4816,50 +4830,54 @@ impl Pool {
                 let mut expected_copy = copy.clone();
                 expected_copy.label = upgraded_label.clone();
                 expected_copy.topology_roster = Some(self.device_guids.clone());
-                expected.push((copy_index, expected_copy));
-                if copy.topology_roster.is_some()
+                let write = if copy.topology_roster.is_some()
                     && copy.label.topology_generation == self.placement_epoch
                 {
-                    continue;
-                }
-
-                let layout_bytes = pool_label::decode_device_layout_v1_bytes(&copy.bytes)
-                    .map_err(|_| StoreError::InvalidOptions {
-                        reason: "Pool bootstrap label DeviceLayoutV1 record is truncated",
-                    })?
-                    .ok_or(StoreError::InvalidOptions {
-                        reason: "Pool bootstrap label is missing DeviceLayoutV1",
-                    })?;
-                let layout = decode_device_layout_v1(&layout_bytes).map_err(|_| {
-                    StoreError::InvalidOptions {
-                        reason: "Pool bootstrap label DeviceLayoutV1 record is corrupt",
-                    }
-                })?;
-                let target = if !config.backing.uses_fixed_offset_pool_labels() {
-                    PoolLabelCopyTarget::Both
-                } else if copy_index == 0 {
-                    PoolLabelCopyTarget::Primary
+                    None
                 } else {
-                    PoolLabelCopyTarget::Backup
+                    let layout_bytes = pool_label::decode_device_layout_v1_bytes(&copy.bytes)
+                        .map_err(|_| StoreError::InvalidOptions {
+                            reason: "Pool bootstrap label DeviceLayoutV1 record is truncated",
+                        })?
+                        .ok_or(StoreError::InvalidOptions {
+                            reason: "Pool bootstrap label is missing DeviceLayoutV1",
+                        })?;
+                    let layout = decode_device_layout_v1(&layout_bytes).map_err(|_| {
+                        StoreError::InvalidOptions {
+                            reason: "Pool bootstrap label DeviceLayoutV1 record is corrupt",
+                        }
+                    })?;
+                    Some((upgraded_label, layout, copy.lifecycle.clone()))
+                };
+                expected.push((device_index, expected_copy, write));
+            }
+            if !family_complete || expected.is_empty() {
+                continue;
+            }
+
+            for (device_index, _, write) in &expected {
+                let Some((label, layout, lifecycle)) = write else {
+                    continue;
+                };
+                let config = &self.config.devices[*device_index];
+                let target = if config.backing.uses_fixed_offset_pool_labels() {
+                    fixed_target
+                } else {
+                    PoolLabelCopyTarget::Both
                 };
                 write_pool_label_copies_with_lifecycle(
                     config,
-                    upgraded_label,
-                    Some(&layout),
+                    label.clone(),
+                    Some(layout),
                     &self.device_guids,
-                    copy.lifecycle.as_ref(),
+                    lifecycle.as_ref(),
                     target,
                     "pool_bootstrap_write_topology_roster",
                 )?;
             }
-            if expected.is_empty() {
-                return Err(StoreError::InvalidOptions {
-                    reason: "Pool bootstrap topology has no matching label copy",
-                });
-            }
 
-            let verified = read_pool_label_copies(config)?;
-            for (copy_index, expected_copy) in expected {
+            for (device_index, expected_copy, _) in expected {
+                let verified = read_pool_label_copies(&self.config.devices[device_index])?;
                 let actual = verified.get(copy_index).ok_or(StoreError::InvalidOptions {
                     reason: "Pool bootstrap topology roster label readback is missing",
                 })?;
@@ -4872,6 +4890,23 @@ impl Pool {
                         reason: "Pool bootstrap topology roster label readback did not verify",
                     });
                 }
+            }
+        }
+
+        for (device_index, config) in self.config.devices.iter().enumerate() {
+            let verified = read_pool_label_copies(config)?;
+            if !verified.iter().any(|copy| {
+                copy.label.pool_guid == self.pool_guid
+                    && copy.label.device_guid == self.device_guids[device_index]
+                    && copy.label.device_index == device_index as u32
+                    && copy.label.device_count == self.device_guids.len() as u32
+                    && copy.label.topology_generation == self.placement_epoch
+                    && copy.topology_roster.as_deref() == Some(self.device_guids.as_slice())
+                    && copy.has_self_consistent_roster()
+            }) {
+                return Err(StoreError::InvalidOptions {
+                    reason: "Pool bootstrap topology roster has no verified complete family",
+                });
             }
         }
 
@@ -13564,6 +13599,40 @@ mod tests {
             assert_eq!(copies[1].label.pool_state, PoolState::Exported);
         }
 
+        // Model a crash after only the first member's backup-family upgrade.
+        // The complete rosterless ACTIVE primary family remains importable,
+        // and the next writable open must resume the partial EXPORTED backup
+        // before it changes any primary-family copy.
+        let first_copies =
+            read_pool_label_copies(&config.devices[0]).expect("read first bootstrap member");
+        let backup_layout_bytes = pool_label::decode_device_layout_v1_bytes(&first_copies[1].bytes)
+            .expect("decode backup DeviceLayoutV1")
+            .expect("backup label has DeviceLayoutV1");
+        let backup_layout =
+            decode_device_layout_v1(&backup_layout_bytes).expect("decode backup bootstrap layout");
+        write_pool_label_copies_with_lifecycle(
+            &config.devices[0],
+            first_copies[1].label.clone(),
+            Some(&backup_layout),
+            &device_guids,
+            first_copies[1].lifecycle.as_ref(),
+            PoolLabelCopyTarget::Backup,
+            "test_partial_backup_topology_roster_upgrade",
+        )
+        .expect("upgrade only the first backup-family copy");
+
+        for (device_index, device) in config.devices.iter().enumerate() {
+            let copies = read_pool_label_copies(device).expect("read partial-upgrade labels");
+            assert_eq!(copies.len(), 2);
+            assert!(copies[0].topology_roster.is_none());
+            assert_eq!(
+                copies[1].topology_roster.as_deref(),
+                (device_index == 0).then_some(device_guids.as_slice())
+            );
+            assert_eq!(copies[0].label.pool_state, PoolState::Active);
+            assert_eq!(copies[1].label.pool_state, PoolState::Exported);
+        }
+
         drop(
             Pool::open(config.clone(), properties.clone(), &test_options())
                 .expect("writable open upgrades bootstrap labels"),
@@ -13571,6 +13640,74 @@ mod tests {
 
         for device in &config.devices {
             let copies = read_pool_label_copies(device).expect("read upgraded label copies");
+            assert_eq!(copies.len(), 2);
+            assert!(copies
+                .iter()
+                .all(|copy| copy.topology_roster.as_deref() == Some(device_guids.as_slice())));
+            assert_eq!(copies[0].label.pool_state, PoolState::Active);
+            assert_eq!(copies[1].label.pool_state, PoolState::Exported);
+        }
+
+        // Model the next crash cut: the EXPORTED backup family is complete,
+        // but only the first ACTIVE primary copy has been upgraded. Reopen
+        // selects the complete backup family, so roster persistence must run
+        // even though the selected labels already carry the roster.
+        let second_copies =
+            read_pool_label_copies(&config.devices[1]).expect("read second upgraded member");
+        let primary_layout_bytes =
+            pool_label::decode_device_layout_v1_bytes(&second_copies[0].bytes)
+                .expect("decode primary DeviceLayoutV1")
+                .expect("primary label has DeviceLayoutV1");
+        let rosterless_primary = pool_label::seal_label_with_device_layout(
+            second_copies[0].label.clone(),
+            Some(&primary_layout_bytes),
+        )
+        .expect("seal rosterless primary label");
+        let mut rosterless_primary_bytes = vec![0u8; pool_label::POOL_LABEL_SIZE];
+        pool_label::encode_label_with_device_layout(
+            &rosterless_primary,
+            Some(&primary_layout_bytes),
+            &mut rosterless_primary_bytes,
+        )
+        .expect("encode rosterless primary label");
+        let mut second_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(device_root_path(&config.devices[1]))
+            .expect("open second bootstrap member");
+        second_file
+            .seek(SeekFrom::Start(0))
+            .expect("seek second primary label");
+        second_file
+            .write_all(&rosterless_primary_bytes)
+            .expect("write second rosterless primary label");
+        second_file
+            .sync_all()
+            .expect("sync second rosterless primary label");
+        drop(second_file);
+
+        for (device_index, device) in config.devices.iter().enumerate() {
+            let copies = read_pool_label_copies(device).expect("read partial-primary labels");
+            assert_eq!(copies.len(), 2);
+            assert_eq!(
+                copies[0].topology_roster.as_deref(),
+                (device_index == 0).then_some(device_guids.as_slice())
+            );
+            assert_eq!(
+                copies[1].topology_roster.as_deref(),
+                Some(device_guids.as_slice())
+            );
+            assert_eq!(copies[0].label.pool_state, PoolState::Active);
+            assert_eq!(copies[1].label.pool_state, PoolState::Exported);
+        }
+
+        drop(
+            Pool::open(config.clone(), properties.clone(), &test_options())
+                .expect("writable open resumes the partial primary-family upgrade"),
+        );
+
+        for device in &config.devices {
+            let copies = read_pool_label_copies(device).expect("read resumed label copies");
             assert_eq!(copies.len(), 2);
             assert!(copies
                 .iter()
