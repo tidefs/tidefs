@@ -1,12 +1,13 @@
 # TideFS: pool remount-lifecycle validation (#6136).
 #
-# Boots a Linux 7.0 qemu guest with two raw virtio-blk disks and exercises
+# Boots a Linux 7.0 qemu guest with three raw virtio-blk disks and exercises
 # the full remount lifecycle with committed-root advancement and intent-log
 # replay consistency verification:
 #   pool create -> import -> FUSE mount -> write/fsync/read ->
 #   unmount -> pool export -> reimport -> remount -> persist verify ->
 #   committed-root advance verify -> intent-log consistency verify ->
 #   mounted clean integrity -> one-target live-owner repair -> crash/reopen ->
+#   remove one member -> recovery-only rebuild -> normal two-copy reopen ->
 #   dual-corruption scrub/repair refusal -> committed-root corruption report.
 #
 # Validation tier: qemu guest.
@@ -39,7 +40,7 @@ let
       cat <<USAGE
 Usage: tidefs-pool-remount-lifecycle-validation [--timeout SECONDS] [--disk-size-mb MB] [--keep-tmp]
 
-Full remount lifecycle on two virtio-blk disks in a Linux 7.0 qemu guest:
+Full remount lifecycle on three virtio-blk disks in a Linux 7.0 qemu guest:
   pool create -> import -> FUSE mount -> write/fsync/read ->
   unmount -> pool export -> reimport -> remount -> persist verify ->
   committed-root advance verify -> intent-log consistency verify.
@@ -102,6 +103,7 @@ USAGE
     RUN_DIR="$WORK_DIR/initrd"
     DISK1_IMG="$WORK_DIR/disk1.img"
     DISK2_IMG="$WORK_DIR/disk2.img"
+    DISK3_IMG="$WORK_DIR/disk3.img"
     VAL_LOG="$WORK_DIR/validation.log"
 
     mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,etc,run/tidefs/import}
@@ -117,6 +119,7 @@ USAGE
     echo "  Creating raw virtio disk images"
     dd if=/dev/zero of="$DISK1_IMG" bs=1M count="$DISK_SIZE_MB" 2>/dev/null
     dd if=/dev/zero of="$DISK2_IMG" bs=1M count="$DISK_SIZE_MB" 2>/dev/null
+    dd if=/dev/zero of="$DISK3_IMG" bs=1M count="$DISK_SIZE_MB" 2>/dev/null
 
     copy_dep_path() {
       local p="$1"
@@ -143,7 +146,7 @@ USAGE
     for applet in sh ls cat echo mount umount grep insmod rmmod dmesg sleep poweroff \
                     reboot mknod mkdir rmdir dd stat cp mv rm ln touch find wc sync \
                     expr head tail cut kill ps test seq blockdev mountpoint du \
-                    uname date hexdump sed sha256sum timeout; do
+                    uname date hexdump sed sha256sum timeout readlink; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
@@ -196,16 +199,18 @@ echo "--- Phase 1: Virtio block devices ---"
 
 DEV0="/dev/vda"
 DEV1="/dev/vdb"
+DEV2="/dev/vdc"
 for _ in $(seq 1 30); do
-    [ -b "$DEV0" ] && [ -b "$DEV1" ] && break
+    [ -b "$DEV0" ] && [ -b "$DEV1" ] && [ -b "$DEV2" ] && break
     sleep 1
 done
 
 [ -b "$DEV0" ] && pass "virtio0_present" || fail "virtio0_present" "$DEV0 missing"
 [ -b "$DEV1" ] && pass "virtio1_present" || fail "virtio1_present" "$DEV1 missing"
+[ -b "$DEV2" ] && pass "virtio2_present" || fail "virtio2_present" "$DEV2 missing"
 
-if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
-    for op in virtio0_size virtio1_size pool_create startup_failure_unwind \
+if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ] || [ ! -b "$DEV2" ]; then
+    for op in virtio0_size virtio1_size virtio2_size pool_create startup_failure_unwind \
              startup_retry_mount pool_import mount \
              live_status write_data fsync_data read_verify lookup_inode rename_entry \
              link_inode_identity unlink_entry readdir_entry unmount pool_export \
@@ -229,6 +234,11 @@ if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
              mounted_repair_single_completed mounted_repair_file_readable \
              mounted_repair_crash_sigkill mounted_repair_stale_mount_detached \
              mounted_repair_reopen mounted_repair_reopen_readback \
+             missing_rebuild_identity missing_rebuild_owner_stopped \
+             missing_rebuild_device_removed missing_rebuild_mount \
+             missing_rebuild_namespace_ro missing_rebuild_completed \
+             missing_rebuild_readback missing_rebuild_normal_reopen \
+             missing_rebuild_normal_readback missing_rebuild_scrub_clean \
              mounted_scrub_corruption_injected mounted_scrub_failure_reported \
              mounted_scrub_no_repair_writeback mounted_repair_dual_refused \
              mounted_repair_dual_bytes_unchanged; do
@@ -243,10 +253,13 @@ echo "--- Phase 2: Device sizes ---"
 
 D0SIZE=$(blockdev --getsize64 "$DEV0" 2>/dev/null || echo 0)
 D1SIZE=$(blockdev --getsize64 "$DEV1" 2>/dev/null || echo 0)
+D2SIZE=$(blockdev --getsize64 "$DEV2" 2>/dev/null || echo 0)
 echo "  $DEV0 = $D0SIZE bytes"
 echo "  $DEV1 = $D1SIZE bytes"
+echo "  $DEV2 = $D2SIZE bytes"
 [ "$D0SIZE" -gt 0 ] && pass "virtio0_size" || fail "virtio0_size" "0 bytes"
 [ "$D1SIZE" -gt 0 ] && pass "virtio1_size" || fail "virtio1_size" "0 bytes"
+[ "$D2SIZE" -gt 0 ] && pass "virtio2_size" || fail "virtio2_size" "0 bytes"
 
 echo ""
 echo "--- Phase 3: Pool create ---"
@@ -1289,19 +1302,231 @@ else
     blocked "mounted_repair_reopen_readback" "repaired pool did not reopen"
 fi
 
+MISSING_REBUILD_IDENTITY_OK=0
+MISSING_REBUILD_OWNER_STOPPED_OK=0
+MISSING_REBUILD_DEVICE_REMOVED_OK=0
+MISSING_REBUILD_MOUNTED=0
+MISSING_REBUILD_NAMESPACE_RO_OK=0
+MISSING_REBUILD_COMPLETE_OK=0
+MISSING_REBUILD_READBACK_OK=0
+MISSING_REBUILD_NORMAL_REOPEN_OK=0
+MISSING_REBUILD_NORMAL_READBACK_OK=0
+MISSING_REBUILD_SCRUB_OK=0
+MISSING_REBUILD_GUID=""
+MISSING_DEVICE="$DEV0"
+RBP=""
+
+if [ "$REPAIR_REOPEN_READBACK_OK" -eq 1 ]; then
+    if tidefsctl pool status "$POOL_NAME" --json \
+        > /tmp/missing_rebuild_status.json 2>/tmp/missing_rebuild_status.err; then
+        MISSING_REBUILD_GUID=$(jq -r \
+            '.members[] | select(.index == 0) | .guid' \
+            /tmp/missing_rebuild_status.json 2>/dev/null | head -1)
+    fi
+    case "$MISSING_REBUILD_GUID" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+            MISSING_REBUILD_IDENTITY_OK=1
+            pass "missing_rebuild_identity"
+            ;;
+        *)
+            fail "missing_rebuild_identity" \
+                "guid=$MISSING_REBUILD_GUID output=$(cat /tmp/missing_rebuild_status.err /tmp/missing_rebuild_status.json 2>/dev/null)"
+            ;;
+    esac
+else
+    blocked "missing_rebuild_identity" "normal repaired owner is not readable"
+fi
+
+if [ "$MISSING_REBUILD_IDENTITY_OK" -eq 1 ]; then
+    if [ -n "$CRP" ] && kill -0 "$CRP" 2>/dev/null; then
+        kill -KILL "$CRP" 2>/dev/null || true
+        wait "$CRP" 2>/dev/null || true
+        CRP=""
+    fi
+    if grep -q "[[:space:]]$MNT[[:space:]]" /proc/self/mountinfo 2>/dev/null; then
+        umount -l "$MNT" 2>/tmp/missing_rebuild_umount.err || true
+    fi
+    if ! grep -q "[[:space:]]$MNT[[:space:]]" /proc/self/mountinfo 2>/dev/null; then
+        MISSING_REBUILD_OWNER_STOPPED_OK=1
+        pass "missing_rebuild_owner_stopped"
+    else
+        fail "missing_rebuild_owner_stopped" \
+            "$(cat /tmp/missing_rebuild_umount.err 2>/dev/null)"
+    fi
+else
+    blocked "missing_rebuild_owner_stopped" "missing member identity unavailable"
+fi
+
+if [ "$MISSING_REBUILD_OWNER_STOPPED_OK" -eq 1 ]; then
+    DEV0_NAME=$(echo "$MISSING_DEVICE" | sed 's#.*/##')
+    VIRTIO_PATH=$(readlink -f "/sys/block/$DEV0_NAME/device" 2>/dev/null || true)
+    PCI_REMOVE=""
+    case "$VIRTIO_PATH" in
+        /sys/devices/*/virtio*) PCI_REMOVE="''${VIRTIO_PATH%/*}/remove" ;;
+    esac
+    if [ -n "$PCI_REMOVE" ] && [ -w "$PCI_REMOVE" ] \
+        && printf '1\n' > "$PCI_REMOVE" 2>/tmp/missing_rebuild_remove.err; then
+        for _ in $(seq 1 30); do
+            [ ! -b "$MISSING_DEVICE" ] && break
+            sleep 1
+        done
+    fi
+    if [ ! -b "$MISSING_DEVICE" ]; then
+        MISSING_REBUILD_DEVICE_REMOVED_OK=1
+        pass "missing_rebuild_device_removed"
+    else
+        fail "missing_rebuild_device_removed" \
+            "device remained present; virtio_path=$VIRTIO_PATH pci_remove=$PCI_REMOVE error=$(cat /tmp/missing_rebuild_remove.err 2>/dev/null)"
+    fi
+else
+    blocked "missing_rebuild_device_removed" "previous owner is still mounted"
+fi
+
+if [ "$MISSING_REBUILD_DEVICE_REMOVED_OK" -eq 1 ]; then
+    tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV1" \
+        --read-only --rebuild-only > /tmp/missing_rebuild_mount.log 2>&1 &
+    RBP=$!
+    for _ in $(seq 1 45); do
+        mountpoint -q "$MNT" 2>/dev/null && { MISSING_REBUILD_MOUNTED=1; break; }
+        sleep 1
+    done
+    if [ "$MISSING_REBUILD_MOUNTED" -eq 1 ]; then
+        pass "missing_rebuild_mount"
+    else
+        fail "missing_rebuild_mount" \
+            "$(tail -40 /tmp/missing_rebuild_mount.log 2>/dev/null)"
+    fi
+else
+    blocked "missing_rebuild_mount" "member zero was not physically removed"
+fi
+
+if [ "$MISSING_REBUILD_MOUNTED" -eq 1 ]; then
+    if touch "$MNT/rebuild-must-stay-read-only" 2>/tmp/missing_rebuild_touch.err; then
+        rm -f "$MNT/rebuild-must-stay-read-only" 2>/dev/null || true
+        fail "missing_rebuild_namespace_ro" "recovery-only namespace accepted create"
+    elif [ ! -e "$MNT/rebuild-must-stay-read-only" ] \
+        && [ "$(cat "$SCRUB_FILE" 2>/dev/null || true)" = "$SCRUB_CONTENT" ]; then
+        MISSING_REBUILD_NAMESPACE_RO_OK=1
+        pass "missing_rebuild_namespace_ro"
+    else
+        fail "missing_rebuild_namespace_ro" \
+            "read=$(cat "$SCRUB_FILE" 2>/dev/null || true) error=$(cat /tmp/missing_rebuild_touch.err 2>/dev/null)"
+    fi
+else
+    blocked "missing_rebuild_namespace_ro" "recovery-only owner did not mount"
+fi
+
+if [ "$MISSING_REBUILD_NAMESPACE_RO_OK" -eq 1 ]; then
+    if tidefsctl device rebuild "$POOL_NAME" "$MISSING_REBUILD_GUID" "$DEV2" --json \
+        > /tmp/missing_rebuild.json 2>/tmp/missing_rebuild.err \
+        && jq -e --arg missing "$MISSING_REBUILD_GUID" '
+            .status == "completed"
+            and .recovery_mode == "device-rebuild-only"
+            and .namespace_read_only == true
+            and .missing_device_guid == $missing
+            and .durable_device_index == 0
+            and .objects_failed == 0
+            and .verified_receipt_count >= 1
+            and .topology_committed == true
+            and (.new_device_guid | test("^[0-9a-f]{32}$"))
+            and .new_device_guid != .missing_device_guid
+        ' /tmp/missing_rebuild.json >/dev/null; then
+        MISSING_REBUILD_COMPLETE_OK=1
+        pass "missing_rebuild_completed"
+    else
+        fail "missing_rebuild_completed" \
+            "$(cat /tmp/missing_rebuild.err /tmp/missing_rebuild.json 2>/dev/null)"
+    fi
+else
+    blocked "missing_rebuild_completed" "recovery-only namespace boundary failed"
+fi
+
+if [ "$MISSING_REBUILD_COMPLETE_OK" -eq 1 ]; then
+    if [ "$(cat "$SCRUB_FILE" 2>/dev/null || true)" = "$SCRUB_CONTENT" ]; then
+        MISSING_REBUILD_READBACK_OK=1
+        pass "missing_rebuild_readback"
+    else
+        fail "missing_rebuild_readback" \
+            "read=$(cat "$SCRUB_FILE" 2>/dev/null || true)"
+    fi
+else
+    blocked "missing_rebuild_readback" "missing-member rebuild did not complete"
+fi
+
+if [ "$MISSING_REBUILD_READBACK_OK" -eq 1 ]; then
+    if [ -n "$RBP" ] && kill -0 "$RBP" 2>/dev/null; then
+        kill -KILL "$RBP" 2>/dev/null || true
+        wait "$RBP" 2>/dev/null || true
+        RBP=""
+    fi
+    umount -l "$MNT" 2>/tmp/missing_rebuild_post_umount.err || true
+    tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV2" "$DEV1" \
+        > /tmp/missing_rebuild_normal_mount.log 2>&1 &
+    CRP=$!
+    for _ in $(seq 1 45); do
+        mountpoint -q "$MNT" 2>/dev/null && { MISSING_REBUILD_NORMAL_REOPEN_OK=1; break; }
+        sleep 1
+    done
+    if [ "$MISSING_REBUILD_NORMAL_REOPEN_OK" -eq 1 ]; then
+        DEV0="$DEV2"
+        pass "missing_rebuild_normal_reopen"
+    else
+        fail "missing_rebuild_normal_reopen" \
+            "$(cat /tmp/missing_rebuild_post_umount.err 2>/dev/null; tail -40 /tmp/missing_rebuild_normal_mount.log 2>/dev/null)"
+    fi
+else
+    blocked "missing_rebuild_normal_reopen" "recovery-only readback failed"
+fi
+
+if [ "$MISSING_REBUILD_NORMAL_REOPEN_OK" -eq 1 ]; then
+    if [ "$(cat "$SCRUB_FILE" 2>/dev/null || true)" = "$SCRUB_CONTENT" ]; then
+        MISSING_REBUILD_NORMAL_READBACK_OK=1
+        pass "missing_rebuild_normal_readback"
+    else
+        fail "missing_rebuild_normal_readback" \
+            "read=$(cat "$SCRUB_FILE" 2>/dev/null || true)"
+    fi
+else
+    blocked "missing_rebuild_normal_readback" "normal successor topology did not mount"
+fi
+
+if [ "$MISSING_REBUILD_NORMAL_READBACK_OK" -eq 1 ]; then
+    if tidefsctl pool scrub "$POOL_NAME" --json \
+        > /tmp/missing_rebuild_scrub.json 2>/tmp/missing_rebuild_scrub.err \
+        && jq -e '
+            .pass == true
+            and .state_source == "live-owner"
+            and .blocks_corrupt == 0
+            and .blocks_unreadable == 0
+            and (.findings | length) == 0
+        ' /tmp/missing_rebuild_scrub.json >/dev/null; then
+        MISSING_REBUILD_SCRUB_OK=1
+        pass "missing_rebuild_scrub_clean"
+    else
+        fail "missing_rebuild_scrub_clean" \
+            "$(cat /tmp/missing_rebuild_scrub.err /tmp/missing_rebuild_scrub.json 2>/dev/null)"
+    fi
+else
+    blocked "missing_rebuild_scrub_clean" "normal successor readback failed"
+fi
+
 SCRUB_CORRUPTED_MEMBERS=0
 SCRUB_CORRUPTED_RECORDS=0
-if [ "$REPAIR_REOPENED" -eq 1 ]; then
+if [ "$REPAIR_REOPENED" -eq 1 ] && [ "$MISSING_REBUILD_SCRUB_OK" -eq 1 ]; then
     bytegrep -Fabo "$SCRUB_CONTENT" "$DEV0" \
         > /tmp/scrub_dev0_matches 2>/tmp/scrub_dev0_bytegrep.err || true
     bytegrep -Fabo "$SCRUB_CONTENT" "$DEV1" \
         > /tmp/scrub_dev1_matches 2>/tmp/scrub_dev1_bytegrep.err || true
     scrub_dev0_occurrences=$(wc -l < /tmp/scrub_dev0_matches)
     scrub_dev1_occurrences=$(wc -l < /tmp/scrub_dev1_matches)
-    if [ "$scrub_dev0_occurrences" -eq 1 ] \
-        && [ "$scrub_dev1_occurrences" -eq 1 ]; then
-        scrub_dev0_offset=$(cut -d: -f1 /tmp/scrub_dev0_matches)
-        scrub_dev1_offset=$(cut -d: -f1 /tmp/scrub_dev1_matches)
+    if [ "$scrub_dev0_occurrences" -ge 1 ] \
+        && [ "$scrub_dev1_occurrences" -ge 1 ]; then
+        # The block store is append-only and its scan/index keeps the latest
+        # record for a key. Repair and rebuild may therefore leave clean stale
+        # payload history; corrupt the highest matching payload offset rather
+        # than requiring raw byte uniqueness.
+        scrub_dev0_offset=$(tail -1 /tmp/scrub_dev0_matches | cut -d: -f1)
+        scrub_dev1_offset=$(tail -1 /tmp/scrub_dev1_matches | cut -d: -f1)
         case "$scrub_dev0_offset:$scrub_dev1_offset" in
             *[!0-9:]*|:*|*:)
                 fail "mounted_scrub_corruption_injected" \
@@ -1327,25 +1552,28 @@ if [ "$REPAIR_REOPENED" -eq 1 ]; then
                     > /tmp/scrub_dev1_after 2>/dev/null || true
                 scrub_dev0_after=$(wc -l < /tmp/scrub_dev0_after)
                 scrub_dev1_after=$(wc -l < /tmp/scrub_dev1_after)
+                scrub_dev0_expected_after=$((scrub_dev0_occurrences - 1))
+                scrub_dev1_expected_after=$((scrub_dev1_occurrences - 1))
                 if [ "$scrub_dev0_written" -eq 1 ] \
                     && [ "$scrub_dev1_written" -eq 1 ] \
-                    && [ "$scrub_dev0_after" -eq 0 ] \
-                    && [ "$scrub_dev1_after" -eq 0 ]; then
+                    && [ "$scrub_dev0_after" -eq "$scrub_dev0_expected_after" ] \
+                    && [ "$scrub_dev1_after" -eq "$scrub_dev1_expected_after" ]; then
                     SCRUB_CORRUPTED_MEMBERS=2
                     SCRUB_CORRUPTED_RECORDS=2
                     pass "mounted_scrub_corruption_injected"
                 else
                     fail "mounted_scrub_corruption_injected" \
-                        "dual injection did not remove exactly the selected occurrences: DEV0_write=$scrub_dev0_written DEV1_write=$scrub_dev1_written DEV0_after=$scrub_dev0_after DEV1_after=$scrub_dev1_after dd=$(cat /tmp/scrub_dev0_dd.err /tmp/scrub_dev1_dd.err 2>/dev/null)"
+                        "dual injection did not remove exactly the selected latest occurrences: DEV0_write=$scrub_dev0_written DEV1_write=$scrub_dev1_written DEV0_before=$scrub_dev0_occurrences DEV1_before=$scrub_dev1_occurrences DEV0_after=$scrub_dev0_after DEV1_after=$scrub_dev1_after dd=$(cat /tmp/scrub_dev0_dd.err /tmp/scrub_dev1_dd.err 2>/dev/null)"
                 fi
                 ;;
         esac
     else
         fail "mounted_scrub_corruption_injected" \
-            "expected exactly one current repaired payload occurrence per member: DEV0=$scrub_dev0_occurrences DEV1=$scrub_dev1_occurrences bytegrep=$(cat /tmp/scrub_dev0_bytegrep.err /tmp/scrub_dev1_bytegrep.err 2>/dev/null)"
+            "expected at least one current repaired payload occurrence per member: DEV0=$scrub_dev0_occurrences DEV1=$scrub_dev1_occurrences bytegrep=$(cat /tmp/scrub_dev0_bytegrep.err /tmp/scrub_dev1_bytegrep.err 2>/dev/null)"
     fi
 else
-    blocked "mounted_scrub_corruption_injected" "repaired pool did not reopen"
+    blocked "mounted_scrub_corruption_injected" \
+        "repaired pool did not complete missing-member rebuild and normal reopen"
 fi
 
 SCRUB_HASH_BEFORE=""
@@ -1467,6 +1695,16 @@ if [ "$INTEGRITY_CLEAN_OK" -eq 1 ] \
     && [ "$REPAIR_STALE_MOUNT_DETACHED_OK" -eq 1 ] \
     && [ "$REPAIR_REOPENED" -eq 1 ] \
     && [ "$REPAIR_REOPEN_READBACK_OK" -eq 1 ] \
+    && [ "$MISSING_REBUILD_IDENTITY_OK" -eq 1 ] \
+    && [ "$MISSING_REBUILD_OWNER_STOPPED_OK" -eq 1 ] \
+    && [ "$MISSING_REBUILD_DEVICE_REMOVED_OK" -eq 1 ] \
+    && [ "$MISSING_REBUILD_MOUNTED" -eq 1 ] \
+    && [ "$MISSING_REBUILD_NAMESPACE_RO_OK" -eq 1 ] \
+    && [ "$MISSING_REBUILD_COMPLETE_OK" -eq 1 ] \
+    && [ "$MISSING_REBUILD_READBACK_OK" -eq 1 ] \
+    && [ "$MISSING_REBUILD_NORMAL_REOPEN_OK" -eq 1 ] \
+    && [ "$MISSING_REBUILD_NORMAL_READBACK_OK" -eq 1 ] \
+    && [ "$MISSING_REBUILD_SCRUB_OK" -eq 1 ] \
     && [ "$SCRUB_FAILURE_REPORTED_OK" -eq 1 ] \
     && [ "$SCRUB_NO_WRITEBACK_OK" -eq 1 ] \
     && [ "$REPAIR_DUAL_REFUSED_OK" -eq 1 ] \
@@ -1538,7 +1776,12 @@ else
     blocked "mounted_integrity_failure_reported" "corruption injection failed"
 fi
 
-# Cleanup crash recovery daemon
+# Cleanup recovery-only or normal owner daemons.
+if [ -n "$RBP" ]; then
+    kill "$RBP" 2>/dev/null || true
+    sleep 1
+    umount "$MNT" 2>/dev/null || true
+fi
 if [ -n "$CRP" ]; then
     kill "$CRP" 2>/dev/null || true
     sleep 1
@@ -1555,8 +1798,10 @@ echo "backend=virtio_blk_raw_disks"
 echo "mode=pool_remount_lifecycle_userspace_fuse_with_read_only_and_crash_cycle"
 echo "pool_name=$POOL_NAME"
 echo "pool_uuid=$POOL_UUID"
-echo "dev0=$DEV0 dev0_size=$D0SIZE"
+echo "missing_device=$MISSING_DEVICE missing_device_guid=$MISSING_REBUILD_GUID"
+echo "active_index0=$DEV0 original_dev0_size=$D0SIZE"
 echo "dev1=$DEV1 dev1_size=$D1SIZE"
+echo "dev2=$DEV2 dev2_size=$D2SIZE"
 echo "PASSED=$PASSED FAILED=$FAILED BLOCKED=$BLOCKED"
 echo "test_content_pre_unmount=$TC"
 echo "test_content_post_remount=$PB"
@@ -1587,6 +1832,7 @@ INITSCRIPT
       -initrd "$WORK_DIR/initrd.img.gz" \
       -drive file="$DISK1_IMG",format=raw,if=virtio,index=0 \
       -drive file="$DISK2_IMG",format=raw,if=virtio,index=1 \
+      -drive file="$DISK3_IMG",format=raw,if=virtio,index=2 \
       -append "console=ttyS0 quiet panic=10" \
       -m 2G \
       -smp 2 \
@@ -1602,7 +1848,8 @@ INITSCRIPT
 
     for op in \
       fuse_support fuse_device \
-      virtio0_present virtio1_present virtio0_size virtio1_size \
+      virtio0_present virtio1_present virtio2_present \
+      virtio0_size virtio1_size virtio2_size \
       pool_create startup_failure_unwind startup_retry_mount \
       pool_import mount live_status write_data fsync_data read_verify lookup_inode \
       rename_entry link_inode_identity unlink_entry readdir_entry \
@@ -1626,6 +1873,11 @@ INITSCRIPT
       mounted_repair_single_completed mounted_repair_file_readable \
       mounted_repair_crash_sigkill mounted_repair_stale_mount_detached \
       mounted_repair_reopen mounted_repair_reopen_readback \
+      missing_rebuild_identity missing_rebuild_owner_stopped \
+      missing_rebuild_device_removed missing_rebuild_mount \
+      missing_rebuild_namespace_ro missing_rebuild_completed \
+      missing_rebuild_readback missing_rebuild_normal_reopen \
+      missing_rebuild_normal_readback missing_rebuild_scrub_clean \
       mounted_scrub_corruption_injected mounted_scrub_failure_reported \
       mounted_scrub_no_repair_writeback mounted_repair_dual_refused \
       mounted_repair_dual_bytes_unchanged \

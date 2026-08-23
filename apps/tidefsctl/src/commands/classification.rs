@@ -509,6 +509,12 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         summary: "rebuild a present readable replicated member through the live owner before same-cardinality topology commit",
     },
     CommandSurface {
+        path: "device rebuild",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwner,
+        summary: "rebuild one exact absent two-copy Pool member through a recovery-only read-only mounted owner",
+    },
+    CommandSurface {
         path: "device status",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwner,
@@ -744,13 +750,6 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         routing: RoutingSemantics::Removed,
         summary:
             "no authoritative pool registry exists; use pool scan --devices or pool status <pool>",
-    },
-    CommandSurface {
-        path: "device rebuild",
-        class: CommandClass::RemovedOrUnsupported,
-        routing: RoutingSemantics::Removed,
-        summary:
-            "offline directory object-store rebuild is retired; use live pool repair authority",
     },
     CommandSurface {
         path: "directory-backed pool media",
@@ -1010,7 +1009,6 @@ mod tests {
     fn removed_surfaces_are_classified_and_error_clearly() {
         for path in [
             "pool list",
-            "device rebuild",
             "directory-backed pool media",
             "pool integrity-check --backing-dir",
         ] {
@@ -1047,6 +1045,7 @@ mod tests {
 
         assert!(!help.contains("pool list [removed]"));
         assert!(!help.contains("device rebuild [removed]"));
+        assert!(help.contains("device rebuild [live-owner]"));
     }
 
     #[test]

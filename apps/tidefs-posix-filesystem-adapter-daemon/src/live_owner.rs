@@ -58,6 +58,7 @@ pub struct LiveOwnerConfig {
     pub mountpoint: PathBuf,
     pub runtime_dir: PathBuf,
     pub read_only: bool,
+    pub rebuild_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -71,6 +72,8 @@ pub struct LiveOwnerManifest {
     pub mountpoint: String,
     pub socket_path: String,
     pub read_only: bool,
+    #[serde(default)]
+    pub rebuild_only: bool,
 }
 
 pub struct LiveOwnerHandle {
@@ -266,6 +269,7 @@ fn start_owner(
         mountpoint: config.mountpoint.display().to_string(),
         socket_path: socket_path.display().to_string(),
         read_only: config.read_only,
+        rebuild_only: config.rebuild_only,
     };
     write_manifest(&manifest_path, &manifest)?;
 
@@ -578,7 +582,8 @@ fn dispatch_request(
         | LivePoolAdminCommand::PoolScrub
         | LivePoolAdminCommand::DeviceStatus
         | LivePoolAdminCommand::DeviceRemove
-        | LivePoolAdminCommand::DeviceReplace => match admin {
+        | LivePoolAdminCommand::DeviceReplace
+        | LivePoolAdminCommand::DeviceRebuild => match admin {
             LiveOwnerAdmin::Fuse { pool_owner, .. } => {
                 pool_owner.handle_live_pool_owner_admin_request(&request)
             }
@@ -1759,17 +1764,19 @@ fn pool_mount_refused(
     request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
 ) -> LivePoolAdminResponse {
-    let (mountpoint, dataset, read_only, relatime) = match pool_mount_request_args(&request.args) {
-        Ok(args) => args,
-        Err(err) => return live_admin_typed_error(err),
-    };
+    let (mountpoint, dataset, read_only, rebuild_only, relatime) =
+        match pool_mount_request_args(&request.args) {
+            Ok(args) => args,
+            Err(err) => return live_admin_typed_error(err),
+        };
     let message = format!(
-        "pool mount for already-imported pool '{}' must be performed by the live owner; the current {} owner has no secondary mount implementation for mountpoint '{}' dataset '{}' (read_only={}, relatime={})",
+        "pool mount for already-imported pool '{}' must be performed by the live owner; the current {} owner has no secondary mount implementation for mountpoint '{}' dataset '{}' (read_only={}, rebuild_only={}, relatime={})",
         manifest.pool_name,
         manifest.owner_kind,
         mountpoint,
         dataset,
         read_only,
+        rebuild_only,
         relatime,
     );
     LivePoolAdminResponse::error(1, message)
@@ -1777,12 +1784,22 @@ fn pool_mount_refused(
 
 fn pool_mount_request_args(
     args: &LivePoolAdminArgs,
-) -> Result<(&str, &str, bool, bool), LivePoolAdminError> {
-    validate_request_arg_names(args, &["mountpoint", "dataset", "read_only", "relatime"])?;
+) -> Result<(&str, &str, bool, bool, bool), LivePoolAdminError> {
+    validate_request_arg_names(
+        args,
+        &[
+            "mountpoint",
+            "dataset",
+            "read_only",
+            "rebuild_only",
+            "relatime",
+        ],
+    )?;
     Ok((
         request_arg_str(args, "mountpoint")?.unwrap_or("<unspecified>"),
         request_arg_str(args, "dataset")?.unwrap_or("root"),
         request_arg_bool(args, "read_only")?.unwrap_or(false),
+        request_arg_bool(args, "rebuild_only")?.unwrap_or(false),
         request_arg_bool(args, "relatime")?.unwrap_or(false),
     ))
 }
@@ -2089,6 +2106,7 @@ mod tests {
             mountpoint: "/mnt/tank".to_string(),
             socket_path: "/run/tidefs/pools/tank/owner.sock".to_string(),
             read_only: false,
+            rebuild_only: false,
         }
     }
 
@@ -2250,6 +2268,7 @@ mod tests {
                 mountpoint: PathBuf::from("ublk:vol"),
                 runtime_dir: runtime_dir.clone(),
                 read_only: false,
+                rebuild_only: false,
             },
             Arc::clone(&runtime),
             "vol".to_string(),
@@ -2834,6 +2853,7 @@ mod tests {
                         LivePoolAdminArg::String("root".to_string()),
                     ),
                     ("read_only".to_string(), LivePoolAdminArg::Bool(true)),
+                    ("rebuild_only".to_string(), LivePoolAdminArg::Bool(false)),
                     ("relatime".to_string(), LivePoolAdminArg::Bool(false)),
                 ]
                 .into_iter()

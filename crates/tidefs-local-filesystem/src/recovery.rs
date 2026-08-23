@@ -439,28 +439,12 @@ pub(crate) fn load_canonical_committed_state_for_dataset(
 ) -> Result<(FileSystemState, RootCommitRecord)> {
     let bytes = runtime.load_dataset_root(dataset_id, DatasetRootKind::Filesystem)?;
     let root = decode_root_commit(&bytes)?;
-    let ordinary = load_state_from_transaction_pool_for_dataset(
+    let mut state = load_state_from_transaction_pool_admitting_pending_device_lifecycle(
         runtime.pool(),
         dataset_id,
         &root,
         root_authentication_key,
-    );
-    let mut state = match ordinary {
-        Ok(state) => state,
-        Err(error) => {
-            let pending_removal = runtime.pool().pending_device_removal_path()?.is_some();
-            let pending_replacement = runtime.pool().has_device_replacement_predecessor_resume();
-            if !pending_removal && !pending_replacement {
-                return Err(error);
-            }
-            load_state_from_transaction_pool_for_pending_device_lifecycle(
-                runtime.pool(),
-                dataset_id,
-                &root,
-                root_authentication_key,
-            )?
-        }
-    };
+    )?;
     state.set_inode_authority_dataset_id(*dataset_id.as_bytes());
     Ok((state, root))
 }
@@ -564,9 +548,19 @@ pub(crate) fn recover_canonical_committed_state_for_dataset_admitting_pending_re
     RootCommitRecord,
     Vec<PendingReplicatedRepairReconciliation>,
 )> {
-    let pending = runtime
-        .pool()
-        .pending_replicated_repair_recovery_evidence_all(DeviceIoClass::Data)?;
+    let device_lifecycle_active = runtime.pool().pending_device_removal_path()?.is_some()
+        || runtime.pool().has_device_replacement_predecessor_resume();
+    // Device lifecycle recovery owns predecessor-to-successor receipt
+    // reconciliation while its durable label evidence is active. Do not ask
+    // the mutually exclusive target-repair path to classify those receipt
+    // transitions before the lifecycle-aware canonical root loader runs.
+    let pending = if device_lifecycle_active {
+        Vec::new()
+    } else {
+        runtime
+            .pool()
+            .pending_replicated_repair_recovery_evidence_all(DeviceIoClass::Data)?
+    };
     if !pending.is_empty() {
         if !policy.allows_any_mutation() {
             return Err(FileSystemError::CorruptState {
@@ -640,10 +634,7 @@ pub(crate) fn recover_canonical_committed_state_for_dataset_admitting_pending_re
             if !matches!(error, FileSystemError::ReceiptAuthorityStale { .. }) {
                 return Err(error);
             }
-            if !policy.allows_any_mutation()
-                || runtime.pool().pending_device_removal_path()?.is_some()
-                || runtime.pool().has_device_replacement_predecessor_resume()
-            {
+            if !policy.allows_any_mutation() || device_lifecycle_active {
                 return Err(error);
             }
             let completed_candidates = completed_replicated_repair_reconciliations(runtime.pool())?;
@@ -2536,6 +2527,40 @@ pub(crate) fn load_state_from_transaction_pool_for_dataset(
     Ok(state)
 }
 
+/// Load one exact filesystem transaction while admitting only a durable
+/// device-lifecycle receipt transition when ordinary authority is stale.
+///
+/// Current and retained roots use this same boundary so a crash after one
+/// root advances cannot make retry reject another authenticated predecessor.
+pub(crate) fn load_state_from_transaction_pool_admitting_pending_device_lifecycle(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<FileSystemState> {
+    match load_state_from_transaction_pool_for_dataset(
+        pool,
+        dataset_id,
+        root,
+        root_authentication_key,
+    ) {
+        Ok(state) => Ok(state),
+        Err(error) => {
+            let pending_removal = pool.pending_device_removal_path()?.is_some();
+            let pending_replacement = pool.has_device_replacement_predecessor_resume();
+            if !pending_removal && !pending_replacement {
+                return Err(error);
+            }
+            load_state_from_transaction_pool_for_pending_device_lifecycle(
+                pool,
+                dataset_id,
+                root,
+                root_authentication_key,
+            )
+        }
+    }
+}
+
 /// Authenticate one committed root immediately before a comparison-selected
 /// replicated chunk repair.
 ///
@@ -3869,14 +3894,15 @@ fn pending_device_lifecycle_transaction_content_entries(
         reason:
             "pending device lifecycle root is missing its authenticated content-manifest checksum",
     })?;
-    let survivor = pool.get_with_removal_survivor_receipt(DeviceIoClass::Data, content_key)?;
+    let survivor =
+        pool.get_with_device_lifecycle_survivor_receipt(DeviceIoClass::Data, content_key)?;
     let predecessor = if survivor
         .as_ref()
         .is_some_and(|(bytes, _)| checksum64(bytes) == expected_checksum)
     {
         None
     } else {
-        pool.get_with_removal_predecessor_receipt(DeviceIoClass::Data, content_key)?
+        pool.get_with_device_lifecycle_predecessor_receipt(DeviceIoClass::Data, content_key)?
     };
     let authenticated_bytes = survivor
         .as_ref()
@@ -3926,13 +3952,13 @@ fn pending_device_lifecycle_transaction_content_entries(
             );
             let chunk_key = keyspace.scope(logical_chunk_key);
             let survivor_chunk =
-                pool.get_with_removal_survivor_receipt(DeviceIoClass::Data, chunk_key)?;
+                pool.get_with_device_lifecycle_survivor_receipt(DeviceIoClass::Data, chunk_key)?;
             if let Some((bytes, receipt)) = survivor_chunk {
                 let mut candidate = authenticated_ref.clone();
                 candidate.placement_receipt_generation = receipt.generation;
                 if receipt.generation == 0
                     || receipt.generation < authenticated_ref.placement_receipt_generation
-                    || !crate::allocation::pending_removal_chunk_payload_matches_ref(
+                    || !crate::allocation::pending_device_lifecycle_chunk_payload_matches_ref(
                         pool,
                         &candidate,
                         logical_chunk_key,
@@ -3946,13 +3972,16 @@ fn pending_device_lifecycle_transaction_content_entries(
                 }
             } else {
                 let (bytes, receipt) = pool
-                    .get_with_removal_predecessor_receipt(DeviceIoClass::Data, chunk_key)?
+                    .get_with_device_lifecycle_predecessor_receipt(
+                        DeviceIoClass::Data,
+                        chunk_key,
+                    )?
                     .ok_or(FileSystemError::CorruptState {
                         reason:
                             "pending device lifecycle lost both predecessor and survivor chunk authority",
                     })?;
                 if receipt.generation != authenticated_ref.placement_receipt_generation
-                    || !crate::allocation::pending_removal_chunk_payload_matches_ref(
+                    || !crate::allocation::pending_device_lifecycle_chunk_payload_matches_ref(
                         pool,
                         authenticated_ref,
                         logical_chunk_key,

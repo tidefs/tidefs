@@ -172,6 +172,10 @@ pub enum PoolCommand {
         #[arg(long = "read-only")]
         read_only: bool,
 
+        /// Admit only one explicit missing-member rebuild while keeping FUSE read-only
+        #[arg(long = "rebuild-only", requires_all = ["read_only", "devices"])]
+        rebuild_only: bool,
+
         /// Block devices for importing and launching this development harness
         #[arg(short = 'd', long = "devices", num_args = 1..)]
         devices: Option<Vec<PathBuf>>,
@@ -450,6 +454,7 @@ pub fn handle_pool(cmd: PoolCommand) {
             pool_name,
             mountpoint,
             read_only,
+            rebuild_only,
             devices,
             relatime,
             dataset,
@@ -480,6 +485,7 @@ pub fn handle_pool(cmd: PoolCommand) {
                 pool_name,
                 mount_point: mountpoint,
                 read_only,
+                rebuild_only,
                 devices,
                 relatime,
                 dataset,

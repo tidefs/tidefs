@@ -463,6 +463,7 @@ fn handle_attach(
         mountpoint: PathBuf::from(format!("ublk:{}", target.dataset)),
         runtime_dir,
         read_only: false,
+        rebuild_only: false,
     };
     let live_owner = match start_block_owner(
         owner_config,

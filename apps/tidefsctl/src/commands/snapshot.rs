@@ -2440,6 +2440,7 @@ fn handle_export(args: SnapshotExportArgs) {
         foreground: true,
         debug: false,
         read_only: false,
+        rebuild_only: false,
         writeback_cache: false,
         coherency_profile:
             tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile::Writeback,

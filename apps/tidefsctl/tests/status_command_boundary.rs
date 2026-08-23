@@ -558,6 +558,7 @@ fn live_degraded_pool_status_reports_durable_member_identity() {
             mountpoint: fixture.path().join("not-mounted"),
             runtime_dir: runtime_dir.clone(),
             read_only: true,
+            rebuild_only: false,
         },
         adapter.engine_handle(),
         adapter.dataset_replacement_handle(),
@@ -791,6 +792,7 @@ fn live_device_remove_cli_commits_survivor_topology() {
             mountpoint: fixture.path().join("not-mounted"),
             runtime_dir: runtime_dir.clone(),
             read_only: false,
+            rebuild_only: false,
         },
         adapter.engine_handle(),
         adapter.dataset_replacement_handle(),
@@ -983,6 +985,7 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
             mountpoint: fixture.path().join("not-mounted"),
             runtime_dir: runtime_dir.clone(),
             read_only: false,
+            rebuild_only: false,
         },
         adapter.engine_handle(),
         adapter.dataset_replacement_handle(),
@@ -1081,4 +1084,302 @@ fn live_device_replace_cli_rebuilds_and_reimports() {
         redundancy_policy,
         &independent_expected,
     );
+}
+
+#[test]
+fn live_device_rebuild_cli_requires_and_uses_recovery_only_owner() {
+    let fixture = tempfile::tempdir().expect("create live rebuild fixture");
+    let metadata_dir = fixture.path().join("metadata");
+    let devices = [
+        fixture.path().join("member-0.img"),
+        fixture.path().join("member-1.img"),
+    ];
+    let replacement = fixture.path().join("replacement.img");
+    fs::create_dir_all(&metadata_dir).expect("create Pool metadata directory");
+    for device in devices.iter().chain(std::iter::once(&replacement)) {
+        File::create(device)
+            .expect("create regular-file Pool member")
+            .set_len(16 * 1024 * 1024)
+            .expect("size regular-file Pool member");
+    }
+
+    let pool_name = format!(
+        "device-rebuild-{}-{}",
+        std::process::id(),
+        NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let redundancy_policy = PoolRedundancyPolicy::replicated(2);
+    let mut filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        &devices,
+        &pool_name,
+        redundancy_policy,
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::default(),
+    )
+    .expect("create two-member replicated filesystem");
+    let snapshot_payload = vec![0x4a; 8193];
+    let current_payload = vec![0x7c; 8193];
+    filesystem
+        .create_file("/rebuild.bin", 0o600)
+        .expect("create rebuild carrier file");
+    filesystem
+        .write_file("/rebuild.bin", 0, &snapshot_payload)
+        .expect("write rebuild snapshot bytes");
+    filesystem
+        .sync_all()
+        .expect("commit rebuild snapshot bytes");
+    filesystem
+        .create_snapshot("before-rebuild-overwrite")
+        .expect("retain rebuild snapshot");
+    filesystem
+        .write_file("/rebuild.bin", 0, &current_payload)
+        .expect("write rebuild current bytes");
+    filesystem.sync_all().expect("commit rebuild current bytes");
+    let topology = filesystem.pool_topology_status();
+    let missing_guid = topology
+        .members
+        .iter()
+        .find(|member| member.device_index == 0)
+        .expect("durable member zero")
+        .device_guid;
+    drop(filesystem);
+
+    let scanned = tidefs_pool_scan::scan_labels(&devices).expect("scan created Pool labels");
+    let pool_uuid = scanned[0].pool_guid.expect("created label has a Pool UUID");
+    assert_eq!(scanned[1].pool_guid, Some(pool_uuid));
+    fs::remove_file(&devices[0]).expect("make member zero physically absent");
+    let survivor = [devices[1].clone()];
+    let survivor_before = fs::read(&survivor[0]).expect("snapshot survivor before recovery open");
+    let runtime_dir = PathBuf::from("/run/tidefs/pools").join(hex_guid(&pool_uuid));
+    assert!(
+        !runtime_dir.exists(),
+        "unique test Pool runtime directory unexpectedly exists: {}",
+        runtime_dir.display()
+    );
+    let replacement_before = fs::read(&replacement).expect("snapshot blank replacement");
+
+    let ordinary = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        &survivor,
+        &pool_name,
+        redundancy_policy,
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::ReadOnly,
+    )
+    .expect("open ordinary read-only survivor");
+    let ordinary_engine = VfsLocalFileSystem::new(ordinary).with_read_only();
+    let ordinary_shared_owner = ordinary_engine.shared_pool_owner();
+    let ordinary_adapter = FuseVfsAdapter::new(Box::new(ordinary_engine))
+        .expect("create ordinary read-only adapter")
+        .with_read_only();
+    let ordinary_shutdown = Arc::new(AtomicBool::new(false));
+    let ordinary_owner = start_fuse_owner(
+        LiveOwnerConfig {
+            pool_name: pool_name.clone(),
+            pool_uuid,
+            backing_dir: metadata_dir.clone(),
+            mountpoint: fixture.path().join("ordinary-not-mounted"),
+            runtime_dir: runtime_dir.clone(),
+            read_only: true,
+            rebuild_only: false,
+        },
+        ordinary_adapter.engine_handle(),
+        ordinary_adapter.dataset_replacement_handle(),
+        ordinary_shared_owner.clone(),
+        Arc::clone(&ordinary_shutdown),
+    )
+    .expect("start ordinary read-only live owner");
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args([
+            "device",
+            "rebuild",
+            &pool_name,
+            &hex_guid(&missing_guid),
+            replacement.to_str().expect("UTF-8 replacement path"),
+            "--json",
+        ])
+        .output()
+        .expect("run rebuild against ordinary read-only owner");
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(refused.stderr.is_empty(), "{refused:?}");
+    let refusal: serde_json::Value =
+        serde_json::from_slice(&refused.stdout).expect("parse rebuild refusal JSON");
+    assert_eq!(refusal["ok"], false, "{refusal}");
+    assert_eq!(refusal["status"], "refused", "{refusal}");
+    assert_eq!(refusal["recovery_mode"], "device-rebuild-only");
+    assert_eq!(refusal["namespace_read_only"], true);
+    assert_eq!(refusal["topology_committed"], false);
+    assert!(refusal["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("--read-only --rebuild-only")));
+    assert_eq!(
+        fs::read(&replacement).expect("reread refused replacement"),
+        replacement_before,
+        "ordinary read-only refusal mutated the replacement candidate"
+    );
+    assert_eq!(
+        fs::read(&survivor[0]).expect("reread survivor after ordinary read-only refusal"),
+        survivor_before,
+        "ordinary read-only open or refusal mutated the survivor"
+    );
+    ordinary_owner.stop();
+    drop(ordinary_shared_owner);
+    drop(ordinary_adapter);
+
+    let recovery = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        &survivor,
+        &pool_name,
+        redundancy_policy,
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::DeviceRebuildOnly,
+    )
+    .expect("open recovery-only survivor");
+    assert_eq!(
+        recovery
+            .read_file("/rebuild.bin")
+            .expect("read mounted bytes through recovery-only owner"),
+        current_payload
+    );
+    assert_eq!(
+        fs::read(&survivor[0]).expect("reread survivor before explicit rebuild"),
+        survivor_before,
+        "recovery-only open mutated the survivor before device rebuild"
+    );
+    let recovery_engine = VfsLocalFileSystem::new(recovery).with_read_only();
+    let recovery_shared_owner = recovery_engine.shared_pool_owner();
+    let recovery_adapter = FuseVfsAdapter::new(Box::new(recovery_engine))
+        .expect("create recovery-only adapter")
+        .with_read_only();
+    let recovery_shutdown = Arc::new(AtomicBool::new(false));
+    let recovery_owner = start_fuse_owner(
+        LiveOwnerConfig {
+            pool_name: pool_name.clone(),
+            pool_uuid,
+            backing_dir: metadata_dir.clone(),
+            mountpoint: fixture.path().join("recovery-not-mounted"),
+            runtime_dir: runtime_dir.clone(),
+            read_only: true,
+            rebuild_only: true,
+        },
+        recovery_adapter.engine_handle(),
+        recovery_adapter.dataset_replacement_handle(),
+        recovery_shared_owner.clone(),
+        Arc::clone(&recovery_shutdown),
+    )
+    .expect("start recovery-only live owner");
+
+    let rebuilt = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args([
+            "device",
+            "rebuild",
+            &pool_name,
+            &hex_guid(&missing_guid),
+            replacement.to_str().expect("UTF-8 replacement path"),
+            "--json",
+        ])
+        .output()
+        .expect("run rebuild through recovery-only owner socket");
+    assert!(rebuilt.status.success(), "{rebuilt:?}");
+    assert!(rebuilt.stderr.is_empty(), "{rebuilt:?}");
+    let result: serde_json::Value =
+        serde_json::from_slice(&rebuilt.stdout).expect("parse rebuild result JSON");
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(result["recovery_mode"], "device-rebuild-only");
+    assert_eq!(result["namespace_read_only"], true);
+    assert_eq!(result["missing_device_guid"], hex_guid(&missing_guid));
+    assert_eq!(result["durable_device_index"], 0);
+    assert_eq!(result["objects_failed"], 0);
+    assert_eq!(result["topology_committed"], true);
+    assert_legacy_device_lifecycle_files_absent(&metadata_dir);
+    {
+        let filesystem = recovery_shared_owner.borrow();
+        assert_eq!(filesystem.pool_topology_status().missing_members, 0);
+        assert_eq!(
+            filesystem
+                .read_file("/rebuild.bin")
+                .expect("read bytes after live-owner rebuild"),
+            current_payload
+        );
+    }
+
+    recovery_owner.stop();
+    drop(recovery_shared_owner);
+    drop(recovery_adapter);
+    fs::remove_dir(&runtime_dir).expect("remove empty test Pool runtime directory");
+
+    let rebuilt_topology = [replacement.clone(), devices[1].clone()];
+    let mut reopened = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        &rebuilt_topology,
+        &pool_name,
+        redundancy_policy,
+        StoreOptions::default(),
+        RootAuthenticationKey::demo_key(),
+        RecoveryPolicy::default(),
+    )
+    .expect("reimport replacement plus survivor topology");
+    assert_eq!(
+        reopened
+            .read_file("/rebuild.bin")
+            .expect("read rebuilt current bytes after normal reimport"),
+        current_payload
+    );
+    reopened
+        .rollback_to_snapshot("before-rebuild-overwrite")
+        .expect("rollback retained rebuild snapshot");
+    assert_eq!(
+        reopened
+            .read_file("/rebuild.bin")
+            .expect("read rebuilt snapshot bytes"),
+        snapshot_payload
+    );
+
+    fs::create_dir(&runtime_dir).expect("recreate test Pool runtime directory");
+    let normal_engine = VfsLocalFileSystem::new(reopened);
+    let normal_shared_owner = normal_engine.shared_pool_owner();
+    let normal_adapter =
+        FuseVfsAdapter::new(Box::new(normal_engine)).expect("create normal rebuilt adapter");
+    let normal_shutdown = Arc::new(AtomicBool::new(false));
+    let normal_owner = start_fuse_owner(
+        LiveOwnerConfig {
+            pool_name: pool_name.clone(),
+            pool_uuid,
+            backing_dir: metadata_dir.clone(),
+            mountpoint: fixture.path().join("normal-not-mounted"),
+            runtime_dir: runtime_dir.clone(),
+            read_only: false,
+            rebuild_only: false,
+        },
+        normal_adapter.engine_handle(),
+        normal_adapter.dataset_replacement_handle(),
+        normal_shared_owner.clone(),
+        Arc::clone(&normal_shutdown),
+    )
+    .expect("start normal rebuilt live owner");
+    let scrubbed = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args(["pool", "scrub", &pool_name, "--json"])
+        .output()
+        .expect("scrub rebuilt topology through live owner socket");
+    assert!(scrubbed.status.success(), "{scrubbed:?}");
+    assert!(scrubbed.stderr.is_empty(), "{scrubbed:?}");
+    let scrub: serde_json::Value =
+        serde_json::from_slice(&scrubbed.stdout).expect("parse rebuilt scrub JSON");
+    assert_eq!(scrub["pass"], true, "rebuilt CLI topology scrub: {scrub}");
+    assert_eq!(scrub["state_source"], "live-owner");
+    assert!(scrub["blocks_scanned"]
+        .as_u64()
+        .is_some_and(|count| count > 0));
+    assert_eq!(scrub["blocks_corrupt"], 0);
+    assert_eq!(scrub["blocks_unreadable"], 0);
+    assert_eq!(scrub["blocks_no_checksum"], 0);
+    normal_owner.stop();
+    drop(normal_shared_owner);
+    drop(normal_adapter);
+    fs::remove_dir(&runtime_dir).expect("remove normal test Pool runtime directory");
 }

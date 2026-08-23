@@ -4147,7 +4147,9 @@ impl PoolDatasetOwner {
             redundancy_policy: pool_redundancy_policy,
             ..PoolProperties::default()
         };
-        let pool = if recovery_policy.allows_any_mutation() {
+        let pool = if recovery_policy.allows_device_rebuild() {
+            Pool::open_missing_member_rebuild_existing(config, properties, options)?
+        } else if recovery_policy.allows_any_mutation() {
             Pool::create(config, properties, options)?
         } else {
             Pool::open_read_only_existing(config, properties, options)?

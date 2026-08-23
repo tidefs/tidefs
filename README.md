@@ -228,6 +228,30 @@ datasets. This row does not claim failed-member rebuild, writable degraded
 operation, simultaneous multi-mounted filesystem atomicity, secure erase,
 media remanence, sanitization, decommissioning, or production readiness.
 
+The same live-owner boundary also implements one bounded missing-member
+rebuild row for an exact two-member `Replicated { copies: 2 }` Pool.
+`tidefsctl pool mount <pool> <mountpoint> --devices <survivor> --read-only
+--rebuild-only` imports exactly one authenticated survivor and keeps the FUSE
+namespace and ordinary recovery mutation read-only. `tidefsctl device rebuild
+<pool> <missing-member-guid> <replacement-device> --json` is the only scoped
+mutation: it requires the full durable missing GUID, a distinct blank
+same-backing candidate with sufficient capacity, and local live-owner
+authority. Versioned checksummed labels bind the Pool GUID, missing member
+index and GUID, new GUID and path, predecessor/successor topology generations,
+subject progress, and terminal state before candidate initialization. The
+owner rebuilds current receipts from the authenticated survivor, reconciles
+mounted and active independent filesystem roots plus their retained
+snapshot-table roots, preserves co-owned Pool-runtime volume graphs, rotates
+the mounted authenticated root ring, and only then publishes redundant
+survivor-plus-replacement topology labels. Reopen resumes from label authority
+before candidate publication, during receipt/root reconciliation, and after
+successor topology publication without a host marker file. Success permits a
+normal writable reimport from survivor plus replacement; it does not admit
+general writable degraded operation, recover absent or corrupt survivor data,
+support erasure-coded or clustered rebuild, activate hot spares, establish
+simultaneous multi-mounted atomicity, or make a support or production-readiness
+claim.
+
 The offline local carrier implements one bounded Pool-destroy row for an exact
 exported Pool supplied with all member paths. `tidefsctl pool destroy` writes
 and rereads a complete `Destroyed` trailing-label family before promoting and

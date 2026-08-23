@@ -417,6 +417,8 @@ pub struct DeviceReplacement {
 pub struct DeviceReplacementResult {
     pub old_path: PathBuf,
     pub new_path: PathBuf,
+    pub old_member_present: bool,
+    pub device_index: usize,
     pub old_device_guid: [u8; 16],
     pub new_device_guid: [u8; 16],
     pub topology_generation: u64,
@@ -1737,6 +1739,17 @@ enum OldReceiptPolicy<'a> {
 enum PoolOpenMode {
     Writable,
     ReadOnlyExisting,
+    MissingMemberRebuild,
+}
+
+impl PoolOpenMode {
+    const fn has_read_only_namespace(self) -> bool {
+        matches!(self, Self::ReadOnlyExisting | Self::MissingMemberRebuild)
+    }
+
+    const fn opens_writable_devices(self) -> bool {
+        matches!(self, Self::Writable | Self::MissingMemberRebuild)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1753,6 +1766,10 @@ pub struct Pool {
     properties: PoolProperties,
     /// Whether this Pool was imported for side-effect-free inspection.
     read_only: bool,
+    /// Whether one explicit missing-member rebuild may arm raw mutation.
+    missing_member_rebuild_only: bool,
+    /// Scoped mutation capability held only by the live rebuild command.
+    missing_member_rebuild_active: bool,
     classes: Vec<DeviceClass>,
     devices: Vec<Device>,
     class_map: ClassMap,
@@ -1875,6 +1892,7 @@ struct DeviceReplacementEvidenceMarker {
     device_index: usize,
     old_path: PathBuf,
     new_path: PathBuf,
+    old_member_present: bool,
     total_subjects: u64,
     subjects_completed: u64,
     subjects_failed: u64,
@@ -1904,6 +1922,18 @@ fn next_pool_lifecycle_sequence(current: Option<u64>) -> Result<u64> {
 
 fn checked_successor_topology_generation(current: u64) -> Option<u64> {
     current.checked_add(1)
+}
+
+fn generate_unique_device_guid(existing: &[[u8; 16]]) -> Result<[u8; 16]> {
+    for _ in 0..64 {
+        let candidate = rand::random();
+        if candidate != [0; 16] && !existing.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(StoreError::InvalidOptions {
+        reason: "could not generate a unique nonzero device GUID",
+    })
 }
 
 /// Discover the current logical subjects whose authoritative placement receipt
@@ -1991,6 +2021,8 @@ impl DeviceReplacementEvidenceMarker {
         DeviceReplacementResult {
             old_path: self.old_path.clone(),
             new_path: self.new_path.clone(),
+            old_member_present: self.old_member_present,
+            device_index: self.device_index,
             old_device_guid: self.old_device_guid,
             new_device_guid: self.new_device_guid,
             topology_generation: self.topology_epoch,
@@ -2010,9 +2042,10 @@ impl DeviceReplacementEvidenceMarker {
     }
 }
 
-const DEVICE_REPLACEMENT_EVIDENCE_MAGIC_V2: &[u8; 8] = b"TFSDRP2\0";
+const DEVICE_REPLACEMENT_EVIDENCE_MAGIC_V3: &[u8; 8] = b"TFSDRP3\0";
 const DEVICE_REPLACEMENT_EVIDENCE_CHECKSUM_LEN: usize = 32;
 const DEVICE_REPLACEMENT_EVIDENCE_STABLE_FLAG: u8 = 1;
+const DEVICE_REPLACEMENT_EVIDENCE_MISSING_OLD_FLAG: u8 = 1 << 1;
 
 fn invalid_device_replacement_evidence() -> StoreError {
     StoreError::InvalidOptions {
@@ -2054,9 +2087,11 @@ fn encode_device_replacement_evidence(
         .subjects_completed
         .checked_add(evidence.subjects_failed)
         .ok_or_else(invalid_device_replacement_evidence)?;
-    if old_path.is_empty()
+    if (evidence.old_member_present && old_path.is_empty())
+        || (!evidence.old_member_present && !old_path.is_empty())
         || new_path.is_empty()
-        || old_path == new_path
+        || (!old_path.is_empty() && old_path == new_path)
+        || evidence.new_device_guid == [0; 16]
         || evidence.old_device_guid == evidence.new_device_guid
         || evidence.topology_epoch == 0
         || completed_or_failed > evidence.total_subjects
@@ -2071,7 +2106,7 @@ fn encode_device_replacement_evidence(
     }
 
     let mut encoded = Vec::with_capacity(
-        DEVICE_REPLACEMENT_EVIDENCE_MAGIC_V2.len()
+        DEVICE_REPLACEMENT_EVIDENCE_MAGIC_V3.len()
             + 16 * 3
             + std::mem::size_of::<u64>() * 6
             + std::mem::size_of::<u32>() * 3
@@ -2080,18 +2115,21 @@ fn encode_device_replacement_evidence(
             + new_path.len()
             + DEVICE_REPLACEMENT_EVIDENCE_CHECKSUM_LEN,
     );
-    encoded.extend_from_slice(DEVICE_REPLACEMENT_EVIDENCE_MAGIC_V2);
+    encoded.extend_from_slice(DEVICE_REPLACEMENT_EVIDENCE_MAGIC_V3);
     encoded.extend_from_slice(&evidence.pool_guid);
     encoded.extend_from_slice(&evidence.old_device_guid);
     encoded.extend_from_slice(&evidence.new_device_guid);
     encoded.extend_from_slice(&evidence.topology_epoch.to_le_bytes());
     encoded.extend_from_slice(&device_index.to_le_bytes());
     encoded.push(replacement_evidence_state_code(evidence.state));
-    encoded.push(if evidence.evidence_stable {
-        DEVICE_REPLACEMENT_EVIDENCE_STABLE_FLAG
-    } else {
-        0
-    });
+    let mut flags = 0;
+    if evidence.evidence_stable {
+        flags |= DEVICE_REPLACEMENT_EVIDENCE_STABLE_FLAG;
+    }
+    if !evidence.old_member_present {
+        flags |= DEVICE_REPLACEMENT_EVIDENCE_MISSING_OLD_FLAG;
+    }
+    encoded.push(flags);
     encoded.extend_from_slice(&evidence.total_subjects.to_le_bytes());
     encoded.extend_from_slice(&evidence.subjects_completed.to_le_bytes());
     encoded.extend_from_slice(&evidence.subjects_failed.to_le_bytes());
@@ -2117,8 +2155,8 @@ fn decode_device_replacement_evidence(encoded: &[u8]) -> Result<DeviceReplacemen
         }
 
         let mut cursor = ReceiptCursor::new(checksum_input);
-        if cursor.take(DEVICE_REPLACEMENT_EVIDENCE_MAGIC_V2.len())?
-            != DEVICE_REPLACEMENT_EVIDENCE_MAGIC_V2
+        if cursor.take(DEVICE_REPLACEMENT_EVIDENCE_MAGIC_V3.len())?
+            != DEVICE_REPLACEMENT_EVIDENCE_MAGIC_V3
         {
             return None;
         }
@@ -2129,7 +2167,11 @@ fn decode_device_replacement_evidence(encoded: &[u8]) -> Result<DeviceReplacemen
         let device_index = u32::from_le_bytes(cursor.array()?) as usize;
         let state = replacement_evidence_state_from_code(cursor.u8()?)?;
         let flags = cursor.u8()?;
-        if flags & !DEVICE_REPLACEMENT_EVIDENCE_STABLE_FLAG != 0 {
+        if flags
+            & !(DEVICE_REPLACEMENT_EVIDENCE_STABLE_FLAG
+                | DEVICE_REPLACEMENT_EVIDENCE_MISSING_OLD_FLAG)
+            != 0
+        {
             return None;
         }
         let total_subjects = u64::from_le_bytes(cursor.array()?);
@@ -2139,7 +2181,11 @@ fn decode_device_replacement_evidence(encoded: &[u8]) -> Result<DeviceReplacemen
         let bytes_rebuilt = u64::from_le_bytes(cursor.array()?);
         let old_path_len = u32::from_le_bytes(cursor.array()?) as usize;
         let new_path_len = u32::from_le_bytes(cursor.array()?) as usize;
-        if old_path_len == 0 || new_path_len == 0 {
+        let old_member_present = flags & DEVICE_REPLACEMENT_EVIDENCE_MISSING_OLD_FLAG == 0;
+        if (old_member_present && old_path_len == 0)
+            || (!old_member_present && old_path_len != 0)
+            || new_path_len == 0
+        {
             return None;
         }
         let old_path = PathBuf::from(OsString::from_vec(cursor.take(old_path_len)?.to_vec()));
@@ -2156,6 +2202,7 @@ fn decode_device_replacement_evidence(encoded: &[u8]) -> Result<DeviceReplacemen
             device_index,
             old_path,
             new_path,
+            old_member_present,
             total_subjects,
             subjects_completed,
             subjects_failed,
@@ -2429,6 +2476,89 @@ fn validate_read_only_lifecycle_state(
     Err(StoreError::InvalidOptions {
         reason: "read-only pool import refuses unresolved device replacement",
     })
+}
+
+fn validate_missing_member_rebuild_lifecycle_state(
+    durable_device_guids: &[[u8; 16]],
+    topology_generation: u64,
+    lifecycle: Option<&PoolLifecycleLabelRecord>,
+) -> Result<()> {
+    let Some(lifecycle) = lifecycle else {
+        return Ok(());
+    };
+    match lifecycle.kind {
+        pool_label::PoolLifecycleKindV1::Clear => Ok(()),
+        pool_label::PoolLifecycleKindV1::DeviceRemoval => Err(StoreError::InvalidOptions {
+            reason: "missing-member rebuild import refuses pending device removal",
+        }),
+        pool_label::PoolLifecycleKindV1::DeviceReplacement => {
+            let evidence = decode_device_replacement_evidence(&lifecycle.payload)?;
+            let durable_target = durable_device_guids.get(evidence.device_index).copied();
+            let predecessor_topology = durable_target == Some(evidence.old_device_guid)
+                && checked_successor_topology_generation(topology_generation)
+                    == Some(evidence.topology_epoch);
+            let successor_topology = durable_target == Some(evidence.new_device_guid)
+                && topology_generation == evidence.topology_epoch
+                && evidence.evidence_stable;
+            if !evidence.old_member_present
+                && evidence.state.is_active()
+                && (predecessor_topology || successor_topology)
+            {
+                Ok(())
+            } else {
+                Err(StoreError::InvalidOptions {
+                    reason: "missing-member rebuild import found incompatible lifecycle evidence",
+                })
+            }
+        }
+    }
+}
+
+fn restore_missing_member_rebuild_evidence(pool: &mut Pool) -> Result<()> {
+    let Some(lifecycle) = pool.label_lifecycle.as_ref() else {
+        return Ok(());
+    };
+    if lifecycle.kind != pool_label::PoolLifecycleKindV1::DeviceReplacement {
+        return Ok(());
+    }
+    let mut evidence = decode_device_replacement_evidence(&lifecycle.payload)?;
+    if evidence.pool_guid != pool.pool_guid
+        || evidence.old_member_present
+        || !evidence.state.is_active()
+    {
+        return Err(StoreError::InvalidOptions {
+            reason: "missing-member rebuild evidence does not match recovery-only import",
+        });
+    }
+    let durable_target = pool
+        .durable_device_guids
+        .get(evidence.device_index)
+        .copied();
+    let predecessor_topology = durable_target == Some(evidence.old_device_guid)
+        && checked_successor_topology_generation(pool.placement_epoch)
+            == Some(evidence.topology_epoch);
+    let successor_topology = durable_target == Some(evidence.new_device_guid)
+        && pool.placement_epoch == evidence.topology_epoch
+        && evidence.evidence_stable;
+    if !predecessor_topology && !successor_topology {
+        return Err(StoreError::InvalidOptions {
+            reason: "missing-member rebuild evidence does not match the durable topology",
+        });
+    }
+    if pool
+        .device_label_indices
+        .contains(&(evidence.device_index as u32))
+    {
+        return Err(StoreError::InvalidOptions {
+            reason: "missing-member rebuild target is already present in the recovery import",
+        });
+    }
+    evidence.state = ReplacementRebuildStatusState::Resuming;
+    pool.set_receipt_generation_authority_state(
+        ReceiptGenerationAuthorityState::ReplacementResumeRequired,
+    );
+    pool.replacement_evidence = Some(evidence);
+    Ok(())
 }
 
 fn restore_device_removal_evidence(pool: &mut Pool) -> Result<()> {
@@ -3265,7 +3395,7 @@ impl Pool {
     }
 
     fn refresh_raw_store_mutation_gate(&self) {
-        let allowed = !self.read_only
+        let allowed = (!self.read_only || self.missing_member_rebuild_active)
             && !self.locked
             && self.next_placement_receipt_generation != 0
             && self.receipt_generation_authority_state
@@ -3377,6 +3507,8 @@ impl Pool {
             config,
             properties,
             read_only: false,
+            missing_member_rebuild_only: false,
+            missing_member_rebuild_active: false,
             classes,
             devices,
             class_map,
@@ -3461,6 +3593,26 @@ impl Pool {
         Self::open_with_mode(config, properties, options, PoolOpenMode::ReadOnlyExisting)
     }
 
+    /// Open one surviving member of an exact two-copy Pool for a scoped
+    /// missing-member rebuild.
+    ///
+    /// The namespace and ordinary Pool mutation surface remain read-only.
+    /// Device handles are writable only so the explicit rebuild command can
+    /// arm a short-lived raw-mutation capability after it validates the
+    /// durable roster, survivor receipt authority, and replacement candidate.
+    pub fn open_missing_member_rebuild_existing(
+        config: PoolConfig,
+        properties: PoolProperties,
+        options: &StoreOptions,
+    ) -> Result<Self> {
+        Self::open_with_mode(
+            config,
+            properties,
+            options,
+            PoolOpenMode::MissingMemberRebuild,
+        )
+    }
+
     fn open_with_mode(
         mut config: PoolConfig,
         properties: PoolProperties,
@@ -3476,7 +3628,7 @@ impl Pool {
             BTreeMap::new()
         };
         let mut properties = properties;
-        if mode == PoolOpenMode::ReadOnlyExisting {
+        if mode.has_read_only_namespace() {
             if !config.root_path.is_dir() {
                 return Err(StoreError::InvalidOptions {
                     reason: "read-only pool import requires an existing metadata directory",
@@ -3541,7 +3693,7 @@ impl Pool {
                         let mut raw = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
                         match f.read_exact(&mut raw) {
                             Ok(()) => raw,
-                            Err(source) if mode == PoolOpenMode::ReadOnlyExisting => {
+                            Err(source) if mode.has_read_only_namespace() => {
                                 return Err(StoreError::Io {
                                     operation: "pool_read_only_read_label",
                                     path: device_root.clone(),
@@ -3551,7 +3703,7 @@ impl Pool {
                             Err(_) => continue,
                         }
                     }
-                    Err(source) if mode == PoolOpenMode::ReadOnlyExisting => {
+                    Err(source) if mode.has_read_only_namespace() => {
                         return Err(StoreError::Io {
                             operation: "pool_read_only_open_label",
                             path: device_root.clone(),
@@ -3563,7 +3715,7 @@ impl Pool {
             } else {
                 let label_path = label_file_path(&device_root);
                 if !label_path.exists() {
-                    if mode == PoolOpenMode::ReadOnlyExisting {
+                    if mode.has_read_only_namespace() {
                         return Err(StoreError::InvalidOptions {
                             reason:
                                 "read-only pool import requires a label on every configured device",
@@ -3655,8 +3807,7 @@ impl Pool {
                     reason: "pool topology device order does not match labels",
                 });
             }
-            if mode == PoolOpenMode::ReadOnlyExisting
-                && config.devices.len() > label.device_count as usize
+            if mode.has_read_only_namespace() && config.devices.len() > label.device_count as usize
             {
                 return Err(StoreError::InvalidOptions {
                     reason: "read-only pool topology has extra configured members",
@@ -3680,7 +3831,7 @@ impl Pool {
                 }
                 _ => {}
             }
-            if mode == PoolOpenMode::ReadOnlyExisting {
+            if mode.has_read_only_namespace() {
                 let configured_name = config.name.as_bytes();
                 let configured_name_len = configured_name.len().min(pool_label::POOL_NAME_MAX);
                 if label.pool_name_len as usize != configured_name_len
@@ -3732,7 +3883,7 @@ impl Pool {
                 decode_device_layout_v1(&layout_bytes).map_err(|_| StoreError::InvalidOptions {
                     reason: "pool label DeviceLayoutV1 record is corrupt",
                 })?;
-            if mode == PoolOpenMode::ReadOnlyExisting {
+            if mode.has_read_only_namespace() {
                 validate_read_only_label_geometry(&label, &device_layout)?;
             }
             let recovered_redundancy_policy =
@@ -3837,7 +3988,7 @@ impl Pool {
         };
 
         if !label_found {
-            if mode == PoolOpenMode::ReadOnlyExisting {
+            if mode.has_read_only_namespace() {
                 return Err(StoreError::InvalidOptions {
                     reason: "read-only pool import requires existing labels",
                 });
@@ -3847,7 +3998,7 @@ impl Pool {
         }
 
         if let Some(recovered_redundancy_policy) = label_redundancy_policy {
-            if mode == PoolOpenMode::ReadOnlyExisting
+            if mode.has_read_only_namespace()
                 && properties.redundancy_policy != recovered_redundancy_policy
             {
                 return Err(StoreError::InvalidOptions {
@@ -3857,6 +4008,24 @@ impl Pool {
             properties.redundancy_policy = recovered_redundancy_policy;
         }
         properties.redundancy_policy.ensure_available()?;
+        if mode == PoolOpenMode::MissingMemberRebuild
+            && (expected_device_count != 2
+                || config.devices.len() != 1
+                || device_guids.len() != 1
+                || device_label_indices.len() != 1
+                || !matches!(
+                    properties.redundancy_policy,
+                    PoolRedundancyPolicy::Replicated { copies: 2 }
+                )
+                || config
+                    .devices
+                    .iter()
+                    .any(|device| device.class != DeviceClass::Data))
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "missing-member rebuild import requires exactly one present data member of an exact two-copy replicated Pool",
+            });
+        }
 
         // -- Pool feature compatibility gate ----------------------------------------
         //
@@ -3912,6 +4081,12 @@ impl Pool {
                 selected_topology_generation,
                 selected_lifecycle.as_ref(),
             )?;
+        } else if mode == PoolOpenMode::MissingMemberRebuild {
+            validate_missing_member_rebuild_lifecycle_state(
+                &durable_device_guids,
+                selected_topology_generation,
+                selected_lifecycle.as_ref(),
+            )?;
         }
 
         // root_path must be a directory for Pool::open to function
@@ -3939,7 +4114,7 @@ impl Pool {
         // object-store WAL. Accept the raw marker and the currently visible
         // receipt ceiling through a no-create, no-repair, no-replay topology
         // projection before any of those recovery mutations are possible.
-        let preflight_reserved_through = if mode == PoolOpenMode::Writable {
+        let preflight_reserved_through = if mode.opens_writable_devices() {
             let identities: Vec<_> = device_guids
                 .iter()
                 .map(|device_guid| BlockStoreIdentity {
@@ -3975,6 +4150,9 @@ impl Pool {
             PoolOpenMode::ReadOnlyExisting => {
                 open_devices_read_only_existing(&config, options, &identities)?
             }
+            PoolOpenMode::MissingMemberRebuild => {
+                open_devices_existing(&config, options, &identities)?
+            }
         };
         let reserved_placement_receipt_generation_through =
             receipt_generation_high_water_for_devices(&devices, pg)?;
@@ -3998,10 +4176,14 @@ impl Pool {
             )?;
         }
         let next_placement_receipt_generation = match mode {
-            PoolOpenMode::Writable if !locked => reserved_placement_receipt_generation_through
-                .checked_add(1)
-                .unwrap_or(0),
-            PoolOpenMode::Writable | PoolOpenMode::ReadOnlyExisting => 0,
+            PoolOpenMode::Writable | PoolOpenMode::MissingMemberRebuild if !locked => {
+                reserved_placement_receipt_generation_through
+                    .checked_add(1)
+                    .unwrap_or(0)
+            }
+            PoolOpenMode::Writable
+            | PoolOpenMode::ReadOnlyExisting
+            | PoolOpenMode::MissingMemberRebuild => 0,
         };
         let raw_store_mutation_allowed = install_pool_raw_mutation_guard(
             &mut devices,
@@ -4039,7 +4221,7 @@ impl Pool {
             }
         }
         let mut health = compute_health(&devices);
-        if mode == PoolOpenMode::ReadOnlyExisting
+        if mode.has_read_only_namespace()
             && devices.len() < expected_device_count as usize
             && health == PoolHealth::Online
         {
@@ -4056,7 +4238,9 @@ impl Pool {
         let mut pool = Self {
             config,
             properties,
-            read_only: mode == PoolOpenMode::ReadOnlyExisting,
+            read_only: mode.has_read_only_namespace(),
+            missing_member_rebuild_only: mode == PoolOpenMode::MissingMemberRebuild,
+            missing_member_rebuild_active: false,
             classes,
             devices,
             class_map,
@@ -4126,6 +4310,11 @@ impl Pool {
             restore_device_replacement_evidence(&mut pool)?;
             // Resume interrupted device removal if a pending marker exists.
             resume_device_removal_if_pending(&mut pool)?;
+            if topology_roster_label_count == 0 {
+                pool.persist_bootstrap_topology_roster()?;
+            }
+        } else if mode == PoolOpenMode::MissingMemberRebuild {
+            restore_missing_member_rebuild_evidence(&mut pool)?;
         }
 
         Ok(pool)
@@ -4180,7 +4369,7 @@ impl Pool {
     }
 
     fn ensure_writable(&self, operation: &'static str) -> Result<()> {
-        if self.read_only {
+        if self.read_only && !self.missing_member_rebuild_active {
             Err(StoreError::ReadOnly { operation })
         } else {
             Ok(())
@@ -4400,6 +4589,9 @@ impl Pool {
         evidence: &DeviceReplacementEvidenceMarker,
     ) -> Result<()> {
         let payload = encode_device_replacement_evidence(evidence)?;
+        if !evidence.old_member_present {
+            return self.persist_missing_rebuild_evidence_on_survivor(payload);
+        }
         if self.devices.len() == self.expected_device_count as usize {
             return self.persist_lifecycle_record_on_current_topology(
                 pool_label::PoolLifecycleKindV1::DeviceReplacement,
@@ -4499,6 +4691,195 @@ impl Pool {
             }
         }
         self.label_lifecycle = Some(next);
+        Ok(())
+    }
+
+    fn persist_missing_rebuild_evidence_on_survivor(&mut self, payload: Vec<u8>) -> Result<()> {
+        if !self.missing_member_rebuild_only
+            || self.expected_device_count != 2
+            || self.device_label_indices.len() != 1
+            || self.durable_device_guids.len() != 2
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "missing-member rebuild lifecycle lacks one exact survivor topology",
+            });
+        }
+        let survivor_durable_index = self.device_label_indices[0] as usize;
+        let survivor_guid = *self
+            .durable_device_guids
+            .get(survivor_durable_index)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "missing-member rebuild survivor index is outside the durable roster",
+            })?;
+        let survivor_runtime_index = self
+            .device_guids
+            .iter()
+            .position(|guid| *guid == survivor_guid)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "missing-member rebuild survivor is not loaded",
+            })?;
+        let topology_generation = self
+            .persisted_label_epoch
+            .ok_or(StoreError::InvalidOptions {
+                reason: "missing-member rebuild lost durable topology generation",
+            })?;
+        let next = self
+            .next_lifecycle_record(pool_label::PoolLifecycleKindV1::DeviceReplacement, payload)?;
+        let config =
+            self.config
+                .devices
+                .get(survivor_runtime_index)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "missing-member rebuild survivor configuration is unavailable",
+                })?;
+        let device =
+            self.devices
+                .get(survivor_runtime_index)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "missing-member rebuild survivor device is unavailable",
+                })?;
+        let layout = self.device_layouts.get(survivor_runtime_index);
+
+        for target in [PoolLabelCopyTarget::Backup, PoolLabelCopyTarget::Primary] {
+            let mut label =
+                self.build_label_with_state(survivor_runtime_index, device, PoolState::Active);
+            label.device_guid = survivor_guid;
+            label.device_index = survivor_durable_index as u32;
+            label.device_count = self.expected_device_count;
+            label.topology_generation = topology_generation;
+            write_pool_label_copies_with_lifecycle(
+                config,
+                label,
+                layout,
+                &self.durable_device_guids,
+                Some(&next),
+                target,
+                "missing-member-rebuild-lifecycle",
+            )?;
+            let required_matches = if matches!(target, PoolLabelCopyTarget::Backup)
+                && config.backing.uses_fixed_offset_pool_labels()
+            {
+                1
+            } else if config.backing.uses_fixed_offset_pool_labels() {
+                2
+            } else {
+                1
+            };
+            let matching = read_pool_label_copies(config)?
+                .into_iter()
+                .filter(|copy| {
+                    copy.label.pool_guid == self.pool_guid
+                        && copy.label.device_guid == survivor_guid
+                        && copy.label.device_index == survivor_durable_index as u32
+                        && copy.label.device_count == self.expected_device_count
+                        && copy.label.topology_generation == topology_generation
+                        && copy.topology_roster.as_deref()
+                            == Some(self.durable_device_guids.as_slice())
+                        && copy.lifecycle.as_ref() == Some(&next)
+                })
+                .count();
+            if matching < required_matches {
+                return Err(StoreError::InvalidOptions {
+                    reason: "missing-member rebuild lifecycle label readback did not verify",
+                });
+            }
+        }
+        self.label_lifecycle = Some(next);
+        Ok(())
+    }
+
+    fn persist_bootstrap_topology_roster(&mut self) -> Result<()> {
+        for (device_index, config) in self.config.devices.iter().enumerate() {
+            let copies = read_pool_label_copies(config)?;
+            let mut expected = Vec::new();
+            for (copy_index, copy) in copies.iter().enumerate() {
+                if copy.label.pool_guid != self.pool_guid
+                    || copy.label.device_guid != self.device_guids[device_index]
+                    || copy.label.device_index != device_index as u32
+                    || copy.label.device_count != self.device_guids.len() as u32
+                    || copy.label.topology_generation.max(1) != self.placement_epoch
+                {
+                    continue;
+                }
+                if copy
+                    .topology_roster
+                    .as_deref()
+                    .is_some_and(|roster| roster != self.device_guids.as_slice())
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "Pool bootstrap label topology roster conflicts with the selected topology",
+                    });
+                }
+
+                let mut upgraded_label = copy.label.clone();
+                upgraded_label.topology_generation = self.placement_epoch;
+                let mut expected_copy = copy.clone();
+                expected_copy.label = upgraded_label.clone();
+                expected_copy.topology_roster = Some(self.device_guids.clone());
+                expected.push((copy_index, expected_copy));
+                if copy.topology_roster.is_some()
+                    && copy.label.topology_generation == self.placement_epoch
+                {
+                    continue;
+                }
+
+                let layout_bytes = pool_label::decode_device_layout_v1_bytes(&copy.bytes)
+                    .map_err(|_| StoreError::InvalidOptions {
+                        reason: "Pool bootstrap label DeviceLayoutV1 record is truncated",
+                    })?
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "Pool bootstrap label is missing DeviceLayoutV1",
+                    })?;
+                let layout = decode_device_layout_v1(&layout_bytes).map_err(|_| {
+                    StoreError::InvalidOptions {
+                        reason: "Pool bootstrap label DeviceLayoutV1 record is corrupt",
+                    }
+                })?;
+                let target = if !config.backing.uses_fixed_offset_pool_labels() {
+                    PoolLabelCopyTarget::Both
+                } else if copy_index == 0 {
+                    PoolLabelCopyTarget::Primary
+                } else {
+                    PoolLabelCopyTarget::Backup
+                };
+                write_pool_label_copies_with_lifecycle(
+                    config,
+                    upgraded_label,
+                    Some(&layout),
+                    &self.device_guids,
+                    copy.lifecycle.as_ref(),
+                    target,
+                    "pool_bootstrap_write_topology_roster",
+                )?;
+            }
+            if expected.is_empty() {
+                return Err(StoreError::InvalidOptions {
+                    reason: "Pool bootstrap topology has no matching label copy",
+                });
+            }
+
+            let verified = read_pool_label_copies(config)?;
+            for (copy_index, expected_copy) in expected {
+                let actual = verified.get(copy_index).ok_or(StoreError::InvalidOptions {
+                    reason: "Pool bootstrap topology roster label readback is missing",
+                })?;
+                if actual.label.device_guid != expected_copy.label.device_guid
+                    || actual.label.device_index != expected_copy.label.device_index
+                    || !actual.same_topology(&expected_copy)
+                    || !actual.has_self_consistent_roster()
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "Pool bootstrap topology roster label readback did not verify",
+                    });
+                }
+            }
+        }
+
+        // This is an extension-only rewrite of the already selected topology.
+        // Preserve each redundant family's ACTIVE/EXPORTED transition state so
+        // the retained import owner can export its selected family normally.
+        self.persisted_label_epoch = Some(self.placement_epoch);
+        self.durable_device_guids.clone_from(&self.device_guids);
         Ok(())
     }
 
@@ -5029,7 +5410,10 @@ impl Pool {
     }
 
     fn read_only_missing_member_budget(&self, receipt: &PlacementReceipt) -> Option<usize> {
-        if self.device_label_indices.len() != self.devices.len() {
+        if self.device_label_indices.len() != self.devices.len()
+            && !(self.missing_member_rebuild_active
+                && self.device_label_indices.len().checked_add(1) == Some(self.devices.len()))
+        {
             return None;
         }
         let missing =
@@ -5078,9 +5462,24 @@ impl Pool {
             )
             && self.allocation_fenced_device_guid.is_none();
 
-        (!self.read_only
+        let missing_rebuild_loaded = !evidence.old_member_present
+            && self.missing_member_rebuild_only
+            && self.read_only
             && self.expected_device_count == 2
-            && self.devices.len() == 2
+            && self.devices.len() == 1
+            && self.device_label_indices.len() == 1
+            && !self
+                .device_label_indices
+                .contains(&(evidence.device_index as u32))
+            && matches!(
+                self.durable_device_guids.get(evidence.device_index),
+                Some(guid)
+                    if *guid == evidence.old_device_guid || *guid == evidence.new_device_guid
+            );
+
+        (((!self.read_only && evidence.old_member_present) || missing_rebuild_loaded)
+            && self.expected_device_count == 2
+            && (self.devices.len() == 2 || missing_rebuild_loaded)
             && matches!(
                 self.properties.redundancy_policy,
                 PoolRedundancyPolicy::Replicated { copies: 2 }
@@ -5088,19 +5487,26 @@ impl Pool {
             && self.receipt_generation_authority_state
                 == ReceiptGenerationAuthorityState::ReplacementResumeRequired
             && evidence.state.is_active()
-            && (old_topology_loaded || new_topology_loaded))
+            && (old_topology_loaded || new_topology_loaded || missing_rebuild_loaded))
             .then_some(evidence)
     }
 
     fn predecessor_replacement_resume_evidence(&self) -> Option<&DeviceReplacementEvidenceMarker> {
         let evidence = self.replacement_resume_evidence()?;
-        (self.device_guids.get(evidence.device_index) == Some(&evidence.old_device_guid)
+        let present_predecessor = self.device_guids.get(evidence.device_index)
+            == Some(&evidence.old_device_guid)
             && replacement_evidence_matches_topology(
                 evidence,
                 &self.device_guids,
                 self.placement_epoch,
-            ))
-        .then_some(evidence)
+            );
+        let missing_predecessor = !evidence.old_member_present
+            && self.missing_member_rebuild_only
+            && self.durable_device_guids.get(evidence.device_index)
+                == Some(&evidence.old_device_guid)
+            && checked_successor_topology_generation(self.placement_epoch)
+                == Some(evidence.topology_epoch);
+        (present_predecessor || missing_predecessor).then_some(evidence)
     }
 
     /// Admit the not-yet-loaded replacement target while reopening the old
@@ -6836,7 +7242,7 @@ impl Pool {
             })
             .collect::<Vec<_>>();
         if indices.is_empty() && self.allocation_fenced_device_guid.is_some() {
-            return self.get_with_removal_predecessor_receipt(class, key);
+            return self.get_with_device_lifecycle_predecessor_receipt(class, key);
         }
         let current = self.get_with_current_receipt_from_indices(class, key, &indices)?;
         if current.is_some() || self.allocation_fenced_device_guid.is_none() {
@@ -6845,52 +7251,72 @@ impl Pool {
         // A partial evacuation can legitimately leave an unrelocated object
         // current only on the still-attached fenced target. Preserve mounted
         // reads through that exact predecessor until a retry relocates it.
-        self.get_with_removal_predecessor_receipt(class, key)
+        self.get_with_device_lifecycle_predecessor_receipt(class, key)
     }
 
-    /// Strictly read the current receipt authority from survivor devices while
-    /// one marker-bound removal target remains attached and allocation-fenced.
+    /// Strictly read current receipt authority from device-lifecycle survivors.
     ///
-    /// This boundary exists only so higher-layer embedded receipt references
-    /// can advance before detach. It does not admit arbitrary degraded reads.
-    pub fn get_with_removal_survivor_receipt(
+    /// Present removal/replacement excludes the exact attached allocation-
+    /// fenced predecessor. Missing-member rebuild instead requires durable
+    /// predecessor evidence proving that the old member is absent and admits
+    /// only the exact loaded survivor. This boundary exists only so higher-
+    /// layer embedded receipt references can advance before topology commit;
+    /// it does not admit arbitrary degraded reads.
+    pub fn get_with_device_lifecycle_survivor_receipt(
         &self,
         class: IoClass,
         key: ObjectKey,
     ) -> Result<Option<(Vec<u8>, PlacementReceipt)>> {
-        let fenced_guid = self
-            .allocation_fenced_device_guid
-            .ok_or(StoreError::InvalidOptions {
-                reason: "removal survivor read requires an allocation-fenced target",
-            })?;
+        let fenced_guid = match self.allocation_fenced_device_guid {
+            Some(guid) => Some(guid),
+            None if self
+                .predecessor_replacement_resume_evidence()
+                .is_some_and(|evidence| !evidence.old_member_present) =>
+            {
+                None
+            }
+            None => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "device lifecycle survivor read lacks exact transition evidence",
+                });
+            }
+        };
         let indices = self
             .class_map
             .get(class)
             .iter()
             .copied()
-            .filter(|idx| self.device_guids.get(*idx) != Some(&fenced_guid))
+            .filter(|idx| fenced_guid.is_none_or(|guid| self.device_guids.get(*idx) != Some(&guid)))
             .collect::<Vec<_>>();
         self.get_with_current_receipt_from_indices(class, key, &indices)
     }
 
-    /// Read the exact pre-relocation payload whose receipt copy remains on
-    /// the allocation-fenced removal target.
+    /// Read exact pre-relocation authority during a device lifecycle transition.
     ///
-    /// This authority exists only while the durable removal marker keeps the
-    /// target attached. Mounted recovery uses it to authenticate the previous
-    /// content-manifest bytes after a crash between survivor reconciliation
-    /// and publication of the first replacement filesystem root. It does not
-    /// make the predecessor receipt current again.
-    pub fn get_with_removal_predecessor_receipt(
+    /// Present removal/replacement may read the attached allocation-fenced
+    /// predecessor. An evidence-bound missing predecessor has no physical
+    /// fallback and returns `None`. Mounted recovery uses this only after a
+    /// survivor read cannot authenticate the predecessor manifest; it never
+    /// makes the predecessor receipt current again.
+    pub fn get_with_device_lifecycle_predecessor_receipt(
         &self,
         class: IoClass,
         key: ObjectKey,
     ) -> Result<Option<(Vec<u8>, PlacementReceipt)>> {
-        let fenced_guid = self
-            .allocation_fenced_device_guid
-            .ok_or(StoreError::InvalidOptions {
-                reason: "removal predecessor read requires an allocation-fenced target",
-            })?;
+        let fenced_guid = match self.allocation_fenced_device_guid {
+            Some(guid) => guid,
+            None if self
+                .predecessor_replacement_resume_evidence()
+                .is_some_and(|evidence| !evidence.old_member_present) =>
+            {
+                return Ok(None);
+            }
+            None => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "device lifecycle predecessor read lacks exact transition evidence",
+                });
+            }
+        };
         let fenced_idx = self
             .device_guids
             .iter()
@@ -8560,6 +8986,670 @@ impl Pool {
         Ok(evidence.result(false))
     }
 
+    /// Arm the exact recovery mutation scope used by a missing-member rebuild.
+    pub fn begin_missing_member_rebuild_mutation(&mut self) -> Result<()> {
+        if !self.missing_member_rebuild_only
+            || !self.read_only
+            || self.expected_device_count != 2
+            || self.device_label_indices.len() != 1
+            || !matches!(
+                self.properties.redundancy_policy,
+                PoolRedundancyPolicy::Replicated { copies: 2 }
+            )
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "missing-member rebuild mutation requires one recovery-only survivor of an exact two-copy Pool",
+            });
+        }
+        if self.missing_member_rebuild_active {
+            return Err(StoreError::InvalidOptions {
+                reason: "missing-member rebuild mutation is already active",
+            });
+        }
+        if self.locked || self.next_placement_receipt_generation == 0 {
+            return Err(StoreError::InvalidOptions {
+                reason:
+                    "missing-member rebuild mutation lacks unlocked receipt-generation authority",
+            });
+        }
+        self.validate_loaded_receipt_generation_high_water()?;
+        if !matches!(
+            self.receipt_generation_authority_state,
+            ReceiptGenerationAuthorityState::Converged
+                | ReceiptGenerationAuthorityState::ReplacementResumeRequired
+        ) {
+            return Err(StoreError::InvalidOptions {
+                reason:
+                    "missing-member rebuild mutation found incompatible receipt-generation state",
+            });
+        }
+        self.missing_member_rebuild_active = true;
+        self.refresh_raw_store_mutation_gate();
+        Ok(())
+    }
+
+    /// Drop the scoped rebuild capability while retaining durable retry state.
+    pub fn end_missing_member_rebuild_mutation(&mut self) {
+        self.missing_member_rebuild_active = false;
+        self.raw_store_mutation_allowed
+            .store(false, Ordering::Release);
+    }
+
+    fn install_missing_member_rebuild_candidate(
+        &mut self,
+        evidence: &DeviceReplacementEvidenceMarker,
+        new_config: DeviceConfig,
+        new_device: Device,
+    ) -> Result<usize> {
+        if self.devices.len() != 1
+            || self.config.devices.len() != 1
+            || self.device_guids.len() != 1
+            || self.classes.len() != 1
+            || self.media_classes.len() != 1
+            || self.device_layouts.len() != 1
+            || self.device_layout_stats.len() != 1
+            || self.device_label_indices.len() != 1
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "missing-member rebuild candidate requires one exact loaded survivor",
+            });
+        }
+        let survivor_durable_index = self.device_label_indices[0] as usize;
+        if survivor_durable_index >= 2
+            || evidence.device_index >= 2
+            || survivor_durable_index == evidence.device_index
+            || self
+                .durable_device_guids
+                .get(evidence.device_index)
+                .is_none_or(|guid| {
+                    *guid != evidence.old_device_guid && *guid != evidence.new_device_guid
+                })
+            || self.durable_device_guids.get(survivor_durable_index) != self.device_guids.first()
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "missing-member rebuild evidence does not match survivor roster",
+            });
+        }
+
+        let survivor_device = self.devices.pop().unwrap();
+        let survivor_config = self.config.devices.pop().unwrap();
+        let survivor_guid = self.device_guids.pop().unwrap();
+        let survivor_class = self.classes.pop().unwrap();
+        let survivor_media_class = self.media_classes.pop().unwrap();
+        let survivor_layout = self.device_layouts.pop().unwrap();
+        let survivor_layout_stats = self.device_layout_stats.pop().unwrap();
+        let replacement_capacity = new_device.store().capacity_bytes();
+        let replacement_layout = self
+            .properties
+            .layout_policy
+            .compute(replacement_capacity)
+            .unwrap_or_else(|_| {
+                DeviceLayoutPolicy::Slice0Small
+                    .compute(replacement_capacity)
+                    .expect("Slice0Small must succeed for non-zero device")
+            });
+        let replacement_layout_stats =
+            DeviceLayoutStats::with_segment_size(new_config.media_class.default_segment_size());
+
+        if evidence.device_index == 0 {
+            self.devices = vec![new_device, survivor_device];
+            self.config.devices = vec![new_config, survivor_config];
+            self.device_guids = vec![evidence.new_device_guid, survivor_guid];
+            self.classes = vec![DeviceClass::Data, survivor_class];
+            self.media_classes = vec![self.config.devices[0].media_class, survivor_media_class];
+            self.device_layouts = vec![replacement_layout, survivor_layout];
+            self.device_layout_stats = vec![replacement_layout_stats, survivor_layout_stats];
+        } else {
+            self.devices = vec![survivor_device, new_device];
+            self.config.devices = vec![survivor_config, new_config];
+            self.device_guids = vec![survivor_guid, evidence.new_device_guid];
+            self.classes = vec![survivor_class, DeviceClass::Data];
+            self.media_classes = vec![survivor_media_class, self.config.devices[1].media_class];
+            self.device_layouts = vec![survivor_layout, replacement_layout];
+            self.device_layout_stats = vec![survivor_layout_stats, replacement_layout_stats];
+        }
+        self.class_map = build_class_map(&self.classes);
+        let total_bytes = self
+            .devices
+            .iter()
+            .map(|device| device.store().capacity_bytes())
+            .collect();
+        self.write_allocator = WriteAllocator::new(self.media_classes.clone(), total_bytes);
+        self.placement_epoch = evidence.topology_epoch;
+        self.allocation_fenced_device_guid = Some(evidence.old_device_guid);
+        self.health = PoolHealth::Degraded;
+        Ok(survivor_durable_index)
+    }
+
+    fn rebuild_missing_member_receipts(
+        &mut self,
+        mut evidence: DeviceReplacementEvidenceMarker,
+        survivor_runtime_index: usize,
+    ) -> Result<DeviceReplacementResult> {
+        if evidence.old_member_present
+            || self.devices.len() != 2
+            || self.device_guids.len() != 2
+            || self.config.devices.len() != 2
+            || survivor_runtime_index == evidence.device_index
+            || self.device_guids.get(evidence.device_index) != Some(&evidence.new_device_guid)
+            || self.durable_device_guids.get(evidence.device_index)
+                != Some(&evidence.old_device_guid)
+            || self.device_label_indices.len() != 1
+            || self.device_label_indices[0] as usize != survivor_runtime_index
+            || self.placement_epoch != evidence.topology_epoch
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "missing-member rebuild runtime topology does not match durable evidence",
+            });
+        }
+        let survivor_guid = self.device_guids[survivor_runtime_index];
+        let mut baseline_receipts = BTreeMap::new();
+        for receipt_key in self.devices[survivor_runtime_index]
+            .store()
+            .list_keys_including_internal()
+            .into_iter()
+            .filter(|key| crate::is_pool_placement_receipt_key(*key))
+        {
+            for location in self.devices[survivor_runtime_index]
+                .store()
+                .version_locations_of(receipt_key)
+            {
+                let Ok(raw) = self.devices[survivor_runtime_index]
+                    .store()
+                    .get_at_location(location)
+                else {
+                    continue;
+                };
+                let Some(predecessor) = PlacementReceipt::decode(&raw) else {
+                    continue;
+                };
+                if placement_receipt_object_key(predecessor.object_key) != receipt_key
+                    || !predecessor
+                        .targets
+                        .iter()
+                        .any(|target| target.device_guid == evidence.old_device_guid)
+                {
+                    continue;
+                }
+                if !matches!(
+                    predecessor.policy,
+                    PoolRedundancyPolicy::Replicated { copies: 2 }
+                ) || predecessor.targets.len() != 2
+                    || predecessor
+                        .targets
+                        .iter()
+                        .filter(|target| target.device_guid == evidence.old_device_guid)
+                        .count()
+                        != 1
+                    || predecessor
+                        .targets
+                        .iter()
+                        .filter(|target| target.device_guid == survivor_guid)
+                        .count()
+                        != 1
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason:
+                            "missing-member rebuild requires an exact two-copy survivor receipt",
+                    });
+                }
+                self.ensure_receipt_replay_authority(&predecessor)?;
+                validate_strict_receipt_structure(&predecessor)?;
+                let replace = match baseline_receipts.get(&predecessor.object_key) {
+                    Some(current) => receipt_supersedes(&predecessor, current)?,
+                    None => true,
+                };
+                if replace {
+                    baseline_receipts.insert(predecessor.object_key, predecessor);
+                }
+            }
+        }
+        if u64::try_from(baseline_receipts.len()).ok() != Some(evidence.total_subjects) {
+            return Err(StoreError::InvalidOptions {
+                reason: "missing-member rebuild subject inventory changed after durable admission",
+            });
+        }
+
+        let authority_indices = vec![0, 1];
+        let mut subjects_completed = 0_u64;
+        let mut subjects_failed = 0_u64;
+        let mut verified_receipt_count = 0_u64;
+        let mut bytes_rebuilt = 0_u64;
+        for (key, predecessor) in baseline_receipts {
+            bytes_rebuilt = bytes_rebuilt.saturating_add(predecessor.payload_len);
+            let current = self.load_placement_receipt(&authority_indices, key)?;
+            let exact_successor = |receipt: &PlacementReceipt| {
+                matches!(
+                    receipt.policy,
+                    PoolRedundancyPolicy::Replicated { copies: 2 }
+                ) && receipt.epoch == evidence.topology_epoch
+                    && receipt.targets.len() == 2
+                    && receipt
+                        .targets
+                        .iter()
+                        .filter(|target| target.device_guid == survivor_guid)
+                        .count()
+                        == 1
+                    && receipt
+                        .targets
+                        .iter()
+                        .filter(|target| {
+                            target.device_guid == evidence.new_device_guid
+                                && target.device_index as usize == evidence.device_index
+                        })
+                        .count()
+                        == 1
+                    && receipt
+                        .targets
+                        .iter()
+                        .all(|target| target.device_guid != evidence.old_device_guid)
+            };
+
+            let current_preserves_predecessor = current.as_ref().is_some_and(|receipt| {
+                receipt.generation > predecessor.generation
+                    && receipt.payload_len == predecessor.payload_len
+                    && receipt.payload_digest == predecessor.payload_digest
+                    && exact_successor(receipt)
+                    && matches!(
+                        self.get_with_receipt(receipt),
+                        Ok(Some(bytes))
+                            if bytes.len() as u64 == predecessor.payload_len
+                                && digest32(&bytes) == predecessor.payload_digest
+                    )
+            });
+
+            let receipt_key = placement_receipt_object_key(key);
+            let mut historical_successor: Option<PlacementReceipt> = None;
+            for location in self.devices[survivor_runtime_index]
+                .store()
+                .version_locations_of(receipt_key)
+            {
+                let Ok(raw) = self.devices[survivor_runtime_index]
+                    .store()
+                    .get_at_location(location)
+                else {
+                    continue;
+                };
+                let Some(candidate) = PlacementReceipt::decode(&raw) else {
+                    continue;
+                };
+                if candidate.object_key != key
+                    || candidate.generation <= predecessor.generation
+                    || candidate.payload_len != predecessor.payload_len
+                    || candidate.payload_digest != predecessor.payload_digest
+                    || !exact_successor(&candidate)
+                {
+                    continue;
+                }
+                self.ensure_receipt_replay_authority(&candidate)?;
+                validate_strict_receipt_structure(&candidate)?;
+                let replace = match historical_successor.as_ref() {
+                    Some(known) => receipt_supersedes(&candidate, known)?,
+                    None => true,
+                };
+                if replace {
+                    historical_successor = Some(candidate);
+                }
+            }
+
+            let historical_successor_is_durable =
+                historical_successor.as_ref().is_some_and(|receipt| {
+                    let Ok(encoded_receipt) = receipt.encode() else {
+                        return false;
+                    };
+                    receipt.targets.iter().all(|target| {
+                        let Some(device_index) = self.resolve_receipt_target(target) else {
+                            return false;
+                        };
+                        let store = self.devices[device_index].store();
+                        let receipt_present = store
+                            .version_locations_of(receipt_key)
+                            .into_iter()
+                            .any(|location| {
+                                store
+                                    .get_at_location(location)
+                                    .is_ok_and(|bytes| bytes == encoded_receipt)
+                            });
+                        let payload_present =
+                            store.version_locations_of(key).into_iter().any(|location| {
+                                store.get_at_location(location).is_ok_and(|bytes| {
+                                    bytes.len() as u64 == receipt.payload_len
+                                        && digest32(&bytes) == receipt.payload_digest
+                                })
+                            });
+                        receipt_present && payload_present
+                    })
+                });
+            let current_follows_historical_successor = historical_successor
+                .as_ref()
+                .zip(current.as_ref())
+                .is_some_and(|(historical, current)| {
+                    historical_successor_is_durable
+                        && current.generation >= historical.generation
+                        && exact_successor(current)
+                        && matches!(self.get_with_receipt(current), Ok(Some(_)))
+                });
+            let already_rebuilt =
+                current_preserves_predecessor || current_follows_historical_successor;
+            if already_rebuilt {
+                subjects_completed = subjects_completed.saturating_add(1);
+                verified_receipt_count = verified_receipt_count.saturating_add(1);
+                continue;
+            }
+
+            if current.as_ref() != Some(&predecessor) {
+                subjects_failed = subjects_failed.saturating_add(1);
+                continue;
+            }
+            let expected_len = match usize::try_from(predecessor.payload_len) {
+                Ok(len) => len,
+                Err(_) => {
+                    subjects_failed = subjects_failed.saturating_add(1);
+                    continue;
+                }
+            };
+            let payload = match self.devices[survivor_runtime_index].get(key) {
+                Ok(Some(payload))
+                    if payload.len() == expected_len
+                        && digest32(&payload) == predecessor.payload_digest =>
+                {
+                    payload
+                }
+                _ => {
+                    subjects_failed = subjects_failed.saturating_add(1);
+                    continue;
+                }
+            };
+            let replacement_receipt = match self.put_pool_wide(
+                IoClass::Data,
+                key,
+                &payload,
+                &authority_indices,
+                OldReceiptPolicy::KnownCurrent(&predecessor),
+            ) {
+                Ok((_stored, receipt)) => receipt,
+                Err(_) => {
+                    subjects_failed = subjects_failed.saturating_add(1);
+                    continue;
+                }
+            };
+            let verified = replacement_receipt.generation > predecessor.generation
+                && replacement_receipt.payload_len == predecessor.payload_len
+                && replacement_receipt.payload_digest == predecessor.payload_digest
+                && exact_successor(&replacement_receipt)
+                && matches!(
+                    self.get_with_receipt(&replacement_receipt),
+                    Ok(Some(bytes)) if bytes == payload
+                );
+            if verified {
+                subjects_completed = subjects_completed.saturating_add(1);
+                verified_receipt_count = verified_receipt_count.saturating_add(1);
+            } else {
+                subjects_failed = subjects_failed.saturating_add(1);
+            }
+        }
+
+        self.sync_all()?;
+        evidence.subjects_completed = subjects_completed;
+        evidence.subjects_failed = subjects_failed;
+        evidence.verified_receipt_count = verified_receipt_count;
+        evidence.bytes_rebuilt = bytes_rebuilt;
+        evidence.evidence_stable = subjects_failed == 0
+            && subjects_completed == evidence.total_subjects
+            && verified_receipt_count >= evidence.total_subjects;
+        evidence.state = ReplacementRebuildStatusState::Pending;
+        self.persist_replacement_evidence_in_labels(&evidence)?;
+        self.replacement_evidence = Some(evidence.clone());
+        Ok(evidence.result(false))
+    }
+
+    /// Rebuild one absent member from the exact authenticated survivor.
+    pub fn rebuild_missing_member(
+        &mut self,
+        missing_device_guid: [u8; 16],
+        new_config: DeviceConfig,
+        options: &StoreOptions,
+    ) -> Result<DeviceReplacementResult> {
+        self.ensure_writable("pool rebuild missing member")?;
+        if !self.missing_member_rebuild_only || !self.missing_member_rebuild_active {
+            return Err(StoreError::InvalidOptions {
+                reason: "missing-member rebuild requires an active recovery-only mutation scope",
+            });
+        }
+        let replayed = self.replacement_evidence.as_ref().cloned();
+        let (mut evidence, resuming) = if let Some(mut evidence) = replayed {
+            if evidence.old_member_present
+                || evidence.old_device_guid != missing_device_guid
+                || evidence.new_path != new_config.path
+                || !evidence.state.is_active()
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "missing-member rebuild request does not match durable evidence",
+                });
+            }
+            evidence.state = ReplacementRebuildStatusState::Pending;
+            evidence.subjects_failed = 0;
+            (evidence, true)
+        } else {
+            if self.devices.len() != 1
+                || self.device_label_indices.len() != 1
+                || self.durable_device_guids.len() != 2
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "missing-member rebuild requires exactly one loaded survivor",
+                });
+            }
+            let survivor_durable_index = self.device_label_indices[0] as usize;
+            let missing_index = 1usize.saturating_sub(survivor_durable_index);
+            if self.durable_device_guids.get(missing_index) != Some(&missing_device_guid) {
+                return Err(StoreError::InvalidOptions {
+                    reason: "requested missing GUID does not match the durable Pool roster",
+                });
+            }
+            let survivor_config = &self.config.devices[0];
+            if new_config.path == survivor_config.path
+                || device_root_path(&new_config) != new_config.path
+                || new_config.backing != survivor_config.backing
+                || new_config.class != DeviceClass::Data
+                || new_config.class != survivor_config.class
+                || new_config.media_class != survivor_config.media_class
+                || !Self::replacement_transform_configuration_matches(survivor_config, &new_config)
+                || !matches!(new_config.kind, DeviceKind::Block { .. })
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "missing-member rebuild candidate must be a distinct same-backing byte-addressable data member",
+                });
+            }
+            let total_subjects =
+                discover_replacement_rebuild_subject_count(self, missing_device_guid)?;
+            let topology_epoch = checked_successor_topology_generation(self.placement_epoch)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "missing-member rebuild topology generation exhausted",
+                })?;
+            let evidence = DeviceReplacementEvidenceMarker {
+                pool_guid: self.pool_guid,
+                old_device_guid: missing_device_guid,
+                new_device_guid: generate_unique_device_guid(&self.durable_device_guids)?,
+                topology_epoch,
+                device_index: missing_index,
+                old_path: PathBuf::new(),
+                new_path: new_config.path.clone(),
+                old_member_present: false,
+                total_subjects,
+                subjects_completed: 0,
+                subjects_failed: 0,
+                verified_receipt_count: 0,
+                bytes_rebuilt: 0,
+                evidence_stable: false,
+                state: ReplacementRebuildStatusState::Pending,
+            };
+            (evidence, false)
+        };
+
+        let durable_target = self
+            .durable_device_guids
+            .get(evidence.device_index)
+            .copied();
+        let successor_topology_loaded = durable_target == Some(evidence.new_device_guid)
+            && self.placement_epoch == evidence.topology_epoch;
+        if successor_topology_loaded && !evidence.evidence_stable {
+            return Err(StoreError::InvalidOptions {
+                reason: "missing-member successor topology lacks stable rebuild evidence",
+            });
+        }
+
+        let survivor_config = self.config.devices[0].clone();
+        if new_config.path == survivor_config.path
+            || new_config.backing != survivor_config.backing
+            || new_config.class != survivor_config.class
+            || new_config.media_class != survivor_config.media_class
+            || !Self::replacement_transform_configuration_matches(&survivor_config, &new_config)
+            || !matches!(new_config.kind, DeviceKind::Block { .. })
+        {
+            return Err(StoreError::InvalidOptions {
+                reason:
+                    "missing-member rebuild candidate no longer matches the survivor configuration",
+            });
+        }
+        let replacement_identity = BlockStoreIdentity {
+            pool_guid: self.pool_guid,
+            device_guid: evidence.new_device_guid,
+        };
+        let minimum_raw_capacity = byte_addressable_device_raw_capacity(&survivor_config)?;
+        let preflighted_candidate = if resuming {
+            None
+        } else {
+            preflight_blank_block_candidate(&new_config, minimum_raw_capacity)?
+        };
+        if preflighted_candidate.is_some() {
+            self.persist_replacement_evidence_in_labels(&evidence)?;
+            self.replacement_evidence = Some(evidence.clone());
+            self.set_receipt_generation_authority_state(
+                ReceiptGenerationAuthorityState::ReplacementResumeRequired,
+            );
+        }
+        let mut new_device = match preflighted_candidate {
+            Some((file, inspection)) => open_preflighted_block_candidate(
+                &new_config,
+                options,
+                replacement_identity,
+                file,
+                &inspection,
+            )?,
+            None => open_replacement_resume_candidate(
+                &new_config,
+                options,
+                options.is_test_fast_harness_fixture(),
+                replacement_identity,
+                minimum_raw_capacity,
+            )?,
+        };
+        new_device.install_pool_raw_mutation_guard(Arc::clone(&self.raw_store_mutation_allowed));
+        if new_device.store().capacity_bytes() < self.devices[0].store().capacity_bytes() {
+            return Err(StoreError::InvalidOptions {
+                reason: "missing-member rebuild candidate is smaller than the surviving member",
+            });
+        }
+        if resuming {
+            if read_receipt_generation_high_water(&new_device)?.is_none() {
+                if new_device.has_any_physical_key() {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "missing-member rebuild candidate has payload without generation authority",
+                    });
+                }
+                seed_receipt_generation_high_water_on_candidate(
+                    &mut new_device,
+                    self.pool_guid,
+                    self.reserved_placement_receipt_generation_through,
+                )?;
+            }
+            self.reconcile_receipt_generation_high_water_with_replacement(&mut new_device)?;
+        } else {
+            seed_receipt_generation_high_water_on_candidate(
+                &mut new_device,
+                self.pool_guid,
+                self.reserved_placement_receipt_generation_through,
+            )?;
+            self.set_receipt_generation_authority_state(
+                ReceiptGenerationAuthorityState::RecoveryRequired,
+            );
+        }
+
+        let survivor_runtime_index =
+            self.install_missing_member_rebuild_candidate(&evidence, new_config, new_device)?;
+        self.converge_receipt_generation_authority()?;
+        if successor_topology_loaded {
+            evidence.state = ReplacementRebuildStatusState::Pending;
+            self.replacement_evidence = Some(evidence.clone());
+            return Ok(evidence.result(false));
+        }
+        self.rebuild_missing_member_receipts(evidence, survivor_runtime_index)
+    }
+
+    /// Publish the successor topology after mounted roots use rebuilt receipts.
+    pub fn finish_missing_member_rebuild(
+        &mut self,
+        missing_device_guid: [u8; 16],
+    ) -> Result<DeviceReplacementResult> {
+        self.ensure_writable("pool finish missing-member rebuild")?;
+        let mut evidence = self
+            .replacement_evidence
+            .as_ref()
+            .filter(|evidence| {
+                !evidence.old_member_present
+                    && evidence.old_device_guid == missing_device_guid
+                    && evidence.evidence_stable
+            })
+            .cloned()
+            .ok_or(StoreError::InvalidOptions {
+                reason: "missing-member rebuild is not stable enough to publish topology",
+            })?;
+        if self.devices.len() != 2
+            || self.device_guids.get(evidence.device_index) != Some(&evidence.new_device_guid)
+            || self.placement_epoch != evidence.topology_epoch
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "missing-member rebuild successor runtime topology is incomplete",
+            });
+        }
+
+        let successor_already_durable = self.durable_device_guids == self.device_guids
+            && self.persisted_label_epoch == Some(evidence.topology_epoch);
+        if !successor_already_durable {
+            let payload = encode_device_replacement_evidence(&evidence)?;
+            self.persist_lifecycle_record_on_current_topology(
+                pool_label::PoolLifecycleKindV1::DeviceReplacement,
+                payload,
+                "missing-member-rebuild-topology",
+            )?;
+            self.persisted_label_epoch = Some(evidence.topology_epoch);
+            self.durable_device_guids.clone_from(&self.device_guids);
+            self.device_label_indices = (0..self.expected_device_count).collect();
+            self.set_receipt_generation_authority_state(
+                ReceiptGenerationAuthorityState::RecoveryRequired,
+            );
+            self.converge_receipt_generation_authority()?;
+        } else {
+            self.verify_active_topology_label_copies(
+                2,
+                "missing-member-rebuild-topology",
+                self.label_lifecycle.as_ref(),
+            )?;
+        }
+
+        evidence.state = ReplacementRebuildStatusState::Completed;
+        let payload = encode_device_replacement_evidence(&evidence)?;
+        self.persist_lifecycle_record_on_current_topology(
+            pool_label::PoolLifecycleKindV1::DeviceReplacement,
+            payload,
+            "missing-member-rebuild-completed",
+        )?;
+        self.replacement_evidence = Some(evidence.clone());
+        self.allocation_fenced_device_guid = None;
+        self.health = compute_health(&self.devices);
+        Ok(evidence.result(true))
+    }
+
     /// Rebuild a present, readable member onto a same-backing replacement.
     ///
     /// This preparation phase is deliberately bounded to the two-member
@@ -8792,11 +9882,12 @@ impl Pool {
             let evidence = DeviceReplacementEvidenceMarker {
                 pool_guid: self.pool_guid,
                 old_device_guid,
-                new_device_guid: rand::random(),
+                new_device_guid: generate_unique_device_guid(&self.device_guids)?,
                 topology_epoch: successor_topology_generation,
                 device_index: idx,
                 old_path: old_path.to_path_buf(),
                 new_path: new_config.path.clone(),
+                old_member_present: true,
                 total_subjects,
                 subjects_completed: 0,
                 subjects_failed: 0,
@@ -9240,8 +10331,10 @@ impl Pool {
         self.health
     }
 
-    /// Whether this Pool was imported through the side-effect-free read-only
-    /// path.
+    /// Whether ordinary Pool and namespace mutation is disabled.
+    ///
+    /// A recovery-only Pool also reports `true`; its explicit rebuild command
+    /// may temporarily arm only the scoped device-lifecycle mutation path.
     #[must_use]
     pub const fn is_read_only(&self) -> bool {
         self.read_only
@@ -9767,8 +10860,8 @@ impl Pool {
     /// All reads and writes go through the Pool → Device → compression/encryption layers.
     pub fn primary_store_mut(&mut self) -> PoolStoreMut<'_> {
         assert!(
-            !self.read_only,
-            "read-only pool has no mutable store handle"
+            !self.read_only || self.missing_member_rebuild_active,
+            "read-only pool has no mutable store handle outside scoped missing-member rebuild"
         );
         PoolStoreMut { pool: self }
     }
@@ -9788,7 +10881,10 @@ impl Pool {
 
     /// Mutable access to the primary Data device's raw LocalObjectStore.
     pub fn raw_primary_store_mut(&mut self) -> &mut LocalObjectStore {
-        assert!(!self.read_only, "read-only pool has no mutable raw store");
+        assert!(
+            !self.read_only || self.missing_member_rebuild_active,
+            "read-only pool has no mutable raw store outside scoped missing-member rebuild"
+        );
         let _ = self.validate_receipt_generation_high_water();
         let indices = self.class_map.get(IoClass::Data);
         let idx = *indices.first().expect("pool has no data device");
@@ -11125,6 +12221,18 @@ mod tests {
     }
 
     fn labelled_pool_bootstrap_config(root: &Path, member_count: usize) -> PoolBootstrapConfig {
+        labelled_pool_bootstrap_config_with_redundancy(
+            root,
+            member_count,
+            PoolRedundancyPolicy::replicated(1),
+        )
+    }
+
+    fn labelled_pool_bootstrap_config_with_redundancy(
+        root: &Path,
+        member_count: usize,
+        redundancy_policy: PoolRedundancyPolicy,
+    ) -> PoolBootstrapConfig {
         std::fs::create_dir_all(root).expect("create bootstrap fixture root");
         let capacity_bytes = 2 * 1024 * 1024;
         let pool_guid = [0x51; 16];
@@ -11145,6 +12253,7 @@ mod tests {
                 label.device_capacity_bytes = capacity_bytes;
                 label.system_area_pointer = layout.system_area_offset;
                 label.system_area_size = layout.system_area_len;
+                label.redundancy_policy = redundancy_policy.to_label_policy();
                 let label = pool_label::seal_label_with_device_layout(label, Some(&layout_bytes))
                     .expect("seal bootstrap fixture label");
                 let mut encoded = [0; pool_label::POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
@@ -11839,6 +12948,444 @@ mod tests {
     }
 
     #[test]
+    fn missing_member_rebuild_restores_two_copy_pool() {
+        let root = temp_dir("missing-member-rebuild-two-copy");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = PoolConfig {
+            name: "missing-member-rebuild".into(),
+            root_path: root.join("metadata"),
+            devices: vec![
+                regular_file_device_config(root.join("device-0.img")),
+                regular_file_device_config(root.join("device-1.img")),
+            ],
+        };
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let options = test_options();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options)
+            .expect("create exact two-copy Pool");
+        let subjects = [
+            (
+                ObjectKey::from_name(b"missing-member-rebuild-a"),
+                b"authenticated survivor payload A".to_vec(),
+            ),
+            (
+                ObjectKey::from_name(b"missing-member-rebuild-b"),
+                b"authenticated survivor payload B".to_vec(),
+            ),
+        ];
+        for (key, payload) in &subjects {
+            let (_, receipt) = pool
+                .put_with_receipt(IoClass::Data, *key, payload)
+                .expect("write two-copy receipt subject");
+            assert_eq!(receipt.targets.len(), 2);
+        }
+        pool.sync_all().expect("sync predecessor Pool");
+        let missing_device_guid = pool.device_guid_for_index(0);
+        let survivor_device_guid = pool.device_guid_for_index(1);
+        let missing_device_path = config.devices[0].path.clone();
+        drop(pool);
+
+        std::fs::remove_file(&missing_device_path).expect("physically remove member zero");
+        let mut survivor_config = config.clone();
+        survivor_config.devices.remove(0);
+        let mut recovery = Pool::open_missing_member_rebuild_existing(
+            survivor_config,
+            properties.clone(),
+            &options,
+        )
+        .expect("open the exact survivor in recovery-only mode");
+        assert!(recovery.is_read_only());
+        assert_eq!(recovery.topology_status().missing_members, 1);
+        for (key, payload) in &subjects {
+            assert_eq!(
+                recovery
+                    .get_with_current_receipt(IoClass::Data, *key)
+                    .expect("read subject from authenticated survivor")
+                    .map(|(bytes, _)| bytes),
+                Some(payload.clone()),
+            );
+        }
+
+        let replacement_path = root.join("replacement.img");
+        let replacement_config = regular_file_device_config(replacement_path.clone());
+        recovery
+            .begin_missing_member_rebuild_mutation()
+            .expect("arm exact rebuild mutation scope");
+        let prepared = recovery
+            .rebuild_missing_member(missing_device_guid, replacement_config, &options)
+            .expect("rebuild receipt subjects onto the replacement");
+        assert!(!prepared.old_member_present);
+        assert_eq!(prepared.device_index, 0);
+        assert_eq!(prepared.old_device_guid, missing_device_guid);
+        assert_eq!(prepared.objects_rebuilt, subjects.len() as u64);
+        assert_eq!(prepared.verified_receipt_count, subjects.len() as u64);
+        assert_eq!(prepared.objects_failed, 0);
+        assert!(!prepared.complete);
+        let completed = recovery
+            .finish_missing_member_rebuild(missing_device_guid)
+            .expect("publish same-cardinality successor topology");
+        assert!(completed.complete);
+        assert_eq!(completed.device_index, 0);
+        assert_eq!(completed.old_device_guid, missing_device_guid);
+        assert_ne!(completed.new_device_guid, missing_device_guid);
+        recovery.end_missing_member_rebuild_mutation();
+        assert!(matches!(
+            recovery.put_with_receipt(
+                IoClass::Data,
+                ObjectKey::from_name(b"out-of-scope-write"),
+                b"must remain read-only",
+            ),
+            Err(StoreError::ReadOnly { .. })
+        ));
+
+        for (key, payload) in &subjects {
+            let (bytes, receipt) = recovery
+                .get_with_current_receipt(IoClass::Data, *key)
+                .expect("read rebuilt receipt")
+                .expect("rebuilt subject remains present");
+            assert_eq!(bytes, *payload);
+            assert_eq!(receipt.targets.len(), 2);
+            assert!(receipt
+                .targets
+                .iter()
+                .any(|target| target.device_guid == survivor_device_guid));
+            assert!(receipt
+                .targets
+                .iter()
+                .any(|target| target.device_guid == completed.new_device_guid));
+            assert!(receipt
+                .targets
+                .iter()
+                .all(|target| target.device_guid != missing_device_guid));
+        }
+        let final_config = recovery.config().clone();
+        drop(recovery);
+
+        let reopened = Pool::open(final_config, properties, &options)
+            .expect("reopen survivor plus replacement normally");
+        assert!(!reopened.is_read_only());
+        assert_eq!(reopened.topology_status().missing_members, 0);
+        for (key, payload) in &subjects {
+            assert_eq!(
+                reopened
+                    .get(IoClass::Data, *key)
+                    .expect("read after normal reopen"),
+                Some(payload.clone()),
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_member_rebuild_resumes_label_evidence_before_candidate_publication() {
+        let root = temp_dir("missing-member-rebuild-pre-candidate-resume");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = PoolConfig {
+            name: "missing-member-rebuild-pre-candidate-resume".into(),
+            root_path: root.join("metadata"),
+            devices: vec![
+                regular_file_device_config(root.join("device-0.img")),
+                regular_file_device_config(root.join("device-1.img")),
+            ],
+        };
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let options = test_options();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options)
+            .expect("create exact two-copy Pool");
+        let key = ObjectKey::from_name(b"missing-member-pre-candidate-resume");
+        let payload = b"label evidence survives a pre-candidate crash cut";
+        pool.put_with_receipt(IoClass::Data, key, payload)
+            .expect("write predecessor receipt");
+        pool.sync_all().expect("sync predecessor Pool");
+        let missing_device_guid = pool.device_guid_for_index(0);
+        let missing_device_path = config.devices[0].path.clone();
+        drop(pool);
+
+        std::fs::remove_file(&missing_device_path).expect("remove member zero");
+        let mut survivor_config = config.clone();
+        survivor_config.devices.remove(0);
+        let replacement_path = root.join("replacement.img");
+        create_regular_file_device_with_size(&replacement_path, 1024 * 1024);
+        let replacement_config = DeviceConfig {
+            media_class: survivor_config.devices[0].media_class,
+            path: replacement_path.clone(),
+            backing: DeviceBacking::RegularFileDev,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Block {
+                path: replacement_path.clone(),
+            },
+            encryption: None,
+            compression: None,
+        };
+        let survivor_before_invalid_candidate =
+            std::fs::read(&survivor_config.devices[0].path).expect("snapshot survivor bytes");
+        let candidate_before_invalid_candidate =
+            std::fs::read(&replacement_path).expect("snapshot undersized candidate bytes");
+
+        let mut recovery = Pool::open_missing_member_rebuild_existing(
+            survivor_config.clone(),
+            properties.clone(),
+            &options,
+        )
+        .expect("open recovery-only survivor");
+        recovery
+            .begin_missing_member_rebuild_mutation()
+            .expect("arm rebuild mutation");
+        assert_invalid_options_reason_contains(
+            recovery.rebuild_missing_member(
+                missing_device_guid,
+                replacement_config.clone(),
+                &options,
+            ),
+            "smaller",
+        );
+        assert!(recovery.replacement_evidence.is_none());
+        assert_eq!(
+            std::fs::read(&survivor_config.devices[0].path)
+                .expect("reread survivor after candidate refusal"),
+            survivor_before_invalid_candidate,
+            "undersized candidate refusal must not publish survivor evidence",
+        );
+        assert_eq!(
+            std::fs::read(&replacement_path).expect("reread refused candidate"),
+            candidate_before_invalid_candidate,
+            "undersized candidate refusal must not mutate the candidate",
+        );
+        assert_legacy_device_lifecycle_files_absent(&root);
+
+        // Repair the external size defect, pass the same read-only candidate
+        // preflight as production, then stop at the exact durable crash cut
+        // after identity publication but before candidate initialization.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement_path)
+            .expect("open undersized candidate")
+            .set_len(2 * 1024 * 1024)
+            .expect("extend blank candidate");
+        let minimum_raw_capacity =
+            byte_addressable_device_raw_capacity(&survivor_config.devices[0])
+                .expect("read survivor capacity");
+        let (preflight_file, _inspection) =
+            preflight_blank_block_candidate(&replacement_config, minimum_raw_capacity)
+                .expect("preflight repaired blank candidate")
+                .expect("byte-addressable candidate preflight");
+        drop(preflight_file);
+        let candidate_before_evidence =
+            std::fs::read(&replacement_path).expect("snapshot preflighted candidate");
+        let missing_index = 1usize.saturating_sub(recovery.device_label_indices[0] as usize);
+        let evidence = DeviceReplacementEvidenceMarker {
+            pool_guid: recovery.pool_guid,
+            old_device_guid: missing_device_guid,
+            new_device_guid: generate_unique_device_guid(&recovery.durable_device_guids)
+                .expect("generate replacement GUID"),
+            topology_epoch: checked_successor_topology_generation(recovery.placement_epoch)
+                .expect("advance topology generation"),
+            device_index: missing_index,
+            old_path: PathBuf::new(),
+            new_path: replacement_path.clone(),
+            old_member_present: false,
+            total_subjects: discover_replacement_rebuild_subject_count(
+                &recovery,
+                missing_device_guid,
+            )
+            .expect("discover rebuild subjects"),
+            subjects_completed: 0,
+            subjects_failed: 0,
+            verified_receipt_count: 0,
+            bytes_rebuilt: 0,
+            evidence_stable: false,
+            state: ReplacementRebuildStatusState::Pending,
+        };
+        recovery
+            .persist_replacement_evidence_in_labels(&evidence)
+            .expect("publish pre-candidate lifecycle evidence");
+        recovery.replacement_evidence = Some(evidence);
+        recovery.set_receipt_generation_authority_state(
+            ReceiptGenerationAuthorityState::ReplacementResumeRequired,
+        );
+        assert_eq!(
+            std::fs::read(&replacement_path).expect("reread evidence-bound candidate"),
+            candidate_before_evidence,
+            "durable evidence must precede candidate initialization",
+        );
+        drop(recovery);
+
+        // Retry only the evidence-bound candidate path.
+        let mut resumed = Pool::open_missing_member_rebuild_existing(
+            survivor_config,
+            properties.clone(),
+            &options,
+        )
+        .expect("restore rebuild evidence from survivor labels");
+        let restored = resumed
+            .device_replacement_result()
+            .expect("project restored rebuild evidence");
+        assert_eq!(restored.old_device_guid, missing_device_guid);
+        assert_eq!(restored.new_path, replacement_path);
+        assert_eq!(restored.objects_rebuilt, 0);
+        resumed
+            .begin_missing_member_rebuild_mutation()
+            .expect("re-arm rebuild mutation");
+        let prepared = resumed
+            .rebuild_missing_member(missing_device_guid, replacement_config, &options)
+            .expect("resume exact evidence-bound candidate");
+        assert_eq!(prepared.objects_failed, 0);
+        assert_eq!(prepared.objects_rebuilt, 1);
+        let completed = resumed
+            .finish_missing_member_rebuild(missing_device_guid)
+            .expect("finish resumed rebuild");
+        assert!(completed.complete);
+        let final_config = resumed.config().clone();
+        drop(resumed);
+
+        let reopened = Pool::open(final_config, properties, &options)
+            .expect("reopen completed resumed topology");
+        assert_eq!(
+            reopened
+                .get(IoClass::Data, key)
+                .expect("read rebuilt payload"),
+            Some(payload.to_vec())
+        );
+        assert_legacy_device_lifecycle_files_absent(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_member_rebuild_resumes_after_successor_topology_publication() {
+        let root = temp_dir("missing-member-rebuild-post-topology-resume");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = PoolConfig {
+            name: "missing-member-rebuild-post-topology-resume".into(),
+            root_path: root.join("metadata"),
+            devices: vec![
+                regular_file_device_config(root.join("device-0.img")),
+                regular_file_device_config(root.join("device-1.img")),
+            ],
+        };
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let options = test_options();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options)
+            .expect("create exact two-copy Pool");
+        let key = ObjectKey::from_name(b"missing-member-post-topology-resume");
+        let payload = b"successor topology resumes terminal evidence";
+        pool.put_with_receipt(IoClass::Data, key, payload)
+            .expect("write predecessor receipt");
+        pool.sync_all().expect("sync predecessor Pool");
+        let missing_device_guid = pool.device_guid_for_index(0);
+        let missing_device_path = config.devices[0].path.clone();
+        drop(pool);
+
+        std::fs::remove_file(&missing_device_path).expect("remove member zero");
+        let mut survivor_config = config.clone();
+        survivor_config.devices.remove(0);
+        let replacement_path = root.join("replacement.img");
+        let replacement_config = regular_file_device_config(replacement_path.clone());
+        let mut recovery = Pool::open_missing_member_rebuild_existing(
+            survivor_config,
+            properties.clone(),
+            &options,
+        )
+        .expect("open recovery-only survivor");
+        recovery
+            .begin_missing_member_rebuild_mutation()
+            .expect("arm rebuild mutation");
+        recovery
+            .rebuild_missing_member(missing_device_guid, replacement_config.clone(), &options)
+            .expect("publish successor receipts");
+        let crash_cut = recovery
+            .replacement_evidence
+            .clone()
+            .expect("stable rebuild evidence");
+        assert!(crash_cut.evidence_stable);
+        assert_eq!(crash_cut.state, ReplacementRebuildStatusState::Pending);
+
+        // Stop finish_missing_member_rebuild() at the exact durable cut after
+        // the successor roster is complete and reread but before terminal
+        // lifecycle evidence is published.
+        let evidence_payload = encode_device_replacement_evidence(&crash_cut)
+            .expect("encode stable successor evidence");
+        recovery
+            .persist_lifecycle_record_on_current_topology(
+                pool_label::PoolLifecycleKindV1::DeviceReplacement,
+                evidence_payload,
+                "test-missing-member-rebuild-topology-crash-cut",
+            )
+            .expect("publish post-topology pre-terminal crash cut");
+        recovery.persisted_label_epoch = Some(crash_cut.topology_epoch);
+        recovery
+            .durable_device_guids
+            .clone_from(&recovery.device_guids);
+        recovery.device_label_indices = (0..recovery.expected_device_count).collect();
+        recovery.set_receipt_generation_authority_state(
+            ReceiptGenerationAuthorityState::RecoveryRequired,
+        );
+        recovery
+            .converge_receipt_generation_authority()
+            .expect("converge successor receipt authority");
+        let mut successor_survivor_config = recovery.config().clone();
+        successor_survivor_config
+            .devices
+            .remove(crash_cut.device_index);
+        assert_legacy_device_lifecycle_files_absent(&root);
+        drop(recovery);
+
+        let mut resumed = Pool::open_missing_member_rebuild_existing(
+            successor_survivor_config,
+            properties.clone(),
+            &options,
+        )
+        .expect("reopen one successor-topology survivor");
+        let topology = resumed.topology_status();
+        assert_eq!(topology.missing_members, 1);
+        assert!(topology.members.iter().any(|member| {
+            !member.present
+                && member.device_index as usize == crash_cut.device_index
+                && member.device_guid == crash_cut.new_device_guid
+        }));
+        let restored = resumed
+            .device_replacement_result()
+            .expect("restore original missing-member identity");
+        assert_eq!(restored.old_device_guid, missing_device_guid);
+        assert_eq!(restored.new_device_guid, crash_cut.new_device_guid);
+        assert!(!restored.complete);
+        resumed
+            .begin_missing_member_rebuild_mutation()
+            .expect("re-arm terminal resume");
+        let prepared = resumed
+            .rebuild_missing_member(missing_device_guid, replacement_config, &options)
+            .expect("reattach exact successor candidate");
+        assert!(!prepared.complete);
+        let completed = resumed
+            .finish_missing_member_rebuild(missing_device_guid)
+            .expect("complete terminal evidence");
+        assert!(completed.complete);
+        assert_eq!(completed.new_device_guid, crash_cut.new_device_guid);
+        let final_config = resumed.config().clone();
+        drop(resumed);
+
+        let reopened = Pool::open(final_config, properties, &options)
+            .expect("reopen completed successor topology");
+        assert_eq!(
+            reopened
+                .get(IoClass::Data, key)
+                .expect("read rebuilt payload"),
+            Some(payload.to_vec())
+        );
+        assert_legacy_device_lifecycle_files_absent(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn pool_open_selects_completed_active_state_over_exported_predecessor() {
         let root = temp_dir("active-lifecycle-state-selection");
         let _ = std::fs::remove_dir_all(&root);
@@ -11934,6 +13481,128 @@ mod tests {
             Pool::open_read_only_existing(config, properties, &options),
             "topology roster mismatch across labels",
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn writable_open_upgrades_rosterless_bootstrap_labels() {
+        let root = temp_dir("writable-open-upgrades-rosterless-bootstrap-labels");
+        let _ = std::fs::remove_dir_all(&root);
+        let bootstrap = labelled_pool_bootstrap_config_with_redundancy(
+            &root,
+            2,
+            PoolRedundancyPolicy::replicated(2),
+        );
+        bootstrap_pool_config(&bootstrap).expect("initialize rosterless bootstrap stores");
+        let device_guids = bootstrap
+            .members
+            .iter()
+            .map(|member| member.device_guid)
+            .collect::<Vec<_>>();
+        let device_configs = bootstrap
+            .members
+            .iter()
+            .map(|member| DeviceConfig {
+                media_class: Default::default(),
+                path: member.path.clone(),
+                backing: DeviceBacking::RegularFileDev,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Block {
+                    path: member.path.clone(),
+                },
+                encryption: None,
+                compression: None,
+            })
+            .collect::<Vec<_>>();
+        let config = PoolConfig {
+            name: "bootstrap-fixture".into(),
+            root_path: root.join("metadata"),
+            devices: device_configs,
+        };
+        std::fs::create_dir_all(&config.root_path).expect("create Pool metadata directory");
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+
+        // Pool import activates its selected primary family while retaining
+        // the redundant exported predecessor. Model that exact state before
+        // the local Pool owner performs its writable open.
+        for device in &config.devices {
+            let copies = read_pool_label_copies(device).expect("read bootstrap label copies");
+            assert_eq!(copies.len(), 2);
+            let mut active_label = copies[0].label.clone();
+            active_label.pool_state = PoolState::Active;
+            let layout_bytes = pool_label::decode_device_layout_v1_bytes(&copies[0].bytes)
+                .expect("decode bootstrap DeviceLayoutV1")
+                .expect("bootstrap label has DeviceLayoutV1");
+            let sealed =
+                pool_label::seal_label_with_device_layout(active_label, Some(&layout_bytes))
+                    .expect("seal active rosterless bootstrap label");
+            let mut encoded = [0u8; pool_label::POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+            pool_label::encode_label_with_device_layout(&sealed, Some(&layout_bytes), &mut encoded)
+                .expect("encode active rosterless bootstrap label");
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(device_root_path(device))
+                .expect("open bootstrap member");
+            file.seek(SeekFrom::Start(0))
+                .expect("seek primary bootstrap label");
+            file.write_all(&encoded)
+                .expect("write active primary bootstrap label");
+            file.sync_all()
+                .expect("sync active primary bootstrap label");
+        }
+
+        for device in &config.devices {
+            let copies = read_pool_label_copies(device).expect("read bootstrap label copies");
+            assert_eq!(copies.len(), 2);
+            assert!(copies.iter().all(|copy| copy.topology_roster.is_none()));
+            assert_eq!(copies[0].label.pool_state, PoolState::Active);
+            assert_eq!(copies[1].label.pool_state, PoolState::Exported);
+        }
+
+        drop(
+            Pool::open(config.clone(), properties.clone(), &test_options())
+                .expect("writable open upgrades bootstrap labels"),
+        );
+
+        for device in &config.devices {
+            let copies = read_pool_label_copies(device).expect("read upgraded label copies");
+            assert_eq!(copies.len(), 2);
+            assert!(copies
+                .iter()
+                .all(|copy| copy.topology_roster.as_deref() == Some(device_guids.as_slice())));
+            assert_eq!(copies[0].label.pool_state, PoolState::Active);
+            assert_eq!(copies[1].label.pool_state, PoolState::Exported);
+        }
+
+        let mut survivor_config = config;
+        survivor_config.devices.remove(0);
+        let recovery = Pool::open_missing_member_rebuild_existing(
+            survivor_config,
+            properties,
+            &test_options(),
+        )
+        .expect("survivor-only recovery import uses upgraded roster");
+        assert_eq!(
+            recovery.topology_status().members,
+            vec![
+                PoolMemberStatus {
+                    device_index: 0,
+                    device_guid: device_guids[0],
+                    present: false,
+                },
+                PoolMemberStatus {
+                    device_index: 1,
+                    device_guid: device_guids[1],
+                    present: true,
+                },
+            ]
+        );
+        drop(recovery);
 
         let _ = std::fs::remove_dir_all(&root);
     }

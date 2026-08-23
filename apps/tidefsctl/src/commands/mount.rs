@@ -128,6 +128,14 @@ pub struct PoolMountArgs {
     #[arg(long = "read-only", default_value_t = false)]
     pub read_only: bool,
 
+    /// Admit only one exact missing-member rebuild while FUSE stays read-only
+    #[arg(
+        long = "rebuild-only",
+        default_value_t = false,
+        requires_all = ["read_only", "devices"]
+    )]
+    pub rebuild_only: bool,
+
     /// Block devices that make up the pool (import+activate before mount)
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
@@ -449,6 +457,67 @@ fn build_mount_runtime(
     Ok((runtime, coherency_profile))
 }
 
+fn validate_rebuild_only_mount(args: &PoolMountArgs) -> Result<(), String> {
+    if !args.rebuild_only {
+        return Ok(());
+    }
+    if !args.read_only {
+        return Err("--rebuild-only requires --read-only".to_string());
+    }
+    if args.devices.as_deref().map(<[_]>::len) != Some(1) {
+        return Err(
+            "--rebuild-only requires exactly one explicit surviving member through --devices"
+                .to_string(),
+        );
+    }
+    if args.runtime.snapshot.is_some() {
+        return Err("--rebuild-only does not support snapshot mounts".to_string());
+    }
+    #[cfg(feature = "cluster")]
+    if args.cluster || args.cluster_client {
+        return Err("--rebuild-only is local-only and refuses cluster mount authority".to_string());
+    }
+
+    let incompatible = [
+        (args.relatime, "--relatime"),
+        (args.runtime.writeback_cache, "--writeback-cache"),
+        (args.runtime.options.is_some(), "--options"),
+        (args.runtime.sync, "--sync"),
+        (
+            args.runtime.content_capacity_bytes.is_some(),
+            "--content-capacity-bytes",
+        ),
+        (
+            args.runtime.writeback_cache_timeout_secs.is_some(),
+            "--writeback-cache-timeout",
+        ),
+        (
+            args.runtime.background_scrub_interval_secs.is_some(),
+            "--background-scrub-interval",
+        ),
+        (args.runtime.coherency.is_some(), "--coherency"),
+        (args.runtime.compress_algo.is_some(), "--compress-algo"),
+        (args.encryption_envelope.is_some(), "--encryption-envelope"),
+        (
+            args.encryption_passphrase.is_some(),
+            "--encryption-passphrase",
+        ),
+        (args.encryption_salt.is_some(), "--encryption-salt"),
+        (args.runtime.enable_dedup, "--enable-dedup"),
+        (args.runtime.enable_reclaim, "--enable-reclaim"),
+        (
+            args.runtime.enable_repair_writeback,
+            "--enable-repair-writeback",
+        ),
+    ];
+    if let Some((_, option)) = incompatible.into_iter().find(|(enabled, _)| *enabled) {
+        return Err(format!(
+            "--rebuild-only refuses incompatible mounted mutation tuning {option}"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "cluster")]
 fn parse_cluster_pool_guid(raw: &str) -> Result<[u8; 16], String> {
     let raw = raw.as_bytes();
@@ -482,6 +551,7 @@ fn parse_cluster_pool_guid(raw: &str) -> Result<[u8; 16], String> {
 #[cfg(feature = "cluster")]
 fn cluster_client_uses_local_mount_inputs(args: &PoolMountArgs) -> bool {
     args.read_only
+        || args.rebuild_only
         || args.devices.is_some()
         || args.relatime
         || args.dataset != "root"
@@ -623,6 +693,11 @@ fn build_cluster_client_mount(
 /// 2. Launch the FUSE daemon on the runtime metadata directory.
 /// 3. Route already-imported pools through the live runtime owner.
 pub fn handle_mount(args: PoolMountArgs) {
+    validate_rebuild_only_mount(&args).unwrap_or_else(|error| {
+        eprintln!("tidefsctl pool mount: {error}");
+        process::exit(1);
+    });
+
     #[cfg(feature = "cluster")]
     if args.cluster_client {
         let config = build_cluster_client_mount(&args).unwrap_or_else(|error| {
@@ -666,6 +741,7 @@ pub fn handle_mount(args: PoolMountArgs) {
             LivePoolAdminArg::String(mountpoint.display().to_string()),
         ),
         ("read_only", LivePoolAdminArg::Bool(args.read_only)),
+        ("rebuild_only", LivePoolAdminArg::Bool(args.rebuild_only)),
         ("relatime", LivePoolAdminArg::Bool(args.relatime)),
         ("dataset", LivePoolAdminArg::String(args.dataset.clone())),
     ]);
@@ -765,6 +841,9 @@ pub fn handle_mount(args: PoolMountArgs) {
     }
     if args.read_only {
         mount_options.push("read-only".to_string());
+    }
+    if args.rebuild_only {
+        mount_options.push("rebuild-only".to_string());
     }
 
     println!("mounting pool at {}", mountpoint.display(),);
@@ -1051,6 +1130,7 @@ pub fn handle_mount(args: PoolMountArgs) {
         foreground: true,
         debug: false,
         read_only: args.read_only,
+        rebuild_only: args.rebuild_only,
         writeback_cache: args.runtime.writeback_cache,
         coherency_profile,
         block_devices: args.devices.clone(),
@@ -1304,6 +1384,87 @@ mod tests {
         assert_eq!(PoolMountRuntimeArgs::default().fs_name, "tidefs");
     }
 
+    fn rebuild_only_mount_args() -> PoolMountArgs {
+        PoolMountArgs {
+            pool_name: "tank".into(),
+            mount_point: PathBuf::from("/mnt/tank"),
+            read_only: true,
+            rebuild_only: true,
+            devices: Some(vec![PathBuf::from("/dev/survivor")]),
+            relatime: false,
+            dataset: "root".into(),
+            encryption_envelope: None,
+            encryption_passphrase: None,
+            encryption_salt: None,
+            runtime: PoolMountRuntimeArgs::default(),
+            #[cfg(feature = "cluster")]
+            cluster_client: false,
+            #[cfg(feature = "cluster")]
+            cluster_vfs_rpc_addr: Vec::new(),
+            #[cfg(feature = "cluster")]
+            cluster_pool_guid: None,
+            #[cfg(feature = "cluster")]
+            cluster: false,
+            #[cfg(feature = "cluster")]
+            cluster_authority_addr: None,
+            #[cfg(feature = "cluster")]
+            cluster_vfs_rpc_bind: None,
+            #[cfg(feature = "cluster")]
+            cluster_node_credential: None,
+            #[cfg(feature = "cluster")]
+            cluster_trusted_authority_identity: None,
+            #[cfg(feature = "cluster")]
+            cluster_trusted_vfs_rpc_peer_identity: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rebuild_only_mount_accepts_exact_guarded_local_inputs() {
+        assert!(validate_rebuild_only_mount(&rebuild_only_mount_args()).is_ok());
+    }
+
+    #[test]
+    fn rebuild_only_mount_refuses_missing_scope_and_mutation_tuning() {
+        let mut args = rebuild_only_mount_args();
+        args.read_only = false;
+        assert!(validate_rebuild_only_mount(&args)
+            .unwrap_err()
+            .contains("requires --read-only"));
+
+        args.read_only = true;
+        args.devices = Some(vec![PathBuf::from("/dev/a"), PathBuf::from("/dev/b")]);
+        assert!(validate_rebuild_only_mount(&args)
+            .unwrap_err()
+            .contains("exactly one explicit surviving member"));
+
+        args.devices = Some(vec![PathBuf::from("/dev/survivor")]);
+        args.runtime.enable_reclaim = true;
+        assert!(validate_rebuild_only_mount(&args)
+            .unwrap_err()
+            .contains("--enable-reclaim"));
+
+        args.runtime.enable_reclaim = false;
+        args.runtime.options = Some("allow_other".into());
+        assert!(validate_rebuild_only_mount(&args)
+            .unwrap_err()
+            .contains("--options"));
+
+        args.runtime.options = None;
+        args.encryption_envelope = Some(PathBuf::from("/run/keys/pool.envelope"));
+        assert!(validate_rebuild_only_mount(&args)
+            .unwrap_err()
+            .contains("--encryption-envelope"));
+    }
+
+    #[test]
+    fn rebuild_only_mount_refuses_snapshot_export() {
+        let mut args = rebuild_only_mount_args();
+        args.runtime.snapshot = Some("retained".into());
+        assert!(validate_rebuild_only_mount(&args)
+            .unwrap_err()
+            .contains("does not support snapshot"));
+    }
+
     #[cfg(feature = "cluster")]
     #[test]
     fn cluster_client_pool_mount_refuses_local_inputs_before_pool_work() {
@@ -1322,6 +1483,7 @@ mod tests {
             pool_name: "remote".into(),
             mount_point: PathBuf::from("/mnt/remote"),
             read_only: true,
+            rebuild_only: false,
             devices: None,
             relatime: false,
             dataset: "root".into(),
@@ -1350,6 +1512,7 @@ mod tests {
             pool_name: "remote".into(),
             mount_point: PathBuf::from("/mnt/remote"),
             read_only: false,
+            rebuild_only: false,
             devices: None,
             relatime: false,
             dataset: "root".into(),
@@ -1534,6 +1697,7 @@ mod tests {
             pool_name: "testpool".into(),
             mount_point: PathBuf::from("/mnt/tidefs"),
             read_only: false,
+            rebuild_only: false,
             devices: None,
             relatime: false,
         };
@@ -1549,6 +1713,7 @@ mod tests {
             pool_name: "ropool".into(),
             mount_point: PathBuf::from("/mnt/ro"),
             read_only: true,
+            rebuild_only: false,
             devices: None,
             relatime: false,
             encryption_envelope: None,
@@ -1584,6 +1749,7 @@ mod tests {
             pool_name: "relpool".into(),
             mount_point: PathBuf::from("/mnt/rel"),
             read_only: false,
+            rebuild_only: false,
             devices: None,
             relatime: true,
             dataset: "root".into(),
@@ -1619,6 +1785,7 @@ mod tests {
             pool_name: "full".into(),
             mount_point: PathBuf::from("/mnt/full"),
             read_only: true,
+            rebuild_only: false,
             devices: None,
             relatime: true,
             dataset: "root".into(),

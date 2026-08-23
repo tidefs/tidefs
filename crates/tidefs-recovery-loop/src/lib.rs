@@ -35,6 +35,9 @@ use std::path::Path;
 /// - \`ReadOnly\`: No mutation allowed. Mount inspects state and returns
 ///   validation but never writes. Suitable for forensics and online
 ///   verification.
+/// - \`DeviceRebuildOnly\`: The mounted namespace and ordinary recovery stay
+///   read-only, while one explicit missing-member rebuild may use a scoped
+///   Pool mutation authority.
 /// - \`ReplayOnly\`: Intent-log replay to the last committed state is
 ///   permitted. Scrub inspection runs read-only. Repair writeback and
 ///   metadata fixup are skipped. This is the safe production default.
@@ -45,6 +48,8 @@ use std::path::Path;
 pub enum RecoveryPolicy {
     /// No mutation allowed — inspect and report only.
     ReadOnly,
+    /// Read-only namespace with explicit missing-member rebuild authority.
+    DeviceRebuildOnly,
     /// Replay intent-log to committed state; no repair writeback.
     ReplayOnly,
     /// Full repair: replay, scrub repair, and metadata fixup.
@@ -70,7 +75,22 @@ impl RecoveryPolicy {
     /// (replay or repair).
     #[must_use]
     pub fn allows_any_mutation(&self) -> bool {
-        !matches!(self, Self::ReadOnly)
+        matches!(self, Self::ReplayOnly | Self::RepairWriteback)
+    }
+
+    /// Returns `true` only for the bounded missing-member rebuild policy.
+    #[must_use]
+    pub fn allows_device_rebuild(&self) -> bool {
+        matches!(self, Self::DeviceRebuildOnly)
+    }
+
+    /// Returns `true` when ordinary mounted or recovery mutation is allowed.
+    ///
+    /// Device-rebuild-only operation is deliberately excluded: its mutation
+    /// authority is armed only inside the exact Pool lifecycle command.
+    #[must_use]
+    pub fn allows_ordinary_mutation(&self) -> bool {
+        self.allows_any_mutation()
     }
 
     /// Human-readable label for diagnostics and validation recording.
@@ -78,6 +98,7 @@ impl RecoveryPolicy {
     pub fn label(&self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
+            Self::DeviceRebuildOnly => "device-rebuild-only",
             Self::ReplayOnly => "replay-only",
             Self::RepairWriteback => "repair-writeback",
         }
@@ -2730,6 +2751,17 @@ mod recovery_policy_tests {
         assert!(!p.allows_replay());
         assert!(!p.allows_repair_writeback());
         assert!(!p.allows_any_mutation());
+        assert!(!p.allows_device_rebuild());
+    }
+
+    #[test]
+    fn device_rebuild_only_scopes_mutation_to_the_explicit_rebuild() {
+        let p = RecoveryPolicy::DeviceRebuildOnly;
+        assert!(!p.allows_replay());
+        assert!(!p.allows_repair_writeback());
+        assert!(!p.allows_any_mutation());
+        assert!(!p.allows_ordinary_mutation());
+        assert!(p.allows_device_rebuild());
     }
 
     #[test]
@@ -2752,6 +2784,7 @@ mod recovery_policy_tests {
     fn labels_are_distinct() {
         let labels: Vec<&str> = [
             RecoveryPolicy::ReadOnly,
+            RecoveryPolicy::DeviceRebuildOnly,
             RecoveryPolicy::ReplayOnly,
             RecoveryPolicy::RepairWriteback,
         ]
@@ -2768,6 +2801,7 @@ mod recovery_policy_tests {
     fn debug_format_is_human_readable() {
         let expected = [
             (RecoveryPolicy::ReadOnly, "ReadOnly"),
+            (RecoveryPolicy::DeviceRebuildOnly, "DeviceRebuildOnly"),
             (RecoveryPolicy::ReplayOnly, "ReplayOnly"),
             (RecoveryPolicy::RepairWriteback, "RepairWriteback"),
         ];

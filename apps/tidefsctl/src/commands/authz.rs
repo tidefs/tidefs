@@ -94,6 +94,7 @@ const LOCAL_ONLY_COMMANDS: &[&str] = &[
     "pool repair",
     "device remove",
     "device replace",
+    "device rebuild",
     "snapshot create",
     "snapshot destroy",
     "snapshot export",
@@ -144,7 +145,6 @@ const UNGUARDED_COMMANDS: &[&str] = &[
     "snapshot prune-scheduled status",
     "snapshot prune-scheduled refusals",
     "snapshot prune-scheduled results",
-    "device rebuild",
     "block list",
     "dataset list",
     "dataset get",
@@ -378,6 +378,7 @@ mod tests {
             "pool repair",
             "device remove",
             "device replace",
+            "device rebuild",
             "snapshot create",
             "snapshot destroy",
             "snapshot export",
@@ -510,6 +511,7 @@ mod tests {
             "import",
             "export",
             "repair",
+            "rebuild",
         ];
         path.split_whitespace()
             .any(|word| MUTATION_VERBS.contains(&word))

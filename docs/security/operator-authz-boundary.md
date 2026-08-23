@@ -79,6 +79,7 @@ product-grade.
 | `snapshot receive` | `public-operator` | `live-owner` | `local-only` | `visible` | receive snapshot streams through the live owner; offline receive is unsupported |
 | `device remove` | `public-operator` | `live-owner` | `local-only` | `visible` | require live-owner authority but refuse dispatch until evacuation receipts and topology/label updates are durable |
 | `device replace` | `public-operator` | `live-owner` | `local-only` | `visible` | rebuild a present readable replicated member through the live owner before same-cardinality topology commit |
+| `device rebuild` | `public-operator` | `live-owner` | `local-only` | `visible` | rebuild one exact absent two-copy Pool member through a recovery-only read-only mounted owner |
 | `device status` | `public-operator` | `live-owner` | `unguarded` | `visible` | query live device status through the live owner; fail closed when no live owner is reachable |
 | `defrag` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | request online extent-map defragmentation for a path |
 | `block attach` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | export a named Pool volume through the live owner or explicit offline devices |
@@ -114,7 +115,6 @@ product-grade.
 | `cluster heal exercise` | `development-diagnostic` | `development-exercise` | `unguarded` | `visible` | development diagnostic exercise for placement-heal code |
 | `cluster status` | `public-operator` | `live-owner` | `unguarded` | `visible` | query live cluster status through the live owner; fail closed when no live owner is reachable |
 | `pool list` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | no authoritative pool registry exists; use pool scan --devices or pool status <pool> |
-| `device rebuild` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | offline directory object-store rebuild is retired; use live pool repair authority |
 | `directory-backed pool media` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | directory object-store pool media is retired for operator pool commands |
 | `pool integrity-check --backing-dir` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | directory object-store integrity scan mode is retired; use --devices or live owner |
 | `snapshot --backing-dir` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | directory object-store snapshot mode is retired |
