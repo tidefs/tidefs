@@ -1072,7 +1072,8 @@ fn encode_label_update_preserving_device_layout(
 
 const SUPPORTED_INCOMPAT_FEATURES: u64 = tidefs_types_pool_label_core::features::POOL_LABEL_V1
     | tidefs_types_pool_label_core::features::ENCRYPTION_INCOMPAT
-    | tidefs_types_pool_label_core::features::CLUSTER_POOL_INCOMPAT;
+    | tidefs_types_pool_label_core::features::CLUSTER_POOL_INCOMPAT
+    | tidefs_types_pool_label_core::features::DEVICE_ADMIN_OFFLINE_INCOMPAT;
 const SUPPORTED_RO_COMPAT_FEATURES: u64 = 0;
 const SUPPORTED_COMPAT_FEATURES: u64 = tidefs_types_pool_label_core::features::DEVICE_CLASS_AWARE
     | tidefs_types_pool_label_core::features::SPARE_POLICY_SUPPORTED
@@ -3684,6 +3685,26 @@ mod tests {
             }
             err => panic!("expected unsupported feature rejection, got {err}"),
         }
+    }
+
+    #[test]
+    fn administrative_device_offline_incompat_feature_is_supported() {
+        ensure_supported_label_features(
+            tidefs_types_pool_label_core::features::DEVICE_ADMIN_OFFLINE_INCOMPAT,
+            0,
+            0,
+        )
+        .expect("current importer understands durable administrative offline state");
+
+        let unknown = 1u64 << 63;
+        assert!(matches!(
+            ensure_supported_label_features(
+                tidefs_types_pool_label_core::features::DEVICE_ADMIN_OFFLINE_INCOMPAT | unknown,
+                0,
+                0,
+            ),
+            Err(ImportError::IncompatibleFeatures { unsupported }) if unsupported == unknown
+        ));
     }
 
     #[test]

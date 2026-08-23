@@ -321,6 +321,11 @@ pub mod features {
     /// importers refuse to open a clustered pool without cluster authority.
     /// Incompat bit 9.
     pub const CLUSTER_POOL_INCOMPAT: u64 = 1 << 9;
+    /// At least one member label uses the administrative-offline bit in
+    /// `device_health`. Readers that do not understand that bit must refuse
+    /// the selected topology instead of silently allocating to the member.
+    /// Incompat bit 10.
+    pub const DEVICE_ADMIN_OFFLINE_INCOMPAT: u64 = 1 << 10;
 
     /// Cluster-aware topology metadata is present in the label.
     /// Stored in `features_compat` — standalone importers can safely open
@@ -394,7 +399,8 @@ pub struct PoolLabelV1 {
     pub features_ro_compat: u64,
     /// Bitmask: compatible feature flags.
     pub features_compat: u64,
-    /// Per-device health state: 0=Online, 1=Degraded, 2=Faulted.
+    /// Per-device health state: low 7 bits are 0=Online, 1=Degraded,
+    /// 2=Faulted; bit 7 records durable administrative offline state.
     pub device_health: u8,
     /// Accumulated read I/O errors on this device.
     pub device_read_errors: u64,
@@ -619,6 +625,11 @@ impl PoolTopologyRosterV1<'_> {
 pub const POOL_LABEL_V1_CHECKSUM_BASE_OFFSET: usize = 379;
 pub const POOL_LABEL_V1_CHECKSUM_HEALTH_OFFSET: usize = 404;
 pub const POOL_LABEL_V1_CHECKSUM_OFFSET: usize = 408;
+
+/// Durable administrative-offline flag carried in `PoolLabelV1::device_health`.
+pub const DEVICE_HEALTH_ADMIN_OFFLINE: u8 = 1 << 7;
+/// Mask selecting the underlying health value from `PoolLabelV1::device_health`.
+pub const DEVICE_HEALTH_STATE_MASK: u8 = !DEVICE_HEALTH_ADMIN_OFFLINE;
 
 // ---------------------------------------------------------------------------
 // Label errors
@@ -1825,6 +1836,26 @@ mod tests {
         assert_eq!(decoded.pool_name_str(), "testpool");
         assert_eq!(decoded.pool_state, PoolState::Active);
         assert_eq!(decoded.checksum, sealed.checksum);
+    }
+
+    #[test]
+    fn device_health_administrative_offline_bit_roundtrips() {
+        let mut label = make_label("offline-health");
+        label.features_incompat |= features::DEVICE_ADMIN_OFFLINE_INCOMPAT;
+        label.device_health = DEVICE_HEALTH_ADMIN_OFFLINE | 1;
+        label.device_read_errors = 7;
+        let sealed = seal_label(label).unwrap();
+        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
+        encode_label(&sealed, &mut buf).unwrap();
+
+        let decoded = decode_label(&buf).unwrap();
+        assert_ne!(
+            decoded.features_incompat & features::DEVICE_ADMIN_OFFLINE_INCOMPAT,
+            0
+        );
+        assert_ne!(decoded.device_health & DEVICE_HEALTH_ADMIN_OFFLINE, 0);
+        assert_eq!(decoded.device_health & DEVICE_HEALTH_STATE_MASK, 1);
+        assert_eq!(decoded.device_read_errors, 7);
     }
 
     #[test]

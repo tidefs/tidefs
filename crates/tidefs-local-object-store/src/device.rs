@@ -33,6 +33,7 @@ use crate::{
     BlockStoreIdentity, LocalObjectStore, ObjectKey, ObjectLocation, Result, ScrubStats,
     StoreError, StoreOptions, StoreRetentionCompactionReport, StoredObject,
 };
+use tidefs_types_pool_label_core::{DEVICE_HEALTH_ADMIN_OFFLINE, DEVICE_HEALTH_STATE_MASK};
 use tracing;
 
 // ---------------------------------------------------------------------------
@@ -673,6 +674,18 @@ impl SingleDevice {
         }
     }
 
+    fn set_administratively_offline(&mut self, offline: bool) {
+        self.status.state = if offline {
+            DeviceState::Offline
+        } else {
+            match self.health_tracker.borrow().health {
+                DeviceHealth::Online => DeviceState::Online,
+                DeviceHealth::Degraded => DeviceState::Degraded,
+                DeviceHealth::Faulted => DeviceState::Faulted,
+            }
+        };
+    }
+
     /// Evaluate and transition device health based on accumulated error counters.
     ///
     /// ONLINE → DEGRADED when total errors >= degrade_threshold.
@@ -931,7 +944,8 @@ impl DeviceImpl for SingleDevice {
         write_errors: u64,
         cksum_errors: u64,
     ) {
-        let health = match health_byte {
+        let administratively_offline = health_byte & DEVICE_HEALTH_ADMIN_OFFLINE != 0;
+        let health = match health_byte & DEVICE_HEALTH_STATE_MASK {
             0 => DeviceHealth::Online,
             1 => DeviceHealth::Degraded,
             2 => DeviceHealth::Faulted,
@@ -945,10 +959,14 @@ impl DeviceImpl for SingleDevice {
         tracker.reset_window();
         // Sync DeviceStatus to match restored health state so that
         // status() reports the correct operational state after import.
-        self.status.state = match health {
-            DeviceHealth::Online => DeviceState::Online,
-            DeviceHealth::Degraded => DeviceState::Degraded,
-            DeviceHealth::Faulted => DeviceState::Faulted,
+        self.status.state = if administratively_offline {
+            DeviceState::Offline
+        } else {
+            match health {
+                DeviceHealth::Online => DeviceState::Online,
+                DeviceHealth::Degraded => DeviceState::Degraded,
+                DeviceHealth::Faulted => DeviceState::Faulted,
+            }
         };
         self.status.read_errors = read_errors;
         self.status.write_errors = write_errors;
@@ -3412,6 +3430,26 @@ fn parity_pool_internal_candidates(
 }
 
 impl Device {
+    pub(crate) fn set_administratively_offline(&mut self, offline: bool) -> Result<()> {
+        match self {
+            Self::Single(device) => {
+                device.set_administratively_offline(offline);
+                Ok(())
+            }
+            Self::Compressed(device) => device.inner.set_administratively_offline(offline),
+            Self::Encrypted(device) => device.inner.set_administratively_offline(offline),
+            Self::Mirror(_) | Self::LogDevice(_) => Err(StoreError::InvalidOptions {
+                reason: "administrative offline supports one byte-addressable Pool member",
+            }),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(_) | Self::ParityRaid2(_) | Self::ParityRaid3(_) => {
+                Err(StoreError::InvalidOptions {
+                    reason: "administrative offline supports one byte-addressable Pool member",
+                })
+            }
+        }
+    }
+
     pub(crate) fn has_any_physical_key(&self) -> bool {
         match self {
             Self::Single(device) => !device.store.list_keys_including_internal().is_empty(),

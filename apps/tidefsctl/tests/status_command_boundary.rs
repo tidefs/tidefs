@@ -467,6 +467,37 @@ fn no_owner_device_replace_json_refuses_without_touching_paths() {
     assert_eq!(refusal["source:status"], "source:unsupported-or-offline");
 }
 
+#[test]
+fn no_owner_device_offline_and_online_json_refuse_by_exact_guid() {
+    let pool_name = format!(
+        "device-state-no-owner-{}-{}",
+        std::process::id(),
+        NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    for operation in ["offline", "online"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+            .args([
+                "device",
+                operation,
+                &pool_name,
+                "11111111111111111111111111111111",
+                "--json",
+            ])
+            .output()
+            .expect("run no-owner administrative device command");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let refusal: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("parse administrative device refusal JSON");
+        assert_eq!(refusal["ok"], false);
+        assert_eq!(refusal["command"], "device");
+        assert_eq!(refusal["operation"], operation);
+        assert_eq!(refusal["pool_name"], pool_name);
+        assert_eq!(refusal["owner_required"], true);
+        assert_eq!(refusal["source:status"], "source:unsupported-or-offline");
+    }
+}
+
 fn hex_guid(guid: &[u8; 16]) -> String {
     guid.iter()
         .map(|byte| format!("{byte:02x}"))

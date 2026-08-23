@@ -92,6 +92,8 @@ const LOCAL_ONLY_COMMANDS: &[&str] = &[
     "pool destroy",
     "pool set",
     "pool repair",
+    "device offline",
+    "device online",
     "device remove",
     "device replace",
     "device rebuild",
@@ -376,6 +378,8 @@ mod tests {
             "pool create",
             "pool destroy",
             "pool repair",
+            "device offline",
+            "device online",
             "device remove",
             "device replace",
             "device rebuild",
@@ -512,6 +516,8 @@ mod tests {
             "export",
             "repair",
             "rebuild",
+            "offline",
+            "online",
         ];
         path.split_whitespace()
             .any(|word| MUTATION_VERBS.contains(&word))

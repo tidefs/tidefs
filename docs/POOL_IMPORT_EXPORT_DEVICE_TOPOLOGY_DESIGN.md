@@ -32,9 +32,9 @@ The current source-backed pool import/export boundary is:
 - `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` and `recovery.rs`:
   mounted-owner receipt reconciliation, authenticated-root refresh, and
   label-intent-bound interrupted lifecycle recovery.
-- `apps/tidefsctl/src/commands/device.rs`: live-owner-only local removal,
-  present-member replacement, and recovery-only missing-member rebuild routing
-  with truthful operator projection.
+- `apps/tidefsctl/src/commands/device.rs`: live-owner-only administrative
+  offline/online, local removal, present-member replacement, and recovery-only
+  missing-member rebuild routing with truthful operator projection.
 
 This document does not supersede source. If source and this summary disagree,
 source plus focused validation wins and this file must be corrected.
@@ -205,6 +205,53 @@ detach safety while explicitly claiming no secure erase, media remanence,
 sanitization, or decommissioning. Absent or unreadable old members, writable
 degraded replacement, erasure coding, filesystem dataset clones, simultaneous
 multi-mounted filesystem atomicity, and hot-spare policy remain separate work.
+
+## Mounted Administrative Offline And Online Boundary
+
+The bounded administrative availability path belongs to the reachable writable
+local mounted owner of an exact two-member `Replicated { copies: 2 }` Pool.
+`device offline` and `device online` name one present member by its full durable
+GUID. The owner refuses an unknown GUID, incomplete or differently ordered
+topology, read-only or recovery-only ownership, a non-two-copy policy, and an
+active removal or replacement before changing the member state.
+
+Administrative offline first syncs mounted and Pool state. The member label's
+`device_health` byte retains the underlying Online, Degraded, or Faulted value
+in its low bits and records administrative exclusion in bit 7. Every member
+label also carries `DEVICE_ADMIN_OFFLINE_INCOMPAT`, so an importer that does not
+understand the exclusion must refuse rather than allocate to the offline
+member. The owner advances the topology generation, writes and rereads the
+complete backup label family, and only then writes and rereads the primary
+family. Before backup-family completion the predecessor family remains
+complete; after completion the higher complete backup is authoritative even if
+primary promotion is interrupted. A reopen can therefore select one complete
+old-or-new state and an idempotent retry can converge both copies.
+
+An offline member is excluded from ordinary allocation candidates, placement
+capacity, and dedicated intent-log health/routing. Pool health becomes
+`Degraded`. For the admitted exact two-copy policy, any new write that cannot
+retain both replicas refuses during placement planning before payload or
+placement-receipt mutation. Existing receipt-authenticated data remains
+readable, and `device status` reports each durable index, full GUID, presence,
+and operational state in both human and explicit `--json` output. Export and
+reimport preserve the label bit and the degraded/offline projection.
+
+Online readmission first requires the target's exact current GUID and durable
+index plus a complete selected label topology. It inventories physical current
+placement receipts across both members, rejects corrupt, conflicting, or
+unstable receipt authority, verifies every current receipt copy, and verifies
+every receipt-bound replica or shard identity, length, digest, and payload. A
+faulted underlying health state refuses readmission. Only after verification
+does the owner clear the offline bit, advance the topology generation, and
+publish and reread the successor backup and primary families; exact-width
+writes resume only after that publication succeeds.
+
+This boundary is administrative availability control for one still-present
+member. It is not physical detach, missing-device recovery, replacement,
+rebuild, general writable degraded operation, erasure or clustered placement
+administration, hot-spare activation, secure erase, sanitization,
+media-remanence treatment, a support-admission statement, or a
+production-readiness claim.
 
 ## Mounted Missing-Member Rebuild Boundary
 

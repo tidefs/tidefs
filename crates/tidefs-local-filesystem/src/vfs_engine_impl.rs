@@ -1346,6 +1346,8 @@ impl VfsLocalFileSystem {
             | LivePoolAdminCommand::DatasetListProps
             | LivePoolAdminCommand::SnapshotList
             | LivePoolAdminCommand::DeviceStatus
+            | LivePoolAdminCommand::DeviceOffline
+            | LivePoolAdminCommand::DeviceOnline
             | LivePoolAdminCommand::DeviceRemove
             | LivePoolAdminCommand::DeviceReplace
             | LivePoolAdminCommand::DeviceRebuild => false,
@@ -3502,6 +3504,12 @@ impl SharedPoolDatasetOwner {
             LivePoolAdminCommand::PoolScrub => self.live_pool_scrub(&request.pool, wants_json),
             LivePoolAdminCommand::PoolRepair => self.live_pool_repair(&request.pool, wants_json),
             LivePoolAdminCommand::DeviceStatus => self.live_device_status(wants_json),
+            LivePoolAdminCommand::DeviceOffline => {
+                self.live_device_administrative_state(&args, wants_json, true)
+            }
+            LivePoolAdminCommand::DeviceOnline => {
+                self.live_device_administrative_state(&args, wants_json, false)
+            }
             LivePoolAdminCommand::DeviceRemove => self.live_device_remove(&args, wants_json),
             LivePoolAdminCommand::DeviceReplace => self.live_device_replace(&args, wants_json),
             LivePoolAdminCommand::DeviceRebuild => self.live_device_rebuild(&args, wants_json),
@@ -3535,6 +3543,18 @@ impl SharedPoolDatasetOwner {
         };
 
         if wants_json {
+            let members = topology
+                .members
+                .iter()
+                .map(|member| {
+                    json!({
+                        "device_index": member.device_index,
+                        "device_guid": guid(&member.device_guid),
+                        "present": member.present,
+                        "operational_state": member.operational_state.map(|state| format!("{state:?}")),
+                    })
+                })
+                .collect::<Vec<_>>();
             let replacement = replacement.map(|result| {
                 json!({
                     "state": state_name(result.state),
@@ -3564,6 +3584,7 @@ impl SharedPoolDatasetOwner {
                     "members_expected": topology.expected_members,
                     "members_present": topology.present_members,
                     "members_missing": topology.missing_members,
+                    "members": members,
                     "replacement": replacement,
                 })
                 .to_string(),
@@ -3599,7 +3620,114 @@ impl SharedPoolDatasetOwner {
         } else {
             message.push_str("\n  replacement: none");
         }
+        for member in &topology.members {
+            let _ = write!(
+                message,
+                "\n  member[{}]: guid={} present={} state={}",
+                member.device_index,
+                guid(&member.device_guid),
+                member.present,
+                member
+                    .operational_state
+                    .map(|state| format!("{state:?}"))
+                    .unwrap_or_else(|| "Missing".to_string()),
+            );
+        }
         live_admin_ok_text(message)
+    }
+
+    fn live_device_administrative_state(
+        &self,
+        args: &Value,
+        wants_json: bool,
+        offline: bool,
+    ) -> LivePoolAdminResponse {
+        let operation = if offline { "offline" } else { "online" };
+        let device_guid = match live_admin_arg(args, "device_guid").and_then(live_admin_exact_guid)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return live_admin_error(2, format!("device {operation}: {error}"));
+            }
+        };
+        let guid_hex = live_admin_hex_encode(&device_guid);
+        if let Err(error) = self
+            .borrow()
+            .ensure_mutation_allowed("change mounted Pool device availability")
+        {
+            return live_admin_error(
+                1,
+                format!("device {operation}: mutation requires a writable owner: {error}"),
+            );
+        }
+
+        let mut fs = self.borrow_mut();
+        if offline {
+            if let Err(error) = fs.sync_all() {
+                return live_admin_error(
+                    1,
+                    format!(
+                        "device offline: could not sync mounted filesystem state before excluding {guid_hex}: {error}"
+                    ),
+                );
+            }
+        }
+        let result = if offline {
+            fs.store.pool_mut().device_offline(device_guid)
+        } else {
+            fs.store.pool_mut().device_online(device_guid)
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let message =
+                    format!("device {operation}: Pool owner refused member {guid_hex}: {error}");
+                return if wants_json {
+                    LivePoolAdminResponse::error_machine_json(
+                        1,
+                        message.clone(),
+                        json!({
+                            "status": "refused",
+                            "operation": operation,
+                            "device_guid": guid_hex,
+                            "message": message,
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    live_admin_error(1, message)
+                };
+            }
+        };
+        let state = format!("{:?}", result.state);
+        let health = format!("{:?}", result.pool_health);
+        let message = format!(
+            "device {operation}: member {} at durable index {} is {} (pool_health={}, topology_generation={}, verified_receipts={})",
+            guid_hex,
+            result.device_index,
+            state,
+            health,
+            result.topology_generation,
+            result.verified_receipts,
+        );
+        if wants_json {
+            LivePoolAdminResponse::ok_machine_json(
+                json!({
+                    "status": "completed",
+                    "operation": operation,
+                    "device_guid": guid_hex,
+                    "device_index": result.device_index,
+                    "operational_state": state,
+                    "pool_health": health,
+                    "topology_generation": result.topology_generation,
+                    "verified_receipts": result.verified_receipts,
+                    "message": message,
+                })
+                .to_string(),
+            )
+        } else {
+            live_admin_ok_text(message)
+        }
     }
 
     fn live_device_replace(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
@@ -8848,6 +8976,8 @@ mod tests {
 
         for (command, operation) in [
             (LivePoolAdminCommand::DeviceStatus, "status"),
+            (LivePoolAdminCommand::DeviceOffline, "offline"),
+            (LivePoolAdminCommand::DeviceOnline, "online"),
             (LivePoolAdminCommand::DeviceRemove, "remove"),
             (LivePoolAdminCommand::DeviceReplace, "replace"),
         ] {
@@ -9880,6 +10010,102 @@ mod tests {
         assert_eq!(engine.fs.borrow().store.pool().stats().device_count, 2);
         drop(engine);
         drop(td);
+    }
+
+    #[test]
+    fn live_device_offline_and_online_report_member_state_and_gate_writes() {
+        let td = tempfile::tempdir().expect("administrative device fixture");
+        let metadata = td.path().join("metadata");
+        std::fs::create_dir_all(&metadata).expect("create administrative metadata dir");
+        let devices = [td.path().join("dev0.img"), td.path().join("dev1.img")];
+        for path in &devices {
+            let file = std::fs::File::create(path).expect("create administrative device image");
+            file.set_len(16 * 1024 * 1024)
+                .expect("size administrative device image");
+        }
+        let policy = tidefs_local_object_store::pool::PoolRedundancyPolicy::replicated(2);
+        let mut filesystem = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &devices,
+            "live-device-offline",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("create administrative device filesystem");
+        let payload = b"mounted bytes remain readable while one member is offline";
+        filesystem
+            .create_file("/offline.bin", 0o600)
+            .expect("create administrative test file");
+        filesystem
+            .write_file("/offline.bin", 0, payload)
+            .expect("write administrative test file");
+        filesystem
+            .sync_all()
+            .expect("sync administrative test file");
+        let target_guid = filesystem.store.pool().topology_status().members[0].device_guid;
+        let target_guid_hex = live_admin_hex_encode(&target_guid);
+        let engine = VfsLocalFileSystem::new(filesystem);
+
+        let offline = live_device_admin(
+            &engine,
+            "offline",
+            json!({ "device_guid": target_guid_hex.clone() }),
+            true,
+        );
+        assert_eq!(offline["ok"], true, "offline response: {offline}");
+        assert_eq!(offline["json"]["status"], "completed");
+        assert_eq!(offline["json"]["operational_state"], "Offline");
+        assert_eq!(offline["json"]["pool_health"], "Degraded");
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_file("/offline.bin")
+                .expect("read mounted bytes with one member offline"),
+            payload
+        );
+        let refused_key =
+            tidefs_local_object_store::ObjectKey::from_name(b"live-device-offline-refused-write");
+        assert!(engine
+            .fs
+            .borrow_mut()
+            .store
+            .pool_mut()
+            .put_with_receipt(
+                tidefs_local_object_store::DeviceIoClass::Data,
+                refused_key,
+                b"must refuse",
+            )
+            .is_err());
+
+        let status = live_device_admin(&engine, "status", json!({}), true);
+        assert_eq!(status["ok"], true, "status response: {status}");
+        assert_eq!(status["json"]["members"][0]["device_guid"], target_guid_hex);
+        assert_eq!(status["json"]["members"][0]["operational_state"], "Offline");
+
+        let online = live_device_admin(
+            &engine,
+            "online",
+            json!({ "device_guid": target_guid_hex.clone() }),
+            true,
+        );
+        assert_eq!(online["ok"], true, "online response: {online}");
+        assert_eq!(online["json"]["operational_state"], "Online");
+        assert_eq!(online["json"]["pool_health"], "Online");
+        assert!(online["json"]["verified_receipts"].as_u64().unwrap() > 0);
+        engine
+            .fs
+            .borrow_mut()
+            .store
+            .pool_mut()
+            .put_with_receipt(
+                tidefs_local_object_store::DeviceIoClass::Data,
+                refused_key,
+                b"now admitted",
+            )
+            .expect("replicated write resumes after verified readmission");
     }
 
     #[test]

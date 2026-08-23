@@ -581,6 +581,8 @@ fn dispatch_request(
         | LivePoolAdminCommand::PoolIntegrityCheck
         | LivePoolAdminCommand::PoolScrub
         | LivePoolAdminCommand::DeviceStatus
+        | LivePoolAdminCommand::DeviceOffline
+        | LivePoolAdminCommand::DeviceOnline
         | LivePoolAdminCommand::DeviceRemove
         | LivePoolAdminCommand::DeviceReplace
         | LivePoolAdminCommand::DeviceRebuild => match admin {
@@ -2090,6 +2092,7 @@ fn hex_uuid(uuid: &[u8; 16]) -> String {
 mod tests {
     use super::*;
 
+    use tidefs_local_object_store::device::DeviceState;
     use tidefs_local_object_store::pool::PoolMemberStatus;
 
     #[cfg(feature = "block-volume")]
@@ -2123,11 +2126,13 @@ mod tests {
                     device_index: 0,
                     device_guid: [0x11; 16],
                     present: false,
+                    operational_state: None,
                 },
                 PoolMemberStatus {
                     device_index: 1,
                     device_guid: [0x22; 16],
                     present: true,
+                    operational_state: Some(DeviceState::Online),
                 },
             ],
         };
@@ -2719,6 +2724,22 @@ mod tests {
         assert_eq!(request.command, LivePoolAdminCommand::DeviceStatus);
         assert_eq!(request.output, LivePoolAdminOutput::MachineJson);
         assert_eq!(request.pool, "tank");
+    }
+
+    #[test]
+    fn device_offline_and_online_wire_commands_decode_to_typed_routes() {
+        for (wire, expected) in [
+            ("device_offline", LivePoolAdminCommand::DeviceOffline),
+            ("device_online", LivePoolAdminCommand::DeviceOnline),
+        ] {
+            let request = decode_live_pool_admin_request(&format!(
+                r#"{{"version":1,"command":"{wire}","pool":"tank","pool_uuid":null,"output":"machine_json","args":{{"device_guid":{{"type":"string","value":"11111111111111111111111111111111"}}}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(request.command, expected);
+            assert_eq!(request.output, LivePoolAdminOutput::MachineJson);
+            assert_eq!(request.pool, "tank");
+        }
     }
 
     #[test]

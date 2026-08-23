@@ -515,6 +515,18 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         summary: "rebuild one exact absent two-copy Pool member through a recovery-only read-only mounted owner",
     },
     CommandSurface {
+        path: "device offline",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwner,
+        summary: "durably exclude one exact present member from allocation through the live owner",
+    },
+    CommandSurface {
+        path: "device online",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwner,
+        summary: "verify and readmit one exact administratively offline member through the live owner",
+    },
+    CommandSurface {
         path: "device status",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwner,
@@ -951,6 +963,8 @@ mod tests {
             "snapshot prune-scheduled results",
             "device remove",
             "device replace",
+            "device offline",
+            "device online",
             #[cfg(feature = "block-volume")]
             "block attach",
         ] {
