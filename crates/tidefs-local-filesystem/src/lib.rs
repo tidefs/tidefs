@@ -2324,9 +2324,12 @@ pub(crate) enum MountedMetadataIntentTransformMode {
 /// Namespace-create entries contain directory-entry and inode metadata;
 /// metadata-setattr entries contain the post-setattr inode record and logical
 /// size. Neither carries mounted file payload bytes. Mounted open already
-/// rejects configured device transforms, so this authority may append and sync
-/// those records through the intent log's raw-state authority without implying
-/// mounted compression or encryption support.
+/// rejects configured device transforms, so this authority may append those
+/// records through the intent log's raw-state authority without implying
+/// mounted compression or encryption support. Explicit durable callers append
+/// and sync immediately; ordinary asynchronous VFS mutations use the intent
+/// log's bounded group commit and rely on fsync, syncfs, commit-group close, or
+/// clean mounted-owner close for the stronger committed-root boundary.
 pub(crate) struct MountedMetadataIntentRawStateAuthority<'a> {
     intent_log: &'a mut IntentLog,
     store: &'a mut Pool,
@@ -2359,6 +2362,7 @@ impl<'a> MountedMetadataIntentRawStateAuthority<'a> {
         MOUNTED_RECOVERY_TRANSFORM_ORDERING
     }
 
+    #[cfg(test)]
     fn append_create_and_sync(
         &mut self,
         intent: NamespaceCreateIntentRecord,
@@ -2372,6 +2376,7 @@ impl<'a> MountedMetadataIntentRawStateAuthority<'a> {
         )
     }
 
+    #[cfg(test)]
     fn append_setattr_and_sync(
         &mut self,
         updated_inode: InodeRecord,
@@ -2385,6 +2390,55 @@ impl<'a> MountedMetadataIntentRawStateAuthority<'a> {
         )
     }
 
+    fn append_create_for_group_commit(
+        &mut self,
+        intent: NamespaceCreateIntentRecord,
+        root_anchor: IntentLogRootAnchor,
+        timestamp_ns: u64,
+    ) -> Result<IntentLogReplyState> {
+        self.append_for_group_commit(
+            IntentLogEntryKind::NamespaceCreateIntent(intent),
+            root_anchor,
+            timestamp_ns,
+        )
+    }
+
+    fn append_setattr_for_group_commit(
+        &mut self,
+        updated_inode: InodeRecord,
+        root_anchor: IntentLogRootAnchor,
+        timestamp_ns: u64,
+    ) -> Result<IntentLogReplyState> {
+        self.append_for_group_commit(
+            IntentLogEntryKind::MetadataSetattrIntent(updated_inode),
+            root_anchor,
+            timestamp_ns,
+        )
+    }
+
+    fn append_for_group_commit(
+        &mut self,
+        entry_kind: IntentLogEntryKind,
+        root_anchor: IntentLogRootAnchor,
+        timestamp_ns: u64,
+    ) -> Result<IntentLogReplyState> {
+        let accepted = self.intent_log.append(
+            self.store.raw_primary_store_mut(),
+            entry_kind,
+            root_anchor,
+            timestamp_ns,
+        )?;
+        if !accepted {
+            return Ok(IntentLogReplyState::Refused);
+        }
+        if self.intent_log.pending_flush_count() == 0 {
+            Ok(IntentLogReplyState::IntentDurable)
+        } else {
+            Ok(IntentLogReplyState::ReplyEligible)
+        }
+    }
+
+    #[cfg(test)]
     fn append_and_sync(
         &mut self,
         entry_kind: IntentLogEntryKind,
@@ -13613,6 +13667,9 @@ impl PoolDatasetOwner {
     pub fn set_max_uncommitted_mutations(&mut self, max: u64) -> Result<()> {
         self.ensure_mutation_allowed("set mounted uncommitted-mutation limit")?;
         self.filesystem.max_uncommitted_mutations = max;
+        self.filesystem
+            .intent_log
+            .set_pressure_depth_threshold(usize::try_from(max).unwrap_or(usize::MAX));
         Ok(())
     }
 
@@ -13899,6 +13956,7 @@ impl PoolDatasetOwner {
         Ok(IntentLogReplyState::IntentDurable)
     }
 
+    #[cfg(test)]
     pub(crate) fn namespace_create_intent(
         &mut self,
         parent_inode_id: InodeId,
@@ -13933,6 +13991,35 @@ impl PoolDatasetOwner {
         Ok(IntentLogReplyState::IntentDurable)
     }
 
+    pub(crate) fn namespace_create_group_commit_intent(
+        &mut self,
+        parent_inode_id: InodeId,
+        entry: NamespaceEntry,
+        inode: &InodeRecord,
+    ) -> Result<IntentLogReplyState> {
+        self.ensure_mutation_allowed("record grouped namespace create intent")?;
+        let committed_root = self.selected_committed_root_summary()?;
+        let root_anchor = IntentLogRootAnchor::from_committed_root_summary(&committed_root);
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        MountedMetadataIntentRawStateAuthority::raw_metadata_only(
+            &mut self.filesystem.intent_log,
+            self.store.pool_mut(),
+        )
+        .append_create_for_group_commit(
+            NamespaceCreateIntentRecord {
+                parent_inode_id,
+                entry,
+                inode: inode.clone(),
+            },
+            root_anchor,
+            timestamp_ns,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn metadata_setattr_intent(
         &mut self,
         updated_inode: &InodeRecord,
@@ -13955,6 +14042,24 @@ impl PoolDatasetOwner {
         }
 
         Ok(IntentLogReplyState::IntentDurable)
+    }
+
+    pub(crate) fn metadata_setattr_group_commit_intent(
+        &mut self,
+        updated_inode: &InodeRecord,
+    ) -> Result<IntentLogReplyState> {
+        self.ensure_mutation_allowed("record grouped metadata setattr intent")?;
+        let committed_root = self.selected_committed_root_summary()?;
+        let root_anchor = IntentLogRootAnchor::from_committed_root_summary(&committed_root);
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        MountedMetadataIntentRawStateAuthority::raw_metadata_only(
+            &mut self.filesystem.intent_log,
+            self.store.pool_mut(),
+        )
+        .append_setattr_for_group_commit(updated_inode.clone(), root_anchor, timestamp_ns)
     }
 
     /// Flush the intent log if the adaptive flush interval has elapsed
@@ -19824,6 +19929,68 @@ mod recovery_integration_tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn mounted_metadata_intent_raw_state_authority_groups_ordinary_vfs_intents() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut fs = LocalFileSystem::open_with_options(tmp.path(), StoreOptions::durable())
+            .expect("open filesystem");
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
+        let (entry, inode) = namespace_create_fixture(&mut fs, "grouped-metadata");
+        let updated = metadata_setattr_fixture(&mut fs, "grouped-setattr");
+        fs.filesystem.intent_log = IntentLog::with_config(IntentLogConfig {
+            max_batch_entries: 2,
+            pressure_depth_threshold: 4,
+            ..IntentLogConfig::default()
+        });
+
+        assert_eq!(
+            fs.namespace_create_group_commit_intent(ROOT_INODE_ID, entry.clone(), &inode)
+                .expect("append first grouped intent"),
+            IntentLogReplyState::ReplyEligible,
+        );
+        assert_eq!(fs.filesystem.intent_log.pending_flush_count(), 1);
+        assert_eq!(
+            fs.metadata_setattr_group_commit_intent(&updated)
+                .expect("append second grouped intent"),
+            IntentLogReplyState::IntentDurable,
+        );
+        assert_eq!(fs.filesystem.intent_log.pending_flush_count(), 0);
+
+        assert_eq!(
+            fs.namespace_create_group_commit_intent(ROOT_INODE_ID, entry, &inode)
+                .expect("append third grouped intent"),
+            IntentLogReplyState::ReplyEligible,
+        );
+        assert_eq!(
+            fs.metadata_setattr_group_commit_intent(&updated)
+                .expect("append fourth grouped intent"),
+            IntentLogReplyState::IntentDurable,
+        );
+        assert_eq!(
+            fs.metadata_setattr_group_commit_intent(&updated)
+                .expect("enforce grouped intent pressure"),
+            IntentLogReplyState::Refused,
+        );
+        assert_eq!(fs.filesystem.intent_log.pending_flush_count(), 0);
+    }
+
+    #[test]
+    fn mounted_deferred_mutation_limit_sets_intent_pressure_bound() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut fs = LocalFileSystem::open_with_options(tmp.path(), StoreOptions::durable())
+            .expect("open filesystem");
+
+        fs.set_max_uncommitted_mutations(64 * 1024)
+            .expect("set mounted deferred-mutation bound");
+
+        assert_eq!(
+            fs.filesystem.intent_log.pressure_depth_threshold(),
+            64 * 1024,
+            "intent pressure must not force a hidden commit below the owning mutation bound"
+        );
     }
 
     // ── RecoveryPolicy integration tests ──────────────────────────────────
