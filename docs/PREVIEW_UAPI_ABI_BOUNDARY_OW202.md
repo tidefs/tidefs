@@ -64,6 +64,8 @@ Command groups must not claim stronger stability than the class recorded here:
 | `pool get` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | read pool properties through owner authority or explicit offline devices |
 | `pool set` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | set pool properties through owner authority or explicit offline devices |
 | `pool list-props` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list pool property definitions and effective values |
+| `pool scrub` | `public-operator` | `live-owner` | `unguarded` | `visible` | scan current mounted Pool-backed filesystem content through the live owner |
+| `pool repair` | `public-operator` | `live-owner` | `local-only` | `visible` | repair one receipt-authorized corrupt replica through the local mounted owner |
 | `snapshot create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create snapshots through the live owner or explicit offline devices |
 | `snapshot list` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list local snapshot catalog entries with kind, origin, hold, and generation metadata |
 | `snapshot clone create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create local snapshot clones through the live owner or explicit offline devices |

@@ -2,6 +2,7 @@
 
 Maturity: current guardrail for TFR-006 and GitHub issue #218.
 Issue #637 records the scrub/repair identity boundary.
+Issue #2582 records one bounded local two-copy live-owner repair path.
 Mounted device-level compression remains blocked.
 Mounted device-level encryption remains blocked.
 
@@ -75,7 +76,7 @@ consumer; exact source-match counts are not an authority or completion gate.
 | Mounted recovery probe, recovery audit, and online verifier | `MountedCommittedRootRepairAuthority`, `recovery_probe_pool`, `audit_recovery_pool`, and `verify_online_pool` | raw-primary metadata plus strict Pool content authority | Mounted diagnostics scan root slots and transaction metadata in the raw recovery store, then load and validate every committed content object through current Pool placement receipts. Missing, stale, malformed, or receiptless content cannot make a root healthy. |
 | Public/raw internal store exposure and scoped diagnostics | `MountedRawStoreDiagnostics`, `dataset_space_usage`, `verify_file_checksum_tree_for_diagnostic`, `committed_root_pointer`, `suspect_log_stats`, and test-only mounted scrub/transaction/content-receipt projections in `src/lib.rs` | metadata/diagnostic scoped | `store_ref` and `object_store` have been removed. Dataset usage, checksum-tree validation, committed-root-pointer access, suspect-log stats, transaction-superblock assertions, VFS receipt assertions, and mounted scrub tests now consume typed projections that do not return `&LocalObjectStore`. Current content-object presence is no longer answered by this raw diagnostic authority; it requires a strict current Pool receipt in the mounted content row below. The POSIX committed-root diagnostic caller now routes through `committed_root_pointer`. No public `&LocalObjectStore` bypass remains on the mounted filesystem for this row. |
 | Reclaim, orphan cleanup, snapshot protection, and mounted allocation accounting | `record_reclaim_delta`, persisted mounted reclaim queue load/store, `prepare_orphan_reclaim_entries`, `collect_snapshot_protected_content_keys`, `drain_local_reclaim_queue_into_store`, `reclaim_unprotected_objects`, `commit_space_delta`, Pool allocation-entry helpers, and journal cleaner key scans | strict Pool authority for mounted content protection, durable logical reclaim obligations, logical reclaim preflight, startup usage, and capacity admission; metadata-only orphan reconciliation; physical receipt-bound drain disabled; metadata/raw-only for journal-cleaner accounting scans | Reclaim identity is an object-key/locator lifetime concern. The integrity-checked mounted queue is read and written only through current Pool receipts, retained across compaction, ordered before committed-root publication, and durably records handoff state before completed originals are removed. Layout derivation, recursive retained snapshot/clone protection, dedup redirect/canonical preflight, replacement proof, startup usage, and current/replaced/retained-root capacity entries use exact current Pool receipts; every non-hole allocation entry is backed by a validated current content read. Mount-time orphan recovery queues exact keys from a still-present inode and strict layout, while metadata cleanup has no object-store handle. Uncertain authority fails closed and keeps original local reclaim work pending. Successful logical handoff leaves lower receipt-bound physical entries queued. The mounted path does not compare filesystem-root generations with Pool receipt generations or treat a global receipt-allocation frontier as root stability; physical reuse waits for exact obsolete-placement tokens durably bound to an authenticated filesystem root and cleared against retained roots and snapshots. Journal-cleaner metadata scans retain their raw-only classification and do not authorize mounted device transforms. |
-| Scrub and repair | `schedule_scrub_repairs`, `scrub_repair_pass`, `dispatch_scheduled_repairs` | blocked; scrub read evidence routed | Local scrub now consumes the mounted content scrub/read authority for inline content bodies and content chunks, reports findings against `ScrubBlockId` plus plaintext-length identity, and records checksum-layer, receipt, and raw/media diagnostic evidence. Repair dispatch still consumes scrub findings through the existing non-writeback scheduling boundary and has not been changed to require transform-aware evidence before writeback. Compression frames, encryption frames, checksum bytes, and raw media bytes remain lower-layer evidence or diagnostics; they must not be the product repair identity for mounted content. The row remains blocked until #652 and the other follow-up implementation issues below are complete and no production blocked row remains. |
+| Scrub and repair | `run_scrub_repair_scheduling`, `dispatch_repair_from_bridge`, `compare_mounted_replicated_repair`, `SharedPoolDatasetOwner::live_pool_repair`, and `Pool::repair_current_replicated_target` | receipt/root-authorized for one bounded local current two-copy live-owner target repair; blocked for scheduled, distributed, rebuild, and device-transform repair paths | Local scrub consumes the mounted content scrub/read authority for inline content bodies and content chunks, reports findings against `ScrubBlockId` plus plaintext-length identity, and records checksum-layer, receipt, and raw/media diagnostic evidence. The closed #652 slice makes the legacy scheduling/dispatch bridge require matching mounted scrub identity, checksum-layer evidence, verified receipt evidence, and a fresh current data version before its truncate, mark-corrupt, or reconstruct strategy can mutate content. That bridge still mutates through `LocalObjectStore` rather than the current Pool/root authority, so its scheduled repair path remains blocked even with the evidence gate. Separately, the #2582 live-owner path authorizes only one corrupt content-chunk target plus one clean source under an exact current writable two-copy Pool receipt. It authenticates current and retained roots, refreshes the full comparison immediately before writeback, publishes a higher replacement receipt, reconciles embedded receipt generations into authenticated filesystem and snapshot roots, and requires a clean re-scrub. It does not enable the legacy scheduler as the `pool repair` carrier, select distributed members, repair dual corruption, rebuild a failed device, or authorize mounted device transforms. Compression frames, encryption frames, checksum bytes, and raw media bytes remain lower-layer evidence or diagnostics; they must not be the product repair identity for mounted content. The row remains blocked while any remaining repair path or other production row bypasses the mounted transform authority. |
 | File content reads, writes, sparse operations, reflink, copy-file-range, truncate, punch-hole, zero-range, read overlay, content inspection | `create_file_like`, `replace_content`, `rewrite_content_*`, `read_content*`, `reflink_*`, `truncate_file`, `free_extent_range`, `punch_hole`, `zero_range`, `inspect_filesystem_content_objects`, `current_content_object_exists_for_diagnostic`, and related helpers in `src/lib.rs` plus inode-based open-unlinked/`O_TMPFILE` operations and whole-file copy fast paths in `vfs_engine_impl.rs` | transform-aware for mounted content compression, plaintext dedup, and receipt-producing content writes; blocked for remaining device-level compression/encryption raw paths | The main content-write population paths route durable chunk writes through `PoolStoreMut::put_with_receipt`. Mounted full/range reads, layout reads, sparse seek layout reads, reflink and rewrite layout planning, extent/content inspection, current-content presence diagnostics, reclaim layout reads, open-unlinked and `O_TMPFILE` handle operations, and whole-file copy fast paths use strict current Pool receipt authority. Sparse overlay, patch, punch-hole, and reflink mutation helpers preserve and compare each chunk receipt generation before rewriting; dedup canonical reads require a strict current receipt and retain their content-addressed key check. Same-key historical self-heal remains available only to explicit non-pool raw-store consumers and cannot authorize mounted mutation. The row remains blocked for device-level compression/encryption until intent-log, send/receive, inode/directory fallback, journal-cleaner scans, and other residual raw paths are routed or proven raw-only. |
 | Snapshot export/import and send/receive | `rollback_to_snapshot`, `export_changed_records`, `export_incremental_changed_records` | blocked | Changed-record export/import carries an explicit stored-frame/no-device-transform contract for transform-disabled streams. The VFSSEND1 codec now binds that contract to a typed metadata tuple covering plaintext identity, transform-frame identity, checksum layer, stored-frame authority, and refusal state; decode rejects mismatched tuples, and receive validation rejects the transform-required typed refusal before staging or publish. The row remains blocked until persisted key-handle/lease and per-frame metadata can replay mounted device transforms through the ordered contract. |
 | Intent-log head and entry records | `IntentLogRawStateAuthority` in `src/intent_log.rs` behind intent-log load, flush, and clear paths | metadata/raw-only | Head and entry records describe log ordering, replay ranges, payload digests, and inode metadata. They do not contain mounted file payload bytes. |
@@ -93,18 +94,31 @@ consumer; exact source-match counts are not an authority or completion gate.
 Issue #637 reviewed this inventory, the deleted scrub/repair/resilver
 historical lineage,
 `crates/tidefs-local-filesystem/src/scrub.rs`,
-`crates/tidefs-local-filesystem/src/repair.rs`, active stale-generation repair
-issue #591, and placement/rebuild issue #18.
+`crates/tidefs-local-filesystem/src/repair.rs`, closed stale-generation repair
+issue #591, and the closed placement-receipt umbrella #18.
 
 The current local scrub source routes inline and chunk block reads through
 `read_mounted_content_scrub_block`, records mounted plaintext identity plus
 checksum-layer evidence, and keeps missing, stale, unavailable, and unbound
-receipt evidence visible in the scrub report. The current repair source still
-reconstructs repair jobs from scrub findings, then dispatches
-truncate/mark-corrupt/reconstruct behavior against the existing content keys.
-The bridge already records missing or stale receipt evidence as blocked
-scheduling state, but repair dispatch has not yet consumed the mounted scrub
-evidence as a writeback precondition.
+receipt evidence visible in the scrub report. The closed #652 work makes the
+legacy repair bridge carry that mounted evidence into scheduling and requires
+matching subject, checksum layer, verified receipt generation, and current
+data version immediately before its existing truncate, mark-corrupt, or
+reconstruct dispatch can mutate content. That path still receives a raw
+`LocalObjectStore`; the evidence gate does not provide Pool-owned receipt-target
+comparison, target-only replacement, authenticated-root reconciliation, or the
+live-owner carrier added by #2582. It therefore remains a blocked scheduled
+repair path.
+
+The #2582 path is separate from the legacy scheduling/dispatch bridge.
+`tidefsctl pool repair` routes to the selected mounted local owner, compares
+both targets named by one exact current `Replicated { copies: 2 }` receipt,
+and authorizes writeback only for `SingleReplicaCorruption` with one clean
+source and one corrupt target. It then refreshes that authority, performs the
+target-only replacement, publishes a higher receipt generation, reconciles
+every affected current or retained-root manifest, publishes the authenticated
+roots, and requires a clean re-scrub. Missing or changed authority and every
+other comparison remain non-writeback outcomes.
 
 The mounted product boundary is:
 
@@ -114,6 +128,12 @@ ScrubBlockId + current data_version + plaintext content identity
   + placement/receipt evidence status
 ```
 
+The bounded #2582 live-owner writeback additionally requires the exact current
+two-copy receipt generation, policy, and target identities plus target-by-target
+read and checksum outcomes. Receipt target order comes only from that receipt;
+it is not distributed membership evidence and cannot be reconstructed from
+current topology or raw media layout.
+
 Plaintext content identity is the logical mounted file/extent bytes after the
 content reader has applied every mounted content and device transform needed to
 interpret the committed object. Checksum-layer evidence remains attached to the
@@ -122,19 +142,20 @@ finding, not the repair identity. Raw media bytes, compression frames, and
 encryption frames may be lower-device diagnostics, but they cannot authorize a
 mounted content repair.
 
-Implementation is split so the write sets do not overlap:
+The identity work and bounded carrier remain separate:
 
-| Issue | Slice | Expected write set |
+| Issue | Slice | Current boundary |
 |---|---|---|
-| #650 | Add the transform-aware mounted content scrub/read authority. | `crates/tidefs-local-filesystem/src/content.rs`, a local helper/type module if needed, and focused local-filesystem tests. |
-| #651 | Route local scrub through that authority and keep findings non-writeback. | `crates/tidefs-local-filesystem/src/scrub.rs` and focused scrub tests. |
-| #652 | Require transform-aware scrub evidence before repair dispatch can write or mark mounted content. | `crates/tidefs-local-filesystem/src/scrub_repair_integration.rs`, `crates/tidefs-local-filesystem/src/repair.rs`, and scrub-core evidence/result types only if needed. |
+| #650 | Add the transform-aware mounted content scrub/read authority. | Closed; the mounted content reader remains the source of scrub plaintext and checksum-layer evidence. |
+| #651 | Route local scrub through that authority and keep findings non-writeback. | Closed; scrub emits the mounted identity and receipt evidence consumed by later gates. |
+| #652 | Require transform-aware scrub evidence before legacy repair dispatch can write or mark mounted content. | Closed; the scheduler/dispatch bridge now fails closed on missing, mismatched, stale, or unverified mounted evidence. Its raw-store mutation authority remains blocked, and it is not the #2582 live-owner carrier. |
+| #2582 | Repair one corrupt target of a current local two-copy receipt through the mounted owner. | Bounded to target-by-target receipt comparison, target-only replacement, receipt/root reconciliation, and clean re-scrub; it does not admit scheduled, distributed, rebuild, dual-corruption, or device-transform repair. |
 
-Issue #591 remains the active stale-generation repair gate. Issue #18 remains
-the placement receipt, rebuild, and source-selection gate. The scrub/repair
-identity work in #637, #650, #651, and #652 is deliberately non-enabling for
-mounted device-level transforms while any production `blocked` row remains in
-this inventory. In that state:
+Closed issues #591 and #18 are historical stale-generation and receipt-authority
+lineage, not future gates and not support claims. The scrub/repair identity work
+in #637, #650, #651, and #652 plus the bounded #2582 carrier remains
+non-enabling for mounted device-level transforms while any production
+`blocked` row remains in this inventory. In that state:
 
 - mounted device-level compression remains blocked.
 - mounted device-level encryption remains blocked.

@@ -96,6 +96,61 @@ pub(crate) fn route_with_format(command: &str, operation: &str, pool: &str, json
     })
 }
 
+/// Resolve a name-only operator request to one reachable Pool UUID before
+/// selecting an owner endpoint or constructing the request.
+///
+/// This is reserved for live-owner-only mutations whose CLI intentionally has
+/// no device argument.  A pool name alone is not sufficient when two distinct
+/// reachable owners publish the same name, so ambiguity fails closed.  Once a
+/// unique UUID is established, the ordinary exact-UUID route revalidates both
+/// the selected manifest and the daemon request.
+pub(crate) fn route_unique_reachable_owner_with_format(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    json: bool,
+) -> ! {
+    let pool_uuid = match unique_reachable_owner_uuid_by_pool_at(&pool_runtime_root(), pool) {
+        Ok(pool_uuid) => pool_uuid,
+        Err(LiveOwnerRequestError::Unavailable(message)) => exit_unavailable(
+            LivePoolRoute {
+                command,
+                operation,
+                pool,
+                pool_uuid: None,
+                json,
+                args: LivePoolAdminArgs::default(),
+            },
+            &message,
+        ),
+        Err(LiveOwnerRequestError::Owner {
+            exit_code,
+            message,
+            detail,
+        }) => exit_owner_error(
+            LivePoolRoute {
+                command,
+                operation,
+                pool,
+                pool_uuid: None,
+                json,
+                args: LivePoolAdminArgs::default(),
+            },
+            exit_code,
+            &message,
+            detail.as_ref(),
+        ),
+    };
+    route_imported_with_format_and_args(
+        command,
+        operation,
+        pool,
+        pool_uuid,
+        json,
+        LivePoolAdminArgs::default(),
+    )
+}
+
 pub(crate) fn route_with_args(
     command: &str,
     operation: &str,
@@ -1255,6 +1310,80 @@ fn find_live_owner_manifest_at(
     )))
 }
 
+fn unique_reachable_owner_uuid_by_pool_at(
+    root: &Path,
+    pool: &str,
+) -> Result<[u8; 16], LiveOwnerRequestError> {
+    let entries = std::fs::read_dir(root).map_err(|err| {
+        LiveOwnerRequestError::Unavailable(format!("read {}: {err}", root.display()))
+    })?;
+    let mut cached_match = false;
+    let mut reachable_uuids = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            LiveOwnerRequestError::Unavailable(format!("read {} entry: {err}", root.display()))
+        })?;
+        let file_type = entry.file_type().map_err(|err| {
+            LiveOwnerRequestError::Unavailable(format!(
+                "inspect {} entry {}: {err}",
+                root.display(),
+                entry.path().display()
+            ))
+        })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path().join("owner.json");
+        match path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(err) => {
+                return Err(LiveOwnerRequestError::Unavailable(format!(
+                    "inspect live owner manifest {}: {err}",
+                    path.display()
+                )))
+            }
+        }
+        let manifest = read_manifest(&path)?;
+        if manifest_pool_name(&manifest) != Some(pool) {
+            continue;
+        }
+        cached_match = true;
+        if !manifest_has_reachable_interface(&manifest) {
+            continue;
+        }
+        let pool_uuid = manifest_pool_uuid_bytes(&manifest).ok_or_else(|| {
+            LiveOwnerRequestError::Unavailable(format!(
+                "reachable live owner manifest {} for pool '{pool}' has no valid Pool UUID",
+                path.display()
+            ))
+        })?;
+        if !reachable_uuids.contains(&pool_uuid) {
+            reachable_uuids.push(pool_uuid);
+        }
+    }
+
+    reachable_uuids.sort_unstable();
+    match reachable_uuids.as_slice() {
+        [pool_uuid] => Ok(*pool_uuid),
+        [] if cached_match => Err(LiveOwnerRequestError::Unavailable(format!(
+            "cached imported-pool state exists for pool '{pool}', but no live owner interface is reachable"
+        ))),
+        [] => Err(LiveOwnerRequestError::Unavailable(format!(
+            "no live owner manifest for pool '{pool}'"
+        ))),
+        pool_uuids => Err(LiveOwnerRequestError::Unavailable(format!(
+            "ambiguous live-owner identity for pool '{pool}': distinct reachable Pool UUIDs {}; refusing name-only routing",
+            pool_uuids
+                .iter()
+                .map(hex_uuid)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 fn cached_without_reachable_interface(route: &LivePoolRoute<'_>) -> LiveOwnerRequestError {
     let mut message = format!(
         "cached imported-pool state exists for pool '{}', but no live owner interface is reachable",
@@ -1957,6 +2086,45 @@ mod tests {
 
         assert_eq!(request.command, LivePoolAdminCommand::PoolScrub);
         assert_eq!(exit_code, 1);
+    }
+
+    #[test]
+    fn pool_repair_machine_report_uses_typed_live_owner_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let response = LivePoolAdminResponse::command_report_machine_json(
+            0,
+            serde_json::json!({
+                "pass": true,
+                "state_source": "live-owner",
+                "outcome": "completed",
+                "repair_attempted": true,
+                "repair_completed": true,
+                "repair_writeback": true,
+                "previous_receipt_generation": 7,
+                "replacement_receipt_generation": 8,
+            })
+            .to_string(),
+        );
+        let handle = spawn_owner_response(listener, response);
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "repair",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let exit_code = send_live_owner_request_at(dir.path(), &route).unwrap();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolRepair);
+        assert_eq!(request.output, LivePoolAdminOutput::MachineJson);
+        assert_eq!(request.pool, "tank");
+        assert_eq!(exit_code, 0);
     }
 
     #[test]
@@ -2901,6 +3069,90 @@ mod tests {
             "tank",
             &[0x42; 16]
         ));
+    }
+
+    #[test]
+    fn unique_reachable_owner_resolution_binds_pool_uuid_before_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let reachable_uuid = [0x42; 16];
+        let stale_uuid = [0x24; 16];
+        let reachable_socket = dir.path().join("reachable-owner.sock");
+        let _listener = UnixListener::bind(&reachable_socket).unwrap();
+
+        for (uuid, socket_path) in [
+            (reachable_uuid, reachable_socket),
+            (stale_uuid, dir.path().join("stale-owner.sock")),
+        ] {
+            let manifest_path = owner_manifest_path(dir.path(), &uuid);
+            std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                manifest_path,
+                serde_json::json!({
+                    "pool_name": "tank",
+                    "pool_uuid": hex_uuid(&uuid),
+                    "socket_path": socket_path,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let resolved = unique_reachable_owner_uuid_by_pool_at(dir.path(), "tank").unwrap();
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "repair",
+            pool: "tank",
+            pool_uuid: Some(resolved),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+        let request = live_owner_request(&route).unwrap();
+
+        assert_eq!(resolved, reachable_uuid);
+        assert_eq!(
+            request.pool_uuid.as_deref(),
+            Some("42424242424242424242424242424242")
+        );
+    }
+
+    #[test]
+    fn unique_reachable_owner_resolution_refuses_same_name_distinct_uuids() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_uuid = [0x42; 16];
+        let second_uuid = [0x24; 16];
+        let first_socket = dir.path().join("first-owner.sock");
+        let second_socket = dir.path().join("second-owner.sock");
+        let _first_listener = UnixListener::bind(&first_socket).unwrap();
+        let _second_listener = UnixListener::bind(&second_socket).unwrap();
+
+        for (uuid, socket_path) in [(first_uuid, first_socket), (second_uuid, second_socket)] {
+            let manifest_path = owner_manifest_path(dir.path(), &uuid);
+            std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                manifest_path,
+                serde_json::json!({
+                    "pool_name": "tank",
+                    "pool_uuid": hex_uuid(&uuid),
+                    "socket_path": socket_path,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let err = unique_reachable_owner_uuid_by_pool_at(dir.path(), "tank").unwrap_err();
+
+        match err {
+            LiveOwnerRequestError::Unavailable(message) => {
+                assert!(message.contains("ambiguous live-owner identity"));
+                assert!(message.contains("24242424242424242424242424242424"));
+                assert!(message.contains("42424242424242424242424242424242"));
+                assert!(message.contains("refusing name-only routing"));
+            }
+            LiveOwnerRequestError::Owner { .. } => {
+                panic!("ambiguous local owner identity is a lookup refusal")
+            }
+        }
     }
 
     #[test]

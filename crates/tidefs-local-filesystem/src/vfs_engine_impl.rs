@@ -14,9 +14,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-#[cfg(feature = "replication-io")]
-use tidefs_local_object_store::IntegrityDigest64;
-use tidefs_local_object_store::{DeviceIoClass, ObjectKey, StoreError};
+use tidefs_local_object_store::{DeviceIoClass, IntegrityDigest64, ObjectKey, StoreError};
 use tidefs_types_extent_map_core::ExtentMapOps;
 use tidefs_types_reclaim_queue_core::{
     ObjectKey as ReclaimObjectKey, QueueFamily as ReclaimQueueFamily, ReclaimQueueEntry,
@@ -1314,6 +1312,7 @@ impl VfsLocalFileSystem {
             | LivePoolAdminCommand::PoolMount
             | LivePoolAdminCommand::PoolExport
             | LivePoolAdminCommand::PoolDestroy
+            | LivePoolAdminCommand::PoolRepair
             | LivePoolAdminCommand::DatasetCreate
             | LivePoolAdminCommand::DatasetResize
             | LivePoolAdminCommand::DatasetRename
@@ -3280,21 +3279,14 @@ impl SharedPoolDatasetOwner {
 
         let mut fs = self.borrow_mut();
         let verifier = mounted_canonical_verifier_report(&mut fs);
-        let statfs = match fs.statfs() {
-            Ok(statfs) => statfs,
-            Err(err) => {
-                return live_admin_error(
-                    1,
-                    format!("pool integrity-check: live statfs failed for '{pool}': {err}"),
-                )
-            }
-        };
+        let statfs = fs.statfs();
         let fs_stats = fs.stats();
         let suspect_stats = fs.suspect_log_stats();
         let intent_log_pending = fs.intent_log_pending();
         let pass = verifier.passed()
             && !verifier.production_fsck_required
-            && suspect_stats.unresolved == 0;
+            && suspect_stats.unresolved == 0
+            && statfs.is_ok();
 
         if wants_json {
             let selected_root = verifier.selected_root.as_ref().map(|root| {
@@ -3323,6 +3315,25 @@ impl SharedPoolDatasetOwner {
                     })
                 })
                 .collect();
+            let statfs_report = match &statfs {
+                Ok(statfs) => json!({
+                    "available": true,
+                    "blocks": statfs.blocks,
+                    "bfree": statfs.bfree,
+                    "bavail": statfs.bavail,
+                    "files": statfs.files,
+                    "ffree": statfs.ffree,
+                    "bsize": statfs.bsize,
+                    "frsize": statfs.frsize,
+                    "namelen": statfs.namelen,
+                    "fsid_hi": statfs.fsid_hi,
+                    "fsid_lo": statfs.fsid_lo,
+                }),
+                Err(error) => json!({
+                    "available": false,
+                    "error": error.to_string(),
+                }),
+            };
 
             let report = json!({
                 "pool": pool,
@@ -3357,18 +3368,7 @@ impl SharedPoolDatasetOwner {
                     "selected_root": selected_root,
                     "issues": issues,
                 },
-                "statfs": {
-                    "blocks": statfs.blocks,
-                    "bfree": statfs.bfree,
-                    "bavail": statfs.bavail,
-                    "files": statfs.files,
-                    "ffree": statfs.ffree,
-                    "bsize": statfs.bsize,
-                    "frsize": statfs.frsize,
-                    "namelen": statfs.namelen,
-                    "fsid_hi": statfs.fsid_hi,
-                    "fsid_lo": statfs.fsid_lo,
-                },
+                "statfs": statfs_report,
                 "filesystem": {
                     "inode_count": fs_stats.inode_count,
                     "directory_count": fs_stats.directory_count,
@@ -3410,8 +3410,15 @@ impl SharedPoolDatasetOwner {
             };
         }
 
+        let statfs_summary = match &statfs {
+            Ok(statfs) => format!(
+                "blocks={} free={} avail={}",
+                statfs.blocks, statfs.bfree, statfs.bavail,
+            ),
+            Err(error) => format!("unavailable ({error})"),
+        };
         let mut out = format!(
-            "pool integrity-check: {pool}\n  source:        live owner (mounted PoolDatasetOwner)\n  pass:          {}\n  verifier:      {}\n  roots:         verified={} candidates={} invalid={}\n  objects:       checked={} chunks={}\n  suspect-log:   unresolved={} total={}\n  intent-log:    pending={}\n  statfs:        blocks={} free={} avail={}\n  inodes:        count={} next={}\n  object-store:  live_objects={} live_bytes={} segments={}",
+            "pool integrity-check: {pool}\n  source:        live owner (mounted PoolDatasetOwner)\n  pass:          {}\n  verifier:      {}\n  roots:         verified={} candidates={} invalid={}\n  objects:       checked={} chunks={}\n  suspect-log:   unresolved={} total={}\n  intent-log:    pending={}\n  statfs:        {}\n  inodes:        count={} next={}\n  object-store:  live_objects={} live_bytes={} segments={}",
             if pass { "yes" } else { "no" },
             verifier.outcome.human_name(),
             verifier.verified_committed_roots.len(),
@@ -3422,9 +3429,7 @@ impl SharedPoolDatasetOwner {
             suspect_stats.unresolved,
             suspect_stats.total_entries,
             intent_log_pending,
-            statfs.blocks,
-            statfs.bfree,
-            statfs.bavail,
+            statfs_summary,
             fs_stats.inode_count,
             fs_stats.next_inode_id,
             fs_stats.object_store.live_objects,
@@ -3494,6 +3499,7 @@ impl SharedPoolDatasetOwner {
                 self.live_pool_integrity_check(&request.pool, &args, wants_json)
             }
             LivePoolAdminCommand::PoolScrub => self.live_pool_scrub(&request.pool, wants_json),
+            LivePoolAdminCommand::PoolRepair => self.live_pool_repair(&request.pool, wants_json),
             LivePoolAdminCommand::DeviceStatus => self.live_device_status(wants_json),
             LivePoolAdminCommand::DeviceRemove => self.live_device_remove(&args, wants_json),
             LivePoolAdminCommand::DeviceReplace => self.live_device_replace(&args, wants_json),
@@ -4241,6 +4247,29 @@ impl PoolDatasetOwner {
             return Ok(0);
         }
 
+        // Snapshot source transactions share the owning filesystem's object
+        // keyspace. Start above every currently reachable root, not merely
+        // above each snapshot's predecessor: snapshot creation has already
+        // published a newer mounted root that otherwise owns the predecessor's
+        // immediate successor transaction identity.
+        let canonical_root = self.selected_committed_root_summary()?;
+        let mut next_snapshot_transaction_id =
+            canonical_root
+                .transaction_id
+                .checked_add(1)
+                .ok_or(FileSystemError::CorruptState {
+                    reason: "mounted snapshot transaction id space is exhausted",
+                })?;
+        for snapshot in snapshots.iter() {
+            next_snapshot_transaction_id = next_snapshot_transaction_id.max(
+                snapshot.captured_root.transaction_id.checked_add(1).ok_or(
+                    FileSystemError::CorruptState {
+                        reason: "mounted snapshot transaction id space is exhausted",
+                    },
+                )?,
+            );
+        }
+
         let reconcile = (|| {
             let mut migrated = Vec::new();
             let mut total_replacements = 0_u64;
@@ -4258,10 +4287,16 @@ impl PoolDatasetOwner {
                     snapshot.captured_state.dataset_id(),
                     &obsolete_manifests,
                 )?;
-                let transaction_id = crate::next_mounted_commit_transaction_id(
-                    snapshot.captured_state.generation,
-                    &snapshot.captured_root.summary(),
+                let transaction_id = self.next_absent_snapshot_source_transaction_id(
+                    &snapshot.captured_state,
+                    next_snapshot_transaction_id,
                 )?;
+                next_snapshot_transaction_id =
+                    transaction_id
+                        .checked_add(1)
+                        .ok_or(FileSystemError::CorruptState {
+                            reason: "mounted snapshot transaction id space is exhausted",
+                        })?;
                 let signed_root = crate::prepare_state_with_pool_at_transaction(
                     self.store.pool_mut(),
                     &snapshot.captured_state,
@@ -7688,9 +7723,11 @@ mod tests {
     use super::*;
     use crate::write_buffer::WriteBufferConfig;
     use crate::RootAuthenticationKey;
+    use std::io::{Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::sync::Arc;
     use tidefs_space_accounting::{DatasetQuotaConfig, DatasetQuotaHierarchy};
+    use tidefs_types_reclaim_queue_core::DeadObjectEntry;
     use tidefs_types_vfs_core::{
         FileHandleId, FATTR_ATIME, FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE,
         FATTR_UID, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFMT, S_ISGID, XATTR_CREATE,
@@ -8395,6 +8432,7 @@ mod tests {
             (LivePoolAdminCommand::PoolListProps, "list-props"),
             (LivePoolAdminCommand::PoolIntegrityCheck, "integrity-check"),
             (LivePoolAdminCommand::PoolScrub, "scrub"),
+            (LivePoolAdminCommand::PoolRepair, "repair"),
         ] {
             let request = LivePoolAdminRequest::new(command, "tank");
             let vfs_response = engine
@@ -9044,6 +9082,7 @@ mod tests {
         assert_eq!(report["owner_state"], "mounted PoolDatasetOwner");
         assert_eq!(report["offline_inputs_ignored"], true);
         assert_eq!(report["requested_limits"]["applied"], false);
+        assert_eq!(report["statfs"]["available"], true);
         assert!(report["filesystem"]["file_count"].as_u64().unwrap_or(0) >= 1);
         assert!(
             report["object_store"]["live_objects"].as_u64().unwrap_or(0) > 0,
@@ -9067,6 +9106,10 @@ mod tests {
         assert_eq!(failed_json["ok"], false, "failed response: {failed_json}");
         assert_eq!(failed_json["json"]["pass"], false);
         assert_eq!(failed_json["json"]["state_source"], "live-owner");
+        assert_eq!(failed_json["json"]["statfs"]["available"], false);
+        assert!(failed_json["json"]["statfs"]["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()));
         assert_eq!(failed_json["json"]["verifier"]["root_slot_count"], 1);
         assert_eq!(failed_json["json"]["verifier"]["root_candidates_seen"], 1);
         assert!(
@@ -19434,5 +19477,4388 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    mod replicated_repair {
+        use super::*;
+
+        fn corrupt_current_pool_chunk_on_primary(
+            engine: &VfsLocalFileSystem,
+            path: &str,
+            payload: &[u8],
+        ) -> (
+            ObjectKey,
+            tidefs_local_object_store::PlacementReceipt,
+            crate::types::ScrubBlockId,
+        ) {
+            assert!(!payload.is_empty(), "corruption payload must be non-empty");
+            let mut fs = engine.fs.borrow_mut();
+            let record = fs.stat(path).expect("stat committed repair fixture");
+            let keyspace = fs.object_keyspace();
+            let manifest_key = keyspace.content(record.inode_id, record.data_version);
+            let (manifest_bytes, _) = fs
+                .store
+                .pool()
+                .get_with_current_receipt(DeviceIoClass::Data, manifest_key)
+                .expect("read repair content manifest")
+                .expect("repair content manifest exists");
+            let manifest = crate::encoding::decode_content_manifest(&manifest_bytes)
+                .expect("decode repair content manifest");
+            let chunk = manifest
+                .chunks
+                .iter()
+                .find(|chunk| !chunk.is_hole())
+                .expect("repair content chunk");
+            let chunk_key =
+                keyspace.content_chunk(record.inode_id, chunk.data_version, chunk.chunk_index);
+            let block_id = crate::types::ScrubBlockId {
+                inode_id: record.inode_id.get(),
+                data_version: chunk.data_version,
+                kind: crate::types::ScrubBlockKind::ContentChunk {
+                    chunk_index: chunk.chunk_index,
+                },
+            };
+            let (mut encoded, receipt) = fs
+                .store
+                .pool()
+                .get_with_current_receipt(DeviceIoClass::Data, chunk_key)
+                .expect("read repair content chunk")
+                .expect("repair content chunk exists");
+            let payload_offset = encoded
+                .windows(payload.len())
+                .position(|candidate| candidate == payload)
+                .expect("repair payload appears in encoded chunk");
+            encoded[payload_offset] ^= 0x5a;
+            fs.store
+                .pool_mut()
+                .raw_primary_store_mut()
+                .put(chunk_key, &encoded)
+                .expect("corrupt exactly the primary receipt target");
+            fs.store
+                .pool_mut()
+                .sync_all()
+                .expect("sync one-target corruption fixture");
+            (chunk_key, receipt, block_id)
+        }
+
+        fn corrupt_current_pool_chunk_on_block_device(
+            engine: &VfsLocalFileSystem,
+            path: &str,
+            payload: &[u8],
+            device_path: &std::path::Path,
+            expected_device_index: u32,
+        ) -> (
+            ObjectKey,
+            tidefs_local_object_store::PlacementReceipt,
+            crate::types::ScrubBlockId,
+        ) {
+            assert!(!payload.is_empty(), "corruption payload must be non-empty");
+            let fs = engine.fs.borrow();
+            let record = fs.stat(path).expect("stat block-device repair fixture");
+            let keyspace = fs.object_keyspace();
+            let manifest_key = keyspace.content(record.inode_id, record.data_version);
+            let (manifest_bytes, _) = fs
+                .store
+                .pool()
+                .get_with_current_receipt(DeviceIoClass::Data, manifest_key)
+                .expect("read block-device repair content manifest")
+                .expect("block-device repair content manifest exists");
+            let manifest = crate::encoding::decode_content_manifest(&manifest_bytes)
+                .expect("decode block-device repair content manifest");
+            let chunk = manifest
+                .chunks
+                .iter()
+                .find(|chunk| !chunk.is_hole())
+                .expect("block-device repair content chunk");
+            let chunk_key =
+                keyspace.content_chunk(record.inode_id, chunk.data_version, chunk.chunk_index);
+            let block_id = crate::types::ScrubBlockId {
+                inode_id: record.inode_id.get(),
+                data_version: chunk.data_version,
+                kind: crate::types::ScrubBlockKind::ContentChunk {
+                    chunk_index: chunk.chunk_index,
+                },
+            };
+            let (_, receipt) = fs
+                .store
+                .pool()
+                .get_with_current_receipt(DeviceIoClass::Data, chunk_key)
+                .expect("read block-device repair content chunk")
+                .expect("block-device repair content chunk exists");
+            assert!(
+                receipt
+                    .targets
+                    .iter()
+                    .any(|target| target.device_index == expected_device_index),
+                "current receipt must name the selected corruption target"
+            );
+            drop(fs);
+
+            let image = std::fs::read(device_path).expect("read selected block-device image");
+            let matches = image
+                .windows(payload.len())
+                .enumerate()
+                .filter_map(|(offset, candidate)| (candidate == payload).then_some(offset))
+                .collect::<Vec<_>>();
+            let [payload_offset] = matches.as_slice() else {
+                panic!(
+                    "selected block-device image must contain exactly one repair payload, found {}",
+                    matches.len()
+                );
+            };
+            let payload_offset = *payload_offset;
+            let corrupt_offset = payload_offset + payload.len() / 2;
+            let corrupt_byte = [image[corrupt_offset] ^ 0x5a];
+            let mut device = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(device_path)
+                .expect("open selected block-device image for corruption");
+            device
+                .seek(SeekFrom::Start(
+                    u64::try_from(corrupt_offset).expect("corruption offset fits u64"),
+                ))
+                .expect("seek selected block-device corruption byte");
+            device
+                .write_all(&corrupt_byte)
+                .expect("corrupt selected block-device target");
+            device
+                .sync_all()
+                .expect("sync selected block-device corruption");
+
+            (chunk_key, receipt, block_id)
+        }
+
+        fn corrupt_one_current_replicated_chunk(
+            engine: &VfsLocalFileSystem,
+            path: &str,
+            payload: &[u8],
+        ) -> (ObjectKey, u64, crate::types::ScrubBlockId) {
+            let (chunk_key, receipt, block_id) =
+                corrupt_current_pool_chunk_on_primary(engine, path, payload);
+            assert_eq!(
+                receipt.policy,
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 }
+            );
+            let fs = engine.fs.borrow();
+            let evidence = fs
+                .store
+                .pool()
+                .replicated_receipt_evidence(DeviceIoClass::Data, chunk_key)
+                .expect("read target evidence after corruption")
+                .expect("current receipt after corruption");
+            assert_eq!(
+                evidence
+                    .targets
+                    .iter()
+                    .filter(|target| matches!(
+                        &target.outcome,
+                        tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Clean
+                    ))
+                    .count(),
+                1,
+                "fixture must retain exactly one clean source"
+            );
+            assert_eq!(
+                evidence
+                    .targets
+                    .iter()
+                    .filter(|target| matches!(
+                        &target.outcome,
+                        tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Corrupt { .. }
+                    ))
+                    .count(),
+                1,
+                "fixture must corrupt exactly one current target"
+            );
+            (chunk_key, receipt.generation, block_id)
+        }
+
+        fn publish_target_only_repair(
+            engine: &VfsLocalFileSystem,
+            chunk_key: ObjectKey,
+        ) -> tidefs_local_object_store::pool::ReplicatedRepairResult {
+            let mut fs = engine.fs.borrow_mut();
+            let evidence = fs
+                .store
+                .pool()
+                .replicated_receipt_evidence(DeviceIoClass::Data, chunk_key)
+                .expect("read direct-repair target evidence")
+                .expect("direct-repair receipt evidence");
+            let source_device_index = evidence
+                .targets
+                .iter()
+                .find(|target| {
+                    matches!(
+                        &target.outcome,
+                        tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Clean
+                    )
+                })
+                .expect("direct repair has one clean source")
+                .target
+                .device_index;
+            let corrupt_device_index = evidence
+                .targets
+                .iter()
+                .find(|target| {
+                    matches!(
+                        &target.outcome,
+                        tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Corrupt { .. }
+                    )
+                })
+                .expect("direct repair has one corrupt target")
+                .target
+                .device_index;
+            let repair = fs
+                .store
+                .pool_mut()
+                .repair_current_replicated_target(
+                    DeviceIoClass::Data,
+                    chunk_key,
+                    &evidence.receipt,
+                    source_device_index,
+                    corrupt_device_index,
+                )
+                .expect("publish target-only repair without filesystem reconciliation");
+            fs.store
+                .pool_mut()
+                .sync_all()
+                .expect("sync direct target-only repair");
+            repair
+        }
+
+        fn stage_pending_target_repair_for_recovery(
+            engine: &VfsLocalFileSystem,
+            chunk_key: ObjectKey,
+            receipt_copies: tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies,
+        ) -> tidefs_local_object_store::pool::PendingReplicatedRepairRecoveryEvidence {
+            let mut fs = engine.fs.borrow_mut();
+            let pool = fs.store.pool_mut();
+            let evidence = pool
+                .replicated_receipt_evidence(DeviceIoClass::Data, chunk_key)
+                .expect("read pending-repair target evidence")
+                .expect("pending-repair receipt exists");
+            let source_device_index = evidence
+                .targets
+                .iter()
+                .find(|target| {
+                    matches!(
+                        target.outcome,
+                        tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Clean
+                    )
+                })
+                .expect("pending repair has one clean source")
+                .target
+                .device_index;
+            let repaired_device_index = evidence
+                .targets
+                .iter()
+                .find(|target| {
+                    matches!(
+                        target.outcome,
+                        tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Corrupt { .. }
+                            | tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Unreadable
+                    )
+                })
+                .expect("pending repair has one failed target")
+                .target
+                .device_index;
+            let pending = pool
+                .stage_pending_replicated_repair_for_recovery_test(
+                    DeviceIoClass::Data,
+                    chunk_key,
+                    source_device_index,
+                    repaired_device_index,
+                    receipt_copies,
+                )
+                .expect("stage exact target-repair recovery cut");
+            assert_eq!(pending.predecessor_receipt, evidence.receipt);
+            assert!(
+                pending.replacement_receipt.generation > pending.predecessor_receipt.generation
+            );
+            assert_eq!(pending.receipt_copies, receipt_copies);
+            pending
+        }
+
+        fn complete_device_hashes(devices: &[PathBuf]) -> Vec<blake3::Hash> {
+            devices
+                .iter()
+                .map(|device| {
+                    let bytes = std::fs::read(device).expect("read complete device image");
+                    blake3::hash(&bytes)
+                })
+                .collect()
+        }
+
+        fn current_file_chunk_authority(
+            fs: &PoolDatasetOwner,
+            path: &str,
+        ) -> (ObjectKey, u64, u64) {
+            let record = fs.stat(path).expect("stat current repair fixture");
+            let keyspace = fs.object_keyspace();
+            let manifest_key = keyspace.content(record.inode_id, record.data_version);
+            let (manifest_bytes, _) = fs
+                .store
+                .pool()
+                .get_with_current_receipt(DeviceIoClass::Data, manifest_key)
+                .expect("read current repair manifest")
+                .expect("current repair manifest exists");
+            let manifest = crate::encoding::decode_content_manifest(&manifest_bytes)
+                .expect("decode current repair manifest");
+            let chunks = manifest
+                .chunks
+                .iter()
+                .filter(|chunk| !chunk.is_hole())
+                .collect::<Vec<_>>();
+            let [chunk] = chunks.as_slice() else {
+                panic!("repair fixture must contain exactly one physical chunk");
+            };
+            (
+                keyspace.content_chunk(record.inode_id, chunk.data_version, chunk.chunk_index),
+                chunk.placement_receipt_generation,
+                record.data_version,
+            )
+        }
+
+        fn temp_fs_with_policy_and_block_devices(
+            device_count: usize,
+            policy: tidefs_local_object_store::pool::PoolRedundancyPolicy,
+        ) -> (VfsLocalFileSystem, tempfile::TempDir, Vec<PathBuf>) {
+            let root = tempfile::tempdir().expect("tempdir");
+            let metadata = root.path().join("metadata");
+            std::fs::create_dir_all(&metadata).expect("create metadata dir");
+            let mut devices = Vec::with_capacity(device_count);
+            for idx in 0..device_count {
+                let path = root.path().join(format!("dev{idx}.img"));
+                let file = std::fs::File::create(&path).expect("create device image");
+                file.set_len(8 * 1024 * 1024).expect("size device image");
+                devices.push(path);
+            }
+            let fs = open_named_test_filesystem(&metadata, &devices, "tank", policy, "root");
+            (VfsLocalFileSystem::new(fs), root, devices)
+        }
+
+        fn temp_replicated_fs_with_block_devices(
+        ) -> (VfsLocalFileSystem, tempfile::TempDir, Vec<PathBuf>) {
+            temp_fs_with_policy_and_block_devices(
+                2,
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+            )
+        }
+
+        #[test]
+        fn live_pool_repair_reconciles_one_target_and_survives_reopen() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"TideFS-live-owner-repair-current-receipt-fixture";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair.txt", 0o644)
+                    .expect("create repair fixture");
+                fs.write_file("/repair.txt", 0, payload)
+                    .expect("write repair fixture");
+                fs.sync_all().expect("commit repair fixture");
+                fs.create_snapshot("repair-retained")
+                    .expect("retain a snapshot sharing the repair chunk");
+            }
+
+            let (chunk_key, predecessor_receipt, _) = corrupt_current_pool_chunk_on_block_device(
+                &engine,
+                "/repair.txt",
+                payload,
+                &devices[1],
+                1,
+            );
+            let old_generation = predecessor_receipt.generation;
+            let repaired = live_pool_admin(&engine, "repair", json!({}), true);
+            assert_eq!(repaired["ok"], true, "repair response: {repaired}");
+            let report = &repaired["json"];
+            assert_eq!(report["pass"], true);
+            assert_eq!(report["state_source"], "live-owner");
+            assert_eq!(report["outcome"], "completed");
+            assert_eq!(report["repair_attempted"], true);
+            assert_eq!(report["repair_completed"], true);
+            assert_eq!(report["repair_writeback"], true);
+            assert_eq!(
+                report["comparison"]["classification"],
+                "SingleReplicaCorruption"
+            );
+            assert_eq!(
+                report["comparison"]["checksum_layer"],
+                "encoded-content-chunk"
+            );
+            assert_eq!(report["comparison"]["target_count"], 2);
+            assert!(report["comparison"].get("membership_epoch").is_none());
+            assert!(report["comparison"]["targets"]
+                .as_array()
+                .is_some_and(|targets| targets.iter().all(|target| {
+                    target.get("evidence_accepted").is_none()
+                        && target.get("evidence_rejection").is_none()
+                })));
+            assert_eq!(
+                report["previous_receipt_generation"].as_u64(),
+                Some(old_generation)
+            );
+            assert!(
+                report["replacement_receipt_generation"]
+                    .as_u64()
+                    .is_some_and(|generation| generation > old_generation),
+                "replacement receipt must advance: {report}"
+            );
+            assert_eq!(report["replacement_receipt_attached"], true);
+            assert_eq!(report["clean_source"]["device_index"], 0);
+            assert_eq!(report["corrupt_target"]["device_index"], 1);
+            assert!(
+                report["reconciled_manifest_count"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 2),
+                "chunk repair must reconcile current and retained snapshot manifests: {report}"
+            );
+            assert_eq!(report["reconciled_current_manifest_count"], 1);
+            assert_eq!(report["reconciled_snapshot_manifest_count"], 1);
+            assert_eq!(report["authenticated_root_published"], true);
+            assert_eq!(report["re_scrub"]["pass"], true);
+            assert_eq!(
+                engine
+                    .fs
+                    .borrow()
+                    .store
+                    .pool()
+                    .replicated_receipt_evidence(DeviceIoClass::Data, chunk_key)
+                    .expect("replacement target evidence")
+                    .expect("replacement receipt")
+                    .targets
+                    .iter()
+                    .filter(|target| matches!(
+                        &target.outcome,
+                        tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Clean
+                    ))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                engine
+                    .fs
+                    .borrow()
+                    .read_file("/repair.txt")
+                    .expect("read repaired file"),
+                payload
+            );
+
+            drop(engine);
+            let mut reopened = open_named_test_filesystem(
+                &root.path().join("metadata"),
+                &devices,
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+            );
+            assert_eq!(
+                reopened
+                    .read_file("/repair.txt")
+                    .expect("read repaired file after reopen"),
+                payload
+            );
+            let re_scrub = reopened
+                .scrub_mounted_content()
+                .expect("scrub repaired content after reopen");
+            assert!(re_scrub.is_clean(), "post-reopen scrub: {re_scrub:?}");
+            assert_eq!(
+                reopened
+                    .list_snapshots_checked()
+                    .expect("retained repair snapshot remains authoritative")
+                    .len(),
+                1
+            );
+            reopened
+                .rollback_to_snapshot("repair-retained")
+                .expect("rollback retained snapshot after repair reopen");
+            assert_eq!(
+                reopened
+                    .read_file("/repair.txt")
+                    .expect("read repaired snapshot content after rollback"),
+                payload
+            );
+        }
+
+        #[test]
+        fn live_pool_repair_after_reopen_preserves_clean_transaction_inode_references() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let repair_payload = b"TideFS-live-owner-repair-after-replay";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                for (path, payload) in [
+                    ("/older.txt", b"older committed inode".as_slice()),
+                    ("/repair.txt", repair_payload.as_slice()),
+                    ("/newer.txt", b"newer committed inode".as_slice()),
+                ] {
+                    fs.create_file(path, 0o644)
+                        .expect("create historical repair fixture");
+                    fs.write_file(path, 0, payload)
+                        .expect("write historical repair fixture");
+                    fs.sync_all()
+                        .expect("commit historical repair fixture independently");
+                }
+                for _ in 0..3 {
+                    fs.persist_dataset_catalog()
+                        .expect("advance transaction identity without a logical mutation");
+                }
+                let committed = fs
+                    .selected_committed_root_summary()
+                    .expect("read pre-crash committed root");
+                assert!(
+                    committed.transaction_id > fs.state.generation,
+                    "fixture must reproduce a transaction identity ahead of logical generation"
+                );
+                fs.set_auto_commit(false)
+                    .expect("defer the crash-bounded namespace commit");
+                fs.set_max_uncommitted_mutations(1_000_000)
+                    .expect("keep the crash-bounded namespace intent uncommitted");
+            }
+            let ctx = RequestCtx {
+                uid: 0,
+                gid: 0,
+                pid: 1,
+                umask: 0o022,
+                groups: vec![0],
+            };
+            let root_inode = engine.get_root_inode(&ctx).expect("lookup root inode");
+            engine
+                .create(root_inode, b"crash-bounded.txt", 0o644, O_WRONLY, &ctx)
+                .expect("stage a replayable namespace create");
+            {
+                let mut fs = engine.fs.borrow_mut();
+                assert!(!fs.intent_log_is_empty());
+                // Suppress the best-effort Drop commit so reopening observes
+                // the same durable-intent/canonical-root boundary as an
+                // abruptly terminated mounted owner.
+                fs.arm_mutation_reopen_fence();
+            }
+
+            drop(engine);
+            let reopened = open_named_test_filesystem(
+                &root.path().join("metadata"),
+                &devices,
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+            );
+            let engine = VfsLocalFileSystem::new(reopened);
+            assert_eq!(
+                engine
+                    .fs
+                    .borrow()
+                    .read_file("/crash-bounded.txt")
+                    .expect("read the crash-replayed empty inode"),
+                b""
+            );
+            let (_, predecessor_receipt, _) = corrupt_current_pool_chunk_on_block_device(
+                &engine,
+                "/repair.txt",
+                repair_payload,
+                &devices[1],
+                1,
+            );
+
+            let repaired = live_pool_admin(&engine, "repair", json!({}), true);
+            assert_eq!(repaired["ok"], true, "repair response: {repaired}");
+            assert_eq!(repaired["json"]["pass"], true);
+            assert!(repaired["json"]["replacement_receipt_generation"]
+                .as_u64()
+                .is_some_and(|generation| generation > predecessor_receipt.generation));
+            assert_eq!(
+                engine
+                    .fs
+                    .borrow()
+                    .read_file("/older.txt")
+                    .expect("read older clean inode after repair"),
+                b"older committed inode"
+            );
+            assert_eq!(
+                engine
+                    .fs
+                    .borrow()
+                    .read_file("/newer.txt")
+                    .expect("read newer clean inode after repair"),
+                b"newer committed inode"
+            );
+            assert_eq!(
+                engine
+                    .fs
+                    .borrow()
+                    .read_file("/repair.txt")
+                    .expect("read repaired inode"),
+                repair_payload
+            );
+        }
+
+        #[test]
+        fn live_pool_repair_same_owner_retry_reuses_pending_generation_after_enospc_before_target_write(
+        ) {
+            const DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME: &str = "tidefs-dead-object-reclaim-queue";
+            const RECEIPT_GENERATION_HIGH_WATER_ENCODED_LEN: u64 = 64;
+
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"TideFS-live-owner-repair-same-owner-enospc-retry";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-enospc.txt", 0o644)
+                    .expect("create ENOSPC repair fixture");
+                fs.write_file("/repair-enospc.txt", 0, payload)
+                    .expect("write ENOSPC repair fixture");
+                fs.sync_all().expect("commit ENOSPC repair fixture");
+            }
+
+            // Reopen before corruption so raw-store ENOSPC accounting starts at
+            // the exact corruption write performed below.
+            drop(engine);
+            let reopened = open_named_test_filesystem(
+                &root.path().join("metadata"),
+                &devices,
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+            );
+            let engine = VfsLocalFileSystem::new(reopened);
+            let (chunk_key, predecessor_generation, block_id) =
+                corrupt_one_current_replicated_chunk(&engine, "/repair-enospc.txt", payload);
+
+            let comparison = {
+                let fs = engine.fs.borrow();
+                crate::scrub::compare_mounted_replicated_repair(
+                    fs.store.pool(),
+                    &fs.filesystem.state.inodes,
+                    fs.object_keyspace(),
+                    &block_id,
+                )
+                .expect("compare ENOSPC repair fixture")
+            };
+            let comparison_corrupt_device_index = match &comparison.classification {
+                crate::scrub::MountedRepairClassification::SingleReplicaCorruption {
+                    corrupt_target,
+                    ..
+                } => *corrupt_target,
+                classification => {
+                    panic!("expected single-replica corruption, got {classification:?}")
+                }
+            };
+            assert_eq!(
+                comparison_corrupt_device_index, 0,
+                "the existing corruption helper must corrupt the comparison-selected raw primary"
+            );
+
+            let (corrupt_encoded_len, successor_queue_encoded_len) = {
+                let fs = engine.fs.borrow();
+                let raw_primary = fs.store.pool().raw_primary_store();
+                let corrupt_encoded_len = u64::try_from(
+                    raw_primary
+                        .get(chunk_key)
+                        .expect("read corrupt raw-primary target")
+                        .expect("corrupt raw-primary target exists")
+                        .len(),
+                )
+                .expect("corrupt payload length fits ENOSPC accounting");
+                let queue = match raw_primary
+                    .get_named(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME)
+                    .expect("read pre-repair dead-object queue")
+                {
+                    Some(bytes) => {
+                        tidefs_reclaim_queue_core::DeadObjectReclaimQueue::decode(&bytes)
+                            .expect("decode pre-repair dead-object queue")
+                    }
+                    None => tidefs_reclaim_queue_core::DeadObjectReclaimQueue::new(),
+                };
+                assert_eq!(
+                    tidefs_reclaim_queue_core::DeadObjectReclaimQueue::new().encoded_len(),
+                    44,
+                    "an absent dead-object queue has the empty wire-format length"
+                );
+                assert!(
+                    queue.all_entries().iter().all(|entry| {
+                        entry.object_id != ReclaimObjectKey(*chunk_key.as_bytes())
+                    }),
+                    "the repair chunk must add a new target-lifetime row"
+                );
+                let successor_queue_encoded_len = queue
+                    .encoded_len()
+                    .checked_add(DeadObjectEntry::ENCODED_SIZE)
+                    .expect("one-entry dead-object queue length remains representable");
+                assert_eq!(DeadObjectEntry::ENCODED_SIZE, 159);
+                assert_eq!(
+                    successor_queue_encoded_len - queue.encoded_len(),
+                    DeadObjectEntry::ENCODED_SIZE
+                );
+                (corrupt_encoded_len, successor_queue_encoded_len)
+            };
+            let enospc_after_bytes = corrupt_encoded_len
+                .checked_add(RECEIPT_GENERATION_HIGH_WATER_ENCODED_LEN)
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        u64::try_from(successor_queue_encoded_len)
+                            .expect("queue length fits ENOSPC accounting"),
+                    )
+                })
+                .expect("ENOSPC byte limit remains representable");
+            let mut fault = tidefs_local_object_store::FaultInjectionConfig::off();
+            fault.enospc_after_bytes = Some(enospc_after_bytes);
+            engine
+                .fs
+                .borrow_mut()
+                .store
+                .pool_mut()
+                .raw_primary_store_mut()
+                .enable_fault_injection(fault);
+
+            let failed = live_pool_admin(&engine, "repair", json!({}), true);
+            engine
+                .fs
+                .borrow_mut()
+                .store
+                .pool_mut()
+                .raw_primary_store_mut()
+                .disable_fault_injection();
+
+            assert_eq!(failed["ok"], false, "ENOSPC repair response: {failed}");
+            let failed_report = &failed["json"];
+            assert_eq!(failed_report["pass"], false);
+            assert_eq!(failed_report["state_source"], "live-owner");
+            assert_eq!(failed_report["outcome"], "incomplete");
+            assert_eq!(failed_report["repair_attempted"], true);
+            assert_eq!(failed_report["repair_completed"], false);
+            assert_eq!(failed_report["repair_writeback"], true);
+            assert_eq!(failed_report["receipt_publication"], "not-attempted");
+            assert_eq!(
+                failed_report["failure"]["code"],
+                "writeback-revalidation-refused"
+            );
+            assert_eq!(
+                failed_report["comparison"]["classification"],
+                "SingleReplicaCorruption"
+            );
+            assert_eq!(
+                failed_report["previous_receipt_generation"].as_u64(),
+                Some(predecessor_generation)
+            );
+            assert_eq!(
+                failed_report["corrupt_target"]["device_index"].as_u64(),
+                Some(u64::from(comparison_corrupt_device_index))
+            );
+            let replacement_generation = failed_report["replacement_receipt_generation"]
+                .as_u64()
+                .expect("failed repair reports its burned replacement generation");
+            assert!(replacement_generation > predecessor_generation);
+
+            let pending = engine
+                .fs
+                .borrow()
+                .store
+                .pool()
+                .pending_replicated_repair_recovery_evidence(DeviceIoClass::Data)
+                .expect("inspect pending ENOSPC repair")
+                .expect("ENOSPC leaves one durable pending repair");
+            assert_eq!(
+                pending.predecessor_receipt.generation,
+                predecessor_generation
+            );
+            assert_eq!(
+                pending.replacement_receipt.generation,
+                replacement_generation
+            );
+            assert_eq!(
+                pending.receipt_copies,
+                tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies::Predecessor
+            );
+            assert_eq!(
+                pending.target_state,
+                tidefs_local_object_store::pool::PendingReplicatedRepairTargetState::NeedsRewrite
+            );
+            let hashes_before_refused_mutation = complete_device_hashes(&devices);
+            let mutation_error = engine
+                .fs
+                .borrow_mut()
+                .write_file("/repair-enospc.txt", 0, b"must remain refused")
+                .expect_err("pending repair must refuse unrelated mounted mutation");
+            assert!(matches!(
+                mutation_error,
+                FileSystemError::Unsupported {
+                    reason: "complete or reopen the pending replicated repair before another mounted mutation",
+                    ..
+                }
+            ));
+            assert_eq!(
+                complete_device_hashes(&devices),
+                hashes_before_refused_mutation,
+                "retry-only repair authority must refuse unrelated mutation before touching a device"
+            );
+
+            let retried = live_pool_admin(&engine, "repair", json!({}), true);
+            assert_eq!(retried["ok"], true, "same-owner retry response: {retried}");
+            let retried_report = &retried["json"];
+            assert_eq!(retried_report["pass"], true);
+            assert_eq!(retried_report["state_source"], "live-owner");
+            assert_eq!(retried_report["outcome"], "completed");
+            assert_eq!(retried_report["repair_attempted"], true);
+            assert_eq!(retried_report["repair_completed"], true);
+            assert_eq!(retried_report["repair_writeback"], true);
+            assert_eq!(retried_report["receipt_publication"], "completed");
+            assert_eq!(
+                retried_report["previous_receipt_generation"].as_u64(),
+                Some(predecessor_generation)
+            );
+            assert_eq!(
+                retried_report["replacement_receipt_generation"].as_u64(),
+                Some(replacement_generation),
+                "same-owner retry must reuse the pending transition generation"
+            );
+            assert_eq!(retried_report["replacement_receipt_attached"], true);
+            assert_eq!(retried_report["reconciled_current_manifest_count"], 1);
+            assert_eq!(retried_report["authenticated_root_published"], true);
+            assert_eq!(retried_report["authenticated_root_state"], "published");
+            assert_eq!(retried_report["re_scrub"]["pass"], true);
+
+            let fs = engine.fs.borrow_mut();
+            assert_eq!(
+                fs.read_file("/repair-enospc.txt")
+                    .expect("read same-owner repaired file"),
+                payload
+            );
+            let re_scrub = fs
+                .scrub_mounted_content()
+                .expect("scrub same-owner repaired content");
+            assert!(re_scrub.is_clean(), "same-owner retry scrub: {re_scrub:?}");
+        }
+
+        #[test]
+        fn live_pool_repair_snapshot_reconciliation_failure_requires_reopen_and_resumes_without_second_target_write(
+        ) {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"TideFS-live-owner-repair-reconciliation-sync-failure";
+            let filesystem_generation_before = {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-reconciliation-failure.txt", 0o644)
+                    .expect("create reconciliation-failure fixture");
+                fs.write_file("/repair-reconciliation-failure.txt", 0, payload)
+                    .expect("write reconciliation-failure fixture");
+                fs.sync_all()
+                    .expect("commit reconciliation-failure fixture");
+                fs.create_snapshot("repair-reconciliation-failure-retained-a")
+                    .expect("retain first snapshot across reconciliation failure");
+                fs.create_snapshot("repair-reconciliation-failure-retained-b")
+                    .expect("retain second snapshot across reconciliation failure");
+                fs.stats().filesystem_generation
+            };
+
+            let (chunk_key, predecessor_generation, _) = corrupt_one_current_replicated_chunk(
+                &engine,
+                "/repair-reconciliation-failure.txt",
+                payload,
+            );
+            crate::persistence::inject_next_sync_failure_after_boundary(
+                crate::types::FilesystemCommitBoundary::TransactionObjectsWritten,
+            );
+
+            let failed = live_pool_admin(&engine, "repair", json!({}), true);
+            assert_eq!(
+                failed["ok"], false,
+                "reconciliation-failure response: {failed}"
+            );
+            let report = &failed["json"];
+            assert_eq!(report["pass"], false);
+            assert_eq!(report["state_source"], "live-owner");
+            assert_eq!(report["outcome"], "incomplete");
+            assert_eq!(report["repair_attempted"], true);
+            assert_eq!(report["repair_completed"], false);
+            assert_eq!(report["repair_writeback"], true);
+            assert_eq!(report["receipt_publication"], "completed");
+            assert_eq!(report["failure"]["code"], "snapshot-reconciliation-failed");
+            assert_eq!(
+                report["comparison"]["classification"],
+                "SingleReplicaCorruption"
+            );
+            assert_eq!(
+                report["previous_receipt_generation"].as_u64(),
+                Some(predecessor_generation)
+            );
+            let replacement_generation = report["replacement_receipt_generation"]
+                .as_u64()
+                .expect("failed reconciliation reports replacement generation");
+            assert!(replacement_generation > predecessor_generation);
+            assert_eq!(report["corrupt_target"]["device_index"], 0);
+            assert_ne!(
+                report["clean_source"]["device_index"],
+                report["corrupt_target"]["device_index"]
+            );
+            assert_eq!(report["authenticated_root_published"], false);
+            assert_eq!(report["authenticated_root_state"], "not-started");
+
+            let (replacement_receipt, repaired_target_location) = {
+                let fs = engine.fs.borrow();
+                let replacement_receipt = fs
+                    .store
+                    .pool()
+                    .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+                    .expect("read replacement receipt after reconciliation failure")
+                    .expect("replacement receipt remains current");
+                assert_eq!(replacement_receipt.generation, replacement_generation);
+                let repaired_target_location = fs
+                    .store
+                    .pool()
+                    .raw_primary_store()
+                    .location_of(chunk_key)
+                    .expect("repaired target location after reconciliation failure");
+                (replacement_receipt, repaired_target_location)
+            };
+            assert!(matches!(
+                engine
+                    .fs
+                    .borrow()
+                    .ensure_mutation_allowed("mutate after repair reconciliation failure"),
+                Err(FileSystemError::MutationRequiresReopen { .. })
+            ));
+
+            drop(engine);
+            let mut reopened = open_named_test_filesystem(
+                &root.path().join("metadata"),
+                &devices,
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .pool()
+                    .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+                    .expect("read receipt after reconciliation recovery"),
+                Some(replacement_receipt),
+                "reopen reconciliation must not publish a second receipt"
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .pool()
+                    .raw_primary_store()
+                    .location_of(chunk_key),
+                Some(repaired_target_location),
+                "reopen reconciliation must not rewrite the repaired target"
+            );
+            assert!(
+                reopened.stats().filesystem_generation > filesystem_generation_before,
+                "reopen reconciliation must publish a successor authenticated root"
+            );
+            assert_eq!(
+                reopened
+                    .read_file("/repair-reconciliation-failure.txt")
+                    .expect("read current content after reconciliation recovery"),
+                payload
+            );
+            let re_scrub = reopened
+                .scrub_mounted_content()
+                .expect("scrub content after reconciliation recovery");
+            assert!(
+                re_scrub.is_clean(),
+                "reopen reconciliation scrub: {re_scrub:?}"
+            );
+            assert_eq!(
+                reopened
+                    .list_snapshots_checked()
+                    .expect("retained snapshots remain authoritative")
+                    .len(),
+                2
+            );
+            reopened
+                .rollback_to_snapshot("repair-reconciliation-failure-retained-a")
+                .expect("rollback first retained snapshot after reconciliation recovery");
+            assert_eq!(
+                reopened
+                    .read_file("/repair-reconciliation-failure.txt")
+                    .expect("read retained snapshot content after reconciliation recovery"),
+                payload
+            );
+        }
+
+        #[test]
+        fn live_pool_repair_resumes_published_target_repair_without_second_target_write() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"TideFS-live-owner-repair-reconciliation-resume";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-resume.txt", 0o644)
+                    .expect("create repair-resume fixture");
+                fs.write_file("/repair-resume.txt", 0, payload)
+                    .expect("write repair-resume fixture");
+                fs.sync_all().expect("commit repair-resume fixture");
+                fs.create_snapshot("repair-resume-retained")
+                    .expect("retain a snapshot sharing the repaired chunk");
+            }
+
+            let (chunk_key, old_generation, _) =
+                corrupt_one_current_replicated_chunk(&engine, "/repair-resume.txt", payload);
+            let direct_repair = publish_target_only_repair(&engine, chunk_key);
+            assert_eq!(
+                direct_repair.previous_receipt.generation, old_generation,
+                "direct repair must advance the generation embedded in the filesystem root"
+            );
+            let replacement_generation = direct_repair.replacement_receipt.generation;
+            assert!(replacement_generation > old_generation);
+            let repaired_target_location = engine
+                .fs
+                .borrow()
+                .store
+                .pool()
+                .raw_primary_store()
+                .location_of(chunk_key)
+                .expect("repaired primary target location");
+
+            let wrong_generation = if old_generation > 1 {
+                old_generation - 1
+            } else {
+                assert!(
+                    replacement_generation > old_generation + 1,
+                    "fixture needs a distinct nonzero predecessor candidate"
+                );
+                old_generation + 1
+            };
+            assert!(
+                engine
+                    .fs
+                    .borrow()
+                    .store
+                    .pool()
+                    .replicated_repair_reconciliation_evidence(
+                        DeviceIoClass::Data,
+                        chunk_key,
+                        wrong_generation,
+                    )
+                    .expect("query wrong predecessor generation")
+                    .is_none(),
+                "target-only repair evidence must bind the exact embedded predecessor generation"
+            );
+
+            let resumed = live_pool_admin(&engine, "repair", json!({}), true);
+            assert_eq!(resumed["ok"], true, "repair-resume response: {resumed}");
+            let report = &resumed["json"];
+            assert_eq!(report["pass"], true);
+            assert_eq!(report["state_source"], "live-owner");
+            assert_eq!(report["outcome"], "completed");
+            assert_eq!(report["repair_attempted"], false);
+            assert_eq!(report["repair_completed"], true);
+            assert_eq!(report["repair_writeback"], false);
+            assert_eq!(report["target_write_previously_completed"], true);
+            assert_eq!(report["receipt_publication"], "previously-completed");
+            assert_eq!(report["reconciliation_resumed"], true);
+            assert_eq!(report["reconciliation_attempted"], true);
+            assert_eq!(report["reconciliation_completed"], true);
+            assert_eq!(report["reconciliation_writeback"], true);
+            assert_eq!(
+                report["comparison"]["classification"],
+                "TargetRepairReconciliation"
+            );
+            assert_eq!(
+                report["previous_receipt_generation"].as_u64(),
+                Some(old_generation)
+            );
+            assert_eq!(
+                report["replacement_receipt_generation"].as_u64(),
+                Some(replacement_generation)
+            );
+            assert_eq!(report["reconciled_current_manifest_count"], 1);
+            assert_eq!(report["reconciled_snapshot_manifest_count"], 1);
+            assert_eq!(report["authenticated_root_published"], true);
+            assert_eq!(report["re_scrub"]["pass"], true);
+
+            {
+                let fs = engine.fs.borrow();
+                assert_eq!(
+                    fs.store
+                        .pool()
+                        .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+                        .expect("read receipt after resumed reconciliation"),
+                    Some(direct_repair.replacement_receipt.clone()),
+                    "reconciliation-only retry must not publish a second chunk receipt"
+                );
+                assert_eq!(
+                    fs.store.pool().raw_primary_store().location_of(chunk_key),
+                    Some(repaired_target_location),
+                    "reconciliation-only retry must not write the repaired target again"
+                );
+                assert_eq!(
+                    fs.read_file("/repair-resume.txt")
+                        .expect("read repair-resume file"),
+                    payload
+                );
+            }
+
+            drop(engine);
+            let mut reopened = open_named_test_filesystem(
+                &root.path().join("metadata"),
+                &devices,
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+            );
+            assert_eq!(
+                reopened
+                    .read_file("/repair-resume.txt")
+                    .expect("read reconciled file after reopen"),
+                payload
+            );
+            let re_scrub = reopened
+                .scrub_mounted_content()
+                .expect("scrub reconciled content after reopen");
+            assert!(re_scrub.is_clean(), "post-reopen scrub: {re_scrub:?}");
+            reopened
+                .rollback_to_snapshot("repair-resume-retained")
+                .expect("rollback retained snapshot after reconciliation resume");
+            assert_eq!(
+                reopened
+                    .read_file("/repair-resume.txt")
+                    .expect("read retained repaired content after rollback"),
+                payload
+            );
+        }
+
+        #[test]
+        fn mounted_open_reconciles_published_target_repair_before_owner_publication() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"TideFS-pre-owner-repair-reconciliation";
+            let filesystem_generation_before = {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-open.txt", 0o644)
+                    .expect("create pre-owner repair fixture");
+                fs.write_file("/repair-open.txt", 0, payload)
+                    .expect("write pre-owner repair fixture");
+                fs.sync_all().expect("commit pre-owner repair fixture");
+                fs.create_snapshot("repair-open-retained")
+                    .expect("retain snapshot across pre-owner repair");
+                fs.stats().filesystem_generation
+            };
+
+            let (chunk_key, old_generation, _) =
+                corrupt_one_current_replicated_chunk(&engine, "/repair-open.txt", payload);
+            let direct_repair = publish_target_only_repair(&engine, chunk_key);
+            assert_eq!(direct_repair.previous_receipt.generation, old_generation);
+            let replacement_receipt = direct_repair.replacement_receipt.clone();
+            let repaired_target_location = engine
+                .fs
+                .borrow()
+                .store
+                .pool()
+                .raw_primary_store()
+                .location_of(chunk_key)
+                .expect("repaired target location before owner loss");
+
+            // Lose the only live owner after Pool receipt publication and before
+            // any filesystem manifest or authenticated-root reconciliation.
+            drop(engine);
+
+            let mut reopened = open_named_test_filesystem(
+                &root.path().join("metadata"),
+                &devices,
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .pool()
+                    .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+                    .expect("read receipt after pre-owner reconciliation"),
+                Some(replacement_receipt),
+                "mounted open must reconcile without publishing a second chunk receipt"
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .pool()
+                    .raw_primary_store()
+                    .location_of(chunk_key),
+                Some(repaired_target_location),
+                "mounted open must not repeat the repaired target write"
+            );
+            assert!(
+                reopened.stats().filesystem_generation > filesystem_generation_before,
+                "pre-owner reconciliation must publish a successor authenticated root"
+            );
+            assert_eq!(
+                reopened
+                    .read_file("/repair-open.txt")
+                    .expect("read repair fixture after pre-owner reconciliation"),
+                payload
+            );
+            let re_scrub = reopened
+                .scrub_mounted_content()
+                .expect("scrub repair fixture after pre-owner reconciliation");
+            assert!(re_scrub.is_clean(), "post-reopen scrub: {re_scrub:?}");
+            reopened
+                .rollback_to_snapshot("repair-open-retained")
+                .expect("rollback retained snapshot after pre-owner reconciliation");
+            assert_eq!(
+                reopened
+                    .read_file("/repair-open.txt")
+                    .expect("read retained snapshot after pre-owner reconciliation"),
+                payload
+            );
+        }
+
+        #[test]
+        fn mounted_open_batch_reconciles_mixed_and_pending_repairs_before_owner_publication() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload_a = b"TideFS-batch-open-completed-repair";
+            let payload_b = b"TideFS-batch-open-pending-repair";
+            let (filesystem_generation_before, snapshot_id, snapshot_root_before) = {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-batch-a.txt", 0o644)
+                    .expect("create completed batch-repair fixture");
+                fs.write_file("/repair-batch-a.txt", 0, payload_a)
+                    .expect("write completed batch-repair fixture");
+                fs.create_file("/repair-batch-b.txt", 0o644)
+                    .expect("create pending batch-repair fixture");
+                fs.write_file("/repair-batch-b.txt", 0, payload_b)
+                    .expect("write pending batch-repair fixture");
+                fs.sync_all().expect("commit batch-repair fixtures");
+                fs.create_snapshot("repair-batch-retained")
+                    .expect("retain both batch-repair chunks");
+                let snapshot_id = fs
+                    .dataset_catalog()
+                    .lookup("root@repair-batch-retained")
+                    .expect("batch-repair snapshot catalog entry");
+                let snapshot_root = fs
+                    .store
+                    .load_snapshot_root(snapshot_id)
+                    .expect("batch-repair typed snapshot root");
+                (fs.stats().filesystem_generation, snapshot_id, snapshot_root)
+            };
+            let (_, embedded_a_before, data_version_a_before) =
+                current_file_chunk_authority(&engine.fs.borrow(), "/repair-batch-a.txt");
+            let (_, embedded_b_before, data_version_b_before) =
+                current_file_chunk_authority(&engine.fs.borrow(), "/repair-batch-b.txt");
+
+            let (chunk_a, old_generation_a, _) =
+                corrupt_one_current_replicated_chunk(&engine, "/repair-batch-a.txt", payload_a);
+            assert_eq!(old_generation_a, embedded_a_before);
+            let completed_a = publish_target_only_repair(&engine, chunk_a);
+            assert_eq!(completed_a.previous_receipt.generation, embedded_a_before);
+            let replacement_a = completed_a.replacement_receipt.clone();
+            let repaired_location_a = engine
+                .fs
+                .borrow()
+                .store
+                .pool()
+                .raw_primary_store()
+                .location_of(chunk_a)
+                .expect("completed batch-repair target location");
+
+            let (chunk_b, old_generation_b, _) =
+                corrupt_one_current_replicated_chunk(&engine, "/repair-batch-b.txt", payload_b);
+            assert_eq!(old_generation_b, embedded_b_before);
+            let pending_b = stage_pending_target_repair_for_recovery(
+                &engine,
+                chunk_b,
+                tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies::Predecessor,
+            );
+            assert_eq!(pending_b.predecessor_receipt.generation, embedded_b_before);
+            assert_eq!(
+                pending_b.target_state,
+                tidefs_local_object_store::pool::PendingReplicatedRepairTargetState::NeedsRewrite
+            );
+
+            // Lose the mounted owner with A durably completed and B stopped at
+            // predecessor receipts. Open must authenticate that complete
+            // exception set (including retained roots) before it completes B.
+            engine.fs.borrow_mut().arm_mutation_reopen_fence();
+            drop(engine);
+
+            let reopened = open_named_test_filesystem(
+                &root.path().join("metadata"),
+                &devices,
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .pool()
+                    .placement_receipt_for_key(DeviceIoClass::Data, chunk_a)
+                    .expect("read completed A receipt after batch open"),
+                Some(replacement_a.clone()),
+                "batch open must not publish another receipt for completed A"
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .pool()
+                    .placement_receipt_for_key(DeviceIoClass::Data, chunk_b)
+                    .expect("read completed B receipt after batch open"),
+                Some(pending_b.replacement_receipt.clone()),
+                "batch open must converge B to its already-reserved replacement receipt"
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .pool()
+                    .raw_primary_store()
+                    .location_of(chunk_a),
+                Some(repaired_location_a),
+                "batch open must not repeat A's completed target write"
+            );
+            let repaired_location_b = reopened
+                .store
+                .pool()
+                .raw_primary_store()
+                .location_of(chunk_b)
+                .expect("completed B target location after batch open");
+
+            let (observed_chunk_a, embedded_a_after, data_version_a_after) =
+                current_file_chunk_authority(&reopened, "/repair-batch-a.txt");
+            let (observed_chunk_b, embedded_b_after, data_version_b_after) =
+                current_file_chunk_authority(&reopened, "/repair-batch-b.txt");
+            assert_eq!(observed_chunk_a, chunk_a);
+            assert_eq!(observed_chunk_b, chunk_b);
+            assert_eq!(embedded_a_after, replacement_a.generation);
+            assert_eq!(embedded_b_after, pending_b.replacement_receipt.generation);
+            assert_eq!(
+                data_version_a_after, data_version_b_after,
+                "A and B must enter one logical successor state, not separately published repairs"
+            );
+            assert!(data_version_a_after > data_version_a_before);
+            assert!(data_version_b_after > data_version_b_before);
+            let filesystem_generation_after = reopened.stats().filesystem_generation;
+            assert!(filesystem_generation_after > filesystem_generation_before);
+            assert_eq!(
+                reopened
+                    .read_file("/repair-batch-a.txt")
+                    .expect("read completed A after batch open"),
+                payload_a
+            );
+            assert_eq!(
+                reopened
+                    .read_file("/repair-batch-b.txt")
+                    .expect("read completed B after batch open"),
+                payload_b
+            );
+            let re_scrub = reopened
+                .scrub_mounted_content()
+                .expect("scrub both files after batch open");
+            assert!(re_scrub.is_clean(), "batch-open scrub: {re_scrub:?}");
+            assert!(
+                reopened
+                    .store
+                    .pool()
+                    .pending_replicated_repair_recovery_evidence_all(DeviceIoClass::Data)
+                    .expect("scan pending repairs after batch open")
+                    .is_empty(),
+                "batch open must complete every pending transition"
+            );
+            for chunk_key in [chunk_a, chunk_b] {
+                let evidence = reopened
+                    .store
+                    .pool()
+                    .replicated_receipt_evidence(DeviceIoClass::Data, chunk_key)
+                    .expect("read converged batch-repair target evidence")
+                    .expect("converged batch-repair receipt exists");
+                assert!(
+                    evidence.targets.iter().all(|target| matches!(
+                        &target.outcome,
+                        tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Clean
+                    )),
+                    "batch open must leave both targets clean for {chunk_key}"
+                );
+            }
+
+            let snapshot_root_after = reopened
+                .store
+                .load_snapshot_root(snapshot_id)
+                .expect("reconciled batch-repair typed snapshot root");
+            assert_eq!(
+                snapshot_root_after.snapshot_generation,
+                snapshot_root_before.snapshot_generation
+            );
+            assert_ne!(
+                snapshot_root_after.source_reference, snapshot_root_before.source_reference,
+                "retained root must advance in the same pre-owner reconciliation"
+            );
+
+            drop(reopened);
+            let mut reopened_again = open_named_test_filesystem(
+                &root.path().join("metadata"),
+                &devices,
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+            );
+            assert_eq!(
+                reopened_again.stats().filesystem_generation,
+                filesystem_generation_after,
+                "idempotent second reopen must not publish another filesystem state"
+            );
+            assert_eq!(
+                reopened_again
+                    .store
+                    .pool()
+                    .placement_receipt_for_key(DeviceIoClass::Data, chunk_a)
+                    .expect("read A receipt after second reopen"),
+                Some(replacement_a.clone()),
+                "second reopen must not publish another A receipt"
+            );
+            assert_eq!(
+                reopened_again
+                    .store
+                    .pool()
+                    .raw_primary_store()
+                    .location_of(chunk_a),
+                Some(repaired_location_a),
+                "second reopen must not repeat A's target write"
+            );
+            assert_eq!(
+                reopened_again
+                    .store
+                    .pool()
+                    .raw_primary_store()
+                    .location_of(chunk_b),
+                Some(repaired_location_b),
+                "second reopen must not repeat B's recovered target write"
+            );
+            assert_eq!(
+                reopened_again
+                    .store
+                    .pool()
+                    .placement_receipt_for_key(DeviceIoClass::Data, chunk_b)
+                    .expect("read B receipt after second reopen"),
+                Some(pending_b.replacement_receipt.clone()),
+                "second reopen must not publish another B receipt"
+            );
+            assert_eq!(
+                reopened_again
+                    .read_file("/repair-batch-a.txt")
+                    .expect("read A after second reopen"),
+                payload_a
+            );
+            assert_eq!(
+                reopened_again
+                    .read_file("/repair-batch-b.txt")
+                    .expect("read B after second reopen"),
+                payload_b
+            );
+            let second_scrub = reopened_again
+                .scrub_mounted_content()
+                .expect("scrub both files after second reopen");
+            assert!(
+                second_scrub.is_clean(),
+                "second batch scrub: {second_scrub:?}"
+            );
+
+            reopened_again
+                .rollback_to_snapshot("repair-batch-retained")
+                .expect("rollback reconciled batch snapshot");
+            assert_eq!(
+                reopened_again
+                    .read_file("/repair-batch-a.txt")
+                    .expect("read snapshot A after batch reconciliation"),
+                payload_a
+            );
+            assert_eq!(
+                reopened_again
+                    .read_file("/repair-batch-b.txt")
+                    .expect("read snapshot B after batch reconciliation"),
+                payload_b
+            );
+            let (_, snapshot_a_generation, snapshot_a_data_version) =
+                current_file_chunk_authority(&reopened_again, "/repair-batch-a.txt");
+            let (_, snapshot_b_generation, snapshot_b_data_version) =
+                current_file_chunk_authority(&reopened_again, "/repair-batch-b.txt");
+            assert_eq!(snapshot_a_generation, replacement_a.generation);
+            assert_eq!(
+                snapshot_b_generation,
+                pending_b.replacement_receipt.generation
+            );
+            assert_eq!(snapshot_a_data_version, snapshot_b_data_version);
+        }
+
+        #[test]
+        fn mounted_open_batch_refuses_invalid_retained_root_before_any_repair_mutation() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload_a = b"TideFS-batch-preflight-completed-repair";
+            let payload_b = b"TideFS-batch-preflight-pending-repair";
+            let snapshot_id = {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-preflight-a.txt", 0o644)
+                    .expect("create completed preflight fixture");
+                fs.write_file("/repair-preflight-a.txt", 0, payload_a)
+                    .expect("write completed preflight fixture");
+                fs.create_file("/repair-preflight-b.txt", 0o644)
+                    .expect("create pending preflight fixture");
+                fs.write_file("/repair-preflight-b.txt", 0, payload_b)
+                    .expect("write pending preflight fixture");
+                fs.sync_all().expect("commit repair-preflight fixtures");
+                fs.create_snapshot("repair-preflight-invalid-b-authority")
+                    .expect("retain both preflight chunks");
+                fs.dataset_catalog()
+                    .lookup("root@repair-preflight-invalid-b-authority")
+                    .expect("preflight snapshot catalog entry")
+            };
+
+            let (chunk_a, _, _) =
+                corrupt_one_current_replicated_chunk(&engine, "/repair-preflight-a.txt", payload_a);
+            let completed_a = publish_target_only_repair(&engine, chunk_a);
+            let (chunk_b, _, _) =
+                corrupt_one_current_replicated_chunk(&engine, "/repair-preflight-b.txt", payload_b);
+            let pending_b = stage_pending_target_repair_for_recovery(
+                &engine,
+                chunk_b,
+                tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies::Predecessor,
+            );
+            assert!(engine
+                .fs
+                .borrow()
+                .store
+                .pool()
+                .replicated_repair_reconciliation_evidence(
+                    DeviceIoClass::Data,
+                    chunk_a,
+                    completed_a.previous_receipt.generation,
+                )
+                .expect("read completed A preflight evidence")
+                .is_some());
+            assert_eq!(
+                pending_b.target_state,
+                tidefs_local_object_store::pool::PendingReplicatedRepairTargetState::NeedsRewrite
+            );
+
+            // Keep a structurally valid typed root while severing its agreement
+            // with the retained filesystem record. The complete current A+B root
+            // still authenticates, so this specifically exercises the retained-
+            // root preflight before either transition may advance further.
+            {
+                let mut fs = engine.fs.borrow_mut();
+                let stored = fs
+                    .store
+                    .load_snapshot_root(snapshot_id)
+                    .expect("load valid preflight snapshot root");
+                let invalid = tidefs_pool_runtime::SnapshotRoot::new(
+                    stored
+                        .snapshot_generation
+                        .checked_add(1)
+                        .expect("preflight snapshot generation remains representable"),
+                    stored.source_reference,
+                )
+                .expect("construct internally valid mismatched snapshot root");
+                fs.store
+                    .publish_dataset_root(
+                        snapshot_id,
+                        tidefs_pool_runtime::DatasetRootKind::Snapshot,
+                        invalid.snapshot_generation,
+                        &invalid.encode(),
+                    )
+                    .expect("publish mismatched retained-root authority");
+                fs.store
+                    .pool_mut()
+                    .sync_all()
+                    .expect("sync mismatched retained-root authority");
+                fs.arm_mutation_reopen_fence();
+            }
+            drop(engine);
+            let hashes_before = complete_device_hashes(&devices);
+
+            let reopened = PoolDatasetOwner::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+                root.path().join("metadata"),
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+                crate::LocalFileSystemOpenConfig {
+                    options: tidefs_local_object_store::StoreOptions::default(),
+                    allocator_policy: crate::LocalStorageAllocatorPolicy::default(),
+                    root_authentication_key: RootAuthenticationKey::demo_key(),
+                    encryption: None,
+                    compression: None,
+                    log_device_device_path: None,
+                    recovery_policy: crate::RecoveryPolicy::default(),
+                    block_devices: Some(&devices),
+                },
+            );
+            assert!(matches!(
+                reopened,
+                Err(FileSystemError::CorruptState { reason })
+                    if reason == "pending replicated repair snapshot typed root is inconsistent"
+            ));
+            assert_eq!(
+                complete_device_hashes(&devices),
+                hashes_before,
+                "invalid B/retained-root preflight must not complete A, rewrite B, converge either receipt, or publish any filesystem root"
+            );
+        }
+
+        fn assert_mounted_open_reconciles_repeated_same_key_repair(
+            receipt_copies: tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies,
+            fixture_name: &str,
+        ) {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let path = format!("/{fixture_name}.txt");
+            let snapshot_name = format!("{fixture_name}-retained");
+            let payload = format!("TideFS repeated same-key repair {fixture_name}").into_bytes();
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file(&path, 0o644)
+                    .expect("create repeated same-key repair fixture");
+                fs.write_file(&path, 0, &payload)
+                    .expect("write repeated same-key repair fixture");
+                fs.sync_all()
+                    .expect("commit repeated same-key repair fixture");
+                fs.create_snapshot(&snapshot_name)
+                    .expect("retain repeated same-key repair chunk");
+            }
+
+            let (chunk_key, generation_0, _) =
+                corrupt_one_current_replicated_chunk(&engine, &path, &payload);
+            let repair_1 = publish_target_only_repair(&engine, chunk_key);
+            assert_eq!(repair_1.previous_receipt.generation, generation_0);
+            let generation_1 = repair_1.replacement_receipt.generation;
+            assert!(generation_1 > generation_0);
+            engine.fs.borrow_mut().arm_mutation_reopen_fence();
+            drop(engine);
+
+            // First reopen finishes G0 -> G1 all the way through the current and
+            // retained filesystem roots. Only then stage a second physical
+            // lifetime of the same logical key for G1 -> G2.
+            let reopened = open_named_test_filesystem(
+                &root.path().join("metadata"),
+                &devices,
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+            );
+            let engine = VfsLocalFileSystem::new(reopened);
+            let (observed_key, embedded_generation_1, _) =
+                current_file_chunk_authority(&engine.fs.borrow(), &path);
+            assert_eq!(observed_key, chunk_key);
+            assert_eq!(embedded_generation_1, generation_1);
+            assert_eq!(
+                engine
+                    .fs
+                    .borrow()
+                    .store
+                    .pool()
+                    .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+                    .expect("read reconciled first same-key receipt"),
+                Some(repair_1.replacement_receipt)
+            );
+            assert_eq!(
+                engine
+                    .fs
+                    .borrow()
+                    .list_snapshots_checked()
+                    .expect("first same-key repair retains its snapshot authority")
+                    .len(),
+                1
+            );
+            let first_scrub = engine
+                .fs
+                .borrow_mut()
+                .scrub_mounted_content()
+                .expect("scrub fully reconciled G1 same-key authority");
+            assert!(
+                first_scrub.is_clean(),
+                "first same-key repair scrub: {first_scrub:?}"
+            );
+
+            let (same_chunk_key, repeated_predecessor_generation, _) =
+                corrupt_one_current_replicated_chunk(&engine, &path, &payload);
+            assert_eq!(same_chunk_key, chunk_key);
+            assert_eq!(repeated_predecessor_generation, generation_1);
+            let pending_2 =
+                stage_pending_target_repair_for_recovery(&engine, chunk_key, receipt_copies);
+            assert_eq!(pending_2.predecessor_receipt.generation, generation_1);
+            let generation_2 = pending_2.replacement_receipt.generation;
+            assert!(generation_2 > generation_1);
+            let target_location_at_cut = engine
+                .fs
+                .borrow()
+                .store
+                .pool()
+                .raw_primary_store()
+                .location_of(chunk_key)
+                .expect("same-key target location at second crash cut");
+            match receipt_copies {
+                tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies::Predecessor => {
+                    assert_eq!(
+                        pending_2.target_state,
+                        tidefs_local_object_store::pool::PendingReplicatedRepairTargetState::NeedsRewrite
+                    );
+                }
+                tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies::Mixed => {
+                    assert_eq!(
+                        pending_2.target_state,
+                        tidefs_local_object_store::pool::PendingReplicatedRepairTargetState::Clean
+                    );
+                }
+                tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies::Replacement => {
+                    panic!("repeated same-key VFS regression expects Predecessor or Mixed")
+                }
+            }
+            engine.fs.borrow_mut().arm_mutation_reopen_fence();
+            drop(engine);
+
+            let reopened = open_named_test_filesystem(
+                &root.path().join("metadata"),
+                &devices,
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .pool()
+                    .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+                    .expect("read second same-key replacement receipt"),
+                Some(pending_2.replacement_receipt.clone()),
+                "G1 -> G2 must converge to the already-reserved generation"
+            );
+            let target_location_after_recovery = reopened
+                .store
+                .pool()
+                .raw_primary_store()
+                .location_of(chunk_key)
+                .expect("same-key target location after second recovery");
+            if receipt_copies
+                == tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies::Mixed
+            {
+                assert_eq!(
+                    target_location_after_recovery, target_location_at_cut,
+                    "Mixed recovery must not repeat the already-completed G1 -> G2 target write"
+                );
+            } else {
+                assert_ne!(
+                    target_location_after_recovery, target_location_at_cut,
+                    "Predecessor recovery must replace the corrupt G1 physical lifetime exactly once"
+                );
+            }
+            let (observed_key, embedded_generation_2, _) =
+                current_file_chunk_authority(&reopened, &path);
+            assert_eq!(observed_key, chunk_key);
+            assert_eq!(embedded_generation_2, generation_2);
+            assert_eq!(
+                reopened
+                    .read_file(&path)
+                    .expect("read twice-repaired same-key file"),
+                payload
+            );
+            let re_scrub = reopened
+                .scrub_mounted_content()
+                .expect("scrub twice-repaired same-key file");
+            assert!(re_scrub.is_clean(), "same-key recovery scrub: {re_scrub:?}");
+            let filesystem_generation_after_recovery = reopened.stats().filesystem_generation;
+
+            drop(reopened);
+            let mut reopened_again = open_named_test_filesystem(
+                &root.path().join("metadata"),
+                &devices,
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+            );
+            assert_eq!(
+                reopened_again.stats().filesystem_generation,
+                filesystem_generation_after_recovery,
+                "idempotent same-key reopen must not publish another filesystem state"
+            );
+            assert_eq!(
+                reopened_again
+                    .store
+                    .pool()
+                    .raw_primary_store()
+                    .location_of(chunk_key),
+                Some(target_location_after_recovery),
+                "second reopen must not rewrite the G1 -> G2 target again"
+            );
+            assert_eq!(
+                reopened_again
+                    .store
+                    .pool()
+                    .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+                    .expect("read same-key receipt after idempotent reopen"),
+                Some(pending_2.replacement_receipt.clone()),
+                "second reopen must retain G2 without allocating G3"
+            );
+            assert_eq!(
+                reopened_again
+                    .read_file(&path)
+                    .expect("read same-key file after idempotent reopen"),
+                payload
+            );
+            let second_scrub = reopened_again
+                .scrub_mounted_content()
+                .expect("scrub same-key file after idempotent reopen");
+            assert!(
+                second_scrub.is_clean(),
+                "idempotent same-key reopen scrub: {second_scrub:?}"
+            );
+
+            reopened_again
+                .rollback_to_snapshot(&snapshot_name)
+                .expect("rollback twice-reconciled same-key retained root");
+            assert_eq!(
+                reopened_again
+                    .read_file(&path)
+                    .expect("read same-key file from twice-reconciled snapshot"),
+                payload
+            );
+            let (_, snapshot_generation_2, _) =
+                current_file_chunk_authority(&reopened_again, &path);
+            assert_eq!(snapshot_generation_2, generation_2);
+        }
+
+        #[test]
+        fn mounted_open_reconciles_repeated_same_key_pending_predecessor_repair() {
+            assert_mounted_open_reconciles_repeated_same_key_repair(
+                tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies::Predecessor,
+                "repair-same-key-predecessor",
+            );
+        }
+
+        #[test]
+        fn mounted_open_reconciles_repeated_same_key_mixed_receipt_repair() {
+            assert_mounted_open_reconciles_repeated_same_key_repair(
+                tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies::Mixed,
+                "repair-same-key-mixed",
+            );
+        }
+
+        #[test]
+        fn live_pool_repair_read_only_reopen_refuses_pending_transition_without_device_mutation() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"TideFS-read-only-pending-repair-refusal";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-read-only.txt", 0o644)
+                    .expect("create read-only pending-repair fixture");
+                fs.write_file("/repair-read-only.txt", 0, payload)
+                    .expect("write read-only pending-repair fixture");
+                fs.sync_all()
+                    .expect("commit read-only pending-repair fixture");
+            }
+
+            let (chunk_key, predecessor_generation, _) =
+                corrupt_one_current_replicated_chunk(&engine, "/repair-read-only.txt", payload);
+            let pending = stage_pending_target_repair_for_recovery(
+                &engine,
+                chunk_key,
+                tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies::Predecessor,
+            );
+            let replacement_generation = pending.replacement_receipt.generation;
+            assert!(replacement_generation > predecessor_generation);
+            assert_eq!(
+                pending.target_state,
+                tidefs_local_object_store::pool::PendingReplicatedRepairTargetState::NeedsRewrite
+            );
+
+            // Model owner loss at the durable post-reclaim-intent boundary. The
+            // fence only suppresses Drop's best-effort final commit; it is not
+            // persisted and cannot affect the subsequent read-only open.
+            engine.fs.borrow_mut().arm_mutation_reopen_fence();
+            drop(engine);
+            let hashes_before = complete_device_hashes(&devices);
+
+            let reopened = PoolDatasetOwner::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+                root.path().join("metadata"),
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+                crate::LocalFileSystemOpenConfig {
+                    options: tidefs_local_object_store::StoreOptions::default(),
+                    allocator_policy: crate::LocalStorageAllocatorPolicy::default(),
+                    root_authentication_key: RootAuthenticationKey::demo_key(),
+                    encryption: None,
+                    compression: None,
+                    log_device_device_path: None,
+                    recovery_policy: crate::RecoveryPolicy::ReadOnly,
+                    block_devices: Some(&devices),
+                },
+            );
+
+            assert!(matches!(
+                reopened,
+                Err(FileSystemError::CorruptState { reason })
+                    if reason == "read-only open refuses an unfinished replicated repair transition"
+            ));
+            assert_eq!(
+                complete_device_hashes(&devices),
+                hashes_before,
+                "read-only pending-repair refusal must leave complete device images unchanged"
+            );
+        }
+
+        #[test]
+        fn mounted_open_refuses_pending_repair_before_mutating_with_durable_intent() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"TideFS-pending-repair-intent-log-refusal";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-intent-refusal.txt", 0o644)
+                    .expect("create intent-log refusal fixture");
+                fs.write_file("/repair-intent-refusal.txt", 0, payload)
+                    .expect("write intent-log refusal fixture");
+                fs.sync_all().expect("commit intent-log refusal fixture");
+            }
+
+            let (chunk_key, _, _) = corrupt_one_current_replicated_chunk(
+                &engine,
+                "/repair-intent-refusal.txt",
+                payload,
+            );
+            stage_pending_target_repair_for_recovery(
+                &engine,
+                chunk_key,
+                tidefs_local_object_store::pool::PendingReplicatedRepairReceiptCopies::Predecessor,
+            );
+            {
+                let mut fs = engine.fs.borrow_mut();
+                let mut updated_root = fs.stat("/").expect("stat root for durable intent");
+                updated_root.mode ^= 0o001;
+                assert_eq!(
+                    fs.metadata_setattr_intent(&updated_root)
+                        .expect("append unrelated durable metadata intent"),
+                    IntentLogReplyState::IntentDurable,
+                );
+                assert!(!fs.intent_log_is_empty());
+                fs.arm_mutation_reopen_fence();
+            }
+            drop(engine);
+            let hashes_before = complete_device_hashes(&devices);
+
+            let reopened = PoolDatasetOwner::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+                root.path().join("metadata"),
+                "tank",
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 2 },
+                "root",
+                crate::LocalFileSystemOpenConfig {
+                    options: tidefs_local_object_store::StoreOptions::default(),
+                    allocator_policy: crate::LocalStorageAllocatorPolicy::default(),
+                    root_authentication_key: RootAuthenticationKey::demo_key(),
+                    encryption: None,
+                    compression: None,
+                    log_device_device_path: None,
+                    recovery_policy: crate::RecoveryPolicy::default(),
+                    block_devices: Some(&devices),
+                },
+            );
+
+            assert!(matches!(
+                reopened,
+                Err(FileSystemError::CorruptState { reason })
+                    if reason == "replicated repair recovery requires an empty dataset intent log before writeback"
+            ));
+            assert_eq!(
+                complete_device_hashes(&devices),
+                hashes_before,
+                "intent-log refusal must happen before pending-repair device mutation"
+            );
+        }
+
+        #[test]
+        fn live_pool_repair_reconciliation_human_report_preserves_subject_identity() {
+            let (engine, root, _devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"TideFS-live-owner-repair-reconciliation-human-report";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-resume-human.txt", 0o644)
+                    .expect("create human reconciliation fixture");
+                fs.write_file("/repair-resume-human.txt", 0, payload)
+                    .expect("write human reconciliation fixture");
+                fs.sync_all().expect("commit human reconciliation fixture");
+                fs.create_snapshot("repair-resume-human-retained")
+                    .expect("retain human reconciliation snapshot");
+            }
+
+            let (chunk_key, old_generation, expected_block_id) =
+                corrupt_one_current_replicated_chunk(&engine, "/repair-resume-human.txt", payload);
+            let direct_repair = publish_target_only_repair(&engine, chunk_key);
+            let expected_source = direct_repair
+                .replacement_receipt
+                .targets
+                .iter()
+                .find(|target| target.device_index == direct_repair.source_device_index)
+                .map(mounted_repair_receipt_target_identity_text)
+                .expect("replacement receipt retains the clean source identity");
+            let expected_target = direct_repair
+                .replacement_receipt
+                .targets
+                .iter()
+                .find(|target| target.device_index == direct_repair.repaired_device_index)
+                .map(mounted_repair_receipt_target_identity_text)
+                .expect("replacement receipt retains the repaired target identity");
+            let expected_object = format!("object:                 {chunk_key}");
+            assert_eq!(chunk_key.to_string().len(), 64);
+            let (expected_kind, expected_chunk_index) =
+                mounted_scrub_block_kind(expected_block_id.kind);
+            let expected_subject = format!(
+                "subject:                inode={} data-version={} kind={} chunk={}",
+                expected_block_id.inode_id,
+                expected_block_id.data_version,
+                expected_kind,
+                expected_chunk_index
+                    .map_or_else(|| "none".to_string(), |chunk_index| chunk_index.to_string()),
+            );
+            let expected_receipt_generation = format!(
+                "receipt generation:     {} -> {}",
+                old_generation, direct_repair.replacement_receipt.generation,
+            );
+
+            let resumed = live_pool_admin(&engine, "repair", json!({}), false);
+
+            assert_eq!(
+                resumed["ok"], true,
+                "human repair-resume response: {resumed}"
+            );
+            assert!(
+                resumed["text"].as_str().is_some_and(|text| {
+                    text.contains("pool repair: tank")
+                        && text.contains("outcome:                completed")
+                        && text
+                            .contains("target write:           previously completed (not repeated)")
+                        && text.contains("reconciliation:         resumed and completed")
+                        && text.contains("comparison:             TargetRepairReconciliation")
+                        && text.contains(&expected_subject)
+                        && text.contains(&expected_object)
+                        && text.contains(&format!("clean source:           {expected_source}"))
+                        && text.contains(&format!("repaired target:        {expected_target}"))
+                        && text.contains(&expected_receipt_generation)
+                        && text.contains("authenticated root:     published")
+                        && text.contains("re-scrub:               clean")
+                }),
+                "human reconciliation report must retain its exact repair subject: {resumed}"
+            );
+            assert_eq!(
+                engine
+                    .fs
+                    .borrow()
+                    .read_file("/repair-resume-human.txt")
+                    .expect("read human reconciliation repaired file"),
+                payload
+            );
+            drop(engine);
+            drop(root);
+        }
+
+        #[test]
+        fn live_pool_repair_refuses_ordinary_same_payload_rewrite_without_device_mutation() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"TideFS-live-owner-ordinary-rewrite-refusal";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-ordinary-rewrite.txt", 0o644)
+                    .expect("create ordinary-rewrite fixture");
+                fs.write_file("/repair-ordinary-rewrite.txt", 0, payload)
+                    .expect("write ordinary-rewrite fixture");
+                fs.sync_all().expect("commit ordinary-rewrite fixture");
+            }
+
+            let (chunk_key, encoded_chunk, old_generation) = {
+                let fs = engine.fs.borrow();
+                let record = fs
+                    .stat("/repair-ordinary-rewrite.txt")
+                    .expect("stat ordinary-rewrite fixture");
+                let keyspace = fs.object_keyspace();
+                let manifest_key = keyspace.content(record.inode_id, record.data_version);
+                let (manifest_bytes, _) = fs
+                    .store
+                    .pool()
+                    .get_with_current_receipt(DeviceIoClass::Data, manifest_key)
+                    .expect("read ordinary-rewrite manifest")
+                    .expect("ordinary-rewrite manifest exists");
+                let manifest = crate::encoding::decode_content_manifest(&manifest_bytes)
+                    .expect("decode ordinary-rewrite manifest");
+                let chunk = manifest
+                    .chunks
+                    .iter()
+                    .find(|chunk| !chunk.is_hole())
+                    .expect("ordinary-rewrite content chunk");
+                let chunk_key =
+                    keyspace.content_chunk(record.inode_id, chunk.data_version, chunk.chunk_index);
+                let (encoded_chunk, receipt) = fs
+                    .store
+                    .pool()
+                    .get_with_current_receipt(DeviceIoClass::Data, chunk_key)
+                    .expect("read ordinary-rewrite chunk")
+                    .expect("ordinary-rewrite chunk exists");
+                (chunk_key, encoded_chunk, receipt.generation)
+            };
+            let replacement_receipt = {
+                let mut fs = engine.fs.borrow_mut();
+                let (_, receipt) = fs
+                    .store
+                    .pool_mut()
+                    .put_with_receipt(DeviceIoClass::Data, chunk_key, &encoded_chunk)
+                    .expect("rewrite the exact same payload through ordinary Pool authority");
+                fs.store
+                    .pool_mut()
+                    .sync_all()
+                    .expect("sync ordinary same-payload rewrite");
+                receipt
+            };
+            assert!(replacement_receipt.generation > old_generation);
+            assert!(
+                engine
+                    .fs
+                    .borrow()
+                    .store
+                    .pool()
+                    .replicated_repair_reconciliation_evidence(
+                        DeviceIoClass::Data,
+                        chunk_key,
+                        old_generation,
+                    )
+                    .expect("query ordinary-rewrite repair evidence")
+                    .is_none(),
+                "ordinary two-target rewrite must not impersonate target-only repair evidence"
+            );
+            let hashes_before = complete_device_hashes(&devices);
+
+            let refused = live_pool_admin(&engine, "repair", json!({}), true);
+
+            assert_eq!(
+                refused["ok"], false,
+                "ordinary-rewrite repair response: {refused}"
+            );
+            let report = &refused["json"];
+            assert_eq!(report["state_source"], "live-owner");
+            assert_eq!(report["outcome"], "refused");
+            assert_eq!(
+                report["refusal"]["code"],
+                "stale-content-receipt-generation"
+            );
+            assert_eq!(report["repair_attempted"], false);
+            assert_eq!(report["repair_writeback"], false);
+            assert_eq!(report["receipt_publication"], "not-attempted");
+            assert_eq!(
+                engine
+                    .fs
+                    .borrow()
+                    .store
+                    .pool()
+                    .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+                    .expect("read ordinary-rewrite receipt after refusal"),
+                Some(replacement_receipt),
+                "refusal must retain the existing ordinary rewrite authority"
+            );
+            assert_eq!(
+                complete_device_hashes(&devices),
+                hashes_before,
+                "ordinary-rewrite refusal must leave complete device images unchanged"
+            );
+            engine.fs.borrow_mut().arm_mutation_reopen_fence();
+            drop(engine);
+            drop(root);
+        }
+
+        #[test]
+        fn live_pool_repair_refuses_missing_current_target_evidence_without_device_mutation() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"missing-current-repair-target-evidence";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-missing-target.txt", 0o644)
+                    .expect("create missing-target repair fixture");
+                fs.write_file("/repair-missing-target.txt", 0, payload)
+                    .expect("write missing-target repair fixture");
+                fs.sync_all().expect("commit missing-target repair fixture");
+            }
+            let (chunk_key, _, _) = corrupt_one_current_replicated_chunk(
+                &engine,
+                "/repair-missing-target.txt",
+                payload,
+            );
+            {
+                let mut fs = engine.fs.borrow_mut();
+                assert!(
+                    fs.store
+                        .pool_mut()
+                        .raw_primary_store_mut()
+                        .delete(chunk_key)
+                        .expect("remove exactly one current receipt target"),
+                    "missing-target fixture must remove the primary target payload"
+                );
+                fs.store
+                    .pool_mut()
+                    .sync_all()
+                    .expect("sync missing-target fixture");
+            }
+            let evidence = engine
+                .fs
+                .borrow()
+                .store
+                .pool()
+                .replicated_receipt_evidence(DeviceIoClass::Data, chunk_key)
+                .expect("read missing-target comparison evidence")
+                .expect("missing-target receipt remains current");
+            assert_eq!(
+                evidence
+                    .targets
+                    .iter()
+                    .filter(|target| matches!(
+                        &target.outcome,
+                        tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Missing
+                    ))
+                    .count(),
+                1,
+                "fixture must omit exactly one current target"
+            );
+            let hashes_before = complete_device_hashes(&devices);
+
+            let refused = live_pool_admin(&engine, "repair", json!({}), true);
+
+            assert_eq!(
+                refused["ok"], false,
+                "missing-target repair response: {refused}"
+            );
+            let report = &refused["json"];
+            assert_eq!(report["state_source"], "live-owner");
+            assert_eq!(report["outcome"], "refused");
+            assert_eq!(report["refusal"]["code"], "comparison-refused-writeback");
+            assert_eq!(
+                report["comparison"]["classification"],
+                "IncompleteComparison"
+            );
+            assert_eq!(report["repair_attempted"], false);
+            assert_eq!(report["repair_writeback"], false);
+            assert_eq!(report["receipt_publication"], "not-attempted");
+            assert!(report["comparison"]["targets"]
+                .as_array()
+                .is_some_and(|targets| targets.iter().any(|target| {
+                    target["receipt_payload_outcome"]["kind"] == "missing"
+                        && target["mounted_checksum_outcome"]["kind"] == "missing"
+                })));
+            assert_eq!(
+                complete_device_hashes(&devices),
+                hashes_before,
+                "missing-target refusal must leave complete device images unchanged"
+            );
+            drop(engine);
+            drop(root);
+        }
+
+        #[test]
+        fn live_pool_repair_refuses_wrong_width_pool_policy_without_device_mutation() {
+            let (engine, root, devices) = temp_fs_with_policy_and_block_devices(
+                3,
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 3 },
+            );
+            let payload = b"wrong-width-repair-policy-refusal";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-wrong-width.txt", 0o644)
+                    .expect("create wrong-width repair fixture");
+                fs.write_file("/repair-wrong-width.txt", 0, payload)
+                    .expect("write wrong-width repair fixture");
+                fs.sync_all().expect("commit wrong-width repair fixture");
+            }
+            let (_, receipt, _) =
+                corrupt_current_pool_chunk_on_primary(&engine, "/repair-wrong-width.txt", payload);
+            assert_eq!(
+                receipt.policy,
+                tidefs_local_object_store::PoolRedundancyPolicy::Replicated { copies: 3 }
+            );
+            let hashes_before = complete_device_hashes(&devices);
+
+            let refused = live_pool_admin(&engine, "repair", json!({}), true);
+
+            assert_eq!(
+                refused["ok"], false,
+                "wrong-width repair response: {refused}"
+            );
+            let report = &refused["json"];
+            assert_eq!(report["state_source"], "live-owner");
+            assert_eq!(report["outcome"], "refused");
+            assert_eq!(report["refusal"]["code"], "receipt-evidence-refused");
+            assert!(report["refusal"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("exact two-copy current pool policy")));
+            assert!(report["comparison"].is_null());
+            assert_eq!(report["repair_attempted"], false);
+            assert_eq!(report["repair_writeback"], false);
+            assert_eq!(report["receipt_publication"], "not-attempted");
+            assert_eq!(
+                complete_device_hashes(&devices),
+                hashes_before,
+                "wrong-width policy refusal must leave complete device images unchanged"
+            );
+            drop(engine);
+            drop(root);
+        }
+
+        #[test]
+        fn live_pool_repair_clean_state_refuses_without_device_mutation() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/clean.txt", 0o644)
+                    .expect("create clean repair fixture");
+                fs.write_file("/clean.txt", 0, b"clean-repair-refusal-fixture")
+                    .expect("write clean repair fixture");
+                fs.sync_all().expect("commit clean repair fixture");
+            }
+            let hashes_before = complete_device_hashes(&devices);
+
+            let refused = live_pool_admin(&engine, "repair", json!({}), true);
+
+            assert_eq!(refused["ok"], false, "clean repair response: {refused}");
+            let report = &refused["json"];
+            assert_eq!(report["state_source"], "live-owner");
+            assert_eq!(report["outcome"], "refused");
+            assert_eq!(report["refusal"]["code"], "no-repair-needed");
+            assert_eq!(report["repair_attempted"], false);
+            assert_eq!(report["repair_writeback"], false);
+            assert_eq!(report["initial_scrub"]["pass"], true);
+            assert_eq!(
+                complete_device_hashes(&devices),
+                hashes_before,
+                "clean repair refusal must not mutate complete device images"
+            );
+            drop(engine);
+            drop(root);
+        }
+
+        #[test]
+        fn live_pool_repair_refuses_corrupt_canonical_root_without_device_mutation() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"corrupt-canonical-root-repair-refusal";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-corrupt-root.txt", 0o644)
+                    .expect("create corrupt-root repair fixture");
+                fs.write_file("/repair-corrupt-root.txt", 0, payload)
+                    .expect("write corrupt-root repair fixture");
+                fs.sync_all().expect("commit corrupt-root repair fixture");
+            }
+            let (chunk_key, _, _) =
+                corrupt_one_current_replicated_chunk(&engine, "/repair-corrupt-root.txt", payload);
+            let (expected_source, expected_target) = {
+                let fs = engine.fs.borrow();
+                let evidence = fs
+                    .store
+                    .pool()
+                    .replicated_receipt_evidence(DeviceIoClass::Data, chunk_key)
+                    .expect("read corrupt-root repair identities")
+                    .expect("corrupt-root repair receipt");
+                let source = evidence
+                    .targets
+                    .iter()
+                    .find(|target| {
+                        matches!(
+                            &target.outcome,
+                            tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Clean
+                        )
+                    })
+                    .map(|target| mounted_repair_receipt_target_identity_text(&target.target))
+                    .expect("corrupt-root repair has a clean source");
+                let target = evidence
+                    .targets
+                    .iter()
+                    .find(|target| {
+                        matches!(
+                            &target.outcome,
+                            tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Corrupt { .. }
+                        )
+                    })
+                    .map(|target| mounted_repair_receipt_target_identity_text(&target.target))
+                    .expect("corrupt-root repair has one corrupt target");
+                (source, target)
+            };
+            {
+                let mut fs = engine.fs.borrow_mut();
+                let dataset_id = DatasetId::from_bytes(fs.mounted_dataset_id());
+                let generation = fs.stats().filesystem_generation.saturating_add(1);
+                fs.store
+                    .publish_dataset_root(
+                        dataset_id,
+                        tidefs_pool_runtime::DatasetRootKind::Filesystem,
+                        generation,
+                        b"invalid mounted canonical root",
+                    )
+                    .expect("publish invalid mounted canonical root");
+                fs.store
+                    .pool_mut()
+                    .sync_all()
+                    .expect("sync invalid mounted canonical root fixture");
+            }
+            let hashes_before = complete_device_hashes(&devices);
+
+            let refused = live_pool_admin(&engine, "repair", json!({}), true);
+
+            assert_eq!(
+                refused["ok"], false,
+                "corrupt-root repair response: {refused}"
+            );
+            let report = &refused["json"];
+            assert_eq!(report["state_source"], "live-owner");
+            assert_eq!(report["outcome"], "refused");
+            assert_eq!(
+                report["comparison"]["classification"],
+                "SingleReplicaCorruption"
+            );
+            assert_eq!(
+                report["refusal"]["code"],
+                "filesystem-root-preflight-failed"
+            );
+            assert_eq!(report["repair_attempted"], false);
+            assert_eq!(report["repair_writeback"], false);
+            assert_eq!(report["receipt_publication"], "not-attempted");
+            assert_eq!(report["authenticated_root_published"], false);
+            assert_eq!(report["authenticated_root_state"], "not-started");
+            let refused_human = live_pool_admin(&engine, "repair", json!({}), false);
+            assert_eq!(
+                refused_human["ok"], false,
+                "human corrupt-root refusal: {refused_human}"
+            );
+            assert!(refused_human["text"].as_str().is_some_and(|text| {
+                text.contains(&format!("object:                 {chunk_key}"))
+                    && text.contains(&format!("clean source:           {expected_source}"))
+                    && text.contains(&format!("corrupt target:         {expected_target}"))
+                    && text.contains("refusal:                filesystem-root-preflight-failed:")
+            }));
+            assert_eq!(
+                complete_device_hashes(&devices),
+                hashes_before,
+                "corrupt canonical-root refusal must leave complete device images unchanged"
+            );
+            engine.fs.borrow_mut().arm_mutation_reopen_fence();
+            drop(engine);
+            drop(root);
+        }
+
+        #[test]
+        fn live_pool_repair_refuses_dirty_mounted_state_without_device_mutation() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"dirty-mounted-state-repair-refusal";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.set_auto_commit(false)
+                    .expect("disable automatic commit for dirty-state fixture");
+                fs.create_file("/repair-dirty.txt", 0o644)
+                    .expect("create repair fixture");
+                fs.write_file("/repair-dirty.txt", 0, payload)
+                    .expect("write repair fixture");
+                fs.sync_all().expect("commit repair fixture");
+            }
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/uncommitted.txt", 0o644)
+                    .expect("create unrelated uncommitted state");
+                assert!(fs.is_state_dirty(), "fixture must remain dirty");
+            }
+            corrupt_one_current_replicated_chunk(&engine, "/repair-dirty.txt", payload);
+            let hashes_before = complete_device_hashes(&devices);
+
+            let refused = live_pool_admin(&engine, "repair", json!({}), true);
+
+            assert_eq!(refused["ok"], false, "dirty repair response: {refused}");
+            let report = &refused["json"];
+            assert_eq!(report["outcome"], "refused");
+            assert_eq!(report["repair_attempted"], false);
+            assert_eq!(report["repair_writeback"], false);
+            assert_eq!(report["receipt_publication"], "not-attempted");
+            assert_eq!(report["refusal"]["code"], "mounted-state-not-quiescent");
+            assert_eq!(
+                complete_device_hashes(&devices),
+                hashes_before,
+                "dirty-state refusal must not commit or otherwise mutate device images"
+            );
+            engine.fs.borrow_mut().arm_mutation_reopen_fence();
+            drop(engine);
+            drop(root);
+        }
+
+        #[test]
+        fn live_pool_repair_refuses_fenced_owner_without_device_mutation() {
+            let (engine, root, devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"fenced-mounted-owner-repair-refusal";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-fenced.txt", 0o644)
+                    .expect("create repair fixture");
+                fs.write_file("/repair-fenced.txt", 0, payload)
+                    .expect("write repair fixture");
+                fs.sync_all().expect("commit repair fixture");
+            }
+            corrupt_one_current_replicated_chunk(&engine, "/repair-fenced.txt", payload);
+            engine.fs.borrow_mut().arm_mutation_reopen_fence();
+            let hashes_before = complete_device_hashes(&devices);
+
+            let refused = live_pool_admin(&engine, "repair", json!({}), true);
+
+            assert_eq!(refused["ok"], false, "fenced repair response: {refused}");
+            let report = &refused["json"];
+            assert_eq!(report["outcome"], "refused");
+            assert_eq!(report["repair_attempted"], false);
+            assert_eq!(report["repair_writeback"], false);
+            assert_eq!(report["receipt_publication"], "not-attempted");
+            assert_eq!(report["refusal"]["code"], "mutation-authority-refused");
+            assert_eq!(
+                complete_device_hashes(&devices),
+                hashes_before,
+                "fenced-owner refusal must leave complete device images unchanged"
+            );
+            drop(engine);
+            drop(root);
+        }
+
+        #[test]
+        fn live_pool_repair_human_report_preserves_repair_authority() {
+            let (engine, root, _devices) = temp_replicated_fs_with_block_devices();
+            let payload = b"TideFS-live-owner-repair-human-report-fixture";
+            {
+                let mut fs = engine.fs.borrow_mut();
+                fs.create_file("/repair-human.txt", 0o644)
+                    .expect("create human repair fixture");
+                fs.write_file("/repair-human.txt", 0, payload)
+                    .expect("write human repair fixture");
+                fs.sync_all().expect("commit human repair fixture");
+            }
+            let (chunk_key, _, expected_block_id) =
+                corrupt_one_current_replicated_chunk(&engine, "/repair-human.txt", payload);
+            let (expected_source, expected_target) = {
+                let fs = engine.fs.borrow();
+                let evidence = fs
+                    .store
+                    .pool()
+                    .replicated_receipt_evidence(DeviceIoClass::Data, chunk_key)
+                    .expect("read human repair identities")
+                    .expect("human repair receipt");
+                let source = evidence
+                    .targets
+                    .iter()
+                    .find(|target| {
+                        matches!(
+                            &target.outcome,
+                            tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Clean
+                        )
+                    })
+                    .map(|target| mounted_repair_receipt_target_identity_text(&target.target))
+                    .expect("human repair has a clean source");
+                let target = evidence
+                    .targets
+                    .iter()
+                    .find(|target| {
+                        matches!(
+                            &target.outcome,
+                            tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Corrupt { .. }
+                        )
+                    })
+                    .map(|target| mounted_repair_receipt_target_identity_text(&target.target))
+                    .expect("human repair has one corrupt target");
+                (source, target)
+            };
+            let expected_object = format!("object:                 {chunk_key}");
+            assert_eq!(chunk_key.to_string().len(), 64);
+
+            let (expected_kind, expected_chunk_index) =
+                mounted_scrub_block_kind(expected_block_id.kind);
+            let expected_subject = format!(
+                "subject:                inode={} data-version={} kind={} chunk={}",
+                expected_block_id.inode_id,
+                expected_block_id.data_version,
+                expected_kind,
+                expected_chunk_index
+                    .map_or_else(|| "none".to_string(), |chunk_index| chunk_index.to_string()),
+            );
+
+            let repaired = live_pool_admin(&engine, "repair", json!({}), false);
+
+            assert_eq!(repaired["ok"], true, "human repair response: {repaired}");
+            assert!(repaired["text"].as_str().is_some_and(|text| {
+                text.contains("pool repair: tank")
+                    && text.contains("source:                 live owner")
+                    && text.contains("outcome:                completed")
+                    && text.contains("comparison:             SingleReplicaCorruption")
+                    && text.contains(&expected_subject)
+                    && text.contains(&expected_object)
+                    && text.contains(&format!("clean source:           {expected_source}"))
+                    && text.contains(&format!("repaired target:        {expected_target}"))
+                    && text.contains("receipt generation:")
+                    && text.contains("authenticated root:     published")
+                    && text.contains("re-scrub:               clean")
+            }));
+            assert_eq!(
+                engine
+                    .fs
+                    .borrow()
+                    .read_file("/repair-human.txt")
+                    .expect("read human-report repaired file"),
+                payload
+            );
+            drop(engine);
+            drop(root);
+        }
+    }
+}
+
+fn mounted_repair_scrub_summary(report: &crate::scrub::ScrubReport) -> Value {
+    let findings = report
+        .violations
+        .iter()
+        .map(|violation| mounted_scrub_finding_json(report, violation))
+        .collect::<Vec<_>>();
+    json!({
+        "pass": report.is_clean() && report.blocks_no_checksum == 0,
+        "blocks_scanned": report.blocks_scanned,
+        "blocks_clean": report.blocks_clean,
+        "blocks_corrupt": report.blocks_corrupt,
+        "blocks_unreadable": report.blocks_unreadable,
+        "blocks_no_checksum": report.blocks_no_checksum,
+        "finding_count": report.violations.len(),
+        "findings": findings,
+    })
+}
+
+fn mounted_repair_classification_name(
+    classification: &crate::scrub::MountedRepairClassification,
+) -> &'static str {
+    match classification {
+        crate::scrub::MountedRepairClassification::CleanAgreement => "CleanAgreement",
+        crate::scrub::MountedRepairClassification::SingleReplicaCorruption { .. } => {
+            "SingleReplicaCorruption"
+        }
+        crate::scrub::MountedRepairClassification::IncompleteComparison { .. } => {
+            "IncompleteComparison"
+        }
+        crate::scrub::MountedRepairClassification::ReceiptTargetDisagreement => {
+            "ReceiptTargetDisagreement"
+        }
+        crate::scrub::MountedRepairClassification::ChecksumAuthorityDisagreement => {
+            "ChecksumAuthorityDisagreement"
+        }
+        crate::scrub::MountedRepairClassification::MissingChecksumEvidence { .. } => {
+            "MissingChecksumEvidence"
+        }
+    }
+}
+
+fn mounted_repair_checksum_token(checksum: IntegrityDigest64) -> String {
+    mounted_scrub_digest(checksum)
+}
+
+fn mounted_repair_read_outcome_json(
+    outcome: &crate::scrub::MountedRepairTargetChecksumOutcome,
+) -> Value {
+    match outcome {
+        crate::scrub::MountedRepairTargetChecksumOutcome::Clean { checksum } => json!({
+            "kind": "clean",
+            "checksum_token": mounted_repair_checksum_token(*checksum),
+        }),
+        crate::scrub::MountedRepairTargetChecksumOutcome::Mismatch { expected, actual } => json!({
+            "kind": "mismatch",
+            "expected_checksum_token": mounted_repair_checksum_token(*expected),
+            "actual_checksum_token": mounted_repair_checksum_token(*actual),
+        }),
+        crate::scrub::MountedRepairTargetChecksumOutcome::ReceiptMismatch { checksum } => json!({
+            "kind": "receipt-mismatch",
+            "checksum_token": mounted_repair_checksum_token(*checksum),
+        }),
+        crate::scrub::MountedRepairTargetChecksumOutcome::Missing => {
+            json!({ "kind": "missing" })
+        }
+        crate::scrub::MountedRepairTargetChecksumOutcome::Unreadable => {
+            json!({ "kind": "unreadable" })
+        }
+        crate::scrub::MountedRepairTargetChecksumOutcome::NoChecksum => {
+            json!({ "kind": "no-checksum" })
+        }
+    }
+}
+
+fn mounted_repair_target_identity_json(
+    comparison: &crate::scrub::MountedReplicatedRepairComparison,
+    device_index: u32,
+) -> Value {
+    comparison
+        .receipt_evidence
+        .targets
+        .iter()
+        .find(|target| target.target.device_index == device_index)
+        .map_or(Value::Null, |target| {
+            mounted_repair_receipt_target_identity_json(&target.target)
+        })
+}
+
+fn mounted_repair_receipt_target_identity_json(
+    target: &tidefs_local_object_store::PlacementReceiptTarget,
+) -> Value {
+    json!({
+        "device_index": target.device_index,
+        "device_guid": live_admin_hex_encode(&target.device_guid),
+        "shard_index": target.shard_index,
+    })
+}
+
+fn mounted_repair_receipt_target_identity_text(
+    target: &tidefs_local_object_store::PlacementReceiptTarget,
+) -> String {
+    format!(
+        "device {} guid={} shard={}",
+        target.device_index,
+        live_admin_hex_encode(&target.device_guid),
+        target.shard_index,
+    )
+}
+
+fn mounted_repair_target_identity_text(
+    comparison: &crate::scrub::MountedReplicatedRepairComparison,
+    device_index: u32,
+) -> String {
+    comparison
+        .receipt_evidence
+        .targets
+        .iter()
+        .find(|target| target.target.device_index == device_index)
+        .map_or_else(
+            || format!("device {device_index} guid=not-established shard=not-established"),
+            |target| mounted_repair_receipt_target_identity_text(&target.target),
+        )
+}
+
+fn mounted_repair_comparison_json(
+    comparison: &crate::scrub::MountedReplicatedRepairComparison,
+) -> Value {
+    let targets = comparison
+        .receipt_evidence
+        .targets
+        .iter()
+        .map(|target| {
+            let mounted = comparison
+                .target_outcomes
+                .iter()
+                .find(|outcome| outcome.device_index == target.target.device_index);
+            let physical = match &target.outcome {
+                tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Clean => {
+                    json!({ "kind": "clean" })
+                }
+                tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Corrupt {
+                    actual_len,
+                    actual_digest,
+                } => json!({
+                    "kind": "corrupt",
+                    "actual_len": actual_len,
+                    "actual_digest": live_admin_hex_encode(actual_digest),
+                }),
+                tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Missing => {
+                    json!({ "kind": "missing" })
+                }
+                tidefs_local_object_store::pool::ReplicatedTargetReadOutcome::Unreadable => {
+                    json!({ "kind": "unreadable" })
+                }
+            };
+            json!({
+                "device_index": target.target.device_index,
+                "device_guid": live_admin_hex_encode(&target.target.device_guid),
+                "shard_index": target.target.shard_index,
+                "receipt_payload_outcome": physical,
+                "mounted_checksum_outcome": mounted
+                    .map(|outcome| mounted_repair_read_outcome_json(&outcome.outcome)),
+            })
+        })
+        .collect::<Vec<_>>();
+    let (kind, chunk_index) = mounted_scrub_block_kind(comparison.block_id.kind);
+    json!({
+        "classification": mounted_repair_classification_name(&comparison.classification),
+        "subject": {
+            "inode_id": comparison.block_id.inode_id,
+            "data_version": comparison.block_id.data_version,
+            "kind": kind,
+            "chunk_index": chunk_index,
+        },
+        "object_key": live_admin_hex_encode(comparison.object_key.as_bytes()),
+        "checksum_layer": mounted_scrub_checksum_layer(comparison.checksum_layer),
+        "receipt_epoch": comparison.receipt_evidence.receipt.epoch,
+        "receipt_generation": comparison.receipt_evidence.receipt.generation,
+        "redundancy_policy": "replicated-2",
+        "target_count": comparison.target_outcomes.len(),
+        "targets": targets,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct LivePoolRepairProgress<'a> {
+    attempted: bool,
+    writeback_started: bool,
+    receipt_publication: &'static str,
+    initial_scrub: Option<&'a crate::scrub::ScrubReport>,
+    comparison: Option<&'a crate::scrub::MountedReplicatedRepairComparison>,
+    previous_receipt_generation: Option<u64>,
+    replacement_receipt_generation: Option<u64>,
+    source_device_index: Option<u32>,
+    corrupt_device_index: Option<u32>,
+    authenticated_root_state: &'static str,
+    re_scrub: Option<&'a crate::scrub::ScrubReport>,
+}
+
+impl Default for LivePoolRepairProgress<'_> {
+    fn default() -> Self {
+        Self {
+            attempted: false,
+            writeback_started: false,
+            receipt_publication: "not-attempted",
+            initial_scrub: None,
+            comparison: None,
+            previous_receipt_generation: None,
+            replacement_receipt_generation: None,
+            source_device_index: None,
+            corrupt_device_index: None,
+            authenticated_root_state: "not-started",
+            re_scrub: None,
+        }
+    }
+}
+
+fn live_pool_repair_failure(
+    pool: &str,
+    wants_json: bool,
+    code: &'static str,
+    message: impl Into<String>,
+    progress: LivePoolRepairProgress<'_>,
+) -> LivePoolAdminResponse {
+    let message = message.into();
+    let outcome = if progress.writeback_started {
+        "incomplete"
+    } else {
+        "refused"
+    };
+    let previous_receipt_generation = progress.previous_receipt_generation.or_else(|| {
+        progress
+            .comparison
+            .map(|comparison| comparison.receipt_evidence.receipt.generation)
+    });
+    let source = progress
+        .comparison
+        .zip(progress.source_device_index)
+        .map_or(Value::Null, |(comparison, device_index)| {
+            mounted_repair_target_identity_json(comparison, device_index)
+        });
+    let corrupt = progress
+        .comparison
+        .zip(progress.corrupt_device_index)
+        .map_or(Value::Null, |(comparison, device_index)| {
+            mounted_repair_target_identity_json(comparison, device_index)
+        });
+    if wants_json {
+        let detail = json!({
+            "code": code,
+            "message": message,
+        });
+        return live_admin_report_json(
+            1,
+            json!({
+                "pool": pool,
+                "pass": false,
+                "state_source": "live-owner",
+                "owner_state": "mounted PoolDatasetOwner",
+                "outcome": outcome,
+                "repair_attempted": progress.attempted,
+                "repair_completed": false,
+                "repair_writeback": progress.writeback_started,
+                "receipt_publication": progress.receipt_publication,
+                "refusal": (!progress.writeback_started).then_some(detail.clone()),
+                "failure": progress.writeback_started.then_some(detail),
+                "initial_scrub": progress.initial_scrub.map(mounted_repair_scrub_summary),
+                "comparison": progress.comparison.map(mounted_repair_comparison_json),
+                "previous_receipt_generation": previous_receipt_generation,
+                "replacement_receipt_generation": progress.replacement_receipt_generation,
+                "clean_source": source,
+                "corrupt_target": corrupt,
+                "authenticated_root_published": progress.authenticated_root_state == "published",
+                "authenticated_root_state": progress.authenticated_root_state,
+                "re_scrub": progress.re_scrub.map(mounted_repair_scrub_summary),
+            }),
+        );
+    }
+    let classification = progress.comparison.map_or("not established", |comparison| {
+        mounted_repair_classification_name(&comparison.classification)
+    });
+    let subject = progress.comparison.map_or_else(
+        || "not established".to_string(),
+        |comparison| {
+            let (kind, chunk_index) = mounted_scrub_block_kind(comparison.block_id.kind);
+            format!(
+                "inode={} data-version={} kind={} chunk={}",
+                comparison.block_id.inode_id,
+                comparison.block_id.data_version,
+                kind,
+                chunk_index.map_or_else(|| "none".to_string(), |index| index.to_string())
+            )
+        },
+    );
+    let object = progress.comparison.map_or_else(
+        || "not established".to_string(),
+        |comparison| comparison.object_key.to_string(),
+    );
+    let source = progress
+        .comparison
+        .zip(progress.source_device_index)
+        .map_or_else(
+            || "not established".to_string(),
+            |(comparison, index)| mounted_repair_target_identity_text(comparison, index),
+        );
+    let corrupt = progress
+        .comparison
+        .zip(progress.corrupt_device_index)
+        .map_or_else(
+            || "not established".to_string(),
+            |(comparison, index)| mounted_repair_target_identity_text(comparison, index),
+        );
+    let previous_generation = previous_receipt_generation
+        .map_or_else(|| "not established".to_string(), |value| value.to_string());
+    let replacement_generation = progress
+        .replacement_receipt_generation
+        .map_or_else(|| "not established".to_string(), |value| value.to_string());
+    let re_scrub = progress.re_scrub.map_or("not run", |report| {
+        if report.is_clean() && report.blocks_no_checksum == 0 {
+            "clean"
+        } else {
+            "not clean"
+        }
+    });
+    let failure_label = if progress.writeback_started {
+        "failure"
+    } else {
+        "refusal"
+    };
+    live_admin_report_text(
+        1,
+        format!(
+            "pool repair: {pool}\n  source:                 live owner (mounted PoolDatasetOwner)\n  outcome:                {outcome}\n  repair attempt:         {}\n  writeback:              {}\n  receipt publication:    {}\n  comparison:             {classification}\n  subject:                {subject}\n  object:                 {object}\n  clean source:           {source}\n  corrupt target:         {corrupt}\n  receipt generation:     {previous_generation} -> {replacement_generation}\n  authenticated root:     {}\n  re-scrub:               {re_scrub}\n  {failure_label}:                {code}: {message}",
+            if progress.attempted { "yes" } else { "no" },
+            if progress.writeback_started { "started" } else { "none" },
+            progress.receipt_publication,
+            progress.authenticated_root_state,
+        ),
+    )
+}
+
+fn live_pool_repair_refusal(
+    pool: &str,
+    wants_json: bool,
+    code: &'static str,
+    message: impl Into<String>,
+    attempted: bool,
+    writeback_started: bool,
+    scrub: Option<&crate::scrub::ScrubReport>,
+    comparison: Option<&crate::scrub::MountedReplicatedRepairComparison>,
+    replacement_receipt_generation: Option<u64>,
+) -> LivePoolAdminResponse {
+    live_pool_repair_failure(
+        pool,
+        wants_json,
+        code,
+        message,
+        LivePoolRepairProgress {
+            attempted,
+            writeback_started,
+            receipt_publication: if replacement_receipt_generation.is_some() {
+                "completed"
+            } else {
+                "not-attempted"
+            },
+            initial_scrub: scrub,
+            comparison,
+            previous_receipt_generation: comparison
+                .map(|comparison| comparison.receipt_evidence.receipt.generation),
+            replacement_receipt_generation,
+            authenticated_root_state: if writeback_started {
+                "incomplete"
+            } else {
+                "not-started"
+            },
+            ..LivePoolRepairProgress::default()
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct LivePoolRepairReconciliationProgress<'a> {
+    initial_scrub: &'a crate::scrub::ScrubReport,
+    block_id: &'a crate::types::ScrubBlockId,
+    object_key: ObjectKey,
+    evidence: &'a tidefs_local_object_store::pool::ReplicatedRepairReconciliationEvidence,
+    reconciliation_started: bool,
+    authenticated_root_state: &'static str,
+    re_scrub: Option<&'a crate::scrub::ScrubReport>,
+}
+
+struct MountedRepairReconciliationOutcome {
+    evidence: tidefs_local_object_store::pool::ReplicatedRepairReconciliationEvidence,
+    reconciled_current_manifests: u64,
+    reconciled_snapshot_manifests: u64,
+    filesystem_generation_before: u64,
+    filesystem_generation_after: u64,
+    re_scrub: crate::scrub::ScrubReport,
+}
+
+struct MountedRepairReconciliationFailure {
+    code: &'static str,
+    message: String,
+    evidence: tidefs_local_object_store::pool::ReplicatedRepairReconciliationEvidence,
+    reconciliation_started: bool,
+    authenticated_root_state: &'static str,
+    re_scrub: Option<crate::scrub::ScrubReport>,
+}
+
+impl MountedRepairReconciliationFailure {
+    fn new(
+        code: &'static str,
+        message: impl Into<String>,
+        evidence: tidefs_local_object_store::pool::ReplicatedRepairReconciliationEvidence,
+        reconciliation_started: bool,
+        authenticated_root_state: &'static str,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            evidence,
+            reconciliation_started,
+            authenticated_root_state,
+            re_scrub: None,
+        }
+    }
+
+    fn with_re_scrub(mut self, re_scrub: crate::scrub::ScrubReport) -> Self {
+        self.re_scrub = Some(re_scrub);
+        self
+    }
+}
+
+impl LivePoolRepairReconciliationProgress<'_> {
+    fn clean_source(&self) -> Option<&tidefs_local_object_store::PlacementReceiptTarget> {
+        self.evidence.current_receipt.targets.iter().find(|target| {
+            target.device_index != self.evidence.repaired_target.device_index
+                || target.device_guid != self.evidence.repaired_target.device_guid
+        })
+    }
+}
+
+fn mounted_repair_reconciliation_comparison_json(
+    progress: LivePoolRepairReconciliationProgress<'_>,
+) -> Value {
+    let (kind, chunk_index) = mounted_scrub_block_kind(progress.block_id.kind);
+    json!({
+        "classification": "TargetRepairReconciliation",
+        "subject": {
+            "inode_id": progress.block_id.inode_id,
+            "data_version": progress.block_id.data_version,
+            "kind": kind,
+            "chunk_index": chunk_index,
+        },
+        "object_key": live_admin_hex_encode(progress.object_key.as_bytes()),
+        "receipt_epoch": progress.evidence.current_receipt.epoch,
+        "embedded_predecessor_generation": progress.evidence.embedded_predecessor_generation,
+        "receipt_generation": progress.evidence.current_receipt.generation,
+        "redundancy_policy": "replicated-2",
+        "target_count": progress.evidence.current_receipt.targets.len(),
+        "durable_target_only_repair_evidence": true,
+        "replacement_receipt_attached": progress.evidence.replacement_receipt_attached,
+    })
+}
+
+fn live_pool_repair_reconciliation_failure(
+    pool: &str,
+    wants_json: bool,
+    code: &'static str,
+    message: impl Into<String>,
+    progress: LivePoolRepairReconciliationProgress<'_>,
+) -> LivePoolAdminResponse {
+    let message = message.into();
+    let source = progress.clean_source();
+    if wants_json {
+        return live_admin_report_json(
+            1,
+            json!({
+                "pool": pool,
+                "pass": false,
+                "state_source": "live-owner",
+                "owner_state": "mounted PoolDatasetOwner",
+                "outcome": "incomplete",
+                "repair_attempted": false,
+                "repair_completed": false,
+                "repair_writeback": false,
+                "target_write_previously_completed": true,
+                "receipt_publication": "previously-completed",
+                "reconciliation_resumed": true,
+                "reconciliation_attempted": progress.reconciliation_started,
+                "reconciliation_completed": false,
+                "reconciliation_writeback": progress.reconciliation_started,
+                "failure": {
+                    "code": code,
+                    "message": message,
+                },
+                "initial_scrub": mounted_repair_scrub_summary(progress.initial_scrub),
+                "comparison": mounted_repair_reconciliation_comparison_json(progress),
+                "previous_receipt_generation": progress.evidence.embedded_predecessor_generation,
+                "replacement_receipt_generation": progress.evidence.current_receipt.generation,
+                "clean_source": source.map(mounted_repair_receipt_target_identity_json),
+                "corrupt_target": mounted_repair_receipt_target_identity_json(&progress.evidence.repaired_target),
+                "authenticated_root_published": progress.authenticated_root_state == "published",
+                "authenticated_root_state": progress.authenticated_root_state,
+                "re_scrub": progress.re_scrub.map(mounted_repair_scrub_summary),
+            }),
+        );
+    }
+
+    let (kind, chunk_index) = mounted_scrub_block_kind(progress.block_id.kind);
+    let source_identity = source.map_or_else(
+        || "not established".to_string(),
+        mounted_repair_receipt_target_identity_text,
+    );
+    let repaired_identity =
+        mounted_repair_receipt_target_identity_text(&progress.evidence.repaired_target);
+    let re_scrub = progress.re_scrub.map_or("not run", |report| {
+        if report.is_clean() && report.blocks_no_checksum == 0 {
+            "clean"
+        } else {
+            "not clean"
+        }
+    });
+    live_admin_report_text(
+        1,
+        format!(
+            "pool repair: {pool}\n  source:                 live owner (mounted PoolDatasetOwner)\n  outcome:                incomplete\n  target write:           previously completed (not repeated)\n  reconciliation:         {}\n  comparison:             TargetRepairReconciliation\n  subject:                inode={} data-version={} kind={} chunk={}\n  object:                 {}\n  clean source:           {source_identity}\n  repaired target:        {repaired_identity}\n  receipt generation:     {} -> {}\n  authenticated root:     {}\n  re-scrub:               {re_scrub}\n  failure:                {code}: {message}",
+            if progress.reconciliation_started {
+                "started"
+            } else {
+                "not started"
+            },
+            progress.block_id.inode_id,
+            progress.block_id.data_version,
+            kind,
+            chunk_index.map_or_else(|| "none".to_string(), |index| index.to_string()),
+            progress.object_key,
+            progress.evidence.embedded_predecessor_generation,
+            progress.evidence.current_receipt.generation,
+            progress.authenticated_root_state,
+        ),
+    )
+}
+
+fn live_pool_repair_reconciliation_success(
+    pool: &str,
+    wants_json: bool,
+    progress: LivePoolRepairReconciliationProgress<'_>,
+    reconciled_current_manifests: u64,
+    reconciled_snapshot_manifests: u64,
+    filesystem_generation_before: u64,
+    filesystem_generation_after: u64,
+) -> LivePoolAdminResponse {
+    let reconciled_manifests =
+        reconciled_current_manifests.saturating_add(reconciled_snapshot_manifests);
+    let source = progress.clean_source();
+    let re_scrub = progress
+        .re_scrub
+        .expect("successful repair reconciliation has a clean re-scrub");
+    if wants_json {
+        return live_admin_ok_json(json!({
+            "pool": pool,
+            "pass": true,
+            "state_source": "live-owner",
+            "owner_state": "mounted PoolDatasetOwner",
+            "outcome": "completed",
+            "repair_attempted": false,
+            "repair_completed": true,
+            "repair_writeback": false,
+            "target_write_previously_completed": true,
+            "receipt_publication": "previously-completed",
+            "reconciliation_resumed": true,
+            "reconciliation_attempted": true,
+            "reconciliation_completed": true,
+            "reconciliation_writeback": true,
+            "comparison": mounted_repair_reconciliation_comparison_json(progress),
+            "previous_receipt_generation": progress.evidence.embedded_predecessor_generation,
+            "replacement_receipt_generation": progress.evidence.current_receipt.generation,
+            "clean_source": source.map(mounted_repair_receipt_target_identity_json),
+            "corrupt_target": mounted_repair_receipt_target_identity_json(&progress.evidence.repaired_target),
+            "reconciled_manifest_count": reconciled_manifests,
+            "reconciled_current_manifest_count": reconciled_current_manifests,
+            "reconciled_snapshot_manifest_count": reconciled_snapshot_manifests,
+            "filesystem_generation_before": filesystem_generation_before,
+            "filesystem_generation_after": filesystem_generation_after,
+            "authenticated_root_published": true,
+            "authenticated_root_state": "published",
+            "re_scrub": mounted_repair_scrub_summary(re_scrub),
+        }));
+    }
+
+    let source_identity = source.map_or_else(
+        || "not established".to_string(),
+        mounted_repair_receipt_target_identity_text,
+    );
+    let repaired_identity =
+        mounted_repair_receipt_target_identity_text(&progress.evidence.repaired_target);
+    let (kind, chunk_index) = mounted_scrub_block_kind(progress.block_id.kind);
+    live_admin_ok_text(format!(
+        "pool repair: {pool}\n  source:                 live owner (mounted PoolDatasetOwner)\n  outcome:                completed\n  target write:           previously completed (not repeated)\n  reconciliation:         resumed and completed\n  comparison:             TargetRepairReconciliation\n  subject:                inode={} data-version={} kind={} chunk={}\n  object:                 {}\n  clean source:           {source_identity}\n  repaired target:        {repaired_identity}\n  receipt generation:     {} -> {}\n  reconciled manifests:   {reconciled_manifests}\n  authenticated root:     published\n  re-scrub:               clean ({} blocks)",
+        progress.block_id.inode_id,
+        progress.block_id.data_version,
+        kind,
+        chunk_index.map_or_else(|| "none".to_string(), |index| index.to_string()),
+        progress.object_key,
+        progress.evidence.embedded_predecessor_generation,
+        progress.evidence.current_receipt.generation,
+        re_scrub.blocks_scanned,
+    ))
+}
+
+struct MountedRepairSnapshotRootAuthority {
+    name: Vec<u8>,
+    dataset_id: DatasetId,
+    previous_typed_root: tidefs_pool_runtime::SnapshotRoot,
+    captured_root: RootCommitRecord,
+}
+impl SharedPoolDatasetOwner {
+    fn live_pool_repair(&self, pool: &str, wants_json: bool) -> LivePoolAdminResponse {
+        let mut fs = self.borrow_mut();
+        if let Err(error) = fs.ensure_mutation_allowed("repair mounted pool replica") {
+            return live_pool_repair_failure(
+                pool,
+                wants_json,
+                "mutation-authority-refused",
+                format!("mounted owner cannot authorize repair mutation: {error}"),
+                LivePoolRepairProgress::default(),
+            );
+        }
+        if fs.store.pool().is_read_only() {
+            return live_pool_repair_failure(
+                pool,
+                wants_json,
+                "read-only-pool-authority",
+                "mounted Pool authority is read-only",
+                LivePoolRepairProgress::default(),
+            );
+        }
+        if let Some(reason) = fs.mounted_repair_quiescence_failure() {
+            return live_pool_repair_failure(
+                pool,
+                wants_json,
+                "mounted-state-not-quiescent",
+                format!("repair requires clean quiescent mounted state: {reason}"),
+                LivePoolRepairProgress::default(),
+            );
+        }
+        let initial_scrub = match fs.scrub_mounted_content() {
+            Ok(report) => report,
+            Err(error) => {
+                return live_pool_repair_refusal(
+                    pool,
+                    wants_json,
+                    "initial-scrub-failed",
+                    format!("mounted content scan failed before repair: {error}"),
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+            }
+        };
+
+        // Refuse clean, incomplete, or non-authoritative evidence without
+        // synchronizing the Pool. Pool::sync_all advances physical state even
+        // when the mounted filesystem has no dirty records, so running it
+        // before these read-only gates would mutate complete device images for
+        // a repair that was never authorized.
+        if initial_scrub.blocks_no_checksum > 0 {
+            return live_pool_repair_refusal(
+                pool,
+                wants_json,
+                "missing-checksum-evidence",
+                "mounted scrub found content without an applicable checksum",
+                false,
+                false,
+                Some(&initial_scrub),
+                None,
+                None,
+            );
+        }
+        if initial_scrub.violations.is_empty() {
+            return live_pool_repair_refusal(
+                pool,
+                wants_json,
+                "no-repair-needed",
+                "mounted scrub is clean; no repair writeback is authorized",
+                false,
+                false,
+                Some(&initial_scrub),
+                None,
+                None,
+            );
+        }
+        if initial_scrub.violations.len() != 1 {
+            return live_pool_repair_refusal(
+                pool,
+                wants_json,
+                "multiple-scrub-findings",
+                format!(
+                    "mounted repair requires exactly one finding, observed {}",
+                    initial_scrub.violations.len()
+                ),
+                false,
+                false,
+                Some(&initial_scrub),
+                None,
+                None,
+            );
+        }
+
+        let block_id = initial_scrub.violations[0].block_id.clone();
+        let keyspace = fs.object_keyspace();
+        let compared = match crate::scrub::compare_mounted_replicated_repair(
+            fs.store.pool(),
+            &fs.filesystem.state.inodes,
+            keyspace,
+            &block_id,
+        ) {
+            Ok(comparison) => comparison,
+            Err(error) => {
+                let stale_receipt_authority = error.code == "stale-content-receipt-generation";
+                if stale_receipt_authority {
+                    if let (Some(object_key), Some(embedded_generation)) =
+                        (error.object_key, error.embedded_receipt_generation)
+                    {
+                        match fs.store.pool().replicated_repair_reconciliation_evidence(
+                            DeviceIoClass::Data,
+                            object_key,
+                            embedded_generation,
+                        ) {
+                            Ok(Some(evidence))
+                                if evidence.current_receipt.object_key == object_key
+                                    && evidence.embedded_predecessor_generation
+                                        == embedded_generation =>
+                            {
+                                return fs.resume_mounted_repair_reconciliation(
+                                    pool,
+                                    wants_json,
+                                    &initial_scrub,
+                                    &block_id,
+                                    object_key,
+                                    evidence,
+                                )
+                            }
+                            Ok(_) => {}
+                            Err(evidence_error) => {
+                                fs.arm_mutation_reopen_fence();
+                                return live_pool_repair_refusal(
+                                    pool,
+                                    wants_json,
+                                    "repair-reconciliation-evidence-failed",
+                                    format!(
+                                        "target-only repair reconciliation evidence could not be read: {evidence_error}"
+                                    ),
+                                    false,
+                                    false,
+                                    Some(&initial_scrub),
+                                    None,
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                }
+                if stale_receipt_authority {
+                    fs.arm_mutation_reopen_fence();
+                }
+                return live_pool_repair_refusal(
+                    pool,
+                    wants_json,
+                    error.code,
+                    error.message,
+                    false,
+                    false,
+                    Some(&initial_scrub),
+                    None,
+                    None,
+                );
+            }
+        };
+        let (source_device_index, corrupt_device_index) = match &compared.classification {
+            crate::scrub::MountedRepairClassification::SingleReplicaCorruption {
+                corrupt_target,
+                clean_sources,
+            } if clean_sources.len() == 1 => (clean_sources[0], *corrupt_target),
+            classification => {
+                return live_pool_repair_refusal(
+                    pool,
+                    wants_json,
+                    "comparison-refused-writeback",
+                    format!(
+                        "{} does not authorize one local target repair",
+                        mounted_repair_classification_name(classification)
+                    ),
+                    false,
+                    false,
+                    Some(&initial_scrub),
+                    Some(&compared),
+                    None,
+                )
+            }
+        };
+        let selected_progress = LivePoolRepairProgress {
+            initial_scrub: Some(&initial_scrub),
+            comparison: Some(&compared),
+            previous_receipt_generation: Some(compared.receipt_evidence.receipt.generation),
+            source_device_index: Some(source_device_index),
+            corrupt_device_index: Some(corrupt_device_index),
+            ..LivePoolRepairProgress::default()
+        };
+
+        if let Err(error) = fs.authenticate_mounted_repair_prewrite_current_root(
+            compared.object_key,
+            &compared.receipt_evidence.receipt,
+            source_device_index,
+            corrupt_device_index,
+        ) {
+            return live_pool_repair_failure(
+                pool,
+                wants_json,
+                "filesystem-root-preflight-failed",
+                format!(
+                    "mounted repair could not authenticate the current filesystem root before writeback: {error}"
+                ),
+                selected_progress,
+            );
+        }
+        if let Err(error) = fs.authenticate_mounted_repair_prewrite_snapshot_roots(
+            compared.object_key,
+            &compared.receipt_evidence.receipt,
+            source_device_index,
+            corrupt_device_index,
+        ) {
+            return live_pool_repair_failure(
+                pool,
+                wants_json,
+                "retained-root-preflight-failed",
+                format!(
+                    "mounted repair could not authenticate retained snapshot state before writeback: {error}"
+                ),
+                selected_progress,
+            );
+        }
+
+        // Refresh the complete mounted and receipt evidence immediately before
+        // writeback.  The owner lock prevents a concurrent mounted mutation,
+        // while the Pool repair entry point performs the final receipt and
+        // payload revalidation after this comparison.
+        let refreshed = match crate::scrub::compare_mounted_replicated_repair(
+            fs.store.pool(),
+            &fs.filesystem.state.inodes,
+            keyspace,
+            &block_id,
+        ) {
+            Ok(comparison)
+                if comparison.object_key == compared.object_key
+                    && comparison.receipt_evidence.receipt == compared.receipt_evidence.receipt
+                    && comparison.checksum_layer == compared.checksum_layer
+                    && comparison.target_outcomes == compared.target_outcomes
+                    && comparison.classification == compared.classification =>
+            {
+                comparison
+            }
+            Ok(_) => {
+                return live_pool_repair_failure(
+                    pool,
+                    wants_json,
+                    "stale-comparison-evidence",
+                    "mounted content or receipt authority changed before writeback",
+                    selected_progress,
+                )
+            }
+            Err(error) => {
+                return live_pool_repair_failure(
+                    pool,
+                    wants_json,
+                    error.code,
+                    format!("stale-authority revalidation failed: {}", error.message),
+                    selected_progress,
+                )
+            }
+        };
+
+        let repair = match fs.store.pool_mut().repair_current_replicated_target(
+            DeviceIoClass::Data,
+            refreshed.object_key,
+            &refreshed.receipt_evidence.receipt,
+            source_device_index,
+            corrupt_device_index,
+        ) {
+            Ok(repair) => repair,
+            Err(failure) => {
+                // Generation reservation, reclaim-intent enqueue, and target
+                // rewrite all precede replacement-receipt publication. The
+                // predecessor receipt/root remain authoritative in those
+                // phases, so a reopen fence would prevent the same live owner
+                // from retrying the exact pending transition. Once receipt
+                // publication completed or became uncertain, however, the
+                // embedded filesystem root can be stale and every later
+                // mutation must wait for reopen reconciliation.
+                if failure.receipt_publication
+                    != tidefs_local_object_store::pool::ReplicatedRepairReceiptPublicationState::NotAttempted
+                {
+                    fs.arm_mutation_reopen_fence();
+                } else if failure.writeback_started {
+                    // Generation reservation or the exact pending reclaim row
+                    // is already durable. Permit the repair carrier to resume
+                    // that transition, but do not let unrelated mounted work
+                    // advance the canonical root out from under its evidence.
+                    fs.arm_replicated_repair_retry_only();
+                }
+                let receipt_publication = match failure.receipt_publication {
+                    tidefs_local_object_store::pool::ReplicatedRepairReceiptPublicationState::NotAttempted => {
+                        "not-attempted"
+                    }
+                    tidefs_local_object_store::pool::ReplicatedRepairReceiptPublicationState::Completed => {
+                        "completed"
+                    }
+                    tidefs_local_object_store::pool::ReplicatedRepairReceiptPublicationState::Uncertain => {
+                        "uncertain"
+                    }
+                };
+                return live_pool_repair_failure(
+                    pool,
+                    wants_json,
+                    "writeback-revalidation-refused",
+                    format!("Pool repair writeback did not complete: {}", failure.error),
+                    LivePoolRepairProgress {
+                        attempted: true,
+                        writeback_started: failure.writeback_started,
+                        receipt_publication,
+                        initial_scrub: Some(&initial_scrub),
+                        comparison: Some(&refreshed),
+                        previous_receipt_generation: Some(
+                            refreshed.receipt_evidence.receipt.generation,
+                        ),
+                        replacement_receipt_generation: failure.replacement_generation,
+                        source_device_index: Some(source_device_index),
+                        corrupt_device_index: Some(corrupt_device_index),
+                        ..LivePoolRepairProgress::default()
+                    },
+                );
+            }
+        };
+        // The Pool has now published and attached the exact replacement
+        // receipt. Reconciliation below runs while this owner remains locked;
+        // every failure after this point arms the stronger reopen fence.
+        fs.clear_replicated_repair_retry_only();
+        let replacement_generation = repair.replacement_receipt.generation;
+        let mut repair_progress = LivePoolRepairProgress {
+            attempted: true,
+            writeback_started: true,
+            receipt_publication: "completed",
+            initial_scrub: Some(&initial_scrub),
+            comparison: Some(&refreshed),
+            previous_receipt_generation: Some(repair.previous_receipt.generation),
+            replacement_receipt_generation: Some(replacement_generation),
+            source_device_index: Some(source_device_index),
+            corrupt_device_index: Some(corrupt_device_index),
+            ..LivePoolRepairProgress::default()
+        };
+        if let Err(error) = fs.store.pool_mut().sync_all() {
+            fs.arm_mutation_reopen_fence();
+            return live_pool_repair_failure(
+                pool,
+                wants_json,
+                "replacement-receipt-sync-failed",
+                format!("replacement receipt could not be synchronized: {error}"),
+                repair_progress,
+            );
+        }
+
+        let reconciliation_evidence =
+            match fs.store.pool().replicated_repair_reconciliation_evidence(
+                DeviceIoClass::Data,
+                refreshed.object_key,
+                repair.previous_receipt.generation,
+            ) {
+                Ok(Some(evidence))
+                    if evidence.current_receipt == repair.replacement_receipt
+                        && evidence.repaired_target.device_index == corrupt_device_index =>
+                {
+                    evidence
+                }
+                Ok(Some(_)) => {
+                    fs.arm_mutation_reopen_fence();
+                    return live_pool_repair_failure(
+                    pool,
+                    wants_json,
+                    "repair-reconciliation-evidence-mismatch",
+                    "replacement receipt no longer matches the exact target-only repair evidence",
+                    repair_progress,
+                );
+                }
+                Ok(None) => {
+                    fs.arm_mutation_reopen_fence();
+                    return live_pool_repair_failure(
+                        pool,
+                        wants_json,
+                        "repair-reconciliation-evidence-missing",
+                        "replacement receipt has no exact target-only repair evidence",
+                        repair_progress,
+                    );
+                }
+                Err(error) => {
+                    fs.arm_mutation_reopen_fence();
+                    return live_pool_repair_failure(
+                        pool,
+                        wants_json,
+                        "repair-reconciliation-evidence-failed",
+                        format!("replacement receipt evidence could not be authenticated: {error}"),
+                        repair_progress,
+                    );
+                }
+            };
+        let reconciliation = match fs
+            .reconcile_mounted_repair_transition(refreshed.object_key, reconciliation_evidence)
+        {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                let message = format!(
+                    "replacement receipt was published but repair reconciliation did not complete: {}",
+                    failure.message
+                );
+                repair_progress.authenticated_root_state = failure.authenticated_root_state;
+                repair_progress.re_scrub = failure.re_scrub.as_ref();
+                fs.arm_mutation_reopen_fence();
+                return live_pool_repair_failure(
+                    pool,
+                    wants_json,
+                    failure.code,
+                    message,
+                    repair_progress,
+                );
+            }
+        };
+        if !reconciliation.evidence.replacement_receipt_attached {
+            repair_progress.authenticated_root_state = "published";
+            repair_progress.re_scrub = Some(&reconciliation.re_scrub);
+            fs.arm_mutation_reopen_fence();
+            return live_pool_repair_failure(
+                pool,
+                wants_json,
+                "repair-reclaim-attachment-incomplete",
+                "repair reconciliation completed without durable replacement-receipt attachment",
+                repair_progress,
+            );
+        }
+
+        let reconciled_current_manifests = reconciliation.reconciled_current_manifests;
+        let reconciled_snapshot_manifests = reconciliation.reconciled_snapshot_manifests;
+        let reconciled_manifests =
+            reconciled_snapshot_manifests.saturating_add(reconciled_current_manifests);
+        let root_generation_before = reconciliation.filesystem_generation_before;
+        let root_generation_after = reconciliation.filesystem_generation_after;
+        let re_scrub = &reconciliation.re_scrub;
+
+        let source = mounted_repair_target_identity_json(&refreshed, source_device_index);
+        let corrupt = mounted_repair_target_identity_json(&refreshed, corrupt_device_index);
+        if wants_json {
+            return live_admin_ok_json(json!({
+                "pool": pool,
+                "pass": true,
+                "state_source": "live-owner",
+                "owner_state": "mounted PoolDatasetOwner",
+                "outcome": "completed",
+                "repair_attempted": true,
+                "repair_completed": true,
+                "repair_writeback": true,
+                "receipt_publication": "completed",
+                "comparison": mounted_repair_comparison_json(&refreshed),
+                "previous_receipt_generation": repair.previous_receipt.generation,
+                "replacement_receipt_generation": repair.replacement_receipt.generation,
+                "replacement_receipt_attached": reconciliation.evidence.replacement_receipt_attached,
+                "clean_source": source,
+                "corrupt_target": corrupt,
+                "reconciled_manifest_count": reconciled_manifests,
+                "reconciled_current_manifest_count": reconciled_current_manifests,
+                "reconciled_snapshot_manifest_count": reconciled_snapshot_manifests,
+                "filesystem_generation_before": root_generation_before,
+                "filesystem_generation_after": root_generation_after,
+                "authenticated_root_published": true,
+                "authenticated_root_state": "published",
+                "re_scrub": mounted_repair_scrub_summary(&re_scrub),
+            }));
+        }
+
+        let (kind, chunk_index) = mounted_scrub_block_kind(refreshed.block_id.kind);
+        let source_identity = mounted_repair_target_identity_text(&refreshed, source_device_index);
+        let repaired_identity =
+            mounted_repair_target_identity_text(&refreshed, corrupt_device_index);
+        live_admin_ok_text(format!(
+            "pool repair: {pool}\n  source:                 live owner (mounted PoolDatasetOwner)\n  outcome:                completed\n  comparison:             SingleReplicaCorruption\n  subject:                inode={} data-version={} kind={} chunk={}\n  object:                 {}\n  clean source:           {source_identity}\n  repaired target:        {repaired_identity}\n  receipt generation:     {} -> {}\n  reconciled manifests:   {}\n  authenticated root:     published\n  re-scrub:               clean ({} blocks)",
+            refreshed.block_id.inode_id,
+            refreshed.block_id.data_version,
+            kind,
+            chunk_index.map_or_else(|| "none".to_string(), |index| index.to_string()),
+            refreshed.object_key,
+            repair.previous_receipt.generation,
+            repair.replacement_receipt.generation,
+            reconciled_manifests,
+            re_scrub.blocks_scanned,
+        ))
+    }
+}
+
+impl PoolDatasetOwner {
+    fn authenticate_mounted_repair_prewrite_current_root(
+        &self,
+        object_key: ObjectKey,
+        expected_receipt: &tidefs_local_object_store::PlacementReceipt,
+        source_device_index: u32,
+        corrupt_device_index: u32,
+    ) -> crate::Result<()> {
+        let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        let root_bytes = self.store.load_dataset_root(
+            mounted_dataset_id,
+            tidefs_pool_runtime::DatasetRootKind::Filesystem,
+        )?;
+        let root = crate::encoding::decode_root_commit(&root_bytes)?;
+        let (persisted_state, persisted_root) =
+            crate::load_replicated_repair_prewrite_root_requiring_reference(
+                self.store.pool(),
+                mounted_dataset_id,
+                &root,
+                self.root_authentication_key,
+                object_key,
+                expected_receipt,
+                source_device_index,
+                corrupt_device_index,
+            )?;
+        if persisted_root != root
+            || persisted_root.generation != self.state.generation
+            || persisted_state.generation != self.state.generation
+            || persisted_root.next_inode_id != self.state.next_inode_id_raw()
+            || persisted_root.inode_count != self.state.inodes.len() as u64
+        {
+            return Err(crate::FileSystemError::CorruptState {
+                reason: "authenticated mounted root no longer matches the quiescent live owner",
+            });
+        }
+        Ok(())
+    }
+
+    fn authenticate_mounted_repair_prewrite_snapshot_roots(
+        &self,
+        object_key: ObjectKey,
+        expected_receipt: &tidefs_local_object_store::PlacementReceipt,
+        source_device_index: u32,
+        corrupt_device_index: u32,
+    ) -> crate::Result<()> {
+        let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        for root in self.capture_mounted_repair_snapshot_roots()? {
+            let (captured_state, authenticated_root) = crate::load_replicated_repair_prewrite_root(
+                self.store.pool(),
+                mounted_dataset_id,
+                &root.captured_root,
+                self.root_authentication_key,
+                object_key,
+                expected_receipt,
+                source_device_index,
+                corrupt_device_index,
+            )?;
+            if authenticated_root != root.captured_root
+                || captured_state.generation != root.captured_root.generation
+                || authenticated_root.next_inode_id != root.captured_root.next_inode_id
+                || authenticated_root.inode_count != root.captured_root.inode_count
+            {
+                return Err(crate::FileSystemError::CorruptState {
+                    reason: "authenticated retained root no longer matches snapshot authority",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_mounted_repair_snapshot_roots(
+        &self,
+    ) -> crate::Result<Vec<MountedRepairSnapshotRootAuthority>> {
+        let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        self.ensure_snapshot_authority_consistent()?;
+        let mut mounted_snapshots = Vec::new();
+        for record in self
+            .state
+            .snapshots
+            .values()
+            .filter(|record| crate::snapshot::snapshot_record_retains_data(record))
+        {
+            self.ensure_snapshot_record_authority(record)?;
+            let dataset_id =
+                crate::snapshot::snapshot_record_dataset_id_for_dataset(record, mounted_dataset_id);
+            mounted_snapshots.push(MountedRepairSnapshotRootAuthority {
+                name: record.name.clone(),
+                dataset_id,
+                previous_typed_root: self.store.load_snapshot_root(dataset_id)?,
+                captured_root: crate::root_commit_from_summary(&record.root),
+            });
+        }
+        Ok(mounted_snapshots)
+    }
+
+    fn load_mounted_repair_snapshot_states(
+        &self,
+        roots: Vec<MountedRepairSnapshotRootAuthority>,
+        object_key: ObjectKey,
+        embedded_receipt_generation: u64,
+    ) -> crate::Result<Vec<DeviceLifecycleSnapshotState>> {
+        let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        roots
+            .into_iter()
+            .map(|root| {
+                let captured_state =
+                    crate::load_state_from_transaction_pool_for_replicated_repair_reconciliation(
+                        self.store.pool(),
+                        mounted_dataset_id,
+                        &root.captured_root,
+                        self.root_authentication_key,
+                        object_key,
+                        embedded_receipt_generation,
+                    )?;
+                Ok(DeviceLifecycleSnapshotState {
+                    name: root.name,
+                    dataset_id: root.dataset_id,
+                    previous_typed_root: root.previous_typed_root,
+                    captured_state,
+                    captured_root: root.captured_root,
+                })
+            })
+            .collect()
+    }
+
+    fn load_mounted_repair_snapshot_states_for_transitions(
+        &self,
+        roots: Vec<MountedRepairSnapshotRootAuthority>,
+        transitions: &[crate::recovery::PendingReplicatedRepairReconciliation],
+    ) -> crate::Result<Vec<DeviceLifecycleSnapshotState>> {
+        let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        roots
+            .into_iter()
+            .map(|root| {
+                let captured_state =
+                    crate::load_state_from_transaction_pool_for_replicated_repair_reconciliations(
+                        self.store.pool(),
+                        mounted_dataset_id,
+                        &root.captured_root,
+                        self.root_authentication_key,
+                        transitions,
+                    )?;
+                Ok(DeviceLifecycleSnapshotState {
+                    name: root.name,
+                    dataset_id: root.dataset_id,
+                    previous_typed_root: root.previous_typed_root,
+                    captured_state,
+                    captured_root: root.captured_root,
+                })
+            })
+            .collect()
+    }
+
+    fn authenticate_mounted_repair_current_root(
+        &self,
+        object_key: ObjectKey,
+        embedded_receipt_generation: u64,
+    ) -> crate::Result<()> {
+        let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        let root_bytes = self.store.load_dataset_root(
+            mounted_dataset_id,
+            tidefs_pool_runtime::DatasetRootKind::Filesystem,
+        )?;
+        let root = crate::encoding::decode_root_commit(&root_bytes)?;
+        let _ = crate::load_state_from_transaction_pool_for_replicated_repair_reconciliation_requiring_reference(
+            self.store.pool(),
+            mounted_dataset_id,
+            &root,
+            self.root_authentication_key,
+            object_key,
+            embedded_receipt_generation,
+        )?;
+        Ok(())
+    }
+
+    fn authenticate_mounted_repair_current_root_for_transitions(
+        &self,
+        transitions: &[crate::recovery::PendingReplicatedRepairReconciliation],
+    ) -> crate::Result<()> {
+        let mounted_dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        let root_bytes = self.store.load_dataset_root(
+            mounted_dataset_id,
+            tidefs_pool_runtime::DatasetRootKind::Filesystem,
+        )?;
+        let root = crate::encoding::decode_root_commit(&root_bytes)?;
+        let _ = crate::load_state_from_transaction_pool_for_replicated_repair_reconciliations_requiring_references(
+            self.store.pool(),
+            mounted_dataset_id,
+            &root,
+            self.root_authentication_key,
+            transitions,
+        )?;
+        Ok(())
+    }
+
+    fn resume_mounted_repair_reconciliation(
+        &mut self,
+        pool_name: &str,
+        wants_json: bool,
+        initial_scrub: &crate::scrub::ScrubReport,
+        block_id: &crate::types::ScrubBlockId,
+        object_key: ObjectKey,
+        evidence: tidefs_local_object_store::pool::ReplicatedRepairReconciliationEvidence,
+    ) -> LivePoolAdminResponse {
+        match self.reconcile_mounted_repair_transition(object_key, evidence) {
+            Ok(outcome) => {
+                let progress = LivePoolRepairReconciliationProgress {
+                    initial_scrub,
+                    block_id,
+                    object_key,
+                    evidence: &outcome.evidence,
+                    reconciliation_started: true,
+                    authenticated_root_state: "published",
+                    re_scrub: Some(&outcome.re_scrub),
+                };
+                live_pool_repair_reconciliation_success(
+                    pool_name,
+                    wants_json,
+                    progress,
+                    outcome.reconciled_current_manifests,
+                    outcome.reconciled_snapshot_manifests,
+                    outcome.filesystem_generation_before,
+                    outcome.filesystem_generation_after,
+                )
+            }
+            Err(failure) => {
+                self.arm_mutation_reopen_fence();
+                live_pool_repair_reconciliation_failure(
+                    pool_name,
+                    wants_json,
+                    failure.code,
+                    failure.message.clone(),
+                    LivePoolRepairReconciliationProgress {
+                        initial_scrub,
+                        block_id,
+                        object_key,
+                        evidence: &failure.evidence,
+                        reconciliation_started: failure.reconciliation_started,
+                        authenticated_root_state: failure.authenticated_root_state,
+                        re_scrub: failure.re_scrub.as_ref(),
+                    },
+                )
+            }
+        }
+    }
+
+    fn reconcile_mounted_repair_transition(
+        &mut self,
+        object_key: ObjectKey,
+        evidence: tidefs_local_object_store::pool::ReplicatedRepairReconciliationEvidence,
+    ) -> std::result::Result<MountedRepairReconciliationOutcome, MountedRepairReconciliationFailure>
+    {
+        if let Some(reason) = self.mounted_repair_quiescence_failure() {
+            return Err(MountedRepairReconciliationFailure::new(
+                "mounted-state-not-quiescent",
+                format!("repair reconciliation requires clean quiescent state: {reason}"),
+                evidence,
+                false,
+                "not-started",
+            ));
+        }
+
+        let evidence = match self.store.pool().replicated_repair_reconciliation_evidence(
+            DeviceIoClass::Data,
+            object_key,
+            evidence.embedded_predecessor_generation,
+        ) {
+            Ok(Some(current))
+                if current.current_receipt == evidence.current_receipt
+                    && current.repaired_target == evidence.repaired_target
+                    && current.embedded_predecessor_generation
+                        == evidence.embedded_predecessor_generation =>
+            {
+                current
+            }
+            Ok(Some(_)) => {
+                return Err(MountedRepairReconciliationFailure::new(
+                    "repair-reconciliation-evidence-mismatch",
+                    "current Pool evidence changed before repair reconciliation",
+                    evidence,
+                    false,
+                    "not-started",
+                ))
+            }
+            Ok(None) => {
+                return Err(MountedRepairReconciliationFailure::new(
+                    "repair-reclaim-evidence-disappeared",
+                    "exact target-only repair evidence disappeared before reconciliation",
+                    evidence,
+                    false,
+                    "not-started",
+                ))
+            }
+            Err(error) => {
+                return Err(MountedRepairReconciliationFailure::new(
+                    "repair-reconciliation-evidence-failed",
+                    format!("exact target-only repair evidence could not be revalidated: {error}"),
+                    evidence,
+                    false,
+                    "not-started",
+                ))
+            }
+        };
+
+        let roots = self
+            .capture_mounted_repair_snapshot_roots()
+            .map_err(|error| {
+                MountedRepairReconciliationFailure::new(
+                    "retained-root-preflight-failed",
+                    format!(
+                    "repair reconciliation could not authenticate retained snapshot roots: {error}"
+                ),
+                    evidence.clone(),
+                    false,
+                    "not-started",
+                )
+            })?;
+        let embedded_generation = evidence.embedded_predecessor_generation;
+        self.authenticate_mounted_repair_current_root(object_key, embedded_generation)
+            .map_err(|error| {
+                MountedRepairReconciliationFailure::new(
+                    "filesystem-root-reconciliation-preflight-failed",
+                    format!(
+                        "the predecessor filesystem root could not be authenticated for repair reconciliation: {error}"
+                    ),
+                    evidence.clone(),
+                    false,
+                    "not-started",
+                )
+            })?;
+        let mut mounted_snapshots = self
+            .load_mounted_repair_snapshot_states(roots, object_key, embedded_generation)
+            .map_err(|error| {
+                MountedRepairReconciliationFailure::new(
+                    "retained-root-reconciliation-preflight-failed",
+                    format!(
+                        "retained snapshot state could not be authenticated for repair reconciliation: {error}"
+                    ),
+                    evidence.clone(),
+                    false,
+                    "not-started",
+                )
+            })?;
+
+        let evidence = if evidence.replacement_receipt_attached {
+            evidence
+        } else {
+            match self
+                .store
+                .pool_mut()
+                .complete_replicated_repair_reclaim_attachment(
+                    DeviceIoClass::Data,
+                    object_key,
+                    evidence.embedded_predecessor_generation,
+                ) {
+                Ok(Some(completed))
+                    if completed.current_receipt == evidence.current_receipt
+                        && completed.repaired_target == evidence.repaired_target
+                        && completed.embedded_predecessor_generation
+                            == evidence.embedded_predecessor_generation =>
+                {
+                    completed
+                }
+                Ok(Some(_)) => {
+                    return Err(MountedRepairReconciliationFailure::new(
+                        "repair-reclaim-attachment-mismatch",
+                        "pending reclaim attachment changed the exact target-only repair evidence",
+                        evidence,
+                        true,
+                        "not-started",
+                    ))
+                }
+                Ok(None) => {
+                    return Err(MountedRepairReconciliationFailure::new(
+                        "repair-reclaim-evidence-disappeared",
+                        "exact target-only repair evidence disappeared before pending reclaim attachment",
+                        evidence,
+                        false,
+                        "not-started",
+                    ))
+                }
+                Err(error) => {
+                    return Err(MountedRepairReconciliationFailure::new(
+                        "repair-reclaim-attachment-failed",
+                        format!(
+                            "pending target-only repair reclaim attachment did not complete: {error}"
+                        ),
+                        evidence,
+                        true,
+                        "not-started",
+                    ))
+                }
+            }
+        };
+
+        let filesystem_generation_before = self.stats().filesystem_generation;
+        let reconciled_snapshot_manifests = self
+            .reconcile_mounted_snapshot_receipts(&mut mounted_snapshots)
+            .map_err(|error| {
+                MountedRepairReconciliationFailure::new(
+                    "snapshot-reconciliation-failed",
+                    format!("retained snapshot repair reconciliation failed: {error}"),
+                    evidence.clone(),
+                    true,
+                    "not-started",
+                )
+            })?;
+        let filesystem_generation_before_current_reconciliation =
+            self.stats().filesystem_generation;
+        let reconciled_current_manifests = match self.reconcile_relocated_content_receipts() {
+            Ok(reconciled) => reconciled,
+            Err(error) => {
+                // `force_commit` can fail before publishing a successor,
+                // after an uncertain root write, or during fallible work
+                // after the new root was durably published and verified.
+                // Preserve that boundary in the operator report instead
+                // of claiming publication never started in every case.
+                let authenticated_root_state =
+                    if matches!(&error, FileSystemError::PublishOutcomeUncertain { .. }) {
+                        "publication-uncertain"
+                    } else if self.stats().filesystem_generation
+                        > filesystem_generation_before_current_reconciliation
+                    {
+                        "published"
+                    } else {
+                        "not-started"
+                    };
+                return Err(MountedRepairReconciliationFailure::new(
+                    "filesystem-reconciliation-failed",
+                    format!("current filesystem repair reconciliation failed: {error}"),
+                    evidence.clone(),
+                    true,
+                    authenticated_root_state,
+                ));
+            }
+        };
+        if reconciled_current_manifests == 0 {
+            return Err(MountedRepairReconciliationFailure::new(
+                "filesystem-reconciliation-missing",
+                "repair evidence named no stale manifest in the current filesystem root",
+                evidence,
+                true,
+                "not-started",
+            ));
+        }
+
+        // `reconcile_relocated_content_receipts` already published the
+        // current filesystem and every pending snapshot-root successor in one
+        // canonical Pool-root transition. Mounted reopen never selects the
+        // non-canonical raw root-slot history, so republishing the same state
+        // cannot provide fallback convergence.
+        self.store.pool_mut().sync_all().map_err(|error| {
+            MountedRepairReconciliationFailure::new(
+                "authenticated-root-sync-failed",
+                format!("repair reconciliation root sync failed: {error}"),
+                evidence.clone(),
+                true,
+                "published",
+            )
+        })?;
+
+        let dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        let root_authentication_key = self.filesystem.root_authentication_key;
+        crate::load_canonical_committed_state_for_dataset(
+            &self.store,
+            dataset_id,
+            root_authentication_key,
+        )
+        .map_err(|error| {
+            MountedRepairReconciliationFailure::new(
+                "authenticated-root-verification-failed",
+                format!("published repair reconciliation root did not authenticate: {error}"),
+                evidence.clone(),
+                true,
+                "published",
+            )
+        })?;
+
+        let re_scrub = self.scrub_mounted_content().map_err(|error| {
+            MountedRepairReconciliationFailure::new(
+                "re-scrub-failed",
+                format!("published repair reconciliation re-scrub failed: {error}"),
+                evidence.clone(),
+                true,
+                "published",
+            )
+        })?;
+        if !re_scrub.is_clean() || re_scrub.blocks_no_checksum != 0 {
+            return Err(MountedRepairReconciliationFailure::new(
+                "re-scrub-not-clean",
+                "published repair reconciliation still has mounted integrity findings",
+                evidence,
+                true,
+                "published",
+            )
+            .with_re_scrub(re_scrub));
+        }
+
+        Ok(MountedRepairReconciliationOutcome {
+            evidence,
+            reconciled_current_manifests,
+            reconciled_snapshot_manifests,
+            filesystem_generation_before,
+            filesystem_generation_after: self.stats().filesystem_generation,
+            re_scrub,
+        })
+    }
+
+    pub(crate) fn reconcile_pending_replicated_repairs_before_owner(
+        &mut self,
+        transitions: Vec<crate::recovery::PendingReplicatedRepairReconciliation>,
+    ) -> crate::Result<()> {
+        if transitions.is_empty() {
+            return Err(crate::FileSystemError::CorruptState {
+                reason: "pending replicated repair reconciliation batch is empty",
+            });
+        }
+        if let Some(reason) = self.mounted_repair_quiescence_failure() {
+            return Err(crate::FileSystemError::CorruptState { reason });
+        }
+
+        // Revalidate and authenticate the complete deterministic exception set
+        // before any mounted or Pool state changes. A crash can leave an older
+        // row fully attached while a later row is still being completed; both
+        // must remain one predecessor-root authority set.
+        let mut previous_order = None;
+        for transition in &transitions {
+            let order = (
+                transition.object_key,
+                transition.evidence.embedded_predecessor_generation,
+                transition.evidence.current_receipt.generation,
+            );
+            if previous_order.is_some_and(|previous| previous >= order)
+                || transition.evidence.current_receipt.object_key != transition.object_key
+                || !transition.evidence.replacement_receipt_attached
+            {
+                return Err(crate::FileSystemError::CorruptState {
+                    reason:
+                        "pending replicated repair reconciliation batch is not exact and ordered",
+                });
+            }
+            let current = self
+                .store
+                .pool()
+                .replicated_repair_reconciliation_evidence(
+                    DeviceIoClass::Data,
+                    transition.object_key,
+                    transition.evidence.embedded_predecessor_generation,
+                )?
+                .ok_or(crate::FileSystemError::CorruptState {
+                    reason: "pending replicated repair reconciliation evidence disappeared",
+                })?;
+            if current != transition.evidence {
+                return Err(crate::FileSystemError::CorruptState {
+                    reason: "pending replicated repair reconciliation evidence changed",
+                });
+            }
+            previous_order = Some(order);
+        }
+
+        let roots = self.capture_mounted_repair_snapshot_roots()?;
+        self.authenticate_mounted_repair_current_root_for_transitions(&transitions)?;
+        let mut mounted_snapshots =
+            self.load_mounted_repair_snapshot_states_for_transitions(roots, &transitions)?;
+
+        // All snapshot and current-manifest successor changes are now planned
+        // from the same predecessor authority. The established snapshot
+        // publication code stages every changed typed root, while the current
+        // reconciliation performs the single logical successor commit.
+        let reconciled_snapshot_manifests =
+            self.reconcile_mounted_snapshot_receipts(&mut mounted_snapshots)?;
+        let reconciled_current_manifests = self.reconcile_relocated_content_receipts()?;
+        if reconciled_current_manifests == 0 {
+            return Err(crate::FileSystemError::CorruptState {
+                reason:
+                    "pending replicated repair batch named no stale manifest in the current root",
+            });
+        }
+
+        // The current reconciliation committed this complete batch and its
+        // snapshot-root successors through one canonical Pool root. Raw
+        // root-slot history is diagnostic only and must not drive duplicate
+        // publications here.
+        self.store.pool_mut().sync_all()?;
+
+        let dataset_id = DatasetId::from_bytes(self.mounted_dataset_id());
+        crate::load_canonical_committed_state_for_dataset(
+            &self.store,
+            dataset_id,
+            self.root_authentication_key,
+        )?;
+        let re_scrub = self.scrub_mounted_content()?;
+        if !re_scrub.is_clean() || re_scrub.blocks_no_checksum != 0 {
+            return Err(crate::FileSystemError::CorruptState {
+                reason: "pending replicated repair batch did not produce a clean mounted scrub",
+            });
+        }
+
+        eprintln!(
+            "recovery: reconciled {} target-only replica repair transitions before mounted owner publication (current_manifests={}, snapshot_manifests={})",
+            transitions.len(),
+            reconciled_current_manifests,
+            reconciled_snapshot_manifests,
+        );
+        Ok(())
+    }
+
+    fn next_absent_snapshot_source_transaction_id(
+        &self,
+        state: &FileSystemState,
+        transaction_floor: u64,
+    ) -> crate::Result<u64> {
+        let keyspace = crate::FilesystemObjectKeyspace::new(state.dataset_id());
+        let mut transaction_id = transaction_floor
+            .max(state.generation)
+            .max(crate::types::ROOT_COMMIT_MIN_TRANSACTION_ID);
+
+        loop {
+            let mut prospective_keys = BTreeSet::new();
+            prospective_keys.insert(keyspace.transaction_superblock(transaction_id));
+            prospective_keys.insert(keyspace.transaction_manifest(transaction_id));
+            for inode in state.inodes.values() {
+                prospective_keys.insert(keyspace.transaction_inode(transaction_id, inode.inode_id));
+                if inode.carries_child_namespace() {
+                    prospective_keys
+                        .insert(keyspace.transaction_directory(transaction_id, inode.inode_id));
+                }
+                if inode.is_file_like() {
+                    prospective_keys
+                        .insert(keyspace.transaction_extent_map(transaction_id, inode.inode_id));
+                }
+            }
+            for snapshot in state.snapshots.values() {
+                prospective_keys
+                    .insert(keyspace.transaction_snapshot(transaction_id, &snapshot.name));
+            }
+
+            let mut occupied = false;
+            for key in prospective_keys {
+                let receipt = self
+                    .store
+                    .pool()
+                    .placement_receipt_for_key(DeviceIoClass::Metadata, key)?;
+                let payload = self.store.pool().get(DeviceIoClass::Metadata, key)?;
+                if receipt.is_some() || payload.is_some() {
+                    occupied = true;
+                    break;
+                }
+            }
+            if !occupied {
+                return Ok(transaction_id);
+            }
+            transaction_id =
+                transaction_id
+                    .checked_add(1)
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "mounted snapshot transaction id space is exhausted",
+                    })?;
+        }
     }
 }

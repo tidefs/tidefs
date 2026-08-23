@@ -6,7 +6,8 @@
 #   pool create -> import -> FUSE mount -> write/fsync/read ->
 #   unmount -> pool export -> reimport -> remount -> persist verify ->
 #   committed-root advance verify -> intent-log consistency verify ->
-#   mounted clean/corrupt integrity and live-owner content-scrub reports.
+#   mounted clean integrity -> one-target live-owner repair -> crash/reopen ->
+#   dual-corruption scrub/repair refusal -> committed-root corruption report.
 #
 # Validation tier: qemu guest.
 {
@@ -25,6 +26,7 @@ let
     CPIO="${pkgs.cpio}/bin/cpio"
     GZIP="${pkgs.gzip}/bin/gzip"
     BYTE_GREP="${pkgs.gnugrep}/bin/grep"
+    JQ="${pkgs.jq}/bin/jq"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
     TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
 
@@ -61,7 +63,7 @@ USAGE
       esac
     done
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$BYTE_GREP" "$TIDEFSCTL"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$BYTE_GREP" "$JQ" "$TIDEFSCTL"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ENVIRONMENT REFUSAL: dependency not found: $dep" >&2
         exit 2
@@ -137,6 +139,7 @@ USAGE
 
     copy_binary_to_bin "$BUSYBOX" busybox
     copy_binary_to_bin "$BYTE_GREP" bytegrep
+    copy_binary_to_bin "$JQ" jq
     for applet in sh ls cat echo mount umount grep insmod rmmod dmesg sleep poweroff \
                     reboot mknod mkdir rmdir dd stat cp mv rm ln touch find wc sync \
                     expr head tail cut kill ps test seq blockdev mountpoint du \
@@ -212,6 +215,7 @@ if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
              readonly_create_erofs readonly_write_erofs readonly_truncate_erofs \
              readonly_unlink_erofs readonly_rename_erofs readonly_mkdir_erofs \
              readonly_setattr_erofs readonly_content_unchanged \
+             readonly_repair_refused readonly_repair_bytes_preserved \
              readonly_release readonly_bytes_preserved \
              crash_cycle_export_prep crash_cycle_preimport crash_cycle_premount \
              crash_cycle_write_committed crash_cycle_write_uncommitted \
@@ -221,8 +225,13 @@ if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
              crash_cycle_inode_stable crash_cycle_unfsynced_bounded \
              mounted_integrity_clean mounted_integrity_corruption_injected \
              mounted_integrity_failure_reported \
-             mounted_scrub_clean mounted_scrub_corruption_injected \
-             mounted_scrub_failure_reported mounted_scrub_no_repair_writeback; do
+             mounted_scrub_clean mounted_repair_single_corruption_injected \
+             mounted_repair_single_completed mounted_repair_file_readable \
+             mounted_repair_crash_sigkill mounted_repair_stale_mount_detached \
+             mounted_repair_reopen mounted_repair_reopen_readback \
+             mounted_scrub_corruption_injected mounted_scrub_failure_reported \
+             mounted_scrub_no_repair_writeback mounted_repair_dual_refused \
+             mounted_repair_dual_bytes_unchanged; do
         blocked "$op" "virtio block devices missing"
     done
     echo "PASSED=$PASSED FAILED=$FAILED BLOCKED=$BLOCKED"
@@ -705,12 +714,45 @@ if [ "$READONLY_PREP_OK" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
         else
             fail "readonly_content_unchanged" "expected '$TC' got '$READONLY_CONTENT_AFTER'"
         fi
+
+        READONLY_REPAIR_HASH_BEFORE=$(sha256sum "$DEV0" "$DEV1" 2>/dev/null || true)
+        if tidefsctl pool repair "$POOL_NAME" --json \
+            > /tmp/readonly_repair.json 2>/tmp/readonly_repair.err; then
+            READONLY_REPAIR_RC=0
+        else
+            READONLY_REPAIR_RC=$?
+        fi
+        READONLY_REPAIR_HASH_AFTER=$(sha256sum "$DEV0" "$DEV1" 2>/dev/null || true)
+        if [ "$READONLY_REPAIR_RC" -ne 0 ] \
+            && jq -e '
+                .pass == false
+                and .state_source == "live-owner"
+                and .outcome == "refused"
+                and .repair_attempted == false
+                and .repair_completed == false
+                and .repair_writeback == false
+                and .receipt_publication == "not-attempted"
+                and .refusal.code == "read-only-owner"
+            ' /tmp/readonly_repair.json >/dev/null; then
+            pass "readonly_repair_refused"
+        else
+            fail "readonly_repair_refused" \
+                "exit=$READONLY_REPAIR_RC output=$(cat /tmp/readonly_repair.err /tmp/readonly_repair.json 2>/dev/null)"
+        fi
+        if [ -n "$READONLY_REPAIR_HASH_BEFORE" ] \
+            && [ "$READONLY_REPAIR_HASH_AFTER" = "$READONLY_REPAIR_HASH_BEFORE" ]; then
+            pass "readonly_repair_bytes_preserved"
+        else
+            fail "readonly_repair_bytes_preserved" \
+                "complete device hashes changed during read-only repair refusal"
+        fi
     else
         fail "readonly_mount" "$(tail -40 /tmp/readonly_mount.log 2>/dev/null)"
         for op in readonly_kernel_ro readonly_read readonly_create_erofs \
                   readonly_write_erofs readonly_truncate_erofs readonly_unlink_erofs \
                   readonly_rename_erofs readonly_mkdir_erofs readonly_setattr_erofs \
-                  readonly_content_unchanged; do
+                  readonly_content_unchanged readonly_repair_refused \
+                  readonly_repair_bytes_preserved; do
             blocked "$op" "read-only mount failed"
         done
     fi
@@ -719,7 +761,8 @@ else
     for op in readonly_kernel_ro readonly_read readonly_create_erofs \
               readonly_write_erofs readonly_truncate_erofs readonly_unlink_erofs \
               readonly_rename_erofs readonly_mkdir_erofs readonly_setattr_erofs \
-              readonly_content_unchanged; do
+              readonly_content_unchanged readonly_repair_refused \
+              readonly_repair_bytes_preserved; do
         blocked "$op" "read-only mount not runnable"
     done
 fi
@@ -1009,97 +1052,305 @@ else
     blocked "mounted_scrub_clean" "recovered committed content unavailable"
 fi
 
-INTEGRITY_CORRUPTED_MEMBERS=0
-if [ "$INTEGRITY_CLEAN_OK" -eq 1 ]; then
-    for dev in "$DEV0" "$DEV1"; do
-        root_offset=$(bytegrep -abo 'VFSROOT1' "$dev" 2>/tmp/integrity_bytegrep.err \
-            | tail -1 | cut -d: -f1)
-        case "$root_offset" in
+REPAIR_SINGLE_CORRUPTED_RECORDS=0
+if [ "$SCRUB_CLEAN_OK" -eq 1 ]; then
+    bytegrep -Fabo "$SCRUB_CONTENT" "$DEV0" \
+        > /tmp/repair_single_dev0_matches 2>/tmp/repair_single_dev0_bytegrep.err || true
+    bytegrep -Fabo "$SCRUB_CONTENT" "$DEV1" \
+        > /tmp/repair_single_dev1_matches 2>/tmp/repair_single_dev1_bytegrep.err || true
+    repair_dev0_occurrences=$(wc -l < /tmp/repair_single_dev0_matches)
+    repair_dev1_occurrences=$(wc -l < /tmp/repair_single_dev1_matches)
+    if [ "$repair_dev0_occurrences" -eq 1 ] \
+        && [ "$repair_dev1_occurrences" -eq 1 ]; then
+        repair_dev0_offset=$(cut -d: -f1 /tmp/repair_single_dev0_matches)
+        repair_dev1_offset=$(cut -d: -f1 /tmp/repair_single_dev1_matches)
+        case "$repair_dev0_offset" in
             ""|*[!0-9]*)
-                echo "  no committed-root payload offset found on $dev"
+                fail "mounted_repair_single_corruption_injected" \
+                    "invalid DEV0 payload offset: $repair_dev0_offset"
                 ;;
             *)
-                if printf 'BADROOT!' \
-                    | dd of="$dev" bs=1 seek="$root_offset" conv=notrunc 2>/tmp/integrity_dd.err; then
-                    INTEGRITY_CORRUPTED_MEMBERS=$((INTEGRITY_CORRUPTED_MEMBERS + 1))
-                    echo "  corrupted newest committed-root record on $dev at byte $root_offset"
-                else
-                    echo "  corruption write failed on $dev: $(cat /tmp/integrity_dd.err 2>/dev/null)"
-                fi
+                case "$repair_dev1_offset" in
+                    ""|*[!0-9]*)
+                        fail "mounted_repair_single_corruption_injected" \
+                            "invalid DEV1 payload offset: $repair_dev1_offset"
+                        ;;
+                    *)
+                        if printf 'X' \
+                            | dd of="$DEV0" bs=1 seek="$repair_dev0_offset" conv=notrunc \
+                                2>/tmp/repair_single_dd.err; then
+                            sync
+                            bytegrep -Fabo "$SCRUB_CONTENT" "$DEV0" \
+                                > /tmp/repair_single_dev0_after 2>/dev/null || true
+                            bytegrep -Fabo "$SCRUB_CONTENT" "$DEV1" \
+                                > /tmp/repair_single_dev1_after 2>/dev/null || true
+                            repair_dev0_after=$(wc -l < /tmp/repair_single_dev0_after)
+                            repair_dev1_after=$(wc -l < /tmp/repair_single_dev1_after)
+                            repair_dev1_remaining_offset=$(cut -d: -f1 \
+                                /tmp/repair_single_dev1_after)
+                            if [ "$repair_dev0_after" -eq 0 ] \
+                                && [ "$repair_dev1_after" -eq 1 ] \
+                                && [ "$repair_dev1_remaining_offset" = "$repair_dev1_offset" ]; then
+                                REPAIR_SINGLE_CORRUPTED_RECORDS=1
+                                pass "mounted_repair_single_corruption_injected"
+                            else
+                                fail "mounted_repair_single_corruption_injected" \
+                                    "post-injection current payload occurrences: DEV0=$repair_dev0_after DEV1=$repair_dev1_after expected DEV0=0 DEV1=1"
+                            fi
+                        else
+                            fail "mounted_repair_single_corruption_injected" \
+                                "dd=$(cat /tmp/repair_single_dd.err 2>/dev/null)"
+                        fi
+                        ;;
+                esac
                 ;;
         esac
-    done
-    sync
-    if [ "$INTEGRITY_CORRUPTED_MEMBERS" -eq 2 ]; then
-        pass "mounted_integrity_corruption_injected"
     else
-        fail "mounted_integrity_corruption_injected" \
-            "corrupted_members=$INTEGRITY_CORRUPTED_MEMBERS bytegrep=$(cat /tmp/integrity_bytegrep.err 2>/dev/null)"
+        fail "mounted_repair_single_corruption_injected" \
+            "expected exactly one current payload occurrence per member: DEV0=$repair_dev0_occurrences DEV1=$repair_dev1_occurrences bytegrep=$(cat /tmp/repair_single_dev0_bytegrep.err /tmp/repair_single_dev1_bytegrep.err 2>/dev/null)"
     fi
 else
-    blocked "mounted_integrity_corruption_injected" "clean integrity report unavailable"
+    blocked "mounted_repair_single_corruption_injected" "clean mounted scrub unavailable"
 fi
 
-if [ "$INTEGRITY_CORRUPTED_MEMBERS" -eq 2 ]; then
-    if tidefsctl pool integrity-check "$POOL_NAME" --json \
-        > /tmp/integrity_failed.json 2>/tmp/integrity_failed.err; then
-        INTEGRITY_FAILED_RC=0
+REPAIR_SINGLE_OK=0
+if [ "$REPAIR_SINGLE_CORRUPTED_RECORDS" -eq 1 ]; then
+    if tidefsctl pool repair "$POOL_NAME" --json \
+        > /tmp/repair_single.json 2>/tmp/repair_single.err \
+        && jq -e '
+            .pass == true
+            and .state_source == "live-owner"
+            and .outcome == "completed"
+            and .repair_attempted == true
+            and .repair_completed == true
+            and .repair_writeback == true
+            and .receipt_publication == "completed"
+            and .replacement_receipt_attached == true
+            and .comparison.classification == "SingleReplicaCorruption"
+            and ((.comparison.subject.inode_id | type) == "number")
+            and .comparison.subject.inode_id > 0
+            and ((.comparison.subject.data_version | type) == "number")
+            and .comparison.subject.data_version > 0
+            and ((.comparison.subject.kind | type) == "string")
+            and (.comparison.subject.kind | length) > 0
+            and ((.comparison.subject.chunk_index | type) == "number")
+            and .comparison.subject.chunk_index >= 0
+            and ((.comparison.object_key | type) == "string")
+            and (.comparison.object_key | test("^[0-9a-f]{64}$"))
+            and ((.comparison.targets | type) == "array")
+            and (.comparison.targets | length) == 2
+            and .comparison.target_count == 2
+            and all(
+                .comparison.targets[];
+                ((.device_index | type) == "number")
+                and ((.device_guid | type) == "string")
+                and (.device_guid | test("^[0-9a-f]{32}$"))
+                and ((.shard_index | type) == "number")
+            )
+            and ([.comparison.targets[].device_index] | sort) == [0, 1]
+            and any(
+                .comparison.targets[];
+                .device_index == 0
+                and (
+                    (
+                        .receipt_payload_outcome.kind == "corrupt"
+                        and .mounted_checksum_outcome.kind == "mismatch"
+                    )
+                    or (
+                        .receipt_payload_outcome.kind == "unreadable"
+                        and .mounted_checksum_outcome.kind == "unreadable"
+                    )
+                )
+            )
+            and any(
+                .comparison.targets[];
+                .device_index == 1
+                and .receipt_payload_outcome.kind == "clean"
+                and .mounted_checksum_outcome.kind == "clean"
+            )
+            and ((.previous_receipt_generation | type) == "number")
+            and .previous_receipt_generation > 0
+            and ((.replacement_receipt_generation | type) == "number")
+            and .replacement_receipt_generation > .previous_receipt_generation
+            and ((.clean_source.device_index | type) == "number")
+            and ((.corrupt_target.device_index | type) == "number")
+            and .clean_source.device_index == 1
+            and .corrupt_target.device_index == 0
+            and ((.clean_source.device_guid | type) == "string")
+            and (.clean_source.device_guid | test("^[0-9a-f]{32}$"))
+            and ((.clean_source.shard_index | type) == "number")
+            and ((.corrupt_target.device_guid | type) == "string")
+            and (.corrupt_target.device_guid | test("^[0-9a-f]{32}$"))
+            and ((.corrupt_target.shard_index | type) == "number")
+            and .clean_source.device_guid != .corrupt_target.device_guid
+            and .clean_source == ([
+                .comparison.targets[]
+                | select(.device_index == 1)
+                | {device_index, device_guid, shard_index}
+            ][0])
+            and .corrupt_target == ([
+                .comparison.targets[]
+                | select(.device_index == 0)
+                | {device_index, device_guid, shard_index}
+            ][0])
+            and .authenticated_root_published == true
+            and .authenticated_root_state == "published"
+            and .re_scrub.pass == true
+            and .re_scrub.blocks_corrupt == 0
+            and .re_scrub.blocks_unreadable == 0
+            and .re_scrub.blocks_no_checksum == 0
+            and .re_scrub.finding_count == 0
+        ' /tmp/repair_single.json >/dev/null; then
+        pass "mounted_repair_single_completed"
+        REPAIR_SINGLE_OK=1
     else
-        INTEGRITY_FAILED_RC=$?
-    fi
-    if [ "$INTEGRITY_FAILED_RC" -ne 0 ] \
-        && grep -q '"pass"[[:space:]]*:[[:space:]]*false' /tmp/integrity_failed.json \
-        && grep -q '"state_source"[[:space:]]*:[[:space:]]*"live-owner"' /tmp/integrity_failed.json \
-        && grep -q 'one or more verifier issues found' /tmp/integrity_failed.json \
-        && [ "$(cat "$CRASH_COMMITTED_FILE" 2>/dev/null || true)" = "$CRASH_COMMITTED_CONTENT" ]; then
-        pass "mounted_integrity_failure_reported"
-    else
-        fail "mounted_integrity_failure_reported" \
-            "exit=$INTEGRITY_FAILED_RC output=$(cat /tmp/integrity_failed.err /tmp/integrity_failed.json 2>/dev/null)"
+        fail "mounted_repair_single_completed" \
+            "$(cat /tmp/repair_single.err /tmp/repair_single.json 2>/dev/null)"
     fi
 else
-    blocked "mounted_integrity_failure_reported" "corruption injection failed"
+    blocked "mounted_repair_single_completed" "single-target corruption injection failed"
+fi
+
+REPAIR_FILE_READABLE_OK=0
+if [ "$REPAIR_SINGLE_OK" -eq 1 ]; then
+    if [ "$(cat "$SCRUB_FILE" 2>/dev/null || true)" = "$SCRUB_CONTENT" ]; then
+        REPAIR_FILE_READABLE_OK=1
+        pass "mounted_repair_file_readable"
+    else
+        fail "mounted_repair_file_readable" \
+            "read=$(cat "$SCRUB_FILE" 2>/dev/null || true)"
+    fi
+else
+    blocked "mounted_repair_file_readable" "single-target repair did not complete"
+fi
+
+REPAIR_CRASHED=0
+if [ "$REPAIR_SINGLE_OK" -eq 1 ]; then
+    if [ -n "$CRP" ] && kill -0 "$CRP" 2>/dev/null; then
+        kill -KILL "$CRP" 2>/dev/null || true
+        wait "$CRP" 2>/dev/null || true
+        CRP=""
+        REPAIR_CRASHED=1
+        pass "mounted_repair_crash_sigkill"
+    else
+        fail "mounted_repair_crash_sigkill" "repair owner was not running after success"
+    fi
+else
+    blocked "mounted_repair_crash_sigkill" "single-target repair did not complete"
+fi
+
+REPAIR_STALE_MOUNT_DETACHED_OK=0
+if [ "$REPAIR_CRASHED" -eq 1 ]; then
+    if grep -q "[[:space:]]$MNT[[:space:]]" /proc/self/mountinfo 2>/dev/null; then
+        if umount -l "$MNT" 2>/tmp/repair_crash_umount.err \
+            && ! grep -q "[[:space:]]$MNT[[:space:]]" /proc/self/mountinfo 2>/dev/null; then
+            REPAIR_STALE_MOUNT_DETACHED_OK=1
+            pass "mounted_repair_stale_mount_detached"
+        else
+            fail "mounted_repair_stale_mount_detached" \
+                "$(cat /tmp/repair_crash_umount.err 2>/dev/null)"
+        fi
+    else
+        REPAIR_STALE_MOUNT_DETACHED_OK=1
+        pass "mounted_repair_stale_mount_detached"
+    fi
+else
+    blocked "mounted_repair_stale_mount_detached" "post-repair crash did not run"
+fi
+
+REPAIR_REOPENED=0
+if [ "$REPAIR_STALE_MOUNT_DETACHED_OK" -eq 1 ]; then
+    tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV0" "$DEV1" \
+        > /tmp/repair_reopen_mount.log 2>&1 &
+    CRP=$!
+    for _ in $(seq 1 45); do
+        mountpoint -q "$MNT" 2>/dev/null && { REPAIR_REOPENED=1; break; }
+        sleep 1
+    done
+    if [ "$REPAIR_REOPENED" -eq 1 ]; then
+        pass "mounted_repair_reopen"
+    else
+        fail "mounted_repair_reopen" "$(tail -40 /tmp/repair_reopen_mount.log 2>/dev/null)"
+    fi
+else
+    blocked "mounted_repair_reopen" "post-repair stale mount was not detached"
+fi
+
+REPAIR_REOPEN_READBACK_OK=0
+if [ "$REPAIR_REOPENED" -eq 1 ]; then
+    if [ "$(cat "$SCRUB_FILE" 2>/dev/null || true)" = "$SCRUB_CONTENT" ]; then
+        REPAIR_REOPEN_READBACK_OK=1
+        pass "mounted_repair_reopen_readback"
+    else
+        fail "mounted_repair_reopen_readback" \
+            "read=$(cat "$SCRUB_FILE" 2>/dev/null || true)"
+    fi
+else
+    blocked "mounted_repair_reopen_readback" "repaired pool did not reopen"
 fi
 
 SCRUB_CORRUPTED_MEMBERS=0
 SCRUB_CORRUPTED_RECORDS=0
-if [ "$SCRUB_CLEAN_OK" -eq 1 ]; then
-    for dev in "$DEV0" "$DEV1"; do
-        scrub_offsets=$(bytegrep -Fabo "$SCRUB_CONTENT" "$dev" 2>/tmp/scrub_bytegrep.err \
-            | cut -d: -f1)
-        scrub_member_records=0
-        for scrub_offset in $scrub_offsets; do
-            case "$scrub_offset" in
-                ""|*[!0-9]*) ;;
-                *)
-                    if printf 'X' \
-                        | dd of="$dev" bs=1 seek="$scrub_offset" conv=notrunc \
-                            2>/tmp/scrub_dd.err; then
-                        scrub_member_records=$((scrub_member_records + 1))
-                        SCRUB_CORRUPTED_RECORDS=$((SCRUB_CORRUPTED_RECORDS + 1))
-                    fi
-                    ;;
-            esac
-        done
-        if [ "$scrub_member_records" -gt 0 ]; then
-            SCRUB_CORRUPTED_MEMBERS=$((SCRUB_CORRUPTED_MEMBERS + 1))
-            echo "  corrupted $scrub_member_records committed content record(s) on $dev"
-        else
-            echo "  no committed scrub content offset found on $dev"
-        fi
-    done
-    sync
-    if [ "$SCRUB_CORRUPTED_MEMBERS" -eq 2 ]; then
-        pass "mounted_scrub_corruption_injected"
+if [ "$REPAIR_REOPENED" -eq 1 ]; then
+    bytegrep -Fabo "$SCRUB_CONTENT" "$DEV0" \
+        > /tmp/scrub_dev0_matches 2>/tmp/scrub_dev0_bytegrep.err || true
+    bytegrep -Fabo "$SCRUB_CONTENT" "$DEV1" \
+        > /tmp/scrub_dev1_matches 2>/tmp/scrub_dev1_bytegrep.err || true
+    scrub_dev0_occurrences=$(wc -l < /tmp/scrub_dev0_matches)
+    scrub_dev1_occurrences=$(wc -l < /tmp/scrub_dev1_matches)
+    if [ "$scrub_dev0_occurrences" -eq 1 ] \
+        && [ "$scrub_dev1_occurrences" -eq 1 ]; then
+        scrub_dev0_offset=$(cut -d: -f1 /tmp/scrub_dev0_matches)
+        scrub_dev1_offset=$(cut -d: -f1 /tmp/scrub_dev1_matches)
+        case "$scrub_dev0_offset:$scrub_dev1_offset" in
+            *[!0-9:]*|:*|*:)
+                fail "mounted_scrub_corruption_injected" \
+                    "invalid current payload offsets: DEV0=$scrub_dev0_offset DEV1=$scrub_dev1_offset"
+                ;;
+            *)
+                scrub_dev0_written=0
+                scrub_dev1_written=0
+                if printf 'Y' \
+                    | dd of="$DEV0" bs=1 seek="$scrub_dev0_offset" conv=notrunc \
+                        2>/tmp/scrub_dev0_dd.err; then
+                    scrub_dev0_written=1
+                fi
+                if printf 'Y' \
+                    | dd of="$DEV1" bs=1 seek="$scrub_dev1_offset" conv=notrunc \
+                        2>/tmp/scrub_dev1_dd.err; then
+                    scrub_dev1_written=1
+                fi
+                sync
+                bytegrep -Fabo "$SCRUB_CONTENT" "$DEV0" \
+                    > /tmp/scrub_dev0_after 2>/dev/null || true
+                bytegrep -Fabo "$SCRUB_CONTENT" "$DEV1" \
+                    > /tmp/scrub_dev1_after 2>/dev/null || true
+                scrub_dev0_after=$(wc -l < /tmp/scrub_dev0_after)
+                scrub_dev1_after=$(wc -l < /tmp/scrub_dev1_after)
+                if [ "$scrub_dev0_written" -eq 1 ] \
+                    && [ "$scrub_dev1_written" -eq 1 ] \
+                    && [ "$scrub_dev0_after" -eq 0 ] \
+                    && [ "$scrub_dev1_after" -eq 0 ]; then
+                    SCRUB_CORRUPTED_MEMBERS=2
+                    SCRUB_CORRUPTED_RECORDS=2
+                    pass "mounted_scrub_corruption_injected"
+                else
+                    fail "mounted_scrub_corruption_injected" \
+                        "dual injection did not remove exactly the selected occurrences: DEV0_write=$scrub_dev0_written DEV1_write=$scrub_dev1_written DEV0_after=$scrub_dev0_after DEV1_after=$scrub_dev1_after dd=$(cat /tmp/scrub_dev0_dd.err /tmp/scrub_dev1_dd.err 2>/dev/null)"
+                fi
+                ;;
+        esac
     else
         fail "mounted_scrub_corruption_injected" \
-            "corrupted_members=$SCRUB_CORRUPTED_MEMBERS corrupted_records=$SCRUB_CORRUPTED_RECORDS bytegrep=$(cat /tmp/scrub_bytegrep.err 2>/dev/null) dd=$(cat /tmp/scrub_dd.err 2>/dev/null)"
+            "expected exactly one current repaired payload occurrence per member: DEV0=$scrub_dev0_occurrences DEV1=$scrub_dev1_occurrences bytegrep=$(cat /tmp/scrub_dev0_bytegrep.err /tmp/scrub_dev1_bytegrep.err 2>/dev/null)"
     fi
 else
-    blocked "mounted_scrub_corruption_injected" "clean mounted scrub unavailable"
+    blocked "mounted_scrub_corruption_injected" "repaired pool did not reopen"
 fi
 
 SCRUB_HASH_BEFORE=""
+SCRUB_FAILURE_REPORTED_OK=0
+SCRUB_NO_WRITEBACK_OK=0
 if [ "$SCRUB_CORRUPTED_MEMBERS" -eq 2 ]; then
     SCRUB_HASH_BEFORE=$(sha256sum "$DEV0" "$DEV1" 2>/dev/null || true)
     if tidefsctl pool scrub "$POOL_NAME" --json \
@@ -1128,6 +1379,7 @@ if [ "$SCRUB_CORRUPTED_MEMBERS" -eq 2 ]; then
         && grep -q 'pass:[[:space:]]*no' /tmp/scrub_failed_human.out \
         && grep -q 'repair:[[:space:]]*not attempted' /tmp/scrub_failed_human.out \
         && grep -q 'inode=' /tmp/scrub_failed_human.out; then
+        SCRUB_FAILURE_REPORTED_OK=1
         pass "mounted_scrub_failure_reported"
     else
         fail "mounted_scrub_failure_reported" \
@@ -1136,13 +1388,154 @@ if [ "$SCRUB_CORRUPTED_MEMBERS" -eq 2 ]; then
 
     SCRUB_HASH_AFTER=$(sha256sum "$DEV0" "$DEV1" 2>/dev/null || true)
     if [ -n "$SCRUB_HASH_BEFORE" ] && [ "$SCRUB_HASH_AFTER" = "$SCRUB_HASH_BEFORE" ]; then
+        SCRUB_NO_WRITEBACK_OK=1
         pass "mounted_scrub_no_repair_writeback"
     else
         fail "mounted_scrub_no_repair_writeback" "member bytes changed during read-only scrub"
     fi
 else
-    blocked "mounted_scrub_failure_reported" "content corruption injection failed"
-    blocked "mounted_scrub_no_repair_writeback" "content corruption injection failed"
+    blocked "mounted_scrub_failure_reported" "dual corruption injection failed"
+    blocked "mounted_scrub_no_repair_writeback" "dual corruption injection failed"
+fi
+
+REPAIR_DUAL_HASH_BEFORE=""
+REPAIR_DUAL_REFUSED_OK=0
+REPAIR_DUAL_BYTES_UNCHANGED_OK=0
+if [ "$SCRUB_CORRUPTED_MEMBERS" -eq 2 ]; then
+    REPAIR_DUAL_HASH_BEFORE=$(sha256sum "$DEV0" "$DEV1" 2>/dev/null || true)
+    if tidefsctl pool repair "$POOL_NAME" --json \
+        > /tmp/repair_dual.json 2>/tmp/repair_dual.err; then
+        REPAIR_DUAL_RC=0
+    else
+        REPAIR_DUAL_RC=$?
+    fi
+    if [ "$REPAIR_DUAL_RC" -ne 0 ] \
+        && jq -e '
+            .pass == false
+            and .state_source == "live-owner"
+            and .outcome == "refused"
+            and .refusal.code == "comparison-refused-writeback"
+            and .comparison.classification == "ReceiptTargetDisagreement"
+            and ((.comparison.targets | type) == "array")
+            and (.comparison.targets | length) == 2
+            and .comparison.target_count == 2
+            and all(
+                .comparison.targets[];
+                ((.device_index | type) == "number")
+                and ((.device_guid | type) == "string")
+                and (.device_guid | length) > 0
+                and .mounted_checksum_outcome.kind == "unreadable"
+                and .receipt_payload_outcome.kind == "unreadable"
+            )
+            and ([.comparison.targets[].device_index] | unique | length) == 2
+            and ([.comparison.targets[].device_guid] | unique | length) == 2
+            and .repair_attempted == false
+            and .repair_completed == false
+            and .repair_writeback == false
+            and .receipt_publication == "not-attempted"
+            and .authenticated_root_published == false
+        ' /tmp/repair_dual.json >/dev/null; then
+        REPAIR_DUAL_REFUSED_OK=1
+        pass "mounted_repair_dual_refused"
+    else
+        fail "mounted_repair_dual_refused" \
+            "exit=$REPAIR_DUAL_RC output=$(cat /tmp/repair_dual.err /tmp/repair_dual.json 2>/dev/null)"
+    fi
+
+    REPAIR_DUAL_HASH_AFTER=$(sha256sum "$DEV0" "$DEV1" 2>/dev/null || true)
+    if [ -n "$REPAIR_DUAL_HASH_BEFORE" ] \
+        && [ "$REPAIR_DUAL_HASH_AFTER" = "$REPAIR_DUAL_HASH_BEFORE" ]; then
+        REPAIR_DUAL_BYTES_UNCHANGED_OK=1
+        pass "mounted_repair_dual_bytes_unchanged"
+    else
+        fail "mounted_repair_dual_bytes_unchanged" \
+            "complete device hashes changed during refused dual-corruption repair"
+    fi
+else
+    blocked "mounted_repair_dual_refused" "dual corruption injection failed"
+    blocked "mounted_repair_dual_bytes_unchanged" "dual corruption injection failed"
+fi
+
+# Keep both repair outcomes on authenticated current roots. Corrupt the newest
+# committed roots only after successful repair/reopen and the complete
+# dual-corruption refusal sequence have finished.
+INTEGRITY_CORRUPTED_MEMBERS=0
+if [ "$INTEGRITY_CLEAN_OK" -eq 1 ] \
+    && [ "$REPAIR_SINGLE_OK" -eq 1 ] \
+    && [ "$REPAIR_FILE_READABLE_OK" -eq 1 ] \
+    && [ "$REPAIR_CRASHED" -eq 1 ] \
+    && [ "$REPAIR_STALE_MOUNT_DETACHED_OK" -eq 1 ] \
+    && [ "$REPAIR_REOPENED" -eq 1 ] \
+    && [ "$REPAIR_REOPEN_READBACK_OK" -eq 1 ] \
+    && [ "$SCRUB_FAILURE_REPORTED_OK" -eq 1 ] \
+    && [ "$SCRUB_NO_WRITEBACK_OK" -eq 1 ] \
+    && [ "$REPAIR_DUAL_REFUSED_OK" -eq 1 ] \
+    && [ "$REPAIR_DUAL_BYTES_UNCHANGED_OK" -eq 1 ]; then
+    for dev in "$DEV0" "$DEV1"; do
+        root_offset=$(bytegrep -abo 'VFSROOT1' "$dev" 2>/tmp/integrity_bytegrep.err \
+            | tail -1 | cut -d: -f1)
+        case "$root_offset" in
+            ""|*[!0-9]*)
+                echo "  no committed-root payload offset found on $dev"
+                ;;
+            *)
+                if printf 'BADROOT!' \
+                    | dd of="$dev" bs=1 seek="$root_offset" conv=notrunc 2>/tmp/integrity_dd.err; then
+                    INTEGRITY_CORRUPTED_MEMBERS=$((INTEGRITY_CORRUPTED_MEMBERS + 1))
+                    echo "  corrupted newest committed-root record on $dev at byte $root_offset"
+                else
+                    echo "  corruption write failed on $dev: $(cat /tmp/integrity_dd.err 2>/dev/null)"
+                fi
+                ;;
+        esac
+    done
+    sync
+    if [ "$INTEGRITY_CORRUPTED_MEMBERS" -eq 2 ]; then
+        pass "mounted_integrity_corruption_injected"
+    else
+        fail "mounted_integrity_corruption_injected" \
+            "corrupted_members=$INTEGRITY_CORRUPTED_MEMBERS bytegrep=$(cat /tmp/integrity_bytegrep.err 2>/dev/null)"
+    fi
+else
+    blocked "mounted_integrity_corruption_injected" \
+        "repair/reopen/dual-corruption prerequisite did not complete"
+fi
+
+if [ "$INTEGRITY_CORRUPTED_MEMBERS" -eq 2 ]; then
+    if tidefsctl pool integrity-check "$POOL_NAME" --json \
+        > /tmp/integrity_failed.json 2>/tmp/integrity_failed.err; then
+        INTEGRITY_FAILED_RC=0
+    else
+        INTEGRITY_FAILED_RC=$?
+    fi
+    if [ "$INTEGRITY_FAILED_RC" -ne 0 ] \
+        && jq -e '
+            .pass == false
+            and .state_source == "live-owner"
+            and .verifier.outcome == "one or more verifier issues found"
+            and ((.verifier.invalid_root_candidates | type) == "number")
+            and .verifier.invalid_root_candidates >= 1
+            and ((.verifier.issues | type) == "array")
+            and (.verifier.issues | length) > 0
+            and any(
+                .verifier.issues[];
+                .severity == "error"
+                and .kind == "root-commit validation"
+                and ((.reason | type) == "string")
+                and (.reason | length) > 0
+            )
+            and .statfs.available == false
+            and ((.statfs.error | type) == "string")
+            and (.statfs.error | length) > 0
+        ' /tmp/integrity_failed.json >/dev/null \
+        && [ "$(cat "$TF" 2>/dev/null || true)" = "$TC" ]; then
+        pass "mounted_integrity_failure_reported"
+    else
+        fail "mounted_integrity_failure_reported" \
+            "exit=$INTEGRITY_FAILED_RC output=$(cat /tmp/integrity_failed.err /tmp/integrity_failed.json 2>/dev/null)"
+    fi
+else
+    blocked "mounted_integrity_failure_reported" "corruption injection failed"
 fi
 
 # Cleanup crash recovery daemon
@@ -1172,6 +1565,7 @@ echo "crash_uncommitted_content=$CRASH_UNCOMMITTED_CONTENT"
 echo "post_crash_committed=$POST_CRASH_COMMITTED"
 echo "post_crash_uncommitted=$POST_CRASH_UNCOMMITTED"
 echo "integrity_corrupted_members=$INTEGRITY_CORRUPTED_MEMBERS"
+echo "repair_single_corrupted_records=$REPAIR_SINGLE_CORRUPTED_RECORDS"
 echo "scrub_corrupted_members=$SCRUB_CORRUPTED_MEMBERS"
 echo "scrub_corrupted_records=$SCRUB_CORRUPTED_RECORDS"
 echo "=== End ==="
@@ -1218,6 +1612,7 @@ INITSCRIPT
       readonly_create_erofs readonly_write_erofs readonly_truncate_erofs \
       readonly_unlink_erofs readonly_rename_erofs readonly_mkdir_erofs \
       readonly_setattr_erofs readonly_content_unchanged \
+      readonly_repair_refused readonly_repair_bytes_preserved \
       readonly_release readonly_bytes_preserved \
       crash_cycle_export_prep crash_cycle_preimport crash_cycle_premount \
       crash_cycle_write_committed crash_cycle_write_uncommitted \
@@ -1227,8 +1622,13 @@ INITSCRIPT
       crash_cycle_inode_stable crash_cycle_unfsynced_bounded \
       mounted_integrity_clean mounted_integrity_corruption_injected \
       mounted_integrity_failure_reported \
-      mounted_scrub_clean mounted_scrub_corruption_injected \
-      mounted_scrub_failure_reported mounted_scrub_no_repair_writeback \
+      mounted_scrub_clean mounted_repair_single_corruption_injected \
+      mounted_repair_single_completed mounted_repair_file_readable \
+      mounted_repair_crash_sigkill mounted_repair_stale_mount_detached \
+      mounted_repair_reopen mounted_repair_reopen_readback \
+      mounted_scrub_corruption_injected mounted_scrub_failure_reported \
+      mounted_scrub_no_repair_writeback mounted_repair_dual_refused \
+      mounted_repair_dual_bytes_unchanged \
       sync_done; do
       if grep -q "PASS: $op" "$VAL_LOG" 2>/dev/null; then
         echo "  PASS: $op"; PASSC=$((PASSC + 1))

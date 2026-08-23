@@ -341,6 +341,12 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         summary: "scan current mounted Pool-backed filesystem content through the live owner",
     },
     CommandSurface {
+        path: "pool repair",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwner,
+        summary: "repair one receipt-authorized corrupt replica through the local mounted owner",
+    },
+    CommandSurface {
         path: "snapshot create",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
@@ -930,6 +936,7 @@ mod tests {
             "pool set",
             "pool list-props",
             "pool scrub",
+            "pool repair",
             "dataset create",
             "dataset resize",
             "snapshot create",
