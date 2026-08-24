@@ -201,7 +201,7 @@ stub placeholders.
 | `FUSE_IOCTL` | `ioctl()` | **Partial-boundary** | `FS_IOC_FIEMAP`, `FS_IOC_FSGETXATTR`, and `TIDEFS_IOC_DEFRAG` are wired; other commands return `EOPNOTSUPP` |
 | `FUSE_POLL` | `poll()` | **Implemented** | Regular-file readiness and schedule-notify registration bookkeeping |
 | `FUSE_COPY_FILE_RANGE` | `copy_file_range()` | **Implemented** | Engine copy path plus writeback-cache fallback |
-| `FUSE_SYNCFS` | `syncfs()` | **Implemented** | Mount-wide dirty-page, engine syncfs, and txg barrier |
+| `FUSE_SYNCFS` | `syncfs()` | **Callback-only; carrier-unreachable** | The daemon callback and internal barrier exist, but ordinary Linux `/dev/fuse` leaves `fuse_conn::sync_fs` disabled; only virtiofs enables it. ABI negotiation cannot make the selected `tidefsctl pool mount` carrier receive opcode 50. |
 | `FUSE_STATX` | `statx()` | **Implemented** | Encodes `ReplyStatx` from adapter metadata projection |
 | `FUSE_BMAP` | `bmap()` | **Explicitly unsupported** | Current userspace adapter returns `EOPNOTSUPP`; FIEMAP is the supported extent-query surface, and BMAP support would require a real block-device address mapping |
 | `FUSE_DESTROY` | `destroy()` | **Implemented** | |
