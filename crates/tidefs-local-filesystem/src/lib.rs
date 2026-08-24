@@ -12309,6 +12309,20 @@ impl PoolDatasetOwner {
         new_path: impl AsRef<str>,
         flags: crate::namespace::rename::RenameAt2Flags,
     ) -> Result<()> {
+        self.renameat2_with_retained_overwrite(old_path, new_path, flags, None)
+    }
+
+    /// Rename while retaining one overwritten last-link file for a live VFS
+    /// handle. The named source replaces the destination atomically, while
+    /// the detached target remains a committed `nlink == 0` orphan until its
+    /// last handle closes.
+    pub(crate) fn renameat2_with_retained_overwrite(
+        &mut self,
+        old_path: impl AsRef<str>,
+        new_path: impl AsRef<str>,
+        flags: crate::namespace::rename::RenameAt2Flags,
+        retained_overwrite_inode: Option<InodeId>,
+    ) -> Result<()> {
         self.ensure_mutation_allowed("rename namespace entry")?;
         let old_path = old_path.as_ref();
         let new_path = new_path.as_ref();
@@ -12391,6 +12405,21 @@ impl PoolDatasetOwner {
         // into swapped_old/swapped_new or renamed).
         let moved_inode_id = old_entry.inode_id;
         let target_inode_id = new_entry.as_ref().map(|e| e.inode_id);
+
+        // Snapshot every inode and directory that the rename can mutate
+        // before changing it. Rollback must restore the pre-rename namespace,
+        // not a partially mutated view captured at the end of the operation.
+        self.mark_inode_metadata_dirty(moved_inode_id);
+        self.mark_dir_dirty(old_parent_id);
+        self.mark_inode_metadata_dirty(old_parent_id);
+        self.mark_dir_dirty(new_parent_id);
+        self.mark_inode_metadata_dirty(new_parent_id);
+        if let Some(target) = new_entry.as_ref() {
+            self.mark_inode_metadata_dirty(target.inode_id);
+            if target.carries_child_namespace() {
+                self.mark_dir_dirty(target.inode_id);
+            }
+        }
 
         if flags.is_exchange() {
             // ── RENAME_EXCHANGE ────────────────────────────────────
@@ -12486,8 +12515,30 @@ impl PoolDatasetOwner {
                         .inode_cache
                         .borrow_mut()
                         .invalidate(moved_inode_id);
+                } else if retained_overwrite_inode == Some(target.inode_id) {
+                    // The destination name is gone, but a live VFS handle
+                    // still owns this last-link file. Keep its inode and
+                    // content in the committed root until final handle close.
+                    if let Some(stored) =
+                        Arc::make_mut(&mut self.filesystem.state.inodes).get_mut(&target.inode_id)
+                    {
+                        stored.nlink = 0;
+                        stored.posix_time.ctime_ns =
+                            Self::next_metadata_ctime_ns(stored.posix_time.ctime_ns);
+                        stored.metadata_version = tick;
+                        Self::advance_subtree_revision(stored);
+                    }
+                    self.filesystem
+                        .inode_cache
+                        .borrow_mut()
+                        .invalidate(target.inode_id);
+                    self.filesystem
+                        .orphan_index
+                        .lock()
+                        .unwrap()
+                        .insert(target.inode_id.get());
                 } else {
-                    // Last link — remove the inode entirely.
+                    // Last link with no live handle — remove the inode entirely.
                     if target_record.size > 0 {
                         let (data_bytes, reserved_bytes) =
                             self.accounted_extent_bytes(target.inode_id, 0, target_record.size);
@@ -12573,7 +12624,6 @@ impl PoolDatasetOwner {
             .inode_cache
             .borrow_mut()
             .invalidate(moved_inode_id);
-        self.mark_inode_metadata_dirty(moved_inode_id);
         // For EXCHANGE, also update the swapped-in target inode.
         if let Some(tid) = target_inode_id {
             if tid != moved_inode_id {
@@ -12585,13 +12635,8 @@ impl PoolDatasetOwner {
                     swapped.metadata_version = tick;
                 }
                 self.filesystem.inode_cache.borrow_mut().invalidate(tid);
-                self.mark_inode_metadata_dirty(tid);
             }
         }
-        self.mark_dir_dirty(old_parent_id);
-        self.mark_inode_metadata_dirty(old_parent_id);
-        self.mark_dir_dirty(new_parent_id);
-        self.mark_inode_metadata_dirty(new_parent_id);
         let commit_result = self.commit_mutation(());
         let release_result =
             self.release_optional_metadata_admission_permit(rename_md_permit.take());
