@@ -17458,6 +17458,45 @@ mod tests {
     }
 
     #[test]
+    fn fsync_clean_inode_does_not_commit_unrelated_dirty_state() {
+        let (engine, _td) = temp_fs();
+        engine
+            .fs
+            .borrow_mut()
+            .set_auto_commit(false)
+            .expect("defer mounted mutations");
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_clean_attr, clean_fh) = engine
+            .create(root, b"already-durable.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine.write(&clean_fh, 0, b"durable", &ctx()).unwrap();
+        engine.fsync(&clean_fh, false, &ctx()).unwrap();
+
+        let (_dirty_attr, dirty_fh) = engine
+            .create(root, b"still-dirty.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine.write(&dirty_fh, 0, b"pending", &ctx()).unwrap();
+        assert!(engine.fs.borrow().is_state_dirty());
+        let before = engine.fs.borrow().fsync_stats_snapshot();
+
+        engine.fsync(&clean_fh, false, &ctx()).unwrap();
+
+        let after = engine.fs.borrow().fsync_stats_snapshot();
+        assert_eq!(after.fsync_count, before.fsync_count + 1);
+        assert_eq!(
+            after.fsync_do_commit_fallback_count, before.fsync_do_commit_fallback_count,
+            "an already-durable inode must not cross another full commit barrier"
+        );
+        assert!(
+            engine.fs.borrow().is_state_dirty(),
+            "fsync of a clean inode must not publish unrelated dirty state"
+        );
+
+        engine.fsync(&dirty_fh, false, &ctx()).unwrap();
+        assert!(!engine.fs.borrow().is_state_dirty());
+    }
+
+    #[test]
     fn fdatasync_file_handle_uses_inode_data_barrier() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
@@ -18823,6 +18862,54 @@ mod tests {
 
         engine.fsyncdir(&dh, false, &ctx()).unwrap();
         engine.fsyncdir(&dh, true, &ctx()).unwrap();
+    }
+
+    #[test]
+    fn fsyncdir_clean_directory_does_not_commit_unrelated_dirty_state() {
+        let (engine, _td) = temp_fs();
+        engine
+            .fs
+            .borrow_mut()
+            .set_auto_commit(false)
+            .expect("defer mounted mutations");
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let clean_dir = engine
+            .mkdir(root, b"already-durable-dir", 0o755, &ctx())
+            .unwrap();
+        let clean_dh = engine.opendir(clean_dir.inode_id, &ctx()).unwrap();
+        engine.fsyncdir(&clean_dh, false, &ctx()).unwrap();
+
+        let dirty_dir = engine
+            .mkdir(root, b"still-dirty-dir", 0o755, &ctx())
+            .unwrap();
+        let dirty_dh = engine.opendir(dirty_dir.inode_id, &ctx()).unwrap();
+        engine
+            .create(
+                dirty_dir.inode_id,
+                b"pending-entry.txt",
+                0o644,
+                O_RDWR,
+                &ctx(),
+            )
+            .unwrap();
+        assert!(engine.fs.borrow().is_state_dirty());
+        let before = engine.fs.borrow().fsync_stats_snapshot();
+
+        engine.fsyncdir(&clean_dh, false, &ctx()).unwrap();
+
+        let after = engine.fs.borrow().fsync_stats_snapshot();
+        assert_eq!(after.fsync_count, before.fsync_count + 1);
+        assert_eq!(
+            after.fsync_do_commit_fallback_count, before.fsync_do_commit_fallback_count,
+            "an already-durable directory must not cross another full commit barrier"
+        );
+        assert!(
+            engine.fs.borrow().is_state_dirty(),
+            "fsyncdir of a clean directory must not publish unrelated dirty state"
+        );
+
+        engine.fsyncdir(&dirty_dh, false, &ctx()).unwrap();
+        assert!(!engine.fs.borrow().is_state_dirty());
     }
 
     #[test]
