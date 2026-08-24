@@ -491,9 +491,10 @@ impl VfsLocalFileSystem {
         parent_path: &str,
     ) -> std::result::Result<InodeRecord, Errno> {
         if parent == ROOT_INODE_ID && self.dataset_root_path.is_some() {
-            fs.stat(parent_path).map_err(|e| map_errno(&e))
+            let parent_id = fs.lookup(parent_path).map_err(|e| map_errno(&e))?;
+            fs.inode_record_only(parent_id).map_err(|e| map_errno(&e))
         } else {
-            fs.inode(parent).map_err(|e| map_errno(&e))
+            fs.inode_record_only(parent).map_err(|e| map_errno(&e))
         }
     }
 
