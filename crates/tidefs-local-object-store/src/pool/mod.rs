@@ -6184,10 +6184,12 @@ impl Pool {
         receipt.generation = self.allocate_placement_receipt_generation()?;
         receipt.payload_digest = digest32(payload);
 
-        // Persist fail-closed cleanup intent before overwriting any physical
-        // payload. The entries carry no replacement receipt yet, so a crash or
-        // publication failure cannot make them eligible for reclaim. A retry
-        // can safely reuse the idempotent queue entries.
+        // Stage fail-closed cleanup intent before overwriting any physical
+        // payload. The append log retains the old lifetime, and receipt
+        // publication's existing strict Pool barrier durably publishes these
+        // receiptless entries with the replacement decision. A crash or
+        // publication failure cannot make them eligible for reclaim, and a
+        // retry can safely reuse the idempotent queue entries.
         let pending_obsolete_placements = match old_receipt.as_ref() {
             Some(old_receipt) => {
                 self.persist_pending_obsolete_placements(old_receipt, receipt.generation)?
@@ -6796,7 +6798,7 @@ impl Pool {
         &self,
         receipt: &PlacementReceipt,
     ) -> Result<Vec<ObsoletePhysicalPlacement>> {
-        let mut placements = BTreeSet::new();
+        let mut placements = Vec::new();
         match receipt.policy {
             PoolRedundancyPolicy::Replicated { .. } => {
                 for target in &receipt.targets {
@@ -6804,14 +6806,21 @@ impl Pool {
                         continue;
                     };
                     let object_key = receipt.object_key;
-                    let lifetime = self.devices[device_index]
-                        .store()
-                        .current_receipt_bound_physical_lifetime_pool_internal(object_key)?;
-                    placements.insert(ObsoletePhysicalPlacement {
-                        device_index,
-                        object_key,
-                        reclaim_object_id: lifetime.reclaim_object_id,
-                    });
+                    let lifetimes = self.devices[device_index]
+                        .current_receipt_bound_physical_lifetimes_pool_internal(object_key)?;
+                    if lifetimes.is_empty() && self.devices[device_index].get(object_key)?.is_some()
+                    {
+                        return Err(StoreError::InvalidDeadObjectReceipt {
+                            reason: "visible physical copy has no current lifetime identity",
+                        });
+                    }
+                    for lifetime in lifetimes {
+                        placements.push(ObsoletePhysicalPlacement {
+                            device_index,
+                            object_key: lifetime.logical_object_key,
+                            reclaim_object_id: lifetime.reclaim_object_id,
+                        });
+                    }
                 }
             }
             PoolRedundancyPolicy::Erasure { .. } => {
@@ -6821,18 +6830,27 @@ impl Pool {
                     };
                     let object_key =
                         placement_shard_object_key(receipt.object_key, target.shard_index);
-                    let lifetime = self.devices[device_index]
-                        .store()
-                        .current_receipt_bound_physical_lifetime_pool_internal(object_key)?;
-                    placements.insert(ObsoletePhysicalPlacement {
-                        device_index,
-                        object_key,
-                        reclaim_object_id: lifetime.reclaim_object_id,
-                    });
+                    let lifetimes = self.devices[device_index]
+                        .current_receipt_bound_physical_lifetimes_pool_internal(object_key)?;
+                    if lifetimes.is_empty() && self.devices[device_index].get(object_key)?.is_some()
+                    {
+                        return Err(StoreError::InvalidDeadObjectReceipt {
+                            reason: "visible physical copy has no current lifetime identity",
+                        });
+                    }
+                    for lifetime in lifetimes {
+                        placements.push(ObsoletePhysicalPlacement {
+                            device_index,
+                            object_key: lifetime.logical_object_key,
+                            reclaim_object_id: lifetime.reclaim_object_id,
+                        });
+                    }
                 }
             }
         }
-        Ok(placements.into_iter().collect())
+        placements.sort_unstable();
+        placements.dedup();
+        Ok(placements)
     }
 
     fn persist_pending_obsolete_placements(
@@ -6855,6 +6873,20 @@ impl Pool {
         death_generation: u64,
         enqueued_generation: u64,
     ) -> Result<()> {
+        if let [placement] = placements {
+            let entry = DeadObjectEntry::new(
+                placement.reclaim_object_id,
+                self.pool_guid,
+                death_generation,
+                true,
+                enqueued_generation,
+            );
+            return self.devices[placement.device_index]
+                .enqueue_pending_receipt_bound_dead_objects_pool_internal(std::slice::from_ref(
+                    &entry,
+                ));
+        }
+        let mut entries_by_device = BTreeMap::<usize, Vec<DeadObjectEntry>>::new();
         for placement in placements {
             let entry = DeadObjectEntry::new(
                 placement.reclaim_object_id,
@@ -6863,9 +6895,14 @@ impl Pool {
                 true,
                 enqueued_generation,
             );
-            self.devices[placement.device_index]
-                .store_mut()
-                .enqueue_pending_receipt_bound_dead_object_pool_internal(entry)?;
+            entries_by_device
+                .entry(placement.device_index)
+                .or_default()
+                .push(entry);
+        }
+        for (device_index, entries) in entries_by_device {
+            self.devices[device_index]
+                .enqueue_pending_receipt_bound_dead_objects_pool_internal(&entries)?;
         }
         Ok(())
     }
@@ -6882,6 +6919,22 @@ impl Pool {
             });
         }
 
+        if let [placement] = placements {
+            let object_id = placement.reclaim_object_id;
+            let replacement = dead_object_replacement_receipt_for_object(
+                placement.object_key,
+                object_id,
+                replacement_receipt,
+            )?;
+            let receipt = (object_id, replacement);
+            return self.devices[placement.device_index]
+                .publish_dead_object_replacement_receipts_pool_internal(std::slice::from_ref(
+                    &receipt,
+                ));
+        }
+
+        let mut receipts_by_device =
+            BTreeMap::<usize, Vec<(ReclaimObjectKey, DeadObjectReplacementReceipt)>>::new();
         for placement in placements {
             let object_id = placement.reclaim_object_id;
             let replacement = dead_object_replacement_receipt_for_object(
@@ -6889,9 +6942,14 @@ impl Pool {
                 object_id,
                 replacement_receipt,
             )?;
-            let _updated = self.devices[placement.device_index]
-                .store_mut()
-                .publish_dead_object_replacement_receipt_pool_internal(&object_id, replacement)?;
+            receipts_by_device
+                .entry(placement.device_index)
+                .or_default()
+                .push((object_id, replacement));
+        }
+        for (device_index, receipts) in receipts_by_device {
+            self.devices[device_index]
+                .publish_dead_object_replacement_receipts_pool_internal(&receipts)?;
         }
         Ok(())
     }
@@ -6902,27 +6960,27 @@ impl Pool {
         object_key: ObjectKey,
         replacement_receipt: &PlacementReceipt,
     ) -> Result<()> {
-        let lifetime = self.devices[device_index]
-            .store()
-            .current_receipt_bound_physical_lifetime_pool_internal(object_key)?;
-        let replacement = dead_object_replacement_receipt_for_object(
-            object_key,
-            lifetime.reclaim_object_id,
-            replacement_receipt,
+        let lifetimes = self.devices[device_index]
+            .current_receipt_bound_physical_lifetimes_pool_internal(object_key)?;
+        if lifetimes.is_empty() {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "visible physical copy has no current lifetime identity",
+            });
+        }
+        let placements = lifetimes
+            .into_iter()
+            .map(|lifetime| ObsoletePhysicalPlacement {
+                device_index,
+                object_key: lifetime.logical_object_key,
+                reclaim_object_id: lifetime.reclaim_object_id,
+            })
+            .collect::<Vec<_>>();
+        self.persist_pending_obsolete_placement_set(
+            &placements,
+            replacement_receipt.generation,
+            replacement_receipt.generation,
         )?;
-        let death_txg = replacement.receipt_generation;
-        let entry = DeadObjectEntry::new(
-            lifetime.reclaim_object_id,
-            self.pool_guid,
-            death_txg,
-            true,
-            death_txg,
-        );
-        let store = self.devices[device_index].store_mut();
-        store.enqueue_pending_receipt_bound_dead_object_pool_internal(entry)?;
-        store
-            .publish_dead_object_replacement_receipt_pool_internal(&entry.object_id, replacement)?;
-        Ok(())
+        self.attach_obsolete_placement_receipt(&placements, replacement_receipt)
     }
 
     fn cleanup_stale_replicated_copies(
@@ -8000,16 +8058,17 @@ impl Pool {
         let mut aggregate = PoolReceiptBoundDeadObjectDrainStats::default();
         let mut remaining = max_count;
         for idx in self.usable_candidates(&indices) {
-            let stats = self.devices[idx]
-                .store_mut()
-                .drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
+            let device_results = self.devices[idx]
+                .drain_receipt_bound_dead_objects_across_stores_pool_internal(
                     stable_committed_txg,
                     stable_committed_generation,
                     remaining,
                 )?;
-            aggregate.devices_scanned += 1;
-            aggregate.absorb_reclaim_stats(stats);
-            remaining = remaining.saturating_sub(stats.entries_processed);
+            for stats in device_results {
+                aggregate.devices_scanned += 1;
+                aggregate.absorb_reclaim_stats(stats);
+                remaining = remaining.saturating_sub(stats.entries_processed);
+            }
         }
 
         if aggregate.devices_scanned == 0 {
@@ -8624,10 +8683,11 @@ impl Pool {
             crate::txg_manager::COMMITTED_ROOT_FILE.as_bytes(),
         ));
         // Rewriting a receipt during evacuation records the obsolete physical
-        // placement in the old store's receipt-bound reclaim queue. That queue
-        // is local cleanup authority for extents on the device being detached,
-        // not live pool payload; its bytes remain on the device for crash/retry.
-        // Keep every other unknown internal object as a removal blocker.
+        // placement in the old store's receipt-bound reclaim queue. Its legacy
+        // snapshot and per-entry records are local cleanup authority for
+        // extents on the device being detached, not live pool payload; their
+        // bytes remain on the device for crash/retry. Keep every other unknown
+        // internal object as a removal blocker.
         accounted_internal_keys.insert(ObjectKey::from_name(
             crate::reclaim_queue::DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes(),
         ));
@@ -8841,6 +8901,7 @@ impl Pool {
         // removal blocker, not a legacy hash-routed evacuation candidate.
         for key in &keys {
             if accounted_internal_keys.contains(key)
+                || crate::store::is_dead_object_reclaim_entry_state_key(*key)
                 || rewritten_logical_keys.contains(key)
                 || current_logical_keys.contains(key)
             {
@@ -16513,10 +16574,13 @@ mod tests {
                 16,
             )
             .expect("stale generation must not authorize repeated-key reclaim");
-        assert_eq!(held.objects_examined, 0);
         assert_eq!(
-            held.reclaim_queue_depth, 1,
-            "the latest physical lifetime must remain queued at the stale generation"
+            held.objects_examined, 1,
+            "the stale generation may revisit only the older physical lifetime"
+        );
+        assert_eq!(
+            held.reclaim_queue_depth, 2,
+            "both exact lifetimes remain queued until the shared segment is dead"
         );
         let eligible = reopened
             .drain_receipt_bound_dead_objects_at_stable_generation(
@@ -16526,10 +16590,13 @@ mod tests {
                 16,
             )
             .expect("latest generation must authorize repeated-key reclaim");
-        assert_eq!(eligible.objects_examined, 1);
         assert_eq!(
-            eligible.reclaim_queue_depth, 1,
-            "segment release may remain queued until every record is dead"
+            eligible.objects_examined, 2,
+            "the newer generation authorizes both exact dead lifetimes"
+        );
+        assert_eq!(
+            eligible.reclaim_queue_depth, 0,
+            "complete segment release acknowledges both exact lifetime rows"
         );
 
         drop(reopened);
@@ -16692,7 +16759,7 @@ mod tests {
                 .unwrap()
                 .get(key)
                 .unwrap(),
-            None
+            Some(payload.to_vec())
         );
         assert_eq!(
             mirror
@@ -16869,6 +16936,16 @@ mod tests {
         pool.fail_post_deletion_publication_cleanup_once = true;
         assert!(pool.delete(IoClass::Data, key).unwrap());
         assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
+        for target in &deleted_receipt.targets {
+            let idx = pool.resolve_receipt_target(target).unwrap();
+            pool.enqueue_replaced_physical_object(idx, key, &deleted_receipt)
+                .unwrap();
+            assert!(pool.devices[idx].delete_exact_logical_object(key).unwrap());
+        }
+        assert!(deleted_receipt.targets.iter().all(|target| {
+            let idx = pool.resolve_receipt_target(target).unwrap();
+            pool.devices[idx].get(key).unwrap().is_none()
+        }));
 
         let replacement_payload = b"newer generation is current";
         let (_, replacement_receipt) = pool
@@ -24546,15 +24623,15 @@ impl Pool {
         else {
             return Ok(None);
         };
-        if evidence.replacement_receipt_attached {
-            return Ok(Some(evidence));
-        }
-
         let repaired_index = self
             .resolve_receipt_target(&evidence.repaired_target)
             .ok_or(StoreError::InvalidOptions {
                 reason: "replicated repair reconciliation target is no longer attached",
             })?;
+        if evidence.replacement_receipt_attached {
+            self.devices[repaired_index].sync_strict_pool_authority()?;
+            return Ok(Some(evidence));
+        }
         let obsolete_target = ObsoletePhysicalPlacement {
             device_index: repaired_index,
             object_key: key,
@@ -24564,6 +24641,7 @@ impl Pool {
             std::slice::from_ref(&obsolete_target),
             &evidence.current_receipt,
         )?;
+        self.devices[repaired_index].sync_strict_pool_authority()?;
 
         let Some(refreshed) = self.replicated_repair_reconciliation_evidence(
             class,
@@ -25127,6 +25205,7 @@ impl Pool {
             std::slice::from_ref(&obsolete_target),
             &current.replacement_receipt,
         )?;
+        self.devices[repaired_index].sync_strict_pool_authority()?;
 
         let evidence = self
             .replicated_repair_reconciliation_evidence(
@@ -25458,10 +25537,13 @@ impl Pool {
                 reason: "test fault: replicated repair failed after receipt publication",
             }));
         }
-        if let Err(error) = self.attach_obsolete_placement_receipt(
-            std::slice::from_ref(&obsolete_target),
-            &replacement_receipt,
-        ) {
+        if let Err(error) = self
+            .attach_obsolete_placement_receipt(
+                std::slice::from_ref(&obsolete_target),
+                &replacement_receipt,
+            )
+            .and_then(|()| self.devices[corrupt_index].sync_strict_pool_authority())
+        {
             eprintln!(
                 "tidefs: targeted repair receipt generation {} committed for {key:?}; obsolete target reclaim remains pending: {error}",
                 replacement_receipt.generation

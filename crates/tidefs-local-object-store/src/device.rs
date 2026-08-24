@@ -17,7 +17,7 @@ use crate::compress::CompressionConfig;
 use crate::encrypt::EncryptionConfig;
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 #[cfg(test)]
@@ -29,11 +29,15 @@ use crate::device_health::{
     DeviceErrorKind, DeviceHealth, DeviceHealthState, DeviceHealthTransitionEntry,
 };
 use crate::io_scheduler::IoClass as SchedClass;
+use crate::store::ReceiptBoundPhysicalLifetime;
 use crate::{
     BlockStoreIdentity, LocalObjectStore, ObjectKey, ObjectLocation, Result, ScrubStats,
     StoreError, StoreOptions, StoreRetentionCompactionReport, StoredObject,
 };
 use tidefs_types_pool_label_core::{DEVICE_HEALTH_ADMIN_OFFLINE, DEVICE_HEALTH_STATE_MASK};
+use tidefs_types_reclaim_queue_core::{
+    DeadObjectEntry, DeadObjectReplacementReceipt, ObjectKey as ReclaimObjectKey,
+};
 use tracing;
 
 // ---------------------------------------------------------------------------
@@ -3468,6 +3472,274 @@ impl Device {
                     .any(|child| !child.store.list_keys_including_internal().is_empty())
             }
         }
+    }
+
+    fn collect_store_receipt_bound_physical_lifetimes(
+        store: &LocalObjectStore,
+        logical_object_key: ObjectKey,
+        lifetimes: &mut BTreeMap<ReclaimObjectKey, ReceiptBoundPhysicalLifetime>,
+    ) -> Result<()> {
+        for lifetime in store.current_receipt_bound_physical_lifetimes_across_stores_pool_internal(
+            logical_object_key,
+        )? {
+            if lifetimes
+                .insert(lifetime.reclaim_object_id, lifetime)
+                .is_some_and(|known| known != lifetime)
+            {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason:
+                        "receipt-bound physical lifetime identity collision across device stores",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn single_receipt_bound_store_root(&self) -> Option<&LocalObjectStore> {
+        match self {
+            Self::Single(device) => Some(&device.store),
+            Self::Compressed(device) => device.inner.single_receipt_bound_store_root(),
+            Self::Encrypted(device) => device.inner.single_receipt_bound_store_root(),
+            Self::LogDevice(device) => Some(&device.store),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(_) | Self::ParityRaid2(_) | Self::ParityRaid3(_) => None,
+            Self::Mirror(_) => None,
+        }
+    }
+
+    fn single_receipt_bound_store_root_mut(&mut self) -> Option<&mut LocalObjectStore> {
+        match self {
+            Self::Single(device) => Some(&mut device.store),
+            Self::Compressed(device) => device.inner.single_receipt_bound_store_root_mut(),
+            Self::Encrypted(device) => device.inner.single_receipt_bound_store_root_mut(),
+            Self::LogDevice(device) => Some(&mut device.store),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(_) | Self::ParityRaid2(_) | Self::ParityRaid3(_) => None,
+            Self::Mirror(_) => None,
+        }
+    }
+
+    fn collect_receipt_bound_physical_lifetimes(
+        &self,
+        logical_object_key: ObjectKey,
+        lifetimes: &mut BTreeMap<ReclaimObjectKey, ReceiptBoundPhysicalLifetime>,
+    ) -> Result<()> {
+        match self {
+            Self::Single(device) => Self::collect_store_receipt_bound_physical_lifetimes(
+                &device.store,
+                logical_object_key,
+                lifetimes,
+            ),
+            Self::Mirror(device) => {
+                for member in &device.members {
+                    Self::collect_store_receipt_bound_physical_lifetimes(
+                        &member.store,
+                        logical_object_key,
+                        lifetimes,
+                    )?;
+                }
+                Ok(())
+            }
+            Self::Compressed(device) => device
+                .inner
+                .collect_receipt_bound_physical_lifetimes(logical_object_key, lifetimes),
+            Self::Encrypted(device) => device
+                .inner
+                .collect_receipt_bound_physical_lifetimes(logical_object_key, lifetimes),
+            Self::LogDevice(device) => Self::collect_store_receipt_bound_physical_lifetimes(
+                &device.store,
+                logical_object_key,
+                lifetimes,
+            ),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                for (column, child) in device.children.iter().enumerate() {
+                    let column = u8::try_from(column).map_err(|_| StoreError::InvalidOptions {
+                        reason: "parity device column index exceeds key format",
+                    })?;
+                    Self::collect_store_receipt_bound_physical_lifetimes(
+                        &child.store,
+                        ParityRaidDevice::column_key(logical_object_key, column),
+                        lifetimes,
+                    )?;
+                }
+                if let Some(child) = device.children.first() {
+                    Self::collect_store_receipt_bound_physical_lifetimes(
+                        &child.store,
+                        ParityRaidDevice::len_key(logical_object_key),
+                        lifetimes,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Capture every still-present physical lifetime for one logical device
+    /// object, including mirror legs, parity columns, and store replicas.
+    pub(crate) fn current_receipt_bound_physical_lifetimes_pool_internal(
+        &self,
+        logical_object_key: ObjectKey,
+    ) -> Result<Vec<ReceiptBoundPhysicalLifetime>> {
+        if let Some(store) = self.single_receipt_bound_store_root() {
+            return store.current_receipt_bound_physical_lifetimes_across_stores_pool_internal(
+                logical_object_key,
+            );
+        }
+        let mut lifetimes = BTreeMap::new();
+        self.collect_receipt_bound_physical_lifetimes(logical_object_key, &mut lifetimes)?;
+        Ok(lifetimes.into_values().collect())
+    }
+
+    fn for_each_receipt_bound_store_root_mut(
+        &mut self,
+        visit: &mut dyn FnMut(&mut LocalObjectStore),
+    ) {
+        match self {
+            Self::Single(device) => visit(&mut device.store),
+            Self::Mirror(device) => {
+                for member in &mut device.members {
+                    visit(&mut member.store);
+                }
+            }
+            Self::Compressed(device) => device.inner.for_each_receipt_bound_store_root_mut(visit),
+            Self::Encrypted(device) => device.inner.for_each_receipt_bound_store_root_mut(visit),
+            Self::LogDevice(device) => visit(&mut device.store),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                for child in &mut device.children {
+                    visit(&mut child.store);
+                }
+            }
+        }
+    }
+
+    /// Stage each pending lifetime on every physical store root that owns the
+    /// exact copy. The next existing strict Pool barrier publishes the batch;
+    /// dirty queue authority keeps physical reclaim disabled until then.
+    pub(crate) fn enqueue_pending_receipt_bound_dead_objects_pool_internal(
+        &mut self,
+        entries: &[DeadObjectEntry],
+    ) -> Result<()> {
+        if entries.len() <= 1 {
+            if let Some(store) = self.single_receipt_bound_store_root_mut() {
+                if store.replica_count() == 0 {
+                    if let Some(entry) = entries.first() {
+                        store.enqueue_pending_receipt_bound_dead_object_pool_internal(*entry)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        let mut roots = 0_usize;
+        let mut first_error = None;
+        self.for_each_receipt_bound_store_root_mut(&mut |store| {
+            roots = roots.saturating_add(1);
+            if let Err(error) =
+                store.enqueue_pending_receipt_bound_dead_objects_pool_internal(entries)
+            {
+                first_error.get_or_insert(error);
+            }
+        });
+        if roots == 0 {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "receipt-bound reclaim device has no physical stores",
+            });
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Stage replacement authority on every root-owned pending lifetime. An
+    /// exact-copy cleanup's existing strict barrier publishes it with the
+    /// deletion before any physical reclaim can consume the transition.
+    pub(crate) fn publish_dead_object_replacement_receipts_pool_internal(
+        &mut self,
+        receipts: &[(ReclaimObjectKey, DeadObjectReplacementReceipt)],
+    ) -> Result<()> {
+        if receipts.len() <= 1 {
+            if let Some(store) = self.single_receipt_bound_store_root_mut() {
+                if store.replica_count() == 0 {
+                    if let Some((object_id, receipt)) = receipts.first() {
+                        store.publish_dead_object_replacement_receipt_pool_internal(
+                            object_id, *receipt,
+                        )?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        let mut roots = 0_usize;
+        let mut first_error = None;
+        self.for_each_receipt_bound_store_root_mut(&mut |store| {
+            roots = roots.saturating_add(1);
+            if let Err(error) =
+                store.publish_dead_object_replacement_receipts_pool_internal(receipts)
+            {
+                first_error.get_or_insert(error);
+            }
+        });
+        if roots == 0 {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "receipt-bound reclaim device has no physical stores",
+            });
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Drain receipt-authorized lifetimes from every physical store behind
+    /// this device, including store replicas.
+    pub(crate) fn drain_receipt_bound_dead_objects_across_stores_pool_internal(
+        &mut self,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+        max_count: usize,
+    ) -> std::result::Result<
+        Vec<tidefs_reclaim::ReclaimConsumerStats>,
+        crate::store::ReceiptBoundDeadObjectDrainError,
+    > {
+        if let Some(store) = self.single_receipt_bound_store_root_mut() {
+            return store.drain_receipt_bound_dead_objects_across_stores_pool_internal(
+                stable_committed_txg,
+                stable_committed_generation,
+                max_count,
+            );
+        }
+        let mut roots = 0_usize;
+        let mut remaining = max_count;
+        let mut results = Vec::new();
+        let mut first_error = None;
+        self.for_each_receipt_bound_store_root_mut(&mut |store| {
+            roots = roots.saturating_add(1);
+            if (remaining == 0 && !results.is_empty()) || first_error.is_some() {
+                return;
+            }
+            match store.drain_receipt_bound_dead_objects_across_stores_pool_internal(
+                stable_committed_txg,
+                stable_committed_generation,
+                remaining,
+            ) {
+                Ok(store_results) => {
+                    remaining = remaining.saturating_sub(
+                        store_results
+                            .iter()
+                            .map(|stats| stats.entries_processed)
+                            .sum::<usize>(),
+                    );
+                    results.extend(store_results);
+                }
+                Err(error) => first_error = Some(error),
+            }
+        });
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if roots == 0 {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "receipt-bound reclaim device has no physical stores",
+            }
+            .into());
+        }
+        Ok(results)
     }
 
     fn pool_internal_candidate_keys(
