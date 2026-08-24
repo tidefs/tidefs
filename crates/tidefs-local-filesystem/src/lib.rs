@@ -8489,6 +8489,11 @@ impl PoolDatasetOwner {
                 0,
             );
         });
+        // Capture every changed record before the namespace mutation so a
+        // pre-publication commit failure restores the failed link syscall.
+        self.mark_inode_metadata_dirty(inode_id);
+        self.mark_dir_dirty(parent_id);
+        self.mark_inode_metadata_dirty(parent_id);
         let mut updated = source_record.clone();
         updated.nlink = updated.nlink.saturating_add(1);
         updated.posix_time.ctime_ns = Self::next_metadata_ctime_ns(updated.posix_time.ctime_ns);
@@ -8510,9 +8515,6 @@ impl PoolDatasetOwner {
             return Err(err);
         }
         self.update_parent_metadata_timestamps(parent_id, tick);
-        self.mark_inode_metadata_dirty(inode_id);
-        self.mark_dir_dirty(parent_id);
-        self.mark_inode_metadata_dirty(parent_id);
         let linked = self.commit_mutation(updated)?;
         // Retire the derivative orphan marker only after the live inode and
         // namespace mutation are ready for committed-root publication.
@@ -12213,6 +12215,13 @@ impl PoolDatasetOwner {
                 path: path_for_error.to_string(),
             });
         }
+        // Capture the parent namespace and both inode records before removal.
+        // The empty child directory is a real persisted object and must be
+        // restored along with its inode when publication fails.
+        self.mark_dir_dirty(parent_id);
+        self.mark_inode_metadata_dirty(parent_id);
+        self.mark_dir_dirty(entry.inode_id);
+        self.mark_inode_metadata_dirty(entry.inode_id);
         let tick = self.bump_generation();
         if let Err(err) = self.remove_directory_entry(parent_id, name, tick) {
             self.rollback_mutation_delta();
@@ -12231,8 +12240,6 @@ impl PoolDatasetOwner {
         }
         Arc::make_mut(&mut self.filesystem.state.inodes).remove(&entry.inode_id);
         self.forget_removed_inode_state(entry.inode_id);
-        self.mark_dir_dirty(parent_id);
-        self.mark_inode_metadata_dirty(parent_id);
         self.commit_mutation(())
     }
 
@@ -15553,10 +15560,12 @@ impl PoolDatasetOwner {
                     // Newly created inode — remove entirely.
                     Arc::make_mut(&mut self.filesystem.state.inodes).remove(&id);
                     Arc::make_mut(&mut self.filesystem.state.directories).remove(&id);
+                    self.filesystem.state.known_inode_ids.remove(&id);
                     // Also remove any write buffer for this inode.
                     self.filesystem.write_buffers.remove(&id);
                 } else {
                     Arc::make_mut(&mut self.filesystem.state.inodes).insert(id, inode);
+                    self.filesystem.state.known_inode_ids.insert(id);
                     self.filesystem.inode_cache.borrow_mut().invalidate(id);
                 }
             }
