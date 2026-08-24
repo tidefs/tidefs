@@ -6981,6 +6981,19 @@ impl VfsEngine for VfsLocalFileSystem {
             .stat(&old_path)
             .map_err(|e| map_errno(&e))?;
         let target_record = self.fs.borrow().stat(&new_path).ok();
+        let retained_overwrite_inode = if renameat2_flags != RenameAt2Flags::EXCHANGE {
+            target_record.as_ref().and_then(|target| {
+                (target.nlink <= 1
+                    && !target.kind().has_child_namespace()
+                    && self
+                        .file_handle_table
+                        .borrow()
+                        .contains_inode(target.inode_id))
+                .then_some(target.inode_id)
+            })
+        } else {
+            None
+        };
 
         // Sticky-bit check: when overwriting a target, the caller must
         // pass the sticky-bit gate on the target's parent directory.
@@ -7004,7 +7017,12 @@ impl VfsEngine for VfsLocalFileSystem {
 
         self.fs
             .borrow_mut()
-            .renameat2(&old_path, &new_path, renameat2_flags)
+            .renameat2_with_retained_overwrite(
+                &old_path,
+                &new_path,
+                renameat2_flags,
+                retained_overwrite_inode,
+            )
             .map_err(|e| map_errno(&e))?;
 
         if renameat2_flags == RenameAt2Flags::EXCHANGE {
@@ -13758,6 +13776,73 @@ mod tests {
         let looked = engine.lookup(root, b"new.txt", &ctx()).unwrap();
         assert_eq!(looked.inode_id, attr.inode_id);
         assert!(engine.lookup(root, b"old.txt", &ctx()).is_err());
+    }
+
+    #[test]
+    fn rename_overwrite_retains_open_target_until_last_close() {
+        let (engine, td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (source, source_fh) = engine
+            .create(root, b"source.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let (target, target_fh) = engine
+            .create(root, b"target.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&source_fh, 0, b"source", &ctx()).unwrap();
+        engine.write(&target_fh, 0, b"target", &ctx()).unwrap();
+
+        engine
+            .rename(root, b"source.txt", root, b"target.txt", 0, &ctx())
+            .expect("overwrite target with an open handle");
+
+        assert_eq!(
+            engine.read(&target_fh, 0, 16, &ctx()).unwrap(),
+            b"target".to_vec(),
+            "the overwritten target must remain reachable through its open handle"
+        );
+        let retained = engine
+            .fs
+            .borrow()
+            .get_inode_by_id(target.inode_id)
+            .cloned()
+            .expect("open overwritten target must retain its inode record");
+        assert_eq!(retained.nlink, 0);
+        engine
+            .fs
+            .borrow()
+            .mount_invariant_report()
+            .expect("retained zero-link target must preserve namespace invariants");
+
+        engine
+            .release(&target_fh)
+            .expect("last target handle close must finalize the orphan");
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .get_inode_by_id(target.inode_id)
+                .is_none(),
+            "last close must remove the overwritten target inode"
+        );
+        engine
+            .fs
+            .borrow()
+            .mount_invariant_report()
+            .expect("orphan finalization must preserve namespace invariants");
+        engine.release(&source_fh).expect("release source handle");
+
+        let mut owner = engine.into_inner();
+        owner.sync_all().expect("sync renamed state");
+        drop(owner);
+        let reopened = PoolDatasetOwner::open(td.path()).expect("reopen renamed state");
+        reopened
+            .mount_invariant_report()
+            .expect("renamed state must reopen with strict namespace invariants");
+        assert_eq!(
+            reopened.lookup("/target.txt").unwrap(),
+            source.inode_id,
+            "the source inode must own the destination name after reopen"
+        );
     }
 
     #[test]
