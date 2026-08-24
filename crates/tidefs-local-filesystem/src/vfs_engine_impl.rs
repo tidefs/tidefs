@@ -13765,6 +13765,47 @@ mod tests {
     }
 
     #[test]
+    fn rmdir_commit_failure_restores_namespace_state() {
+        let (engine, td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let directory = engine.mkdir(root, b"retained", 0o755, &ctx()).unwrap();
+        let root_before = engine.getattr(root, None, &ctx()).unwrap();
+
+        crate::persistence::inject_next_sync_failure_after_boundary(
+            crate::types::FilesystemCommitBoundary::TransactionObjectsWritten,
+        );
+        engine
+            .rmdir(root, b"retained", &ctx())
+            .expect_err("injected pre-publication failure must abort rmdir");
+
+        assert_eq!(
+            engine.lookup(root, b"retained", &ctx()).unwrap().inode_id,
+            directory.inode_id,
+            "failed rmdir must restore the parent directory entry"
+        );
+        assert_eq!(
+            engine
+                .getattr(directory.inode_id, None, &ctx())
+                .unwrap()
+                .inode_id,
+            directory.inode_id,
+            "failed rmdir must restore the removed directory inode"
+        );
+        assert_eq!(
+            engine.getattr(root, None, &ctx()).unwrap().posix.nlink,
+            root_before.posix.nlink,
+            "failed rmdir must restore the parent link count"
+        );
+        engine
+            .fs
+            .borrow()
+            .mount_invariant_report()
+            .expect("rmdir rollback must preserve strict namespace invariants");
+        drop(engine);
+        drop(td);
+    }
+
+    #[test]
     fn rename_file() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
@@ -14294,6 +14335,45 @@ mod tests {
                 .nlink,
             2
         );
+    }
+
+    #[test]
+    fn hard_link_commit_failure_restores_namespace_state() {
+        let (engine, td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (original, _fh) = engine
+            .create(root, b"original.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let original_before = engine.getattr(original.inode_id, None, &ctx()).unwrap();
+
+        crate::persistence::inject_next_sync_failure_after_boundary(
+            crate::types::FilesystemCommitBoundary::TransactionObjectsWritten,
+        );
+        engine
+            .link(original.inode_id, root, b"alias.txt", &ctx())
+            .expect_err("injected pre-publication failure must abort hard link");
+
+        assert_eq!(
+            engine.lookup(root, b"alias.txt", &ctx()).unwrap_err(),
+            Errno::ENOENT,
+            "failed hard link must restore destination absence"
+        );
+        assert_eq!(
+            engine
+                .getattr(original.inode_id, None, &ctx())
+                .unwrap()
+                .posix
+                .nlink,
+            original_before.posix.nlink,
+            "failed hard link must restore the source link count"
+        );
+        engine
+            .fs
+            .borrow()
+            .mount_invariant_report()
+            .expect("hard-link rollback must preserve strict namespace invariants");
+        drop(engine);
+        drop(td);
     }
 
     #[test]
