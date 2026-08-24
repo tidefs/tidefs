@@ -6992,10 +6992,32 @@ impl LocalObjectStore {
     }
 
     pub(crate) fn sync_strict_pool_authority(&mut self) -> Result<()> {
+        self.sync_pool_authority_storage(true)
+    }
+
+    /// Persist Pool-internal receipt-generation authority without consuming
+    /// unrelated public raw-mutation work.
+    ///
+    /// The generation allocator temporarily fences public raw mutations while
+    /// extending its durable high-water marker. A replacement-reclaim delta
+    /// may legitimately be waiting for the next ordinary strict Pool barrier,
+    /// so this narrower barrier must leave that delta staged until generation
+    /// authority has converged again.
+    pub(crate) fn sync_receipt_generation_authority(&mut self) -> Result<()> {
+        self.sync_pool_authority_storage(false)
+    }
+
+    fn sync_pool_authority_storage(&mut self, publish_pending_reclaim: bool) -> Result<()> {
         self.ensure_writable("sync strict pool authority")?;
-        // Receipt publication and exact cleanup already require this strict
-        // barrier, so publish their staged root-owned reclaim delta here.
-        let prepared_dead_object_reclaim = self.prepare_dead_object_reclaim_queue_authority()?;
+        // Receipt publication and exact cleanup require the ordinary strict
+        // barrier to publish their staged root-owned reclaim delta. The
+        // receipt-generation reservation barrier deliberately skips it while
+        // public raw mutation is fenced.
+        let prepared_dead_object_reclaim = if publish_pending_reclaim {
+            self.prepare_dead_object_reclaim_queue_authority()?
+        } else {
+            None
+        };
         let mut first_error = (self.options.replica_count() != self.replicas.len()).then_some(
             StoreError::InvalidOptions {
                 reason: "strict pool authority store replica is unavailable",
@@ -7012,7 +7034,7 @@ impl LocalObjectStore {
             first_error.get_or_insert(error);
         }
         for (i, replica) in self.replicas.iter_mut().enumerate() {
-            match replica.sync_strict_pool_authority() {
+            match replica.sync_pool_authority_storage(publish_pending_reclaim) {
                 Ok(()) if i < self.replica_healthy.len() => self.replica_healthy[i] = true,
                 Ok(()) => {}
                 Err(error) => {

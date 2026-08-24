@@ -2798,7 +2798,7 @@ fn verify_receipt_generation_high_water_copy(
 fn sync_receipt_generation_high_water_devices(devices: &mut [Device]) -> Result<()> {
     let mut first_error = None;
     for device in devices {
-        if let Err(error) = device.sync_strict_pool_authority() {
+        if let Err(error) = device.sync_receipt_generation_authority() {
             first_error.get_or_insert(error);
         }
     }
@@ -17312,6 +17312,55 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn receipt_generation_reservation_does_not_publish_pending_reclaim_under_fence() {
+        let root = temp_dir("receipt-generation-reservation-pending-reclaim");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+        let properties = PoolProperties::default();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+        let key = ObjectKey::from_name(b"receipt-generation-reservation-pending-reclaim");
+
+        pool.put(IoClass::Data, key, b"first lifetime").unwrap();
+        pool.put(IoClass::Data, key, b"second lifetime").unwrap();
+
+        // Replacement-receipt attachment intentionally leaves its exact
+        // physical-lifetime delta staged for the next ordinary strict Pool
+        // barrier. Force that next write across a reservation boundary: the
+        // high-water publisher must sync only its Pool-internal marker while
+        // public raw mutation is fenced, then let receipt publication carry
+        // the reclaim delta after generation authority converges.
+        let previous_reservation = pool.reserved_placement_receipt_generation_through;
+        pool.next_placement_receipt_generation = previous_reservation + 1;
+        let (_, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, b"third lifetime")
+            .expect("reserve a new receipt range with pending reclaim state");
+
+        assert_eq!(receipt.generation, previous_reservation + 1);
+        assert_eq!(
+            pool.receipt_generation_authority_state,
+            ReceiptGenerationAuthorityState::Converged
+        );
+        assert!(
+            pool.reserved_placement_receipt_generation_through >= receipt.generation,
+            "the published receipt must remain inside durable high-water authority"
+        );
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(b"third lifetime".to_vec())
+        );
+
+        pool.sync_all().unwrap();
+        drop(pool);
+        let reopened = Pool::open(config, properties, &test_options()).unwrap();
+        assert_eq!(
+            reopened.get(IoClass::Data, key).unwrap(),
+            Some(b"third lifetime".to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
