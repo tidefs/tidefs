@@ -13738,7 +13738,7 @@ impl PoolDatasetOwner {
         self.filesystem.max_uncommitted_mutations = max;
         self.filesystem
             .intent_log
-            .set_pressure_depth_threshold(usize::try_from(max).unwrap_or(usize::MAX));
+            .set_deferred_mutation_bound(usize::try_from(max).unwrap_or(usize::MAX));
         Ok(())
     }
 
@@ -20142,7 +20142,7 @@ mod recovery_integration_tests {
     }
 
     #[test]
-    fn mounted_deferred_mutation_limit_sets_intent_pressure_bound() {
+    fn mounted_deferred_mutation_limit_sets_intent_bounds() {
         let tmp = TempDir::new().expect("tempdir");
         let mut fs = LocalFileSystem::open_with_options(tmp.path(), StoreOptions::durable())
             .expect("open filesystem");
@@ -20154,6 +20154,11 @@ mod recovery_integration_tests {
             fs.filesystem.intent_log.pressure_depth_threshold(),
             64 * 1024,
             "intent pressure must not force a hidden commit below the owning mutation bound"
+        );
+        assert_eq!(
+            fs.filesystem.intent_log.max_batch_entries(),
+            64 * 1024,
+            "intent auto-flush must not force a hidden storage sync below the owning mutation bound"
         );
     }
 
