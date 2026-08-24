@@ -3924,6 +3924,41 @@ impl Device {
         self.pool_internal_candidates(crate::store::is_pool_pending_deletion_key)
     }
 
+    /// Read every physical copy slot for one exact pending-deletion key.
+    pub(crate) fn pending_deletion_candidates_for_key(
+        &self,
+        handoff_key: ObjectKey,
+    ) -> Result<Vec<Vec<u8>>> {
+        if !crate::store::is_pool_pending_deletion_key(handoff_key) {
+            return Err(StoreError::InvalidOptions {
+                reason: "pending deletion copy lookup requires a handoff key",
+            });
+        }
+        match self {
+            Self::Compressed(device) => device
+                .inner
+                .pending_deletion_candidates_for_key(handoff_key),
+            Self::Encrypted(device) => device
+                .inner
+                .pending_deletion_candidates_for_key(handoff_key),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                Ok(parity_pool_internal_candidates(
+                    device,
+                    crate::store::is_pool_pending_deletion_key,
+                )?
+                .into_iter()
+                .filter_map(|(candidate_key, payload)| {
+                    (candidate_key == handoff_key).then_some(payload)
+                })
+                .collect())
+            }
+            Self::Single(_) | Self::Mirror(_) | Self::LogDevice(_) => {
+                self.pool_internal_copy_candidates_for_key(handoff_key)
+            }
+        }
+    }
+
     pub(crate) fn sync_strict_pool_authority(&mut self) -> Result<()> {
         match self {
             Self::Single(device) => device.store.sync_strict_pool_authority(),

@@ -6538,10 +6538,7 @@ impl Pool {
         let mut carriers = Vec::new();
         for &idx in indices {
             let mut carries_receipt = false;
-            for (candidate_key, raw) in self.devices[idx].placement_receipt_candidates()? {
-                if candidate_key != receipt_key {
-                    continue;
-                }
+            for raw in self.devices[idx].placement_receipt_candidates_for_key(receipt_key)? {
                 let persisted =
                     PlacementReceipt::decode(&raw).ok_or(StoreError::InvalidOptions {
                         reason: "pending deletion preflight found a corrupt receipt carrier",
@@ -6611,14 +6608,9 @@ impl Pool {
             if self.devices[idx].sync_strict_pool_authority().is_err() {
                 continue;
             }
-            durable_copy |=
-                self.devices[idx]
-                    .pending_deletion_candidates()
-                    .is_ok_and(|candidates| {
-                        candidates.iter().any(|(candidate_key, payload)| {
-                            *candidate_key == handoff_key && payload == encoded
-                        })
-                    });
+            durable_copy |= self.devices[idx]
+                .pending_deletion_candidates_for_key(handoff_key)
+                .is_ok_and(|candidates| candidates.iter().any(|payload| payload == encoded));
         }
         if durable_copy {
             self.pending_deletions.insert(handoff_key, pending.clone());
@@ -6725,9 +6717,8 @@ impl Pool {
             self.devices[idx].delete_pool_internal(handoff_key)?;
             self.devices[idx].sync_strict_pool_authority()?;
             resolved &= self.devices[idx]
-                .pending_deletion_candidates()?
-                .iter()
-                .all(|(candidate_key, _)| *candidate_key != handoff_key);
+                .pending_deletion_candidates_for_key(handoff_key)?
+                .is_empty();
         }
         if resolved {
             self.pending_deletions.remove(&handoff_key);
@@ -6773,6 +6764,15 @@ impl Pool {
         }
 
         let newer_receipt = self.newer_receipt_superseding_deletion(pending)?;
+        self.reconcile_committed_pending_deletion_with_successor(pending, newer_receipt)
+    }
+
+    fn reconcile_committed_pending_deletion_with_successor(
+        &mut self,
+        pending: &PoolPendingDeletion,
+        newer_receipt: Option<PlacementReceipt>,
+    ) -> Result<bool> {
+        debug_assert!(pending.phase >= PendingDeletionPhase::Committed);
         if let Some(newer) = &newer_receipt {
             let indices = self.class_map.get(pending.class);
             self.verify_placement_receipt_publication(indices, newer)?;
@@ -8190,7 +8190,12 @@ impl Pool {
                 return Ok(true);
             }
 
-            if let Err(error) = self.reconcile_one_pending_deletion(&pending) {
+            // No caller can publish a successor while this fresh deletion
+            // holds exclusive Pool mutation authority. Retry and reopen paths
+            // still discover and validate successor receipts before cleanup.
+            if let Err(error) =
+                self.reconcile_committed_pending_deletion_with_successor(&pending, None)
+            {
                 eprintln!(
                     "tidefs: deletion committed for {key:?}; exact physical cleanup remains pending: {error}"
                 );
