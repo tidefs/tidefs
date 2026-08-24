@@ -13676,6 +13676,23 @@ impl PoolDatasetOwner {
         }
     }
 
+    /// Make a mounted rename reply contingent on durable root publication.
+    ///
+    /// Linux does not forward `syncfs(2)` to an ordinary `/dev/fuse` daemon:
+    /// the kernel's `fuse_conn::sync_fs` switch is enabled only by virtiofs.
+    /// The selected mounted carrier therefore gives rename a stronger
+    /// boundary and publishes the already-mutated namespace before the VFS
+    /// acknowledges it. `force_commit` restores the pre-rename mutation delta
+    /// on a failure before publication and preserves the reopen fence when the
+    /// publication outcome is uncertain.
+    pub(crate) fn commit_mounted_rename_acknowledgement(&mut self) -> Result<()> {
+        self.force_commit(())?;
+        self.store
+            .pool_mut()
+            .sync_all()
+            .map_err(FileSystemError::from)
+    }
+
     /// Synchronously publish a whole-state replacement for
     /// `rollback_to_snapshot`.
     ///

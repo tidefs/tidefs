@@ -7016,15 +7016,26 @@ impl VfsEngine for VfsLocalFileSystem {
             }
         }
 
-        self.fs
-            .borrow_mut()
-            .renameat2_with_retained_overwrite(
-                &old_path,
-                &new_path,
-                renameat2_flags,
-                retained_overwrite_inode,
-            )
-            .map_err(|e| map_errno(&e))?;
+        if let Err(error) = self.fs.borrow_mut().renameat2_with_retained_overwrite(
+            &old_path,
+            &new_path,
+            renameat2_flags,
+            retained_overwrite_inode,
+        ) {
+            // Pre-check failures do not mutate the cache, while an uncertain
+            // threshold-triggered publication can leave the new namespace
+            // live and fenced. Resetting the derived cache is safe for both.
+            self.reset_path_cache();
+            return Err(map_errno(&error));
+        }
+
+        if let Err(error) = self.fs.borrow_mut().commit_mounted_rename_acknowledgement() {
+            // A pre-publication failure restored the old namespace; a later
+            // failure may retain the new committed namespace. Rebuild derived
+            // paths from whichever state remains authoritative.
+            self.reset_path_cache();
+            return Err(map_errno(&error));
+        }
 
         if renameat2_flags == RenameAt2Flags::EXCHANGE {
             if let Some(target_record) = target_record.as_ref() {
@@ -13818,6 +13829,114 @@ mod tests {
         let looked = engine.lookup(root, b"new.txt", &ctx()).unwrap();
         assert_eq!(looked.inode_id, attr.inode_id);
         assert!(engine.lookup(root, b"old.txt", &ctx()).is_err());
+    }
+
+    #[test]
+    fn rename_acknowledgement_publishes_committed_root_before_return() {
+        let (engine, td, devices) = temp_fs_with_block_devices(2);
+        engine
+            .fs
+            .borrow_mut()
+            .set_auto_commit(false)
+            .expect("defer ordinary mounted mutations");
+        let root = engine.get_root_inode(&ctx()).expect("root inode");
+        let (_attr, fh) = engine
+            .create(root, b"pre-rename.bin", 0o644, O_RDWR, &ctx())
+            .expect("create synchronized source");
+        let payload = b"rename acknowledgement committed-root payload";
+        engine
+            .write(&fh, 0, payload, &ctx())
+            .expect("write synchronized source");
+        engine
+            .fsync(&fh, false, &ctx())
+            .expect("synchronize source bytes");
+
+        engine
+            .rename(root, b"pre-rename.bin", root, b"committed.bin", 0, &ctx())
+            .expect("acknowledge durable rename");
+
+        // Model abrupt mount-owner death: Drop must not publish state that the
+        // rename acknowledgement itself failed to make durable.
+        engine.fs.borrow_mut().arm_mutation_reopen_fence();
+        drop(engine);
+
+        let reopened = PoolDatasetOwner::open_with_block_devices(
+            td.path().join("metadata"),
+            &devices,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("reopen after acknowledged rename");
+        let reopened_engine = VfsLocalFileSystem::new(reopened);
+        let reopened_root = reopened_engine
+            .get_root_inode(&ctx())
+            .expect("reopened root inode");
+        assert_eq!(
+            reopened_engine
+                .lookup(reopened_root, b"pre-rename.bin", &ctx())
+                .unwrap_err(),
+            Errno::ENOENT,
+            "the old name must not survive an acknowledged rename",
+        );
+        let renamed = reopened_engine
+            .lookup(reopened_root, b"committed.bin", &ctx())
+            .expect("lookup committed name after reopen");
+        let reopened_fh = reopened_engine
+            .open(renamed.inode_id, O_RDONLY, &ctx())
+            .expect("open committed name after reopen");
+        assert_eq!(
+            reopened_engine
+                .read(&reopened_fh, 0, payload.len() as u32, &ctx())
+                .expect("read committed bytes after reopen"),
+            payload,
+        );
+    }
+
+    #[test]
+    fn rename_acknowledgement_prepublication_failure_restores_namespace() {
+        let (engine, _td) = temp_fs();
+        engine
+            .fs
+            .borrow_mut()
+            .set_auto_commit(false)
+            .expect("defer ordinary mounted mutations");
+        let root = engine.get_root_inode(&ctx()).expect("root inode");
+        let (_attr, fh) = engine
+            .create(root, b"retained.bin", 0o644, O_RDWR, &ctx())
+            .expect("create retained source");
+        engine
+            .write(&fh, 0, b"retained", &ctx())
+            .expect("write retained source");
+        engine
+            .fsync(&fh, false, &ctx())
+            .expect("commit retained source");
+
+        crate::persistence::inject_next_sync_failure_after_boundary(
+            crate::types::FilesystemCommitBoundary::TransactionObjectsWritten,
+        );
+        assert_eq!(
+            engine
+                .rename(root, b"retained.bin", root, b"rolled-back.bin", 0, &ctx(),)
+                .unwrap_err(),
+            Errno::EIO,
+        );
+
+        assert_eq!(
+            engine
+                .lookup(root, b"retained.bin", &ctx())
+                .expect("old name restored after failed publication")
+                .inode_id,
+            fh.inode_id,
+        );
+        assert_eq!(
+            engine.lookup(root, b"rolled-back.bin", &ctx()).unwrap_err(),
+            Errno::ENOENT,
+        );
+        engine
+            .fs
+            .borrow()
+            .mount_invariant_report()
+            .expect("rename rollback preserves namespace invariants");
     }
 
     #[test]
