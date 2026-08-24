@@ -14927,14 +14927,14 @@ impl PoolDatasetOwner {
             let transaction_id = transaction_id.ok_or(FileSystemError::CorruptState {
                 reason: "mounted commit lost its selected transaction identity",
             })?;
-            let signed_root = match persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
+            let publication = match persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
                 &mut self.store,
                 &self.filesystem.state,
                 transaction_id,
                 self.filesystem.root_authentication_key,
                 &self.filesystem.pending_snapshot_root_rewrites,
             ) {
-                Ok(root) => root,
+                Ok(publication) => publication,
                 Err(error) => {
                     if matches!(&error, FileSystemError::PublishOutcomeUncertain { .. }) {
                         self.arm_mutation_reopen_fence();
@@ -14955,7 +14955,7 @@ impl PoolDatasetOwner {
                 DatasetRootKind::Filesystem,
             )?;
             let stored_root = decode_root_commit(&stored_bytes)?;
-            if stored_root != signed_root {
+            if stored_root != publication.root {
                 return Err(FileSystemError::CorruptState {
                     reason: "canonical Pool root selected a different filesystem commit",
                 });
@@ -14970,7 +14970,11 @@ impl PoolDatasetOwner {
             // be retried, but must not restore live state behind this root.
             self.discard_mutation_delta();
             check_crash_hook(CrashInjectionPoint::CommitGroupAfterCommit);
-            self.mark_metalogue_committed(transaction_id)?;
+            self.mark_metalogue_committed(
+                transaction_id,
+                &publication.inode_write_ids,
+                &publication.directory_write_ids,
+            )?;
         }
         // Persist quota table alongside committed state
         let keyspace = self.object_keyspace();
@@ -15322,14 +15326,19 @@ impl PoolDatasetOwner {
         self.filesystem.state.dirty_content.contains(&inode_id)
     }
 
-    fn mark_metalogue_committed(&mut self, transaction_id: u64) -> Result<()> {
-        for &inode_id in &self.filesystem.state.dirty_inodes {
+    fn mark_metalogue_committed(
+        &mut self,
+        transaction_id: u64,
+        inode_write_ids: &BTreeSet<InodeId>,
+        directory_write_ids: &BTreeSet<InodeId>,
+    ) -> Result<()> {
+        for &inode_id in inode_write_ids {
             self.filesystem
                 .state
                 .last_inode_write_tx
                 .insert(inode_id, transaction_id);
         }
-        for &inode_id in &self.filesystem.state.dirty_dirs {
+        for &inode_id in directory_write_ids {
             self.filesystem
                 .state
                 .last_dir_write_tx
@@ -19736,6 +19745,54 @@ mod recovery_integration_tests {
 
     fn cleanup(path: &std::path::Path) {
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn rewritten_clean_metadata_advances_manifest_reuse_cursors() {
+        let root = temp_root("rewritten-clean-metadata-cursor");
+        let mut fs = LocalFileSystem::open_with_options(&root, test_options()).expect("open fs");
+        let source = fs
+            .create_file("/source", DEFAULT_FILE_PERMISSIONS)
+            .expect("create source file");
+        let original_directory_transaction = fs.filesystem.state.last_dir_write_tx[&ROOT_INODE_ID];
+
+        fs.set_auto_commit(false).expect("defer hard-link commit");
+        fs.link_file("/source", "/linked")
+            .expect("create deferred hard link");
+
+        // Model a lost dirty-tracking transition. Persistence must still
+        // detect the live-byte divergence, publish the current metadata, and
+        // advance its reuse cursors to the keys in that successor manifest.
+        fs.clear_metalogue_dirty_tracking()
+            .expect("clear stale dirty tracking");
+        fs.mark_inode_metadata_dirty(source.inode_id);
+        fs.do_commit()
+            .expect("publish checksum-divergent clean metadata");
+        let rewritten_transaction = fs
+            .selected_committed_root_summary()
+            .expect("read rewritten committed root")
+            .transaction_id;
+        assert_ne!(rewritten_transaction, original_directory_transaction);
+        assert_eq!(
+            fs.filesystem.state.last_dir_write_tx[&ROOT_INODE_ID], rewritten_transaction,
+            "directory reuse must follow the metadata key actually published"
+        );
+        assert_eq!(
+            fs.filesystem.state.last_inode_write_tx[&ROOT_INODE_ID], rewritten_transaction,
+            "inode reuse must follow the metadata key actually published"
+        );
+
+        fs.mark_inode_metadata_dirty(source.inode_id);
+        fs.do_commit()
+            .expect("reuse rewritten metadata in the next commit");
+        drop(fs);
+
+        let reopened = LocalFileSystem::open_with_options(&root, test_options())
+            .expect("reopen rewritten committed state");
+        assert_eq!(reopened.stat("/source").expect("stat source").nlink, 2);
+        assert_eq!(reopened.stat("/linked").expect("stat link").nlink, 2);
+        drop(reopened);
+        cleanup(&root);
     }
 
     fn namespace_create_fixture(

@@ -4932,7 +4932,8 @@ impl PoolDatasetOwner {
                         transaction_id,
                         self.filesystem.root_authentication_key,
                         &snapshot_rewrites,
-                    )?;
+                    )?
+                    .root;
                 self.store.pool_mut().sync_all()?;
                 let _ = crate::load_canonical_committed_state_for_dataset(
                     &self.store,
