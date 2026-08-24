@@ -14945,11 +14945,11 @@ impl PoolDatasetOwner {
             check_crash_hook(CrashInjectionPoint::CommitGroupAfterAppendData);
             // Re-verify the stored root commit (#870).
             check_crash_hook(CrashInjectionPoint::CommitGroupBeforeCommit);
-            // Root authentication is validated at mount time only. If
-            // in-memory state corruption propagates to disk between
-            // mount and commit, the corruption goes undetected until
-            // next mount.  Re-read the root commit we just wrote and
-            // run the same validation that mount uses.
+            // Persistence already re-read and authenticated the prepared
+            // superblock, manifest, and every changed metadata entry before
+            // publication. Re-read the canonical typed root after publication
+            // without turning each commit into a scrub of every unchanged
+            // content object.
             let stored_bytes = self.store.load_dataset_root(
                 DatasetId::from_bytes(self.filesystem.mounted_dataset_id),
                 DatasetRootKind::Filesystem,
@@ -14960,12 +14960,6 @@ impl PoolDatasetOwner {
                     reason: "canonical Pool root selected a different filesystem commit",
                 });
             }
-            let _ = load_state_from_transaction_pool_for_dataset(
-                self.store.pool_mut(),
-                DatasetId::from_bytes(self.filesystem.mounted_dataset_id),
-                &stored_root,
-                self.filesystem.root_authentication_key,
-            )?;
             // The canonical Pool root now contains every authorized snapshot
             // successor. Later fallible maintenance may be retried, but must
             // not attempt the same predecessor transition again.
