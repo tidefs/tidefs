@@ -148,6 +148,22 @@ impl<'a> PriorTransactionManifestIndex<'a> {
         Ok((entry.checksum == checksum64(current_bytes)).then(|| entry.clone()))
     }
 
+    fn contains_metadata_entry(
+        &self,
+        key: ObjectKey,
+        role: TransactionManifestObjectRole,
+    ) -> Result<bool> {
+        let Some(position) = self.positions.get(&key).copied() else {
+            return Ok(false);
+        };
+        if self.manifest.entries[position].role != role {
+            return Err(FileSystemError::CorruptState {
+                reason: "current transaction metadata key has the wrong manifest role",
+            });
+        }
+        Ok(true)
+    }
+
     fn content_entries(
         &self,
         inode: &InodeRecord,
@@ -263,7 +279,7 @@ fn validate_prepared_runtime_successor(
     root: &RootCommitRecord,
     root_authentication_key: RootAuthenticationKey,
     prior_manifest: &TransactionManifestRecord,
-) -> Result<()> {
+) -> Result<TransactionManifestRecord> {
     let authentication = validate_root_authentication_record(root, root_authentication_key)?;
     let keyspace = FilesystemObjectKeyspace::new(dataset_id);
 
@@ -355,7 +371,41 @@ fn validate_prepared_runtime_successor(
             }
         }
     }
-    Ok(())
+    Ok(manifest)
+}
+
+#[derive(Debug)]
+pub(crate) struct FilesystemStatePublication {
+    pub(crate) root: RootCommitRecord,
+    pub(crate) inode_write_ids: BTreeSet<InodeId>,
+    pub(crate) directory_write_ids: BTreeSet<InodeId>,
+}
+
+fn current_transaction_metadata_writes(
+    state: &FileSystemState,
+    manifest: &TransactionManifestRecord,
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<(BTreeSet<InodeId>, BTreeSet<InodeId>)> {
+    let index = PriorTransactionManifestIndex::new(manifest)?;
+    let mut inode_write_ids = BTreeSet::new();
+    let mut directory_write_ids = BTreeSet::new();
+    for inode in state.inodes.values() {
+        if index.contains_metadata_entry(
+            keyspace.transaction_inode(manifest.transaction_id, inode.inode_id),
+            TransactionManifestObjectRole::TransactionInode,
+        )? {
+            inode_write_ids.insert(inode.inode_id);
+        }
+        if inode.carries_child_namespace()
+            && index.contains_metadata_entry(
+                keyspace.transaction_directory(manifest.transaction_id, inode.inode_id),
+                TransactionManifestObjectRole::TransactionDirectory,
+            )?
+        {
+            directory_write_ids.insert(inode.inode_id);
+        }
+    }
+    Ok((inode_write_ids, directory_write_ids))
 }
 #[cfg(test)]
 pub(crate) fn persist_state(
@@ -409,12 +459,15 @@ pub(crate) fn persist_state_with_runtime_at_transaction(
     transaction_id: u64,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RootCommitRecord> {
-    persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
-        runtime,
-        state,
-        transaction_id,
-        root_authentication_key,
-        &BTreeMap::new(),
+    Ok(
+        persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
+            runtime,
+            state,
+            transaction_id,
+            root_authentication_key,
+            &BTreeMap::new(),
+        )?
+        .root,
     )
 }
 
@@ -432,7 +485,7 @@ pub(crate) fn persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
     transaction_id: u64,
     root_authentication_key: RootAuthenticationKey,
     expected_snapshot_predecessors: &BTreeMap<DatasetId, tidefs_pool_runtime::SnapshotRoot>,
-) -> Result<RootCommitRecord> {
+) -> Result<FilesystemStatePublication> {
     let source_dataset_id = state.dataset_id();
     let prior_manifest =
         load_authenticated_runtime_manifest(runtime, source_dataset_id, root_authentication_key)?;
@@ -443,12 +496,17 @@ pub(crate) fn persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
         root_authentication_key,
         &prior_manifest,
     )?;
-    validate_prepared_runtime_successor(
+    let successor_manifest = validate_prepared_runtime_successor(
         runtime.pool(),
         source_dataset_id,
         &signed,
         root_authentication_key,
         &prior_manifest,
+    )?;
+    let (inode_write_ids, directory_write_ids) = current_transaction_metadata_writes(
+        state,
+        &successor_manifest,
+        FilesystemObjectKeyspace::new(source_dataset_id),
     )?;
     let bytes = encode_root_commit(&signed);
     let mut snapshot_roots = Vec::new();
@@ -508,7 +566,11 @@ pub(crate) fn persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
         },
     ));
     runtime.publish_metadata_with_roots(&updates)?;
-    Ok(signed)
+    Ok(FilesystemStatePublication {
+        root: signed,
+        inode_write_ids,
+        directory_write_ids,
+    })
 }
 
 /// Write and sync a complete filesystem transaction without choosing its
