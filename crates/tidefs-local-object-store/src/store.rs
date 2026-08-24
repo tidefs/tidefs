@@ -594,6 +594,14 @@ pub struct LocalObjectStore {
     segment_created_at: Instant,
     segment_write_count: u64,
     index: BTreeMap<ObjectKey, ObjectLocation>,
+    /// Exact projection of non-internal live entries in `index`.
+    ///
+    /// These counters are updated by the same helpers that mutate the live
+    /// index and rebuilt from the index on open and wholesale replacement.
+    /// They are a lower-layer physical-placement input, not mounted capacity
+    /// authority.
+    stats_live_objects: usize,
+    stats_live_bytes: u64,
     history: BTreeMap<ObjectKey, Vec<ObjectLocation>>,
     receipt_bound_physical_lifetimes: BTreeMap<ReclaimObjectKey, ReceiptBoundPhysicalLifetime>,
     pub(crate) next_sequence: u64,
@@ -880,6 +888,22 @@ fn stats_counted_index_bytes(index: &BTreeMap<ObjectKey, ObjectLocation>) -> u64
         .filter(|(key, _)| !is_stats_internal_key(**key))
         .map(|(_, loc)| loc.payload_len)
         .sum()
+}
+
+fn stats_counted_index_totals(index: &BTreeMap<ObjectKey, ObjectLocation>) -> (usize, u64) {
+    index
+        .iter()
+        .filter(|(key, _)| !is_stats_internal_key(**key))
+        .fold((0_usize, 0_u64), |(objects, bytes), (_, location)| {
+            (
+                objects
+                    .checked_add(1)
+                    .expect("live object count remains representable"),
+                bytes
+                    .checked_add(location.payload_len)
+                    .expect("live byte count remains representable"),
+            )
+        })
 }
 
 fn encode_compaction_location(buf: &mut Vec<u8>, location: ObjectLocation) {
@@ -1804,7 +1828,7 @@ impl LocalObjectStore {
                 visible_swap_applied = true;
             }
             Some(location) if location == entry.old_location => {
-                self.index.insert(entry.key, entry.target_location);
+                self.set_index_location(entry.key, entry.target_location);
                 visible_swap_applied = true;
             }
             Some(location) if location.sequence > entry.target_location.sequence => {}
@@ -2227,6 +2251,7 @@ impl LocalObjectStore {
             .max(persisted_next_sequence);
         let receipt_bound_physical_lifetimes =
             build_receipt_bound_physical_lifetime_index(&history)?;
+        let (stats_live_objects, stats_live_bytes) = stats_counted_index_totals(&index);
 
         let root = device_path.clone();
         let segments_dir = device_path;
@@ -2251,6 +2276,8 @@ impl LocalObjectStore {
             segment_created_at: Instant::now(),
             segment_write_count: 0,
             index,
+            stats_live_objects,
+            stats_live_bytes,
             history,
             receipt_bound_physical_lifetimes,
             next_sequence,
@@ -2574,6 +2601,7 @@ impl LocalObjectStore {
         let next_sequence = next_sequence.max(next_put_sequence_after_history(&history)?);
         let receipt_bound_physical_lifetimes =
             build_receipt_bound_physical_lifetime_index(&history)?;
+        let (stats_live_objects, stats_live_bytes) = stats_counted_index_totals(&index);
         let mut store = Self {
             root,
             segments_dir,
@@ -2587,6 +2615,8 @@ impl LocalObjectStore {
             current_file,
             block_device_capacity: None,
             index,
+            stats_live_objects,
+            stats_live_bytes,
             history,
             receipt_bound_physical_lifetimes,
             current_io_class: IoClass::AsyncData,
@@ -3144,22 +3174,88 @@ impl LocalObjectStore {
         }
     }
 
+    fn set_index_location(
+        &mut self,
+        key: ObjectKey,
+        location: ObjectLocation,
+    ) -> Option<ObjectLocation> {
+        let previous = self.index.insert(key, location);
+        if is_stats_internal_key(key) {
+            return previous;
+        }
+
+        if let Some(previous) = previous {
+            self.stats_live_bytes = self
+                .stats_live_bytes
+                .checked_sub(previous.payload_len)
+                .and_then(|bytes| bytes.checked_add(location.payload_len))
+                .expect("live byte count matches the live index");
+        } else {
+            self.stats_live_objects = self
+                .stats_live_objects
+                .checked_add(1)
+                .expect("live object count remains representable");
+            self.stats_live_bytes = self
+                .stats_live_bytes
+                .checked_add(location.payload_len)
+                .expect("live byte count remains representable");
+        }
+        previous
+    }
+
+    fn remove_index_location(&mut self, key: ObjectKey) -> Option<ObjectLocation> {
+        let removed = self.index.remove(&key);
+        if let Some(location) = removed {
+            if !is_stats_internal_key(key) {
+                self.stats_live_objects = self
+                    .stats_live_objects
+                    .checked_sub(1)
+                    .expect("live object count matches the live index");
+                self.stats_live_bytes = self
+                    .stats_live_bytes
+                    .checked_sub(location.payload_len)
+                    .expect("live byte count matches the live index");
+            }
+        }
+        removed
+    }
+
+    fn replace_index(&mut self, index: BTreeMap<ObjectKey, ObjectLocation>) {
+        let (stats_live_objects, stats_live_bytes) = stats_counted_index_totals(&index);
+        self.index = index;
+        self.stats_live_objects = stats_live_objects;
+        self.stats_live_bytes = stats_live_bytes;
+    }
+
     #[must_use]
     pub fn stats(&self) -> StoreStats {
-        let mirror_live_objects = if !self.replicas.is_empty() {
-            stats_counted_index_len(&self.replicas[0].index)
-        } else {
-            0
-        };
-        let mirror_live_bytes = if !self.replicas.is_empty() {
-            stats_counted_index_bytes(&self.replicas[0].index)
-        } else {
-            0
-        };
+        debug_assert_eq!(
+            self.stats_live_objects,
+            stats_counted_index_len(&self.index),
+            "cached live object count must match the live index"
+        );
+        debug_assert_eq!(
+            self.stats_live_bytes,
+            stats_counted_index_bytes(&self.index),
+            "cached live byte count must match the live index"
+        );
+        debug_assert!(self.replicas.iter().all(|replica| {
+            replica.stats_live_objects == stats_counted_index_len(&replica.index)
+                && replica.stats_live_bytes == stats_counted_index_bytes(&replica.index)
+        }));
+
+        let mirror_live_objects = self
+            .replicas
+            .first()
+            .map_or(0, |replica| replica.stats_live_objects);
+        let mirror_live_bytes = self
+            .replicas
+            .first()
+            .map_or(0, |replica| replica.stats_live_bytes);
         let replica_live_objects: Vec<usize> = self
             .replicas
             .iter()
-            .map(|r| stats_counted_index_len(&r.index))
+            .map(|replica| replica.stats_live_objects)
             .collect();
         let last_scrub_secs = self.last_scrub.elapsed().as_secs();
         let free_segments = self.free_map.free_count();
@@ -3167,8 +3263,8 @@ impl LocalObjectStore {
         let committed_root_txg = committed_root.commit_group_id.0;
         let committed_root_generation = self.txg_manager().commit_count();
         StoreStats {
-            live_objects: stats_counted_index_len(&self.index),
-            live_bytes: stats_counted_index_bytes(&self.index),
+            live_objects: self.stats_live_objects,
+            live_bytes: self.stats_live_bytes,
             segment_count: self.replay.segment_count,
             free_segments,
             free_bytes: free_segments * self.options.max_segment_bytes,
@@ -4292,7 +4388,7 @@ impl LocalObjectStore {
             reason: "object-store physical lifetime sequence exhausted",
         })?;
         self.append_record(RecordKind::Delete, key, &[], checksum64(&[]), sequence, 0)?;
-        self.index.remove(&key);
+        self.remove_index_location(key);
         self.checksums.remove(&key);
         self.next_sequence = next_sequence;
         Ok(true)
@@ -5653,7 +5749,7 @@ impl LocalObjectStore {
         }
         self.history.entry(key).or_default().push(location);
         self.index_receipt_bound_physical_lifetime(key, location)?;
-        self.index.insert(key, location);
+        self.set_index_location(key, location);
         self.next_sequence = next_sequence;
 
         if replicate {
@@ -5880,7 +5976,7 @@ impl LocalObjectStore {
         })?;
         let empty_checksum = checksum64(&[]);
         self.append_record(RecordKind::Delete, key, &[], empty_checksum, sequence, 0)?;
-        self.index.remove(&key);
+        self.remove_index_location(key);
         self.checksums.remove(&key);
         let reclaim_key = tidefs_types_reclaim_queue_core::ObjectKey(key.0);
         let reclaim_entry = tidefs_types_reclaim_queue_core::ReclaimQueueEntry::new(
@@ -6294,7 +6390,7 @@ impl LocalObjectStore {
             }
         }
 
-        self.index.remove(&key);
+        self.remove_index_location(key);
         self.checksums.remove(&key);
         self.next_sequence = next_sequence;
         if !pool_metadata_family {
@@ -7703,7 +7799,7 @@ impl LocalObjectStore {
             .sync_all()
             .map_err(|source| io_error("block_device_compact_sync_all", &self.root, source))?;
 
-        self.index = compacted_index;
+        self.replace_index(compacted_index);
         self.history = compacted_history;
         self.receipt_bound_physical_lifetimes = compacted_lifetimes;
         self.checksums.retain(|key, _| self.index.contains_key(key));
