@@ -45,21 +45,54 @@ impl TransactionMetadataStore for LocalObjectStore {
     }
 }
 
-impl TransactionMetadataStore for Pool {
-    fn get_transaction_metadata(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
-        let receipt = self.placement_receipt_for_key(DeviceIoClass::Metadata, key)?;
-        let payload = self.get(DeviceIoClass::Metadata, key)?;
-        match (receipt, payload) {
-            (Some(_), payload) => Ok(payload),
-            (None, None) => Ok(None),
-            (None, Some(_)) => Err(FileSystemError::CorruptState {
-                reason: "filesystem transaction metadata is missing Pool placement authority",
-            }),
+fn get_pool_transaction_metadata(pool: &Pool, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+    Ok(pool
+        .get_with_current_receipt(DeviceIoClass::Metadata, key)?
+        .map(|(payload, _receipt)| payload))
+}
+
+struct PoolTransactionMetadataBatch<'a> {
+    pool: &'a mut Pool,
+    pending: BTreeMap<ObjectKey, Vec<u8>>,
+}
+
+impl<'a> PoolTransactionMetadataBatch<'a> {
+    fn new(pool: &'a mut Pool) -> Self {
+        Self {
+            pool,
+            pending: BTreeMap::new(),
         }
     }
 
+    fn finish(self) -> Result<()> {
+        maybe_inject_sync_failure_after_boundary(
+            self.pool.raw_primary_store(),
+            FilesystemCommitBoundary::TransactionObjectsWritten,
+        )?;
+        let entries = self.pending.into_iter().collect::<Vec<_>>();
+        self.pool.put_prepublication_metadata_batch(&entries)?;
+        Ok(())
+    }
+}
+
+impl TransactionMetadataStore for PoolTransactionMetadataBatch<'_> {
+    fn get_transaction_metadata(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        if let Some(payload) = self.pending.get(&key) {
+            return Ok(Some(payload.clone()));
+        }
+        get_pool_transaction_metadata(self.pool, key)
+    }
+
     fn put_transaction_metadata(&mut self, key: ObjectKey, payload: &[u8]) -> Result<()> {
-        self.put_with_receipt(DeviceIoClass::Metadata, key, payload)?;
+        if let Some(current) = self.pending.get(&key) {
+            if current.as_slice() != payload {
+                return Err(FileSystemError::CorruptState {
+                    reason: "filesystem transaction metadata repeats a key with different payload",
+                });
+            }
+            return Ok(());
+        }
+        self.pending.insert(key, payload.to_vec());
         Ok(())
     }
 }
@@ -197,12 +230,13 @@ fn load_authenticated_runtime_manifest(
     }
 
     let keyspace = FilesystemObjectKeyspace::new(dataset_id);
-    let manifest_bytes = runtime
-        .pool()
-        .get_transaction_metadata(keyspace.transaction_manifest(root.transaction_id))?
-        .ok_or(FileSystemError::CorruptState {
-            reason: "canonical filesystem transaction manifest is missing",
-        })?;
+    let manifest_bytes = get_pool_transaction_metadata(
+        runtime.pool(),
+        keyspace.transaction_manifest(root.transaction_id),
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "canonical filesystem transaction manifest is missing",
+    })?;
     if checksum64(&manifest_bytes) != root.manifest_checksum
         || root_authentication_digest(ROOT_AUTHENTICATION_MANIFEST_DOMAIN, &manifest_bytes)
             != authentication.manifest_digest
@@ -233,11 +267,11 @@ fn validate_prepared_runtime_successor(
     let authentication = validate_root_authentication_record(root, root_authentication_key)?;
     let keyspace = FilesystemObjectKeyspace::new(dataset_id);
 
-    let superblock_bytes = pool
-        .get_transaction_metadata(keyspace.transaction_superblock(root.transaction_id))?
-        .ok_or(FileSystemError::CorruptState {
-            reason: "prepared filesystem transaction superblock is missing",
-        })?;
+    let superblock_bytes =
+        get_pool_transaction_metadata(pool, keyspace.transaction_superblock(root.transaction_id))?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "prepared filesystem transaction superblock is missing",
+            })?;
     if checksum64(&superblock_bytes) != root.superblock_checksum
         || root_authentication_digest(ROOT_AUTHENTICATION_SUPERBLOCK_DOMAIN, &superblock_bytes)
             != authentication.superblock_digest
@@ -256,11 +290,11 @@ fn validate_prepared_runtime_successor(
         });
     }
 
-    let manifest_bytes = pool
-        .get_transaction_metadata(keyspace.transaction_manifest(root.transaction_id))?
-        .ok_or(FileSystemError::CorruptState {
-            reason: "prepared filesystem transaction manifest is missing",
-        })?;
+    let manifest_bytes =
+        get_pool_transaction_metadata(pool, keyspace.transaction_manifest(root.transaction_id))?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "prepared filesystem transaction manifest is missing",
+            })?;
     if checksum64(&manifest_bytes) != root.manifest_checksum
         || root_authentication_digest(ROOT_AUTHENTICATION_MANIFEST_DOMAIN, &manifest_bytes)
             != authentication.manifest_digest
@@ -302,7 +336,7 @@ fn validate_prepared_runtime_successor(
             | TransactionManifestObjectRole::TransactionDirectory
             | TransactionManifestObjectRole::TransactionSnapshotCatalogEntry
             | TransactionManifestObjectRole::TransactionExtentMap => {
-                let bytes = pool.get_transaction_metadata(entry.object_key)?.ok_or(
+                let bytes = get_pool_transaction_metadata(pool, entry.object_key)?.ok_or(
                     FileSystemError::CorruptState {
                         reason: "prepared manifest metadata entry is missing",
                     },
@@ -529,16 +563,16 @@ fn prepare_state_with_pool_at_transaction_inner(
         .transpose()?;
     let content_entries =
         pool_content_manifest_entries_for_state(pool, state, prior_index.as_ref())?;
+    let mut batch = PoolTransactionMetadataBatch::new(pool);
     let root = persist_transaction_objects_with_precomputed_content(
-        pool,
+        &mut batch,
         state,
         transaction_id,
         &content_entries,
         keyspace,
         prior_index.as_ref(),
     )?;
-    sync_pool_after_commit_boundary(pool, FilesystemCommitBoundary::TransactionObjectsWritten)
-        .map_err(FileSystemError::from)?;
+    batch.finish()?;
     sign_root_commit(&root, root_authentication_key)
 }
 
