@@ -47,12 +47,13 @@ use std::time::Instant;
 // already imported above
 use crate::compress::CompressionStats;
 use crate::io_scheduler::{IoScheduler, IoSchedulerConfig};
+#[cfg(test)]
+use crate::reclaim_queue::load_dead_object_reclaim_queue;
 use crate::reclaim_queue::{
-    load_dead_object_reclaim_queue, load_reclaim_queue_entries, load_reclaim_receipts,
-    load_segment_liveness_queue, load_snapshot_extent_pin_set, store_dead_object_reclaim_queue,
-    store_reclaim_receipts, store_snapshot_extent_pin_set, DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME,
-    RECLAIM_QUEUE_ENTRIES_OBJECT_NAME, RECLAIM_QUEUE_OBJECT_NAME, RECLAIM_RECEIPTS_OBJECT_NAME,
-    SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME,
+    load_reclaim_queue_entries, load_reclaim_receipts, load_segment_liveness_queue,
+    load_snapshot_extent_pin_set, store_reclaim_receipts, store_snapshot_extent_pin_set,
+    DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME, RECLAIM_QUEUE_ENTRIES_OBJECT_NAME,
+    RECLAIM_QUEUE_OBJECT_NAME, RECLAIM_RECEIPTS_OBJECT_NAME, SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME,
 };
 use crate::segment_builder::{FlushResult, SegmentBuilder};
 use crate::txg_manager::CommitGroupManager;
@@ -142,9 +143,11 @@ const COMPACTION_PUBLISH_MANIFEST_OBJECT_NAME: &str = "tidefs-compaction-publish
 /// maximum. It is rewritten only as part of the verified compacted prefix.
 const PHYSICAL_LIFETIME_SEQUENCE_HIGH_WATER_OBJECT_NAME: &str =
     "tidefs-physical-lifetime-sequence-high-water-v1";
-/// `sync_all()` records dirty reclaim authority through `put_named()`, which
-/// opens one commit group, then publishes its chained root on block media as
-/// the exact 48-byte payload produced by `encode_root_with_digest()`.
+/// `sync_all()` records remaining named reclaim authority through
+/// `put_named()`, which opens one commit group, then publishes its chained root
+/// on block media as the exact 48-byte payload produced by
+/// `encode_root_with_digest()`. Root-owned dead-object entries use their own
+/// focused barrier and do not consume this reserve.
 const CHAINED_COMMITTED_ROOT_PAYLOAD_LEN: u64 = 48;
 /// Well-known object name for the mounted filesystem's exact deferred-reclaim queue.
 ///
@@ -155,6 +158,14 @@ const CHAINED_COMMITTED_ROOT_PAYLOAD_LEN: u64 = 48;
 pub const FILESYSTEM_RECLAIM_QUEUE_OBJECT_NAME: &str = "tidefs-filesystem-reclaim-queue-v1";
 /// Prefix for hidden target objects staged by verified compaction rewrites.
 const COMPACTION_TARGET_KEY_PREFIX: [u8; 8] = *b"TFSCMPCT";
+/// Root-owned receipt-bound reclaim rows.
+///
+/// Each physical store root persists only the lifetimes it owns. Keeping one
+/// checksummed queue entry behind each derived key makes a transition an
+/// append of constant size instead of a rewrite of the complete growing
+/// queue. These records deliberately do not use ordinary store-replica fanout:
+/// replica roots can own different physical lifetime identities.
+const DEAD_OBJECT_RECLAIM_ENTRY_KEY_PREFIX: [u8; 8] = *b"TFSRQE1\0";
 /// Hidden Pool-owned records that make logical deletion publication replayable.
 ///
 /// The remaining 24 bytes identify one `(I/O class, object key, receipt
@@ -602,6 +613,13 @@ pub struct LocalObjectStore {
     /// barrier. The current index may already point at an unsynced append, so
     /// retry compaction must not infer old durable authority from that index.
     durable_dead_object_reclaim_queue: DeadObjectReclaimQueue,
+    /// Exact per-entry changes waiting for the next root-owned durability
+    /// barrier. Keeping this delta explicit makes the ordinary Pool barrier
+    /// proportional to newly changed lifetimes rather than the lifetime of the
+    /// complete reclaim queue.
+    dead_object_reclaim_pending_upserts: BTreeMap<ReclaimObjectKey, DeadObjectEntry>,
+    dead_object_reclaim_pending_upsert_record_bytes: u64,
+    dead_object_reclaim_pending_removals: BTreeSet<ReclaimObjectKey>,
     dead_object_reclaim_queue_dirty: bool,
     reclaim_receipts: Vec<ReclaimReceipt>,
     reclaim_receipts_dirty: bool,
@@ -781,6 +799,21 @@ fn is_compaction_target_key(key: ObjectKey) -> bool {
     key.as_bytes()[..8] == COMPACTION_TARGET_KEY_PREFIX
 }
 
+fn dead_object_reclaim_entry_state_key(object_id: ReclaimObjectKey) -> ObjectKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"TideFS dead-object reclaim entry state v1\0");
+    hasher.update(&object_id.0);
+    let mut bytes = *hasher.finalize().as_bytes();
+    bytes[..DEAD_OBJECT_RECLAIM_ENTRY_KEY_PREFIX.len()]
+        .copy_from_slice(&DEAD_OBJECT_RECLAIM_ENTRY_KEY_PREFIX);
+    ObjectKey::from_bytes32(bytes)
+}
+
+pub(crate) fn is_dead_object_reclaim_entry_state_key(key: ObjectKey) -> bool {
+    key.as_bytes()[..DEAD_OBJECT_RECLAIM_ENTRY_KEY_PREFIX.len()]
+        == DEAD_OBJECT_RECLAIM_ENTRY_KEY_PREFIX
+}
+
 pub(crate) fn is_pool_pending_deletion_key(key: ObjectKey) -> bool {
     key.as_bytes()[..8] == POOL_PENDING_DELETION_KEY_PREFIX
 }
@@ -792,7 +825,9 @@ pub(crate) fn is_strict_pool_authority_key(key: ObjectKey) -> bool {
 }
 
 fn is_pool_store_internal_key(key: ObjectKey) -> bool {
-    crate::is_pool_placement_scan_internal_key(key) || is_pool_pending_deletion_key(key)
+    crate::is_pool_placement_scan_internal_key(key)
+        || is_pool_pending_deletion_key(key)
+        || is_dead_object_reclaim_entry_state_key(key)
 }
 
 fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 8] {
@@ -812,7 +847,7 @@ fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 8] {
 }
 
 fn is_persistent_reclaim_metadata_key(key: ObjectKey) -> bool {
-    persistent_reclaim_metadata_keys().contains(&key)
+    persistent_reclaim_metadata_keys().contains(&key) || is_dead_object_reclaim_entry_state_key(key)
 }
 
 fn is_stats_internal_key(key: ObjectKey) -> bool {
@@ -1665,10 +1700,10 @@ impl LocalObjectStore {
         &mut self,
         entry: &PersistedCompactionPublishEntry,
         mark_dirty: bool,
-    ) {
+    ) -> Result<()> {
         let object_id = compaction_reclaim_key(entry.key);
         if self.compaction_source_release_receipted(object_id) {
-            return;
+            return Ok(());
         }
         let dead_entry = DeadObjectEntry::new(
             object_id,
@@ -1679,8 +1714,9 @@ impl LocalObjectStore {
         )
         .with_replacement_receipt(entry.receipt);
         if self.dead_object_reclaim_queue.enqueue(dead_entry) && mark_dirty {
-            self.dead_object_reclaim_queue_dirty = true;
+            self.stage_dead_object_reclaim_queue_delta(&[dead_entry], &[])?;
         }
+        Ok(())
     }
 
     fn build_compaction_checksum_tree(
@@ -1792,7 +1828,7 @@ impl LocalObjectStore {
             self.checksums
                 .insert(entry.key, compaction_read_verify_digest(&payload));
         }
-        self.enqueue_compaction_source_release(entry, mark_queue_dirty);
+        self.enqueue_compaction_source_release(entry, mark_queue_dirty)?;
 
         Ok(visible_swap_applied.then(|| PublishedCompactionRewrite {
             key: entry.key,
@@ -2231,6 +2267,9 @@ impl LocalObjectStore {
             reclaim_queue: BPlusTreeReclaimQueue::default(),
             dead_object_reclaim_queue: DeadObjectReclaimQueue::default(),
             durable_dead_object_reclaim_queue: DeadObjectReclaimQueue::default(),
+            dead_object_reclaim_pending_upserts: BTreeMap::new(),
+            dead_object_reclaim_pending_upsert_record_bytes: 0,
+            dead_object_reclaim_pending_removals: BTreeSet::new(),
             dead_object_reclaim_queue_dirty: false,
             reclaim_receipts: Vec::new(),
             reclaim_receipts_dirty: false,
@@ -2270,7 +2309,7 @@ impl LocalObjectStore {
         // required so a close/reopen cannot forget a deletion handoff or make
         // one physical generation eligible twice.
         store.reclaim_queue = load_reclaim_queue_entries(&store);
-        store.dead_object_reclaim_queue = load_dead_object_reclaim_queue(&store)?;
+        store.dead_object_reclaim_queue = store.load_dead_object_reclaim_queue_for_root()?;
         store.durable_dead_object_reclaim_queue = store.dead_object_reclaim_queue.clone();
         store.reclaim_receipts = load_reclaim_receipts(&store)?;
         store.snapshot_extent_pin_set = load_snapshot_extent_pin_set(&store)?;
@@ -2574,6 +2613,9 @@ impl LocalObjectStore {
             reclaim_queue: BPlusTreeReclaimQueue::new(),
             dead_object_reclaim_queue: DeadObjectReclaimQueue::new(),
             durable_dead_object_reclaim_queue: DeadObjectReclaimQueue::new(),
+            dead_object_reclaim_pending_upserts: BTreeMap::new(),
+            dead_object_reclaim_pending_upsert_record_bytes: 0,
+            dead_object_reclaim_pending_removals: BTreeSet::new(),
             dead_object_reclaim_queue_dirty: false,
             reclaim_receipts: Vec::new(),
             reclaim_receipts_dirty: false,
@@ -2619,7 +2661,7 @@ impl LocalObjectStore {
         // Restore persisted reclaim-queue entries.
         store.reclaim_queue = load_reclaim_queue_entries(&store);
         // Restore persisted receipt-bound dead-object reclaim entries.
-        store.dead_object_reclaim_queue = load_dead_object_reclaim_queue(&store)?;
+        store.dead_object_reclaim_queue = store.load_dead_object_reclaim_queue_for_root()?;
         store.durable_dead_object_reclaim_queue = store.dead_object_reclaim_queue.clone();
         // Restore committed reclaim receipt evidence.
         store.reclaim_receipts = load_reclaim_receipts(&store)?;
@@ -2632,7 +2674,13 @@ impl LocalObjectStore {
         // Initialize reclaim-queue consumer live counts from the index.
         {
             let lc = store.reclaim_consumer.live_counts_mut();
-            for loc in store.index.values() {
+            for (key, loc) in &store.index {
+                // Per-entry reclaim authority is relocated explicitly before
+                // a directory-backed segment free and is never counted on
+                // the write path. Reopen must preserve that same accounting.
+                if is_dead_object_reclaim_entry_state_key(*key) {
+                    continue;
+                }
                 let seg = loc.segment_id;
                 let c = lc.live_count(seg);
                 lc.set_live_count(seg, c.saturating_add(1));
@@ -2687,10 +2735,23 @@ impl LocalObjectStore {
             // Record partial-segment liveness in the reclaim consumer for
             // future cleaning-priority decisions.
             for summary in &scan_result.partial_segments {
+                let root_owned_reclaim_entries = store
+                    .index
+                    .iter()
+                    .filter(|(key, location)| {
+                        is_dead_object_reclaim_entry_state_key(**key)
+                            && location.segment_id == summary.segment_id
+                    })
+                    .count() as u64;
                 let lc = store.reclaim_consumer.live_counts_mut();
                 let current = lc.live_count(summary.segment_id);
                 if current == 0 {
-                    lc.set_live_count(summary.segment_id, summary.live_object_count);
+                    lc.set_live_count(
+                        summary.segment_id,
+                        summary
+                            .live_object_count
+                            .saturating_sub(root_owned_reclaim_entries),
+                    );
                 }
             }
 
@@ -3701,14 +3762,15 @@ impl LocalObjectStore {
         }
         if !receipt_covered_queue_ids.is_empty() {
             let ack_object_ids = receipt_covered_queue_ids.into_iter().collect::<Vec<_>>();
-            if self
+            let removed = self
                 .dead_object_reclaim_queue
-                .ack_reclaimed(&ack_object_ids)
-                > 0
-            {
-                self.dead_object_reclaim_queue_dirty = true;
-                self.sync_all()?;
+                .ack_reclaimed(&ack_object_ids);
+            if removed != ack_object_ids.len() {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "receipt replay queue acknowledgement was not exact",
+                });
             }
+            self.persist_dead_object_reclaim_queue_delta(&[], &ack_object_ids)?;
         }
 
         let mut physical_state_changed = false;
@@ -3846,28 +3908,29 @@ impl LocalObjectStore {
         for candidate in &candidates {
             Self::ensure_public_pool_reclaim_key_allowed(candidate.object_id)?;
         }
-        let mut candidate_queue = self.dead_object_reclaim_queue.clone();
-        let mut inserted = 0usize;
+        let mut inserted_entries = Vec::new();
         for candidate in candidates {
-            if candidate_queue.enqueue(candidate.into_dead_object_entry()) {
-                inserted += 1;
+            let entry = candidate.into_dead_object_entry();
+            if self.dead_object_reclaim_queue.enqueue(entry) {
+                inserted_entries.push(entry);
             }
         }
-        if inserted != 0 {
-            self.persist_dead_object_reclaim_queue_candidate(candidate_queue)?;
+        if !inserted_entries.is_empty() {
+            self.persist_dead_object_reclaim_queue_delta(&inserted_entries, &[])?;
         } else if self.dead_object_reclaim_queue_dirty {
-            self.sync_all()?;
+            self.sync_dead_object_reclaim_queue_authority()?;
         }
-        Ok(inserted)
+        Ok(inserted_entries.len())
     }
 
     /// Enqueue one dead object whose old placement may be retired only after
     /// replacement/base receipt evidence and commit-group stability agree.
     ///
-    /// The receipt-bearing queue state reaches [`sync_all`](Self::sync_all)
-    /// before this method returns `Ok(true)`, so a later drain cannot race an
-    /// in-memory-only receipt publication. Duplicate object ids are accepted as
-    /// idempotent replays and return `Ok(false)`.
+    /// The receipt-bearing entry reaches the root-owned reclaim barrier before
+    /// this method returns `Ok(true)`, so a later drain cannot race an
+    /// in-memory-only receipt publication or commit unrelated store state.
+    /// Duplicate object ids are accepted as idempotent replays and return
+    /// `Ok(false)`.
     pub fn enqueue_receipt_bound_dead_object(&mut self, entry: DeadObjectEntry) -> Result<bool> {
         self.ensure_pool_raw_mutation_allowed()?;
         Self::ensure_public_pool_reclaim_key_allowed(entry.object_id)?;
@@ -3890,12 +3953,11 @@ impl LocalObjectStore {
             });
         }
 
-        let mut candidate_queue = self.dead_object_reclaim_queue.clone();
-        let inserted = candidate_queue.enqueue(entry);
+        let inserted = self.dead_object_reclaim_queue.enqueue(entry);
         if inserted {
-            self.persist_dead_object_reclaim_queue_candidate(candidate_queue)?;
+            self.persist_dead_object_reclaim_queue_delta(&[entry], &[])?;
         } else if self.dead_object_reclaim_queue_dirty {
-            self.sync_all()?;
+            self.sync_dead_object_reclaim_queue_authority()?;
         }
         Ok(inserted)
     }
@@ -3920,7 +3982,83 @@ impl LocalObjectStore {
         &mut self,
         entry: DeadObjectEntry,
     ) -> Result<bool> {
-        self.enqueue_pending_receipt_bound_dead_object_authorized(entry)
+        self.ensure_pool_raw_mutation_allowed()?;
+        self.ensure_writable("stage Pool-owned receipt-bound dead object")?;
+        if entry.replacement_receipt.is_some() {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "pending receipt-bound enqueue must not include a replacement receipt",
+            });
+        }
+        let inserted = self.dead_object_reclaim_queue.enqueue(entry);
+        if inserted {
+            self.stage_dead_object_reclaim_queue_delta(&[entry], &[])?;
+        } else if self.dead_object_reclaim_queue_dirty {
+            self.stage_dead_object_reclaim_queue_delta(&[], &[])?;
+        }
+        Ok(inserted)
+    }
+
+    pub(crate) fn enqueue_pending_receipt_bound_dead_objects_pool_internal(
+        &mut self,
+        entries: &[DeadObjectEntry],
+    ) -> Result<()> {
+        for entry in entries {
+            if entry.replacement_receipt.is_some() {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "pending receipt-bound enqueue must not include a replacement receipt",
+                });
+            }
+        }
+        self.enqueue_pending_receipt_bound_dead_objects_across_store_tree(entries)
+    }
+
+    fn enqueue_pending_receipt_bound_dead_objects_across_store_tree(
+        &mut self,
+        entries: &[DeadObjectEntry],
+    ) -> Result<()> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        self.ensure_writable("enqueue pending receipt-bound dead objects")?;
+        let mut changed = Vec::new();
+        for entry in entries {
+            // The lifetime index intentionally retains historical identities
+            // until their reclaim rows are acknowledged. Resolve only the
+            // supplied exact id: rebuilding the set of all current lifetimes
+            // here would make every overwrite scan the complete write history.
+            let owned_current_lifetime = self
+                .receipt_bound_physical_lifetimes
+                .get(&entry.object_id)
+                .is_some_and(|lifetime| {
+                    self.index.get(&lifetime.logical_object_key).copied() == Some(lifetime.location)
+                });
+            if owned_current_lifetime {
+                if self.dead_object_reclaim_queue.enqueue(*entry) {
+                    changed.push(*entry);
+                }
+            }
+        }
+        let mut first_error = if !changed.is_empty() {
+            self.stage_dead_object_reclaim_queue_delta(&changed, &[])
+                .err()
+        } else if self.dead_object_reclaim_queue_dirty {
+            self.stage_dead_object_reclaim_queue_delta(&[], &[]).err()
+        } else {
+            None
+        };
+        for (index, replica) in self.replicas.iter_mut().enumerate() {
+            match replica.enqueue_pending_receipt_bound_dead_objects_across_store_tree(entries) {
+                Ok(()) if index < self.replica_healthy.len() => {
+                    self.replica_healthy[index] = true;
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    if index < self.replica_healthy.len() {
+                        self.replica_healthy[index] = false;
+                    }
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Capture the exact current append-log lifetime for a Pool-owned object.
@@ -3952,6 +4090,61 @@ impl LocalObjectStore {
             });
         }
         Ok(lifetime)
+    }
+
+    /// Capture every present current lifetime for one key across this store
+    /// and its configured replica stores.
+    ///
+    /// Missing copies are idempotent cleanup state. A configured replica that
+    /// is not open is different: its physical state is unknown, so reclaim
+    /// must remain fail-closed until that store is available.
+    pub(crate) fn current_receipt_bound_physical_lifetimes_across_stores_pool_internal(
+        &self,
+        logical_object_key: ObjectKey,
+    ) -> Result<Vec<ReceiptBoundPhysicalLifetime>> {
+        if self.replicas.is_empty() {
+            return if self.index.contains_key(&logical_object_key) {
+                Ok(vec![self
+                    .current_receipt_bound_physical_lifetime_pool_internal(
+                        logical_object_key,
+                    )?])
+            } else {
+                Ok(Vec::new())
+            };
+        }
+        let mut lifetimes = BTreeMap::new();
+        self.collect_current_receipt_bound_physical_lifetimes(logical_object_key, &mut lifetimes)?;
+        Ok(lifetimes.into_values().collect())
+    }
+
+    fn collect_current_receipt_bound_physical_lifetimes(
+        &self,
+        logical_object_key: ObjectKey,
+        lifetimes: &mut BTreeMap<ReclaimObjectKey, ReceiptBoundPhysicalLifetime>,
+    ) -> Result<()> {
+        if self.options.replica_count() != self.replicas.len() {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "receipt-bound reclaim cannot inspect an unavailable store replica",
+            });
+        }
+        if self.index.contains_key(&logical_object_key) {
+            let lifetime =
+                self.current_receipt_bound_physical_lifetime_pool_internal(logical_object_key)?;
+            if lifetimes
+                .insert(lifetime.reclaim_object_id, lifetime)
+                .is_some_and(|known| known != lifetime)
+            {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason:
+                        "receipt-bound physical lifetime identity collision across store replicas",
+                });
+            }
+        }
+        for replica in &self.replicas {
+            replica
+                .collect_current_receipt_bound_physical_lifetimes(logical_object_key, lifetimes)?;
+        }
+        Ok(())
     }
 
     fn index_receipt_bound_physical_lifetime(
@@ -3991,16 +4184,501 @@ impl LocalObjectStore {
             .copied())
     }
 
-    fn persist_dead_object_reclaim_queue_candidate(
-        &mut self,
-        candidate_queue: DeadObjectReclaimQueue,
-    ) -> Result<()> {
-        if self.block_device_mode {
-            self.ensure_block_device_authority_append_space(Some(&candidate_queue))?;
+    fn encode_dead_object_reclaim_entry_state(entry: DeadObjectEntry) -> Vec<u8> {
+        let mut queue = DeadObjectReclaimQueue::new();
+        let inserted = queue.enqueue(entry);
+        debug_assert!(inserted);
+        queue.encode()
+    }
+
+    fn decode_dead_object_reclaim_entry_state(
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<DeadObjectEntry> {
+        let queue = DeadObjectReclaimQueue::decode(payload).map_err(|_| {
+            StoreError::InvalidDeadObjectReceipt {
+                reason: "persisted dead-object reclaim entry is corrupt or unverifiable",
+            }
+        })?;
+        let entries = queue.all_entries();
+        let [entry] = entries.as_slice() else {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "persisted dead-object reclaim entry does not contain exactly one row",
+            });
+        };
+        if dead_object_reclaim_entry_state_key(entry.object_id) != key {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "persisted dead-object reclaim entry key does not match its object id",
+            });
         }
-        self.dead_object_reclaim_queue = candidate_queue;
-        self.dead_object_reclaim_queue_dirty = true;
-        self.sync_all()
+        Ok(*entry)
+    }
+
+    pub(crate) fn load_dead_object_reclaim_queue_for_root(&self) -> Result<DeadObjectReclaimQueue> {
+        let retired_snapshot_key =
+            ObjectKey::from_name(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes());
+        if self.index.contains_key(&retired_snapshot_key) {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "retired pre-release dead-object queue snapshot is unsupported",
+            });
+        }
+        let mut entries = BTreeMap::<ReclaimObjectKey, DeadObjectEntry>::new();
+
+        for (key, location) in self
+            .index
+            .iter()
+            .filter(|(key, _)| is_dead_object_reclaim_entry_state_key(**key))
+        {
+            let entry = Self::decode_dead_object_reclaim_entry_state(
+                *key,
+                &self.read_location(*location)?,
+            )?;
+            if entries.insert(entry.object_id, entry).is_some() {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "persisted dead-object reclaim entry identity is duplicated",
+                });
+            }
+        }
+
+        let mut queue = DeadObjectReclaimQueue::new();
+        for entry in entries.into_values() {
+            if !queue.enqueue(entry) {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "persisted dead-object reclaim entry identity is duplicated",
+                });
+            }
+        }
+        Ok(queue)
+    }
+
+    fn put_dead_object_reclaim_entry_state_local(&mut self, entry: DeadObjectEntry) -> Result<()> {
+        let key = dead_object_reclaim_entry_state_key(entry.object_id);
+        if let Some(location) = self.index.get(&key).copied() {
+            let known =
+                Self::decode_dead_object_reclaim_entry_state(key, &self.read_location(location)?)?;
+            if known.object_id != entry.object_id {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "dead-object reclaim entry key collision",
+                });
+            }
+        }
+        let payload = Self::encode_dead_object_reclaim_entry_state(entry);
+        let effective_payload = self.prepare_payload_with_fault_injection(&payload)?;
+        let _ = self.put_inner(key, &effective_payload, 0, false, false)?;
+        let domain_key = DomainTag::ReadVerify.derive_key();
+        self.checksums
+            .insert(key, ObjectDigest::compute(&payload, &domain_key));
+        Ok(())
+    }
+
+    fn delete_dead_object_reclaim_authority_record_local(
+        &mut self,
+        key: ObjectKey,
+    ) -> Result<bool> {
+        if key != ObjectKey::from_name(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes())
+            && !is_dead_object_reclaim_entry_state_key(key)
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "root-owned reclaim deletion requires a reclaim authority key",
+            });
+        }
+        self.ensure_writable("delete root-owned dead-object reclaim authority")?;
+        let existed = self.index.contains_key(&key);
+        if !existed {
+            return Ok(false);
+        }
+        let sequence = self.next_sequence;
+        let next_sequence = sequence.checked_add(1).ok_or(StoreError::InvalidOptions {
+            reason: "object-store physical lifetime sequence exhausted",
+        })?;
+        self.append_record(RecordKind::Delete, key, &[], checksum64(&[]), sequence, 0)?;
+        self.index.remove(&key);
+        self.checksums.remove(&key);
+        self.next_sequence = next_sequence;
+        Ok(true)
+    }
+
+    fn sync_dead_object_reclaim_root_barrier(&mut self) -> Result<()> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        self.ensure_writable("sync dead-object reclaim root authority")?;
+        let path = segment_path(&self.segments_dir, self.current_segment_id);
+        self.current_file
+            .sync_all()
+            .map_err(|source| io_error("sync dead-object reclaim authority", &path, source))?;
+        sync_directory(&self.segments_dir)?;
+        sync_directory(&self.root)
+    }
+
+    fn verify_dead_object_reclaim_entry_state_local(
+        &self,
+        expected: DeadObjectEntry,
+    ) -> Result<()> {
+        let key = dead_object_reclaim_entry_state_key(expected.object_id);
+        let location =
+            self.index
+                .get(&key)
+                .copied()
+                .ok_or(StoreError::InvalidDeadObjectReceipt {
+                    reason: "durable dead-object reclaim entry is missing after publication",
+                })?;
+        let actual =
+            Self::decode_dead_object_reclaim_entry_state(key, &self.read_location(location)?)?;
+        if actual != expected {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "durable dead-object reclaim entry differs after publication",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_dead_object_reclaim_delta(
+        &self,
+        upserts: &[DeadObjectEntry],
+        removals: &[ReclaimObjectKey],
+    ) -> Result<()> {
+        let mut touched = BTreeSet::new();
+        for entry in upserts {
+            if !touched.insert(entry.object_id) || removals.contains(&entry.object_id) {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "dead-object reclaim delta contains conflicting operations",
+                });
+            }
+            if self.dead_object_reclaim_queue.entry(&entry.object_id) != Some(*entry) {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "dead-object reclaim upsert differs from in-memory authority",
+                });
+            }
+            if let Some(durable) = self
+                .durable_dead_object_reclaim_queue
+                .entry(&entry.object_id)
+            {
+                let mut durable_base = durable;
+                durable_base.replacement_receipt = None;
+                let mut entry_base = *entry;
+                entry_base.replacement_receipt = None;
+                let monotonic = match (durable.replacement_receipt, entry.replacement_receipt) {
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                    (Some(old), Some(new)) => {
+                        new.receipt_generation > old.receipt_generation || new == old
+                    }
+                };
+                if durable_base != entry_base || !monotonic {
+                    return Err(StoreError::InvalidDeadObjectReceipt {
+                        reason: "dead-object reclaim update is not monotonic",
+                    });
+                }
+            }
+        }
+        for object_id in removals {
+            if !touched.insert(*object_id)
+                || self.dead_object_reclaim_queue.entry(object_id).is_some()
+            {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "dead-object reclaim removal differs from queue authority",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn dead_object_reclaim_queue_delta(&self) -> (Vec<DeadObjectEntry>, Vec<ReclaimObjectKey>) {
+        let durable = self
+            .durable_dead_object_reclaim_queue
+            .all_entries()
+            .into_iter()
+            .map(|entry| (entry.object_id, entry))
+            .collect::<BTreeMap<_, _>>();
+        let current = self
+            .dead_object_reclaim_queue
+            .all_entries()
+            .into_iter()
+            .map(|entry| (entry.object_id, entry))
+            .collect::<BTreeMap<_, _>>();
+        let upserts = current
+            .iter()
+            .filter_map(|(object_id, entry)| {
+                (durable.get(object_id) != Some(entry)).then_some(*entry)
+            })
+            .collect::<Vec<_>>();
+        let removals = durable
+            .keys()
+            .filter(|object_id| !current.contains_key(object_id))
+            .copied()
+            .collect::<Vec<_>>();
+        (upserts, removals)
+    }
+
+    fn dead_object_reclaim_entry_record_bytes(&self, entry: DeadObjectEntry) -> Result<u64> {
+        let payload_len = Self::encode_dead_object_reclaim_entry_state(entry).len() as u64;
+        if payload_len > self.options.max_object_bytes() {
+            return Err(StoreError::PayloadTooLarge {
+                len: payload_len,
+                max: self.options.max_object_bytes(),
+            });
+        }
+        Ok(Self::checked_record_total_len_u64(payload_len))
+    }
+
+    fn remove_dead_object_reclaim_pending_upsert(
+        &mut self,
+        object_id: &ReclaimObjectKey,
+    ) -> Result<()> {
+        let Some(entry) = self
+            .dead_object_reclaim_pending_upserts
+            .get(object_id)
+            .copied()
+        else {
+            return Ok(());
+        };
+        let record_bytes = self.dead_object_reclaim_entry_record_bytes(entry)?;
+        let retained_bytes = self
+            .dead_object_reclaim_pending_upsert_record_bytes
+            .checked_sub(record_bytes)
+            .ok_or(StoreError::InvalidDeadObjectReceipt {
+                reason: "dead-object reclaim pending reserve underflow",
+            })?;
+        self.dead_object_reclaim_pending_upserts.remove(object_id);
+        self.dead_object_reclaim_pending_upsert_record_bytes = retained_bytes;
+        Ok(())
+    }
+
+    fn insert_dead_object_reclaim_pending_upsert(&mut self, entry: DeadObjectEntry) -> Result<()> {
+        self.remove_dead_object_reclaim_pending_upsert(&entry.object_id)?;
+        let record_bytes = self.dead_object_reclaim_entry_record_bytes(entry)?;
+        let retained_bytes = self
+            .dead_object_reclaim_pending_upsert_record_bytes
+            .checked_add(record_bytes)
+            .ok_or(StoreError::NoSpace)?;
+        self.dead_object_reclaim_pending_upserts
+            .insert(entry.object_id, entry);
+        self.dead_object_reclaim_pending_upsert_record_bytes = retained_bytes;
+        Ok(())
+    }
+
+    fn merge_dead_object_reclaim_pending_delta(
+        &mut self,
+        upserts: &[DeadObjectEntry],
+        removals: &[ReclaimObjectKey],
+    ) -> Result<()> {
+        for entry in upserts {
+            self.dead_object_reclaim_pending_removals
+                .remove(&entry.object_id);
+            if self
+                .durable_dead_object_reclaim_queue
+                .entry(&entry.object_id)
+                == Some(*entry)
+            {
+                self.remove_dead_object_reclaim_pending_upsert(&entry.object_id)?;
+            } else {
+                self.insert_dead_object_reclaim_pending_upsert(*entry)?;
+            }
+        }
+        for object_id in removals {
+            self.remove_dead_object_reclaim_pending_upsert(object_id)?;
+            if self
+                .durable_dead_object_reclaim_queue
+                .entry(object_id)
+                .is_some()
+            {
+                self.dead_object_reclaim_pending_removals.insert(*object_id);
+            } else {
+                self.dead_object_reclaim_pending_removals.remove(object_id);
+            }
+        }
+        self.dead_object_reclaim_queue_dirty = !self.dead_object_reclaim_pending_upserts.is_empty()
+            || !self.dead_object_reclaim_pending_removals.is_empty();
+        Ok(())
+    }
+
+    fn rebuild_dead_object_reclaim_pending_delta(&mut self) -> Result<()> {
+        let (upserts, removals) = self.dead_object_reclaim_queue_delta();
+        self.dead_object_reclaim_pending_upserts.clear();
+        self.dead_object_reclaim_pending_upsert_record_bytes = 0;
+        self.dead_object_reclaim_pending_removals.clear();
+        self.merge_dead_object_reclaim_pending_delta(&upserts, &removals)
+    }
+
+    fn stage_dead_object_reclaim_queue_delta(
+        &mut self,
+        upserts: &[DeadObjectEntry],
+        removals: &[ReclaimObjectKey],
+    ) -> Result<()> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        self.validate_dead_object_reclaim_delta(upserts, removals)?;
+        self.merge_dead_object_reclaim_pending_delta(upserts, removals)?;
+
+        if !self.block_device_mode || !self.dead_object_reclaim_queue_dirty {
+            return Ok(());
+        }
+
+        // Pool-internal transitions may stage several changes before the
+        // existing strict Pool barrier. Reserve for the complete current
+        // delta so a later receipt publication cannot discover ENOSPC only
+        // after it has overwritten the old logical object.
+        let pending_upsert_record_bytes = self.dead_object_reclaim_pending_upsert_record_bytes;
+        let pending_removal_count = self.dead_object_reclaim_pending_removals.len();
+        self.ensure_block_device_dead_object_queue_delta_space(
+            pending_upsert_record_bytes,
+            pending_removal_count,
+        )
+    }
+
+    fn prepare_dead_object_reclaim_queue_authority(
+        &mut self,
+    ) -> Result<Option<(Vec<DeadObjectEntry>, Vec<ReclaimObjectKey>)>> {
+        if !self.dead_object_reclaim_queue_dirty {
+            return Ok(None);
+        }
+        self.ensure_pool_raw_mutation_allowed()?;
+        // Direct dirty-state construction is restricted to focused fault-cut
+        // tests. Reconstruct once if it occurs; ordinary production mutations
+        // always retain their exact pending delta as they change the queue.
+        if self.dead_object_reclaim_pending_upserts.is_empty()
+            && self.dead_object_reclaim_pending_removals.is_empty()
+        {
+            self.rebuild_dead_object_reclaim_pending_delta()?;
+            if !self.dead_object_reclaim_queue_dirty {
+                return Ok(None);
+            }
+        }
+        let upserts = self
+            .dead_object_reclaim_pending_upserts
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        let removals = self
+            .dead_object_reclaim_pending_removals
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        self.validate_dead_object_reclaim_delta(&upserts, &removals)?;
+        if self.block_device_mode {
+            let pending_upsert_record_bytes = self.dead_object_reclaim_pending_upsert_record_bytes;
+            let pending_removal_count = self.dead_object_reclaim_pending_removals.len();
+            self.ensure_block_device_dead_object_queue_delta_space(
+                pending_upsert_record_bytes,
+                pending_removal_count,
+            )?;
+        }
+        for entry in &upserts {
+            self.put_dead_object_reclaim_entry_state_local(*entry)?;
+        }
+        for object_id in &removals {
+            let key = dead_object_reclaim_entry_state_key(*object_id);
+            self.delete_dead_object_reclaim_authority_record_local(key)?;
+        }
+        Ok(Some((upserts, removals)))
+    }
+
+    fn finish_dead_object_reclaim_queue_authority(
+        &mut self,
+        upserts: &[DeadObjectEntry],
+        removals: &[ReclaimObjectKey],
+    ) -> Result<()> {
+        for entry in upserts {
+            self.verify_dead_object_reclaim_entry_state_local(*entry)?;
+        }
+        for object_id in removals {
+            if self
+                .index
+                .contains_key(&dead_object_reclaim_entry_state_key(*object_id))
+            {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "acknowledged dead-object reclaim entry remained after publication",
+                });
+            }
+        }
+        if !upserts.iter().all(|entry| {
+            self.dead_object_reclaim_pending_upserts
+                .get(&entry.object_id)
+                == Some(entry)
+        }) || !removals.iter().all(|object_id| {
+            self.dead_object_reclaim_pending_removals
+                .contains(object_id)
+                && self
+                    .durable_dead_object_reclaim_queue
+                    .entry(object_id)
+                    .is_some()
+        }) {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "published dead-object reclaim delta differs from pending authority",
+            });
+        }
+
+        for entry in upserts {
+            if self
+                .durable_dead_object_reclaim_queue
+                .entry(&entry.object_id)
+                != Some(*entry)
+            {
+                if self
+                    .durable_dead_object_reclaim_queue
+                    .entry(&entry.object_id)
+                    .is_some()
+                    && self
+                        .durable_dead_object_reclaim_queue
+                        .ack_reclaimed(&[entry.object_id])
+                        != 1
+                {
+                    return Err(StoreError::InvalidDeadObjectReceipt {
+                        reason: "durable dead-object reclaim update was not exact",
+                    });
+                }
+                if !self.durable_dead_object_reclaim_queue.enqueue(*entry) {
+                    return Err(StoreError::InvalidDeadObjectReceipt {
+                        reason: "durable dead-object reclaim upsert was not exact",
+                    });
+                }
+            }
+        }
+        for object_id in removals {
+            if self
+                .durable_dead_object_reclaim_queue
+                .ack_reclaimed(&[*object_id])
+                != 1
+            {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "durable dead-object reclaim removal was not exact",
+                });
+            }
+        }
+        for entry in upserts {
+            self.remove_dead_object_reclaim_pending_upsert(&entry.object_id)?;
+        }
+        for object_id in removals {
+            self.dead_object_reclaim_pending_removals.remove(object_id);
+        }
+        self.dead_object_reclaim_queue_dirty = !self.dead_object_reclaim_pending_upserts.is_empty()
+            || !self.dead_object_reclaim_pending_removals.is_empty();
+        Ok(())
+    }
+
+    fn persist_dead_object_reclaim_queue_delta(
+        &mut self,
+        upserts: &[DeadObjectEntry],
+        removals: &[ReclaimObjectKey],
+    ) -> Result<()> {
+        self.stage_dead_object_reclaim_queue_delta(upserts, removals)?;
+        self.sync_dead_object_reclaim_queue_authority()
+    }
+
+    fn sync_dead_object_reclaim_queue_authority(&mut self) -> Result<()> {
+        let Some((upserts, removals)) = self.prepare_dead_object_reclaim_queue_authority()? else {
+            return Ok(());
+        };
+        self.sync_dead_object_reclaim_root_barrier()?;
+        self.finish_dead_object_reclaim_queue_authority(&upserts, &removals)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_dead_object_reclaim_queue_for_test(
+        &mut self,
+        queue: &DeadObjectReclaimQueue,
+    ) -> Result<()> {
+        self.dead_object_reclaim_queue = queue.clone();
+        self.rebuild_dead_object_reclaim_pending_delta()?;
+        self.sync_dead_object_reclaim_queue_authority()
     }
 
     /// Return every Pool-owned reclaim row that resolves to `logical_key`.
@@ -4048,10 +4726,7 @@ impl LocalObjectStore {
         &self,
         object_id: &ReclaimObjectKey,
     ) -> Option<DeadObjectEntry> {
-        self.dead_object_reclaim_queue
-            .all_entries()
-            .into_iter()
-            .find(|entry| &entry.object_id == object_id)
+        self.dead_object_reclaim_queue.entry(object_id)
     }
 
     fn enqueue_pending_receipt_bound_dead_object_authorized(
@@ -4065,12 +4740,11 @@ impl LocalObjectStore {
             });
         }
 
-        let mut candidate_queue = self.dead_object_reclaim_queue.clone();
-        let inserted = candidate_queue.enqueue(entry);
+        let inserted = self.dead_object_reclaim_queue.enqueue(entry);
         if inserted {
-            self.persist_dead_object_reclaim_queue_candidate(candidate_queue)?;
+            self.persist_dead_object_reclaim_queue_delta(&[entry], &[])?;
         } else if self.dead_object_reclaim_queue_dirty {
-            self.sync_all()?;
+            self.sync_dead_object_reclaim_queue_authority()?;
         }
         Ok(inserted)
     }
@@ -4102,7 +4776,86 @@ impl LocalObjectStore {
         object_id: &ReclaimObjectKey,
         receipt: DeadObjectReplacementReceipt,
     ) -> Result<bool> {
-        self.publish_dead_object_replacement_receipt_authorized(object_id, receipt)
+        self.ensure_pool_raw_mutation_allowed()?;
+        self.ensure_writable("stage Pool-owned dead-object replacement receipt")?;
+        if !receipt.authorizes_reclaim_for(*object_id) {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "replacement receipt does not authorize this object",
+            });
+        }
+        let updated = self
+            .dead_object_reclaim_queue
+            .publish_replacement_receipt(object_id, receipt);
+        if updated {
+            let entry = self.dead_object_reclaim_queue.entry(object_id).ok_or(
+                StoreError::InvalidDeadObjectReceipt {
+                    reason: "replacement receipt update lost its queue entry",
+                },
+            )?;
+            self.stage_dead_object_reclaim_queue_delta(&[entry], &[])?;
+        } else if self.dead_object_reclaim_queue_dirty {
+            self.stage_dead_object_reclaim_queue_delta(&[], &[])?;
+        }
+        Ok(updated)
+    }
+
+    pub(crate) fn publish_dead_object_replacement_receipts_pool_internal(
+        &mut self,
+        receipts: &[(ReclaimObjectKey, DeadObjectReplacementReceipt)],
+    ) -> Result<()> {
+        for (object_id, receipt) in receipts {
+            if !receipt.authorizes_reclaim_for(*object_id) {
+                return Err(StoreError::InvalidDeadObjectReceipt {
+                    reason: "replacement receipt does not authorize this object",
+                });
+            }
+        }
+        self.publish_dead_object_replacement_receipts_across_store_tree(receipts)
+    }
+
+    fn publish_dead_object_replacement_receipts_across_store_tree(
+        &mut self,
+        receipts: &[(ReclaimObjectKey, DeadObjectReplacementReceipt)],
+    ) -> Result<()> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        self.ensure_writable("publish dead-object replacement receipts")?;
+        let mut changed = Vec::new();
+        for (object_id, receipt) in receipts {
+            if self
+                .dead_object_reclaim_queue
+                .publish_replacement_receipt(object_id, *receipt)
+            {
+                let entry = self.dead_object_reclaim_queue.entry(object_id).ok_or(
+                    StoreError::InvalidDeadObjectReceipt {
+                        reason: "replacement receipt update lost its queue entry",
+                    },
+                )?;
+                changed.push(entry);
+            }
+        }
+        let mut first_error = if !changed.is_empty() {
+            self.stage_dead_object_reclaim_queue_delta(&changed, &[])
+                .err()
+        } else if self.dead_object_reclaim_queue_dirty {
+            self.stage_dead_object_reclaim_queue_delta(&[], &[]).err()
+        } else {
+            None
+        };
+        for (index, replica) in self.replicas.iter_mut().enumerate() {
+            match replica.publish_dead_object_replacement_receipts_across_store_tree(receipts) {
+                Ok(()) if index < self.replica_healthy.len() => {
+                    self.replica_healthy[index] = true;
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    if index < self.replica_healthy.len() {
+                        self.replica_healthy[index] = false;
+                    }
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn publish_dead_object_replacement_receipt_authorized(
@@ -4116,12 +4869,18 @@ impl LocalObjectStore {
                 reason: "replacement receipt does not authorize this object",
             });
         }
-        let mut candidate_queue = self.dead_object_reclaim_queue.clone();
-        let updated = candidate_queue.publish_replacement_receipt(object_id, receipt);
+        let updated = self
+            .dead_object_reclaim_queue
+            .publish_replacement_receipt(object_id, receipt);
         if updated {
-            self.persist_dead_object_reclaim_queue_candidate(candidate_queue)?;
+            let entry = self.dead_object_reclaim_queue.entry(object_id).ok_or(
+                StoreError::InvalidDeadObjectReceipt {
+                    reason: "replacement receipt update lost its queue entry",
+                },
+            )?;
+            self.persist_dead_object_reclaim_queue_delta(&[entry], &[])?;
         } else if self.dead_object_reclaim_queue_dirty {
-            self.sync_all()?;
+            self.sync_dead_object_reclaim_queue_authority()?;
         }
         Ok(updated)
     }
@@ -4131,7 +4890,8 @@ impl LocalObjectStore {
     ///
     /// Selected entries pass through `ReclaimConsumerService` before this method
     /// acknowledges them in the persisted dead-object queue. Completed stats are
-    /// returned only after the acknowledged queue state reaches `sync_all()`.
+    /// returned only after the exact per-entry acknowledgements cross the
+    /// root-owned reclaim barrier and the authorized physical release is synced.
     pub fn drain_receipt_bound_dead_objects_at_stable_generation(
         &mut self,
         stable_committed_txg: u64,
@@ -4160,6 +4920,45 @@ impl LocalObjectStore {
             max_count,
             true,
         )
+    }
+
+    pub(crate) fn drain_receipt_bound_dead_objects_across_stores_pool_internal(
+        &mut self,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+        max_count: usize,
+    ) -> std::result::Result<
+        Vec<tidefs_reclaim::ReclaimConsumerStats>,
+        ReceiptBoundDeadObjectDrainError,
+    > {
+        let mut remaining = max_count;
+        let mut results = Vec::new();
+        let primary = self.drain_receipt_bound_dead_objects_at_stable_generation_pool_internal(
+            stable_committed_txg,
+            stable_committed_generation,
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(primary.entries_processed);
+        results.push(primary);
+        for replica in &mut self.replicas {
+            if remaining == 0 {
+                break;
+            }
+            let replica_results = replica
+                .drain_receipt_bound_dead_objects_across_stores_pool_internal(
+                    stable_committed_txg,
+                    stable_committed_generation,
+                    remaining,
+                )?;
+            remaining = remaining.saturating_sub(
+                replica_results
+                    .iter()
+                    .map(|stats| stats.entries_processed)
+                    .sum::<usize>(),
+            );
+            results.extend(replica_results);
+        }
+        Ok(results)
     }
 
     fn drain_receipt_bound_dead_objects_authorized(
@@ -4224,10 +5023,20 @@ impl LocalObjectStore {
             .map(|(key, location)| Ok((*key, self.read_location(*location)?)))
             .collect::<Result<_>>()?;
         if !reserved_copies.is_empty() {
+            let mut relocated_reclaim_entries = Vec::new();
             for (key, payload) in reserved_copies {
-                self.put_direct(key, &payload)?;
+                if is_dead_object_reclaim_entry_state_key(key) {
+                    let entry = Self::decode_dead_object_reclaim_entry_state(key, &payload)?;
+                    self.put_dead_object_reclaim_entry_state_local(entry)?;
+                    relocated_reclaim_entries.push(entry);
+                } else {
+                    self.put_direct(key, &payload)?;
+                }
             }
             self.sync_all()?;
+            for entry in relocated_reclaim_entries {
+                self.verify_dead_object_reclaim_entry_state_local(entry)?;
+            }
         }
 
         let queue_snapshot = self.dead_object_reclaim_queue.clone();
@@ -4341,12 +5150,10 @@ impl LocalObjectStore {
             }
             .into());
         }
-        self.dead_object_reclaim_queue_dirty = true;
-
         // Phase two: make the exact receipt-covered acknowledgement durable
         // before allocator or segment-file state can change. A crash after
         // this barrier replays the durable receipt idempotently.
-        self.sync_all()?;
+        self.persist_dead_object_reclaim_queue_delta(&[], &drain.ack_object_ids)?;
 
         // Phase three: only now expose the reclaimed segment to the allocator
         // and release its file capacity. Keep the lock-free counter exact by
@@ -4409,22 +5216,16 @@ impl LocalObjectStore {
             });
         }
 
-        let mut acknowledged_queue = self.dead_object_reclaim_queue.clone();
-        if acknowledged_queue.ack_reclaimed(&acknowledged) != acknowledged.len() {
+        if self.dead_object_reclaim_queue.ack_reclaimed(&acknowledged) != acknowledged.len() {
             return Err(StoreError::InvalidOptions {
                 reason: "block-device reclaim queue acknowledgement was not exact",
             });
         }
 
-        // If the acknowledgement record itself cannot append, compact first
-        // while the old durable queue is still installed. That rewrite must
-        // retain every row we are about to acknowledge. Only after enough
-        // headroom exists do we publish the smaller queue and cross its sync
-        // barrier. A crash before a later compaction is a conservative leak.
-        self.ensure_block_device_authority_append_space(Some(&acknowledged_queue))?;
-        self.dead_object_reclaim_queue = acknowledged_queue;
-        self.dead_object_reclaim_queue_dirty = true;
-        self.sync_all()?;
+        // Publish exact per-entry tombstones before a later block-log
+        // compaction may omit the acknowledged physical histories. A crash
+        // before that compaction is a conservative leak.
+        self.persist_dead_object_reclaim_queue_delta(&[], &acknowledged)?;
 
         Ok(tidefs_reclaim::ReclaimConsumerStats {
             entries_processed: entries.len(),
@@ -4730,7 +5531,7 @@ impl LocalObjectStore {
     /// Core write path shared by [`put`](Self::put) and [`put_direct`](Self::put_direct).
     ///
     /// Handles I/O admission, payload size validation, segment append,
-    /// index update, and replica fan-out. Callers are responsible for
+    /// index update, and optional replica fan-out. Callers are responsible for
     /// fault injection (before) and commit_group tracking (after).
     /// When `track_liveness` is false (internal system objects), the
     /// reclaim consumer live-count is not incremented.
@@ -4740,6 +5541,7 @@ impl LocalObjectStore {
         payload: &[u8],
         compression_algorithm: u8,
         track_liveness: bool,
+        replicate: bool,
     ) -> Result<StoredObject> {
         // I/O class admission: when the scheduler refuses, apply soft backpressure
         // (a brief yield) so bulk I/O slows down without hard-failing callers.
@@ -4854,47 +5656,50 @@ impl LocalObjectStore {
         self.index.insert(key, location);
         self.next_sequence = next_sequence;
 
-        // Fan out to all replica stores.
-        let total_replicas = self.replicas.len();
-        let quorum = self.replica_quorum();
-        let mut replica_acks: usize = 0;
-        for (i, replica) in self.replicas.iter_mut().enumerate() {
-            // Replicas receive the original payload (fault injection only
-            // affects the primary write path, matching the original behavior).
-            let replica_result = if internal_metadata {
-                replica.put_preencoded_internal(key, payload, compression_algorithm)
-            } else {
-                replica.put(key, payload)
-            };
-            if replica_result.is_ok() {
-                replica_acks = replica_acks.saturating_add(1);
-                if i < self.replica_healthy.len() && !self.replica_healthy[i] {
-                    self.replica_healthy[i] = true;
+        if replicate {
+            // Fan out ordinary logical objects and replica-consensus Pool
+            // authority to every configured store replica.
+            let total_replicas = self.replicas.len();
+            let quorum = self.replica_quorum();
+            let mut replica_acks: usize = 0;
+            for (i, replica) in self.replicas.iter_mut().enumerate() {
+                // Replicas receive the original payload (fault injection only
+                // affects the primary write path, matching the original behavior).
+                let replica_result = if internal_metadata {
+                    replica.put_preencoded_internal(key, payload, compression_algorithm)
+                } else {
+                    replica.put(key, payload)
+                };
+                if replica_result.is_ok() {
+                    replica_acks = replica_acks.saturating_add(1);
+                    if i < self.replica_healthy.len() && !self.replica_healthy[i] {
+                        self.replica_healthy[i] = true;
+                    }
+                } else if i < self.replica_healthy.len() {
+                    self.replica_healthy[i] = false;
                 }
-            } else if i < self.replica_healthy.len() {
-                self.replica_healthy[i] = false;
             }
-        }
 
-        let ack_total = 1 + replica_acks;
-        self.last_replicated_write = Some(if ack_total >= quorum {
-            if replica_acks == total_replicas {
-                crate::ReplicatedWriteResult::committed(total_replicas, quorum)
+            let ack_total = 1 + replica_acks;
+            self.last_replicated_write = Some(if ack_total >= quorum {
+                if replica_acks == total_replicas {
+                    crate::ReplicatedWriteResult::committed(total_replicas, quorum)
+                } else {
+                    crate::ReplicatedWriteResult::degraded(
+                        replica_acks,
+                        total_replicas,
+                        quorum,
+                        self.replica_healthy.clone(),
+                    )
+                }
             } else {
-                crate::ReplicatedWriteResult::degraded(
-                    replica_acks,
+                crate::ReplicatedWriteResult::refused(
                     total_replicas,
                     quorum,
                     self.replica_healthy.clone(),
                 )
-            }
-        } else {
-            crate::ReplicatedWriteResult::refused(
-                total_replicas,
-                quorum,
-                self.replica_healthy.clone(),
-            )
-        });
+            });
+        }
 
         Ok(StoredObject {
             key,
@@ -4972,6 +5777,7 @@ impl LocalObjectStore {
             &stored_payload,
             compression_algorithm,
             !pool_metadata_family,
+            true,
         )?;
         if pool_metadata_family
             && self
@@ -5048,7 +5854,7 @@ impl LocalObjectStore {
         payload: &[u8],
         compression_algorithm: u8,
     ) -> Result<StoredObject> {
-        self.put_inner(key, payload, compression_algorithm, false)
+        self.put_inner(key, payload, compression_algorithm, false, true)
     }
 
     /// Write a named object directly to the segment without commit_group tracking.
@@ -5056,7 +5862,7 @@ impl LocalObjectStore {
     /// Used internally by the commit_group commit path to persist journal records
     /// and committed roots without recursing into the commit_group accumulator.
     pub(crate) fn put_direct(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
-        self.put_inner(key, payload, 0, false)
+        self.put_inner(key, payload, 0, false, true)
     }
 
     /// Return the per-object BLAKE3 domain-separated checksum for `key`,
@@ -5656,8 +6462,13 @@ impl LocalObjectStore {
             .iter()
             .filter(|(key, _, _)| protected_keys.contains(key))
             .count();
+        let mut relocated_reclaim_entries = Vec::new();
         for (key, internal_key, bytes) in retained_copies {
-            if internal_key {
+            if is_dead_object_reclaim_entry_state_key(key) {
+                let entry = Self::decode_dead_object_reclaim_entry_state(key, &bytes)?;
+                self.put_dead_object_reclaim_entry_state_local(entry)?;
+                relocated_reclaim_entries.push(entry);
+            } else if internal_key {
                 self.put_direct(key, &bytes)?;
             } else {
                 self.put(key, &bytes)?;
@@ -5699,6 +6510,9 @@ impl LocalObjectStore {
         )?;
 
         self.sync_all()?;
+        for entry in relocated_reclaim_entries {
+            self.verify_dead_object_reclaim_entry_state_local(entry)?;
+        }
         // Segment retirement can remove the history that suppresses
         // already-applied intent-log writes during replay.
         self.mark_committed_intent_log_segments_replayed_for_compaction()?;
@@ -6018,23 +6832,16 @@ impl LocalObjectStore {
     pub fn sync_all(&mut self) -> Result<()> {
         self.ensure_pool_raw_mutation_allowed()?;
         self.ensure_writable("sync_all")?;
+        // Pool-internal reclaim changes join this existing store commit
+        // boundary instead of crossing a separate fsync per queue transition.
+        let prepared_dead_object_reclaim = self.prepare_dead_object_reclaim_queue_authority()?;
         if self.block_device_mode
-            && (self.dead_object_reclaim_queue_dirty
-                || self.reclaim_receipts_dirty
-                || self.snapshot_extent_pin_set_dirty)
+            && (self.reclaim_receipts_dirty || self.snapshot_extent_pin_set_dirty)
         {
-            self.ensure_block_device_authority_append_space(None)?;
+            self.ensure_block_device_authority_append_space()?;
         }
-        let dead_object_reclaim_queue_dirty = self.dead_object_reclaim_queue_dirty;
         let reclaim_receipts_dirty = self.reclaim_receipts_dirty;
         let snapshot_extent_pin_set_dirty = self.snapshot_extent_pin_set_dirty;
-        if dead_object_reclaim_queue_dirty {
-            // Keep the complete queue installed while its named-object update
-            // appends. In particular, an ENOSPC path must never observe an
-            // empty in-memory queue and compact away a still-durable row.
-            let queue = self.dead_object_reclaim_queue.clone();
-            store_dead_object_reclaim_queue(&queue, self)?;
-        }
 
         if reclaim_receipts_dirty {
             let receipts = self.reclaim_receipts.clone();
@@ -6055,10 +6862,6 @@ impl LocalObjectStore {
         // and pin objects cross this barrier. Auto-compaction is suppressed
         // while any of these flags is set, so omission can only consume a
         // queue acknowledgement that is already durable.
-        if dead_object_reclaim_queue_dirty {
-            self.durable_dead_object_reclaim_queue = self.dead_object_reclaim_queue.clone();
-            self.dead_object_reclaim_queue_dirty = false;
-        }
         if reclaim_receipts_dirty {
             self.reclaim_receipts_dirty = false;
         }
@@ -6085,6 +6888,9 @@ impl LocalObjectStore {
         }
 
         sync_directory(&self.root)?;
+        if let Some((upserts, removals)) = prepared_dead_object_reclaim {
+            self.finish_dead_object_reclaim_queue_authority(&upserts, &removals)?;
+        }
 
         // Commit the current commit_group and persist the committed root.
         match self.commit_group.commit_current() {
@@ -6187,6 +6993,9 @@ impl LocalObjectStore {
 
     pub(crate) fn sync_strict_pool_authority(&mut self) -> Result<()> {
         self.ensure_writable("sync strict pool authority")?;
+        // Receipt publication and exact cleanup already require this strict
+        // barrier, so publish their staged root-owned reclaim delta here.
+        let prepared_dead_object_reclaim = self.prepare_dead_object_reclaim_queue_authority()?;
         let mut first_error = (self.options.replica_count() != self.replicas.len()).then_some(
             StoreError::InvalidOptions {
                 reason: "strict pool authority store replica is unavailable",
@@ -6216,6 +7025,15 @@ impl LocalObjectStore {
         }
         if let Err(error) = sync_directory(&self.root) {
             first_error.get_or_insert(error);
+        }
+        if first_error.is_none() {
+            if let Some((upserts, removals)) = prepared_dead_object_reclaim {
+                if let Err(error) =
+                    self.finish_dead_object_reclaim_queue_authority(&upserts, &removals)
+                {
+                    first_error.get_or_insert(error);
+                }
+            }
         }
 
         first_error.map_or(Ok(()), Err)
@@ -6870,7 +7688,11 @@ impl LocalObjectStore {
         self.reclaim_queue.clear();
         self.segment_liveness.clear();
 
-        let live_count = self.index.len() as u64;
+        let live_count = self
+            .index
+            .keys()
+            .filter(|key| !is_dead_object_reclaim_entry_state_key(**key))
+            .count() as u64;
         self.reclaim_consumer.live_counts_mut().remove(0);
         if live_count > 0 {
             self.reclaim_consumer
@@ -6976,16 +7798,8 @@ impl LocalObjectStore {
         Ok(())
     }
 
-    fn block_device_authority_payload_lengths(
-        &self,
-        dead_object_queue: Option<&DeadObjectReclaimQueue>,
-    ) -> Result<Vec<u64>> {
+    fn block_device_authority_payload_lengths(&self) -> Result<Vec<u64>> {
         let mut payload_lengths = Vec::new();
-        if let Some(queue) = dead_object_queue {
-            payload_lengths.push(queue.encode().len() as u64);
-        } else if self.dead_object_reclaim_queue_dirty {
-            payload_lengths.push(self.dead_object_reclaim_queue.encode().len() as u64);
-        }
         if self.reclaim_receipts_dirty {
             let payload_len = self
                 .reclaim_receipts
@@ -7012,13 +7826,9 @@ impl LocalObjectStore {
         Ok(payload_lengths)
     }
 
-    fn ensure_block_device_authority_append_space(
-        &mut self,
-        candidate_dead_object_queue: Option<&DeadObjectReclaimQueue>,
-    ) -> Result<()> {
+    fn ensure_block_device_authority_append_space(&mut self) -> Result<()> {
         debug_assert!(self.block_device_mode);
-        let payload_lengths =
-            self.block_device_authority_payload_lengths(candidate_dead_object_queue)?;
+        let payload_lengths = self.block_device_authority_payload_lengths()?;
         if payload_lengths.is_empty() {
             return Ok(());
         }
@@ -7046,10 +7856,9 @@ impl LocalObjectStore {
             return Ok(());
         }
 
-        // Retain the union of the old durable queue, current in-memory queue,
-        // and a not-yet-installed candidate queue. This lets authority growth
-        // recover append space without either dropping the new lifetime or
-        // consuming an acknowledgement that has not reached durable media.
+        // Retain pending dead-object lifetimes while named receipt or pin
+        // authority recovers append space. Dead-object entry deltas preflight
+        // their own constant-sized records through the focused helper.
         let mut pending_reclaim_object_ids = BTreeSet::new();
         for entry in self.durable_dead_object_reclaim_queue.all_entries() {
             pending_reclaim_object_ids.insert(entry.object_id);
@@ -7057,10 +7866,60 @@ impl LocalObjectStore {
         for entry in self.dead_object_reclaim_queue.all_entries() {
             pending_reclaim_object_ids.insert(entry.object_id);
         }
-        if let Some(queue) = candidate_dead_object_queue {
-            for entry in queue.all_entries() {
-                pending_reclaim_object_ids.insert(entry.object_id);
-            }
+        let live_locations = self.index.iter().map(|(key, loc)| (*key, *loc)).collect();
+        self.compact_block_device_locations_with_pending_reclaim(
+            live_locations,
+            &pending_reclaim_object_ids,
+        )?;
+        let usable_end = self.block_device_usable_end()?;
+        if self
+            .current_offset
+            .checked_add(append_reserve)
+            .is_some_and(|end| end <= usable_end)
+        {
+            Ok(())
+        } else {
+            Err(StoreError::NoSpace)
+        }
+    }
+
+    fn ensure_block_device_dead_object_queue_delta_space(
+        &mut self,
+        upsert_record_bytes: u64,
+        deletion_count: usize,
+    ) -> Result<()> {
+        debug_assert!(self.block_device_mode);
+        if upsert_record_bytes == 0 && deletion_count == 0 {
+            return Ok(());
+        }
+
+        let mut append_reserve = RECORD_HEADER_LEN_U64
+            .checked_add(upsert_record_bytes)
+            .ok_or(StoreError::NoSpace)?;
+        let deletion_count = u64::try_from(deletion_count).map_err(|_| StoreError::NoSpace)?;
+        append_reserve = Self::checked_record_total_len_u64(0)
+            .checked_mul(deletion_count)
+            .and_then(|deletions| append_reserve.checked_add(deletions))
+            .ok_or(StoreError::NoSpace)?;
+
+        let usable_end = self.block_device_usable_end()?;
+        if self
+            .current_offset
+            .checked_add(append_reserve)
+            .is_some_and(|end| end <= usable_end)
+        {
+            return Ok(());
+        }
+
+        // Compaction must retain both the last durable queue and the current
+        // in-memory candidate. The latter can contain a newly installed row
+        // whose per-entry record has not been appended yet.
+        let mut pending_reclaim_object_ids = BTreeSet::new();
+        for entry in self.durable_dead_object_reclaim_queue.all_entries() {
+            pending_reclaim_object_ids.insert(entry.object_id);
+        }
+        for entry in self.dead_object_reclaim_queue.all_entries() {
+            pending_reclaim_object_ids.insert(entry.object_id);
         }
         let live_locations = self.index.iter().map(|(key, loc)| (*key, *loc)).collect();
         self.compact_block_device_locations_with_pending_reclaim(
@@ -10732,14 +11591,11 @@ mod block_device_open_tests {
 
         let entry = DeadObjectEntry::new(obsolete.reclaim_object_id, [0x91; 16], 1, true, 1)
             .with_replacement_receipt(dead_object_receipt(obsolete.reclaim_object_id));
-        let mut candidate_queue = store.dead_object_reclaim_queue.clone();
-        assert!(candidate_queue.enqueue(entry));
+        let entry_payload_len =
+            LocalObjectStore::encode_dead_object_reclaim_entry_state(entry).len() as u64;
         let required_authority_append =
-            LocalObjectStore::checked_record_total_len_u64(candidate_queue.encode().len() as u64)
-                .checked_add(LocalObjectStore::checked_record_total_len_u64(
-                    CHAINED_COMMITTED_ROOT_PAYLOAD_LEN,
-                ))
-                .and_then(|len| len.checked_add(RECORD_HEADER_LEN_U64))
+            LocalObjectStore::checked_record_total_len_u64(entry_payload_len)
+                .checked_add(RECORD_HEADER_LEN_U64)
                 .expect("authority append reserve");
         let usable_end = store.block_device_usable_end().expect("block usable end");
         let available = usable_end - store.current_offset;
@@ -10931,23 +11787,19 @@ mod block_device_open_tests {
             .expect("persist old queue authority"));
         assert_eq!(store.durable_dead_object_reclaim_queue.len(), 1);
 
-        let mut acknowledged_queue = store.dead_object_reclaim_queue.clone();
         assert_eq!(
-            acknowledged_queue.ack_reclaimed(&[obsolete.reclaim_object_id]),
+            store
+                .dead_object_reclaim_queue
+                .ack_reclaimed(&[obsolete.reclaim_object_id]),
             1
         );
-        let queue_record_len = LocalObjectStore::checked_record_total_len_u64(
-            acknowledged_queue.encode().len() as u64,
-        );
-        let retry_reserve = queue_record_len
-            .checked_add(LocalObjectStore::checked_record_total_len_u64(
-                CHAINED_COMMITTED_ROOT_PAYLOAD_LEN,
-            ))
-            .and_then(|len| len.checked_add(RECORD_HEADER_LEN_U64))
+        let acknowledgement_record_len = LocalObjectStore::checked_record_total_len_u64(0);
+        let retry_reserve = acknowledgement_record_len
+            .checked_add(RECORD_HEADER_LEN_U64)
             .expect("retry reserve");
         let usable_end = store.block_device_usable_end().expect("block usable end");
         let available = usable_end - store.current_offset;
-        let desired_before_ack_append = queue_record_len + retry_reserve - 1;
+        let desired_before_ack_append = acknowledgement_record_len + retry_reserve - 1;
         let filler_payload_len = available
             .checked_sub(desired_before_ack_append)
             .and_then(|len| len.checked_sub(LocalObjectStore::checked_record_total_len_u64(0)))
@@ -10957,29 +11809,31 @@ mod block_device_open_tests {
             .put_direct(filler_key, &vec![0x51; filler_payload_len as usize])
             .expect("fill before unsynced acknowledgement append");
 
-        // Model the exact post-append/pre-barrier cut: the live index points
-        // at the smaller queue, but the last successfully synced snapshot
-        // still contains the old row and remains compaction authority.
-        store.dead_object_reclaim_queue = acknowledged_queue.clone();
+        // Model the exact per-entry post-tombstone/pre-barrier cut: the live
+        // index no longer exposes the state record, but the last successful
+        // root barrier still retains the row as compaction authority.
         store.dead_object_reclaim_queue_dirty = true;
-        store_dead_object_reclaim_queue(&acknowledged_queue, &mut store)
-            .expect("append acknowledgement without crossing barrier");
+        assert!(store
+            .delete_dead_object_reclaim_authority_record_local(dead_object_reclaim_entry_state_key(
+                obsolete.reclaim_object_id
+            ),)
+            .expect("append acknowledgement without crossing barrier"));
         assert!(usable_end - store.current_offset < retry_reserve);
         assert_eq!(store.dead_object_reclaim_queue.len(), 0);
         assert_eq!(store.durable_dead_object_reclaim_queue.len(), 1);
 
         store
-            .ensure_block_device_authority_append_space(None)
-            .expect("retry compaction retains last durable queue authority");
+            .sync_dead_object_reclaim_queue_authority()
+            .expect("retry acknowledgement after compaction");
         assert!(store
             .resolve_receipt_bound_physical_lifetime(&obsolete.reclaim_object_id)
-            .expect("resolve durable queue lifetime after retry compaction")
+            .expect("resolve acknowledged lifetime after retry compaction")
             .is_some());
-        assert_eq!(store.durable_dead_object_reclaim_queue.len(), 1);
+        assert!(store.durable_dead_object_reclaim_queue.is_empty());
 
         store
             .sync_all()
-            .expect("make acknowledgement durable after retry compaction");
+            .expect("sync remaining store authority after retry compaction");
         assert!(store.durable_dead_object_reclaim_queue.is_empty());
         assert_eq!(
             store.get(logical_key).unwrap(),
@@ -11674,6 +12528,166 @@ mod reclaim_queue_production_tests {
     }
 
     #[test]
+    fn dead_object_reclaim_updates_append_constant_size_entry_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut options = StoreOptions::test_fast();
+        options.max_segment_bytes = 64 * 1024;
+        options.segment_rotation_interval_secs = 0;
+        options.segment_rotation_write_limit = 0;
+        let mut store = LocalObjectStore::open_with_options(dir.path(), options)
+            .expect("open non-rotating store");
+        let mut append_len = None;
+        for byte in 1..=16_u8 {
+            let before = store.current_offset;
+            assert!(store
+                .enqueue_receipt_bound_dead_object(dead_object_entry(byte))
+                .expect("persist one receipt-bound entry"));
+            let appended = store.current_offset - before;
+            if let Some(expected) = append_len {
+                assert_eq!(
+                    appended, expected,
+                    "queue growth must append one constant-size entry record"
+                );
+            } else {
+                append_len = Some(appended);
+            }
+        }
+        assert!(!store.index.contains_key(&ObjectKey::from_name(
+            DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes()
+        )));
+        assert_eq!(
+            store
+                .index
+                .keys()
+                .filter(|key| is_dead_object_reclaim_entry_state_key(**key))
+                .count(),
+            16
+        );
+    }
+
+    #[test]
+    fn dead_object_reclaim_barrier_does_not_commit_unrelated_payload_state() {
+        let (mut store, _dir) = temp_store();
+        let payload_key = ObjectKey::from_name(b"payload transaction remains open");
+        store
+            .put(payload_key, b"ordinary payload")
+            .expect("put ordinary payload");
+        assert!(store.intent_log_tx_open);
+
+        assert!(store
+            .enqueue_receipt_bound_dead_object(dead_object_entry(0x61))
+            .expect("persist independent reclaim authority"));
+        assert!(
+            store.intent_log_tx_open,
+            "reclaim authority barrier must not commit the ordinary payload transaction"
+        );
+        assert_eq!(
+            store.get(payload_key).expect("read ordinary payload"),
+            Some(b"ordinary payload".to_vec())
+        );
+    }
+
+    #[test]
+    fn pool_internal_reclaim_stages_until_strict_authority_sync() {
+        let (mut store, dir) = temp_store();
+        let logical_key = ObjectKey::from_name(b"Pool-internal staged reclaim lifetime");
+        store
+            .put(logical_key, b"old physical lifetime")
+            .expect("put old physical lifetime");
+        let lifetime = store
+            .current_receipt_bound_physical_lifetime_pool_internal(logical_key)
+            .expect("capture exact physical lifetime");
+        let entry = DeadObjectEntry::new(lifetime.reclaim_object_id, [0x61; 16], 5, true, 5);
+        let entry_key = dead_object_reclaim_entry_state_key(entry.object_id);
+
+        let raw_mutation_allowed = Arc::new(AtomicBool::new(false));
+        store.install_pool_raw_mutation_guard(Arc::clone(&raw_mutation_allowed));
+        assert!(matches!(
+            store.enqueue_pending_receipt_bound_dead_object_pool_internal(entry),
+            Err(StoreError::InvalidOptions {
+                reason:
+                    "raw mutation refused while pool receipt-generation authority is unavailable"
+            })
+        ));
+        assert!(store.dead_object_reclaim_queue.is_empty());
+        assert!(store.durable_dead_object_reclaim_queue.is_empty());
+        assert!(!store.dead_object_reclaim_queue_dirty);
+
+        raw_mutation_allowed.store(true, Ordering::Release);
+        assert!(store
+            .enqueue_pending_receipt_bound_dead_object_pool_internal(entry)
+            .expect("stage pending Pool reclaim authority"));
+        assert!(store.dead_object_reclaim_queue_dirty);
+        assert!(store.durable_dead_object_reclaim_queue.is_empty());
+        assert_eq!(store.dead_object_reclaim_pending_upserts.len(), 1);
+        assert_eq!(
+            store.dead_object_reclaim_pending_upsert_record_bytes,
+            store
+                .dead_object_reclaim_entry_record_bytes(entry)
+                .expect("size staged Pool reclaim authority")
+        );
+        assert!(store.dead_object_reclaim_pending_removals.is_empty());
+        assert!(!store.index.contains_key(&entry_key));
+
+        store
+            .sync_strict_pool_authority()
+            .expect("publish pending authority at strict Pool barrier");
+        assert!(!store.dead_object_reclaim_queue_dirty);
+        assert!(store.dead_object_reclaim_pending_upserts.is_empty());
+        assert_eq!(store.dead_object_reclaim_pending_upsert_record_bytes, 0);
+        assert!(store.dead_object_reclaim_pending_removals.is_empty());
+        assert_eq!(
+            store
+                .durable_dead_object_reclaim_queue
+                .entry(&entry.object_id),
+            Some(entry)
+        );
+        assert!(store.index.contains_key(&entry_key));
+
+        let receipt = dead_object_receipt(entry.object_id, 6);
+        assert!(store
+            .publish_dead_object_replacement_receipt_pool_internal(&entry.object_id, receipt)
+            .expect("stage replacement receipt"));
+        assert!(store.dead_object_reclaim_queue_dirty);
+        assert_eq!(store.dead_object_reclaim_pending_upserts.len(), 1);
+        let receipted_entry = store
+            .dead_object_reclaim_queue
+            .entry(&entry.object_id)
+            .expect("current receipted reclaim entry");
+        assert_eq!(
+            store.dead_object_reclaim_pending_upsert_record_bytes,
+            store
+                .dead_object_reclaim_entry_record_bytes(receipted_entry)
+                .expect("size staged replacement authority")
+        );
+        assert!(store.dead_object_reclaim_pending_removals.is_empty());
+        assert!(store
+            .dead_object_reclaim_queue
+            .entry(&entry.object_id)
+            .is_some_and(|current| current.replacement_receipt == Some(receipt)));
+        assert!(store
+            .durable_dead_object_reclaim_queue
+            .entry(&entry.object_id)
+            .is_some_and(|durable| durable.replacement_receipt.is_none()));
+
+        store
+            .sync_strict_pool_authority()
+            .expect("publish replacement authority at strict Pool barrier");
+        assert!(!store.dead_object_reclaim_queue_dirty);
+        assert!(store.dead_object_reclaim_pending_upserts.is_empty());
+        assert_eq!(store.dead_object_reclaim_pending_upsert_record_bytes, 0);
+        assert!(store.dead_object_reclaim_pending_removals.is_empty());
+        drop(store);
+
+        let reopened = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+            .expect("reopen strict Pool authority");
+        assert!(reopened
+            .dead_object_reclaim_queue
+            .entry(&entry.object_id)
+            .is_some_and(|durable| durable.replacement_receipt == Some(receipt)));
+    }
+
+    #[test]
     fn receipt_bound_dead_object_enqueue_persists_across_reopen() {
         let (mut store, dir) = temp_store();
         let key = dead_object_key(0x51);
@@ -11698,6 +12712,84 @@ mod reclaim_queue_production_tests {
             1
         );
         assert!(!reopened.dead_object_reclaim_queue_dirty);
+    }
+
+    #[test]
+    fn pending_receipt_bound_lifetimes_stay_with_own_store_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary_path = dir.path().join("primary");
+        let replica_path = dir.path().join("replica");
+        let mut options = StoreOptions::test_fast();
+        options.mirror_path = Some(replica_path);
+        let mut store = LocalObjectStore::open_with_options(&primary_path, options.clone())
+            .expect("open replicated store");
+
+        store.replicas[0]
+            .put(ObjectKey::from_name(b"replica layout skew"), b"skew")
+            .expect("skew replica lifetime positions");
+        let logical_key = ObjectKey::from_name(b"root-owned physical lifetimes");
+        store
+            .put(logical_key, b"replicated payload")
+            .expect("put replicated payload");
+
+        let lifetimes = store
+            .current_receipt_bound_physical_lifetimes_across_stores_pool_internal(logical_key)
+            .expect("capture both physical lifetimes");
+        assert_eq!(lifetimes.len(), 2);
+        store
+            .rotate_segment()
+            .expect("separate primary root-owned reclaim state");
+        store.replicas[0]
+            .rotate_segment()
+            .expect("separate replica root-owned reclaim state");
+        let entries = lifetimes
+            .iter()
+            .map(|lifetime| {
+                DeadObjectEntry::new(lifetime.reclaim_object_id, [0x5A; 16], 5, true, 5)
+            })
+            .collect::<Vec<_>>();
+        store
+            .enqueue_pending_receipt_bound_dead_objects_pool_internal(&entries)
+            .expect("persist root-owned pending lifetimes");
+
+        let primary_entries = store.dead_object_reclaim_queue.all_entries();
+        let replica_entries = store.replicas[0].dead_object_reclaim_queue.all_entries();
+        assert_eq!(primary_entries.len(), 1);
+        assert_eq!(replica_entries.len(), 1);
+        assert_ne!(primary_entries[0].object_id, replica_entries[0].object_id);
+
+        let receipts = lifetimes
+            .iter()
+            .map(|lifetime| {
+                (
+                    lifetime.reclaim_object_id,
+                    dead_object_receipt(lifetime.reclaim_object_id, 6),
+                )
+            })
+            .collect::<Vec<_>>();
+        store
+            .publish_dead_object_replacement_receipts_pool_internal(&receipts)
+            .expect("publish each root's exact replacement receipt");
+        assert!(store.dead_object_reclaim_queue.all_entries()[0]
+            .replacement_receipt
+            .is_some());
+        assert!(store.replicas[0].dead_object_reclaim_queue.all_entries()[0]
+            .replacement_receipt
+            .is_some());
+        store
+            .compact_retaining(&[logical_key], &[])
+            .expect("relocate primary root-owned state without replica fanout");
+        drop(store);
+
+        let reopened = LocalObjectStore::open_with_options(&primary_path, options)
+            .expect("reopen replicated store roots");
+        let primary_entries = reopened.dead_object_reclaim_queue.all_entries();
+        let replica_entries = reopened.replicas[0].dead_object_reclaim_queue.all_entries();
+        assert_eq!(primary_entries.len(), 1);
+        assert_eq!(replica_entries.len(), 1);
+        assert_ne!(primary_entries[0].object_id, replica_entries[0].object_id);
+        assert!(primary_entries[0].replacement_receipt.is_some());
+        assert!(replica_entries[0].replacement_receipt.is_some());
     }
 
     #[test]
@@ -11741,9 +12833,9 @@ mod reclaim_queue_production_tests {
             store.publish_dead_object_replacement_receipt(&reserved_key, replacement),
             Err(StoreError::InvalidOptions { .. })
         ));
-        assert!(store
-            .publish_dead_object_replacement_receipt_pool_internal(&reserved_key, replacement)
-            .expect("pool reclaim authority may publish reserved physical receipt"));
+        store
+            .publish_dead_object_replacement_receipts_pool_internal(&[(reserved_key, replacement)])
+            .expect("pool reclaim authority may publish reserved physical receipt");
         assert!(matches!(
             store.drain_receipt_bound_dead_objects_at_stable_generation(6, 2, 16),
             Err(ReceiptBoundDeadObjectDrainError::Store(
@@ -11766,10 +12858,13 @@ mod reclaim_queue_production_tests {
             .enqueue_snapshot_deadlist_candidate(candidate)
             .expect("duplicate snapshot-deadlist candidate is replay-safe"));
         assert!(!store.dead_object_reclaim_queue_dirty);
+        assert!(!store.index.contains_key(&ObjectKey::from_name(
+            DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes()
+        )));
         assert!(store
-            .get_named(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME)
-            .expect("read persisted dead-object queue")
-            .is_some());
+            .index
+            .keys()
+            .any(|key| { is_dead_object_reclaim_entry_state_key(*key) }));
         drop(store);
 
         let mut reopened =
@@ -11900,6 +12995,9 @@ mod reclaim_queue_production_tests {
             .enqueue_snapshot_deadlist_candidate(snapshot_candidate(reclaim_key, 0, 1))
             .expect("enqueue snapshot-deadlist candidate"));
         store.pin_snapshot_extent(snapshot_id, reclaim_key);
+        store
+            .sync_all()
+            .expect("persist snapshot-deadlist pin before drain");
         assert!(store
             .publish_dead_object_replacement_receipt(
                 &reclaim_key,

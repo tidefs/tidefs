@@ -287,6 +287,12 @@ impl DeadObjectReclaimQueue {
         self.entries.is_empty()
     }
 
+    /// Return one queued entry by its exact physical object identity.
+    #[must_use]
+    pub fn entry(&self, object_id: &ObjectKey) -> Option<DeadObjectEntry> {
+        self.entries.get(object_id).copied()
+    }
+
     /// Enqueue a dead object for eventual reclamation.
     ///
     /// Idempotent: if an entry with the same `object_id` already exists,
@@ -583,7 +589,10 @@ impl DeadObjectReclaimQueue {
 
     /// Remove successfully reclaimed entries from the queue.
     ///
-    /// Call this after the allocator has freed the objects' space.
+    /// Call this only after durable receipt authority fixes the exact release
+    /// decision. Storage backends may persist this acknowledgement before
+    /// exposing the authorized physical space for reuse so crash replay cannot
+    /// repeat an unauthorised free.
     /// Missing keys are silently ignored (the entry may have been removed
     /// by a concurrent operation or a prior ack).
     ///

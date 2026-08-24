@@ -15,9 +15,10 @@ use tidefs_reclaim::{
     decode_reclaim_wire, encode_reclaim_wire, ReclaimReceipt, ReclaimReceiptDecodeError,
     ReclaimWireError,
 };
+#[cfg(test)]
+use tidefs_reclaim_queue_core::DeadObjectReclaimQueue;
 use tidefs_reclaim_queue_core::{
-    BPlusTreeReclaimQueue, DeadObjectReclaimQueue, ReclaimQueueStorage,
-    SegmentLivenessPersistError, SegmentLivenessQueue,
+    BPlusTreeReclaimQueue, ReclaimQueueStorage, SegmentLivenessPersistError, SegmentLivenessQueue,
 };
 use tidefs_types_reclaim_queue_core::ObjectKey;
 
@@ -145,33 +146,21 @@ pub(crate) fn store_reclaim_queue_entries(
     Ok(())
 }
 
-/// Load a [`DeadObjectReclaimQueue`] from the object store.
-///
-/// A missing object means no receipt-bound lifetime has been published. An
-/// unreadable or malformed object is lost reclaim authority and must fail the
-/// open instead of being mistaken for an empty queue.
+/// Load the complete root-owned [`DeadObjectReclaimQueue`] from the object store.
+#[cfg(test)]
 pub(crate) fn load_dead_object_reclaim_queue(
     store: &LocalObjectStore,
 ) -> Result<DeadObjectReclaimQueue, StoreError> {
-    match store.get_named(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME) {
-        Ok(Some(bytes)) => DeadObjectReclaimQueue::decode(&bytes).map_err(|_| {
-            StoreError::InvalidDeadObjectReceipt {
-                reason: "persisted dead-object reclaim queue is corrupt or unverifiable",
-            }
-        }),
-        Ok(None) => Ok(DeadObjectReclaimQueue::new()),
-        Err(error) => Err(error),
-    }
+    store.load_dead_object_reclaim_queue_for_root()
 }
 
 /// Persist a [`DeadObjectReclaimQueue`] to the object store.
+#[cfg(test)]
 pub(crate) fn store_dead_object_reclaim_queue(
     queue: &DeadObjectReclaimQueue,
     store: &mut LocalObjectStore,
 ) -> Result<(), StoreError> {
-    let bytes = queue.encode();
-    store.put_named(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME, &bytes)?;
-    Ok(())
+    store.replace_dead_object_reclaim_queue_for_test(queue)
 }
 
 fn encode_reclaim_receipts(receipts: &[ReclaimReceipt]) -> Vec<u8> {
@@ -824,19 +813,27 @@ mod tests {
     }
 
     #[test]
-    fn dead_object_reclaim_queue_corrupt_bytes_fail_closed() {
-        let (mut store, _dir) = temp_store();
+    fn retired_dead_object_reclaim_queue_snapshot_fails_closed() {
+        let (mut store, dir) = temp_store();
 
         store
             .put_named(
                 DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME,
-                b"not a dead-object queue",
+                b"retired pre-release queue snapshot",
             )
-            .expect("store corrupt bytes");
+            .expect("store retired snapshot");
         assert!(matches!(
             load_dead_object_reclaim_queue(&store),
             Err(StoreError::InvalidDeadObjectReceipt {
-                reason: "persisted dead-object reclaim queue is corrupt or unverifiable"
+                reason: "retired pre-release dead-object queue snapshot is unsupported"
+            })
+        ));
+        store.sync_all().expect("sync retired snapshot");
+        drop(store);
+        assert!(matches!(
+            LocalObjectStore::open(dir.path()),
+            Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "retired pre-release dead-object queue snapshot is unsupported"
             })
         ));
     }
