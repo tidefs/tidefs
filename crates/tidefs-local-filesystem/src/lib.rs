@@ -14210,12 +14210,53 @@ impl PoolDatasetOwner {
         receipt
     }
 
+    fn inode_has_pending_sync_work(&self, inode_id: InodeId) -> bool {
+        self.filesystem.state.dirty_content.contains(&inode_id)
+            || self.filesystem.state.dirty_inodes.contains(&inode_id)
+            || self.filesystem.dirty_set.dirty_inodes.contains(&inode_id)
+            || self
+                .filesystem
+                .intent_log
+                .has_pending_data_for_inode(inode_id)
+    }
+
+    fn directory_has_pending_sync_work(&self, inode_id: InodeId) -> bool {
+        self.filesystem.state.dirty_dirs.contains(&inode_id)
+            || self.filesystem.state.dirty_inodes.contains(&inode_id)
+            || self.filesystem.dirty_set.dirty_dirs.contains(&inode_id)
+            || self.filesystem.dirty_set.dirty_inodes.contains(&inode_id)
+            || self
+                .filesystem
+                .intent_log
+                .has_pending_namespace_for_dir(inode_id)
+    }
+
+    fn record_fsync_stats(&self, started: Instant) {
+        self.filesystem
+            .fsync_stats
+            .fsync_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.filesystem
+            .fsync_stats
+            .fsync_total_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
     pub fn fsync_file(&mut self, path: impl AsRef<str>) -> Result<()> {
         self.ensure_mutation_allowed("synchronize mounted file")?;
         check_crash_hook(CrashInjectionPoint::OpFsyncBeforeFlush);
         let started = Instant::now();
         let attr = self.stat(path.as_ref())?;
         self.flush_write_buffer(attr.inode_id)?;
+        if !self.inode_has_pending_sync_work(attr.inode_id) {
+            self.record_fsync_stats(started);
+            self.record_full_local_placement_ack_receipt(
+                LocalAckOperation::Fsync,
+                LocalAckReceiptTarget::inode(attr.inode_id.get()),
+                None,
+            );
+            return Ok(());
+        }
         // Flush pending entries for this inode before the committed-root
         // barrier. They remain replayable until do_commit() folds their
         // payload through Pool receipt authority, publishes the replacement
@@ -14253,14 +14294,7 @@ impl PoolDatasetOwner {
             .fsync_stats
             .fsync_do_commit_fallback_count
             .fetch_add(1, Ordering::Relaxed);
-        self.filesystem
-            .fsync_stats
-            .fsync_count
-            .fetch_add(1, Ordering::Relaxed);
-        self.filesystem
-            .fsync_stats
-            .fsync_total_ns
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.record_fsync_stats(started);
         if result.is_ok() {
             self.record_full_local_placement_ack_receipt(
                 LocalAckOperation::Fsync,
@@ -14463,6 +14497,19 @@ impl PoolDatasetOwner {
         self.flush_write_buffer(inode_id)?;
         let started = Instant::now();
 
+        // A prior committed-root barrier already covers a clean inode. Do not
+        // publish unrelated dirty state or force another Pool-wide barrier for
+        // an idempotent fsync request.
+        if !self.inode_has_pending_sync_work(inode_id) {
+            self.record_fsync_stats(started);
+            self.record_full_local_placement_ack_receipt(
+                LocalAckOperation::Fsync,
+                LocalAckReceiptTarget::inode(inode_id.get()),
+                None,
+            );
+            return Ok(());
+        }
+
         // Flush pending write intents to durable storage first.
         // Committed-root commit through do_commit() is the primary durability
         // path; intent-log replay recovered during the next pool import
@@ -14500,14 +14547,7 @@ impl PoolDatasetOwner {
             .fsync_stats
             .fsync_do_commit_fallback_count
             .fetch_add(1, Ordering::Relaxed);
-        self.filesystem
-            .fsync_stats
-            .fsync_count
-            .fetch_add(1, Ordering::Relaxed);
-        self.filesystem
-            .fsync_stats
-            .fsync_total_ns
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.record_fsync_stats(started);
         if result.is_ok() {
             self.record_full_local_placement_ack_receipt(
                 LocalAckOperation::Fsync,
@@ -14651,6 +14691,15 @@ impl PoolDatasetOwner {
                 path: path.as_ref().to_string(),
             });
         }
+        if !self.directory_has_pending_sync_work(attr.inode_id) {
+            self.record_fsync_stats(started);
+            self.record_full_local_placement_ack_receipt(
+                LocalAckOperation::FsyncDirectory,
+                LocalAckReceiptTarget::inode(attr.inode_id.get()),
+                None,
+            );
+            return Ok(());
+        }
         // Flush pending NamespaceSyncIntent entries before the committed-root
         // barrier. They remain replayable until do_commit() publishes the
         // already-applied namespace state and clears the covered entries.
@@ -14684,14 +14733,7 @@ impl PoolDatasetOwner {
             .fsync_stats
             .fsync_do_commit_fallback_count
             .fetch_add(1, Ordering::Relaxed);
-        self.filesystem
-            .fsync_stats
-            .fsync_count
-            .fetch_add(1, Ordering::Relaxed);
-        self.filesystem
-            .fsync_stats
-            .fsync_total_ns
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.record_fsync_stats(started);
         self.record_full_local_placement_ack_receipt(
             LocalAckOperation::FsyncDirectory,
             LocalAckReceiptTarget::inode(attr.inode_id.get()),
