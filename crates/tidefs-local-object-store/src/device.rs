@@ -3962,6 +3962,47 @@ impl Device {
         }
     }
 
+    /// Persist only the Pool-internal receipt-generation reservation marker.
+    /// Pending replacement-reclaim state remains staged for the next ordinary
+    /// strict Pool barrier after generation authority converges.
+    pub(crate) fn sync_receipt_generation_authority(&mut self) -> Result<()> {
+        match self {
+            Self::Single(device) => device.store.sync_receipt_generation_authority(),
+            Self::Mirror(device) => {
+                if device.members.is_empty() {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "receipt generation authority mirror has no legs",
+                    });
+                }
+                let mut first_error = None;
+                for member in &mut device.members {
+                    if let Err(error) = member.store.sync_receipt_generation_authority() {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            }
+            Self::Compressed(device) => device.inner.sync_receipt_generation_authority(),
+            Self::Encrypted(device) => device.inner.sync_receipt_generation_authority(),
+            Self::LogDevice(device) => device.store.sync_receipt_generation_authority(),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                if device.children.is_empty() {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "receipt generation authority parity device has no columns",
+                    });
+                }
+                let mut first_error = None;
+                for child in &mut device.children {
+                    if let Err(error) = child.store.sync_receipt_generation_authority() {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            }
+        }
+    }
+
     fn delete_exact_logical_object_with_pool_authority(
         &mut self,
         key: ObjectKey,
