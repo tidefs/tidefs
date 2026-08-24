@@ -63,6 +63,266 @@ impl TransactionMetadataStore for Pool {
         Ok(())
     }
 }
+
+/// Authenticated COW source for one successor transaction manifest.
+///
+/// A mounted commit must validate and write every changed object, but it must
+/// not turn a per-inode durability barrier into a filesystem-wide scrub. Clean
+/// objects retain their immutable key and checksum from the canonical prior
+/// root. Reopen and the scrub path remain responsible for reading and checking
+/// every retained payload.
+struct PriorTransactionManifestIndex<'a> {
+    manifest: &'a TransactionManifestRecord,
+    positions: BTreeMap<ObjectKey, usize>,
+}
+
+impl<'a> PriorTransactionManifestIndex<'a> {
+    fn new(manifest: &'a TransactionManifestRecord) -> Result<Self> {
+        let mut positions = BTreeMap::new();
+        for (position, entry) in manifest.entries.iter().enumerate() {
+            if positions.insert(entry.object_key, position).is_some() {
+                return Err(FileSystemError::CorruptState {
+                    reason: "committed transaction manifest repeats an object key",
+                });
+            }
+        }
+        Ok(Self {
+            manifest,
+            positions,
+        })
+    }
+
+    fn matching_metadata_entry(
+        &self,
+        key: ObjectKey,
+        role: TransactionManifestObjectRole,
+        current_bytes: &[u8],
+        missing_reason: &'static str,
+    ) -> Result<Option<TransactionManifestEntry>> {
+        let position = self
+            .positions
+            .get(&key)
+            .copied()
+            .ok_or(FileSystemError::CorruptState {
+                reason: missing_reason,
+            })?;
+        let entry = &self.manifest.entries[position];
+        if entry.role != role {
+            return Err(FileSystemError::CorruptState {
+                reason: "clean metadata key has the wrong committed manifest role",
+            });
+        }
+        Ok((entry.checksum == checksum64(current_bytes)).then(|| entry.clone()))
+    }
+
+    fn content_entries(
+        &self,
+        inode: &InodeRecord,
+        last_inode_transaction: u64,
+        keyspace: FilesystemObjectKeyspace,
+    ) -> Result<Vec<TransactionManifestEntry>> {
+        if inode.size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let content_key = keyspace.scope(content_object_key_for_version(
+            inode.inode_id,
+            inode.data_version,
+        ));
+        let inode_key = keyspace.transaction_inode(last_inode_transaction, inode.inode_id);
+        self.content_entries_between(content_key, inode_key)
+    }
+
+    fn content_entries_between(
+        &self,
+        content_key: ObjectKey,
+        inode_key: ObjectKey,
+    ) -> Result<Vec<TransactionManifestEntry>> {
+        let position =
+            self.positions
+                .get(&content_key)
+                .copied()
+                .ok_or(FileSystemError::CorruptState {
+                    reason: "clean inode has no committed content manifest entry",
+                })?;
+        let first = &self.manifest.entries[position];
+        if first.role != TransactionManifestObjectRole::VersionedContent {
+            return Err(FileSystemError::CorruptState {
+                reason: "clean inode content key has the wrong committed manifest role",
+            });
+        }
+
+        let mut entries = vec![first.clone()];
+        let mut cursor = position + 1;
+        while self
+            .manifest
+            .entries
+            .get(cursor)
+            .is_some_and(|entry| entry.role == TransactionManifestObjectRole::VersionedContentChunk)
+        {
+            entries.push(self.manifest.entries[cursor].clone());
+            cursor += 1;
+        }
+
+        let terminator =
+            self.manifest
+                .entries
+                .get(cursor)
+                .ok_or(FileSystemError::CorruptState {
+                    reason: "clean inode content entries have no owning inode entry",
+                })?;
+        if terminator.role != TransactionManifestObjectRole::TransactionInode
+            || terminator.object_key != inode_key
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "clean inode content entries do not terminate at their owning inode",
+            });
+        }
+        Ok(entries)
+    }
+}
+
+fn load_authenticated_runtime_manifest(
+    runtime: &PoolRuntime,
+    dataset_id: DatasetId,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<TransactionManifestRecord> {
+    let root_bytes = runtime.load_dataset_root(dataset_id, DatasetRootKind::Filesystem)?;
+    let root = decode_root_commit(&root_bytes)?;
+    let authentication = validate_root_authentication_record(&root, root_authentication_key)?;
+    if !root.has_manifest() {
+        return Err(FileSystemError::CorruptState {
+            reason: "canonical filesystem root has no transaction manifest",
+        });
+    }
+
+    let keyspace = FilesystemObjectKeyspace::new(dataset_id);
+    let manifest_bytes = runtime
+        .pool()
+        .get_transaction_metadata(keyspace.transaction_manifest(root.transaction_id))?
+        .ok_or(FileSystemError::CorruptState {
+            reason: "canonical filesystem transaction manifest is missing",
+        })?;
+    if checksum64(&manifest_bytes) != root.manifest_checksum
+        || root_authentication_digest(ROOT_AUTHENTICATION_MANIFEST_DOMAIN, &manifest_bytes)
+            != authentication.manifest_digest
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "canonical filesystem transaction manifest failed root authentication",
+        });
+    }
+    let manifest = decode_transaction_manifest(&manifest_bytes)?;
+    if manifest.transaction_id != root.transaction_id
+        || manifest.generation != root.generation
+        || manifest.entries.len() as u64 != root.manifest_entry_count
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "canonical filesystem transaction manifest does not match its root",
+        });
+    }
+    Ok(manifest)
+}
+
+fn validate_prepared_runtime_successor(
+    pool: &Pool,
+    dataset_id: DatasetId,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    prior_manifest: &TransactionManifestRecord,
+) -> Result<()> {
+    let authentication = validate_root_authentication_record(root, root_authentication_key)?;
+    let keyspace = FilesystemObjectKeyspace::new(dataset_id);
+
+    let superblock_bytes = pool
+        .get_transaction_metadata(keyspace.transaction_superblock(root.transaction_id))?
+        .ok_or(FileSystemError::CorruptState {
+            reason: "prepared filesystem transaction superblock is missing",
+        })?;
+    if checksum64(&superblock_bytes) != root.superblock_checksum
+        || root_authentication_digest(ROOT_AUTHENTICATION_SUPERBLOCK_DOMAIN, &superblock_bytes)
+            != authentication.superblock_digest
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "prepared filesystem transaction superblock failed root authentication",
+        });
+    }
+    let superblock = decode_superblock(&superblock_bytes)?;
+    if superblock.generation != root.generation
+        || superblock.next_inode_id != root.next_inode_id
+        || superblock.inode_count != root.inode_count
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "prepared filesystem transaction superblock does not match its root",
+        });
+    }
+
+    let manifest_bytes = pool
+        .get_transaction_metadata(keyspace.transaction_manifest(root.transaction_id))?
+        .ok_or(FileSystemError::CorruptState {
+            reason: "prepared filesystem transaction manifest is missing",
+        })?;
+    if checksum64(&manifest_bytes) != root.manifest_checksum
+        || root_authentication_digest(ROOT_AUTHENTICATION_MANIFEST_DOMAIN, &manifest_bytes)
+            != authentication.manifest_digest
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "prepared filesystem transaction manifest failed root authentication",
+        });
+    }
+    let manifest = decode_transaction_manifest(&manifest_bytes)?;
+    if manifest.transaction_id != root.transaction_id
+        || manifest.generation != root.generation
+        || manifest.entries.len() as u64 != root.manifest_entry_count
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "prepared filesystem transaction manifest does not match its root",
+        });
+    }
+
+    let prior_entries = prior_manifest
+        .entries
+        .iter()
+        .map(|entry| (entry.role, entry.object_key, entry.checksum))
+        .collect::<BTreeSet<_>>();
+    for entry in &manifest.entries {
+        if prior_entries.contains(&(entry.role, entry.object_key, entry.checksum)) {
+            continue;
+        }
+        match entry.role {
+            TransactionManifestObjectRole::TransactionSuperblock => {
+                if entry.object_key != keyspace.transaction_superblock(root.transaction_id)
+                    || entry.checksum != root.superblock_checksum
+                {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "prepared manifest superblock entry does not match its root",
+                    });
+                }
+            }
+            TransactionManifestObjectRole::TransactionInode
+            | TransactionManifestObjectRole::TransactionDirectory
+            | TransactionManifestObjectRole::TransactionSnapshotCatalogEntry
+            | TransactionManifestObjectRole::TransactionExtentMap => {
+                let bytes = pool.get_transaction_metadata(entry.object_key)?.ok_or(
+                    FileSystemError::CorruptState {
+                        reason: "prepared manifest metadata entry is missing",
+                    },
+                )?;
+                if checksum64(&bytes) != entry.checksum {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "prepared manifest metadata entry checksum mismatch",
+                    });
+                }
+            }
+            TransactionManifestObjectRole::VersionedContent
+            | TransactionManifestObjectRole::VersionedContentChunk => {
+                // Changed content was strictly read through current Pool
+                // receipts before the transaction objects were prepared.
+                // Clean content retains its authenticated prior-root entry.
+            }
+        }
+    }
+    Ok(())
+}
 #[cfg(test)]
 pub(crate) fn persist_state(
     store: &mut LocalObjectStore,
@@ -140,11 +400,21 @@ pub(crate) fn persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
     expected_snapshot_predecessors: &BTreeMap<DatasetId, tidefs_pool_runtime::SnapshotRoot>,
 ) -> Result<RootCommitRecord> {
     let source_dataset_id = state.dataset_id();
-    let signed = prepare_state_with_pool_at_transaction(
+    let prior_manifest =
+        load_authenticated_runtime_manifest(runtime, source_dataset_id, root_authentication_key)?;
+    let signed = prepare_state_with_pool_at_transaction_reusing_manifest(
         runtime.pool_mut(),
         state,
         transaction_id,
         root_authentication_key,
+        &prior_manifest,
+    )?;
+    validate_prepared_runtime_successor(
+        runtime.pool(),
+        source_dataset_id,
+        &signed,
+        root_authentication_key,
+        &prior_manifest,
     )?;
     let bytes = encode_root_commit(&signed);
     let mut snapshot_roots = Vec::new();
@@ -216,19 +486,56 @@ pub(crate) fn prepare_state_with_pool_at_transaction(
     transaction_id: u64,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RootCommitRecord> {
+    prepare_state_with_pool_at_transaction_inner(
+        pool,
+        state,
+        transaction_id,
+        root_authentication_key,
+        None,
+    )
+}
+
+fn prepare_state_with_pool_at_transaction_reusing_manifest(
+    pool: &mut Pool,
+    state: &FileSystemState,
+    transaction_id: u64,
+    root_authentication_key: RootAuthenticationKey,
+    prior_manifest: &TransactionManifestRecord,
+) -> Result<RootCommitRecord> {
+    prepare_state_with_pool_at_transaction_inner(
+        pool,
+        state,
+        transaction_id,
+        root_authentication_key,
+        Some(prior_manifest),
+    )
+}
+
+fn prepare_state_with_pool_at_transaction_inner(
+    pool: &mut Pool,
+    state: &FileSystemState,
+    transaction_id: u64,
+    root_authentication_key: RootAuthenticationKey,
+    prior_manifest: Option<&TransactionManifestRecord>,
+) -> Result<RootCommitRecord> {
     if transaction_id < state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID) {
         return Err(FileSystemError::CorruptState {
             reason: "mounted transaction id precedes filesystem state generation",
         });
     }
     let keyspace = FilesystemObjectKeyspace::new(state.dataset_id());
-    let content_entries = pool_content_manifest_entries_for_state(pool, state)?;
+    let prior_index = prior_manifest
+        .map(PriorTransactionManifestIndex::new)
+        .transpose()?;
+    let content_entries =
+        pool_content_manifest_entries_for_state(pool, state, prior_index.as_ref())?;
     let root = persist_transaction_objects_with_precomputed_content(
         pool,
         state,
         transaction_id,
         &content_entries,
         keyspace,
+        prior_index.as_ref(),
     )?;
     sync_pool_after_commit_boundary(pool, FilesystemCommitBoundary::TransactionObjectsWritten)
         .map_err(FileSystemError::from)?;
@@ -263,13 +570,14 @@ pub(crate) fn persist_state_with_pool_at_transaction_until_boundary(
             reason: "mounted transaction id precedes filesystem state generation",
         });
     }
-    let content_entries = pool_content_manifest_entries_for_state(pool, state)?;
+    let content_entries = pool_content_manifest_entries_for_state(pool, state, None)?;
     let root = persist_transaction_objects_with_precomputed_content(
         pool.raw_primary_store_mut(),
         state,
         transaction_id,
         &content_entries,
         FilesystemObjectKeyspace::new(state.dataset_id()),
+        None,
     )?;
     if stop_after == Some(FilesystemCommitBoundary::TransactionObjectsWritten) {
         return Ok(FilesystemCommitBoundary::TransactionObjectsWritten);
@@ -564,14 +872,41 @@ pub(crate) fn transaction_manifest_entries_for_pool_content_in_keyspace(
 fn pool_content_manifest_entries_for_state(
     pool: &Pool,
     state: &FileSystemState,
+    prior_manifest: Option<&PriorTransactionManifestIndex<'_>>,
 ) -> Result<BTreeMap<InodeId, Vec<TransactionManifestEntry>>> {
     let keyspace = FilesystemObjectKeyspace::new(state.dataset_id());
     let mut entries = BTreeMap::new();
     for inode in state.inodes.values().filter(|inode| inode.is_file_like()) {
-        entries.insert(
-            inode.inode_id,
-            transaction_manifest_entries_for_pool_content_in_keyspace(pool, inode, keyspace)?,
-        );
+        let prior_clean_transaction = if !state.dirty_content.contains(&inode.inode_id)
+            && !state.dirty_inodes.contains(&inode.inode_id)
+        {
+            if let (Some(prior), Some(last_transaction)) = (
+                prior_manifest,
+                state.last_inode_write_tx.get(&inode.inode_id).copied(),
+            ) {
+                let inode_key = keyspace.transaction_inode(last_transaction, inode.inode_id);
+                let inode_bytes = try_encode_inode(inode)?;
+                prior
+                    .matching_metadata_entry(
+                        inode_key,
+                        TransactionManifestObjectRole::TransactionInode,
+                        &inode_bytes,
+                        "clean inode reference is missing from committed manifest",
+                    )?
+                    .map(|_| last_transaction)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let inode_entries = match (prior_manifest, prior_clean_transaction) {
+            (Some(prior), Some(last_transaction)) => {
+                prior.content_entries(inode, last_transaction, keyspace)?
+            }
+            _ => transaction_manifest_entries_for_pool_content_in_keyspace(pool, inode, keyspace)?,
+        };
+        entries.insert(inode.inode_id, inode_entries);
     }
     Ok(entries)
 }
@@ -601,6 +936,7 @@ pub(crate) fn persist_transaction_objects(
         transaction_id,
         &content_entries,
         FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
+        None,
     )
 }
 
@@ -630,8 +966,16 @@ fn persist_transaction_objects_with_precomputed_content<S: TransactionMetadataSt
     transaction_id: u64,
     content_entries: &BTreeMap<InodeId, Vec<TransactionManifestEntry>>,
     keyspace: FilesystemObjectKeyspace,
+    prior_manifest: Option<&PriorTransactionManifestIndex<'_>>,
 ) -> Result<RootCommitRecord> {
-    persist_transaction_objects_impl(store, state, transaction_id, content_entries, keyspace)
+    persist_transaction_objects_impl(
+        store,
+        state,
+        transaction_id,
+        content_entries,
+        keyspace,
+        prior_manifest,
+    )
 }
 
 fn persist_transaction_objects_impl<S: TransactionMetadataStore>(
@@ -640,6 +984,7 @@ fn persist_transaction_objects_impl<S: TransactionMetadataStore>(
     transaction_id: u64,
     content_entries: &BTreeMap<InodeId, Vec<TransactionManifestEntry>>,
     keyspace: FilesystemObjectKeyspace,
+    prior_manifest: Option<&PriorTransactionManifestIndex<'_>>,
 ) -> Result<RootCommitRecord> {
     let mut manifest_entries = Vec::new();
     for inode in state.inodes.values() {
@@ -670,26 +1015,44 @@ fn persist_transaction_objects_impl<S: TransactionMetadataStore>(
             let last_tx = state.last_inode_write_tx[&inode.inode_id];
             let last_key = keyspace.transaction_inode(last_tx, inode.inode_id);
             let current_bytes = try_encode_inode(inode)?;
-            let existing_bytes =
-                store
-                    .get_transaction_metadata(last_key)?
-                    .ok_or(FileSystemError::CorruptState {
-                        reason: "clean inode reference points to missing object",
-                    })?;
-            if current_bytes != existing_bytes {
-                let inode_key = keyspace.transaction_inode(transaction_id, inode.inode_id);
-                store.put_transaction_metadata(inode_key, &current_bytes)?;
-                manifest_entries.push(TransactionManifestEntry {
-                    role: TransactionManifestObjectRole::TransactionInode,
-                    object_key: inode_key,
-                    checksum: checksum64(&current_bytes),
-                });
+            if let Some(prior) = prior_manifest {
+                if let Some(entry) = prior.matching_metadata_entry(
+                    last_key,
+                    TransactionManifestObjectRole::TransactionInode,
+                    &current_bytes,
+                    "clean inode reference is missing from committed manifest",
+                )? {
+                    manifest_entries.push(entry);
+                } else {
+                    let inode_key = keyspace.transaction_inode(transaction_id, inode.inode_id);
+                    store.put_transaction_metadata(inode_key, &current_bytes)?;
+                    manifest_entries.push(TransactionManifestEntry {
+                        role: TransactionManifestObjectRole::TransactionInode,
+                        object_key: inode_key,
+                        checksum: checksum64(&current_bytes),
+                    });
+                }
             } else {
-                manifest_entries.push(TransactionManifestEntry {
-                    role: TransactionManifestObjectRole::TransactionInode,
-                    object_key: last_key,
-                    checksum: checksum64(&existing_bytes),
-                });
+                let existing_bytes = store.get_transaction_metadata(last_key)?.ok_or(
+                    FileSystemError::CorruptState {
+                        reason: "clean inode reference points to missing object",
+                    },
+                )?;
+                if current_bytes != existing_bytes {
+                    let inode_key = keyspace.transaction_inode(transaction_id, inode.inode_id);
+                    store.put_transaction_metadata(inode_key, &current_bytes)?;
+                    manifest_entries.push(TransactionManifestEntry {
+                        role: TransactionManifestObjectRole::TransactionInode,
+                        object_key: inode_key,
+                        checksum: checksum64(&current_bytes),
+                    });
+                } else {
+                    manifest_entries.push(TransactionManifestEntry {
+                        role: TransactionManifestObjectRole::TransactionInode,
+                        object_key: last_key,
+                        checksum: checksum64(&existing_bytes),
+                    });
+                }
             }
         }
 
@@ -721,26 +1084,46 @@ fn persist_transaction_objects_impl<S: TransactionMetadataStore>(
                     },
                 )?;
                 let current_bytes = encode_directory(inode, directory);
-                let existing_bytes = store.get_transaction_metadata(last_key)?.ok_or(
-                    FileSystemError::CorruptState {
-                        reason: "clean directory reference points to missing object",
-                    },
-                )?;
-                if current_bytes != existing_bytes {
-                    let directory_key =
-                        keyspace.transaction_directory(transaction_id, inode.inode_id);
-                    store.put_transaction_metadata(directory_key, &current_bytes)?;
-                    manifest_entries.push(TransactionManifestEntry {
-                        role: TransactionManifestObjectRole::TransactionDirectory,
-                        object_key: directory_key,
-                        checksum: checksum64(&current_bytes),
-                    });
+                if let Some(prior) = prior_manifest {
+                    if let Some(entry) = prior.matching_metadata_entry(
+                        last_key,
+                        TransactionManifestObjectRole::TransactionDirectory,
+                        &current_bytes,
+                        "clean directory reference is missing from committed manifest",
+                    )? {
+                        manifest_entries.push(entry);
+                    } else {
+                        let directory_key =
+                            keyspace.transaction_directory(transaction_id, inode.inode_id);
+                        store.put_transaction_metadata(directory_key, &current_bytes)?;
+                        manifest_entries.push(TransactionManifestEntry {
+                            role: TransactionManifestObjectRole::TransactionDirectory,
+                            object_key: directory_key,
+                            checksum: checksum64(&current_bytes),
+                        });
+                    }
                 } else {
-                    manifest_entries.push(TransactionManifestEntry {
-                        role: TransactionManifestObjectRole::TransactionDirectory,
-                        object_key: last_key,
-                        checksum: checksum64(&existing_bytes),
-                    });
+                    let existing_bytes = store.get_transaction_metadata(last_key)?.ok_or(
+                        FileSystemError::CorruptState {
+                            reason: "clean directory reference points to missing object",
+                        },
+                    )?;
+                    if current_bytes != existing_bytes {
+                        let directory_key =
+                            keyspace.transaction_directory(transaction_id, inode.inode_id);
+                        store.put_transaction_metadata(directory_key, &current_bytes)?;
+                        manifest_entries.push(TransactionManifestEntry {
+                            role: TransactionManifestObjectRole::TransactionDirectory,
+                            object_key: directory_key,
+                            checksum: checksum64(&current_bytes),
+                        });
+                    } else {
+                        manifest_entries.push(TransactionManifestEntry {
+                            role: TransactionManifestObjectRole::TransactionDirectory,
+                            object_key: last_key,
+                            checksum: checksum64(&existing_bytes),
+                        });
+                    }
                 }
             }
         }
@@ -897,4 +1280,108 @@ pub(crate) fn next_mounted_commit_transaction_id(
         .ok_or(FileSystemError::CorruptState {
             reason: "committed-root transaction id space is exhausted",
         })
+}
+
+#[cfg(test)]
+mod prior_manifest_tests {
+    use super::*;
+
+    fn manifest_entry(
+        role: TransactionManifestObjectRole,
+        object_key: ObjectKey,
+        payload: &[u8],
+    ) -> TransactionManifestEntry {
+        TransactionManifestEntry {
+            role,
+            object_key,
+            checksum: checksum64(payload),
+        }
+    }
+
+    #[test]
+    fn clean_metadata_reuse_skips_live_state_divergence() {
+        let inode_key = ObjectKey::from_name("prior-clean-inode");
+        let committed = b"committed inode bytes";
+        let manifest = TransactionManifestRecord {
+            transaction_id: 7,
+            generation: 9,
+            entries: vec![manifest_entry(
+                TransactionManifestObjectRole::TransactionInode,
+                inode_key,
+                committed,
+            )],
+        };
+        let index = PriorTransactionManifestIndex::new(&manifest).expect("index prior manifest");
+
+        let reused = index
+            .matching_metadata_entry(
+                inode_key,
+                TransactionManifestObjectRole::TransactionInode,
+                committed,
+                "missing",
+            )
+            .expect("check matching committed inode")
+            .expect("reuse matching committed inode");
+        assert_eq!(reused, manifest.entries[0]);
+
+        let divergent = index
+            .matching_metadata_entry(
+                inode_key,
+                TransactionManifestObjectRole::TransactionInode,
+                b"untracked live mutation",
+                "missing",
+            )
+            .expect("check divergent committed inode");
+        assert!(divergent.is_none(), "divergent metadata must be rewritten");
+    }
+
+    #[test]
+    fn clean_content_reuse_stops_at_its_committed_inode() {
+        let content_key = ObjectKey::from_name("prior-content");
+        let chunk_key = ObjectKey::from_name("prior-content-chunk");
+        let inode_key = ObjectKey::from_name("prior-content-inode");
+        let other_inode_key = ObjectKey::from_name("other-inode");
+        let manifest = TransactionManifestRecord {
+            transaction_id: 11,
+            generation: 13,
+            entries: vec![
+                manifest_entry(
+                    TransactionManifestObjectRole::VersionedContent,
+                    content_key,
+                    b"content manifest",
+                ),
+                manifest_entry(
+                    TransactionManifestObjectRole::VersionedContentChunk,
+                    chunk_key,
+                    b"content chunk",
+                ),
+                manifest_entry(
+                    TransactionManifestObjectRole::TransactionInode,
+                    inode_key,
+                    b"inode",
+                ),
+                manifest_entry(
+                    TransactionManifestObjectRole::TransactionInode,
+                    other_inode_key,
+                    b"other inode",
+                ),
+            ],
+        };
+        let index = PriorTransactionManifestIndex::new(&manifest).expect("index prior manifest");
+
+        let entries = index
+            .content_entries_between(content_key, inode_key)
+            .expect("reuse exact content span");
+        assert_eq!(entries, manifest.entries[..2]);
+
+        let error = index
+            .content_entries_between(content_key, other_inode_key)
+            .expect_err("content span must not cross its owning inode");
+        assert!(matches!(
+            error,
+            FileSystemError::CorruptState {
+                reason: "clean inode content entries do not terminate at their owning inode"
+            }
+        ));
+    }
 }
