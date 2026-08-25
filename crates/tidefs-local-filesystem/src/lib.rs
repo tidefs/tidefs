@@ -7609,6 +7609,27 @@ impl PoolDatasetOwner {
         Ok(bytes)
     }
 
+    fn capacity_replacement_credit_bytes_in_ranges(
+        &self,
+        inode_id: InodeId,
+        record: &InodeRecord,
+        ranges: &[(u64, u64)],
+    ) -> Result<u64> {
+        let materialized = self.materialized_content_bytes_in_ranges(inode_id, record, ranges)?;
+        let reserved = ranges.iter().try_fold(0_u64, |total, &(offset, length)| {
+            total
+                .checked_add(self.accounted_extent_bytes(inode_id, offset, length).1)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })
+        })?;
+        materialized
+            .checked_add(reserved)
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })
+    }
+
     fn reflink_clone_content_plan(
         &self,
         source_inode_id: InodeId,
@@ -10546,7 +10567,7 @@ impl PoolDatasetOwner {
                 }
             }
             let committed_record = self.committed_inode_record(inode_id)?;
-            let replacement_credit_bytes = self.materialized_content_bytes_in_ranges(
+            let replacement_credit_bytes = self.capacity_replacement_credit_bytes_in_ranges(
                 inode_id,
                 &committed_record,
                 &dirty_charge_ranges,
@@ -10566,6 +10587,7 @@ impl PoolDatasetOwner {
                 write_space_delta,
             );
         };
+        let capacity_admit_bytes = physical_admit_bytes.saturating_sub(replacement_credit_bytes);
         // A buffered write is one mounted mutation even when it reaches the
         // foreground writeback threshold immediately.  Start rollback
         // authority before accepting its capacity hold so a threshold flush
@@ -10657,7 +10679,7 @@ impl PoolDatasetOwner {
             if mutation_was_active {
                 self.filesystem
                     .dataset_capacity
-                    .record_free(physical_admit_bytes);
+                    .record_free(capacity_admit_bytes);
                 self.filesystem.mutation_recorded_commit_group_write =
                     mutation_had_commit_group_write;
             } else {
@@ -10808,8 +10830,9 @@ impl PoolDatasetOwner {
         }
 
         let result = self.inode(inode_id)?.clone();
-        // Capacity reservation was committed inline before the write.
-        // On error paths the caller must roll back dataset capacity via record_free.
+        // Net logical capacity was committed inline before the write. On
+        // error paths the caller must roll back that exact charge via
+        // record_free.
         Ok(result)
     }
 
@@ -10884,11 +10907,12 @@ impl PoolDatasetOwner {
         }
 
         let base_record = self.committed_inode_record(inode_id)?;
-        let replacement_credit_bytes = self.materialized_content_bytes_in_ranges(
+        let replacement_credit_bytes = self.capacity_replacement_credit_bytes_in_ranges(
             inode_id,
             &base_record,
             &materialization_charge_ranges,
         )?;
+        let capacity_admit_bytes = physical_admit_bytes.saturating_sub(replacement_credit_bytes);
         let write_space_delta = self.data_write_space_delta(inode_id, &written_ranges)?;
         if physical_admit_bytes > 0 {
             let handle = self.reserve_with_hierarchy_replacement_credit(
@@ -10952,7 +10976,7 @@ impl PoolDatasetOwner {
                 // retaining any pre-existing dirty-buffer charge.
                 self.filesystem
                     .dataset_capacity
-                    .record_free(physical_admit_bytes);
+                    .record_free(capacity_admit_bytes);
                 return Err(err);
             }
         };

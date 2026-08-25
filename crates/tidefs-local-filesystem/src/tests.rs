@@ -1823,6 +1823,78 @@ fn full_capacity_committed_overwrites_are_admitted() {
 }
 
 #[test]
+fn full_capacity_unwritten_reservations_admit_buffered_and_direct_writes() {
+    let root = temp_root("full-capacity-unwritten-reservation");
+    let chunk = content_chunk_size() as usize;
+    let mut fs =
+        LocalFileSystem::open_with_capacity(&root, StoreOptions::test_fast(), (chunk * 2) as u64)
+            .expect("open fs");
+    fs.create_file("/buffered.bin", 0o600)
+        .expect("create buffered target");
+    fs.create_file("/direct.bin", 0o600)
+        .expect("create direct target");
+    fs.fallocate_file("/buffered.bin", 0, chunk as u64)
+        .expect("reserve buffered target");
+    fs.fallocate_file("/direct.bin", 0, chunk as u64)
+        .expect("reserve direct target");
+    fs.fsync_all().expect("commit both reservations");
+
+    assert_eq!(fs.capacity_authority().used_bytes(), (chunk * 2) as u64);
+    assert_eq!(fs.space_counters().logical_used_bytes, 0);
+    assert_eq!(fs.space_counters().reserved_bytes, (chunk * 2) as u64);
+    assert_eq!(fs.statfs().expect("full reserved statfs").bavail, 0);
+
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_write_buffer_flush_threshold_bytes(chunk * 8)
+        .expect("test setup mutation must be admitted");
+    fs.write_file("/buffered.bin", 0, &vec![0x41; chunk / 2])
+        .expect("write first half of reserved buffered extent");
+    fs.write_file("/buffered.bin", (chunk / 2) as u64, &vec![0x42; chunk / 2])
+        .expect("write second half while reserved capacity remains full");
+    assert_eq!(
+        fs.capacity_authority().pending_bytes(),
+        0,
+        "buffered reservation conversion must not add transient capacity",
+    );
+    assert_eq!(fs.capacity_authority().used_bytes(), (chunk * 2) as u64);
+    fs.fsync_all()
+        .expect("commit buffered reservation conversion");
+
+    fs.write_file_ranges_direct("/direct.bin", vec![(0, vec![0x43; chunk])])
+        .expect("direct write converts its reserved extent");
+    assert_eq!(
+        fs.capacity_authority().pending_bytes(),
+        0,
+        "direct reservation conversion must not add transient capacity",
+    );
+    assert_eq!(fs.capacity_authority().used_bytes(), (chunk * 2) as u64);
+    fs.fsync_all()
+        .expect("commit direct reservation conversion");
+
+    assert_eq!(
+        fs.read_file("/buffered.bin").expect("read buffered target"),
+        [vec![0x41; chunk / 2], vec![0x42; chunk / 2]].concat(),
+    );
+    assert_eq!(
+        fs.read_file("/direct.bin").expect("read direct target"),
+        vec![0x43; chunk],
+    );
+    assert_eq!(fs.space_counters().logical_used_bytes, (chunk * 2) as u64);
+    assert_eq!(fs.space_counters().reserved_bytes, 0);
+    assert_eq!(fs.capacity_authority().used_bytes(), (chunk * 2) as u64);
+
+    fs.create_file("/growth.bin", 0o600)
+        .expect("create growth target");
+    let error = fs
+        .write_file("/growth.bin", 0, &[0x44])
+        .expect_err("unreserved growth must remain refused");
+    assert!(matches!(error, FileSystemError::NoSpace { .. }), "{error}");
+
+    cleanup(&root);
+}
+
+#[test]
 fn buffered_overwrites_charge_unique_dirty_bytes_only() {
     let root = temp_root("buffered-overwrite-unique-dirty");
     let data_len = content_chunk_size() as usize;
