@@ -44,8 +44,8 @@ generic/694
 #   inode_operations::fiemap. Ordinary FUSE does not provide that operation,
 #   so xfs_io receives EOPNOTSUPP before FUSE_IOCTL can reach the TideFS daemon.
 #   Sparse discovery remains supported through SEEK_DATA/SEEK_HOLE.
-#   generic/016 reaches this prerequisite before its collapse-range checks;
-#   the exclusion does not retract TideFS's wired collapse-range path.
+#   generic/016 reaches this prerequisite before its collapse-range checks.
+#   Linux FUSE also refuses collapse range before sending FUSE_FALLOCATE.
 #   generic/017 also requires FIEMAP and a scratch filesystem.
 #   generic/317 is the direct FIEMAP behavior row.
 generic/016
@@ -88,9 +88,10 @@ generic/048
 generic/054
 
 #   generic/058 exercises standard FALLOC_FL_INSERT_RANGE through xfs_io
-#   finsert plus FIEMAP extent checks. TideFS source has insert-range handling,
-#   but the row cannot pass its FIEMAP checks on the ordinary FUSE carrier;
-#   insert-range behavior still needs a reachable outer-boundary test.
+#   finsert plus FIEMAP extent checks. Linux FUSE refuses insert range before
+#   sending FUSE_FALLOCATE, and the row also cannot pass its FIEMAP checks on
+#   the ordinary FUSE carrier. The direct engine implementation remains for
+#   non-FUSE consumers.
 generic/058
 
 #   generic/062 is a broad xattr namespace row across user/trusted/security
@@ -159,17 +160,17 @@ generic/068
 generic/085
 generic/275
 
-# --- Insert/collapse range row validation (#1926) ---
+# --- Insert/collapse range carrier refusal (#1926, #2604) ---
 #   Focused FUSE xfstests run 29188560825 requested generic/060,
 #   generic/061, generic/063, generic/064, and generic/072. The rows were not
 #   runnable: generic/060-064 stopped at xfs_io fiemap prechecks because the
 #   ordinary FUSE carrier has no inode_operations::fiemap, and generic/072
 #   stopped at the xfs_io fcollapse precheck.
-#   FUSE fallocate dispatch and the local filesystem engine wire
-#   FALLOC_FL_INSERT_RANGE and FALLOC_FL_COLLAPSE_RANGE. These rows stay
-#   excluded until delayed-allocation/multi-insert, mixed insert/collapse,
-#   and collapse/truncate stress behavior is validated through a reachable
-#   outer boundary and filesystem consistency checks.
+#   Linux fuse_file_fallocate() rejects FALLOC_FL_INSERT_RANGE and
+#   FALLOC_FL_COLLAPSE_RANGE before sending FUSE_FALLOCATE. The daemon mirrors
+#   that EOPNOTSUPP boundary. Direct local-filesystem engine implementations
+#   remain for legitimate non-FUSE consumers, but do not make these mounted
+#   rows reachable.
 generic/060
 generic/061
 generic/063

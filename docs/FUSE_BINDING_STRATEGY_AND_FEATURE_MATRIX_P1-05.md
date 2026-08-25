@@ -200,7 +200,7 @@ stub placeholders.
 | `FUSE_SETLK` | `setlk()` | **Implemented** | Advisory lock surface (PC-007) |
 | `FUSE_SETLKW` | `setlkw()` | **Implemented** | Blocking lock (queue_class_6) |
 | `FUSE_FLOCK` | `flock()` | **Implemented** | BSD whole-file advisory lock surface |
-| `FUSE_FALLOCATE` | `fallocate()` | **Implemented** | mode 0, KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE, COLLAPSE_RANGE, INSERT_RANGE |
+| `FUSE_FALLOCATE` | `fallocate()` | **Partial-boundary** | mode 0, KEEP_SIZE, PUNCH_HOLE, and ZERO_RANGE are wired. Linux returns `EOPNOTSUPP` for COLLAPSE_RANGE and INSERT_RANGE in `fuse_file_fallocate()` before a request can reach the daemon; the adapter also refuses those modes. |
 | `FUSE_LSEEK` | `lseek()` | **Implemented** | SEEK_SET/END/CUR/DATA/HOLE (PC-004B) |
 | `FUSE_IOCTL` | `ioctl()` | **Partial-boundary** | `FS_IOC_FSGETXATTR` and `TIDEFS_IOC_DEFRAG` are wired; other commands reaching the daemon return `EOPNOTSUPP`. `FS_IOC_FIEMAP` does not reach this callback on ordinary FUSE and generic VFS returns `EOPNOTSUPP`. |
 | `FUSE_POLL` | `poll()` | **Implemented** | Regular-file readiness and schedule-notify registration bookkeeping |

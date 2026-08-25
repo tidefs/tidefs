@@ -68,10 +68,9 @@ use tidefs_types_posix_filesystem_adapter_core::PosixFilesystemAdapterWriteStagi
 use tidefs_types_vfs_core::{
     compose_posix_time_ns, split_posix_time_ns, DirEntry, EngineDirHandle, EngineFileHandle, Errno,
     FileHandleId, Generation, InodeAttr, InodeId, NodeKind, PosixAttrs, RequestCtx, SetAttr,
-    StatFs, FALLOC_FL_COLLAPSE_RANGE, FALLOC_FL_INSERT_RANGE, FALLOC_FL_KEEP_SIZE,
-    FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME,
-    FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE,
-    FATTR_UID, F_UNLCK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
+    StatFs, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, FATTR_ATIME,
+    FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME,
+    FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, F_UNLCK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
 };
 use tidefs_vfs_engine::{
     LivePoolAdminRequest, LivePoolAdminResponse, LockSpec, LseekDataRange, VfsEngine,
@@ -7602,6 +7601,13 @@ impl FuseVfsAdapter {
         length: u64,
     ) -> Result<(), Errno> {
         let diagnostic = fuse_op_diagnostics_enabled();
+        // Linux fuse_file_fallocate() rejects every other mode before it can
+        // emit FUSE_FALLOCATE. Keep the daemon boundary equally strict for
+        // callers that exercise this dispatcher without the kernel carrier.
+        let supported_mode = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE;
+        if mode & !supported_mode != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
         self.check_not_read_only()?;
         let efh = self.resolve_file_handle(ino, fh, 0)?;
         // Reject read-only file handles: fallocate is a write operation per POSIX.
@@ -7611,19 +7617,16 @@ impl FuseVfsAdapter {
         }
         let e = self.engine.lock().unwrap();
         // POSIX: immutable files reject all fallocate operations.
-        // Append-only files reject PUNCH_HOLE and COLLAPSE_RANGE (shrinking ops).
+        // Append-only files reject PUNCH_HOLE, the reachable shrinking mode.
         let attr = e.getattr(InodeId::new(ino), Some(&efh), ctx)?;
         let raw_flags = attr.flags.to_raw_flags();
         enforce_immutable_guard(raw_flags)?;
-        // Append-only files reject shrinking operations: PUNCH_HOLE and COLLAPSE_RANGE.
-        if (mode & FALLOC_FL_PUNCH_HOLE) != 0 || (mode & FALLOC_FL_COLLAPSE_RANGE) != 0 {
+        if (mode & FALLOC_FL_PUNCH_HOLE) != 0 {
             enforce_append_only_write_guard(raw_flags, false)?;
         }
         let engine_start = std::time::Instant::now();
         let is_hole_or_zero =
             (mode & FALLOC_FL_PUNCH_HOLE) != 0 || (mode & FALLOC_FL_ZERO_RANGE) != 0;
-        let is_collapse = (mode & FALLOC_FL_COLLAPSE_RANGE) != 0;
-        let is_insert = (mode & FALLOC_FL_INSERT_RANGE) != 0;
         let old_size = attr.posix.size;
         if diagnostic {
             eprintln!(
@@ -7672,21 +7675,6 @@ impl FuseVfsAdapter {
                     );
                 }
                 self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
-            } else if is_collapse || is_insert {
-                let suffix_end = if is_insert {
-                    old_size.saturating_add(length)
-                } else {
-                    old_size
-                };
-                if suffix_end > offset {
-                    self.invalidate_caches_after_engine_data_mutation(
-                        ino,
-                        offset,
-                        suffix_end - offset,
-                    );
-                } else {
-                    self.invalidate_inode_metadata_after_engine_write(ino);
-                }
             } else if mode & FALLOC_FL_KEEP_SIZE == 0 {
                 let end = offset.saturating_add(length);
                 if end > old_size {
@@ -10825,9 +10813,9 @@ mod tests {
     use tidefs_local_object_store::StoreOptions;
     use tidefs_types_posix_filesystem_adapter_core::rename_flags::RENAME_WHITEOUT;
     use tidefs_types_vfs_core::{
-        DirHandleId, Generation, InodeFlags, PosixAttrs, FALLOC_FL_COLLAPSE_RANGE,
-        FALLOC_FL_INSERT_RANGE, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
-        RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFIFO, S_IFLNK, S_IFREG, XATTR_CREATE, XATTR_REPLACE,
+        DirHandleId, Generation, InodeFlags, PosixAttrs, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE,
+        FALLOC_FL_ZERO_RANGE, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFIFO, S_IFLNK, S_IFREG,
+        XATTR_CREATE, XATTR_REPLACE,
     };
     use tidefs_vfs_engine::{
         LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminResponseBody,
@@ -17954,41 +17942,6 @@ mod tests {
             "punch hole must fence the punched byte range"
         );
 
-        let collapse_prefix = fixture.adapter.data_cache_generation_snapshot(ino, 0, 512);
-        let collapse_suffix = fixture
-            .adapter
-            .data_cache_generation_snapshot(ino, 4096, 512);
-        fixture
-            .adapter
-            .dispatch_fallocate_file(&ctx, ino, adapter_fh, FALLOC_FL_COLLAPSE_RANGE, 2048, 1024)
-            .expect("collapse range");
-        assert!(
-            fixture
-                .adapter
-                .data_cache_snapshot_still_current(ino, 0, 512, collapse_prefix),
-            "collapse range should not fence bytes before the collapse offset"
-        );
-        assert!(
-            !fixture
-                .adapter
-                .data_cache_snapshot_still_current(ino, 4096, 512, collapse_suffix),
-            "collapse range must fence the shifted suffix"
-        );
-
-        let insert_suffix = fixture
-            .adapter
-            .data_cache_generation_snapshot(ino, 4096, 512);
-        fixture
-            .adapter
-            .dispatch_fallocate_file(&ctx, ino, adapter_fh, FALLOC_FL_INSERT_RANGE, 2048, 1024)
-            .expect("insert range");
-        assert!(
-            !fixture
-                .adapter
-                .data_cache_snapshot_still_current(ino, 4096, 512, insert_suffix),
-            "insert range must fence the shifted suffix"
-        );
-
         let old_size = {
             let engine = fixture.adapter.engine.lock().unwrap();
             engine
@@ -18411,15 +18364,23 @@ mod tests {
             libc::O_RDWR as u32,
         );
 
-        // Unknown mode bits return EOPNOTSUPP (filesystem does not support
-        // the requested mode).  Known-but-deferred modes (COLLAPSE_RANGE,
-        // INSERT_RANGE) also land here.
-        assert_eq!(
-            fixture
-                .adapter
-                .dispatch_fallocate_file(&ctx, inode.get(), adapter_fh, 0xDEAD, 0, 4096,),
-            Err(Errno::EOPNOTSUPP)
-        );
+        for mode in [
+            libc::FALLOC_FL_COLLAPSE_RANGE as u32,
+            libc::FALLOC_FL_INSERT_RANGE as u32,
+            0xDEAD,
+        ] {
+            assert_eq!(
+                fixture.adapter.dispatch_fallocate_file(
+                    &ctx,
+                    inode.get(),
+                    adapter_fh,
+                    mode,
+                    0,
+                    4096,
+                ),
+                Err(Errno::EOPNOTSUPP)
+            );
+        }
     }
 
     #[test]

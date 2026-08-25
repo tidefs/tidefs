@@ -39,8 +39,8 @@ let
  *  1. Allocate: pre-allocate blocks for a file range.
  *  2. Punch-hole: deallocate a range creating a sparse hole.
  *  3. Zero-range: zero-fill a range without block deallocation.
- *  4. Collapse-range: remove a range and shift subsequent data backward.
- *  5. Insert-range: insert a zero-filled hole shifting data forward.
+ *  4. Collapse-range: verify explicit EOPNOTSUPP without mutation.
+ *  5. Insert-range: verify explicit EOPNOTSUPP without mutation.
  *  6. Keep-size: allocate blocks without changing file size.
  *  7. Concurrent-allocate: two threads performing alloc/punch on same file.
  *
@@ -168,104 +168,50 @@ static int test_zero_range(void) {
     return 0;
 }
 
-/* ── 4. Collapse-range ────────────────────────────────────────────── */
-static int test_collapse_range(void) {
-    make_path("collapse.bin");
+/* ── 4-5. Kernel-refused range modes ──────────────────────────────── */
+static int test_refused_range_mode(const char *file_name, const char *label, int mode) {
+    make_path(file_name);
     unlink(test_path);
     int fd = open(test_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) { perror("collapse open"); return 1; }
+    if (fd < 0) { perror("range-refusal open"); return 1; }
 
-    /* Write pattern: first PAGE = 0xAA, second PAGE = 0xBB, third PAGE = 0xCC */
     unsigned char data[PAGE * 3];
-    memset(data, 0xAA, PAGE);
-    memset(data + PAGE, 0xBB, PAGE);
-    memset(data + PAGE * 2, 0xCC, PAGE);
+    unsigned char readback[PAGE * 3];
+    fill_buf(data, sizeof(data), 4);
     if (write(fd, data, PAGE * 3) != PAGE * 3) { perror("write"); close(fd); return 1; }
 
-    /* Collapse middle page (FALLOC_FL_COLLAPSE_RANGE = 0x08) */
-    if (fallocate(fd, 0x08, PAGE, PAGE) < 0) {
-        perror("fallocate collapse"); close(fd); return 1;
+    errno = 0;
+    if (fallocate(fd, mode, PAGE, PAGE) == 0 || errno != EOPNOTSUPP) {
+        fprintf(stderr, "%s-range: expected EOPNOTSUPP, got %s\n",
+                label, errno == 0 ? "success" : strerror(errno));
+        close(fd); return 1;
     }
 
     struct stat st;
     if (fstat(fd, &st) < 0) { perror("fstat"); close(fd); return 1; }
-    if (st.st_size != PAGE * 2) {
-        fprintf(stderr, "collapse: expected size %d got %ld\n", PAGE * 2, (long)st.st_size);
+    if (st.st_size != (off_t)sizeof(data)) {
+        fprintf(stderr, "%s-range refusal changed size: expected %zu got %ld\n",
+                label, sizeof(data), (long)st.st_size);
         close(fd); return 1;
     }
-
-    /* First page should be 0xAA, second page should be 0xCC (was third page) */
-    unsigned char buf[PAGE];
-    if (pread(fd, buf, PAGE, 0) != PAGE) { perror("pread 0"); close(fd); return 1; }
-    for (int i = 0; i < PAGE; i++) {
-        if (buf[i] != 0xAA) {
-            fprintf(stderr, "collapse: page0[%d] expected 0xAA got 0x%02x\n", i, buf[i]);
-            close(fd); return 1;
-        }
+    if (pread(fd, readback, sizeof(readback), 0) != (ssize_t)sizeof(readback)) {
+        perror("range-refusal pread"); close(fd); return 1;
     }
-    if (pread(fd, buf, PAGE, PAGE) != PAGE) { perror("pread PAGE"); close(fd); return 1; }
-    for (int i = 0; i < PAGE; i++) {
-        if (buf[i] != 0xCC) {
-            fprintf(stderr, "collapse: page1[%d] expected 0xCC got 0x%02x\n", i, buf[i]);
-            close(fd); return 1;
-        }
+    if (memcmp(readback, data, sizeof(data)) != 0) {
+        fprintf(stderr, "%s-range refusal changed file data\n", label);
+        close(fd); return 1;
     }
     close(fd);
-    printf("PASS: collapse-range-shifts-data\n");
+    printf("PASS: %s-range-refused-eopnotsupp-and-unchanged\n", label);
     return 0;
 }
 
-/* ── 5. Insert-range ──────────────────────────────────────────────── */
+static int test_collapse_range(void) {
+    return test_refused_range_mode("collapse.bin", "collapse", 0x08);
+}
+
 static int test_insert_range(void) {
-    make_path("insert.bin");
-    unlink(test_path);
-    int fd = open(test_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) { perror("insert open"); return 1; }
-
-    /* Write pattern: first PAGE = 0xAA, second PAGE = 0xBB */
-    unsigned char data[PAGE * 2];
-    memset(data, 0xAA, PAGE);
-    memset(data + PAGE, 0xBB, PAGE);
-    if (write(fd, data, PAGE * 2) != PAGE * 2) { perror("write"); close(fd); return 1; }
-
-    /* Insert a page at offset PAGE (FALLOC_FL_INSERT_RANGE = 0x20) */
-    if (fallocate(fd, 0x20, PAGE, PAGE) < 0) {
-        perror("fallocate insert"); close(fd); return 1;
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) < 0) { perror("fstat"); close(fd); return 1; }
-    if (st.st_size != PAGE * 3) {
-        fprintf(stderr, "insert: expected size %d got %ld\n", PAGE * 3, (long)st.st_size);
-        close(fd); return 1;
-    }
-
-    /* First page: 0xAA, second page: zero (inserted), third page: 0xBB (shifted) */
-    unsigned char buf[PAGE];
-    if (pread(fd, buf, PAGE, 0) != PAGE) { perror("pread 0"); close(fd); return 1; }
-    for (int i = 0; i < PAGE; i++) {
-        if (buf[i] != 0xAA) {
-            fprintf(stderr, "insert: page0[%d] expected 0xAA got 0x%02x\n", i, buf[i]);
-            close(fd); return 1;
-        }
-    }
-    if (pread(fd, buf, PAGE, PAGE) != PAGE) { perror("pread PAGE"); close(fd); return 1; }
-    for (int i = 0; i < PAGE; i++) {
-        if (buf[i] != 0) {
-            fprintf(stderr, "insert: page1[%d] expected 0 got 0x%02x\n", i, buf[i]);
-            close(fd); return 1;
-        }
-    }
-    if (pread(fd, buf, PAGE, PAGE * 2) != PAGE) { perror("pread 2*PAGE"); close(fd); return 1; }
-    for (int i = 0; i < PAGE; i++) {
-        if (buf[i] != 0xBB) {
-            fprintf(stderr, "insert: page2[%d] expected 0xBB got 0x%02x\n", i, buf[i]);
-            close(fd); return 1;
-        }
-    }
-    close(fd);
-    printf("PASS: insert-range-shifts-data\n");
-    return 0;
+    return test_refused_range_mode("insert.bin", "insert", 0x20);
 }
 
 /* ── 6. Keep-size ─────────────────────────────────────────────────── */
@@ -409,7 +355,8 @@ CEOF
 Usage: tidefs-fuse-fallocate-validation [--keep-tmp]
 
 Validate FUSE userspace fallocate(2) operations (allocate, punch-hole,
-zero-range, collapse-range, insert-range, keep-size, concurrent-allocate)
+zero-range, keep-size, concurrent-allocate) and explicit collapse-range and
+insert-range refusal
 with crash-consistency verification through committed-root integrity checks.
 
 Environment:
