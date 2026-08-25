@@ -930,7 +930,7 @@ mod tests {
             "tidefsctl",
             "snapshot",
             "create",
-            "mysnap",
+            "mypool/root@mysnap",
             "--backing-dir",
             "/tmp/pool",
         ]);
@@ -941,13 +941,22 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_snapshot_create_live_pool_positional() {
+    fn cli_parse_snapshot_create_uses_one_canonical_typed_target() {
         use clap::Parser;
-        let args = Cli::try_parse_from(["tidefsctl", "snapshot", "create", "mypool", "mysnap"]);
-        assert!(
-            args.is_ok(),
-            "snapshot create with positional pool and name should parse"
-        );
+        for operation in ["create", "destroy", "rollback"] {
+            assert!(Cli::try_parse_from([
+                "tidefsctl",
+                "snapshot",
+                operation,
+                "mypool/root@before",
+            ])
+            .is_ok());
+            assert!(
+                Cli::try_parse_from(["tidefsctl", "snapshot", operation, "mypool", "before",])
+                    .is_err()
+            );
+            assert!(Cli::try_parse_from(["tidefsctl", "snapshot", operation, "mypool"]).is_err());
+        }
     }
 
     #[test]
@@ -1125,7 +1134,7 @@ mod tests {
             "tidefsctl",
             "snapshot",
             "destroy",
-            "mysnap",
+            "mypool/root@mysnap",
             "--backing-dir",
             "/tmp/pool",
         ]);
@@ -1136,12 +1145,12 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_snapshot_destroy_live_pool_positional() {
+    fn cli_parse_snapshot_destroy_rejects_retired_two_positional_form() {
         use clap::Parser;
         let args = Cli::try_parse_from(["tidefsctl", "snapshot", "destroy", "mypool", "mysnap"]);
         assert!(
-            args.is_ok(),
-            "snapshot destroy with positional pool and name should parse"
+            args.is_err(),
+            "snapshot destroy with positional pool and name must be retired"
         );
     }
 
@@ -1152,7 +1161,7 @@ mod tests {
             "tidefsctl",
             "snapshot",
             "destroy",
-            "mysnap",
+            "mypool/root@mysnap",
             "-b",
             "/tmp/pool",
         ]);

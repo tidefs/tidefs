@@ -11453,8 +11453,8 @@ mod tests {
         let mut request = LivePoolAdminRequest::new(command, "tank");
         request.args = LivePoolAdminArgs(
             [(
-                "name".to_string(),
-                LivePoolAdminArg::String(name.to_string()),
+                "target".to_string(),
+                LivePoolAdminArg::String(format!("root@{name}")),
             )]
             .into_iter()
             .collect(),
