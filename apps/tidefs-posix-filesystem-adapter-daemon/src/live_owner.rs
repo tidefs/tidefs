@@ -1654,7 +1654,7 @@ fn pool_status(
         "state": "Active",
         "owner_kind": manifest.owner_kind,
         "pid": manifest.pid,
-        "backing_dir": manifest.backing_dir,
+        "owner_metadata_dir": manifest.backing_dir,
         "mountpoint": manifest.mountpoint,
         "socket_path": manifest.socket_path,
         "health": health,
@@ -1690,7 +1690,7 @@ fn pool_status_text(
     topology: &PoolTopologyStatus,
 ) -> String {
     let mut text = format!(
-        "pool: {}\n  pool uuid:   {}\n  state:       Active\n  health:      {}\n  access:      {}\n  owner:       {} (pid {})\n  backing dir: {}\n  mountpoint:  {}\n  members:     expected={} present={} missing={}\n  blocks:      total={} free={} avail={}\n  files:       total={} free={}",
+        "pool: {}\n  pool uuid:   {}\n  state:       Active\n  health:      {}\n  access:      {}\n  owner:       {} (pid {})\n  owner metadata dir: {}\n  mountpoint:  {}\n  members:     expected={} present={} missing={}\n  blocks:      total={} free={} avail={}\n  files:       total={} free={}",
             manifest.pool_name,
             manifest.pool_uuid,
             pool_health_label(topology.health),
@@ -2143,6 +2143,8 @@ mod tests {
 
         assert!(text.contains("health:      Degraded"));
         assert!(text.contains("access:      ReadOnly"));
+        assert!(text.contains("owner metadata dir: /var/lib/tidefs/tank"));
+        assert!(!text.contains("backing dir:"));
         assert!(text.contains("members:     expected=2 present=1 missing=1"));
         assert!(text.contains("member 0:   11111111111111111111111111111111 Missing"));
         assert!(text.contains("member 1:   22222222222222222222222222222222 Present"));
