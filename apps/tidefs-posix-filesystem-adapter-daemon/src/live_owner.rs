@@ -27,6 +27,7 @@ use tidefs_block_volume_adapter_daemon::storage_backend::{
 };
 #[cfg(feature = "block-volume")]
 use tidefs_block_volume_adapter_daemon::ublk_control_open::run_ublk_live_device;
+use tidefs_dataset_lifecycle::{DatasetCatalog, DatasetType};
 use tidefs_local_filesystem::SharedPoolDatasetOwner;
 use tidefs_local_object_store::pool::{PoolHealth, PoolMemberStatus, PoolTopologyStatus};
 use tidefs_types_vfs_core::RequestCtx;
@@ -537,29 +538,30 @@ fn dispatch_request(
             shutdown,
         ),
         LivePoolAdminCommand::PoolDestroy => pool_destroy_refused(&request, manifest),
+        LivePoolAdminCommand::SnapshotCreate
+        | LivePoolAdminCommand::SnapshotDestroy
+        | LivePoolAdminCommand::SnapshotRollback => snapshot_mutation(
+            &request,
+            admin,
+            #[cfg(feature = "block-volume")]
+            block_export,
+        ),
         #[cfg(feature = "block-volume")]
         LivePoolAdminCommand::DatasetResize
         | LivePoolAdminCommand::DatasetRename
         | LivePoolAdminCommand::DatasetDestroy
-        | LivePoolAdminCommand::SnapshotCreate
         | LivePoolAdminCommand::SnapshotCloneCreate
         | LivePoolAdminCommand::SnapshotCloneDelete
-        | LivePoolAdminCommand::SnapshotClonePromote
-        | LivePoolAdminCommand::SnapshotDestroy
-        | LivePoolAdminCommand::SnapshotRollback => {
+        | LivePoolAdminCommand::SnapshotClonePromote => {
             volume_lifecycle_mutation(&request, admin, block_export)
         }
         #[cfg(not(feature = "block-volume"))]
         LivePoolAdminCommand::DatasetResize
         | LivePoolAdminCommand::DatasetRename
         | LivePoolAdminCommand::DatasetDestroy
-        | LivePoolAdminCommand::SnapshotCreate
         | LivePoolAdminCommand::SnapshotCloneCreate
         | LivePoolAdminCommand::SnapshotCloneDelete
-        | LivePoolAdminCommand::SnapshotClonePromote
-        | LivePoolAdminCommand::SnapshotDestroy => delegate_admin_request(&request, admin),
-        #[cfg(not(feature = "block-volume"))]
-        LivePoolAdminCommand::SnapshotRollback => rollback_snapshot(&request, admin),
+        | LivePoolAdminCommand::SnapshotClonePromote => delegate_admin_request(&request, admin),
         LivePoolAdminCommand::DatasetCreate
         | LivePoolAdminCommand::DatasetList
         | LivePoolAdminCommand::DatasetSetStrategy
@@ -720,6 +722,118 @@ impl BlockExportState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotSourceKind {
+    MountedFilesystem,
+    Volume,
+}
+
+fn snapshot_mutation(
+    request: &LivePoolAdminRequest,
+    admin: &LiveOwnerAdmin,
+    #[cfg(feature = "block-volume")] block_export: &SharedBlockExport,
+) -> LivePoolAdminResponse {
+    let source_kind = match snapshot_source_kind(request, admin) {
+        Ok(source_kind) => source_kind,
+        Err(response) => return response,
+    };
+    match source_kind {
+        SnapshotSourceKind::MountedFilesystem => {
+            if request.command == LivePoolAdminCommand::SnapshotRollback {
+                rollback_snapshot(request, admin)
+            } else {
+                delegate_admin_request(request, admin)
+            }
+        }
+        SnapshotSourceKind::Volume => {
+            #[cfg(feature = "block-volume")]
+            {
+                let targets = match volume_mutation_targets(request) {
+                    Ok(targets) => targets,
+                    Err(error) => return live_admin_typed_error(error),
+                };
+                match with_volume_mutation_admission(block_export, &targets, || {
+                    delegate_admin_request(request, admin)
+                }) {
+                    Ok(response) => response,
+                    Err(message) => {
+                        let (command, operation) = request.command.parts();
+                        LivePoolAdminResponse::error(
+                            1,
+                            format!("{command} {operation} refused: {message}"),
+                        )
+                    }
+                }
+            }
+            #[cfg(not(feature = "block-volume"))]
+            {
+                delegate_admin_request(request, admin)
+            }
+        }
+    }
+}
+
+fn snapshot_source_kind(
+    request: &LivePoolAdminRequest,
+    admin: &LiveOwnerAdmin,
+) -> Result<SnapshotSourceKind, LivePoolAdminResponse> {
+    let target =
+        required_request_arg_str(&request.args, "target").map_err(live_admin_typed_error)?;
+    let source = canonical_snapshot_source(target).map_err(live_admin_typed_error)?;
+    match admin {
+        LiveOwnerAdmin::Fuse { pool_owner, .. } => {
+            let owner = pool_owner.borrow();
+            snapshot_catalog_source_kind(
+                owner.dataset_catalog(),
+                Some(owner.mounted_dataset_id()),
+                source,
+            )
+        }
+        #[cfg(feature = "block-volume")]
+        LiveOwnerAdmin::StandaloneBlock { runtime } => {
+            let runtime = runtime.lock().map_err(|_| {
+                LivePoolAdminResponse::error(1, "shared Pool runtime lock poisoned")
+            })?;
+            snapshot_catalog_source_kind(runtime.dataset_catalog(), None, source)
+        }
+    }
+}
+
+fn snapshot_catalog_source_kind(
+    catalog: &DatasetCatalog,
+    mounted_dataset_id: Option<[u8; 16]>,
+    source: &str,
+) -> Result<SnapshotSourceKind, LivePoolAdminResponse> {
+    let dataset_id = catalog.lookup(source).map_err(|_| {
+        LivePoolAdminResponse::error(
+            1,
+            format!("snapshot source '{source}' does not exist in the canonical Pool catalog"),
+        )
+    })?;
+    let (_, _, source_type, _, _, _) = catalog.get_by_id(&dataset_id).ok_or_else(|| {
+        LivePoolAdminResponse::error(
+            1,
+            format!("snapshot source '{source}' lost its catalog identity"),
+        )
+    })?;
+    match source_type {
+        DatasetType::Volume => Ok(SnapshotSourceKind::Volume),
+        DatasetType::Filesystem
+            if mounted_dataset_id.is_some_and(|mounted| mounted == *dataset_id.as_bytes()) =>
+        {
+            Ok(SnapshotSourceKind::MountedFilesystem)
+        }
+        DatasetType::Filesystem => Err(LivePoolAdminResponse::error(
+            1,
+            format!("filesystem snapshot source '{source}' is not mounted by this live owner"),
+        )),
+        DatasetType::Snapshot => Err(LivePoolAdminResponse::error(
+            1,
+            format!("snapshot source '{source}' is itself a snapshot, not a filesystem or volume"),
+        )),
+    }
+}
+
 #[cfg(feature = "block-volume")]
 fn volume_lifecycle_mutation(
     request: &LivePoolAdminRequest,
@@ -730,12 +844,6 @@ fn volume_lifecycle_mutation(
         Ok(targets) => targets,
         Err(error) => return live_admin_typed_error(error),
     };
-    if targets.is_empty() {
-        if request.command == LivePoolAdminCommand::SnapshotRollback {
-            return rollback_snapshot(request, admin);
-        }
-        return delegate_admin_request(request, admin);
-    }
     match with_volume_mutation_admission(block_export, &targets, || {
         delegate_admin_request(request, admin)
     }) {
@@ -810,15 +918,6 @@ fn volume_mutation_targets(
         }
     };
     let target = request_arg_str(&request.args, name)?;
-    if matches!(
-        request.command,
-        LivePoolAdminCommand::SnapshotCreate
-            | LivePoolAdminCommand::SnapshotDestroy
-            | LivePoolAdminCommand::SnapshotRollback
-    ) && target.is_none()
-    {
-        return Ok(Vec::new());
-    }
     let target = target
         .ok_or_else(|| LivePoolAdminError::malformed(format!("object mutation requires {name}")))?;
     if matches!(
@@ -827,9 +926,21 @@ fn volume_mutation_targets(
             | LivePoolAdminCommand::SnapshotDestroy
             | LivePoolAdminCommand::SnapshotRollback
     ) {
-        return Ok(vec![volume_snapshot_source(target)?]);
+        return Ok(vec![canonical_snapshot_source(target)?]);
     }
     Ok(vec![target])
+}
+
+fn canonical_snapshot_source(target: &str) -> Result<&str, LivePoolAdminError> {
+    let (source, snapshot) = target.rsplit_once('@').ok_or_else(|| {
+        LivePoolAdminError::malformed("snapshot target requires <filesystem-or-volume>@<snapshot>")
+    })?;
+    if source.is_empty() || snapshot.is_empty() || snapshot.contains('/') {
+        return Err(LivePoolAdminError::malformed(
+            "snapshot target must name one source and one snapshot",
+        ));
+    }
+    Ok(source)
 }
 
 #[cfg(feature = "block-volume")]
@@ -1196,6 +1307,26 @@ fn standalone_block_admin_request(
             );
         }
     }
+    if matches!(
+        request.command,
+        LivePoolAdminCommand::SnapshotCreate
+            | LivePoolAdminCommand::SnapshotDestroy
+            | LivePoolAdminCommand::SnapshotRollback
+    ) {
+        let target = match required_request_arg_str(&request.args, "target") {
+            Ok(target) => target,
+            Err(error) => return live_admin_typed_error(error),
+        };
+        let source = match canonical_snapshot_source(target) {
+            Ok(source) => source,
+            Err(error) => return live_admin_typed_error(error),
+        };
+        match snapshot_catalog_source_kind(runtime.dataset_catalog(), None, source) {
+            Ok(SnapshotSourceKind::Volume) => {}
+            Ok(SnapshotSourceKind::MountedFilesystem) => unreachable!(),
+            Err(response) => return response,
+        }
+    }
     match request.command {
         LivePoolAdminCommand::DatasetResize => {
             let name = match required_request_arg_str(&request.args, "name") {
@@ -1483,7 +1614,6 @@ fn standalone_block_admin_request(
     }
 }
 
-#[cfg(feature = "block-volume")]
 fn required_request_arg_str<'a>(
     args: &'a LivePoolAdminArgs,
     name: &str,
@@ -2494,7 +2624,7 @@ mod tests {
     fn standalone_block_owner_routes_volume_clone_and_snapshot_to_active_export_admission() {
         use std::fs::OpenOptions;
 
-        use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, SyncGuarantee};
+        use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, DatasetType, SyncGuarantee};
         use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2525,6 +2655,19 @@ mod tests {
                 SyncGuarantee::Local,
             )
             .unwrap();
+        runtime
+            .create_dataset_with_root(
+                "fs",
+                DatasetId::from_bytes([8; 16]),
+                DatasetType::Filesystem,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+                1,
+                b"filesystem-root",
+            )
+            .unwrap();
+        runtime.create_volume_snapshot("vol@seed").unwrap();
         let runtime = Arc::new(Mutex::new(runtime));
         let shutdown = Arc::new(AtomicBool::new(false));
         let runtime_dir = dir.path().join("runtime");
@@ -2661,12 +2804,42 @@ mod tests {
             };
             assert!(message.contains("actively exported"), "{message}");
         }
-        assert!(runtime
-            .lock()
-            .unwrap()
-            .list_volume_snapshots()
-            .unwrap()
-            .is_empty());
+
+        for (target, expected) in [
+            ("fs@before", "is not mounted by this live owner"),
+            (
+                "missing@before",
+                "does not exist in the canonical Pool catalog",
+            ),
+            (
+                "vol@seed@nested",
+                "is itself a snapshot, not a filesystem or volume",
+            ),
+        ] {
+            let mut stream = UnixStream::connect(runtime_dir.join("owner.sock")).unwrap();
+            let mut request =
+                LivePoolAdminRequest::new(LivePoolAdminCommand::SnapshotCreate, "tank");
+            request.args = LivePoolAdminArgs(
+                [(
+                    "target".to_string(),
+                    LivePoolAdminArg::String(target.to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            );
+            writeln!(stream, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+            let mut response = String::new();
+            BufReader::new(stream).read_line(&mut response).unwrap();
+            let response: LivePoolAdminResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(response.exit_code, 1);
+            let LivePoolAdminResponseBody::Error { message, .. } = response.body else {
+                panic!("invalid source should refuse before mutation");
+            };
+            assert!(message.contains(expected), "{target}: {message}");
+        }
+        let snapshots = runtime.lock().unwrap().list_volume_snapshots().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].path, "vol@seed");
 
         owner.stop();
         assert!(!runtime_dir.join("owner.json").exists());
@@ -2700,7 +2873,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             );
-            assert!(volume_mutation_targets(&request).is_err());
+            assert_eq!(volume_mutation_targets(&request).unwrap(), vec!["vol@snap"]);
 
             request.args = LivePoolAdminArgs(
                 [(
@@ -2710,7 +2883,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             );
-            assert!(volume_mutation_targets(&request).unwrap().is_empty());
+            assert!(volume_mutation_targets(&request).is_err());
         }
 
         let mut create =

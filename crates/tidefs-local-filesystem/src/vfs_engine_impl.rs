@@ -2719,29 +2719,37 @@ impl VfsLocalFileSystem {
     }
 
     fn live_snapshot_create(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
-        if let Some(target) = live_admin_optional_arg(args, "target") {
-            let mut fs = self.fs.borrow_mut();
-            return match fs.create_volume_snapshot_dataset(target) {
+        let target = match live_admin_arg(args, "target") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let source = {
+            let fs = self.fs.borrow();
+            match resolve_live_snapshot_source(&fs, target) {
+                Ok(source) => source,
+                Err(error) => return live_admin_error(1, format!("snapshot create: {error}")),
+            }
+        };
+        let mut fs = self.fs.borrow_mut();
+        match source {
+            LiveSnapshotSource::MountedFilesystem { snapshot } => {
+                match fs.create_snapshot(snapshot) {
+                    Ok(summary) => {
+                        live_admin_ok_text(format!("{} created", snapshot_summary_line(&summary)))
+                    }
+                    Err(err) => live_admin_error(
+                        1,
+                        format!("snapshot create: failed to create '{target}': {err}"),
+                    ),
+                }
+            }
+            LiveSnapshotSource::Volume => match fs.create_volume_snapshot_dataset(target) {
                 Ok(summary) => volume_snapshot_response("created", &summary, wants_json),
                 Err(err) => live_admin_error(
                     1,
                     format!("snapshot create: failed to create '{target}': {err}"),
                 ),
-            };
-        }
-        let name = match live_admin_arg(args, "name") {
-            Ok(value) => value,
-            Err(err) => return live_admin_error(2, err),
-        };
-        let mut fs = self.fs.borrow_mut();
-        match fs.create_snapshot(name) {
-            Ok(summary) => {
-                live_admin_ok_text(format!("{} created", snapshot_summary_line(&summary)))
-            }
-            Err(err) => live_admin_error(
-                1,
-                format!("snapshot create: failed to create snapshot '{name}': {err}"),
-            ),
+            },
         }
     }
 
@@ -2853,72 +2861,90 @@ impl VfsLocalFileSystem {
     }
 
     fn live_snapshot_destroy(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
-        if let Some(target) = live_admin_optional_arg(args, "target") {
-            let mut fs = self.fs.borrow_mut();
-            return match fs.destroy_volume_snapshot_dataset(target) {
+        let target = match live_admin_arg(args, "target") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let source = {
+            let fs = self.fs.borrow();
+            match resolve_live_snapshot_source(&fs, target) {
+                Ok(source) => source,
+                Err(error) => return live_admin_error(1, format!("snapshot destroy: {error}")),
+            }
+        };
+        let mut fs = self.fs.borrow_mut();
+        match source {
+            LiveSnapshotSource::MountedFilesystem { snapshot } => {
+                match fs.delete_snapshot(snapshot) {
+                    Ok(summary) => {
+                        live_admin_ok_text(format!("{} destroyed", snapshot_summary_line(&summary)))
+                    }
+                    Err(err) => live_admin_error(
+                        1,
+                        format!("snapshot destroy: failed to destroy '{target}': {err}"),
+                    ),
+                }
+            }
+            LiveSnapshotSource::Volume => match fs.destroy_volume_snapshot_dataset(target) {
                 Ok(result) => volume_snapshot_destroy_response(&result, wants_json),
                 Err(err) => live_admin_error(
                     1,
                     format!("snapshot destroy: failed to destroy '{target}': {err}"),
                 ),
-            };
-        }
-        let name = match live_admin_arg(args, "name") {
-            Ok(value) => value,
-            Err(err) => return live_admin_error(2, err),
-        };
-        let mut fs = self.fs.borrow_mut();
-        match fs.delete_snapshot(name) {
-            Ok(summary) => {
-                live_admin_ok_text(format!("{} destroyed", snapshot_summary_line(&summary)))
-            }
-            Err(err) => live_admin_error(
-                1,
-                format!("snapshot destroy: failed to destroy snapshot '{name}': {err}"),
-            ),
+            },
         }
     }
 
     fn live_snapshot_rollback(&self, args: &Value) -> LivePoolAdminResponse {
-        if let Some(target) = live_admin_optional_arg(args, "target") {
-            let mut fs = self.fs.borrow_mut();
-            return match fs.restore_volume_snapshot_dataset(target) {
-                Ok(result) => live_admin_ok_text(format!(
-                    "volume snapshot '{}' restored to '{}' (size={} generation={} resize_generation={} snapshot_generation={})",
-                    result.snapshot.path,
-                    result.snapshot.source_path,
-                    result.geometry.capacity_bytes,
-                    result.generation,
-                    result.resize_generation,
-                    result.snapshot_generation,
-                )),
-                Err(err) => live_admin_error(
-                    1,
-                    format!("snapshot rollback: failed to restore '{target}': {err}"),
-                ),
-            };
-        }
-        let name = match live_admin_arg(args, "name") {
+        let target = match live_admin_arg(args, "target") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
         };
-        let rollback = self.fs.borrow_mut().rollback_to_snapshot(name);
-        match rollback {
-            Ok(report) => {
-                self.reset_path_cache();
-                live_admin_ok_text(format!(
-                    "rolled back to snapshot '{}' (generation {} -> {}, restored source gen {}, {} snapshot entries)",
-                    report.snapshot.name,
-                    report.generation_before,
-                    report.published_generation,
-                    report.restored_source_generation,
-                    report.snapshot_catalog_entries,
-                ))
+        let source = {
+            let fs = self.fs.borrow();
+            match resolve_live_snapshot_source(&fs, target) {
+                Ok(source) => source,
+                Err(error) => return live_admin_error(1, format!("snapshot rollback: {error}")),
             }
-            Err(err) => live_admin_error(
-                1,
-                format!("snapshot rollback: failed to rollback to snapshot '{name}': {err}"),
-            ),
+        };
+        match source {
+            LiveSnapshotSource::MountedFilesystem { snapshot } => {
+                let rollback = self.fs.borrow_mut().rollback_to_snapshot(snapshot);
+                match rollback {
+                    Ok(report) => {
+                        self.reset_path_cache();
+                        live_admin_ok_text(format!(
+                            "rolled back to snapshot '{}' (generation {} -> {}, restored source gen {}, {} snapshot entries)",
+                            report.snapshot.name,
+                            report.generation_before,
+                            report.published_generation,
+                            report.restored_source_generation,
+                            report.snapshot_catalog_entries,
+                        ))
+                    }
+                    Err(err) => live_admin_error(
+                        1,
+                        format!("snapshot rollback: failed to rollback to '{target}': {err}"),
+                    ),
+                }
+            }
+            LiveSnapshotSource::Volume => {
+                match self.fs.borrow_mut().restore_volume_snapshot_dataset(target) {
+                    Ok(result) => live_admin_ok_text(format!(
+                        "volume snapshot '{}' restored to '{}' (size={} generation={} resize_generation={} snapshot_generation={})",
+                        result.snapshot.path,
+                        result.snapshot.source_path,
+                        result.geometry.capacity_bytes,
+                        result.generation,
+                        result.resize_generation,
+                        result.snapshot_generation,
+                    )),
+                    Err(err) => live_admin_error(
+                        1,
+                        format!("snapshot rollback: failed to restore '{target}': {err}"),
+                    ),
+                }
+            }
         }
     }
 
@@ -6205,6 +6231,45 @@ fn snapshot_summary_line(summary: &crate::types::SnapshotSummary) -> String {
         summary.source_generation,
         summary.created_at_generation
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveSnapshotSource<'a> {
+    MountedFilesystem { snapshot: &'a str },
+    Volume,
+}
+
+fn resolve_live_snapshot_source<'a>(
+    fs: &PoolDatasetOwner,
+    target: &'a str,
+) -> Result<LiveSnapshotSource<'a>, String> {
+    let (source, snapshot) = target
+        .rsplit_once('@')
+        .ok_or_else(|| "target must use <filesystem-or-volume>@<snapshot> form".to_string())?;
+    if source.is_empty() || snapshot.is_empty() || snapshot.contains('/') {
+        return Err("target must name one source and one snapshot".to_string());
+    }
+    let dataset_id = fs
+        .dataset_catalog()
+        .lookup(source)
+        .map_err(|_| format!("source '{source}' does not exist in the canonical Pool catalog"))?;
+    let (_, _, source_type, _, _, _) = fs
+        .dataset_catalog()
+        .get_by_id(&dataset_id)
+        .ok_or_else(|| format!("source '{source}' lost its catalog identity"))?;
+    match source_type {
+        DatasetType::Volume => Ok(LiveSnapshotSource::Volume),
+        DatasetType::Filesystem if *dataset_id.as_bytes() == fs.mounted_dataset_id() => {
+            Ok(LiveSnapshotSource::MountedFilesystem { snapshot })
+        }
+        DatasetType::Filesystem => Err(format!(
+            "filesystem source '{source}' is not the mounted filesystem '{}' owned by this live carrier",
+            fs.mounted_dataset_path()
+        )),
+        DatasetType::Snapshot => Err(format!(
+            "source '{source}' is itself a snapshot, not a filesystem or volume"
+        )),
+    }
 }
 
 fn volume_snapshot_line(summary: &tidefs_pool_runtime::VolumeSnapshotSummary) -> String {
@@ -9571,7 +9636,7 @@ mod tests {
     }
 
     #[test]
-    fn live_volume_reclaim_snapshot_commands_restore_bytes_and_retain_snapshot() {
+    fn live_snapshot_volume_commands_restore_bytes_and_retain_snapshot() {
         let (engine, _td) = temp_fs();
         let created = live_dataset_admin(
             &engine,
@@ -9674,7 +9739,7 @@ mod tests {
         let filesystem_snapshot = live_snapshot_admin(
             &engine,
             "create",
-            json!({"name": "filesystem-before"}),
+            json!({"target": "root@filesystem-before"}),
             false,
         );
         assert_eq!(
@@ -9686,13 +9751,67 @@ mod tests {
         let filesystem_destroy = live_snapshot_admin(
             &engine,
             "destroy",
-            json!({"name": "filesystem-before"}),
+            json!({"target": "root@filesystem-before"}),
             false,
         );
         assert_eq!(
             filesystem_destroy["ok"], true,
             "filesystem snapshot destroy response: {filesystem_destroy}"
         );
+    }
+
+    #[test]
+    fn live_snapshot_targets_infer_catalog_type_and_refuse_wrong_sources_before_mutation() {
+        let (engine, _td) = temp_fs();
+        let mounted =
+            live_snapshot_admin(&engine, "create", json!({"target": "root@before"}), false);
+        assert_eq!(mounted["ok"], true, "mounted snapshot response: {mounted}");
+
+        let unmounted = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "unmounted",
+                "parent": "root",
+                "type": "filesystem",
+                "sync": "local",
+            }),
+        );
+        assert_eq!(unmounted["ok"], true, "filesystem response: {unmounted}");
+
+        for (target, expected) in [
+            (
+                "missing@nope",
+                "does not exist in the canonical Pool catalog",
+            ),
+            ("unmounted@nope", "is not the mounted filesystem"),
+            (
+                "root@before@nested",
+                "is itself a snapshot, not a filesystem or volume",
+            ),
+        ] {
+            let refused = live_snapshot_admin(&engine, "create", json!({"target": target}), false);
+            assert_eq!(refused["ok"], false, "{target} response: {refused}");
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(expected)),
+                "{target} response did not contain {expected:?}: {refused}",
+            );
+        }
+
+        let retired =
+            live_snapshot_admin(&engine, "create", json!({"name": "retired-alias"}), false);
+        assert_eq!(retired["ok"], false, "retired alias response: {retired}");
+        assert!(retired["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("argument 'target'")));
+
+        let fs = engine.fs.borrow();
+        assert!(fs.dataset_catalog().contains("root@before"));
+        assert!(!fs.dataset_catalog().contains("missing@nope"));
+        assert!(!fs.dataset_catalog().contains("unmounted@nope"));
+        assert!(!fs.dataset_catalog().contains("root@before@nested"));
     }
 
     #[test]
@@ -9798,7 +9917,7 @@ mod tests {
             live_snapshot_admin(
                 &engine,
                 "create",
-                json!({"name": "filesystem-before"}),
+                json!({"target": "root@filesystem-before"}),
                 false,
             )["ok"],
             true
@@ -9816,13 +9935,13 @@ mod tests {
     }
 
     #[test]
-    fn live_filesystem_rollback_discards_post_snapshot_path_projection() {
+    fn live_snapshot_filesystem_rollback_discards_post_snapshot_path_projection() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
         let snapshot = live_snapshot_admin(
             &engine,
             "create",
-            json!({"name": "before-extra-path"}),
+            json!({"target": "root@before-extra-path"}),
             false,
         );
         assert_eq!(snapshot["ok"], true, "snapshot response: {snapshot}");
@@ -9838,7 +9957,7 @@ mod tests {
         let rollback = live_snapshot_admin(
             &engine,
             "rollback",
-            json!({"name": "before-extra-path"}),
+            json!({"target": "root@before-extra-path"}),
             false,
         );
         assert_eq!(rollback["ok"], true, "rollback response: {rollback}");
