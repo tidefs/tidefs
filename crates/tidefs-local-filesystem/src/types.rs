@@ -387,9 +387,9 @@ pub const POSIX_SUBSET_ENTRIES: &[PosixSubsetEntry] = &[
     PosixSubsetEntry {
         topic: PosixTopic::SparseDiscovery,
         operation: "fiemap",
-        support: PosixSupport::IncludedAfterCurrentUserspaceImpl,
-        errno: "EINVAL/EIO/EOPNOTSUPP",
-        rule: "FS_IOC_FIEMAP is included in the current userspace implementation because VfsEngine::data_ranges now exposes extent-map-backed sparse intervals without inventing dense-file layout truth.",
+        support: PosixSupport::ExplicitlyUnsupported,
+        errno: "EOPNOTSUPP",
+        rule: "Linux generic VFS requires inode_operations::fiemap, which ordinary FUSE does not provide, so the mounted carrier returns EOPNOTSUPP before FUSE_IOCTL can reach the daemon. VfsEngine::fiemap_file remains available to kernel-resident consumers.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::SpecialInodes,

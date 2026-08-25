@@ -23,9 +23,8 @@ use crate::dispatch_helpers::{reply_empty_ok_or_errno, ReplyError};
 use crate::fuse_create_unlink_dispatch::*;
 use crate::fuse_rename::{EngineRenameRequest, FuseRenameDispatch};
 use crate::fusewire::{
-    parse_defrag_input, parse_fiemap_input, DefragIoctlInput, DefragIoctlOutput, FiemapInput,
-    FiemapOutput, FsxattrOutput, FuseLockIn, FuseSetlkRequest, FICLONE, FICLONERANGE,
-    FIDEDUPERANGE, FIEMAP_HEADER_SIZE, FS_IOC_FIEMAP, FS_IOC_FREEZE, FS_IOC_FSGETXATTR,
+    parse_defrag_input, DefragIoctlInput, DefragIoctlOutput, FsxattrOutput, FuseLockIn,
+    FuseSetlkRequest, FICLONE, FICLONERANGE, FIDEDUPERANGE, FS_IOC_FREEZE, FS_IOC_FSGETXATTR,
     FS_IOC_THAW, TIDEFS_IOC_DEFRAG,
 };
 use crate::handler_prelude::*;
@@ -447,8 +446,6 @@ const CREATE_METADATA_RESERVATION_BYTES: u64 = 4096;
 
 const LINUX_FMODE_EXEC_OPEN_FLAG: u32 = 0x20;
 const LINUX_O_TMPFILE: u32 = 0o20200000;
-const FIEMAP_EXTENT_LAST: u32 = 0x0000_0001;
-const FIEMAP_EXTENT_SIZE: usize = 56;
 const POLL_READ_EVENTS: u32 =
     libc::POLLIN as u32 | libc::POLLRDNORM as u32 | libc::POLLRDBAND as u32 | libc::POLLPRI as u32;
 const POLL_WRITE_EVENTS: u32 =
@@ -1624,138 +1621,26 @@ fn plan_vfs_copy_file_range_writeback_fallback(
 
 fn unsupported_vfs_bmap_errno() -> Errno {
     // BMAP reports physical block-device addresses. The userspace adapter has
-    // no stable block-device address authority; FIEMAP is the extent query path.
+    // no stable block-device address authority. Sparse discovery is available
+    // through SEEK_DATA/SEEK_HOLE; BMAP and FIEMAP are unsupported by this
+    // ordinary FUSE carrier.
     Errno::EOPNOTSUPP
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VfsIoctlCommand {
-    Fiemap,
     Fsgetxattr,
     Defrag,
 }
 
 fn classify_vfs_ioctl_command(cmd: u32) -> Result<VfsIoctlCommand, Errno> {
     match cmd {
-        FS_IOC_FIEMAP => Ok(VfsIoctlCommand::Fiemap),
         FS_IOC_FSGETXATTR => Ok(VfsIoctlCommand::Fsgetxattr),
         TIDEFS_IOC_DEFRAG => Ok(VfsIoctlCommand::Defrag),
         FICLONE | FICLONERANGE | FIDEDUPERANGE => Err(Errno::EOPNOTSUPP),
         FS_IOC_FREEZE | FS_IOC_THAW => Err(Errno::EOPNOTSUPP),
         _ => Err(Errno::EOPNOTSUPP),
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FiemapRequest {
-    start: u64,
-    length: u64,
-    flags: u32,
-    mapped_extents: u32,
-    extent_count: u32,
-}
-
-fn parse_fiemap_header(data: &[u8]) -> Option<FiemapRequest> {
-    if data.len() < FIEMAP_HEADER_SIZE {
-        return None;
-    }
-    Some(FiemapRequest {
-        start: u64::from_le_bytes(data[0..8].try_into().unwrap()),
-        length: u64::from_le_bytes(data[8..16].try_into().unwrap()),
-        flags: u32::from_le_bytes(data[16..20].try_into().unwrap()),
-        mapped_extents: u32::from_le_bytes(data[20..24].try_into().unwrap()),
-        extent_count: u32::from_le_bytes(data[24..28].try_into().unwrap()),
-    })
-}
-
-fn parse_vfs_fiemap_request(cmd: u32, in_data: &[u8]) -> Result<FiemapRequest, Errno> {
-    if cmd != FS_IOC_FIEMAP {
-        return Err(Errno::EOPNOTSUPP);
-    }
-    parse_fiemap_header(in_data).ok_or(Errno::EINVAL)
-}
-
-fn write_fiemap_header(buf: &mut Vec<u8>, request: FiemapRequest, mapped_extents: u32) {
-    buf.extend_from_slice(&request.start.to_le_bytes());
-    buf.extend_from_slice(&request.length.to_le_bytes());
-    buf.extend_from_slice(&request.flags.to_le_bytes());
-    buf.extend_from_slice(&mapped_extents.to_le_bytes());
-    buf.extend_from_slice(&request.extent_count.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes());
-}
-
-fn write_fiemap_extent(
-    buf: &mut Vec<u8>,
-    fe_logical: u64,
-    fe_physical: u64,
-    fe_length: u64,
-    fe_flags: u32,
-) {
-    buf.extend_from_slice(&fe_logical.to_le_bytes());
-    buf.extend_from_slice(&fe_physical.to_le_bytes());
-    buf.extend_from_slice(&fe_length.to_le_bytes());
-    buf.extend_from_slice(&[0u8; 16]);
-    buf.extend_from_slice(&fe_flags.to_le_bytes());
-    buf.extend_from_slice(&[0u8; 12]);
-}
-
-fn fiemap_ranges(
-    request: FiemapRequest,
-    file_size: u64,
-    data_ranges: &[LseekDataRange],
-) -> Vec<LseekDataRange> {
-    if request.start >= file_size {
-        return Vec::new();
-    }
-
-    let end = file_size;
-    normalized_lseek_data_ranges(file_size, data_ranges)
-        .into_iter()
-        .filter_map(|range| {
-            let start = range.start.max(request.start);
-            let end = range.end.min(end);
-            (start < end).then_some(LseekDataRange::new(start, end))
-        })
-        .collect()
-}
-
-fn build_fiemap_response(
-    request: FiemapRequest,
-    out_size: u32,
-    file_size: u64,
-    data_ranges: &[LseekDataRange],
-) -> Result<Vec<u8>, Errno> {
-    let _ = request.mapped_extents;
-    let ranges = fiemap_ranges(request, file_size, data_ranges);
-    let total_mapped = u32::try_from(ranges.len()).unwrap_or(u32::MAX);
-
-    if request.start >= file_size || request.extent_count == 0 {
-        let mut buf = Vec::with_capacity(FIEMAP_HEADER_SIZE);
-        write_fiemap_header(&mut buf, request, total_mapped);
-        return Ok(buf);
-    }
-
-    let emitted_count = ranges.len().min(request.extent_count as usize);
-    let total_out = FIEMAP_HEADER_SIZE + FIEMAP_EXTENT_SIZE * emitted_count;
-    if total_out > out_size as usize {
-        return Err(Errno::ERANGE);
-    }
-
-    let mut buf = Vec::with_capacity(total_out);
-    write_fiemap_header(
-        &mut buf,
-        request,
-        u32::try_from(emitted_count).unwrap_or(u32::MAX),
-    );
-    for (idx, range) in ranges.iter().take(emitted_count).enumerate() {
-        let flags = if idx + 1 == ranges.len() {
-            FIEMAP_EXTENT_LAST
-        } else {
-            0
-        };
-        write_fiemap_extent(&mut buf, range.start, 0, range.end - range.start, flags);
-    }
-    Ok(buf)
 }
 
 struct AccessAttrView<'a> {
@@ -8000,41 +7885,6 @@ impl FuseVfsAdapter {
         }
     }
 
-    /// Dispatch FIEMAP ioctl: map extent descriptors for a file byte range.
-    ///
-    /// Uses [`VfsEngine::fiemap_file`] to retrieve extent descriptors with
-    /// correct flags (`FLAG_LAST`, `FLAG_UNWRITTEN`, `FLAG_MERGED`) and
-    /// encodes them into the wire format expected by the `FS_IOC_FIEMAP` ioctl.
-    pub fn dispatch_fiemap(
-        &self,
-        ctx: &RequestCtx,
-        ino: u64,
-        fh: u64,
-        input: FiemapInput,
-        out_size: u32,
-    ) -> Result<Vec<u8>, Errno> {
-        let efh = self.resolve_file_handle(ino, fh, 0)?;
-        let engine = self.engine.lock().unwrap();
-        let extents = engine.fiemap_file(
-            &efh,
-            input.fm_start,
-            input.fm_length,
-            input.fm_extent_count,
-            ctx,
-        )?;
-        let total_mapped = u32::try_from(extents.len()).unwrap_or(u32::MAX);
-        let output = FiemapOutput {
-            fm_mapped_extents: total_mapped,
-            extents,
-        };
-        let buf = output.encode(input.fm_start, input.fm_length, input.fm_flags);
-        let buf_len = u32::try_from(buf.len()).map_err(|_| Errno::EFBIG)?;
-        if buf_len > out_size && out_size > 0 {
-            return Err(Errno::ERANGE);
-        }
-        Ok(buf)
-    }
-
     /// Dispatch FS_IOC_FSGETXATTR with Linux-shaped empty inode xflags.
     pub fn dispatch_fsgetxattr(
         &self,
@@ -10447,19 +10297,6 @@ impl Filesystem for FuseVfsAdapter {
             Self::classify_fuse_ioctl(req.unique(), ino, fh, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
         match classify_vfs_ioctl_command(cmd) {
-            Ok(VfsIoctlCommand::Fiemap) => {
-                let input = match parse_fiemap_input(in_data) {
-                    Some(input) => input,
-                    None => {
-                        reply.reply_errno(Errno::EINVAL);
-                        return;
-                    }
-                };
-                match self.dispatch_fiemap(&ctx, ino, fh, input, out_size) {
-                    Ok(buf) => reply.ioctl(0, &buf),
-                    Err(errno) => reply.reply_errno(errno),
-                }
-            }
             Ok(VfsIoctlCommand::Fsgetxattr) => {
                 match self.dispatch_fsgetxattr(&ctx, ino, out_size) {
                     Ok(buf) => reply.ioctl(0, &buf),
@@ -22380,29 +22217,6 @@ mod tests {
         );
     }
 
-    fn fiemap_request_bytes(start: u64, length: u64, extent_count: u32) -> Vec<u8> {
-        let request = FiemapRequest {
-            start,
-            length,
-            flags: 0,
-            mapped_extents: 0,
-            extent_count,
-        };
-        let mut bytes = Vec::with_capacity(FIEMAP_HEADER_SIZE);
-        write_fiemap_header(&mut bytes, request, 0);
-        bytes
-    }
-
-    fn fiemap_extent_fields(bytes: &[u8]) -> (u64, u64, u64, u32) {
-        let extent = &bytes[FIEMAP_HEADER_SIZE..FIEMAP_HEADER_SIZE + FIEMAP_EXTENT_SIZE];
-        (
-            u64::from_le_bytes(extent[0..8].try_into().unwrap()),
-            u64::from_le_bytes(extent[8..16].try_into().unwrap()),
-            u64::from_le_bytes(extent[16..24].try_into().unwrap()),
-            u32::from_le_bytes(extent[40..44].try_into().unwrap()),
-        )
-    }
-
     #[test]
     fn bmap_reports_explicit_adapter_non_support() {
         assert_eq!(unsupported_vfs_bmap_errno(), Errno::EOPNOTSUPP);
@@ -22411,8 +22225,8 @@ mod tests {
     #[test]
     fn ioctl_command_classification_rejects_unsupported_commands() {
         assert_eq!(
-            classify_vfs_ioctl_command(FS_IOC_FIEMAP),
-            Ok(VfsIoctlCommand::Fiemap)
+            classify_vfs_ioctl_command(0xC020_660B),
+            Err(Errno::EOPNOTSUPP)
         );
         assert_eq!(
             classify_vfs_ioctl_command(FS_IOC_FSGETXATTR),
@@ -22443,114 +22257,6 @@ mod tests {
     }
 
     #[test]
-    fn fiemap_parse_rejects_unsupported_command_and_short_header() {
-        assert_eq!(
-            parse_vfs_fiemap_request(0xFFFF, &fiemap_request_bytes(0, 4096, 1)),
-            Err(Errno::EOPNOTSUPP)
-        );
-        assert_eq!(
-            parse_vfs_fiemap_request(FS_IOC_FIEMAP, &[0u8; FIEMAP_HEADER_SIZE - 1]),
-            Err(Errno::EINVAL)
-        );
-    }
-
-    #[test]
-    fn fiemap_query_mode_reports_extent_count_without_payload() {
-        let request =
-            parse_vfs_fiemap_request(FS_IOC_FIEMAP, &fiemap_request_bytes(0, 4096, 0)).unwrap();
-
-        let response = build_fiemap_response(
-            request,
-            FIEMAP_HEADER_SIZE as u32,
-            8192,
-            &[lseek_range(0, 4096), lseek_range(4096, 8192)],
-        )
-        .expect("query response");
-        let header = parse_fiemap_header(&response).expect("parse response");
-
-        assert_eq!(response.len(), FIEMAP_HEADER_SIZE);
-        assert_eq!(header.mapped_extents, 1);
-        assert_eq!(header.extent_count, 0);
-    }
-
-    #[test]
-    fn fiemap_data_mode_reports_dense_extent_to_eof() {
-        let request =
-            parse_vfs_fiemap_request(FS_IOC_FIEMAP, &fiemap_request_bytes(128, 4096, 1)).unwrap();
-
-        let response = build_fiemap_response(
-            request,
-            (FIEMAP_HEADER_SIZE + FIEMAP_EXTENT_SIZE) as u32,
-            1024,
-            &[lseek_range(0, 1024)],
-        )
-        .expect("data response");
-        let header = parse_fiemap_header(&response).expect("parse response");
-        let (logical, physical, length, flags) = fiemap_extent_fields(&response);
-
-        assert_eq!(header.start, 128);
-        assert_eq!(header.length, 4096);
-        assert_eq!(header.mapped_extents, 1);
-        assert_eq!(header.extent_count, 1);
-        assert_eq!(logical, 128);
-        assert_eq!(physical, 0);
-        assert_eq!(length, 896);
-        assert_eq!(flags & FIEMAP_EXTENT_LAST, FIEMAP_EXTENT_LAST);
-    }
-
-    #[test]
-    fn fiemap_reports_zero_extents_beyond_eof() {
-        let request =
-            parse_vfs_fiemap_request(FS_IOC_FIEMAP, &fiemap_request_bytes(1024, 4096, 1)).unwrap();
-
-        let response = build_fiemap_response(
-            request,
-            (FIEMAP_HEADER_SIZE + FIEMAP_EXTENT_SIZE) as u32,
-            1024,
-            &[lseek_range(0, 1024)],
-        )
-        .expect("beyond eof response");
-        let header = parse_fiemap_header(&response).expect("parse response");
-
-        assert_eq!(response.len(), FIEMAP_HEADER_SIZE);
-        assert_eq!(header.mapped_extents, 0);
-        assert_eq!(header.extent_count, 1);
-    }
-
-    #[test]
-    fn fiemap_data_mode_clips_sparse_ranges() {
-        let request =
-            parse_vfs_fiemap_request(FS_IOC_FIEMAP, &fiemap_request_bytes(5, 50, 2)).unwrap();
-
-        let response = build_fiemap_response(
-            request,
-            (FIEMAP_HEADER_SIZE + FIEMAP_EXTENT_SIZE * 2) as u32,
-            40,
-            &[lseek_range(0, 10), lseek_range(20, 30)],
-        )
-        .expect("sparse response");
-        let header = parse_fiemap_header(&response).expect("parse response");
-        let first = fiemap_extent_fields(&response);
-        let second_offset = FIEMAP_HEADER_SIZE + FIEMAP_EXTENT_SIZE;
-        let second = {
-            let extent = &response[second_offset..second_offset + FIEMAP_EXTENT_SIZE];
-            (
-                u64::from_le_bytes(extent[0..8].try_into().unwrap()),
-                u64::from_le_bytes(extent[8..16].try_into().unwrap()),
-                u64::from_le_bytes(extent[16..24].try_into().unwrap()),
-                u32::from_le_bytes(extent[40..44].try_into().unwrap()),
-            )
-        };
-
-        assert_eq!(header.mapped_extents, 2);
-        assert_eq!(first, (5, 0, 5, 0));
-        assert_eq!(second.0, 20);
-        assert_eq!(second.1, 0);
-        assert_eq!(second.2, 10);
-        assert_eq!(second.3 & FIEMAP_EXTENT_LAST, FIEMAP_EXTENT_LAST);
-    }
-
-    #[test]
     fn dispatch_fsgetxattr_reports_empty_linux_fsxattr() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
@@ -22567,50 +22273,6 @@ mod tests {
         assert_eq!(response.len(), crate::fusewire::FSXATTR_WIRE_SIZE);
         assert_eq!(&response[0..20], &[0u8; 20]);
         assert_eq!(&response[20..28], &[0u8; 8]);
-    }
-
-    #[test]
-    fn dispatch_fiemap_falls_back_to_data_ranges_for_file_without_extent_map() {
-        let fixture = adapter_fixture();
-        let ctx = root_ctx();
-        let (inode, created_adapter_fh, created_engine_fh) = create_adapter_file_handle(
-            &fixture.adapter,
-            &ctx,
-            b"test_fiemap_fallback",
-            libc::O_RDWR as u32,
-        );
-        {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine
-                .write(&created_engine_fh, 0, b"hello world", &ctx)
-                .expect("write test file");
-        }
-        let input = FiemapInput {
-            fm_start: 0,
-            fm_length: 4096,
-            fm_flags: 0,
-            fm_extent_count: 4,
-        };
-        // File exists but has no extent map (inline or chunked content only).
-        // fiemap_file() falls back to data_ranges() and produces valid extents.
-        let buf = fixture
-            .adapter
-            .dispatch_fiemap(&ctx, inode.get(), created_adapter_fh, input, 4096)
-            .expect("dispatch_fiemap with fallback");
-        // Should get a header + at least one extent
-        assert!(buf.len() >= FIEMAP_HEADER_SIZE);
-        // fm_mapped_extents should be at least 1
-        let mapped = u32::from_le_bytes(buf[20..24].try_into().unwrap());
-        assert!(mapped >= 1);
-        // The extent should cover the written data
-        if buf.len() >= FIEMAP_HEADER_SIZE + FIEMAP_EXTENT_SIZE {
-            let fe_logical = u64::from_le_bytes(
-                buf[FIEMAP_HEADER_SIZE..FIEMAP_HEADER_SIZE + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-            assert_eq!(fe_logical, 0, "first extent should start at offset 0");
-        }
     }
 
     fn lseek_range(start: u64, end: u64) -> LseekDataRange {
