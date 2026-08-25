@@ -1681,7 +1681,10 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         let dataset_id: Option<DatasetId> = None;
         (engine, None, dataset_id)
     } else {
-        use tidefs_local_filesystem::{LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy};
+        use tidefs_local_filesystem::{
+            LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy, MountedAccessReadonlyProbe,
+            MountedAccessReadonlyProbeConfig,
+        };
         use tidefs_recovery_loop::RecoveryPolicy;
 
         if let Some(ref devices) = config.block_devices {
@@ -1703,29 +1706,29 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             RecoveryPolicy::default()
         };
         let selected_dataset_path = config.dataset_path.as_deref().unwrap_or("root");
+        let store_options_for_mode = |mode: EffectiveMountMode| StoreOptions {
+            background_scrub_interval_secs: mode.background_scrub_interval_secs,
+            reclaim_enabled: !mode.read_only && config.runtime.enable_reclaim,
+            fault_injection_config: if mode.read_only {
+                None
+            } else {
+                config.runtime.fault_inject_corruption.map(|probability| {
+                    tidefs_local_object_store::FaultInjectionConfig {
+                        byte_corruption_probability: probability,
+                        ..tidefs_local_object_store::FaultInjectionConfig::off()
+                    }
+                })
+            },
+            ..StoreOptions::default()
+        };
         let open_owner = |mode: EffectiveMountMode, recovery_policy: RecoveryPolicy| {
-            let store_options = StoreOptions {
-                background_scrub_interval_secs: mode.background_scrub_interval_secs,
-                reclaim_enabled: !mode.read_only && config.runtime.enable_reclaim,
-                fault_injection_config: if mode.read_only {
-                    None
-                } else {
-                    config.runtime.fault_inject_corruption.map(|probability| {
-                        tidefs_local_object_store::FaultInjectionConfig {
-                            byte_corruption_probability: probability,
-                            ..tidefs_local_object_store::FaultInjectionConfig::off()
-                        }
-                    })
-                },
-                ..StoreOptions::default()
-            };
             PoolDatasetOwner::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
                 &config.backing_dir,
                 config.pool_name.as_deref().unwrap_or("tidefs"),
                 config.pool_redundancy_policy,
                 selected_dataset_path,
                 LocalFileSystemOpenConfig {
-                    options: store_options,
+                    options: store_options_for_mode(mode),
                     allocator_policy: LocalStorageAllocatorPolicy {
                         content_capacity_bytes: config.runtime.content_capacity_bytes,
                         ..LocalStorageAllocatorPolicy::default()
@@ -1749,25 +1752,40 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             .as_deref()
             .is_some_and(|devices| !devices.is_empty())
             || PoolDatasetOwner::default_development_device_path(&config.backing_dir).exists();
-        let mut lfs = if !effective_mode.read_only && existing_catalog_carrier {
+        if !effective_mode.read_only && existing_catalog_carrier {
             let property_read_only_mode = effective_mount_mode(config, true);
-            let probe = open_owner(property_read_only_mode, RecoveryPolicy::ReadOnly)?;
-            if probe
-                .mounted_access_readonly()
-                .map_err(|e| format!("resolve mounted access.readonly: {e}"))?
-            {
+            let probe = PoolDatasetOwner::probe_named_pool_filesystem_dataset_access_readonly(
+                &config.backing_dir,
+                config.pool_name.as_deref().unwrap_or("tidefs"),
+                config.pool_redundancy_policy,
+                selected_dataset_path,
+                MountedAccessReadonlyProbeConfig {
+                    options: store_options_for_mode(property_read_only_mode),
+                    allocator_policy: LocalStorageAllocatorPolicy {
+                        content_capacity_bytes: config.runtime.content_capacity_bytes,
+                        ..LocalStorageAllocatorPolicy::default()
+                    },
+                    encryption: config.encryption.clone(),
+                    compression: config.runtime.compression.clone(),
+                    block_devices: config.block_devices.as_deref(),
+                },
+            )
+            .map_err(|e| format!("probe mounted access.readonly: {e}"))?;
+            if probe == MountedAccessReadonlyProbe::Resolved(true) {
                 effective_mode = property_read_only_mode;
                 eprintln!(
                     "tidefsctl: effective access.readonly=on; keeping mounted owner read-only"
                 );
-                probe
-            } else {
-                drop(probe);
-                open_owner(effective_mode, recovery_policy)?
             }
+        }
+        let open_recovery_policy = if config.rebuild_only {
+            recovery_policy
+        } else if effective_mode.read_only {
+            RecoveryPolicy::ReadOnly
         } else {
-            open_owner(effective_mode, recovery_policy)?
+            recovery_policy
         };
+        let mut lfs = open_owner(effective_mode, open_recovery_policy)?;
 
         let catalog_read_only = lfs
             .mounted_access_readonly()
