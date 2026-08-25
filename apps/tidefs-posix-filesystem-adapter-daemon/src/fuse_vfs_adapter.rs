@@ -18273,6 +18273,57 @@ mod tests {
     }
 
     #[test]
+    fn fallocate_enospc_unlink_syncfs_keeps_error_scoped() {
+        let mut fixture =
+            adapter_fixture_with_writeback_cache_deferred_commit_and_content_capacity(4096);
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let (inode, adapter_fh, _) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"fallocate-enospc-unlink.bin",
+            libc::O_WRONLY as u32,
+        );
+
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_fallocate_file(&ctx, inode.get(), adapter_fh, 0, 0, 8192,),
+            Err(Errno::ENOSPC)
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_getattr(&ctx, inode.get(), 0, Some(adapter_fh))
+                .expect("getattr after refused fallocate")
+                .attr
+                .size,
+            0
+        );
+
+        fixture
+            .adapter
+            .dispatch_flush(&ctx, inode.get(), adapter_fh, 0)
+            .expect("flush refused fallocate target");
+        fixture
+            .adapter
+            .dispatch_release(inode.get(), adapter_fh, libc::O_WRONLY as u32, None, false)
+            .expect("release refused fallocate target");
+        fixture
+            .adapter
+            .dispatch_unlink_entry(&ctx, root.get(), b"fallocate-enospc-unlink.bin")
+            .expect("unlink refused fallocate target");
+
+        fixture
+            .adapter
+            .dispatch_syncfs(&ctx)
+            .expect("syncfs after refused fallocate target unlink");
+    }
+
+    #[test]
     fn vfs_adapter_dispatch_fallocate_unknown_handle_ebadf() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
@@ -40969,6 +41020,46 @@ mod tests {
             .expect("create adapter")
             .with_writeback_cache_enabled();
         adapter.timestamp_policy = TimestampPolicy::StrictAtime;
+        AdapterFixture { adapter, root }
+    }
+
+    fn adapter_fixture_with_writeback_cache_deferred_commit_and_content_capacity(
+        content_capacity_bytes: u64,
+    ) -> AdapterFixture {
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-vfs-adapter-wb-deferred-cap-{}-{temp_id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let default_policy = LocalStorageAllocatorPolicy::default();
+        let mut local_fs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
+            &root,
+            LocalFileSystemOpenConfig {
+                options: StoreOptions::test_fast(),
+                allocator_policy: LocalStorageAllocatorPolicy::new(
+                    content_capacity_bytes,
+                    default_policy.inode_capacity,
+                ),
+                root_authentication_key: RootAuthenticationKey::demo_key(),
+                encryption: None,
+                compression: None,
+                log_device_device_path: None,
+                recovery_policy: RecoveryPolicy::default(),
+                block_devices: None,
+            },
+        )
+        .expect("open local filesystem");
+        local_fs
+            .set_auto_commit(false)
+            .expect("configure deferred-commit fixture");
+        local_fs
+            .set_max_uncommitted_mutations(16 * 1024)
+            .expect("configure deferred-commit mutation limit");
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create adapter")
+            .with_writeback_cache_enabled();
         AdapterFixture { adapter, root }
     }
 

@@ -10767,6 +10767,9 @@ impl PoolDatasetOwner {
             }
         }
         if reserve_bytes > 0 {
+            let mutation_was_active = self.filesystem.mutation_delta.is_some();
+            let mutation_had_commit_group_write =
+                self.filesystem.mutation_recorded_commit_group_write;
             self.begin_mutation("allocate file range")?;
             let reservation_succeeded = self
                 .reserve_with_hierarchy(reserve_bytes)
@@ -10775,7 +10778,15 @@ impl PoolDatasetOwner {
                 })
                 .is_ok();
             if !reservation_succeeded {
-                self.rollback_mutation_delta();
+                // Admission refused this operation before it changed mounted
+                // state. Preserve any earlier accepted mutations in the open
+                // commit group instead of rolling the whole group back.
+                if mutation_was_active {
+                    self.filesystem.mutation_recorded_commit_group_write =
+                        mutation_had_commit_group_write;
+                } else {
+                    self.discard_mutation_delta();
+                }
                 return Err(FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
                     requested: reserve_bytes,
