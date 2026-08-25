@@ -6287,6 +6287,41 @@ impl PoolDatasetOwner {
         Ok(plan)
     }
 
+    /// Carry the authority returned by the immediately preceding content
+    /// writes into reclaim and allocation state. A fully receipted emitted
+    /// layout needs no recursive Pool reread; compatibility writers without
+    /// that authority retain the strict/deferred path above.
+    fn rewrite_side_state_after_content_write(
+        &self,
+        inode_id: InodeId,
+        old_layout: &ContentLayout,
+        new_record: &InodeRecord,
+        content_write: &ContentWriteOutcome,
+    ) -> Result<(RewriteTrimPlan, Option<BTreeMap<ObjectKey, u64>>)> {
+        let Some(new_layout) = content_write.receipted_layout() else {
+            return Ok((
+                self.rewrite_trim_plan_for_layout(inode_id, old_layout, new_record)?,
+                None,
+            ));
+        };
+        validate_content_layout(inode_id, new_record, new_layout)?;
+        let keyspace = self.object_keyspace();
+        let plan = RewriteTrimPlan {
+            trimmable: obsolete_extent_keys_after_receipted_full_replace(
+                inode_id, old_layout, new_layout,
+            )
+            .into_iter()
+            .map(|key| keyspace.scope(key))
+            .collect(),
+            ..RewriteTrimPlan::default()
+        };
+        let allocation_entries = content_allocation_entries_for_layout(inode_id, new_layout)?
+            .into_iter()
+            .map(|(key, grains)| (keyspace.scope(key), grains))
+            .collect();
+        Ok((plan, Some(allocation_entries)))
+    }
+
     fn apply_rewrite_trim_plan(&mut self, plan: RewriteTrimPlan) {
         crate::allocation::queue_extent_keys_for_reclaim(
             &self.filesystem.reclaim_queue,
@@ -9203,18 +9238,12 @@ impl PoolDatasetOwner {
         let old_layout = self.read_committed_content_layout(inode_id, &old_record)?;
         let planned_entries = planned_chunk_allocation_entries_for_patch_batch_layout(
             &old_layout,
-            &old_record,
             &planned_record,
             &content_patches,
             allow_holes,
         )?;
         #[cfg(feature = "policy-observation")]
-        let old_allocation_bytes =
-            allocation_bytes(&content_allocation_entries_for_inode_pool_in_keyspace(
-                self.store.pool(),
-                &old_record,
-                self.object_keyspace(),
-            )?)?;
+        let old_allocation_bytes = self.authenticated_live_content_allocation_bytes(&old_record)?;
         #[cfg(feature = "policy-observation")]
         let allocation_bytes = allocation_bytes(&planned_entries)?;
         let dirty_allocation_bytes = dirty_patch_batch_allocation_bytes(new_size, patches)?;
@@ -9264,16 +9293,17 @@ impl PoolDatasetOwner {
                 compression_policy: &self.filesystem.content_compression_policy,
             })
         };
-        if let Err(err) = result {
-            self.rollback_mutation_delta();
-            return Err(err);
-        }
-        let mut rewrite_trim_plan = match self
-            .read_committed_content_layout(inode_id, &old_record)
-            .and_then(|old_layout| {
-                self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record)
-            }) {
-            Ok(plan) => plan,
+        let content_write = match result {
+            Ok(content_write) => content_write,
+            Err(err) => {
+                self.rollback_mutation_delta();
+                return Err(err);
+            }
+        };
+        let (mut rewrite_trim_plan, receipted_allocation_entries) = match self
+            .rewrite_side_state_after_content_write(inode_id, &old_layout, &record, &content_write)
+        {
+            Ok(side_state) => side_state,
             Err(err) => {
                 self.rollback_mutation_delta();
                 return Err(err);
@@ -9317,6 +9347,11 @@ impl PoolDatasetOwner {
         } else {
             self.commit_mutation(record)?
         };
+        if let Some(entries) = receipted_allocation_entries {
+            self.filesystem
+                .authenticated_content_allocation_cache
+                .record_live_entries(&committed, entries);
+        }
         self.apply_rewrite_trim_plan(rewrite_trim_plan);
         Ok(committed)
     }
@@ -9326,9 +9361,6 @@ impl PoolDatasetOwner {
         inode_id: InodeId,
         segments: Vec<(u64, Vec<u8>)>,
     ) -> Result<()> {
-        if segments.is_empty() {
-            return Ok(());
-        }
         let base_record = self.committed_inode_record(inode_id)?;
         let pending_record = self
             .buffered_write_base_records
@@ -9345,21 +9377,23 @@ impl PoolDatasetOwner {
                 return Err(err);
             }
         };
-        let batch_new_size = patches.iter().try_fold(base_record.size, |size, patch| {
-            let patch_len =
-                u64::try_from(patch.bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
-                    requested: u64::MAX,
-                })?;
-            let patch_end =
-                patch
-                    .offset
-                    .checked_add(patch_len)
-                    .ok_or(FileSystemError::SizeOverflow {
-                        requested: u64::MAX,
+        let batch_new_size =
+            patches
+                .iter()
+                .try_fold(pending_record.size, |size, patch| {
+                    let patch_len = u64::try_from(patch.bytes.len()).map_err(|_| {
+                        FileSystemError::SizeOverflow {
+                            requested: u64::MAX,
+                        }
                     })?;
-            Ok::<u64, FileSystemError>(size.max(patch_end))
-        })?;
-        if !patches.is_empty() {
+                    let patch_end = patch.offset.checked_add(patch_len).ok_or(
+                        FileSystemError::SizeOverflow {
+                            requested: u64::MAX,
+                        },
+                    )?;
+                    Ok::<u64, FileSystemError>(size.max(patch_end))
+                })?;
+        if !patches.is_empty() || segments.is_empty() {
             match self.rewrite_content_with_patch_batch(
                 inode_id,
                 base_record.clone(),
@@ -9435,12 +9469,18 @@ impl PoolDatasetOwner {
     fn materialize_write_buffer(&mut self, inode_id: InodeId) -> Result<bool> {
         self.ensure_mutation_allowed("flush inode write buffer")?;
         self.snapshot_write_buffers_for_rollback();
+        let has_pending_content = self
+            .filesystem
+            .buffered_write_base_records
+            .contains_key(&inode_id);
         let segments = match self.filesystem.write_buffers.get_mut(&inode_id) {
             Some(wb) if !wb.is_empty() => wb.drain(),
+            Some(_) if has_pending_content => Vec::new(),
             Some(_) => {
                 self.filesystem.write_buffers.remove(&inode_id);
                 return Ok(false);
             }
+            None if has_pending_content => Vec::new(),
             None => return Ok(false),
         };
         self.filesystem.write_buffers.remove(&inode_id);
@@ -9848,6 +9888,19 @@ impl PoolDatasetOwner {
         freed
     }
 
+    /// Trim a still-open buffered content epoch without discarding its base
+    /// record when the final truncate removes every buffered byte.
+    ///
+    /// The matching inode version remains pending until writeback, fsync,
+    /// close, or commit-group pressure materializes the final layout.
+    fn truncate_pending_write_buffer_for_inode(&mut self, inode_id: InodeId, size: u64) -> u64 {
+        self.snapshot_write_buffers_for_rollback();
+        self.filesystem
+            .write_buffers
+            .get_mut(&inode_id)
+            .map_or(0, |write_buffer| write_buffer.truncate(size) as u64)
+    }
+
     fn clear_write_buffer_ranges(&mut self, inode_id: InodeId, ranges: &[(u64, u64)]) -> u64 {
         if ranges.is_empty() || !self.filesystem.write_buffers.contains_key(&inode_id) {
             return 0;
@@ -9908,9 +9961,6 @@ impl PoolDatasetOwner {
         let Some(wb) = self.filesystem.write_buffers.get(&inode_id) else {
             return Ok(None);
         };
-        if wb.is_empty() {
-            return Ok(None);
-        }
 
         let effective_size = wb.max_offset().unwrap_or(0).max(record.size);
         if len == 0 || offset >= effective_size {
@@ -9977,6 +10027,35 @@ impl PoolDatasetOwner {
             .try_admit_dirty_write(dirty_bytes, dirty_ops)?;
         self.filesystem.pending_permits.push(permit);
         Ok(())
+    }
+
+    /// Close an existing deferred group before its next write would exceed
+    /// filesystem-owned dirty-work admission.
+    ///
+    /// The caller must re-plan against the newly committed state when this
+    /// returns `true`. Explicit transactions are never split, and a request
+    /// that cannot be admitted into an otherwise empty group retains the
+    /// normal rejection result.
+    fn commit_deferred_group_for_write_admission(
+        &mut self,
+        dirty_bytes: u64,
+        dirty_ops: u32,
+    ) -> Result<bool> {
+        match self
+            .filesystem
+            .write_admission
+            .check_dirty_write(dirty_bytes, dirty_ops)
+        {
+            Ok(()) => Ok(false),
+            Err(_)
+                if !self.filesystem.in_transaction
+                    && !self.filesystem.pending_permits.is_empty() =>
+            {
+                self.force_commit(())?;
+                Ok(true)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Release all outstanding admission permits after a successful SYNC.
@@ -10047,16 +10126,16 @@ impl PoolDatasetOwner {
         bytes: &[u8],
     ) -> Result<InodeRecord> {
         self.ensure_mutation_allowed("write mounted file by inode")?;
-        let record = self.inode(inode_id)?.clone();
-        if record.kind() != NodeKind::File {
-            if record.kind() == NodeKind::Dir {
+        let initial_record = self.inode(inode_id)?.clone();
+        if initial_record.kind() != NodeKind::File {
+            if initial_record.kind() == NodeKind::Dir {
                 return Err(FileSystemError::IsDirectory {
                     path: target.to_string(),
                 });
             }
             return Err(FileSystemError::NotFile {
                 path: target.to_string(),
-                kind: record.kind(),
+                kind: initial_record.kind(),
             });
         }
 
@@ -10066,7 +10145,7 @@ impl PoolDatasetOwner {
             requested: u64::MAX,
         })?;
         if bytes_len == 0 {
-            return Ok(record);
+            return Ok(initial_record);
         }
         let end = offset
             .checked_add(bytes_len)
@@ -10075,41 +10154,75 @@ impl PoolDatasetOwner {
             })?;
         let _end_len =
             usize::try_from(end).map_err(|_| FileSystemError::SizeOverflow { requested: end })?;
-        let new_size = record.size.max(end);
-        if bytes.iter().all(|byte| *byte == 0)
-            && self.sparse_zero_write_is_noop(inode_id, &record, offset, bytes.len())?
-        {
-            return Ok(record);
-        }
-        self.ensure_content_write_not_over_capacity(bytes_len)?;
-        // Quota: check byte grain delta for write
-        let old_grains = crate::quota::allocation_grains_for_len(record.size);
-        let new_grains = crate::quota::allocation_grains_for_len(new_size);
-        let delta_bytes = new_grains.saturating_sub(old_grains);
-        if delta_bytes > 0 {
-            let pool_free = self.pool_free_bytes_for_quota();
-            let decision = self.filesystem.state.quota_table.check_delta(
-                inode_ancestors,
-                delta_bytes,
-                0,
-                pool_free,
-            );
-            if decision.is_refusal() {
-                return Err(FileSystemError::from(decision));
+        let (
+            record,
+            new_size,
+            delta_bytes,
+            physical_admit_bytes,
+            committed_record,
+            replacement_credit_bytes,
+            write_space_delta,
+        ) = loop {
+            let record = self.inode(inode_id)?.clone();
+            let new_size = record.size.max(end);
+            if bytes.iter().all(|byte| *byte == 0)
+                && self.sparse_zero_write_is_noop(inode_id, &record, offset, bytes.len())?
+            {
+                return Ok(record);
             }
-        }
-        // Capacity reservation follows unique dirty-buffer growth. Rewrites of
-        // bytes already buffered for this inode replace in-memory data, not
-        // another future physical allocation.
-        let dirty_charge_ranges = self.write_buffer_uncovered_ranges(inode_id, offset, bytes_len);
-        let physical_admit_bytes = Self::range_bytes(&dirty_charge_ranges)?;
-        let committed_record = self.committed_inode_record(inode_id)?;
-        let replacement_credit_bytes = self.materialized_content_bytes_in_ranges(
-            inode_id,
-            &committed_record,
-            &dirty_charge_ranges,
-        )?;
-        let write_space_delta = self.data_write_space_delta(inode_id, &[(offset, bytes_len)])?;
+
+            // Capacity reservation follows unique dirty-buffer growth.
+            // Rewrites of bytes already buffered for this inode replace
+            // in-memory data, not another future physical allocation.
+            let dirty_charge_ranges =
+                self.write_buffer_uncovered_ranges(inode_id, offset, bytes_len);
+            let physical_admit_bytes = Self::range_bytes(&dirty_charge_ranges)?;
+            if self.commit_deferred_group_for_write_admission(physical_admit_bytes, 1)? {
+                continue;
+            }
+
+            // A foreground admission commit can materialize every write
+            // buffer and publish a new root. All capacity, quota, replacement,
+            // and accounting planning below therefore runs only after the
+            // commit decision and is repeated if admission ages out while
+            // Pool-backed planning is in progress.
+            self.ensure_content_write_not_over_capacity(bytes_len)?;
+            let old_grains = crate::quota::allocation_grains_for_len(record.size);
+            let new_grains = crate::quota::allocation_grains_for_len(new_size);
+            let delta_bytes = new_grains.saturating_sub(old_grains);
+            if delta_bytes > 0 {
+                let pool_free = self.pool_free_bytes_for_quota();
+                let decision = self.filesystem.state.quota_table.check_delta(
+                    inode_ancestors,
+                    delta_bytes,
+                    0,
+                    pool_free,
+                );
+                if decision.is_refusal() {
+                    return Err(FileSystemError::from(decision));
+                }
+            }
+            let committed_record = self.committed_inode_record(inode_id)?;
+            let replacement_credit_bytes = self.materialized_content_bytes_in_ranges(
+                inode_id,
+                &committed_record,
+                &dirty_charge_ranges,
+            )?;
+            let write_space_delta =
+                self.data_write_space_delta(inode_id, &[(offset, bytes_len)])?;
+            if self.commit_deferred_group_for_write_admission(physical_admit_bytes, 1)? {
+                continue;
+            }
+            break (
+                record,
+                new_size,
+                delta_bytes,
+                physical_admit_bytes,
+                committed_record,
+                replacement_credit_bytes,
+                write_space_delta,
+            );
+        };
         // A buffered write is one mounted mutation even when it reaches the
         // foreground writeback threshold immediately.  Start rollback
         // authority before accepting its capacity hold so a threshold flush
@@ -10961,15 +11074,28 @@ impl PoolDatasetOwner {
                 kind: record.kind(),
             });
         }
-        // Truncate is a new content-version boundary. Materialize the complete
-        // accepted write epoch first so it cannot discard the Pool base record
-        // while leaving an inode version whose content object does not exist.
-        self.flush_write_buffer(inode_id)?;
         let _new_len =
             usize::try_from(size).map_err(|_| FileSystemError::SizeOverflow { requested: size })?;
+        let has_pending_content = self
+            .filesystem
+            .buffered_write_base_records
+            .contains_key(&inode_id);
+        let pending_record = has_pending_content.then_some(record.clone());
         let old_effective_size = self.effective_file_size(inode_id);
+        // Keep an ordinary buffered write plus its following truncate in the
+        // same open content epoch. Explicit durability, clean close, writeback
+        // thresholds, and commit-group pressure still materialize that epoch
+        // before publishing its root. A truncate without buffered content
+        // retains the immediate rewrite path below.
+        if !has_pending_content {
+            self.flush_write_buffer(inode_id)?;
+        }
         if size < old_effective_size {
-            self.truncate_dirty_write_buffer_for_inode(inode_id, size);
+            if has_pending_content {
+                let _ = self.truncate_pending_write_buffer_for_inode(inode_id, size);
+            } else {
+                self.truncate_dirty_write_buffer_for_inode(inode_id, size);
+            }
             self.clear_writeback_ranges_from(inode_id, size);
         }
         let record = self.committed_inode_record(inode_id)?;
@@ -11016,7 +11142,28 @@ impl PoolDatasetOwner {
                     );
             }
         }
-        let result = if record.size == size {
+        let result = if let Some(mut pending_record) = pending_record {
+            self.begin_mutation("truncate buffered file")?;
+            let tick = self.bump_generation();
+            pending_record.size = size;
+            pending_record.data_version = tick;
+            pending_record.metadata_version = tick;
+            Self::advance_subtree_revision(&mut pending_record);
+            self.mark_inode_metadata_dirty(inode_id);
+            Arc::make_mut(&mut self.filesystem.state.inodes)
+                .insert(inode_id, pending_record.clone());
+            self.filesystem
+                .inode_cache
+                .borrow_mut()
+                .invalidate(inode_id);
+            self.mark_inode_content_dirty(inode_id);
+            let write_buffer_config = self.filesystem.write_buffer_config.clone();
+            self.filesystem
+                .write_buffers
+                .entry(inode_id)
+                .or_insert_with(|| WriteBuffer::new(write_buffer_config));
+            self.commit_mutation(pending_record)?
+        } else if record.size == size {
             if committed_truncate_only {
                 self.commit_mutation(record)?
             } else {
@@ -11030,7 +11177,9 @@ impl PoolDatasetOwner {
         } else {
             result
         };
-        self.truncate_dirty_write_buffer_for_inode(inode_id, size);
+        if !has_pending_content {
+            self.truncate_dirty_write_buffer_for_inode(inode_id, size);
+        }
         // ── Intent-log: record truncate for crash recovery replay ──
         // Record the truncate after all extent and write-buffer mutations
         // are applied so that a crash before the next txg commit will replay
@@ -13408,14 +13557,10 @@ impl PoolDatasetOwner {
         planned_record.size = size;
         planned_record.data_version = planned_tick;
         planned_record.metadata_version = planned_tick;
+        let old_layout = self.read_committed_content_layout(inode_id, &record)?;
         let planned_entries = planned_chunk_allocation_entries_for_full_content(&planned_record)?;
         #[cfg(feature = "policy-observation")]
-        let old_allocation_bytes =
-            allocation_bytes(&content_allocation_entries_for_inode_pool_in_keyspace(
-                self.store.pool(),
-                &record,
-                self.object_keyspace(),
-            )?)?;
+        let old_allocation_bytes = self.authenticated_live_content_allocation_bytes(&record)?;
         #[cfg(feature = "policy-observation")]
         let allocation_bytes = allocation_bytes(&planned_entries)?;
         #[cfg(feature = "policy-observation")]
@@ -13429,7 +13574,6 @@ impl PoolDatasetOwner {
         self.begin_mutation("replace file content")?; // was: let previous_state = self.filesystem.state.clone()
         let tick = self.bump_generation();
         debug_assert_eq!(tick, planned_tick);
-        let old_record = record.clone();
         record.size = size;
         record.data_version = tick;
         record.metadata_version = tick;
@@ -13439,7 +13583,7 @@ impl PoolDatasetOwner {
             let dataset_id = DatasetId::from_bytes(self.filesystem.mounted_dataset_id);
             let pool_store = self.store.pool_mut().pool_store_mut();
             let mut content_store = FilesystemContentWriteStore::new(pool_store, dataset_id);
-            write_chunked_content(
+            write_chunked_content_with_outcome(
                 self.filesystem.dedup_enabled,
                 &mut content_store,
                 &record,
@@ -13450,22 +13594,23 @@ impl PoolDatasetOwner {
                 &self.filesystem.content_compression_policy,
             )
         };
-        if let Err(err) = result {
-            self.rollback_mutation_delta();
-            return Err(err);
-        }
+        let content_write = match result {
+            Ok(content_write) => content_write,
+            Err(err) => {
+                self.rollback_mutation_delta();
+                return Err(err);
+            }
+        };
         // Build deferred extent trims for old content objects replaced by
         // this write.  Each (old_key, new_key) pair defers reclaim of the
         // old object until the replacement receipt is durable.  The plan is
         // applied only after commit_mutation succeeds so rollback paths do
         // not leave stale reclaim work for still-live extents.
         // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
-        let rewrite_trim_plan = match self
-            .read_committed_content_layout(inode_id, &old_record)
-            .and_then(|old_layout| {
-                self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record)
-            }) {
-            Ok(plan) => plan,
+        let (rewrite_trim_plan, receipted_allocation_entries) = match self
+            .rewrite_side_state_after_content_write(inode_id, &old_layout, &record, &content_write)
+        {
+            Ok(side_state) => side_state,
             Err(err) => {
                 self.rollback_mutation_delta();
                 return Err(err);
@@ -13488,6 +13633,11 @@ impl PoolDatasetOwner {
             .invalidate(inode_id);
         self.mark_inode_content_dirty(inode_id);
         let committed = self.commit_mutation(record)?;
+        if let Some(entries) = receipted_allocation_entries {
+            self.filesystem
+                .authenticated_content_allocation_cache
+                .record_live_entries(&committed, entries);
+        }
         self.apply_rewrite_trim_plan(rewrite_trim_plan);
         Ok(committed)
     }
@@ -13517,12 +13667,7 @@ impl PoolDatasetOwner {
             allow_holes,
         )?;
         #[cfg(feature = "policy-observation")]
-        let old_allocation_bytes =
-            allocation_bytes(&content_allocation_entries_for_inode_pool_in_keyspace(
-                self.store.pool(),
-                &old_record,
-                self.object_keyspace(),
-            )?)?;
+        let old_allocation_bytes = self.authenticated_live_content_allocation_bytes(&old_record)?;
         // Pre-check obligation ledger before allocator (Design rule Rule 3: authority is scarce)
         #[cfg(feature = "policy-observation")]
         let allocation_bytes = allocation_bytes(&planned_entries)?;
@@ -13576,22 +13721,23 @@ impl PoolDatasetOwner {
                 compression_policy: &self.filesystem.content_compression_policy,
             })
         };
-        if let Err(err) = result {
-            self.rollback_mutation_delta();
-            return Err(err);
-        }
+        let content_write = match result {
+            Ok(content_write) => content_write,
+            Err(err) => {
+                self.rollback_mutation_delta();
+                return Err(err);
+            }
+        };
         // Build deferred extent trims for old content objects replaced by
         // this overlay write.  Each (old_key, new_key) pair defers reclaim
         // of the old object until the replacement receipt is durable.  The
         // plan is applied only after commit_mutation succeeds so rollback
         // paths do not leave stale reclaim work for still-live extents.
         // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
-        let mut rewrite_trim_plan = match self
-            .read_committed_content_layout(inode_id, &old_record)
-            .and_then(|old_layout| {
-                self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record)
-            }) {
-            Ok(plan) => plan,
+        let (mut rewrite_trim_plan, receipted_allocation_entries) = match self
+            .rewrite_side_state_after_content_write(inode_id, &old_layout, &record, &content_write)
+        {
+            Ok(side_state) => side_state,
             Err(err) => {
                 self.rollback_mutation_delta();
                 return Err(err);
@@ -13623,6 +13769,11 @@ impl PoolDatasetOwner {
         self.mark_inode_content_dirty(inode_id);
         self.account_rewrite_replaced_data(rewrite_trim_plan.replaced_data_bytes);
         let committed = self.commit_mutation(record)?;
+        if let Some(entries) = receipted_allocation_entries {
+            self.filesystem
+                .authenticated_content_allocation_cache
+                .record_live_entries(&committed, entries);
+        }
         self.apply_rewrite_trim_plan(rewrite_trim_plan);
         Ok(committed)
     }
@@ -13738,7 +13889,7 @@ impl PoolDatasetOwner {
         self.filesystem.max_uncommitted_mutations = max;
         self.filesystem
             .intent_log
-            .set_pressure_depth_threshold(usize::try_from(max).unwrap_or(usize::MAX));
+            .set_deferred_mutation_bound(usize::try_from(max).unwrap_or(usize::MAX));
         Ok(())
     }
 
@@ -15714,6 +15865,27 @@ impl PoolDatasetOwner {
             .authenticated_content_allocation_cache
             .retain_live_inodes(&live_inode_ids);
         for pool_readable_record in pool_readable_records {
+            // Replaced content is excluded from the capacity union. Still
+            // authenticate a cache miss before superseding it, but do not
+            // clone an already-authenticated entry set only to discard it.
+            if Some(pool_readable_record.inode_id) == replaced_inode {
+                if self
+                    .filesystem
+                    .authenticated_content_allocation_cache
+                    .live_entries(&pool_readable_record)
+                    .is_none()
+                {
+                    let entries = content_allocation_entries_for_inode_pool_in_keyspace(
+                        self.store.pool(),
+                        &pool_readable_record,
+                        keyspace,
+                    )?;
+                    self.filesystem
+                        .authenticated_content_allocation_cache
+                        .record_live_entries(&pool_readable_record, entries);
+                }
+                continue;
+            }
             let inode_entries = match self
                 .filesystem
                 .authenticated_content_allocation_cache
@@ -15733,13 +15905,6 @@ impl PoolDatasetOwner {
                     entries
                 }
             };
-            // A replacement does not reserve both the old and planned live
-            // inode images. Its exact old content identity must already have
-            // passed strict Pool receipt authority above before the old image
-            // can be superseded.
-            if Some(pool_readable_record.inode_id) == replaced_inode {
-                continue;
-            }
             merge_allocation_entries(&mut current_entries, inode_entries);
         }
         merge_allocation_entries(
@@ -15750,6 +15915,35 @@ impl PoolDatasetOwner {
                 .collect(),
         );
         self.ensure_content_capacity_for_current_entries(current_entries)
+    }
+
+    /// Return allocation bytes already authenticated for this exact live
+    /// content identity, falling back to the strict Pool read on a cache miss.
+    ///
+    /// Receipt-producing local rewrites record their emitted layout after all
+    /// writes succeed. Policy observation can reuse that authority until the
+    /// inode's size or data version changes; externally discovered identities
+    /// and Pool lifecycle invalidation still take the strict path.
+    #[cfg(feature = "policy-observation")]
+    fn authenticated_live_content_allocation_bytes(&mut self, record: &InodeRecord) -> Result<u64> {
+        if let Some(entries) = self
+            .filesystem
+            .authenticated_content_allocation_cache
+            .live_entries(record)
+        {
+            return allocation_bytes(entries);
+        }
+
+        let entries = content_allocation_entries_for_inode_pool_in_keyspace(
+            self.store.pool(),
+            record,
+            self.object_keyspace(),
+        )?;
+        let bytes = allocation_bytes(&entries)?;
+        self.filesystem
+            .authenticated_content_allocation_cache
+            .record_live_entries(record, entries);
+        Ok(bytes)
     }
 
     fn ensure_content_capacity_for_current_entries(
@@ -20142,7 +20336,7 @@ mod recovery_integration_tests {
     }
 
     #[test]
-    fn mounted_deferred_mutation_limit_sets_intent_pressure_bound() {
+    fn mounted_deferred_mutation_limit_sets_intent_bounds() {
         let tmp = TempDir::new().expect("tempdir");
         let mut fs = LocalFileSystem::open_with_options(tmp.path(), StoreOptions::durable())
             .expect("open filesystem");
@@ -20154,6 +20348,11 @@ mod recovery_integration_tests {
             fs.filesystem.intent_log.pressure_depth_threshold(),
             64 * 1024,
             "intent pressure must not force a hidden commit below the owning mutation bound"
+        );
+        assert_eq!(
+            fs.filesystem.intent_log.max_batch_entries(),
+            64 * 1024,
+            "intent auto-flush must not force a hidden storage sync below the owning mutation bound"
         );
     }
 

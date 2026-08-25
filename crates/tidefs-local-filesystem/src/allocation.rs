@@ -56,10 +56,12 @@ struct AuthenticatedInodeAllocation {
 ///
 /// Capacity planning keys live entries by the complete content identity, not
 /// metadata generation, so unrelated chmod/link/timestamp changes do not make
-/// the filesystem reread payloads. A size or data-version change is a cache
-/// miss and must pass the normal Pool-backed layout and chunk reads before its
-/// entries can be reused. Retained-root entries are reusable only for the
-/// exact ordered root set that was authenticated.
+/// the filesystem reread payloads. An externally discovered size or
+/// data-version change must pass the normal Pool-backed layout and chunk reads.
+/// A locally emitted layout may be recorded after all of its receipt-producing
+/// writes succeed, because that path already owns the persisted placement
+/// authority. Retained-root entries are reusable only for the exact ordered
+/// root set that was authenticated.
 #[derive(Debug, Default)]
 pub(crate) struct AuthenticatedContentAllocationCache {
     live_inodes: BTreeMap<InodeId, AuthenticatedInodeAllocation>,
@@ -550,16 +552,15 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay_layout(
 
 pub(crate) fn planned_chunk_allocation_entries_for_patch_batch_layout(
     old_layout: &ContentLayout,
-    old_record: &InodeRecord,
     new_record: &InodeRecord,
     patches: &[ContentOverlayPatch<'_>],
     allow_holes: bool,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
     let mut entries = BTreeMap::new();
-    if !allow_holes || old_record.size > new_record.size {
+    if !allow_holes {
         return Err(FileSystemError::Unsupported {
             operation: "patch batch allocation planning",
-            reason: "batch writeback optimization requires non-shrinking sparse content",
+            reason: "batch writeback optimization requires sparse-hole authority",
         });
     }
     let crate::records::ContentLayout::Chunked(manifest) = old_layout else {
@@ -1197,6 +1198,70 @@ pub(crate) fn obsolete_extent_keys_for_full_replace_in_keyspace(
     (trimmable, deferred)
 }
 
+/// Select obsolete logical content keys from the exact layout returned by a
+/// completed receipt-producing rewrite.
+///
+/// The caller must hold a [`crate::content::ContentWriteOutcome`] whose
+/// `receipted_layout()` returned `Some`. In that case every new non-hole object
+/// and the new manifest already have persisted placement authority, so a
+/// second recursive Pool read cannot add reclaim safety. Paths without that
+/// returned authority continue to use the strict/deferred helpers above.
+pub(crate) fn obsolete_extent_keys_after_receipted_full_replace(
+    inode_id: InodeId,
+    old_layout: &ContentLayout,
+    new_layout: &ContentLayout,
+) -> Vec<ObjectKey> {
+    let new_data_version = match new_layout {
+        ContentLayout::Inline(content) => content.data_version,
+        ContentLayout::Chunked(manifest) => manifest.data_version,
+    };
+
+    match old_layout {
+        ContentLayout::Inline(content) => {
+            if content.data_version == new_data_version {
+                Vec::new()
+            } else {
+                vec![content_object_key_for_version(
+                    inode_id,
+                    content.data_version,
+                )]
+            }
+        }
+        ContentLayout::Chunked(old_manifest) => {
+            let new_by_index: BTreeMap<u64, &crate::records::ContentChunkRef> = match new_layout {
+                ContentLayout::Inline(_) => BTreeMap::new(),
+                ContentLayout::Chunked(new_manifest) => new_manifest
+                    .chunks
+                    .iter()
+                    .map(|chunk| (chunk.chunk_index, chunk))
+                    .collect(),
+            };
+            let mut obsolete = Vec::new();
+            for old_chunk in &old_manifest.chunks {
+                if old_chunk.is_hole()
+                    || new_by_index
+                        .get(&old_chunk.chunk_index)
+                        .is_some_and(|new_chunk| new_chunk.data_version == old_chunk.data_version)
+                {
+                    continue;
+                }
+                obsolete.push(content_chunk_object_key_for_version(
+                    inode_id,
+                    old_chunk.data_version,
+                    old_chunk.chunk_index,
+                ));
+            }
+            if old_manifest.data_version != new_data_version {
+                obsolete.push(content_object_key_for_version(
+                    inode_id,
+                    old_manifest.data_version,
+                ));
+            }
+            obsolete
+        }
+    }
+}
+
 /// Classify old extent keys for an inline content replacement.
 ///
 /// The old inline content object is obsolete.  Trimming is gated on
@@ -1357,6 +1422,16 @@ mod tests {
         changed_content = record.clone();
         changed_content.size += 1;
         assert!(cache.live_entries(&changed_content).is_none());
+
+        let changed_key =
+            content_object_key_for_version(changed_content.inode_id, changed_content.data_version);
+        let changed_entries = BTreeMap::from([(changed_key, u64::from(content_chunk_size()))]);
+        cache.record_live_entries(&changed_content, changed_entries.clone());
+        assert_eq!(
+            cache.live_entries(&changed_content),
+            Some(&changed_entries),
+            "a locally receipted content identity can carry its allocation authority forward"
+        );
 
         cache.retain_live_inodes(&std::collections::BTreeSet::new());
         assert!(cache.live_entries(&record).is_none());

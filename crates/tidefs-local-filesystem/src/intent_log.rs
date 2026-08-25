@@ -1114,12 +1114,18 @@ impl IntentLog {
         self.log_device.is_some()
     }
 
-    /// Keep intent-log pressure aligned with the owning deferred-mutation
-    /// window. A pressure fallback may force a whole-state commit, so a
-    /// smaller independent limit would defeat the caller's commit-group
-    /// bound.
-    pub(crate) fn set_pressure_depth_threshold(&mut self, threshold: usize) {
-        self.config.pressure_depth_threshold = threshold;
+    /// Keep intent-log batching and pressure aligned with the owning
+    /// deferred-mutation window. Either an automatic batch flush or a
+    /// pressure fallback can introduce synchronous storage work, so neither
+    /// limit may create a smaller hidden commit cadence than the owner.
+    pub(crate) fn set_deferred_mutation_bound(&mut self, bound: usize) {
+        self.config.max_batch_entries = bound.max(1);
+        self.config.pressure_depth_threshold = bound;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_batch_entries(&self) -> usize {
+        self.config.max_batch_entries
     }
 
     #[cfg(test)]

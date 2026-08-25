@@ -62,6 +62,35 @@ pub(crate) trait ContentWriteStore {
     fn raw_store_mut(&mut self) -> &mut LocalObjectStore;
 }
 
+/// Exact layout emitted by one completed content rewrite.
+///
+/// A Pool-backed writer may carry this layout directly into allocation and
+/// reclaim planning when every non-hole object plus the manifest received a
+/// nonzero placement receipt. Raw compatibility stores retain their existing
+/// zero-generation behavior and therefore do not produce that authority.
+pub(crate) struct ContentWriteOutcome {
+    layout: ContentLayout,
+    has_persisted_receipt_authority: bool,
+}
+
+impl ContentWriteOutcome {
+    fn chunked(manifest: ContentManifestObject, manifest_receipt: PlacementReceipt) -> Self {
+        let has_persisted_receipt_authority = manifest_receipt.generation > 0
+            && manifest
+                .chunks
+                .iter()
+                .all(|chunk| chunk.is_hole() || chunk.placement_receipt_generation > 0);
+        Self {
+            layout: ContentLayout::Chunked(manifest),
+            has_persisted_receipt_authority,
+        }
+    }
+
+    pub(crate) fn receipted_layout(&self) -> Option<&ContentLayout> {
+        self.has_persisted_receipt_authority.then_some(&self.layout)
+    }
+}
+
 /// Dataset-scoped view of content I/O.
 ///
 /// Content encodings retain logical per-filesystem keys (including dedup
@@ -1420,11 +1449,35 @@ pub(crate) fn write_chunked_content<S: ContentWriteStore>(
     record: &InodeRecord,
     bytes: &[u8],
     dedup_index: &mut DedupIndex,
-    #[cfg(feature = "quorum-write")] mut quorum_store: Option<
+    #[cfg(feature = "quorum-write")] quorum_store: Option<
         &mut tidefs_quorum_write_runtime::QuorumObjectStore,
     >,
     compression_policy: &ContentCompressionPolicy,
 ) -> Result<()> {
+    write_chunked_content_with_outcome(
+        dedup_enabled,
+        store,
+        record,
+        bytes,
+        dedup_index,
+        #[cfg(feature = "quorum-write")]
+        quorum_store,
+        compression_policy,
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn write_chunked_content_with_outcome<S: ContentWriteStore>(
+    dedup_enabled: bool,
+    store: &mut S,
+    record: &InodeRecord,
+    bytes: &[u8],
+    dedup_index: &mut DedupIndex,
+    #[cfg(feature = "quorum-write")] mut quorum_store: Option<
+        &mut tidefs_quorum_write_runtime::QuorumObjectStore,
+    >,
+    compression_policy: &ContentCompressionPolicy,
+) -> Result<ContentWriteOutcome> {
     let actual_size = u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
         requested: u64::MAX,
     })?;
@@ -1471,11 +1524,11 @@ pub(crate) fn write_chunked_content<S: ContentWriteStore>(
         chunk_size: content_chunk_size(),
         chunks,
     };
-    let _ = store.put_with_receipt(
+    let manifest_receipt = store.put_with_receipt(
         content_object_key_for_version(record.inode_id, record.data_version),
         &encode_content_manifest(&manifest),
     )?;
-    Ok(())
+    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
 }
 
 fn write_same_size_sparse_overlay<S: ContentWriteStore>(
@@ -1492,7 +1545,7 @@ fn write_same_size_sparse_overlay<S: ContentWriteStore>(
         &mut tidefs_quorum_write_runtime::QuorumObjectStore,
     >,
     compression_policy: &ContentCompressionPolicy,
-) -> Result<()> {
+) -> Result<ContentWriteOutcome> {
     let chunk_count = content_chunk_count(new_record.size)?;
     let mut chunks_by_index = BTreeMap::new();
     for old_ref in &old_manifest.chunks {
@@ -1519,7 +1572,9 @@ fn write_same_size_sparse_overlay<S: ContentWriteStore>(
     let Some((first_overlay_chunk, last_overlay_chunk)) =
         overlay_chunk_index_bounds(new_record.size, overlay_offset, overlay_bytes.len())?
     else {
-        return Ok(());
+        return Err(FileSystemError::CorruptState {
+            reason: "nonempty same-size overlay does not intersect its new content",
+        });
     };
 
     for chunk_index in first_overlay_chunk..=last_overlay_chunk {
@@ -1593,15 +1648,15 @@ fn write_same_size_sparse_overlay<S: ContentWriteStore>(
     };
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
-    let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    let manifest_receipt = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(())
+    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
 }
 
-fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
+fn write_sparse_patch_batch<S: ContentWriteStore>(
     dedup_enabled: bool,
     store: &mut S,
     old_layout: &ContentLayout,
@@ -1614,7 +1669,7 @@ fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
         &mut tidefs_quorum_write_runtime::QuorumObjectStore,
     >,
     compression_policy: &ContentCompressionPolicy,
-) -> Result<()> {
+) -> Result<ContentWriteOutcome> {
     let chunk_count = content_chunk_count(new_record.size)?;
     let mut patches_by_chunk: BTreeMap<u64, Vec<ContentOverlayPatch<'_>>> = BTreeMap::new();
     for patch in patches {
@@ -1777,12 +1832,12 @@ fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
     };
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
-    let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    let manifest_receipt = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(())
+    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
 }
 
 fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
@@ -1797,8 +1852,9 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
         &mut tidefs_quorum_write_runtime::QuorumObjectStore,
     >,
     compression_policy: &ContentCompressionPolicy,
-) -> Result<()> {
+) -> Result<ContentWriteOutcome> {
     let old_chunk_count = content_chunk_count(old_record.size)?;
+    let new_chunk_count = content_chunk_count(new_record.size)?;
     let mut patches_by_chunk: BTreeMap<u64, Vec<ContentOverlayPatch<'_>>> = BTreeMap::new();
     for patch in patches {
         let Some((first_chunk, last_chunk)) =
@@ -1873,7 +1929,7 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
     // payload one content chunk at a time, then visit only patched chunks in the
     // sparse extension. This keeps peak memory bounded by the inline object plus
     // one chunk instead of allocating the new logical file size.
-    for chunk_index in 0..old_chunk_count {
+    for chunk_index in 0..old_chunk_count.min(new_chunk_count) {
         write_chunk(
             chunk_index,
             patches_by_chunk.remove(&chunk_index).unwrap_or_default(),
@@ -1892,12 +1948,12 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
     };
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
-    let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    let manifest_receipt = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(())
+    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
 }
 
 fn write_sparse_size_change<S: ContentWriteStore>(
@@ -1910,7 +1966,7 @@ fn write_sparse_size_change<S: ContentWriteStore>(
         &mut tidefs_quorum_write_runtime::QuorumObjectStore,
     >,
     compression_policy: &ContentCompressionPolicy,
-) -> Result<()> {
+) -> Result<ContentWriteOutcome> {
     let new_chunk_count = content_chunk_count(new_record.size)?;
     let max_retained_chunks = usize::try_from(new_chunk_count).unwrap_or(usize::MAX);
     let mut chunks = Vec::with_capacity(old_manifest.chunks.len().min(max_retained_chunks));
@@ -1974,12 +2030,12 @@ fn write_sparse_size_change<S: ContentWriteStore>(
     };
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
-    let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    let manifest_receipt = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(())
+    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1997,7 +2053,7 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
         &mut tidefs_quorum_write_runtime::QuorumObjectStore,
     >,
     compression_policy: &ContentCompressionPolicy,
-) -> Result<()> {
+) -> Result<ContentWriteOutcome> {
     let new_chunk_count = content_chunk_count(new_record.size)?;
     let mut chunks_by_index = BTreeMap::new();
 
@@ -2147,17 +2203,17 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
     };
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
-    let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    let manifest_receipt = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(())
+    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
 }
 
 pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
     request: WriteChunkedContentOverlay<'_, S>,
-) -> Result<()> {
+) -> Result<ContentWriteOutcome> {
     let WriteChunkedContentOverlay {
         dedup_enabled,
         store,
@@ -2332,17 +2388,17 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
     };
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
-    let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    let manifest_receipt = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     #[cfg(feature = "quorum-write")]
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(())
+    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
 }
 
 pub(crate) fn write_chunked_content_with_patch_batch<S: ContentWriteStore>(
     request: WriteChunkedContentPatchBatch<'_, S>,
-) -> Result<()> {
+) -> Result<ContentWriteOutcome> {
     let WriteChunkedContentPatchBatch {
         dedup_enabled,
         store,
@@ -2357,9 +2413,9 @@ pub(crate) fn write_chunked_content_with_patch_batch<S: ContentWriteStore>(
         compression_policy,
     } = request;
     let old_layout = read_content_layout_from_write_store(store, inode_id, old_record)?;
-    if allow_holes && old_record.size <= new_record.size {
+    if allow_holes {
         return match old_layout {
-            ContentLayout::Chunked(ref old_manifest) => write_same_size_sparse_patch_batch(
+            ContentLayout::Chunked(ref old_manifest) => write_sparse_patch_batch(
                 dedup_enabled,
                 store,
                 &old_layout,
@@ -2388,8 +2444,7 @@ pub(crate) fn write_chunked_content_with_patch_batch<S: ContentWriteStore>(
     }
     Err(FileSystemError::Unsupported {
         operation: "chunked content patch batch",
-        reason:
-            "batch writeback optimization requires non-shrinking content with sparse-hole authority",
+        reason: "batch writeback optimization requires sparse-hole authority",
     })
 }
 
@@ -4484,6 +4539,7 @@ mod receipt_durability_tests {
 mod rewrite_extent_trimming_tests {
     use super::*;
     use crate::allocation::{
+        obsolete_extent_keys_after_receipted_full_replace,
         obsolete_extent_keys_for_chunked_rewrite, obsolete_extent_keys_for_full_replace,
         obsolete_extent_keys_for_inline_replace, queue_extent_keys_for_reclaim,
     };
@@ -4839,6 +4895,66 @@ mod rewrite_extent_trimming_tests {
         // Old chunk + old manifest = 2 entries
         assert_eq!(trimmable.len(), 2);
         assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn receipted_rewrite_trim_uses_emitted_layout_without_pool_revalidation() {
+        let inode_id = InodeId(10);
+        let old_chunk0 = ContentChunkRef {
+            chunk_index: 0,
+            data_version: 1,
+            len: TEST_CHUNK_SIZE,
+            checksum: checksum64(b"retained"),
+            placement_receipt_generation: 11,
+        };
+        let old_chunk1 = ContentChunkRef {
+            chunk_index: 1,
+            data_version: 1,
+            len: TEST_CHUNK_SIZE,
+            checksum: checksum64(b"replaced"),
+            placement_receipt_generation: 12,
+        };
+        let old_chunk2 = ContentChunkRef {
+            chunk_index: 2,
+            data_version: 1,
+            len: TEST_CHUNK_SIZE,
+            checksum: checksum64(b"removed"),
+            placement_receipt_generation: 13,
+        };
+        let new_chunk1 = ContentChunkRef {
+            chunk_index: 1,
+            data_version: 2,
+            len: TEST_CHUNK_SIZE,
+            checksum: checksum64(b"replacement"),
+            placement_receipt_generation: 14,
+        };
+        let old_layout = ContentLayout::Chunked(ContentManifestObject {
+            inode_id,
+            data_version: 1,
+            file_size: u64::from(TEST_CHUNK_SIZE) * 3,
+            chunk_size: TEST_CHUNK_SIZE,
+            chunks: vec![old_chunk0.clone(), old_chunk1, old_chunk2],
+        });
+        let new_layout = ContentLayout::Chunked(ContentManifestObject {
+            inode_id,
+            data_version: 2,
+            file_size: u64::from(TEST_CHUNK_SIZE) * 2,
+            chunk_size: TEST_CHUNK_SIZE,
+            chunks: vec![old_chunk0, new_chunk1],
+        });
+
+        let obsolete =
+            obsolete_extent_keys_after_receipted_full_replace(inode_id, &old_layout, &new_layout);
+        let retained_key = content_chunk_object_key_for_version(inode_id, 1, 0);
+        let replaced_key = content_chunk_object_key_for_version(inode_id, 1, 1);
+        let removed_key = content_chunk_object_key_for_version(inode_id, 1, 2);
+        let old_manifest_key = content_object_key_for_version(inode_id, 1);
+
+        assert!(!obsolete.contains(&retained_key));
+        assert!(obsolete.contains(&replaced_key));
+        assert!(obsolete.contains(&removed_key));
+        assert!(obsolete.contains(&old_manifest_key));
+        assert_eq!(obsolete.len(), 3);
     }
 
     #[test]
