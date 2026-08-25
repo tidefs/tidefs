@@ -1192,6 +1192,33 @@ impl ExtentMap {
         }
     }
 
+    /// Build a tracked extent map from exact committed entries.
+    ///
+    /// This recovery/commit bridge preserves the full entry metadata instead
+    /// of recreating every allocation as UNWRITTEN. Fresh local extent IDs are
+    /// assigned to the normalized entries so ordinary free/refcount operations
+    /// remain available after restoration.
+    pub fn from_committed_entries(entries: &[ExtentMapEntryV2]) -> Result<Self, ExtentMapError> {
+        let mut map = Self::new();
+        if entries.is_empty() {
+            return Ok(map);
+        }
+        map.inner.insert_extent(entries)?;
+        let normalized = map.inner.lookup_range(0, u64::MAX)?;
+        for entry in normalized {
+            let extent_id = ExtentId(map.next_extent_id);
+            map.next_extent_id = map
+                .next_extent_id
+                .checked_add(1)
+                .ok_or(ExtentMapError::InvalidRange)?;
+            map.id_to_offset
+                .insert(extent_id, (entry.logical_offset, entry.length));
+            map.refcounts.insert(extent_id, 1);
+            map.free_tracker.carve(entry.logical_offset, entry.length)?;
+        }
+        Ok(map)
+    }
+
     /// Set the pool identifier for cross-pool reflink validation.
     pub fn set_pool_id(&mut self, pool_id: u64) {
         self.pool_id = Some(pool_id);
@@ -3360,6 +3387,21 @@ mod tests {
         let mut recon2 = recon.clone();
         let e4 = recon2.allocate(12288, 4096).unwrap();
         assert_eq!(e4, ExtentId(4));
+    }
+
+    #[test]
+    fn restored_extent_entries_keep_exact_kinds() {
+        let data = ExtentMapEntryV2::new_data(0, 4096, LocatorId(7), [0xa5; 32], 11);
+        let unwritten = ExtentMapEntryV2::new_unwritten(8192, 4096, 12);
+
+        let restored =
+            ExtentMap::from_committed_entries(&[data.clone(), unwritten.clone()]).unwrap();
+
+        assert_eq!(
+            restored.lookup_range(0, 12288).unwrap(),
+            vec![data, unwritten]
+        );
+        assert_eq!(restored.next_extent_id(), ExtentId(3));
     }
 
     #[test]

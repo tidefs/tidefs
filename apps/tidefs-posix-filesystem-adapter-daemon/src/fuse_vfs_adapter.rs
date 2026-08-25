@@ -18324,6 +18324,91 @@ mod tests {
     }
 
     #[test]
+    fn sparse_getattr_blocks_track_allocated_extents() {
+        let mut fixture = adapter_fixture_with_writeback_cache_deferred_commit_and_content_capacity(
+            2 * 1024 * 1024,
+        );
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"sparse-getattr-blocks.bin",
+            libc::O_RDWR as u32,
+        );
+        let initial_statfs = fixture
+            .adapter
+            .dispatch_statfs(&ctx, 1)
+            .expect("statfs before sparse growth");
+
+        let mut sparse_size = SetAttr::new();
+        sparse_size.valid = FATTR_SIZE | FATTR_FH;
+        sparse_size.size = 4 * 1024 * 1024;
+        let sparse = fixture
+            .adapter
+            .dispatch_setattr(&ctx, 26_000, inode.get(), &sparse_size, Some(adapter_fh))
+            .expect("extend file sparsely");
+        assert_eq!(sparse.attr.size, sparse_size.size);
+        assert_eq!(sparse.attr.blocks, 0);
+        let sparse_statfs = fixture
+            .adapter
+            .dispatch_statfs(&ctx, 1)
+            .expect("statfs after sparse growth");
+        assert_eq!(sparse_statfs.avail_blocks, initial_statfs.avail_blocks);
+
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                inode.get(),
+                adapter_fh,
+                2 * 1024 * 1024,
+                &[0x5a; 4096],
+                0,
+            )
+            .expect("write one sparse extent");
+        fixture
+            .adapter
+            .dispatch_flush(&ctx, inode.get(), adapter_fh, 0)
+            .expect("flush sparse extent");
+
+        let with_data = fixture
+            .adapter
+            .dispatch_getattr(&ctx, inode.get(), 26_001, Some(adapter_fh))
+            .expect("getattr after sparse write");
+        assert_eq!(with_data.attr.size, sparse_size.size);
+        assert_eq!(with_data.attr.blocks, 8);
+        let data_statfs = fixture
+            .adapter
+            .dispatch_statfs(&ctx, 1)
+            .expect("statfs after sparse write");
+        assert_eq!(
+            data_statfs.avail_blocks.saturating_add(1),
+            initial_statfs.avail_blocks
+        );
+
+        let mut truncate_zero = SetAttr::new();
+        truncate_zero.valid = FATTR_SIZE | FATTR_FH;
+        truncate_zero.size = 0;
+        let truncated = fixture
+            .adapter
+            .dispatch_setattr(&ctx, 26_002, inode.get(), &truncate_zero, Some(adapter_fh))
+            .expect("truncate sparse file to zero");
+        assert_eq!(truncated.attr.size, 0);
+        assert_eq!(truncated.attr.blocks, 0);
+        let final_attr = fixture
+            .adapter
+            .dispatch_getattr(&ctx, inode.get(), 26_003, Some(adapter_fh))
+            .expect("getattr after truncate to zero");
+        assert_eq!(final_attr.attr.size, 0);
+        assert_eq!(final_attr.attr.blocks, 0);
+        let final_statfs = fixture
+            .adapter
+            .dispatch_statfs(&ctx, 1)
+            .expect("statfs after truncate to zero");
+        assert_eq!(final_statfs.avail_blocks, initial_statfs.avail_blocks);
+    }
+
+    #[test]
     fn vfs_adapter_dispatch_fallocate_unknown_handle_ebadf() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
