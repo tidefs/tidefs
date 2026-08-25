@@ -169,6 +169,9 @@ pub struct VfsLocalFileSystem {
     /// typically the backing directory of a non-root dataset.  The root inode
     /// (ROOT_INODE_ID) maps to this path instead of "/".
     dataset_root_path: Option<String>,
+    /// Host path served by this live VFS owner. This is runtime projection
+    /// state only and is never persisted into the Pool or dataset catalog.
+    live_mountpoint: Option<String>,
     /// Mount-level atime policy (relatime, noatime, strictatime).
     timestamp_policy: TimestampPolicy,
     /// Per-dataset write-acknowledgment durability guarantee.
@@ -193,6 +196,7 @@ impl VfsLocalFileSystem {
             active_dir_handles: RefCell::new(BTreeMap::new()),
             next_dir_handle_id: RefCell::new(1),
             dataset_root_path: None,
+            live_mountpoint: None,
             timestamp_policy: TimestampPolicy::Relatime,
             sync_guarantee: SyncGuarantee::Local,
         }
@@ -210,6 +214,15 @@ impl VfsLocalFileSystem {
             .borrow_mut()
             .insert(ROOT_INODE_ID, root.clone());
         self.dataset_root_path = Some(root);
+        self
+    }
+
+    /// Attach the host path exposed by this live VFS owner.
+    ///
+    /// Callers publish the engine as a live owner only after the mount has
+    /// succeeded. The path remains process-local operator state.
+    pub fn with_live_mountpoint(mut self, mountpoint: impl Into<String>) -> Self {
+        self.live_mountpoint = Some(mountpoint.into());
         self
     }
 
@@ -1663,6 +1676,8 @@ impl VfsLocalFileSystem {
         });
         let used_bytes = capacity.map(|(used, _)| used);
         let available_bytes = capacity.map(|(_, available)| available);
+        let mounted_dataset_id = fs.mounted_dataset_id();
+        let live_mountpoint = self.live_mountpoint.as_deref();
         let catalog = fs.dataset_catalog();
         let entries: Vec<_> = catalog
             .list_all()
@@ -1678,6 +1693,9 @@ impl VfsLocalFileSystem {
             let values: Vec<_> = entries
                 .iter()
                 .map(|(path, id, dataset_type, _, _, _)| {
+                    let mountpoint = (*id.as_bytes() == mounted_dataset_id)
+                        .then_some(live_mountpoint)
+                        .flatten();
                     json!({
                         "pool": pool,
                         "name": format!("{pool}/{path}"),
@@ -1685,7 +1703,7 @@ impl VfsLocalFileSystem {
                         "type": dataset_type.to_string(),
                         "used": used_bytes,
                         "available": available_bytes,
-                        "mountpoint": Value::Null,
+                        "mountpoint": mountpoint,
                         "id": id.to_string(),
                         "sync": catalog.sync_guarantee(path).ok().map(|value| value.to_string()),
                         "state": catalog.lifecycle_state(path).ok().map(|value| format!("{value:?}")),
@@ -1707,7 +1725,12 @@ impl VfsLocalFileSystem {
             "{:<40} {:<12} {:>14} {:>14} {}",
             "NAME", "TYPE", "USED", "AVAILABLE", "MOUNTPOINT"
         );
-        for (path, _, dataset_type, _, _, _) in &entries {
+        for (path, id, dataset_type, _, _, _) in &entries {
+            let mountpoint = if *id.as_bytes() == mounted_dataset_id {
+                live_mountpoint.unwrap_or("-")
+            } else {
+                "-"
+            };
             let _ = write!(
                 out,
                 "\n{:<40} {:<12} {:>14} {:>14} {}",
@@ -1719,7 +1742,7 @@ impl VfsLocalFileSystem {
                 available_bytes
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
-                "-"
+                mountpoint
             );
         }
         live_admin_ok_text(out)
@@ -8534,6 +8557,50 @@ mod tests {
             }),
             "human dataset list should carry the same capacity projection: {human}",
         );
+    }
+
+    #[test]
+    fn live_dataset_list_reports_only_the_mounted_dataset_path() {
+        let (engine, _td) = temp_fs();
+        let engine = engine.with_live_mountpoint("/mnt/tank");
+        let created = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "childfs",
+                "parent": "root",
+                "type": "filesystem",
+                "sync": "local",
+            }),
+        );
+        assert_eq!(created["ok"], true, "dataset create response: {created}");
+
+        let listed = live_admin(&engine, "dataset", "list", json!({}), true);
+        assert_eq!(listed["ok"], true, "dataset list response: {listed}");
+        let datasets = listed["json"]["datasets"].as_array().expect("dataset rows");
+        let root = datasets
+            .iter()
+            .find(|dataset| dataset["path"] == "root")
+            .expect("root dataset row");
+        let child = datasets
+            .iter()
+            .find(|dataset| dataset["path"] == "childfs")
+            .expect("child dataset row");
+        assert_eq!(root["mountpoint"], "/mnt/tank");
+        assert_eq!(child["mountpoint"], Value::Null);
+
+        let human = live_admin(&engine, "dataset", "list", json!({}), false);
+        let text = human["text"].as_str().expect("human dataset list");
+        let root = text
+            .lines()
+            .find(|line| line.starts_with("tank/root"))
+            .expect("human root row");
+        let child = text
+            .lines()
+            .find(|line| line.starts_with("tank/childfs"))
+            .expect("human child row");
+        assert!(root.ends_with("/mnt/tank"), "root row: {root}");
+        assert!(child.ends_with('-'), "child row: {child}");
     }
 
     #[test]
