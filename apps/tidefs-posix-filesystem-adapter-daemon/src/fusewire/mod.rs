@@ -1318,11 +1318,6 @@ pub struct FuseSetlkRequest {
     pub sleep: bool,
 }
 
-// ── FIEMAP ioctl types ─────────────────────────────────────────────────────
-
-/// Linux `FS_IOC_FIEMAP` ioctl command value.
-pub const FS_IOC_FIEMAP: u32 = 0xC020_660B;
-
 /// Linux `FS_IOC_FSGETXATTR` ioctl command value.
 pub const FS_IOC_FSGETXATTR: u32 = 0x801C_581F;
 
@@ -1378,90 +1373,6 @@ impl FsxattrOutput {
         buf.extend_from_slice(&self.fsx_projid.to_le_bytes());
         buf.extend_from_slice(&self.fsx_cowextsize.to_le_bytes());
         buf.extend_from_slice(&[0u8; 8]);
-        buf
-    }
-}
-
-/// Wire size of a `struct fiemap` header.
-pub const FIEMAP_HEADER_SIZE: usize = 32;
-
-/// Wire size of a `struct fiemap_extent`.
-pub const FIEMAP_EXTENT_SIZE: usize = 56;
-
-/// Re-export `FiemapExtent` so adapter code can use it directly.
-#[allow(unused_imports)]
-pub use tidefs_types_extent_map_core::FiemapExtent;
-
-/// FIEMAP request decoded from the FUSE ioctl input buffer.
-///
-/// Fields correspond to `struct fiemap` from `<linux/fiemap.h>`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FiemapInput {
-    /// Logical offset (inclusive) in bytes to start mapping.
-    pub fm_start: u64,
-    /// Length in bytes of the mapping range.
-    pub fm_length: u64,
-    /// FIEMAP flags (e.g. `FIEMAP_FLAG_SYNC`).
-    pub fm_flags: u32,
-    /// Number of extents requested (0 = query only, reports count).
-    pub fm_extent_count: u32,
-}
-
-/// Decode a `FiemapInput` from the FUSE ioctl input buffer.
-///
-/// Returns `None` if the buffer is smaller than [`FIEMAP_HEADER_SIZE`].
-#[must_use]
-pub fn parse_fiemap_input(data: &[u8]) -> Option<FiemapInput> {
-    if data.len() < FIEMAP_HEADER_SIZE {
-        return None;
-    }
-    Some(FiemapInput {
-        fm_start: u64::from_le_bytes(data[0..8].try_into().unwrap()),
-        fm_length: u64::from_le_bytes(data[8..16].try_into().unwrap()),
-        fm_flags: u32::from_le_bytes(data[16..20].try_into().unwrap()),
-        fm_extent_count: u32::from_le_bytes(data[24..28].try_into().unwrap()),
-    })
-}
-
-/// FIEMAP response ready for wire encoding.
-#[derive(Clone, Debug)]
-pub struct FiemapOutput {
-    /// The total number of extents mapped (may exceed `extents.len()`).
-    pub fm_mapped_extents: u32,
-    /// The extent descriptors to encode.
-    pub extents: std::vec::Vec<FiemapExtent>,
-}
-
-impl FiemapOutput {
-    /// Encode the FIEMAP response into a wire buffer.
-    ///
-    /// The returned buffer contains the `struct fiemap` header followed by
-    /// `extents.len()` `struct fiemap_extent` records in little-endian order.
-    #[must_use]
-    pub fn encode(&self, fm_start: u64, fm_length: u64, fm_flags: u32) -> std::vec::Vec<u8> {
-        let mut buf = std::vec::Vec::with_capacity(
-            FIEMAP_HEADER_SIZE + FIEMAP_EXTENT_SIZE * self.extents.len(),
-        );
-        // struct fiemap header
-        buf.extend_from_slice(&fm_start.to_le_bytes());
-        buf.extend_from_slice(&fm_length.to_le_bytes());
-        buf.extend_from_slice(&fm_flags.to_le_bytes());
-        buf.extend_from_slice(&self.fm_mapped_extents.to_le_bytes());
-        buf.extend_from_slice(
-            &u32::try_from(self.extents.len())
-                .unwrap_or(u32::MAX)
-                .to_le_bytes(),
-        );
-        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
-                                                    // struct fiemap_extent[]
-        for ext in &self.extents {
-            buf.extend_from_slice(&ext.fe_logical.to_le_bytes());
-            buf.extend_from_slice(&ext.fe_physical.to_le_bytes());
-            buf.extend_from_slice(&ext.fe_length.to_le_bytes());
-            buf.extend_from_slice(&[0u8; 16]); // reserved[2]
-            buf.extend_from_slice(&ext.fe_flags.to_le_bytes());
-            buf.extend_from_slice(&[0u8; 12]); // reserved[3]
-        }
         buf
     }
 }
@@ -6745,80 +6656,5 @@ mod tests {
                 actual: FUSE_SETLKW_IN_WIRE_SIZE + 1
             })
         );
-    }
-
-    // ── FIEMAP wire-format tests ──────────────────────────────────────────
-
-    #[test]
-    fn fiemap_input_parses_valid_header() {
-        let mut data = [0u8; 32];
-        data[0..8].copy_from_slice(&4096u64.to_le_bytes());
-        data[8..16].copy_from_slice(&8192u64.to_le_bytes());
-        data[16..20].copy_from_slice(&0x1u32.to_le_bytes()); // flags
-        data[24..28].copy_from_slice(&4u32.to_le_bytes()); // extent_count
-
-        let input = parse_fiemap_input(&data).expect("parse fiemap input");
-        assert_eq!(input.fm_start, 4096);
-        assert_eq!(input.fm_length, 8192);
-        assert_eq!(input.fm_flags, 0x1);
-        assert_eq!(input.fm_extent_count, 4);
-    }
-
-    #[test]
-    fn fiemap_input_rejects_short_header() {
-        assert!(parse_fiemap_input(&[0u8; 31]).is_none());
-    }
-
-    #[test]
-    fn fiemap_output_encode_produces_correct_wire_format() {
-        let ext = FiemapExtent::new(0, 1024, 4096, FiemapExtent::FLAG_UNWRITTEN);
-        let output = FiemapOutput {
-            fm_mapped_extents: 1,
-            extents: std::vec![ext],
-        };
-        let buf = output.encode(0, 4096, 0);
-        // Header (32 bytes) + 1 extent (56 bytes) = 88 bytes
-        assert_eq!(buf.len(), 88);
-        // Check header fields
-        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 0); // fm_start
-        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 4096); // fm_length
-        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 0); // fm_flags
-        assert_eq!(u32::from_le_bytes(buf[20..24].try_into().unwrap()), 1); // fm_mapped_extents
-        assert_eq!(u32::from_le_bytes(buf[24..28].try_into().unwrap()), 1); // fm_extent_count
-                                                                            // Check extent fields
-        let ext_off = FIEMAP_HEADER_SIZE;
-        assert_eq!(
-            u64::from_le_bytes(buf[ext_off..ext_off + 8].try_into().unwrap()),
-            0
-        ); // fe_logical
-        assert_eq!(
-            u64::from_le_bytes(buf[ext_off + 8..ext_off + 16].try_into().unwrap()),
-            1024
-        ); // fe_physical
-        assert_eq!(
-            u64::from_le_bytes(buf[ext_off + 16..ext_off + 24].try_into().unwrap()),
-            4096
-        ); // fe_length
-        assert_eq!(
-            u32::from_le_bytes(buf[ext_off + 40..ext_off + 44].try_into().unwrap()),
-            FiemapExtent::FLAG_UNWRITTEN
-        ); // fe_flags
-    }
-
-    #[test]
-    fn fiemap_output_encode_sets_last_flag_on_final_extent() {
-        let ext1 = FiemapExtent::new(0, 0, 4096, 0);
-        let mut ext2 = FiemapExtent::new(4096, 4096, 4096, 0);
-        ext2.fe_flags |= FiemapExtent::FLAG_LAST;
-        let output = FiemapOutput {
-            fm_mapped_extents: 2,
-            extents: std::vec![ext1, ext2],
-        };
-        let buf = output.encode(0, 8192, 0);
-        assert_eq!(buf.len(), 32 + 56 * 2);
-        // Check second extent's flags
-        let ext2_off = FIEMAP_HEADER_SIZE + FIEMAP_EXTENT_SIZE;
-        let flags = u32::from_le_bytes(buf[ext2_off + 40..ext2_off + 44].try_into().unwrap());
-        assert_eq!(flags & FiemapExtent::FLAG_LAST, FiemapExtent::FLAG_LAST);
     }
 }

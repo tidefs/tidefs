@@ -6,7 +6,6 @@
 #
 # Removed as delivered:
 #   file locks (#491/#791): generic/131, generic/150, generic/167
-#   FIEMAP (#500): generic/317
 #   O_DIRECT (#876): generic/095, generic/130, generic/208-213, generic/240
 #   sub-second timestamps (#3184): generic/258 (atimensec/mtimensec/ctimensec confirmed
 #     wired through full FUSE attr path — fuse_vfs_adapter.rs:782-784,839-841)
@@ -40,11 +39,24 @@ generic/318
 #   #2229; this exclusion stays until that row passes.
 generic/694
 
+# --- FIEMAP unavailable on the ordinary FUSE carrier (#2602) ---
+#   Linux generic VFS handles FS_IOC_FIEMAP through
+#   inode_operations::fiemap. Ordinary FUSE does not provide that operation,
+#   so xfs_io receives EOPNOTSUPP before FUSE_IOCTL can reach the TideFS daemon.
+#   Sparse discovery remains supported through SEEK_DATA/SEEK_HOLE.
+#   generic/016 reaches this prerequisite before its collapse-range checks;
+#   the exclusion does not retract TideFS's wired collapse-range path.
+#   generic/017 also requires FIEMAP and a scratch filesystem.
+#   generic/317 is the direct FIEMAP behavior row.
+generic/016
+generic/017
+generic/317
+
 # --- Linux fscrypt policy/key ioctls (unsupported/refused) ---
 #   generic/397-401 exercise Linux fscrypt policy/key behavior. The TideFS
 #   FUSE preview does not implement fscrypt compatibility; its ioctl boundary
-#   wires only FS_IOC_FIEMAP, FS_IOC_FSGETXATTR, and TIDEFS_IOC_DEFRAG, with
-#   other commands refused as EOPNOTSUPP by FuseVfsAdapter::ioctl in
+#   wires only FS_IOC_FSGETXATTR and TIDEFS_IOC_DEFRAG, with other commands
+#   that reach the daemon refused as EOPNOTSUPP by FuseVfsAdapter::ioctl in
 #   apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs. This
 #   is separate from mounted device-transform encryption, which remains
 #   blocked by transform authority.
@@ -62,13 +74,13 @@ generic/401
 
 # --- Row-classified FUSE ioctl/kernel-specific exclusions (#1934) ---
 #   generic/009 exercises FALLOC_FL_ZERO_RANGE through xfs_io fzero plus
-#   FIEMAP extent checks. TideFS wires zero-range fallocate, but the mounted
-#   row remains excluded until zero-range plus FIEMAP is validated end-to-end.
+#   FIEMAP extent checks. TideFS wires zero-range fallocate, but this mounted
+#   row cannot pass its FIEMAP checks on the ordinary FUSE carrier.
 generic/009
 
 #   generic/048 needs scratch shutdown, sync/shutdown/remount recovery, and
-#   FIEMAP/extent checks. The FUSE preview has no mounted filesystem shutdown
-#   or log-replay boundary.
+#   FIEMAP/extent checks. The FUSE preview has neither a mounted filesystem
+#   shutdown/log-replay boundary nor FIEMAP on the ordinary FUSE carrier.
 generic/048
 
 #   generic/054 is another shutdown/log-replay row with version-2 log
@@ -77,8 +89,8 @@ generic/054
 
 #   generic/058 exercises standard FALLOC_FL_INSERT_RANGE through xfs_io
 #   finsert plus FIEMAP extent checks. TideFS source has insert-range handling,
-#   but this row shares the insert-range/FIEMAP validation boundary tracked by
-#   #1926 before the exclusion can be removed.
+#   but the row cannot pass its FIEMAP checks on the ordinary FUSE carrier;
+#   insert-range behavior still needs a reachable outer-boundary test.
 generic/058
 
 #   generic/062 is a broad xattr namespace row across user/trusted/security
@@ -150,13 +162,14 @@ generic/275
 # --- Insert/collapse range row validation (#1926) ---
 #   Focused FUSE xfstests run 29188560825 requested generic/060,
 #   generic/061, generic/063, generic/064, and generic/072. The rows were not
-#   runnable: generic/060-064 stopped at xfs_io fiemap prechecks, and
-#   generic/072 stopped at the xfs_io fcollapse precheck.
+#   runnable: generic/060-064 stopped at xfs_io fiemap prechecks because the
+#   ordinary FUSE carrier has no inode_operations::fiemap, and generic/072
+#   stopped at the xfs_io fcollapse precheck.
 #   FUSE fallocate dispatch and the local filesystem engine wire
 #   FALLOC_FL_INSERT_RANGE and FALLOC_FL_COLLAPSE_RANGE. These rows stay
 #   excluded until delayed-allocation/multi-insert, mixed insert/collapse,
-#   and collapse/truncate stress behavior is validated end-to-end with FIEMAP
-#   and filesystem consistency checks.
+#   and collapse/truncate stress behavior is validated through a reachable
+#   outer boundary and filesystem consistency checks.
 generic/060
 generic/061
 generic/063

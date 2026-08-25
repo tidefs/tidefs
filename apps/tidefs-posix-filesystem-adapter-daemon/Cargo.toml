@@ -27,7 +27,6 @@ tidefs-dir-index = { workspace = true }
 tidefs-posix-acl = { workspace = true }
 tidefs-cache-core = { workspace = true }
 tidefs-extent-map = { workspace = true }
-tidefs-types-extent-map-core = { workspace = true }
 tidefs-permission = { workspace = true }
 tidefs-lock-service = { workspace = true, optional = true }
 tidefs-posix-semantics = { workspace = true }

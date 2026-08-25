@@ -146,8 +146,12 @@ follow-up issue that owns support vs intentional non-support.
 The #713 audit identified `FUSE_BMAP` as a visible FUSE operation gap in this
 document. Issue #786 resolved the current userspace adapter boundary as
 explicit non-support: BMAP returns a physical block-device address, while the
-daemon has no stable block-device address authority. FIEMAP remains the
-supported extent-query surface.
+daemon has no stable block-device address authority. `FS_IOC_FIEMAP` is also
+unsupported on the selected carrier: Linux generic VFS requires
+`inode_operations::fiemap`, which ordinary FUSE does not provide, so the
+command returns `EOPNOTSUPP` before a `FUSE_IOCTL` request can reach the daemon.
+Mounted sparse discovery remains available through `FUSE_LSEEK` with
+`SEEK_DATA` and `SEEK_HOLE`.
 
 Issue #1081 refreshed this section from the current
 `FuseVfsAdapter` daemon callback surface. Rows below classify adapter behavior,
@@ -198,12 +202,12 @@ stub placeholders.
 | `FUSE_FLOCK` | `flock()` | **Implemented** | BSD whole-file advisory lock surface |
 | `FUSE_FALLOCATE` | `fallocate()` | **Implemented** | mode 0, KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE, COLLAPSE_RANGE, INSERT_RANGE |
 | `FUSE_LSEEK` | `lseek()` | **Implemented** | SEEK_SET/END/CUR/DATA/HOLE (PC-004B) |
-| `FUSE_IOCTL` | `ioctl()` | **Partial-boundary** | `FS_IOC_FIEMAP`, `FS_IOC_FSGETXATTR`, and `TIDEFS_IOC_DEFRAG` are wired; other commands return `EOPNOTSUPP` |
+| `FUSE_IOCTL` | `ioctl()` | **Partial-boundary** | `FS_IOC_FSGETXATTR` and `TIDEFS_IOC_DEFRAG` are wired; other commands reaching the daemon return `EOPNOTSUPP`. `FS_IOC_FIEMAP` does not reach this callback on ordinary FUSE and generic VFS returns `EOPNOTSUPP`. |
 | `FUSE_POLL` | `poll()` | **Implemented** | Regular-file readiness and schedule-notify registration bookkeeping |
 | `FUSE_COPY_FILE_RANGE` | `copy_file_range()` | **Implemented** | Engine copy path plus writeback-cache fallback |
 | `FUSE_SYNCFS` | `syncfs()` | **Callback-only; carrier-unreachable** | The daemon callback and internal barrier exist, but ordinary Linux `/dev/fuse` leaves `fuse_conn::sync_fs` disabled; only virtiofs enables it. ABI negotiation cannot make the selected `tidefsctl pool mount` carrier receive opcode 50. |
 | `FUSE_STATX` | `statx()` | **Implemented** | Encodes `ReplyStatx` from adapter metadata projection |
-| `FUSE_BMAP` | `bmap()` | **Explicitly unsupported** | Current userspace adapter returns `EOPNOTSUPP`; FIEMAP is the supported extent-query surface, and BMAP support would require a real block-device address mapping |
+| `FUSE_BMAP` | `bmap()` | **Explicitly unsupported** | Current userspace adapter returns `EOPNOTSUPP`; BMAP would require real block-device address authority. FIEMAP is also unsupported on ordinary FUSE; sparse discovery uses `FUSE_LSEEK` with `SEEK_DATA`/`SEEK_HOLE`. |
 | `FUSE_DESTROY` | `destroy()` | **Implemented** | |
 | `FUSE_INTERRUPT` | (internal to fuser) | **Binding-internal** | No TideFS daemon callback; blocking `setlk(..., sleep = true)` observes fuser's abort handle |
 

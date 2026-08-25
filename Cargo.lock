@@ -3026,7 +3026,6 @@ dependencies = [
  "tidefs-schema-codec-posix-filesystem-adapter",
  "tidefs-transport",
  "tidefs-types-dataset-feature-flags-core",
- "tidefs-types-extent-map-core",
  "tidefs-types-package-profile-catalog",
  "tidefs-types-posix-filesystem-adapter-core",
  "tidefs-types-vfs-core",

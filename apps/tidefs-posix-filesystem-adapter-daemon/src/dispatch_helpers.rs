@@ -46,8 +46,6 @@
 //! | `plan_vfs_copy_file_range_dispatch`    | dst handle not found                 | `EBADF`      |
 //! | `plan_vfs_copy_file_range_dispatch`    | overlapping ranges                   | `EINVAL`     |
 //! | `bmap`                                 | current userspace adapter boundary   | `EOPNOTSUPP` |
-//! | `parse_vfs_fiemap_request`             | unknown ioctl cmd                    | `EOPNOTSUPP` |
-//! | `parse_vfs_fiemap_request`             | malformed header                     | `EINVAL`     |
 //! | `dispatch_lookup` (negative cache hit) |                                      | `ENOENT`     |
 //! | `lookup_attr` (engine error)           |                                      | `ENOENT`     |
 //! | `dispatch_getattr` (ENOENT→ESTALE)     |                                      | `ESTALE`     |
@@ -77,7 +75,6 @@
 //! |-----------|--------------------------------------|--------------|
 //! | `write`   | `FUSE_WRITE_CACHE` (when writeback-cache disabled) or unknown flags  | `EINVAL`     |
 //! | `lookup`  | `emit_lookup_reply` (no attr+no err) | `EIO`        |
-//! | `ioctl`   | bad fiemap request                   | (varies)     |
 //! | `getlk`   | deadlock detected                    | `EDEADLK`    |
 //!
 //! # Reply helpers
