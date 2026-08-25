@@ -649,8 +649,11 @@ fn open_offline_pool_runtime(
     .map_err(|err| format!("failed to open canonical Pool runtime: {err}"))
 }
 
-/// Derive a stable DatasetId from a dataset name using BLAKE3.
+/// Resolve the reserved canonical root ID or derive a stable named-object ID.
 fn dataset_id_from_name(name: &str) -> DatasetId {
+    if name == "root" {
+        return tidefs_pool_runtime::ROOT_DATASET_ID;
+    }
     let mut id_bytes = [0u8; 16];
     let hash = blake3::hash(name.as_bytes());
     id_bytes.copy_from_slice(&hash.as_bytes()[..16]);
@@ -1095,10 +1098,10 @@ fn handle_create(args: DatasetCreateArgs, object_type: DatasetTypeArg) {
     let capacity = validate_create_capacity(object_type, args.size)
         .unwrap_or_else(|err| exit_dataset_error(command, err, args.json));
 
-    if full_path == "root" {
+    if full_path == "root" && object_type == DatasetTypeArg::Volume {
         exit_dataset_error(
             command,
-            "'root' filesystem cannot be re-created; it is created automatically with the pool",
+            "'root' is reserved for the canonical filesystem",
             args.json,
         );
     }
