@@ -2404,6 +2404,31 @@ pub struct LocalFileSystemOpenConfig<'a> {
     pub block_devices: Option<&'a [std::path::PathBuf]>,
 }
 
+/// Read-only inputs for resolving mounted access policy before filesystem
+/// recovery authority is selected.
+pub struct MountedAccessReadonlyProbeConfig<'a> {
+    /// Read-only object-store options used during canonical catalog loading.
+    pub options: StoreOptions,
+    /// Capacity geometry needed to locate a development Pool image.
+    pub allocator_policy: LocalStorageAllocatorPolicy,
+    /// Optional device encryption configuration, subject to mounted transform refusal.
+    pub encryption: Option<EncryptionConfig>,
+    /// Optional device compression configuration, subject to mounted transform refusal.
+    pub compression: Option<CompressionConfig>,
+    /// Explicit Pool devices, or the existing hidden development device when absent.
+    pub block_devices: Option<&'a [std::path::PathBuf]>,
+}
+
+/// Result of probing the canonical Pool catalog for mounted read-only access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountedAccessReadonlyProbe {
+    /// The Pool exists but has no published catalog or filesystem root yet.
+    NoPublishedCatalog,
+    /// The selected filesystem has a resolved local, inherited, or default
+    /// `access.readonly` value.
+    Resolved(bool),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MountedOpenRecoveryTransformMode {
     RawOnlyNoDeviceTransforms,
@@ -4729,6 +4754,89 @@ impl PoolDatasetOwner {
             "root",
             config,
         )
+    }
+
+    /// Resolve a selected filesystem's mounted access policy without granting
+    /// writable Pool, recovery, or filesystem authority.
+    pub fn probe_named_pool_filesystem_dataset_access_readonly(
+        root: impl AsRef<Path>,
+        pool_name: &str,
+        pool_redundancy_policy: PoolRedundancyPolicy,
+        dataset_path: &str,
+        config: MountedAccessReadonlyProbeConfig<'_>,
+    ) -> Result<MountedAccessReadonlyProbe> {
+        let MountedAccessReadonlyProbeConfig {
+            options,
+            allocator_policy,
+            encryption,
+            compression,
+            block_devices,
+        } = config;
+        allocator_policy.validate()?;
+        MountedOpenRecoveryAuthority::reject_device_transforms(
+            encryption.as_ref(),
+            compression.as_ref(),
+        )?;
+        let root_path = root.as_ref().to_path_buf();
+        let pool = if let Some(devices) = block_devices {
+            Self::block_device_pool_with_recovery_policy(
+                &root_path,
+                devices,
+                pool_name,
+                pool_redundancy_policy,
+                encryption,
+                compression,
+                &options,
+                RecoveryPolicy::ReadOnly,
+            )?
+        } else {
+            let min_image_bytes = Self::hidden_regular_file_dev_image_bytes_for_content_capacity(
+                allocator_policy.content_capacity_bytes,
+            )?;
+            Self::default_development_pool_with_min_image_bytes(
+                &root_path,
+                &options,
+                encryption,
+                compression,
+                min_image_bytes,
+                RecoveryPolicy::ReadOnly,
+            )?
+        };
+        if pool.is_locked() {
+            return Err(FileSystemError::DatasetLocked {
+                reason: "encrypted pool opened without encryption key; supply a key to unlock"
+                    .into(),
+            });
+        }
+        let runtime = PoolRuntime::open(pool)?;
+        if runtime.is_unpublished() {
+            return Ok(MountedAccessReadonlyProbe::NoPublishedCatalog);
+        }
+        let dataset_id = runtime
+            .dataset_catalog()
+            .mount_lookup(dataset_path)
+            .map_err(|_| FileSystemError::CorruptState {
+                reason: "selected filesystem dataset is absent from the canonical catalog",
+            })?;
+        let Some((_path, _parent, dataset_type, _txg, _flags, lifecycle_state)) =
+            runtime.dataset_catalog().get_by_id(&dataset_id)
+        else {
+            return Err(FileSystemError::CorruptState {
+                reason: "mounted dataset id is absent from the canonical catalog",
+            });
+        };
+        if dataset_type != DatasetType::Filesystem {
+            return Err(FileSystemError::CorruptState {
+                reason: "mounted dataset typed root is not a filesystem",
+            });
+        }
+        if lifecycle_state.to_u8() != 0 {
+            return Err(FileSystemError::CorruptState {
+                reason: "mounted filesystem dataset is not active",
+            });
+        }
+        mounted_access_readonly_from_catalog(runtime.dataset_catalog(), dataset_path)
+            .map(MountedAccessReadonlyProbe::Resolved)
     }
 
     /// Open the exact filesystem dataset root selected by the canonical Pool
