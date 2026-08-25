@@ -308,6 +308,40 @@ impl PoolImportOwner {
         &self.imported
     }
 
+    /// Export through the current device paths of the mounted Pool runtime.
+    ///
+    /// A mounted device removal or replacement can commit a successor
+    /// topology after this owner was created.  The runtime paths therefore
+    /// supersede the predecessor import paths for label export, but only after
+    /// a fresh scan proves that they still identify this owner's exact Pool.
+    pub fn export_with_current_device_paths(
+        mut self,
+        current_device_paths: &[PathBuf],
+    ) -> Result<(), ImportError> {
+        let entries = tidefs_pool_scan::scan_labels(current_device_paths).map_err(|error| {
+            ImportError::Assembly {
+                msg: error.to_string(),
+            }
+        })?;
+        let current =
+            tidefs_pool_scan::PoolAssembler::assemble(&entries, None).map_err(|error| {
+                ImportError::Assembly {
+                    msg: error.to_string(),
+                }
+            })?;
+        if current.pool_uuid != self.imported.config.pool_uuid {
+            return Err(ImportError::Assembly {
+                msg: format!(
+                    "current mounted devices identify Pool {} but import owner holds Pool {}",
+                    hex_uuid(&current.pool_uuid),
+                    hex_uuid(&self.imported.config.pool_uuid),
+                ),
+            });
+        }
+        self.device_paths = current_device_paths.to_vec();
+        self.export()
+    }
+
     /// Export this owner's pool and release its import exclusion.
     pub fn export(self) -> Result<(), ImportError> {
         if self.read_only {
@@ -523,15 +557,25 @@ fn release_import_lock(lock_dir: &Path, pool_uuid: &[u8; 16]) -> Result<(), Impo
     }
 }
 
-fn rollback_export_labels(devices: &mut [DeviceHandle], prior_labels: &[(u32, Vec<u8>)]) {
-    for (written_index, prior_label) in prior_labels.iter().rev() {
+fn rollback_export_labels(devices: &mut [DeviceHandle], prior_labels: &[(u32, u64, Vec<u8>)]) {
+    for (written_index, label_offset, prior_label) in prior_labels.iter().rev() {
         if let Some(rollback_device) = devices
             .iter_mut()
             .find(|candidate| candidate.device_index == *written_index)
         {
-            let _ = rollback_device.write_label_bytes(prior_label);
+            let _ = rollback_device.write_label_bytes_at(*label_offset, prior_label);
         }
     }
+    for device in devices {
+        let _ = device.sync_label_writes();
+    }
+}
+
+struct ExportLabelUpdate {
+    device_index: u32,
+    label_offset: u64,
+    prior_label: Vec<u8>,
+    exported_label: Vec<u8>,
 }
 
 /// Export (deactivate) a pool: transition it from Active to Exported state.
@@ -565,10 +609,12 @@ pub fn pool_export(
         devices.push(handle);
     }
 
-    // 3. For each device: read label, set Exported, reseal, write.
-    // Preserve prior label bytes so a late write failure does not leave a
-    // mixed ACTIVE/EXPORTED topology.
-    let mut written_prior_labels: Vec<(u32, Vec<u8>)> = Vec::new();
+    // 3. Derive one Exported successor from each selected label. Include every
+    // redundant copy whose encoded authority is byte-identical to the selected
+    // authority. A completed mounted topology publication has matching primary
+    // and backup families, while an interrupted promotion leaves a different
+    // predecessor copy that export must preserve.
+    let mut updates = Vec::new();
     for device_idx in 0..devices.len() {
         let device = &mut devices[device_idx];
         let old_buf = device.read_label_bytes()?;
@@ -577,7 +623,6 @@ pub fn pool_export(
         let old_label = match tidefs_types_pool_label_core::decode_label(&old_buf) {
             Ok(label) => label,
             Err(e) => {
-                rollback_export_labels(&mut devices, &written_prior_labels);
                 return Err(ImportError::Io {
                     device_path: Some(device_path),
                     msg: format!("decode label: {e}"),
@@ -601,22 +646,75 @@ pub fn pool_export(
             "export",
         ) {
             Ok(out_buf) => out_buf,
-            Err(e) => {
-                rollback_export_labels(&mut devices, &written_prior_labels);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
 
-        if let Err(err) = devices[device_idx].write_label_bytes(&out_buf) {
-            let mut rollback_labels = written_prior_labels.clone();
-            rollback_labels.push((device_index, old_buf));
-            rollback_export_labels(&mut devices, &rollback_labels);
-            return Err(err);
+        let copy_offsets = device.redundant_label_copy_offsets()?;
+        let authority_len = device.label_write_len(&old_buf)?;
+        for label_offset in [Some(copy_offsets.primary), copy_offsets.backup]
+            .into_iter()
+            .flatten()
+        {
+            let prior_label = device.read_bytes_at(
+                label_offset,
+                tidefs_types_pool_label_core::POOL_LABEL_SIZE as u64,
+            )?;
+            if prior_label[..authority_len] == old_buf[..authority_len] {
+                updates.push(ExportLabelUpdate {
+                    device_index,
+                    label_offset,
+                    prior_label,
+                    exported_label: out_buf.clone(),
+                });
+            }
         }
-        written_prior_labels.push((device_index, old_buf));
     }
 
-    // 4. Remove the import lock file.
+    // 4. Publish, sync, and reread every matching redundant copy before the
+    // import exclusion is released. Preserve exact prior bytes for a best-
+    // effort rollback if any write, durability barrier, or verification fails.
+    let mut written_prior_labels = Vec::new();
+    for update in &updates {
+        let device = devices
+            .iter_mut()
+            .find(|candidate| candidate.device_index == update.device_index)
+            .expect("export update device came from the assembled topology");
+        if let Err(error) = device.write_label_bytes_at(update.label_offset, &update.exported_label)
+        {
+            rollback_export_labels(&mut devices, &written_prior_labels);
+            return Err(error);
+        }
+        written_prior_labels.push((
+            update.device_index,
+            update.label_offset,
+            update.prior_label.clone(),
+        ));
+    }
+    for device_idx in 0..devices.len() {
+        if updates
+            .iter()
+            .any(|update| update.device_index == devices[device_idx].device_index)
+        {
+            if let Err(error) = devices[device_idx].sync_label_writes() {
+                rollback_export_labels(&mut devices, &written_prior_labels);
+                return Err(error);
+            }
+        }
+    }
+    for update in &updates {
+        let device = devices
+            .iter_mut()
+            .find(|candidate| candidate.device_index == update.device_index)
+            .expect("export update device came from the assembled topology");
+        if let Err(error) =
+            device.verify_label_bytes_at(update.label_offset, &update.exported_label)
+        {
+            rollback_export_labels(&mut devices, &written_prior_labels);
+            return Err(error);
+        }
+    }
+
+    // 5. Remove the import lock file only after durable label verification.
     release_import_lock(lock_dir, &config.pool_uuid)
 }
 
@@ -4472,6 +4570,115 @@ mod tests {
             tidefs_types_pool_label_core::PoolState::Exported,
             "label must show Exported after pool_export"
         );
+    }
+
+    #[test]
+    fn writable_owner_export_accepts_current_same_pool_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("device-original");
+        let current = dir.path().join("device-current");
+        {
+            let mut file = File::create(&original).unwrap();
+            write_test_label(&mut file, "retarget_export");
+        }
+        let lock_dir = dir.path().join("locks");
+        let owner = pool_import_owned(&[original.clone()], &lock_dir, false, None).unwrap();
+        let pool_uuid = owner.imported().config.pool_uuid;
+
+        fs::rename(&original, &current).unwrap();
+        owner
+            .export_with_current_device_paths(&[current.clone()])
+            .unwrap();
+
+        assert!(!lock_dir.join(hex_uuid(&pool_uuid)).exists());
+        let mut handle = DeviceHandle::open_ro(&current, 0).unwrap();
+        let label = tidefs_types_pool_label_core::decode_label(&handle.read_label_bytes().unwrap())
+            .unwrap();
+        assert_eq!(label.pool_guid, pool_uuid);
+        assert_eq!(label.pool_state, PoolState::Exported);
+    }
+
+    #[test]
+    fn writable_owner_export_refuses_different_pool_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned_path = dir.path().join("owned-device");
+        let other_path = dir.path().join("other-device");
+        let owned_pool_guid = [0x61; 16];
+        let other_pool_guid = [0x62; 16];
+        for (path, pool_guid, device_guid, name) in [
+            (&owned_path, owned_pool_guid, [0x71; 16], "owned-pool"),
+            (&other_path, other_pool_guid, [0x72; 16], "other-pool"),
+        ] {
+            let mut file = File::create(path).unwrap();
+            write_test_label_for_device(
+                &mut file,
+                pool_guid,
+                device_guid,
+                name,
+                0,
+                1,
+                PoolState::Exported,
+            );
+        }
+        let lock_dir = dir.path().join("locks");
+        let owner = pool_import_owned(&[owned_path.clone()], &lock_dir, false, None).unwrap();
+
+        let error = owner
+            .export_with_current_device_paths(&[other_path.clone()])
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("current mounted devices identify Pool"),
+            "{error}"
+        );
+        assert!(lock_dir.join(hex_uuid(&owned_pool_guid)).exists());
+        let mut other = DeviceHandle::open_ro(&other_path, 0).unwrap();
+        let other_label =
+            tidefs_types_pool_label_core::decode_label(&other.read_label_bytes().unwrap()).unwrap();
+        assert_eq!(other_label.pool_guid, other_pool_guid);
+        assert_eq!(other_label.pool_state, PoolState::Exported);
+
+        pool_export(&[owned_path], &lock_dir, false).unwrap();
+    }
+
+    #[test]
+    fn writable_owner_export_updates_duplicate_selected_label_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let (device_paths, backup_offset, expected_payload) =
+            create_backup_lifecycle_pool(dir.path(), "duplicate-selected-export");
+        let lock_dir = dir.path().join("locks");
+        let owner = pool_import_owned(&device_paths, &lock_dir, false, None)
+            .expect("activate selected replacement lifecycle family");
+        let selected = tidefs_pool_scan::select_label_copy_offsets(&device_paths)
+            .expect("select active replacement lifecycle family");
+
+        // Model a completed mounted topology publication: both redundant
+        // families carry the exact selected ACTIVE topology and lifecycle.
+        for path in &device_paths {
+            let active = read_label_bytes_at(path, selected[path]);
+            let mut file = OpenOptions::new().write(true).open(path).unwrap();
+            for offset in [0, backup_offset] {
+                file.seek(SeekFrom::Start(offset)).unwrap();
+                file.write_all(&active).unwrap();
+            }
+            file.sync_all().unwrap();
+        }
+
+        owner
+            .export_with_current_device_paths(&device_paths)
+            .expect("export duplicate current topology families");
+        for path in &device_paths {
+            for offset in [0, backup_offset] {
+                let exported = read_label_bytes_at(path, offset);
+                let label = tidefs_types_pool_label_core::decode_label(&exported).unwrap();
+                let lifecycle = decode_pool_lifecycle_v1(&exported).unwrap().unwrap();
+                assert_eq!(label.pool_state, PoolState::Exported);
+                assert_eq!(label.topology_generation, 2);
+                assert_eq!(lifecycle.kind(), PoolLifecycleKindV1::DeviceReplacement);
+                assert_eq!(lifecycle.payload(), expected_payload);
+            }
+        }
     }
 
     #[test]
