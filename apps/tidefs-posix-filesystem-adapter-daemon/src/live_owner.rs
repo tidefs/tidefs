@@ -28,7 +28,7 @@ use tidefs_block_volume_adapter_daemon::storage_backend::{
 #[cfg(feature = "block-volume")]
 use tidefs_block_volume_adapter_daemon::ublk_control_open::run_ublk_live_device;
 use tidefs_local_filesystem::SharedPoolDatasetOwner;
-use tidefs_local_object_store::pool::{PoolHealth, PoolTopologyStatus};
+use tidefs_local_object_store::pool::{PoolHealth, PoolMemberStatus, PoolTopologyStatus};
 use tidefs_types_vfs_core::RequestCtx;
 use tidefs_vfs_engine::{
     LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminError,
@@ -1639,13 +1639,7 @@ fn pool_status(
     let members: Vec<_> = topology
         .members
         .iter()
-        .map(|member| {
-            json!({
-                "index": member.device_index,
-                "guid": hex_uuid(&member.device_guid),
-                "presence": if member.present { "Present" } else { "Missing" },
-            })
-        })
+        .map(pool_member_status_json)
         .collect();
 
     let value = json!({
@@ -1684,6 +1678,15 @@ fn pool_status(
     }
 }
 
+fn pool_member_status_json(member: &PoolMemberStatus) -> serde_json::Value {
+    json!({
+        "index": member.device_index,
+        "guid": hex_uuid(&member.device_guid),
+        "runtime_locator": member.runtime_locator.as_ref().map(|path| path.display().to_string()),
+        "presence": if member.present { "Present" } else { "Missing" },
+    })
+}
+
 fn pool_status_text(
     manifest: &LiveOwnerManifest,
     statfs: &tidefs_types_vfs_core::StatFs,
@@ -1714,10 +1717,15 @@ fn pool_status_text(
         );
     for member in &topology.members {
         text.push_str(&format!(
-            "\n  member {}:   {} {}",
+            "\n  member {}:   {} {} locator={}",
             member.device_index,
             hex_uuid(&member.device_guid),
-            if member.present { "Present" } else { "Missing" }
+            if member.present { "Present" } else { "Missing" },
+            member
+                .runtime_locator
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string())
         ));
     }
     text
@@ -2092,11 +2100,9 @@ fn hex_uuid(uuid: &[u8; 16]) -> String {
 mod tests {
     use super::*;
 
-    use tidefs_local_object_store::device::DeviceState;
-    use tidefs_local_object_store::pool::PoolMemberStatus;
-
     #[cfg(feature = "block-volume")]
     use tidefs_block_volume_adapter_daemon::storage_backend::PoolRuntime;
+    use tidefs_local_object_store::device::DeviceState;
 
     fn manifest() -> LiveOwnerManifest {
         LiveOwnerManifest {
@@ -2125,12 +2131,14 @@ mod tests {
                 PoolMemberStatus {
                     device_index: 0,
                     device_guid: [0x11; 16],
+                    runtime_locator: None,
                     present: false,
                     operational_state: None,
                 },
                 PoolMemberStatus {
                     device_index: 1,
                     device_guid: [0x22; 16],
+                    runtime_locator: Some(PathBuf::from("/dev/tidefs-member-1")),
                     present: true,
                     operational_state: Some(DeviceState::Online),
                 },
@@ -2146,8 +2154,15 @@ mod tests {
         assert!(text.contains("owner metadata dir: /var/lib/tidefs/tank"));
         assert!(!text.contains("backing dir:"));
         assert!(text.contains("members:     expected=2 present=1 missing=1"));
-        assert!(text.contains("member 0:   11111111111111111111111111111111 Missing"));
-        assert!(text.contains("member 1:   22222222222222222222222222222222 Present"));
+        assert!(text.contains("member 0:   11111111111111111111111111111111 Missing locator=-"));
+        assert!(text.contains(
+            "member 1:   22222222222222222222222222222222 Present locator=/dev/tidefs-member-1"
+        ));
+
+        let missing_json = pool_member_status_json(&topology.members[0]);
+        assert_eq!(missing_json["runtime_locator"], serde_json::Value::Null);
+        let present_json = pool_member_status_json(&topology.members[1]);
+        assert_eq!(present_json["runtime_locator"], "/dev/tidefs-member-1");
     }
 
     #[test]

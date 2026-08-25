@@ -3595,6 +3595,7 @@ impl SharedPoolDatasetOwner {
                     json!({
                         "device_index": member.device_index,
                         "device_guid": guid(&member.device_guid),
+                        "runtime_locator": member.runtime_locator.as_ref().map(|path| path.display().to_string()),
                         "present": member.present,
                         "operational_state": member.operational_state.map(|state| format!("{state:?}")),
                     })
@@ -3668,9 +3669,14 @@ impl SharedPoolDatasetOwner {
         for member in &topology.members {
             let _ = write!(
                 message,
-                "\n  member[{}]: guid={} present={} state={}",
+                "\n  member[{}]: guid={} locator={} present={} state={}",
                 member.device_index,
                 guid(&member.device_guid),
+                member
+                    .runtime_locator
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".to_string()),
                 member.present,
                 member
                     .operational_state
@@ -9176,6 +9182,27 @@ mod tests {
         assert!(owner_value["text"]
             .as_str()
             .is_some_and(|output| output.starts_with("device status:")));
+    }
+
+    #[test]
+    fn live_device_status_reports_guid_bound_runtime_locator() {
+        let (engine, _td) = temp_fs();
+        let runtime_locator = engine.fs.borrow().current_pool_device_paths()[0]
+            .display()
+            .to_string();
+
+        let machine = live_device_admin(&engine, "status", json!({}), true);
+        assert_eq!(machine["ok"], true, "machine response: {machine}");
+        assert_eq!(
+            machine["json"]["members"][0]["runtime_locator"],
+            runtime_locator
+        );
+
+        let human = live_device_admin(&engine, "status", json!({}), false);
+        assert_eq!(human["ok"], true, "human response: {human}");
+        assert!(human["text"]
+            .as_str()
+            .is_some_and(|output| output.contains(&format!("locator={runtime_locator}"))));
     }
 
     #[test]
