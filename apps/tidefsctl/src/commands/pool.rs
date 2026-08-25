@@ -20,9 +20,8 @@
 // (checked via `is_block_device` on the path).
 
 use std::os::unix::fs::FileTypeExt;
-use tidefs_pool_scan::scanner::{PoolScanReport, ScanPlan, SegmentScanner};
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process;
 
 use clap::Parser;
@@ -1086,141 +1085,40 @@ fn route_live_device_pool_owner_with_format(
 // pool integrity-check
 // ---------------------------------------------------------------------------
 
-/// Read the highest committed transaction group from a device's VCRL ledger
-/// in the system area. Returns None if no valid VCRL ledger is found.
-fn read_vcrl_committed_txg(device_path: &std::path::Path) -> Option<u64> {
-    use std::io::{Read, Seek, SeekFrom};
-    use tidefs_types_pool_label_core::{
-        VCRL_ENTRY_SIZE, VCRL_HEADER_SIZE, VCRL_MAGIC, VCRL_VERSION,
-    };
-
-    let mut file = std::fs::File::open(device_path).ok()?;
-
-    // Read pool label to find system area pointer.
-    let mut label_buf = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
-    file.seek(SeekFrom::Start(0)).ok()?;
-    file.read_exact(&mut label_buf).ok()?;
-
-    let label = tidefs_types_pool_label_core::decode_label(&label_buf).ok()?;
-    let sa_ptr = label.system_area_pointer;
-    let sa_size = label.system_area_size;
-
-    if sa_size < VCRL_HEADER_SIZE as u64 {
-        return None;
-    }
-
-    // Read VCRL header.
-    file.seek(SeekFrom::Start(sa_ptr)).ok()?;
-    let mut header = [0u8; VCRL_HEADER_SIZE];
-    file.read_exact(&mut header).ok()?;
-
-    if header[0..4] != VCRL_MAGIC {
-        return None;
-    }
-    let version = u32::from_le_bytes(header[4..8].try_into().ok()?);
-    if version != VCRL_VERSION {
-        return None;
-    }
-    let entry_count = u32::from_le_bytes(header[8..12].try_into().ok()?);
-    if entry_count == 0 {
-        return None;
-    }
-
-    // Read the last VCRL entry (highest txg is typically the last one).
-    let entry_off = VCRL_HEADER_SIZE + (entry_count as usize - 1) * VCRL_ENTRY_SIZE;
-    file.seek(SeekFrom::Start(sa_ptr + entry_off as u64 + 40))
-        .ok()?;
-    let mut txg_buf = [0u8; 8];
-    file.read_exact(&mut txg_buf).ok()?;
-    Some(u64::from_le_bytes(txg_buf))
+#[derive(Debug)]
+struct OfflinePoolIntegrityReport {
+    verifier: tidefs_local_filesystem::OnlineVerifierReport,
+    statfs: Result<tidefs_local_filesystem::FileSystemStatfs, String>,
+    filesystem: tidefs_local_filesystem::FileSystemStats,
+    suspect_log: tidefs_local_object_store::SuspectLogStats,
+    intent_log_pending: usize,
 }
 
-/// Run a quick block-device integrity scan across devices.
-/// Opens each device as a block-device object store and verifies
-/// segment integrity. Returns a count of checksum errors found.
-/// Returns None if no device could be opened.
-fn scan_block_devices_for_integrity(device_paths: &[std::path::PathBuf]) -> Option<PoolScanReport> {
-    use std::time::Instant;
-    use tidefs_local_object_store::LocalObjectStore;
-    use tidefs_local_object_store::StoreOptions;
-    use tidefs_local_object_store::SuspectLog;
-
-    let started = Instant::now();
-    let mut total_records: u64 = 0;
-    let mut total_bytes: u64 = 0;
-    let mut total_checksum_errors: u64 = 0;
-    let mut total_segments: u64 = 0;
-    let mut suspect_entries: u64 = 0;
-    let mut suspect_unresolved: u64 = 0;
-    let mut any_device_opened = false;
-
-    let entries = tidefs_pool_scan::scan_labels(device_paths).ok()?;
-    for entry in entries {
-        if !entry.label_valid {
-            continue;
-        }
-        let (Some(pool_guid), Some(device_guid)) = (entry.pool_guid, entry.device_guid) else {
-            continue;
-        };
-        let store = match LocalObjectStore::open_block_device_read_only_existing(
-            &entry.device_path,
-            StoreOptions::default(),
-            pool_guid,
-            device_guid,
-        ) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        any_device_opened = true;
-
-        let stats = store.stats();
-        total_segments = total_segments.saturating_add(stats.segment_count as u64);
-
-        let mut suspect_log = SuspectLog::new();
-        let mut cursor: (u64, u64) = (0, 0);
-
-        loop {
-            match store.verify_segment_integrity(&mut suspect_log, &mut cursor, 1000, 0) {
-                Ok((records, bytes, has_more)) => {
-                    total_records = total_records.saturating_add(records);
-                    total_bytes = total_bytes.saturating_add(bytes);
-                    if !has_more {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        let log_stats = suspect_log.stats();
-        total_checksum_errors = total_checksum_errors.saturating_add(log_stats.total_entries);
-        suspect_entries = suspect_entries.saturating_add(log_stats.total_entries);
-        suspect_unresolved = suspect_unresolved.saturating_add(log_stats.unresolved);
+impl OfflinePoolIntegrityReport {
+    fn collect(filesystem: &mut LocalFileSystem) -> Result<Self, String> {
+        let verifier = filesystem
+            .canonical_dataset_online_verifier_report()
+            .map_err(|error| format!("authenticated Pool verifier failed: {error}"))?;
+        let statfs = filesystem.statfs().map_err(|error| error.to_string());
+        Ok(Self {
+            verifier,
+            statfs,
+            filesystem: filesystem.stats(),
+            suspect_log: filesystem.suspect_log_stats(),
+            intent_log_pending: filesystem.intent_log_pending(),
+        })
     }
 
-    if !any_device_opened {
-        return None;
+    fn passed(&self) -> bool {
+        self.verifier.passed()
+            && !self.verifier.production_fsck_required
+            && self.verifier.selected_root.is_some()
+            && !self.verifier.verified_committed_roots.is_empty()
+            && self.verifier.checked_transaction_manifests > 0
+            && self.verifier.checked_content_objects > 0
+            && self.suspect_log.unresolved == 0
+            && self.statfs.is_ok()
     }
-
-    let elapsed = started.elapsed();
-    let store_root = device_paths
-        .first()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("."));
-    Some(PoolScanReport {
-        store_root,
-        completed: true,
-        scan_duration: elapsed,
-        total_segments,
-        total_records,
-        total_bytes,
-        live_bytes: total_bytes,
-        dead_bytes: 0,
-        checksum_errors: total_checksum_errors,
-        suspect_entries,
-        suspect_unresolved,
-        segments: Vec::new(),
-    })
 }
 
 fn handle_pool_integrity_check(
@@ -1300,447 +1198,278 @@ fn handle_pool_integrity_check(
         super::offline_pool::refuse_runtime_pool_path("pool", "integrity-check", path);
     }
 
-    if let Some(ref device_paths) = device_paths {
-        let config = assemble_device_pool_config(device_paths, "integrity-check");
-        ensure_device_pool_name(&pool, "integrity-check", &config);
-        super::live_owner::route_or_refuse_active_for_uuid_with_args(
-            "pool",
-            "integrity-check",
-            &pool,
-            config.pool_uuid,
-            config.state == tidefs_types_pool_label_core::PoolState::Active,
-            live_args.clone(),
-        );
-    }
-
-    // ── Phase 1: device-level checks (labels, committed root, intent log) ──
-    let mut label_failures: Vec<String> = Vec::new();
-    let mut committed_root_found = false;
-    let mut committed_root_txg: u64 = 0;
-    let mut intent_log_pending_devices: Vec<String> = Vec::new();
-    let mut vrbt_missing_devices: Vec<String> = Vec::new();
-
-    if let Some(ref device_paths) = device_paths {
-        // Validate pool labels via PoolScanner.
-        let scan_config = tidefs_pool_scan::label::PoolScanConfig::new(device_paths.clone());
-        match tidefs_pool_scan::result::PoolScanner::scan(&scan_config) {
-            Ok(scan_result) => {
-                // Check for corrupted/unreadable labels.
-                for dev in &scan_result.devices {
-                    if !dev.label_valid {
-                        label_failures.push(format!(
-                            "{}: {}",
-                            dev.device_path.display(),
-                            dev.label_status
-                        ));
-                    }
-                }
-                // Check committed-root presence via VCRL ledger.
-                // PoolScanner uses VBSA format but the pool creator writes
-                // VCRL format. Read the VCRL header directly from the system
-                // area for authoritative committed-root detection.
-                for dev_path in device_paths {
-                    if let Some(txg) = read_vcrl_committed_txg(dev_path) {
-                        committed_root_found = true;
-                        if txg > committed_root_txg {
-                            committed_root_txg = txg;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                label_failures.push(format!("label scan failed: {e}"));
-            }
-        }
-
-        // Check VRBT intent-log state per device.
-        for dev_path in device_paths {
-            match tidefs_pool_import::check_pool_intent_log_pending(dev_path) {
-                Ok(Some(result)) => {
-                    if result.intent_log_pending {
-                        intent_log_pending_devices.push(result.description.clone());
-                    }
-                    if !result.vrbt_valid {
-                        vrbt_missing_devices.push(result.description.clone());
-                    }
-                }
-                Ok(None) => {
-                    // Device has no label or no system area — label scan
-                    // already reported this above.
-                }
-                Err(e) => {
-                    label_failures.push(format!(
-                        "intent-log check failed on {}: {e}",
-                        dev_path.display()
-                    ));
-                }
-            }
-        }
-    }
-
-    // ── Phase 2: segment-level integrity scan ──
-    // Retired directory object-stores use SegmentScanner. Byte-addressable
-    // pool members use the block-device object-store scanner when --devices is
-    // present.
-    let mut segment_scan_error: Option<String> = None;
-    let report_root = backing_dir
-        .clone()
-        .or_else(|| {
-            device_paths
-                .as_ref()
-                .and_then(|paths| paths.first().cloned())
-        })
-        .unwrap_or_else(|| PathBuf::from(&pool));
-
-    let segment_report: Option<PoolScanReport> = if let Some(ref path) = backing_dir {
-        if !path.exists() {
-            eprintln!(
-                "tidefsctl: integrity-check retired directory object-store does not exist: {}",
-                path.display()
-            );
-            process::exit(2);
-        }
-
-        let mut plan = ScanPlan::full(path.clone());
-        if let Some(n) = max_records {
-            plan = plan.with_max_records(n);
-        }
-        if let Some(b) = max_bytes {
-            plan = plan.with_max_bytes(b);
-        }
-
-        match SegmentScanner::scan(&plan, None) {
-            Ok(r) => Some(r),
-            Err(err) => {
-                if let Some(ref device_paths) = device_paths {
-                    scan_block_devices_for_integrity(device_paths)
-                } else {
-                    segment_scan_error = Some(err);
-                    None
-                }
-            }
-        }
-    } else if let Some(ref device_paths) = device_paths {
-        scan_block_devices_for_integrity(device_paths)
-    } else {
-        None
-    };
-
-    // Whether device-level checks were requested.
-    let device_checks_enabled = device_paths.is_some();
-    let device_checks_skipped = !device_checks_enabled;
-    let segment_scan_available = segment_report.is_some();
-
-    // If neither device checks nor segment scan are available, report the
-    // error and exit.
-    if device_checks_skipped && !segment_scan_available {
-        let err_msg = segment_scan_error.as_deref().unwrap_or("unknown error");
-        if json {
-            let out = serde_json::json!({
-                "pass": false,
-                "error": err_msg,
-            });
-            println!("{}", serde_json::to_string_pretty(&out).unwrap());
-        } else {
-            eprintln!("tidefsctl: pool integrity-check failed: {err_msg}");
-        }
-        process::exit(2);
-    }
-
-    // ── Phase 3: aggregate pass/fail ──
-    let segment_pass = segment_report.as_ref().map_or(true, |r| r.is_healthy());
-
-    // Device-level checks only apply when --devices is given. When device
-    // checks are skipped the segment-scan alone is not a full pass because
-    // labels, committed-root, intent-log, and VRBT gates were never checked.
-    // Use --devices to run the complete verification.
-    let label_pass = !device_checks_enabled || label_failures.is_empty();
-    let committed_root_pass = !device_checks_enabled || committed_root_found;
-    let intent_log_pass = !device_checks_enabled || intent_log_pending_devices.is_empty();
-    let vrbt_pass = !device_checks_enabled || vrbt_missing_devices.is_empty();
-
-    // overall_pass is only meaningful when device checks ran. Without them
-    // the operator gets a non-zero exit to signal incomplete verification.
-    let overall_pass = if device_checks_skipped {
-        false
-    } else {
-        let device_checks_pass = label_pass && committed_root_pass && intent_log_pass && vrbt_pass;
-        if segment_scan_available {
-            segment_pass && device_checks_pass
-        } else {
-            device_checks_pass
-        }
-    };
-
-    if json {
-        print_combined_integrity_json(
-            &pool,
-            device_checks_enabled,
-            segment_report.as_ref(),
-            &report_root,
-            overall_pass,
-            &label_failures,
-            committed_root_found,
-            committed_root_txg,
-            &intent_log_pending_devices,
-            &vrbt_missing_devices,
-            segment_scan_error.as_deref(),
-        );
-    } else {
-        print_combined_integrity_text(
-            &pool,
-            device_checks_enabled,
-            device_checks_skipped,
-            segment_report.as_ref(),
-            &report_root,
-            overall_pass,
-            &label_failures,
-            committed_root_found,
-            committed_root_txg,
-            &intent_log_pending_devices,
-            &vrbt_missing_devices,
-            segment_scan_error.as_deref(),
-        );
-    }
-
-    if !overall_pass {
-        if device_checks_skipped {
-            process::exit(3);
-        } else {
-            process::exit(1);
-        }
-    }
-}
-
-fn print_combined_integrity_text(
-    pool: &str,
-    device_checks_enabled: bool,
-    device_checks_skipped: bool,
-    report: Option<&PoolScanReport>,
-    store_root: &Path,
-    overall_pass: bool,
-    label_failures: &[String],
-    committed_root_found: bool,
-    committed_root_txg: u64,
-    intent_log_pending_devices: &[String],
-    vrbt_missing_devices: &[String],
-    segment_scan_error: Option<&str>,
-) {
-    println!("pool integrity-check: {pool}");
-    println!("  storage:       {}", store_root.display());
-    println!(
-        "  overall pass:  {}",
-        if overall_pass {
-            "yes"
-        } else if device_checks_skipped {
-            "incomplete (device checks skipped)"
-        } else {
-            "no"
-        }
+    let device_paths = device_paths.expect("offline integrity inputs were checked above");
+    let config = assemble_device_pool_config(&device_paths, "integrity-check");
+    ensure_device_pool_name(&pool, "integrity-check", &config);
+    super::live_owner::route_or_refuse_active_for_uuid_with_format_and_args(
+        "pool",
+        "integrity-check",
+        &pool,
+        config.pool_uuid,
+        config.state == tidefs_types_pool_label_core::PoolState::Active,
+        json,
+        live_args,
     );
-    println!();
 
-    // ── Label checks ──
-    if !label_failures.is_empty() {
-        println!("  label failures: {} device(s)", label_failures.len());
-        for f in label_failures {
-            println!("    - {f}");
-        }
-    } else if device_checks_enabled {
-        println!("  labels:        ok");
+    let root_authentication_key =
+        match super::required_root_authentication_key("pool integrity-check") {
+            Ok(key) => key,
+            Err(error) => exit_offline_integrity_error(&pool, device_paths.len(), json, &error),
+        };
+    let metadata_dir =
+        super::offline_pool::metadata_dir("pool", "integrity-check", &config.pool_uuid);
+    let mut filesystem = match LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        &device_paths,
+        &pool,
+        PoolRedundancyPolicy::from_label_policy(config.redundancy_policy),
+        StoreOptions::default(),
+        root_authentication_key,
+        RecoveryPolicy::ReadOnly,
+    ) {
+        Ok(filesystem) => filesystem,
+        Err(error) => exit_offline_integrity_error(
+            &pool,
+            device_paths.len(),
+            json,
+            &format!("read-only Pool open failed: {error}"),
+        ),
+    };
+    let report = match OfflinePoolIntegrityReport::collect(&mut filesystem) {
+        Ok(report) => report,
+        Err(error) => exit_offline_integrity_error(&pool, device_paths.len(), json, &error),
+    };
+    let passed = report.passed();
+    if json {
+        print_offline_integrity_json(&pool, device_paths.len(), max_records, max_bytes, &report);
     } else {
-        println!("  labels:        skipped (use --devices to check)");
+        print_offline_integrity_text(&pool, device_paths.len(), max_records, max_bytes, &report);
     }
-
-    // ── Committed-root check ──
-    if device_checks_enabled {
-        println!(
-            "  committed root: {}",
-            if committed_root_found {
-                format!("present (txg={committed_root_txg})")
-            } else {
-                "missing".to_string()
-            }
-        );
-    } else {
-        println!("  committed root: skipped (use --devices to check)");
-    }
-
-    // ── Intent-log check ──
-    if !device_checks_enabled {
-        println!("  intent-log:    skipped (use --devices to check)");
-    } else if !intent_log_pending_devices.is_empty() {
-        println!("  intent-log:    BLOCKED (pending records)");
-        for d in intent_log_pending_devices {
-            println!("    - {d}");
-        }
-    } else {
-        println!("  intent-log:    clean");
-    }
-
-    // ── VRBT check ──
-    if !device_checks_enabled {
-        println!("  VRBT:          skipped (use --devices to check)");
-    } else if !vrbt_missing_devices.is_empty() {
-        println!(
-            "  VRBT:          missing/invalid on {} device(s)",
-            vrbt_missing_devices.len()
-        );
-        for d in vrbt_missing_devices {
-            println!("    - {d}");
-        }
-    }
-
-    // ── Segment scan ──
-    println!();
-    if let Some(r) = report {
-        println!("  scan duration: {:.2}s", r.scan_duration.as_secs_f64());
-        println!("  segments:      {}", r.total_segments);
-        println!("  records:       {}", r.total_records);
-        println!(
-            "  total bytes:   {} ({:.1}% live)",
-            format_bytes(r.total_bytes),
-            r.live_ratio() * 100.0,
-        );
-        println!("  live bytes:    {}", format_bytes(r.live_bytes));
-        println!("  dead bytes:    {}", format_bytes(r.dead_bytes));
-        println!("  checksum errors: {}", r.checksum_errors);
-        if r.checksum_errors > 0 {
-            let ids = r.corrupted_segment_ids();
-            println!(
-                "  corrupted segments: [{}]",
-                ids.iter()
-                    .map(|id| id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        println!("  suspect entries:       {}", r.suspect_entries);
-        println!("  suspect unresolved:    {}", r.suspect_unresolved);
-    } else {
-        println!("  segment scan:  unavailable (no object-store directory found)");
-        if let Some(err) = segment_scan_error {
-            println!("  scan error:    {err}");
-        }
-    }
-
-    if !overall_pass {
-        eprintln!();
-        if device_checks_skipped {
-            eprintln!(
-                "tidefsctl: pool integrity-check INCOMPLETE (device checks skipped; use --devices)"
-            );
-        } else {
-            eprintln!("tidefsctl: pool integrity-check FAILED");
-        }
-        if device_checks_enabled && !label_failures.is_empty() {
-            eprintln!(
-                "  - label validation failed on {} device(s)",
-                label_failures.len()
-            );
-        }
-        if device_checks_enabled && !committed_root_found {
-            eprintln!("  - no committed root found");
-        }
-        if device_checks_enabled && !intent_log_pending_devices.is_empty() {
-            eprintln!(
-                "  - intent-log has pending records on {} device(s)",
-                intent_log_pending_devices.len()
-            );
-        }
-        if device_checks_enabled && !vrbt_missing_devices.is_empty() {
-            eprintln!(
-                "  - VRBT block missing or invalid on {} device(s)",
-                vrbt_missing_devices.len()
-            );
-        }
-        if let Some(r) = report {
-            if r.checksum_errors > 0 {
-                eprintln!(
-                    "  - {} checksum error(s) detected in segment data",
-                    r.checksum_errors
-                );
-            }
-        }
+    if !passed {
+        process::exit(1);
     }
 }
 
-fn print_combined_integrity_json(
+fn exit_offline_integrity_error(pool: &str, device_count: usize, json: bool, error: &str) -> ! {
+    if json {
+        let out = serde_json::json!({
+            "pool": pool,
+            "pass": false,
+            "state_source": "offline-explicit-devices",
+            "inspection_state": "read-only",
+            "device_count": device_count,
+            "error": error,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    } else {
+        eprintln!("tidefsctl pool integrity-check: {error}");
+    }
+    process::exit(1)
+}
+
+fn print_offline_integrity_text(
     pool: &str,
-    device_checks_enabled: bool,
-    report: Option<&PoolScanReport>,
-    store_root: &Path,
-    overall_pass: bool,
-    label_failures: &[String],
-    committed_root_found: bool,
-    committed_root_txg: u64,
-    intent_log_pending_devices: &[String],
-    vrbt_missing_devices: &[String],
-    segment_scan_error: Option<&str>,
+    device_count: usize,
+    max_records: Option<u64>,
+    max_bytes: Option<u64>,
+    report: &OfflinePoolIntegrityReport,
 ) {
-    let scan_fields = if let Some(r) = report {
-        serde_json::json!({
-            "store_root": r.store_root.to_string_lossy(),
-            "completed": r.completed,
-            "scan_duration_secs": r.scan_duration.as_secs_f64(),
-            "total_segments": r.total_segments,
-            "total_records": r.total_records,
-            "total_bytes": r.total_bytes,
-            "live_bytes": r.live_bytes,
-            "dead_bytes": r.dead_bytes,
-            "live_ratio": r.live_ratio(),
-            "checksum_errors": r.checksum_errors,
-            "suspect_entries": r.suspect_entries,
-            "suspect_unresolved": r.suspect_unresolved,
-            "corrupted_segment_ids": r.corrupted_segment_ids(),
-        })
-    } else {
-        serde_json::json!({
-            "store_root": store_root.to_string_lossy(),
-            "segment_scan_available": false,
-            "segment_scan_error": segment_scan_error,
-        })
-    };
-
-    let out = serde_json::json!({
-        "pool_name": pool,
-        "pass": overall_pass,
-        "device_checks_enabled": device_checks_enabled,
-        "label_failures": label_failures,
-        "committed_root_found": committed_root_found,
-        "committed_root_txg": committed_root_txg,
-        "intent_log_pending_devices": intent_log_pending_devices,
-        "vrbt_missing_devices": vrbt_missing_devices,
-    });
-    // Merge scan fields into the output object.
-    let mut out_map = match out {
-        serde_json::Value::Object(m) => m,
-        _ => serde_json::Map::new(),
-    };
-    if let serde_json::Value::Object(scan_map) = scan_fields {
-        for (k, v) in scan_map {
-            out_map.insert(k, v);
+    let verifier = &report.verifier;
+    println!("pool integrity-check: {pool}");
+    println!("  source:        offline explicit devices (read-only Pool authority)");
+    println!(
+        "  pass:          {}",
+        if report.passed() { "yes" } else { "no" }
+    );
+    println!("  devices:       {device_count}");
+    println!("  verifier:      {}", verifier.outcome.human_name());
+    println!(
+        "  roots:         verified={} candidates={} invalid={}",
+        verifier.verified_committed_roots.len(),
+        verifier.root_candidates_seen,
+        verifier.invalid_root_candidates,
+    );
+    println!(
+        "  objects:       checked={} chunks={}",
+        verifier.checked_content_objects, verifier.checked_content_chunks,
+    );
+    println!(
+        "  suspect-log:   unresolved={} total={}",
+        report.suspect_log.unresolved, report.suspect_log.total_entries,
+    );
+    println!("  intent-log:    pending={}", report.intent_log_pending);
+    match &report.statfs {
+        Ok(statfs) => println!(
+            "  statfs:        blocks={} free={} avail={}",
+            statfs.blocks, statfs.bfree, statfs.bavail,
+        ),
+        Err(error) => println!("  statfs:        unavailable ({error})"),
+    }
+    println!(
+        "  inodes:        count={} next={}",
+        report.filesystem.inode_count, report.filesystem.next_inode_id,
+    );
+    println!(
+        "  object-store:  live_objects={} live_bytes={} segments={}",
+        report.filesystem.object_store.live_objects,
+        report.filesystem.object_store.live_bytes,
+        report.filesystem.object_store.segment_count,
+    );
+    if max_records.is_some() || max_bytes.is_some() {
+        println!(
+            "  limits:        requested max_records={} max_bytes={} (not applied; authenticated Pool verifier is full-scope)",
+            max_records
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            max_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        );
+    }
+    for issue in &verifier.issues {
+        println!(
+            "    - severity={} slot={:?} tx={:?} {}",
+            issue.severity.human_name(),
+            issue.slot,
+            issue.transaction_id,
+            issue.reason,
+        );
+    }
+    if !report.passed() {
+        eprintln!("tidefsctl: pool integrity-check FAILED");
+        if verifier.production_fsck_required {
+            eprintln!("  - production fsck/operator repair is required");
+        }
+        if report.suspect_log.unresolved > 0 {
+            eprintln!(
+                "  - {} unresolved suspect-log entry or entries",
+                report.suspect_log.unresolved,
+            );
+        }
+        if let Err(error) = &report.statfs {
+            eprintln!("  - filesystem accounting is unavailable: {error}");
         }
     }
-    let out = serde_json::Value::Object(out_map);
-    println!("{}", serde_json::to_string_pretty(&out).unwrap());
 }
 
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-/// Format a byte count as a human-readable string.
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    for unit in UNITS {
-        if value < 1024.0 {
-            return format!("{value:.1} {unit}");
-        }
-        value /= 1024.0;
-    }
-    format!("{value:.1} PiB")
+fn print_offline_integrity_json(
+    pool: &str,
+    device_count: usize,
+    max_records: Option<u64>,
+    max_bytes: Option<u64>,
+    report: &OfflinePoolIntegrityReport,
+) {
+    let verifier = &report.verifier;
+    let selected_root = verifier.selected_root.as_ref().map(|root| {
+        serde_json::json!({
+            "slot": root.slot,
+            "transaction_id": root.transaction_id,
+            "generation": root.generation,
+            "next_inode_id": root.next_inode_id,
+            "inode_count": root.inode_count,
+            "has_transaction_manifest": root.has_transaction_manifest,
+            "manifest_entry_count": root.manifest_entry_count,
+            "has_root_authentication": root.has_root_authentication,
+        })
+    });
+    let issues: Vec<_> = verifier
+        .issues
+        .iter()
+        .map(|issue| {
+            serde_json::json!({
+                "severity": issue.severity.human_name(),
+                "kind": issue.kind.human_name(),
+                "slot": issue.slot,
+                "transaction_id": issue.transaction_id,
+                "generation": issue.generation,
+                "reason": &issue.reason,
+            })
+        })
+        .collect();
+    let statfs = match &report.statfs {
+        Ok(statfs) => serde_json::json!({
+            "available": true,
+            "blocks": statfs.blocks,
+            "bfree": statfs.bfree,
+            "bavail": statfs.bavail,
+            "files": statfs.files,
+            "ffree": statfs.ffree,
+            "bsize": statfs.bsize,
+            "frsize": statfs.frsize,
+            "namelen": statfs.namelen,
+            "fsid_hi": statfs.fsid_hi,
+            "fsid_lo": statfs.fsid_lo,
+        }),
+        Err(error) => serde_json::json!({
+            "available": false,
+            "error": error,
+        }),
+    };
+    let out = serde_json::json!({
+        "pool": pool,
+        "pass": report.passed(),
+        "state_source": "offline-explicit-devices",
+        "inspection_state": "read-only",
+        "device_count": device_count,
+        "requested_limits": {
+            "max_records": max_records,
+            "max_bytes": max_bytes,
+            "applied": false,
+            "reason": "authenticated Pool verifier is full-scope",
+        },
+        "verifier": {
+            "outcome": verifier.outcome.human_name(),
+            "root_slot_count": verifier.root_slot_count,
+            "root_slots_seen": verifier.root_slots_seen,
+            "root_slot_records_seen": verifier.root_slot_records_seen,
+            "root_candidates_seen": verifier.root_candidates_seen,
+            "verified_committed_roots": verifier.verified_committed_roots.len(),
+            "invalid_root_candidates": verifier.invalid_root_candidates,
+            "checked_transaction_manifests": verifier.checked_transaction_manifests,
+            "checked_content_objects": verifier.checked_content_objects,
+            "checked_content_chunks": verifier.checked_content_chunks,
+            "verified_snapshot_roots": verifier.verified_snapshot_roots,
+            "production_fsck_required": verifier.production_fsck_required,
+            "mutating_repair_attempted": verifier.mutating_repair_attempted,
+            "selected_root": selected_root,
+            "issues": issues,
+        },
+        "statfs": statfs,
+        "filesystem": {
+            "inode_count": report.filesystem.inode_count,
+            "directory_count": report.filesystem.directory_count,
+            "file_count": report.filesystem.file_count,
+            "symlink_count": report.filesystem.symlink_count,
+            "snapshot_count": report.filesystem.snapshot_count,
+            "next_inode_id": report.filesystem.next_inode_id,
+            "generation": report.filesystem.filesystem_generation,
+            "intent_log_pending": report.intent_log_pending,
+        },
+        "object_store": {
+            "live_objects": report.filesystem.object_store.live_objects,
+            "live_bytes": report.filesystem.object_store.live_bytes,
+            "segment_count": report.filesystem.object_store.segment_count,
+            "free_segments": report.filesystem.object_store.free_segments,
+            "free_bytes": report.filesystem.object_store.free_bytes,
+            "next_sequence": report.filesystem.object_store.next_sequence,
+            "tombstone_count": report.filesystem.object_store.tombstone_count,
+            "mirror_degraded": report.filesystem.object_store.mirror_degraded,
+            "mirror_live_objects": report.filesystem.object_store.mirror_live_objects,
+            "mirror_live_bytes": report.filesystem.object_store.mirror_live_bytes,
+            "replica_healthy": report.filesystem.object_store.replica_healthy,
+            "replica_live_objects": report.filesystem.object_store.replica_live_objects,
+            "last_scrub_secs": report.filesystem.object_store.last_scrub_secs,
+            "committed_root_txg": report.filesystem.object_store.committed_root_txg,
+            "committed_root_generation": report.filesystem.object_store.committed_root_generation,
+        },
+        "suspect_log": {
+            "total_entries": report.suspect_log.total_entries,
+            "unresolved": report.suspect_log.unresolved,
+            "resolved": report.suspect_log.resolved,
+            "oldest_unresolved_age": report.suspect_log.oldest_unresolved_age,
+        },
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
 }
 
 // ---------------------------------------------------------------------------
@@ -2460,6 +2189,100 @@ mod tests {
         assert!(
             PoolCommand::try_parse_from(args).is_err(),
             "pool integrity-check backing-dir must be retired"
+        );
+    }
+
+    #[test]
+    fn offline_explicit_device_integrity_uses_authenticated_pool_state() {
+        use tidefs_local_filesystem::RootAuthenticationKey;
+        use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
+
+        let dir = tempfile::tempdir().expect("offline integrity fixture");
+        let devices = [
+            dir.path().join("member0.img"),
+            dir.path().join("member1.img"),
+        ];
+        for path in &devices {
+            std::fs::File::create(path)
+                .expect("create Pool member")
+                .set_len(32 * 1024 * 1024)
+                .expect("size Pool member");
+        }
+        PoolCreator::create_pool(
+            &devices,
+            &PoolCreateConfig {
+                pool_name: "offline-integrity".to_string(),
+                pool_guid: None,
+                redundancy: RedundancyPolicy::replicated(2),
+                encryption_key: None,
+                clustered: false,
+            },
+        )
+        .expect("create exported Pool");
+
+        let metadata = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata).expect("create Pool metadata directory");
+        let root_key = RootAuthenticationKey::from_bytes32([0x73; 32]);
+        {
+            let mut filesystem = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+                &metadata,
+                &devices,
+                "offline-integrity",
+                PoolRedundancyPolicy::replicated(2),
+                StoreOptions::default(),
+                root_key,
+                RecoveryPolicy::default(),
+            )
+            .expect("open writable Pool carrier");
+            filesystem
+                .create_file("/checked.bin", 0o600)
+                .expect("create checked file");
+            filesystem
+                .write_file("/checked.bin", 0, b"authenticated offline integrity")
+                .expect("write checked file");
+            filesystem.sync_all().expect("commit checked file");
+        }
+
+        let lock_dir = dir.path().join("locks");
+        tidefs_pool_import::pool_export(&devices, &lock_dir, false).expect("export fixture Pool");
+        let mut read_only = LocalFileSystem::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &devices,
+            "offline-integrity",
+            PoolRedundancyPolicy::replicated(2),
+            StoreOptions::default(),
+            root_key,
+            RecoveryPolicy::ReadOnly,
+        )
+        .expect("open explicit devices read-only");
+        let report = OfflinePoolIntegrityReport::collect(&mut read_only)
+            .expect("collect authenticated offline integrity");
+
+        assert!(report.passed(), "report: {report:?}");
+        assert!(report.verifier.selected_root.is_some());
+        assert!(report.verifier.checked_content_objects > 0);
+        assert!(report.verifier.checked_content_chunks > 0);
+        assert_eq!(report.filesystem.file_count, 1);
+        drop(read_only);
+
+        let labels = assemble_device_pool_config(&devices, "integrity-check-test");
+        assert_eq!(
+            labels.state,
+            tidefs_types_pool_label_core::PoolState::Exported,
+            "read-only integrity must not activate or rewrite Pool labels",
+        );
+        assert!(
+            LocalFileSystem::open_with_block_devices_and_recovery_policy(
+                &metadata,
+                &devices,
+                "offline-integrity",
+                PoolRedundancyPolicy::replicated(2),
+                StoreOptions::default(),
+                RootAuthenticationKey::from_bytes32([0x74; 32]),
+                RecoveryPolicy::ReadOnly,
+            )
+            .is_err(),
+            "a wrong root-authentication key must not yield a passing report",
         );
     }
 

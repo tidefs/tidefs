@@ -5675,6 +5675,18 @@ impl PoolDatasetOwner {
         authority.online_verifier_report()
     }
 
+    /// Verify the mounted canonical dataset through current Pool authority.
+    ///
+    /// Unlike [`Self::online_verifier_report`], this does not inspect the
+    /// non-canonical raw root-slot history used by recovery diagnostics. It
+    /// authenticates the selected typed dataset root, transaction manifest,
+    /// snapshots, and receipt-backed content without attempting repair.
+    pub fn canonical_dataset_online_verifier_report(&mut self) -> Result<OnlineVerifierReport> {
+        let root_authentication_key = self.filesystem.root_authentication_key;
+        let dataset_id = DatasetId::from_bytes(self.filesystem.mounted_dataset_id);
+        verify_online_canonical_dataset(&mut self.store, dataset_id, root_authentication_key)
+    }
+
     pub fn root_retention_plan(
         &mut self,
         policy: RootRetentionPolicy,
