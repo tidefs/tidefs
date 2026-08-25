@@ -3989,6 +3989,22 @@ impl PoolDatasetOwner {
         self.filesystem.background_scheduler = None;
     }
 
+    /// Return the current durable Pool membership paths owned by this runtime.
+    ///
+    /// Mounted topology operations can replace or remove the paths supplied at
+    /// import.  Clean shutdown must export these successor members rather than
+    /// replaying the import owner's stale predecessor path list.
+    #[must_use]
+    pub fn current_pool_device_paths(&self) -> Vec<std::path::PathBuf> {
+        self.store
+            .pool()
+            .config()
+            .devices
+            .iter()
+            .map(|device| device.path.clone())
+            .collect()
+    }
+
     /// Complete the fallible storage side of a clean mounted shutdown.
     ///
     /// The mounted carrier calls this after it has stopped admitting work and
@@ -15367,6 +15383,15 @@ impl PoolDatasetOwner {
                 );
             }
         }
+
+        // Every successful commit path above has either published the dirty
+        // state or proved that there was no state left to publish.  Keep the
+        // deferred-mutation counter aligned with that durable boundary.  In
+        // particular, fsync and sync_all call do_commit directly instead of
+        // force_commit; leaving their already-committed mutations counted
+        // makes device lifecycle preflight permanently treat a clean mounted
+        // owner as non-quiescent.
+        self.filesystem.uncommitted_mutation_count = 0;
 
         Ok(())
     }

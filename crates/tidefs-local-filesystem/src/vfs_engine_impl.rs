@@ -10330,6 +10330,80 @@ mod tests {
     }
 
     #[test]
+    fn live_device_replace_after_deferred_sync_reopens_new_topology() {
+        let td = tempfile::tempdir().expect("deferred replacement fixture");
+        let metadata = td.path().join("metadata");
+        std::fs::create_dir_all(&metadata).expect("create replacement metadata dir");
+        let old_devices = [td.path().join("dev0.img"), td.path().join("dev1.img")];
+        let replacement = td.path().join("replacement.img");
+        for path in old_devices.iter().chain(std::iter::once(&replacement)) {
+            let file = std::fs::File::create(path).expect("create replacement device image");
+            file.set_len(16 * 1024 * 1024)
+                .expect("size replacement device image");
+        }
+        let policy = tidefs_local_object_store::pool::PoolRedundancyPolicy::replicated(2);
+        let mut filesystem = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &old_devices,
+            "live-device-replace-deferred",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("create replicated mounted filesystem");
+        filesystem
+            .set_auto_commit(false)
+            .expect("select mounted deferred-commit policy");
+        let payload = b"deferred fsync state stays replaceable";
+        filesystem
+            .create_file("/replace.bin", 0o600)
+            .expect("create replacement test file");
+        filesystem
+            .write_file("/replace.bin", 0, payload)
+            .expect("write replacement test file");
+        assert!(filesystem.uncommitted_mutation_count() > 0);
+        filesystem
+            .sync_all()
+            .expect("commit deferred mounted state");
+        assert_eq!(filesystem.uncommitted_mutation_count(), 0);
+        assert_eq!(filesystem.mounted_mutation_quiescence_failure(), None);
+        let engine = VfsLocalFileSystem::new(filesystem);
+
+        let replaced = live_device_admin(
+            &engine,
+            "replace",
+            json!({
+                "old_device_path": old_devices[0].display().to_string(),
+                "new_device_path": replacement.display().to_string(),
+            }),
+            true,
+        );
+        assert_eq!(replaced["ok"], true, "replace response: {replaced}");
+        assert_eq!(replaced["json"]["status"], "completed");
+        assert_eq!(replaced["json"]["topology_committed"], true);
+        assert_eq!(replaced["json"]["old_device_detach_allowed"], true);
+        drop(engine);
+
+        let reopened = PoolDatasetOwner::open_with_block_devices_and_recovery_policy(
+            &metadata,
+            &[replacement, old_devices[1].clone()],
+            "live-device-replace-deferred",
+            policy,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+            crate::RecoveryPolicy::default(),
+        )
+        .expect("reopen replacement plus survivor");
+        assert_eq!(
+            reopened
+                .read_file("/replace.bin")
+                .expect("read exact bytes after replacement reimport"),
+            payload
+        );
+    }
+
+    #[test]
     fn missing_member_rebuild_is_scoped_to_recovery_only_read_only_owner() {
         let td = tempfile::tempdir().expect("missing-member rebuild fixture");
         let metadata = td.path().join("metadata");

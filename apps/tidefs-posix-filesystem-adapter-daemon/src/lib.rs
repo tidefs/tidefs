@@ -2365,9 +2365,12 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
         None => Ok(()),
     };
     let export_result = match (import_owner, &mounted_close_result) {
-        (Some(owner), Ok(())) => owner
-            .export()
-            .map_err(|err| format!("clean pool export failed during unmount: {err}")),
+        (Some(owner), Ok(())) => {
+            let current_device_paths = shared_pool_owner.borrow().current_pool_device_paths();
+            owner
+                .export_with_current_device_paths(&current_device_paths)
+                .map_err(|err| format!("clean pool export failed during unmount: {err}"))
+        }
         (Some(_owner), Err(_)) => Err(
             "Pool label export withheld because the mounted filesystem did not close cleanly"
                 .to_string(),
