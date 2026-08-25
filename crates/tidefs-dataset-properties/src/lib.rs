@@ -42,6 +42,9 @@
 //! [`resolve_space_quota_for_capacity_authority`] to project the inherited
 //! property metadata into a typed capacity-authority input; mounted quota
 //! enforcement remains in the gated capacity authority closeout slice.
+//! `access.readonly` is a non-transform mounted authority.  Use
+//! [`resolve_access_readonly_for_mount_authority`] to project its inherited
+//! value before a mounted carrier enables writable recovery or I/O.
 //!
 //! # Key types
 //!
@@ -55,6 +58,8 @@
 //! - [`resolve_effective`] — walk the parent chain to resolve a property value.
 //! - [`resolve_space_quota_for_capacity_authority`] — typed `space.quota`
 //!   projection for the capacity authority input boundary.
+//! - [`resolve_access_readonly_for_mount_authority`] — typed
+//!   `access.readonly` projection for mounted startup.
 //! - [`validate_set`] — check a proposed value against the registry and constraints.
 
 use std::collections::BTreeMap;
@@ -62,6 +67,8 @@ use std::fmt;
 
 /// Canonical property name for the dataset capacity quota.
 pub const SPACE_QUOTA_PROPERTY_NAME: &str = "space.quota";
+/// Canonical property name for mounted dataset read-only access.
+pub const ACCESS_READONLY_PROPERTY_NAME: &str = "access.readonly";
 /// Canonical property name for snapshot retention policy.
 pub const SNAPSHOT_RETENTION_PROPERTY_NAME: &str = "snapshot.retention";
 /// Canonical property name for live snapshot-pruner cadence in seconds.
@@ -487,6 +494,15 @@ pub struct CapacityAuthorityQuotaInput {
     /// Effective quota limit in bytes.
     pub quota_bytes: Option<u64>,
     /// Provenance of the resolved `space.quota` value.
+    pub source: PropertySource,
+}
+
+/// Resolved `access.readonly` input for mounted startup authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountAccessReadonlyInput {
+    /// Whether the selected dataset must be opened and mounted read-only.
+    pub read_only: bool,
+    /// Provenance of the resolved `access.readonly` value.
     pub source: PropertySource,
 }
 
@@ -979,6 +995,12 @@ pub fn space_quota_property_key() -> PropertyKey {
     PropertyKey::new(SPACE_QUOTA_PROPERTY_NAME)
 }
 
+/// Return the canonical `access.readonly` property key.
+#[must_use]
+pub fn access_readonly_property_key() -> PropertyKey {
+    PropertyKey::new(ACCESS_READONLY_PROPERTY_NAME)
+}
+
 /// Return the canonical `snapshot.retention` property key.
 #[must_use]
 pub fn snapshot_retention_property_key() -> PropertyKey {
@@ -1011,6 +1033,24 @@ pub fn space_quota_definition() -> PropertyDefinitionV1 {
         feature_flag: None,
         cross_constraints: Vec::new(),
         range: Some((0, i64::MAX as u64)),
+        is_content_transform: false,
+    }
+}
+
+/// Return the standard `access.readonly` property definition.
+#[must_use]
+pub fn access_readonly_definition() -> PropertyDefinitionV1 {
+    PropertyDefinitionV1 {
+        name: access_readonly_property_key(),
+        value_type: PropertyType::Bool,
+        default_value: PropertyValue::Bool(false),
+        inheritance: InheritanceMode::Parent,
+        change_policy: ChangePolicy::Always,
+        scope: PropertyScope::Dataset,
+        family: PropertyFamily::Access,
+        feature_flag: None,
+        cross_constraints: Vec::new(),
+        range: None,
         is_content_transform: false,
     }
 }
@@ -1100,6 +1140,36 @@ pub fn resolve_space_quota_for_capacity_authority(
 
     Ok(CapacityAuthorityQuotaInput {
         quota_bytes,
+        source: resolved.source,
+    })
+}
+
+/// Resolve `access.readonly` into the mounted startup authority input.
+///
+/// `parent_sets` is ordered from immediate parent to root ancestor.
+pub fn resolve_access_readonly_for_mount_authority(
+    local_set: &PropertySet,
+    parent_sets: &[&PropertySet],
+) -> Result<MountAccessReadonlyInput, ValidationError> {
+    let key = access_readonly_property_key();
+    let def = access_readonly_definition();
+    let resolved = resolve_effective(&key, local_set, parent_sets, &def);
+
+    validate_set(&key, &resolved.value, &def, local_set)?;
+
+    let read_only = match resolved.value {
+        PropertyValue::Bool(read_only) => read_only,
+        other => {
+            return Err(ValidationError::TypeMismatch {
+                property: key,
+                expected: PropertyType::Bool,
+                actual: other.property_type(),
+            });
+        }
+    };
+
+    Ok(MountAccessReadonlyInput {
+        read_only,
         source: resolved.source,
     })
 }
@@ -1354,19 +1424,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
             is_content_transform: true,
         },
         // -- Access family --
-        PropertyDefinitionV1 {
-            name: PropertyKey::new("access.readonly"),
-            value_type: PropertyType::Bool,
-            default_value: PropertyValue::Bool(false),
-            inheritance: InheritanceMode::Parent,
-            change_policy: ChangePolicy::Always,
-            scope: PropertyScope::Dataset,
-            family: PropertyFamily::Access,
-            feature_flag: None,
-            cross_constraints: Vec::new(),
-            range: None,
-            is_content_transform: false,
-        },
+        access_readonly_definition(),
         PropertyDefinitionV1 {
             name: PropertyKey::new("access.atime"),
             value_type: PropertyType::Bool,
@@ -1979,6 +2037,27 @@ mod tests {
 
         let result = resolve_effective(&key, &local, &[&parent], &def);
         assert_eq!(result.value, PropertyValue::Bool(true));
+    }
+
+    #[test]
+    fn resolve_access_readonly_for_mount_authority_uses_local_inherited_and_default_values() {
+        let empty = PropertySet::new();
+        let default = resolve_access_readonly_for_mount_authority(&empty, &[]).unwrap();
+        assert!(!default.read_only);
+        assert!(matches!(default.source, PropertySource::Default));
+
+        let key = access_readonly_property_key();
+        let mut parent = PropertySet::new();
+        parent.set_local(key.clone(), PropertyValue::Bool(true));
+        let inherited = resolve_access_readonly_for_mount_authority(&empty, &[&parent]).unwrap();
+        assert!(inherited.read_only);
+        assert!(matches!(inherited.source, PropertySource::Inherited { .. }));
+
+        let mut local = PropertySet::new();
+        local.set_local(key, PropertyValue::Bool(false));
+        let overridden = resolve_access_readonly_for_mount_authority(&local, &[&parent]).unwrap();
+        assert!(!overridden.read_only);
+        assert!(matches!(overridden.source, PropertySource::Local));
     }
 
     #[test]

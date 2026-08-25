@@ -505,8 +505,11 @@ struct EffectiveMountMode {
     background_scrub_interval_secs: u64,
 }
 
-fn effective_mount_mode(config: &MountConfig) -> EffectiveMountMode {
-    let read_only = config.read_only || config.rebuild_only || config.snapshot_name.is_some();
+fn effective_mount_mode(config: &MountConfig, dataset_access_readonly: bool) -> EffectiveMountMode {
+    let read_only = config.read_only
+        || config.rebuild_only
+        || config.snapshot_name.is_some()
+        || dataset_access_readonly;
     EffectiveMountMode {
         read_only,
         writeback_cache: config.writeback_cache && !read_only,
@@ -602,7 +605,7 @@ mod effective_mount_mode_tests {
     #[test]
     fn ordinary_read_only_mount_suppresses_writeback() {
         assert_eq!(
-            effective_mount_mode(&config(true, None, true)),
+            effective_mount_mode(&config(true, None, true), false),
             EffectiveMountMode {
                 read_only: true,
                 writeback_cache: false,
@@ -616,7 +619,7 @@ mod effective_mount_mode_tests {
         let mut config = config(false, Some("snap0"), true);
         config.runtime.background_scrub_interval_secs = 60;
         assert_eq!(
-            effective_mount_mode(&config),
+            effective_mount_mode(&config, false),
             EffectiveMountMode {
                 read_only: true,
                 writeback_cache: false,
@@ -628,7 +631,7 @@ mod effective_mount_mode_tests {
     #[test]
     fn read_write_mount_preserves_explicit_writeback() {
         assert_eq!(
-            effective_mount_mode(&config(false, None, true)),
+            effective_mount_mode(&config(false, None, true), false),
             EffectiveMountMode {
                 read_only: false,
                 writeback_cache: true,
@@ -645,7 +648,22 @@ mod effective_mount_mode_tests {
 
         assert!(validate_rebuild_only_config(&config).is_ok());
         assert_eq!(
-            effective_mount_mode(&config),
+            effective_mount_mode(&config, false),
+            EffectiveMountMode {
+                read_only: true,
+                writeback_cache: false,
+                background_scrub_interval_secs: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn access_readonly_property_forces_read_only_mount_authorities() {
+        let mut config = config(false, None, true);
+        config.runtime.background_scrub_interval_secs = 60;
+
+        assert_eq!(
+            effective_mount_mode(&config, true),
             EffectiveMountMode {
                 read_only: true,
                 writeback_cache: false,
@@ -1576,7 +1594,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     use tidefs_local_filesystem::PoolDatasetOwner;
 
     let snapshot_export = config.snapshot_name.is_some();
-    let effective_mode = effective_mount_mode(config);
+    let mut effective_mode = effective_mount_mode(config, false);
     validate_rebuild_only_config(config)?;
     if snapshot_export && config.mount_authority.is_cluster_authorized() {
         return Err(
@@ -1684,23 +1702,24 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         } else {
             RecoveryPolicy::default()
         };
-        let store_options = StoreOptions {
-            background_scrub_interval_secs: effective_mode.background_scrub_interval_secs,
-            reclaim_enabled: !effective_mode.read_only && config.runtime.enable_reclaim,
-            fault_injection_config: if effective_mode.read_only {
-                None
-            } else {
-                config.runtime.fault_inject_corruption.map(|probability| {
-                    tidefs_local_object_store::FaultInjectionConfig {
-                        byte_corruption_probability: probability,
-                        ..tidefs_local_object_store::FaultInjectionConfig::off()
-                    }
-                })
-            },
-            ..StoreOptions::default()
-        };
         let selected_dataset_path = config.dataset_path.as_deref().unwrap_or("root");
-        let mut lfs = PoolDatasetOwner::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+        let open_owner = |mode: EffectiveMountMode, recovery_policy: RecoveryPolicy| {
+            let store_options = StoreOptions {
+                background_scrub_interval_secs: mode.background_scrub_interval_secs,
+                reclaim_enabled: !mode.read_only && config.runtime.enable_reclaim,
+                fault_injection_config: if mode.read_only {
+                    None
+                } else {
+                    config.runtime.fault_inject_corruption.map(|probability| {
+                        tidefs_local_object_store::FaultInjectionConfig {
+                            byte_corruption_probability: probability,
+                            ..tidefs_local_object_store::FaultInjectionConfig::off()
+                        }
+                    })
+                },
+                ..StoreOptions::default()
+            };
+            PoolDatasetOwner::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
                 &config.backing_dir,
                 config.pool_name.as_deref().unwrap_or("tidefs"),
                 config.pool_redundancy_policy,
@@ -1719,7 +1738,46 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
                     block_devices: config.block_devices.as_deref(),
                 },
             )
-        .map_err(|e| format!("open store: {e}"))?;
+            .map_err(|e| format!("open store: {e}"))
+        };
+
+        // A persisted access mode must be resolved without first granting
+        // replay, repair, store, or background mutation authority. A genuinely
+        // fresh development Pool has no catalog or property to probe.
+        let existing_catalog_carrier = config
+            .block_devices
+            .as_deref()
+            .is_some_and(|devices| !devices.is_empty())
+            || PoolDatasetOwner::default_development_device_path(&config.backing_dir).exists();
+        let mut lfs = if !effective_mode.read_only && existing_catalog_carrier {
+            let property_read_only_mode = effective_mount_mode(config, true);
+            let probe = open_owner(property_read_only_mode, RecoveryPolicy::ReadOnly)?;
+            if probe
+                .mounted_access_readonly()
+                .map_err(|e| format!("resolve mounted access.readonly: {e}"))?
+            {
+                effective_mode = property_read_only_mode;
+                eprintln!(
+                    "tidefsctl: effective access.readonly=on; keeping mounted owner read-only"
+                );
+                probe
+            } else {
+                drop(probe);
+                open_owner(effective_mode, recovery_policy)?
+            }
+        } else {
+            open_owner(effective_mode, recovery_policy)?
+        };
+
+        let catalog_read_only = lfs
+            .mounted_access_readonly()
+            .map_err(|e| format!("resolve mounted access.readonly: {e}"))?;
+        if catalog_read_only && !effective_mode.read_only {
+            return Err(
+                "mounted access.readonly authority changed during startup; refusing writable mount"
+                    .into(),
+            );
+        }
 
         if !effective_mode.read_only && config.runtime.enable_dedup {
             #[cfg(not(feature = "data-policy"))]

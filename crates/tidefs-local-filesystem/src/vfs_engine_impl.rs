@@ -2636,6 +2636,21 @@ impl VfsLocalFileSystem {
         };
         let path = name;
         let mut fs = self.fs.borrow_mut();
+        let mounted_path = fs.mounted_dataset_path();
+        let targets_mounted_access = path == mounted_path
+            || mounted_path
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with('/'));
+        if prop_name == tidefs_dataset_properties::ACCESS_READONLY_PROPERTY_NAME
+            && targets_mounted_access
+        {
+            return live_admin_error(
+                1,
+                format!(
+                    "{object_label} set: access.readonly for mounted dataset '{mounted_path}' or its ancestry cannot change live; unmount and set or clear the property offline before remounting"
+                ),
+            );
+        }
         let existing_props = fs
             .dataset_catalog()
             .get_properties(path)
@@ -10193,6 +10208,36 @@ mod tests {
                 .is_some(),
             "property should be stored on pool-local dataset path",
         );
+    }
+
+    #[test]
+    fn live_access_readonly_change_refuses_before_mounted_catalog_mutation() {
+        let (engine, _td) = temp_fs();
+
+        let set = live_dataset_admin(
+            &engine,
+            "set",
+            json!({
+                "name": "root",
+                "type": "filesystem",
+                "assignment": "access.readonly=on",
+            }),
+        );
+        assert_eq!(set["ok"], false, "set response: {set}");
+        assert!(set["error"].as_str().is_some_and(|error| {
+            error.contains("cannot change live")
+                && error.contains("unmount")
+                && error.contains("offline")
+        }));
+
+        let fs = engine.fs.borrow();
+        let key = tidefs_dataset_properties::access_readonly_property_key();
+        assert!(fs
+            .dataset_catalog()
+            .get_properties("root")
+            .expect("root properties")
+            .get(&key)
+            .is_none());
     }
 
     #[test]
