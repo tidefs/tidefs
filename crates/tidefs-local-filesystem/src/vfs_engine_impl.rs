@@ -1651,10 +1651,18 @@ impl VfsLocalFileSystem {
             Err(err) => return live_admin_error(1, err),
         };
         let mut fs = self.fs.borrow_mut();
-        let available_bytes = fs
-            .statfs()
-            .ok()
-            .map(|stats| stats.bavail.saturating_mul(u64::from(stats.bsize)));
+        let capacity = fs.statfs().ok().map(|stats| {
+            let block_size = u64::from(stats.bsize);
+            (
+                stats
+                    .blocks
+                    .saturating_sub(stats.bfree)
+                    .saturating_mul(block_size),
+                stats.bavail.saturating_mul(block_size),
+            )
+        });
+        let used_bytes = capacity.map(|(used, _)| used);
+        let available_bytes = capacity.map(|(_, available)| available);
         let catalog = fs.dataset_catalog();
         let entries: Vec<_> = catalog
             .list_all()
@@ -1675,7 +1683,7 @@ impl VfsLocalFileSystem {
                         "name": format!("{pool}/{path}"),
                         "path": path,
                         "type": dataset_type.to_string(),
-                        "used": Value::Null,
+                        "used": used_bytes,
                         "available": available_bytes,
                         "mountpoint": Value::Null,
                         "id": id.to_string(),
@@ -1705,7 +1713,9 @@ impl VfsLocalFileSystem {
                 "\n{:<40} {:<12} {:>14} {:>14} {}",
                 format!("{pool}/{path}"),
                 dataset_type,
-                "-",
+                used_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
                 available_bytes
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
@@ -8469,6 +8479,61 @@ mod tests {
             LivePoolAdminRequest::new(LivePoolAdminCommand::DatasetSetStrategy, "tank");
         strategy.args = live_admin_args_from_json(json!({ "name": "root", "list": true }));
         assert!(engine.live_pool_admin_request(&strategy).is_ok());
+    }
+
+    #[test]
+    fn live_dataset_list_reports_one_statfs_capacity_projection() {
+        let (engine, _td) = temp_fs();
+        let created = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "childfs",
+                "parent": "root",
+                "type": "filesystem",
+                "sync": "local",
+            }),
+        );
+        assert_eq!(created["ok"], true, "dataset create response: {created}");
+        let (expected_used, expected_available) = {
+            let mut fs = engine.fs.borrow_mut();
+            fs.create_file("/capacity.bin", 0o644)
+                .expect("create capacity fixture");
+            fs.write_file("/capacity.bin", 0, b"live dataset capacity")
+                .expect("write capacity fixture");
+            fs.sync_all().expect("commit capacity fixture");
+            let stats = fs.statfs().expect("authoritative statfs projection");
+            let block_size = u64::from(stats.bsize);
+            (
+                stats
+                    .blocks
+                    .saturating_sub(stats.bfree)
+                    .saturating_mul(block_size),
+                stats.bavail.saturating_mul(block_size),
+            )
+        };
+
+        let listed = live_admin(&engine, "dataset", "list", json!({}), true);
+        assert_eq!(listed["ok"], true, "dataset list response: {listed}");
+        let datasets = listed["json"]["datasets"].as_array().expect("dataset rows");
+        assert_eq!(datasets.len(), 2, "dataset list response: {listed}");
+        for dataset in datasets {
+            assert_eq!(dataset["used"], expected_used, "dataset row: {dataset}");
+            assert_eq!(
+                dataset["available"], expected_available,
+                "dataset row: {dataset}"
+            );
+        }
+        assert!(expected_used > 0);
+
+        let human = live_admin(&engine, "dataset", "list", json!({}), false);
+        assert!(
+            human["text"].as_str().is_some_and(|text| {
+                text.contains(&expected_used.to_string())
+                    && text.contains(&expected_available.to_string())
+            }),
+            "human dataset list should carry the same capacity projection: {human}",
+        );
     }
 
     #[test]
