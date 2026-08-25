@@ -397,7 +397,10 @@ use tidefs_dataset_lifecycle::{
     DatasetCatalog, DatasetFlags, DatasetId, DatasetLifecycle, DatasetType, PoisonNotification,
     SyncGuarantee,
 };
-use tidefs_dataset_properties::{resolve_space_quota_for_capacity_authority, PropertySet};
+use tidefs_dataset_properties::{
+    resolve_access_readonly_for_mount_authority, resolve_space_quota_for_capacity_authority,
+    PropertySet,
+};
 use tidefs_extent_map::ExtentAllocator;
 use tidefs_local_object_store::{
     device_layout::DeviceMediaClass, CompressionConfig, CrashInjectionPoint, DeviceBacking,
@@ -700,10 +703,10 @@ pub fn create_filesystem_dataset_in_pool_runtime(
     )?)
 }
 
-fn mounted_space_quota_from_catalog(
+fn mounted_property_context_from_catalog(
     catalog: &DatasetCatalog,
     dataset_path: &str,
-) -> Result<Option<u64>> {
+) -> Result<(PropertySet, Vec<PropertySet>)> {
     let local =
         catalog
             .get_properties(dataset_path)
@@ -720,12 +723,79 @@ fn mounted_space_quota_from_catalog(
         })?);
         current_path = parent_path;
     }
+    Ok((local, parent_sets))
+}
+
+fn mounted_space_quota_from_catalog(
+    catalog: &DatasetCatalog,
+    dataset_path: &str,
+) -> Result<Option<u64>> {
+    let (local, parent_sets) = mounted_property_context_from_catalog(catalog, dataset_path)?;
     let parent_refs: Vec<&PropertySet> = parent_sets.iter().collect();
     resolve_space_quota_for_capacity_authority(&local, &parent_refs)
         .map(|input| input.quota_bytes)
         .map_err(|_| FileSystemError::CorruptState {
             reason: "mounted dataset space.quota property is invalid",
         })
+}
+
+fn mounted_access_readonly_from_catalog(
+    catalog: &DatasetCatalog,
+    dataset_path: &str,
+) -> Result<bool> {
+    let (local, parent_sets) = mounted_property_context_from_catalog(catalog, dataset_path)?;
+    let parent_refs: Vec<&PropertySet> = parent_sets.iter().collect();
+    resolve_access_readonly_for_mount_authority(&local, &parent_refs)
+        .map(|input| input.read_only)
+        .map_err(|_| FileSystemError::CorruptState {
+            reason: "mounted dataset access.readonly property is invalid",
+        })
+}
+
+#[cfg(test)]
+mod mounted_access_readonly_catalog_tests {
+    use super::*;
+    use tidefs_dataset_properties::{access_readonly_property_key, PropertyValue};
+
+    #[test]
+    fn mounted_access_readonly_resolves_catalog_ancestry_and_local_override() {
+        let mut catalog = DatasetCatalog::new();
+        catalog
+            .create(
+                "root",
+                DatasetId::from_bytes([1; 16]),
+                DatasetType::Filesystem,
+                1,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+            )
+            .unwrap();
+        catalog
+            .create(
+                "root/child",
+                DatasetId::from_bytes([2; 16]),
+                DatasetType::Filesystem,
+                2,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+            )
+            .unwrap();
+
+        let key = access_readonly_property_key();
+        let mut root_properties = PropertySet::new();
+        root_properties.set_local(key.clone(), PropertyValue::Bool(true));
+        catalog.set_properties("root", &root_properties).unwrap();
+        assert!(mounted_access_readonly_from_catalog(&catalog, "root/child").unwrap());
+
+        let mut child_properties = PropertySet::new();
+        child_properties.set_local(key, PropertyValue::Bool(false));
+        catalog
+            .set_properties("root/child", &child_properties)
+            .unwrap();
+        assert!(!mounted_access_readonly_from_catalog(&catalog, "root/child").unwrap());
+    }
 }
 
 pub fn audit_recovery(
@@ -2993,6 +3063,15 @@ impl PoolDatasetOwner {
 
     pub(crate) fn mounted_dataset_path(&self) -> &str {
         &self.filesystem.mounted_dataset_path
+    }
+
+    /// Resolve whether the selected dataset's canonical property ancestry
+    /// requires a read-only mounted owner.
+    pub fn mounted_access_readonly(&self) -> Result<bool> {
+        mounted_access_readonly_from_catalog(
+            self.dataset_catalog(),
+            &self.filesystem.mounted_dataset_path,
+        )
     }
 
     fn refresh_mounted_space_quota_from_catalog(&mut self) -> Result<()> {
