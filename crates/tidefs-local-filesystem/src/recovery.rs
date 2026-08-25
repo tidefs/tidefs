@@ -4824,6 +4824,68 @@ fn manifest_snapshot_records(
     Ok(snapshots)
 }
 
+fn manifest_extent_maps(
+    store: &LocalObjectStore,
+    entries: &[TransactionManifestEntry],
+    candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
+    transaction_id: u64,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    keyspace: FilesystemObjectKeyspace,
+) -> Result<(
+    BTreeMap<InodeId, tidefs_extent_map::ExtentMap>,
+    BTreeMap<InodeId, u64>,
+)> {
+    let mut extent_maps = BTreeMap::new();
+    let mut last_extent_map_write_tx = BTreeMap::new();
+    for entry in entries {
+        if entry.role != TransactionManifestObjectRole::TransactionExtentMap {
+            continue;
+        }
+        let inode_id = inodes
+            .keys()
+            .copied()
+            .find(|inode_id| {
+                keyspace.transaction_extent_map(transaction_id, *inode_id) == entry.object_key
+            })
+            .ok_or(FileSystemError::CorruptState {
+                reason: "transaction extent-map key does not match a committed inode",
+            })?;
+        if !inodes[&inode_id].is_file_like() {
+            return Err(FileSystemError::CorruptState {
+                reason: "transaction extent map belongs to a non-file inode",
+            });
+        }
+        let bytes = recovery_object_bytes(store, candidate_objects, entry.object_key)?.ok_or(
+            FileSystemError::CorruptState {
+                reason: "transaction manifest references a missing extent map",
+            },
+        )?;
+        if checksum64(&bytes) != entry.checksum {
+            return Err(FileSystemError::CorruptState {
+                reason: "transaction extent-map checksum mismatch",
+            });
+        }
+        let mut cursor = std::io::Cursor::new(bytes.as_slice());
+        let extent_map = tidefs_extent_map::ExtentMap::deserialize(&mut cursor).map_err(|_| {
+            FileSystemError::CorruptState {
+                reason: "transaction extent map did not decode",
+            }
+        })?;
+        if cursor.position() != bytes.len() as u64 {
+            return Err(FileSystemError::CorruptState {
+                reason: "transaction extent map has trailing bytes",
+            });
+        }
+        if extent_maps.insert(inode_id, extent_map).is_some() {
+            return Err(FileSystemError::CorruptState {
+                reason: "transaction manifest contains duplicate extent maps for an inode",
+            });
+        }
+        last_extent_map_write_tx.insert(inode_id, transaction_id);
+    }
+    Ok((extent_maps, last_extent_map_write_tx))
+}
+
 fn load_state_from_superblock_for_content_inspection(
     store: &LocalObjectStore,
     superblock: &SuperblockRecord,
@@ -4916,6 +4978,23 @@ fn load_state_from_superblock_with_content_validation(
     } else {
         validate_loaded_namespace_state(&inodes, &directories)?;
     }
+    let (extent_maps, last_extent_map_write_tx) = match manifest_entries {
+        Some(entries) => manifest_extent_maps(
+            store,
+            entries,
+            candidate_objects,
+            transaction_id.ok_or(FileSystemError::CorruptState {
+                reason: "extent-map manifest has no transaction identity",
+            })?,
+            &inodes,
+            keyspace,
+        )?,
+        None => (BTreeMap::new(), BTreeMap::new()),
+    };
+    // The current persistence path publishes every tracked map in each
+    // successor transaction. Keep recovered maps in that retained set so an
+    // unrelated post-reopen metadata commit cannot omit their authority.
+    let dirty_extent_maps = extent_maps.keys().copied().collect();
     let mut snapshots = match manifest_entries {
         Some(entries) => manifest_snapshot_records(store, entries, candidate_objects)?,
         None => BTreeMap::new(),
@@ -4971,9 +5050,9 @@ fn load_state_from_superblock_with_content_validation(
         last_inode_write_tx: BTreeMap::new(),
         last_dir_write_tx: BTreeMap::new(),
         change_streams: BTreeMap::new(),
-        extent_maps: Arc::new(Mutex::new(BTreeMap::new())),
-        dirty_extent_maps: BTreeSet::new(),
-        last_extent_map_write_tx: BTreeMap::new(),
+        extent_maps: Arc::new(Mutex::new(extent_maps)),
+        dirty_extent_maps,
+        last_extent_map_write_tx,
         content_compression_policy: ContentCompressionPolicy::default(),
     })
 }

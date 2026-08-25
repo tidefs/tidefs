@@ -66,7 +66,7 @@ impl From<ExtentMapError> for ExtentAllocError {
 ///
 /// When the spacemap allocator integration lands, the `next_locator` counter
 /// will be replaced by `SegmentFreeMap` queries.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ExtentAllocator {
     /// Per-inode (keyed by inode number) extent maps.
     maps: BTreeMap<u64, InlineExtentMap>,
@@ -74,6 +74,18 @@ pub struct ExtentAllocator {
     next_extent_id: u64,
     /// Monotonically increasing locator id counter (physical address).
     next_locator: u64,
+}
+
+impl Default for ExtentAllocator {
+    fn default() -> Self {
+        Self {
+            maps: BTreeMap::new(),
+            next_extent_id: 0,
+            // LocatorId::NONE (zero) is reserved by the durable extent-map
+            // format and cannot identify DATA or PENDING_DATA.
+            next_locator: 1,
+        }
+    }
 }
 
 impl ExtentAllocator {
@@ -90,8 +102,55 @@ impl ExtentAllocator {
         Self {
             maps: BTreeMap::new(),
             next_extent_id: 0,
-            next_locator: initial_locator,
+            next_locator: initial_locator.max(1),
         }
+    }
+
+    /// Restore one inode's exact committed extent entries after recovery.
+    ///
+    /// Unlike the allocation methods, recovery must not assign replacement
+    /// locators or collapse DATA, PENDING_DATA, and UNWRITTEN into one kind.
+    /// The allocator counters advance past every restored entry so later
+    /// allocations cannot reuse an already-committed physical locator or
+    /// extent identity.
+    pub fn restore_inode_extents(
+        &mut self,
+        inode: u64,
+        entries: &[ExtentMapEntryV2],
+    ) -> Result<(), ExtentAllocError> {
+        if self.maps.contains_key(&inode) {
+            return Err(ExtentAllocError::MapError(
+                ExtentMapError::OverlappingExtent,
+            ));
+        }
+
+        let mut map = InlineExtentMap::new();
+        map.insert_extent(entries)?;
+
+        let mut next_locator = self.next_locator;
+        for entry in entries {
+            if entry.is_data() || entry.is_pending_data() {
+                let locator_end = entry
+                    .locator_id
+                    .0
+                    .checked_add(entry.length)
+                    .ok_or(ExtentAllocError::OutOfSpace)?;
+                next_locator = next_locator.max(locator_end);
+            }
+        }
+        let restored_count =
+            u64::try_from(entries.len()).map_err(|_| ExtentAllocError::OutOfSpace)?;
+        let next_extent_id = self
+            .next_extent_id
+            .checked_add(restored_count)
+            .ok_or(ExtentAllocError::OutOfSpace)?;
+
+        if !entries.is_empty() {
+            self.maps.insert(inode, map);
+        }
+        self.next_extent_id = next_extent_id;
+        self.next_locator = next_locator;
+        Ok(())
     }
 
     /// Allocate extents for `inode` at `logical_offset` with `length`.
@@ -500,15 +559,35 @@ mod tests {
 
         // Verify ExtentId and LocatorId are assigned.
         assert_eq!(extent_id, ExtentId(0));
-        assert_eq!(locator_id, LocatorId(0));
+        assert_eq!(locator_id, LocatorId(1));
 
         // Look up the extent and verify physical mapping.
         let entries = allocator.lookup_extents(1, 0, 4096);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].logical_offset, 0);
         assert_eq!(entries[0].length, 4096);
-        assert_eq!(entries[0].locator_id, LocatorId(0));
+        assert_eq!(entries[0].locator_id, LocatorId(1));
         assert!(entries[0].is_pending_data());
+    }
+
+    #[test]
+    fn restored_extent_entries_preserve_kinds_and_advance_locator() {
+        let mut allocator = ExtentAllocator::new();
+        let data = ExtentMapEntryV2::new_data(0, 4096, LocatorId(8192), [0x5a; 32], 7);
+        let unwritten = ExtentMapEntryV2::new_unwritten(8192, 4096, 8);
+
+        allocator
+            .restore_inode_extents(41, &[data.clone(), unwritten.clone()])
+            .expect("restore committed extent entries");
+
+        assert_eq!(
+            allocator.lookup_extents(41, 0, 12288),
+            vec![data, unwritten]
+        );
+        let allocated = allocator
+            .allocate_extent(42, 0, 4096, None)
+            .expect("allocate after recovery");
+        assert_eq!(allocated[0], (ExtentId(2), LocatorId(12288)));
     }
 
     #[test]
@@ -601,12 +680,12 @@ mod tests {
 
         let results = allocator.allocate_extent(1, 0, 4096, None).unwrap();
         let loc1 = results[0].1;
-        assert_eq!(loc1, LocatorId(0));
+        assert_eq!(loc1, LocatorId(1));
 
         // Resize from 4096 -> 12288 (grow).
         let results = allocator.resize_extent(1, 0, 4096, 12288).unwrap();
         let loc2 = results[0].1;
-        assert_eq!(loc2, LocatorId(4096)); // after old extent's locator
+        assert_eq!(loc2, LocatorId(4097)); // after old extent's locator
 
         let entries = allocator.lookup_extents(1, 0, 12288);
         assert_eq!(entries.len(), 1);

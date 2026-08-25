@@ -2845,9 +2845,52 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
     }
 
     fn committed_content_used_bytes(&self, state: &FileSystemState) -> Result<u64> {
+        if let Some(bytes) = committed_extent_data_bytes(state)? {
+            return Ok(bytes);
+        }
         content_allocation_entries_for_state_pool(self.store, state)
             .and_then(|entries| allocation_bytes(&entries))
     }
+}
+
+/// Recover committed logical DATA usage from the durable extent authority.
+///
+/// Content-object allocation grains are a physical protection input and can
+/// be larger than the written range inside a sparse chunk. Once a transaction
+/// carries extent maps, those exact DATA/PENDING_DATA lengths are the logical
+/// counter floor used by mounted statfs. UNWRITTEN lengths remain represented
+/// by the separate committed reserved-bytes counter.
+fn committed_extent_data_bytes(state: &FileSystemState) -> Result<Option<u64>> {
+    let extent_maps = state
+        .extent_maps
+        .lock()
+        .map_err(|_| FileSystemError::CorruptState {
+            reason: "recovered extent-map authority lock is poisoned",
+        })?;
+    if extent_maps.is_empty() {
+        return Ok(None);
+    }
+
+    let mut data_bytes = 0_u64;
+    for extent_map in extent_maps.values() {
+        let entries =
+            extent_map
+                .lookup_range(0, u64::MAX)
+                .map_err(|_| FileSystemError::CorruptState {
+                    reason: "recovered extent map could not provide capacity usage",
+                })?;
+        for entry in entries {
+            if entry.is_data() || entry.is_pending_data() {
+                data_bytes =
+                    data_bytes
+                        .checked_add(entry.length)
+                        .ok_or(FileSystemError::SizeOverflow {
+                            requested: u64::MAX,
+                        })?;
+            }
+        }
+    }
+    Ok(Some(data_bytes))
 }
 
 /// Intent-log payload for a `copy_file_range` operation.
@@ -4903,6 +4946,24 @@ impl PoolDatasetOwner {
         #[cfg(feature = "data-policy")]
         let online_defrag_stats = Arc::new(Mutex::new(DefragStats::default()));
 
+        let extent_allocator = {
+            let extent_maps = state.extent_maps.lock().unwrap();
+            let mut allocator = ExtentAllocator::new();
+            for (inode_id, extent_map) in extent_maps.iter() {
+                let entries = extent_map.lookup_range(0, u64::MAX).map_err(|_| {
+                    FileSystemError::CorruptState {
+                        reason: "recovered extent map could not be enumerated",
+                    }
+                })?;
+                allocator
+                    .restore_inode_extents(inode_id.get(), &entries)
+                    .map_err(|_| FileSystemError::CorruptState {
+                        reason: "recovered extent map could not hydrate the live allocator",
+                    })?;
+            }
+            allocator
+        };
+
         let mut fs = Self {
             store,
             filesystem: FilesystemDatasetEngine {
@@ -4910,7 +4971,7 @@ impl PoolDatasetOwner {
                 quorum_store: None,
                 state,
                 allocator_policy,
-                extent_allocator: ExtentAllocator::new(),
+                extent_allocator,
                 root_authentication_key,
                 encryption_key: key_for_struct,
                 dedup_index: RefCell::new(DedupIndex::new()),
@@ -7075,6 +7136,19 @@ impl PoolDatasetOwner {
         (data_bytes, reserved_bytes)
     }
 
+    /// Project an inode record through this owner's live extent authority.
+    ///
+    /// Logical size does not describe allocated space for sparse files. DATA,
+    /// PENDING_DATA, and UNWRITTEN extents do, including KEEP_SIZE reservations
+    /// beyond EOF.
+    pub(crate) fn inode_attr(&self, record: &InodeRecord) -> InodeAttr {
+        let mut attr = record.to_inode_attr();
+        let (data_bytes, reserved_bytes) =
+            self.accounted_extent_bytes(record.inode_id, 0, u64::MAX);
+        attr.posix.blocks_512 = data_bytes.saturating_add(reserved_bytes).div_ceil(512);
+        attr
+    }
+
     fn data_write_space_delta(
         &self,
         inode_id: InodeId,
@@ -8048,7 +8122,7 @@ impl PoolDatasetOwner {
     }
 
     pub fn stat_attr(&self, path: impl AsRef<str>) -> Result<InodeAttr> {
-        self.stat(path).map(|record| record.to_inode_attr())
+        self.stat(path).map(|record| self.inode_attr(&record))
     }
 
     /// Apply a [`SetAttr`] mask to an inode's metadata fields (mode, uid, gid,
@@ -14974,21 +15048,18 @@ impl PoolDatasetOwner {
     }
     /// Sync the extent allocator's in-memory state into FileSystemState so
     /// dirty extent maps are included in the next transaction commit.
-    fn sync_extent_allocator_to_state(&mut self) {
+    fn sync_extent_allocator_to_state(&mut self) -> Result<()> {
         for inode_id in &self.filesystem.state.dirty_extent_maps.clone() {
-            // Use a large-but-safe length that does not overflow when
-            // added to offset 0 (u64::MAX would overflow checked_add).
-            let entries = self.filesystem.extent_allocator.lookup_extents(
-                inode_id.get(),
-                0,
-                0x7FFF_FFFF_FFFF_FFFF,
-            );
-            let mut emap = tidefs_extent_map::ExtentMap::new();
-            for entry in &entries {
-                // Entries from the allocator are non-overlapping,
-                // so each allocate succeeds.
-                let _ = emap.allocate(entry.logical_offset, entry.length);
-            }
+            let entries =
+                self.filesystem
+                    .extent_allocator
+                    .lookup_extents(inode_id.get(), 0, u64::MAX);
+            let emap =
+                tidefs_extent_map::ExtentMap::from_committed_entries(&entries).map_err(|_| {
+                    FileSystemError::CorruptState {
+                        reason: "live extent entries could not be prepared for commit",
+                    }
+                })?;
             self.filesystem
                 .state
                 .extent_maps
@@ -14996,6 +15067,7 @@ impl PoolDatasetOwner {
                 .unwrap()
                 .insert(*inode_id, emap);
         }
+        Ok(())
     }
 
     pub(crate) fn do_commit(&mut self) -> Result<()> {
@@ -15097,7 +15169,7 @@ impl PoolDatasetOwner {
             }
         }
         if must_persist {
-            self.sync_extent_allocator_to_state();
+            self.sync_extent_allocator_to_state()?;
             // Reclaim obligations created by this mutation must reach Pool
             // placement authority before the transaction sync and committed
             // root can make their source objects unreachable. The transaction
@@ -15656,10 +15728,13 @@ impl PoolDatasetOwner {
             .authenticated_content_allocation_cache
             .invalidate();
         let total_bytes = self.filesystem.allocator_policy.content_capacity_bytes;
-        let used_bytes = allocation_bytes(&content_allocation_entries_for_state_pool(
-            self.store.pool(),
-            &self.filesystem.state,
-        )?)?
+        let used_bytes = match committed_extent_data_bytes(&self.filesystem.state)? {
+            Some(bytes) => bytes,
+            None => allocation_bytes(&content_allocation_entries_for_state_pool(
+                self.store.pool(),
+                &self.filesystem.state,
+            )?)?,
+        }
         .min(total_bytes);
         let mut counters = *self.filesystem.state.space_accounting.counters();
         if counters.logical_used_bytes < used_bytes {

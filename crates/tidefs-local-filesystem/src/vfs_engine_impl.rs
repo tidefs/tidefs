@@ -320,7 +320,10 @@ impl VfsLocalFileSystem {
     /// This is the preferred entry point for FUSE GETATTR dispatch when
     /// the caller already has an inode number.
     pub fn getattr_by_ino(&self, ino: u64) -> std::result::Result<InodeAttr, Errno> {
-        fuse_getattr::engine_getattr(&self.fs.borrow(), ino).map_err(|e| e.to_errno())
+        let fs = self.fs.borrow();
+        let attr = fuse_getattr::engine_getattr(&fs, ino).map_err(|error| error.to_errno())?;
+        let record = fs.inode(attr.inode_id).map_err(|error| map_errno(&error))?;
+        Ok(fs.inode_attr(&record))
     }
 
     /// Direct inode-ID-based attribute mutation (bypasses path resolution).
@@ -931,7 +934,7 @@ impl VfsLocalFileSystem {
         };
 
         committed
-            .map(|record| record.to_inode_attr())
+            .map(|record| fs.inode_attr(&record))
             .map_err(|e| map_errno(&e))
             .inspect(|attr| {
                 self.path_cache
@@ -6539,7 +6542,7 @@ impl VfsEngine for VfsLocalFileSystem {
         let child_path = build_child_path(&parent_path, name)?;
         let (_parent_record, child_record) =
             self.parent_and_child_records(parent, &parent_path, name)?;
-        let attr = child_record.to_inode_attr();
+        let attr = self.fs.borrow().inode_attr(&child_record);
         self.path_cache
             .borrow_mut()
             .insert(attr.inode_id, child_path);
@@ -6652,7 +6655,7 @@ impl VfsEngine for VfsLocalFileSystem {
             child_gid,
             parent_default_acl_entries.as_ref(),
         )?;
-        Ok(record.to_inode_attr())
+        Ok(self.fs.borrow().inode_attr(&record))
     }
 
     fn create(
@@ -6705,7 +6708,7 @@ impl VfsEngine for VfsLocalFileSystem {
                 }
                 if flags & O_TRUNC == 0 {
                     // Existing file, no O_EXCL, no O_TRUNC: open existing.
-                    let attr = record.to_inode_attr();
+                    let attr = self.fs.borrow().inode_attr(&record);
                     let fh = self.register_file_handle(record.inode_id, flags, false)?;
                     self.path_cache
                         .borrow_mut()
@@ -6713,12 +6716,13 @@ impl VfsEngine for VfsLocalFileSystem {
                     return Ok((attr, fh));
                 }
 
-                let attr = self
-                    .fs
-                    .borrow_mut()
-                    .truncate_file(&child_path, 0)
-                    .map(|record| record.to_inode_attr())
-                    .map_err(|e| map_errno(&e))?;
+                let attr = {
+                    let mut fs = self.fs.borrow_mut();
+                    let record = fs
+                        .truncate_file(&child_path, 0)
+                        .map_err(|e| map_errno(&e))?;
+                    fs.inode_attr(&record)
+                };
                 let fh = self.register_file_handle(record.inode_id, flags, false)?;
                 self.path_cache
                     .borrow_mut()
@@ -6741,7 +6745,7 @@ impl VfsEngine for VfsLocalFileSystem {
             child_gid,
             parent_default_acl_entries.as_ref(),
         )?;
-        let attr = record.to_inode_attr();
+        let attr = self.fs.borrow().inode_attr(&record);
         let fh = self.register_file_handle(record.inode_id, flags, false)?;
         Ok((attr, fh))
     }
@@ -6795,7 +6799,7 @@ impl VfsEngine for VfsLocalFileSystem {
             child_gid,
             parent_default_acl_entries.as_ref(),
         )?;
-        let attr = record.to_inode_attr();
+        let attr = self.fs.borrow().inode_attr(&record);
         // Preserve the caller's open flags so subsequent data-plane operations
         // validate against the same (inode, flags, fh_id) triple.
         let fh = self.register_file_handle(record.inode_id, flags, false)?;
@@ -6858,7 +6862,7 @@ impl VfsEngine for VfsLocalFileSystem {
             )
             .map_err(|error| map_errno(&error))?;
         let inode_id = record.inode_id;
-        let attr = record.to_inode_attr();
+        let attr = self.fs.borrow().inode_attr(&record);
 
         let fh = match self.register_file_handle(inode_id, flags, true) {
             Ok(fh) => fh,
@@ -7093,7 +7097,7 @@ impl VfsEngine for VfsLocalFileSystem {
                 .link_file_by_inode(target, new_parent, new_name, &new_path)
                 .map_err(|error| map_errno(&error))?;
             self.path_cache.borrow_mut().insert(target, new_path);
-            return Ok(linked.to_inode_attr());
+            return Ok(self.fs.borrow().inode_attr(&linked));
         }
 
         let target_path = self.inode_path(target)?;
@@ -7164,7 +7168,7 @@ impl VfsEngine for VfsLocalFileSystem {
             let mut fs = self.fs.borrow_mut();
             Self::apply_metadata_setattr_to_inode(&mut fs, record.inode_id, &attr_update, false)?;
             fs.inode(record.inode_id)
-                .map(|record| record.to_inode_attr())
+                .map(|record| fs.inode_attr(&record))
                 .map_err(|e| map_errno(&e))?
         };
         self.path_cache
@@ -18025,6 +18029,104 @@ mod tests {
         for e in &extents {
             assert!(e.is_unwritten(), "KEEP_SIZE extents must be Unwritten");
         }
+    }
+
+    #[test]
+    fn sparse_blocks_track_data_and_unwritten_extents() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"sparse-blocks.bin", 0o644, 0, &ctx())
+            .unwrap();
+
+        let mut sparse_size = SetAttr::new();
+        sparse_size.valid = FATTR_SIZE;
+        sparse_size.size = 4 * 1024 * 1024;
+        engine
+            .setattr(fh.inode_id, &sparse_size, Some(&fh), &ctx())
+            .unwrap();
+
+        let sparse = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(sparse.posix.size, sparse_size.size);
+        assert_eq!(sparse.posix.blocks_512, 0);
+
+        engine
+            .write(&fh, 2 * 1024 * 1024, &[0x5a; 4096], &ctx())
+            .unwrap();
+        let with_data = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(with_data.posix.size, sparse_size.size);
+        assert_eq!(with_data.posix.blocks_512, 8);
+
+        engine
+            .fallocate(&fh, FALLOC_FL_KEEP_SIZE, 8 * 1024 * 1024, 4096, &ctx())
+            .unwrap();
+        let with_reservation = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(with_reservation.posix.size, sparse_size.size);
+        assert_eq!(with_reservation.posix.blocks_512, 16);
+    }
+
+    #[test]
+    fn sparse_blocks_survive_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let engine = VfsLocalFileSystem::new(PoolDatasetOwner::open(dir.path()).expect("open"));
+            assert_eq!(engine.fs.borrow().capacity_authority().used_bytes(), 0);
+            let root = engine.get_root_inode(&ctx()).unwrap();
+            let (_attr, fh) = engine
+                .create(root, b"sparse-reopen.bin", 0o644, 0, &ctx())
+                .unwrap();
+            let mut sparse_size = SetAttr::new();
+            sparse_size.valid = FATTR_SIZE;
+            sparse_size.size = 4 * 1024 * 1024;
+            engine
+                .setattr(fh.inode_id, &sparse_size, Some(&fh), &ctx())
+                .unwrap();
+            engine
+                .write(&fh, 2 * 1024 * 1024, &[0x5a; 4096], &ctx())
+                .unwrap();
+            engine.fsync(&fh, false, &ctx()).unwrap();
+            assert_eq!(
+                engine
+                    .getattr(fh.inode_id, Some(&fh), &ctx())
+                    .unwrap()
+                    .posix
+                    .blocks_512,
+                8
+            );
+            assert_eq!(engine.fs.borrow().capacity_authority().used_bytes(), 4096);
+        }
+
+        {
+            let engine =
+                VfsLocalFileSystem::new(PoolDatasetOwner::open(dir.path()).expect("reopen"));
+            assert_eq!(engine.fs.borrow().capacity_authority().used_bytes(), 4096);
+            let root = engine.get_root_inode(&ctx()).unwrap();
+            let reopened = engine.lookup(root, b"sparse-reopen.bin", &ctx()).unwrap();
+            assert_eq!(reopened.posix.size, 4 * 1024 * 1024);
+            assert_eq!(reopened.posix.blocks_512, 8);
+
+            let fh = engine.open(reopened.inode_id, O_RDWR, &ctx()).unwrap();
+            engine
+                .write(&fh, 3 * 1024 * 1024, &[0xa5; 4096], &ctx())
+                .unwrap();
+            engine.fsync(&fh, false, &ctx()).unwrap();
+            assert_eq!(
+                engine
+                    .getattr(reopened.inode_id, Some(&fh), &ctx())
+                    .unwrap()
+                    .posix
+                    .blocks_512,
+                16
+            );
+            assert_eq!(engine.fs.borrow().capacity_authority().used_bytes(), 8192);
+        }
+
+        let engine =
+            VfsLocalFileSystem::new(PoolDatasetOwner::open(dir.path()).expect("second reopen"));
+        assert_eq!(engine.fs.borrow().capacity_authority().used_bytes(), 8192);
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let reopened = engine.lookup(root, b"sparse-reopen.bin", &ctx()).unwrap();
+        assert_eq!(reopened.posix.blocks_512, 16);
     }
 
     #[test]

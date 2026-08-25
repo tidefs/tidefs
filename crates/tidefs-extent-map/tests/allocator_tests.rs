@@ -23,7 +23,7 @@ fn allocate_then_free_then_lookup_empty() {
 
     let lid = _results[0].1;
     assert_eq!(eid, ExtentId(0));
-    assert_eq!(lid, LocatorId(0));
+    assert_eq!(lid, LocatorId(1));
 
     let entries = alloc.lookup_extents(1, 0, 4096);
     assert_eq!(entries.len(), 1);
@@ -100,8 +100,8 @@ fn lookup_by_returned_extent_id_via_range() {
     // corresponding ranges exist with the returned LocatorIds.
     assert_eq!(eid0, ExtentId(0));
     assert_eq!(eid1, ExtentId(1));
-    assert_eq!(lid0, LocatorId(0));
-    assert_eq!(lid1, LocatorId(4096));
+    assert_eq!(lid0, LocatorId(1));
+    assert_eq!(lid1, LocatorId(4097));
 
     let r0 = alloc.lookup_extents(99, 0, 4096);
     assert_eq!(r0[0].locator_id, lid0);
@@ -127,8 +127,8 @@ fn resize_grow_extent() {
     let entries = alloc.lookup_extents(1, 0, 12288);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].length, 12288);
-    // Old alloc at loc 0; resize frees it, reallocates at 4096.
-    assert_eq!(lid, LocatorId(4096));
+    // Old alloc at loc 1; resize frees it, reallocates at 4097.
+    assert_eq!(lid, LocatorId(4097));
 }
 
 #[test]
@@ -142,9 +142,9 @@ fn resize_shrink_extent() {
     let entries = alloc.lookup_extents(1, 0, 4096);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].length, 4096);
-    // Old alloc at loc 0 (len 12288). Free, then realloc: next_locator
-    // was 12288, so new loc = 12288.
-    assert_eq!(lid, LocatorId(12288));
+    // Old alloc at loc 1 (len 12288). Free, then realloc: next_locator
+    // was 12289, so new loc = 12289.
+    assert_eq!(lid, LocatorId(12289));
 }
 
 #[test]
@@ -196,7 +196,7 @@ fn free_then_reallocate_same_offset() {
     let eid = _results[0].0;
     let lid = _results[0].1;
     assert_eq!(eid, ExtentId(1)); // second ext id
-    assert_eq!(lid, LocatorId(4096)); // locator advanced past first alloc
+    assert_eq!(lid, LocatorId(4097)); // locator advanced past first alloc
 
     assert_eq!(alloc.lookup_extents(1, 0, 4096).len(), 1);
     assert_eq!(alloc.total_extents(), 1);
@@ -392,9 +392,9 @@ fn locator_advances_by_length_on_each_alloc() {
     let _results = alloc.allocate_extent(1, 20480, 512, None).unwrap();
     let l2 = _results[0].1;
 
-    assert_eq!(l0, LocatorId(0));
-    assert_eq!(l1, LocatorId(4096));
-    assert_eq!(l2, LocatorId(4096 + 8192));
+    assert_eq!(l0, LocatorId(1));
+    assert_eq!(l1, LocatorId(4097));
+    assert_eq!(l2, LocatorId(4097 + 8192));
 }
 
 #[test]
@@ -417,11 +417,11 @@ fn locator_wraps_at_u64_boundary() {
 }
 
 #[test]
-fn with_initial_locator_accepts_zero() {
+fn with_initial_locator_normalizes_reserved_zero() {
     let mut alloc = ExtentAllocator::with_initial_locator(0);
     let _results = alloc.allocate_extent(1, 0, 4096, None).unwrap();
     let lid = _results[0].1;
-    assert_eq!(lid, LocatorId(0));
+    assert_eq!(lid, LocatorId(1));
 }
 
 #[test]
