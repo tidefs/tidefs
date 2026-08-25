@@ -1808,7 +1808,9 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
         };
 
         // The PoolDatasetOwner already owns the exact typed dataset root.
-        let mut engine = VfsLocalFileSystem::new(lfs).with_sync_guarantee(sync_guarantee);
+        let mut engine = VfsLocalFileSystem::new(lfs)
+            .with_sync_guarantee(sync_guarantee)
+            .with_live_mountpoint(config.mountpoint.display().to_string());
         if effective_mode.read_only {
             engine
                 .set_timestamp_policy(tidefs_inode_attributes::timestamp::TimestampPolicy::Noatime)
