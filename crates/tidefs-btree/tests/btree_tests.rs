@@ -1767,7 +1767,7 @@ fn clear_on_multi_level_tree_then_reinsert() {
     for i in 1u64..=50 {
         t.insert(i, format!("v{i}"));
     }
-    assert_eq!(t.depth(), 3);
+    assert!(t.depth() >= 3);
     t.clear();
     assert!(t.is_empty());
     assert_eq!(t.depth(), 1);

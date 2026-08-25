@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 
 use tidefs_binary_schema_checksum::blake3_domain_digest;
 use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
-use tidefs_btree::{BPlusTree, BTreeError};
+use tidefs_btree::{BPlusTree, BTreeError, RebuildFromSortedIterError};
 use tidefs_types_reclaim_queue_core::{
     ObjectKey, QueueFamily, ReclaimQueueEntry, RECLAIM_QUEUE_SPEC,
 };
@@ -572,10 +572,15 @@ impl BPlusTreeReclaimQueue {
         if body_len < expected_body_len {
             return Err(ReclaimQueueDecodeError::Truncated);
         }
+        if body_len > expected_body_len {
+            return Err(ReclaimQueueDecodeError::TrailingData);
+        }
 
-        // Parse entries
-        let mut queue = Self::new();
-        for i in 0..count {
+        // Parse the canonical key-ordered stream and construct the tree once.
+        // Repeated BPlusTree::insert calls collect and rebuild the complete
+        // tree for every entry, making queue decode quadratic in queued
+        // objects on the mounted persistence path.
+        let entries = (0..count).map(|i| {
             let offset = 12 + i * ReclaimQueueEntry::ENCODED_SIZE;
             let entry_bytes: &[u8; ReclaimQueueEntry::ENCODED_SIZE] = data
                 [offset..offset + ReclaimQueueEntry::ENCODED_SIZE]
@@ -583,10 +588,19 @@ impl BPlusTreeReclaimQueue {
                 .map_err(|_| ReclaimQueueDecodeError::Truncated)?;
             let entry = ReclaimQueueEntry::decode(entry_bytes)
                 .map_err(|e| ReclaimQueueDecodeError::EntryDecode(alloc::format!("{e}")))?;
-            queue.insert(entry);
+            Ok((entry.object_key, entry))
+        });
+
+        let mut tree = BPlusTree::new();
+        match tree.try_rebuild_compact_from_sorted_iter(count, entries) {
+            Ok(()) => {}
+            Err(RebuildFromSortedIterError::Source(error)) => return Err(error),
+            Err(RebuildFromSortedIterError::Tree(error)) => {
+                return Err(ReclaimQueueDecodeError::Tree(error));
+            }
         }
 
-        Ok(queue)
+        Ok(Self { tree })
     }
 
     /// Estimate the serialized byte size without allocating.
@@ -628,6 +642,10 @@ pub enum ReclaimQueueDecodeError {
     UnsupportedVersion { found: u32, expected: u32 },
     /// A per-entry decode failed.
     EntryDecode(String),
+    /// Decoded entries cannot form the canonical strictly key-ordered tree.
+    Tree(BTreeError),
+    /// Bytes remain between the declared entries and integrity footer.
+    TrailingData,
     /// The BLAKE3 integrity footer did not verify.
     IntegrityFooterMismatch,
 }
@@ -644,6 +662,8 @@ impl core::fmt::Display for ReclaimQueueDecodeError {
                 )
             }
             Self::EntryDecode(msg) => write!(f, "reclaim-queue entry decode error: {msg}"),
+            Self::Tree(error) => write!(f, "invalid reclaim-queue tree: {error}"),
+            Self::TrailingData => f.write_str("trailing data in reclaim-queue body"),
             Self::IntegrityFooterMismatch => {
                 f.write_str("reclaim-queue BLAKE3 integrity footer mismatch")
             }
@@ -668,6 +688,35 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = id;
         ObjectKey(k)
+    }
+
+    fn numbered_entry(id: u32, delta: i64) -> ReclaimQueueEntry {
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(&id.to_be_bytes());
+        ReclaimQueueEntry::new(ObjectKey(key), delta, QueueFamily::Extent)
+    }
+
+    fn encode_entries_with_trailing(entries: &[ReclaimQueueEntry], trailing: &[u8]) -> Vec<u8> {
+        let count = u32::try_from(entries.len()).expect("test entry count fits u32");
+        let mut data = Vec::with_capacity(
+            12 + entries.len() * ReclaimQueueEntry::ENCODED_SIZE + trailing.len() + 32,
+        );
+        data.extend_from_slice(BPlusTreeReclaimQueue::MAGIC);
+        data.extend_from_slice(&BPlusTreeReclaimQueue::FORMAT_VERSION.to_le_bytes());
+        data.extend_from_slice(&count.to_le_bytes());
+        for entry in entries {
+            data.extend_from_slice(&entry.encode());
+        }
+        data.extend_from_slice(trailing);
+        let digest = blake3_domain_digest(
+            &data,
+            BPlusTreeReclaimQueue::FAMILY_ID,
+            BPlusTreeReclaimQueue::TYPE_ID,
+            BPlusTreeReclaimQueue::VERSION,
+            BPlusTreeReclaimQueue::DOMAIN_TAG,
+        );
+        data.extend_from_slice(&digest);
+        data
     }
 
     #[test]
@@ -1229,6 +1278,24 @@ mod tests {
     }
 
     #[test]
+    fn decode_bulk_builds_large_sorted_queue() {
+        let entries: Vec<_> = (0..10_000u32)
+            .map(|id| numbered_entry(id, -i64::from(id) - 1))
+            .collect();
+        let bytes = encode_entries_with_trailing(&entries, &[]);
+
+        let decoded = BPlusTreeReclaimQueue::decode(&bytes).unwrap();
+
+        assert_eq!(decoded.len(), entries.len());
+        assert_eq!(decoded.get(&entries[0].object_key), Some(entries[0]));
+        assert_eq!(
+            decoded.get(&entries[entries.len() - 1].object_key),
+            Some(entries[entries.len() - 1])
+        );
+        assert_eq!(decoded.validate(), Ok(()));
+    }
+
+    #[test]
     fn encode_decode_all_families_roundtrip() {
         let mut q = BPlusTreeReclaimQueue::new();
         q.insert(entry(1, -1, QueueFamily::Extent));
@@ -1419,6 +1486,28 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_duplicate_keys() {
+        let first = numbered_entry(7, -1);
+        let replacement = numbered_entry(7, -2);
+        let data = encode_entries_with_trailing(&[first, replacement], &[]);
+
+        assert_eq!(
+            BPlusTreeReclaimQueue::decode(&data),
+            Err(ReclaimQueueDecodeError::Tree(BTreeError::KeyOrderViolation))
+        );
+    }
+
+    #[test]
+    fn decode_rejects_trailing_body_bytes() {
+        let data = encode_entries_with_trailing(&[numbered_entry(7, -1)], &[0xA5]);
+
+        assert_eq!(
+            BPlusTreeReclaimQueue::decode(&data),
+            Err(ReclaimQueueDecodeError::TrailingData)
+        );
+    }
+
+    #[test]
     fn decode_errors_display_non_empty() {
         let variants = [
             ReclaimQueueDecodeError::Truncated,
@@ -1428,6 +1517,8 @@ mod tests {
                 expected: 1,
             },
             ReclaimQueueDecodeError::EntryDecode("test error".into()),
+            ReclaimQueueDecodeError::Tree(BTreeError::KeyOrderViolation),
+            ReclaimQueueDecodeError::TrailingData,
             ReclaimQueueDecodeError::IntegrityFooterMismatch,
         ];
         for err in &variants {

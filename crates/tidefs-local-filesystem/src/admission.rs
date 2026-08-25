@@ -343,6 +343,41 @@ impl LocalWriteAdmission {
         dirty_ops: u32,
     ) -> Result<LocalAdmissionPermit, LocalAdmissionError> {
         self.refresh_tick();
+        let (new_bytes, new_ops, new_permits) =
+            self.checked_dirty_write_usage(dirty_bytes, dirty_ops)?;
+        let charge = LocalAdmissionCharge::dirty_write(dirty_bytes, dirty_ops, self.current_tick);
+        let permit = self.issue_permit(charge)?;
+        self.usage.dirty_bytes = new_bytes;
+        self.usage.dirty_ops = new_ops;
+        self.usage.outstanding_permits = new_permits;
+        self.usage.oldest_dirty_tick = Some(match self.usage.oldest_dirty_tick {
+            Some(oldest) => min_u64(oldest, charge.admitted_tick),
+            None => charge.admitted_tick,
+        });
+        self.update_peaks();
+        Ok(permit)
+    }
+
+    /// Check whether one dirty write can be admitted without issuing a permit.
+    ///
+    /// Mounted writeback uses this to close an existing deferred commit group
+    /// before starting a new mutation whose permit would otherwise be refused.
+    /// The real admission still issues the linear permit after planning.
+    pub fn check_dirty_write(
+        &mut self,
+        dirty_bytes: u64,
+        dirty_ops: u32,
+    ) -> Result<(), LocalAdmissionError> {
+        self.refresh_tick();
+        self.checked_dirty_write_usage(dirty_bytes, dirty_ops)
+            .map(|_| ())
+    }
+
+    fn checked_dirty_write_usage(
+        &self,
+        dirty_bytes: u64,
+        dirty_ops: u32,
+    ) -> Result<(u64, u32, u32), LocalAdmissionError> {
         if dirty_ops == 0 {
             return Err(LocalAdmissionError::ZeroDirtyOperations);
         }
@@ -379,17 +414,7 @@ impl LocalWriteAdmission {
         }
 
         let new_permits = self.checked_permit_count()?;
-        let charge = LocalAdmissionCharge::dirty_write(dirty_bytes, dirty_ops, self.current_tick);
-        let permit = self.issue_permit(charge)?;
-        self.usage.dirty_bytes = new_bytes;
-        self.usage.dirty_ops = new_ops;
-        self.usage.outstanding_permits = new_permits;
-        self.usage.oldest_dirty_tick = Some(match self.usage.oldest_dirty_tick {
-            Some(oldest) => min_u64(oldest, charge.admitted_tick),
-            None => charge.admitted_tick,
-        });
-        self.update_peaks();
-        Ok(permit)
+        Ok((new_bytes, new_ops, new_permits))
     }
 
     /// Admit one metadata mutation against the permit-slot cap only.

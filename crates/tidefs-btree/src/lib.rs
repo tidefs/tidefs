@@ -13,9 +13,9 @@
 //!
 //! Leaf nodes hold up to `MAX_LEAF` key-value pairs. Internal nodes hold
 //! up to `MAX_INTERNAL` children. Separator `keys[i]` is the minimum key
-//! in `children[i+1]`. The tree is rebuilt bottom-up from a sorted entry
-//! list on every mutation — O(n) per mutation, correct and auditable,
-//! intentionally not a high-concurrency production implementation.
+//! in `children[i+1]`. Insert descends one path and splits overflowing
+//! nodes bottom-up. Delete, update, and explicit compaction retain the
+//! auditable sorted rebuild path.
 //!
 //! ## Node Integrity
 //!
@@ -31,18 +31,18 @@
 //!
 //! ## Compaction
 //!
-//! Mutations use `rebuild_compact()` which guarantees minimum fill for
-//! non-root nodes: each leaf holds at least `MIN_LEAF` entries and each
-//! internal node has at least `MIN_INTERNAL` children. The root is
-//! exempt from underflow. `compact()` rebuilds via `rebuild_compact()`
-//! to enforce these invariants.
+//! Insert splits preserve minimum fill for non-root nodes: each leaf holds
+//! at least `MIN_LEAF` entries and each internal node has at least
+//! `MIN_INTERNAL` children. The root is exempt from underflow. `compact()`
+//! rebuilds via `rebuild_compact()` to restore dense packing after deletes or
+//! imported under-full state.
 //!
 //! ## Component boundary
 //!
 //! This crate is a standalone, reusable B+tree component for extent maps,
-//! cleanup queues, directory index, orphan index, and xattr storage. It favors
-//! auditable rebuild-on-mutation behavior over high-concurrency production
-//! tuning.
+//! cleanup queues, directory index, orphan index, and xattr storage. It keeps
+//! insertion path-local while retaining explicit auditable rebuild APIs for
+//! compaction and bulk loading.
 
 extern crate alloc;
 
@@ -261,6 +261,10 @@ enum BTreeNode<K: Ord + Clone, V: Clone> {
         children: Vec<BTreeNode<K, V>>,
         checksum: [u8; 32],
     },
+}
+
+struct InsertSplit<K: Ord + Clone, V: Clone> {
+    right: BTreeNode<K, V>,
 }
 
 impl<K: Ord + Clone, V: Clone> BTreeNode<K, V> {
@@ -530,22 +534,112 @@ impl<K: Ord + Clone, V: Clone, const MAX_LEAF: usize, const MAX_INTERNAL: usize>
     /// Inserts a key-value pair. Returns the previous value if the key
     /// already existed, otherwise `None`.
     ///
-    /// Triggers a full-tree rebuild via `[rebuild_compact](Self::rebuild_compact)`
-    /// which recomputes BLAKE3 checksums for every node.
+    /// Descends one tree path and splits overflowing nodes bottom-up. Every
+    /// affected leaf and ancestor receives a refreshed structural checksum;
+    /// unaffected subtrees are neither collected nor rebuilt.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        let mut entries = self.collect_all_entries();
-        match entries.binary_search_by(|(k, _)| k.cmp(&key)) {
-            Ok(idx) => {
-                let old = core::mem::replace(&mut entries[idx], (key, value));
-                self.rebuild_compact(&entries);
-                Some(old.1)
+        let (previous, split) = Self::insert_into_node(&mut self.root, key, value);
+        if let Some(InsertSplit { right }) = split {
+            let left = core::mem::replace(
+                &mut self.root,
+                BTreeNode::Leaf(Vec::new(), leaf_checksum(0)),
+            );
+            let children = vec![left, right];
+            let keys = vec![children[1].min_key()];
+            let checksum = internal_checksum(children.len(), &children);
+            self.root = BTreeNode::Internal {
+                keys,
+                children,
+                checksum,
+            };
+        }
+        if previous.is_none() {
+            self.len = self
+                .len
+                .checked_add(1)
+                .expect("B+tree entry count overflow");
+        }
+        previous
+    }
+
+    fn insert_into_node(
+        node: &mut BTreeNode<K, V>,
+        key: K,
+        value: V,
+    ) -> (Option<V>, Option<InsertSplit<K, V>>) {
+        match node {
+            BTreeNode::Leaf(entries, checksum) => {
+                match entries.binary_search_by(|(entry_key, _)| entry_key.cmp(&key)) {
+                    Ok(index) => {
+                        let previous = core::mem::replace(&mut entries[index], (key, value));
+                        *checksum = leaf_checksum(entries.len());
+                        return (Some(previous.1), None);
+                    }
+                    Err(index) => entries.insert(index, (key, value)),
+                }
+
+                if entries.len() <= MAX_LEAF {
+                    *checksum = leaf_checksum(entries.len());
+                    return (None, None);
+                }
+
+                let right_entries = entries.split_off(entries.len().div_ceil(2));
+                *checksum = leaf_checksum(entries.len());
+                let right_checksum = leaf_checksum(right_entries.len());
+                (
+                    None,
+                    Some(InsertSplit {
+                        right: BTreeNode::Leaf(right_entries, right_checksum),
+                    }),
+                )
             }
-            Err(idx) => {
-                entries.insert(idx, (key, value));
-                self.rebuild_compact(&entries);
-                None
+            BTreeNode::Internal {
+                keys,
+                children,
+                checksum,
+            } => {
+                let child_index = keys.partition_point(|separator| &key >= separator);
+                let (previous, child_split) =
+                    Self::insert_into_node(&mut children[child_index], key, value);
+                if let Some(InsertSplit { right }) = child_split {
+                    children.insert(child_index + 1, right);
+                }
+
+                Self::refresh_internal_metadata(keys, children, checksum);
+                if children.len() <= MAX_INTERNAL {
+                    return (previous, None);
+                }
+
+                let right_children = children.split_off(children.len().div_ceil(2));
+                Self::refresh_internal_metadata(keys, children, checksum);
+                let right_keys = right_children
+                    .iter()
+                    .skip(1)
+                    .map(BTreeNode::min_key)
+                    .collect();
+                let right_checksum = internal_checksum(right_children.len(), &right_children);
+                (
+                    previous,
+                    Some(InsertSplit {
+                        right: BTreeNode::Internal {
+                            keys: right_keys,
+                            children: right_children,
+                            checksum: right_checksum,
+                        },
+                    }),
+                )
             }
         }
+    }
+
+    fn refresh_internal_metadata(
+        keys: &mut Vec<K>,
+        children: &[BTreeNode<K, V>],
+        checksum: &mut [u8; 32],
+    ) {
+        keys.clear();
+        keys.extend(children.iter().skip(1).map(BTreeNode::min_key));
+        *checksum = internal_checksum(children.len(), children);
     }
 
     /// Removes a key from the tree. Returns the value if the key existed.
@@ -2083,8 +2177,8 @@ mod tests {
             t.insert(i, i.to_string());
         }
         assert_eq!(t.depth(), 3);
-        assert_eq!(t.leaf_count(), 7);
-        assert_eq!(t.internal_count(), 3);
+        assert_eq!(t.leaf_count(), 8);
+        assert_eq!(t.internal_count(), 4);
 
         assert_eq!(t.delete(&12).unwrap(), "12");
 
@@ -2616,7 +2710,7 @@ mod tests {
     // ── minimum-fill compaction ─────────────────────────────────────
 
     #[test]
-    fn insert_uses_compact_rebuild() {
+    fn insert_splits_preserve_minimum_fill() {
         let mut t = TestTree::new();
         for i in 0..9u64 {
             t.insert(i, i.to_string());

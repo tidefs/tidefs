@@ -1995,6 +1995,93 @@ fn truncate_of_buffered_dirty_file_releases_dirty_capacity() {
 }
 
 #[test]
+fn buffered_write_truncates_materialize_final_content_at_commit() {
+    let root = temp_root("buffered-write-truncate-group");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    let inode_id = fs
+        .create_file("/truncate.bin", 0o600)
+        .expect("create file")
+        .inode_id;
+    let base = vec![0x5a; 16 * 1024];
+    fs.write_file("/truncate.bin", 0, &base)
+        .expect("write nonzero committed base");
+    fs.sync_all().expect("commit nonzero base");
+    fs.set_auto_commit(false)
+        .expect("defer ordinary mounted mutations");
+    fs.set_write_buffer_flush_threshold_bytes(content_chunk_size() as usize * 8)
+        .expect("keep the focused writes below threshold");
+
+    fs.write_file("/truncate.bin", 8192, b"discarded")
+        .expect("buffer first write");
+    fs.truncate_file("/truncate.bin", 4096)
+        .expect("truncate away first write");
+    assert!(fs.write_buffers.contains_key(&inode_id));
+    assert!(fs
+        .write_buffers
+        .get(&inode_id)
+        .is_some_and(WriteBuffer::is_empty));
+    assert!(fs
+        .filesystem
+        .buffered_write_base_records
+        .contains_key(&inode_id));
+    assert_eq!(
+        fs.read_file("/truncate.bin")
+            .expect("read empty pending content epoch"),
+        base[..4096],
+        "an empty pending buffer must read through its committed base",
+    );
+
+    fs.write_file("/truncate.bin", 1024, b"kept")
+        .expect("buffer retained write");
+    fs.truncate_file("/truncate.bin", 2048)
+        .expect("retain write in final size");
+    let pending = fs.stat("/truncate.bin").expect("stat pending file");
+    assert_eq!(pending.size, 2048);
+    let pending_key = content_object_key_for_version(inode_id, pending.data_version);
+    assert!(fs
+        .store
+        .pool()
+        .get(DeviceIoClass::Data, pending_key)
+        .expect("inspect pending content identity")
+        .is_none());
+
+    let mut expected = base[..2048].to_vec();
+    expected[1024..1028].copy_from_slice(b"kept");
+    assert_eq!(
+        fs.read_file("/truncate.bin").expect("read pending file"),
+        expected
+    );
+
+    fs.do_commit().expect("materialize and publish final epoch");
+    assert!(!fs.write_buffers.contains_key(&inode_id));
+    assert!(!fs
+        .filesystem
+        .buffered_write_base_records
+        .contains_key(&inode_id));
+    assert!(fs
+        .store
+        .pool()
+        .get(DeviceIoClass::Data, pending_key)
+        .expect("read committed content identity")
+        .is_some());
+    assert_eq!(
+        fs.read_file("/truncate.bin").expect("read committed file"),
+        expected
+    );
+    drop(fs);
+
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        reopened
+            .read_file("/truncate.bin")
+            .expect("read reopened file"),
+        expected
+    );
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
 fn symlink_round_trips_target() {
     let root = temp_root("symlink");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
@@ -2677,6 +2764,50 @@ fn metadata_mutations_count_once_toward_commit_group_target() {
     assert_eq!(fs.commit_group.dirty_ops, 0);
     assert!(fs.dirty_set.is_clean());
     assert!(!fs.is_state_dirty());
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
+fn deferred_buffered_writes_commit_before_permit_cap_rejection() {
+    let root = temp_root("deferred-write-permit-backpressure");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.stop_background_scheduler();
+    fs.create_file("/pressure.bin", 0o644)
+        .expect("create pressure file");
+    fs.set_auto_commit(false)
+        .expect("disable automatic per-mutation commits");
+    fs.set_commit_group_throughput_profile()
+        .expect("select mounted throughput profile");
+    fs.set_max_uncommitted_mutations(64 * 1024)
+        .expect("retain the throughput-profile mutation bound");
+
+    let permit_cap = fs.admission_config().hard_max_permits;
+    let start_commit_group = fs.commit_group.current_commit_group().0;
+    for index in 0..permit_cap.saturating_add(2) {
+        let byte = u8::try_from(index % 251).unwrap_or(0).saturating_add(1);
+        fs.write_file("/pressure.bin", 0, &[byte])
+            .unwrap_or_else(|error| {
+                panic!("buffered write {index} must apply backpressure: {error}")
+            });
+    }
+
+    let snapshot = fs.take_admission_snapshot().expect("read admission usage");
+    assert_eq!(snapshot.peak_outstanding_permits, permit_cap);
+    assert!(
+        snapshot.current_outstanding_permits < permit_cap,
+        "foreground commit must release the full prior permit group"
+    );
+    assert!(
+        fs.commit_group.current_commit_group().0 > start_commit_group,
+        "crossing the permit boundary must publish the prior group"
+    );
+
+    fs.do_commit().expect("commit remaining buffered writes");
+    let final_snapshot = fs.take_admission_snapshot().expect("read final usage");
+    assert_eq!(final_snapshot.current_dirty_bytes, 0);
+    assert_eq!(final_snapshot.current_dirty_ops, 0);
+    assert_eq!(final_snapshot.current_outstanding_permits, 0);
     drop(fs);
     cleanup(&root);
 }
