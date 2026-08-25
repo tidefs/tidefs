@@ -68,9 +68,9 @@ Command groups must not claim stronger stability than the class recorded here:
 | `pool repair` | `public-operator` | `live-owner` | `local-only` | `visible` | repair one receipt-authorized corrupt replica through the local mounted owner |
 | `snapshot create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create snapshots through the live owner or explicit offline devices |
 | `snapshot list` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list local snapshot catalog entries with kind, origin, hold, and generation metadata |
-| `snapshot clone create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create local snapshot clones through the live owner or explicit offline devices |
-| `snapshot clone delete` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | delete local snapshot clones through the live owner or explicit offline devices |
-| `snapshot clone promote` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | promote local snapshot clones through the live owner or explicit offline devices |
+| `snapshot clone create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create writable local volume clones from canonical volume snapshots; filesystem snapshot aliases are explicitly unsupported |
+| `snapshot clone delete` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | delete unpromoted writable volume clones through the live owner or explicit offline devices |
+| `snapshot clone promote` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | promote writable volume clones into independent volumes through canonical Pool authority |
 | `snapshot bookmark create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create local snapshot bookmarks through the live owner or explicit offline devices |
 | `snapshot bookmark delete` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | delete local snapshot bookmarks through the live owner or explicit offline devices |
 | `snapshot hold` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | place local deletion-prevention holds on snapshots or clones |
@@ -93,35 +93,47 @@ Command groups must not claim stronger stability than the class recorded here:
 | `device remove` | `public-operator` | `live-owner` | `local-only` | `visible` | require live-owner authority but refuse dispatch until evacuation receipts and topology/label updates are durable |
 | `device replace` | `public-operator` | `live-owner` | `local-only` | `visible` | rebuild a present readable replicated member through the live owner before same-cardinality topology commit |
 | `device rebuild` | `public-operator` | `live-owner` | `local-only` | `visible` | rebuild one exact absent two-copy Pool member through a recovery-only read-only mounted owner |
+| `device offline` | `public-operator` | `live-owner` | `local-only` | `visible` | durably exclude one exact present member from allocation through the live owner |
+| `device online` | `public-operator` | `live-owner` | `local-only` | `visible` | verify and readmit one exact administratively offline member through the live owner |
 | `device status` | `public-operator` | `live-owner` | `unguarded` | `visible` | query live device status through the live owner; fail closed when no live owner is reachable |
 | `defrag` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | request online extent-map defragmentation for a path |
 | `block attach` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | export a named Pool volume through the live owner or explicit offline devices |
 | `block detach` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | detach an existing ublk device by numeric id |
 | `block list` | `public-operator` | `no-live-pool-state` | `unguarded` | `visible` | list attached ublk devices |
-| `dataset create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create catalog-backed datasets through owner authority or explicit devices |
-| `dataset list` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list catalog-backed datasets through owner authority or explicit devices |
-| `dataset destroy` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | destroy catalog entries through owner authority or explicit devices |
-| `dataset rename` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | rename catalog entries through owner authority or explicit devices |
-| `dataset set-strategy` | `public-operator` | `live-owner-or-offline-input` | `local-only-when-mutating` | `visible` | set dataset feature strategy through owner authority or explicit devices |
-| `dataset seal-key` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | seal dataset keys through owner authority or explicit devices |
-| `dataset rotate-key` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | rotate dataset wrapping keys through owner authority or explicit devices |
-| `dataset upgrade` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | enable supported dataset features through owner authority or explicit devices |
-| `dataset get` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | read dataset properties through owner authority or explicit devices |
-| `dataset set` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | set dataset properties through owner authority or explicit devices |
-| `dataset list-props` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list dataset property definitions and effective values |
+| `filesystem create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create mountable filesystems through owner authority or explicit devices |
+| `filesystem list` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list filesystems through owner authority or explicit devices |
+| `filesystem destroy` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | destroy filesystems through owner authority or explicit devices |
+| `filesystem rename` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | rename filesystems through owner authority or explicit devices |
+| `filesystem set-strategy` | `public-operator` | `live-owner-or-offline-input` | `local-only-when-mutating` | `visible` | set filesystem feature strategy through owner authority or explicit devices |
+| `filesystem seal-key` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | seal filesystem keys through owner authority or explicit devices |
+| `filesystem upgrade` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | enable supported filesystem features through owner authority or explicit devices |
+| `filesystem get` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | read filesystem properties through owner authority or explicit devices |
+| `filesystem set` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | set filesystem properties through owner authority or explicit devices |
+| `filesystem list-props` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list filesystem property definitions and effective values |
+| `volume create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create block volumes through owner authority or explicit devices |
+| `volume list` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list block volumes through owner authority or explicit devices |
+| `volume resize` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | resize block volumes through owner authority or explicit devices |
+| `volume destroy` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | destroy block volumes through owner authority or explicit devices |
+| `volume rename` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | rename block volumes through owner authority or explicit devices |
+| `volume seal-key` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | seal volume keys through owner authority or explicit devices |
+| `volume get` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | read volume properties through owner authority or explicit devices |
+| `volume set` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | set volume properties through owner authority or explicit devices |
+| `volume list-props` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list volume property definitions and effective values |
+| `pool rotate-key` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | rotate the Pool wrapping key through owner authority or explicit devices |
 | `merge resolve` | `public-operator` | `no-live-pool-state` | `unguarded` | `visible` | resolve receive conflicts into a local inventory document |
 | `merge validate` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | validate a resolved receive conflict inventory read-only |
 | `merge show` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | display a receive conflict inventory read-only |
 | `storage-intent explain` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | render supplied storage-intent policy, receipt, and evidence-query records read-only |
-| `storage-intent policy set` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | stage dataset prefetch/residency policy source through #855 without activation |
-| `storage-intent policy clear` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | stage dataset prefetch/residency policy clears through #855 without activation |
-| `storage-intent policy show` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | render staged dataset prefetch/residency policy source documents |
-| `storage-intent policy dry-run` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | compile staged dataset prefetch/residency policy source and render blocked support |
+| `storage-intent policy set` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | stage filesystem or volume prefetch/residency policy source through #855 without activation |
+| `storage-intent policy clear` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | stage filesystem or volume prefetch/residency policy clears through #855 without activation |
+| `storage-intent policy show` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | render staged filesystem or volume prefetch/residency policy source documents |
+| `storage-intent policy dry-run` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | compile staged filesystem or volume prefetch/residency policy source and render blocked support |
 | `mount` | `userspace-harness` | `userspace-harness` | `unguarded` | `visible` | launch the current direct FUSE development harness |
 | `pool mount` | `userspace-harness` | `userspace-harness` | `unguarded` | `visible` | import explicit devices and launch the current FUSE owner harness |
 | `pool integrity-check` | `operator-diagnostic` | `live-owner-or-offline-input` | `unguarded` | `visible` | run live-owner or explicit-device integrity diagnostics |
 | `kernel status` | `operator-diagnostic` | `passive-diagnostic` | `unguarded` | `visible` | passively inspect the declared kernel control endpoint |
 | `diag` | `operator-diagnostic` | `passive-diagnostic` | `unguarded` | `visible` | collect a redacted diagnostic support bundle |
+| `cluster identity create` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | create a host-local node credential and separate shareable public identity |
 | `cluster pool create` | `prototype` | `prototype-only` | `unguarded` | `visible` | prototype clustered pool creation; not final distributed operator UAPI |
 | `cluster placement exercise` | `development-diagnostic` | `development-exercise` | `unguarded` | `visible` | development diagnostic exercise for placement-map code |
 | `cluster heal exercise` | `development-diagnostic` | `development-exercise` | `unguarded` | `visible` | development diagnostic exercise for placement-heal code |

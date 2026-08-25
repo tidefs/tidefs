@@ -159,8 +159,8 @@ or smoke carrier. Ordinary development is selected by this contract, current
 source, and live issues and pull requests; publication claims do not select or
 block that work.
 
-The default `tidefsctl` build is this local pool, mount, device, dataset,
-snapshot, defrag, live-owner, and status carrier. Block-volume commands,
+The default `tidefsctl` build is this local pool, mount, device, filesystem,
+volume, snapshot, defrag, live-owner, and status carrier. Block-volume commands,
 cluster authority, remote snapshot transport, kernel/validation diagnostics,
 receive-merge inspection, optional data policy, and storage-intent policy
 inspection remain in the same CLI source behind the explicit `block-volume`,

@@ -363,7 +363,7 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         path: "snapshot clone create",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "create writable local volume datasets from canonical volume snapshots; filesystem snapshot aliases are explicitly unsupported",
+        summary: "create writable local volume clones from canonical volume snapshots; filesystem snapshot aliases are explicitly unsupported",
     },
     CommandSurface {
         path: "snapshot clone delete",
@@ -560,76 +560,124 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         summary: "list attached ublk devices",
     },
     CommandSurface {
-        path: "dataset create",
+        path: "filesystem create",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "create catalog-backed datasets through owner authority or explicit devices",
+        summary: "create mountable filesystems through owner authority or explicit devices",
     },
     CommandSurface {
-        path: "dataset list",
+        path: "filesystem list",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "list catalog-backed datasets through owner authority or explicit devices",
+        summary: "list filesystems through owner authority or explicit devices",
     },
     CommandSurface {
-        path: "dataset resize",
+        path: "filesystem destroy",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "resize Pool-backed volumes through owner authority or explicit devices",
+        summary: "destroy filesystems through owner authority or explicit devices",
     },
     CommandSurface {
-        path: "dataset destroy",
+        path: "filesystem rename",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "destroy catalog entries through owner authority or explicit devices",
+        summary: "rename filesystems through owner authority or explicit devices",
     },
     CommandSurface {
-        path: "dataset rename",
+        path: "filesystem set-strategy",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "rename catalog entries through owner authority or explicit devices",
+        summary: "set filesystem feature strategy through owner authority or explicit devices",
     },
     CommandSurface {
-        path: "dataset set-strategy",
+        path: "filesystem seal-key",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "set dataset feature strategy through owner authority or explicit devices",
+        summary: "seal filesystem keys through owner authority or explicit devices",
     },
     CommandSurface {
-        path: "dataset seal-key",
+        path: "filesystem upgrade",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "seal dataset keys through owner authority or explicit devices",
+        summary: "enable supported filesystem features through owner authority or explicit devices",
     },
     CommandSurface {
-        path: "dataset rotate-key",
+        path: "filesystem get",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "rotate dataset wrapping keys through owner authority or explicit devices",
+        summary: "read filesystem properties through owner authority or explicit devices",
     },
     CommandSurface {
-        path: "dataset upgrade",
+        path: "filesystem set",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "enable supported dataset features through owner authority or explicit devices",
+        summary: "set filesystem properties through owner authority or explicit devices",
     },
     CommandSurface {
-        path: "dataset get",
+        path: "filesystem list-props",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "read dataset properties through owner authority or explicit devices",
+        summary: "list filesystem property definitions and effective values",
     },
     CommandSurface {
-        path: "dataset set",
+        path: "volume create",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "set dataset properties through owner authority or explicit devices",
+        summary: "create block volumes through owner authority or explicit devices",
     },
     CommandSurface {
-        path: "dataset list-props",
+        path: "volume list",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "list dataset property definitions and effective values",
+        summary: "list block volumes through owner authority or explicit devices",
+    },
+    CommandSurface {
+        path: "volume resize",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "resize block volumes through owner authority or explicit devices",
+    },
+    CommandSurface {
+        path: "volume destroy",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "destroy block volumes through owner authority or explicit devices",
+    },
+    CommandSurface {
+        path: "volume rename",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "rename block volumes through owner authority or explicit devices",
+    },
+    CommandSurface {
+        path: "volume seal-key",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "seal volume keys through owner authority or explicit devices",
+    },
+    CommandSurface {
+        path: "volume get",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "read volume properties through owner authority or explicit devices",
+    },
+    CommandSurface {
+        path: "volume set",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "set volume properties through owner authority or explicit devices",
+    },
+    CommandSurface {
+        path: "volume list-props",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "list volume property definitions and effective values",
+    },
+    CommandSurface {
+        path: "pool rotate-key",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "rotate the Pool wrapping key through owner authority or explicit devices",
     },
     #[cfg(feature = "receive-merge")]
     CommandSurface {
@@ -665,21 +713,21 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         path: "storage-intent policy set",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::NoLivePoolState,
-        summary: "stage dataset prefetch/residency policy source through #855 without activation",
+        summary: "stage filesystem or volume prefetch/residency policy source through #855 without activation",
     },
     #[cfg(feature = "storage-intent")]
     CommandSurface {
         path: "storage-intent policy clear",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::NoLivePoolState,
-        summary: "stage dataset prefetch/residency policy clears through #855 without activation",
+        summary: "stage filesystem or volume prefetch/residency policy clears through #855 without activation",
     },
     #[cfg(feature = "storage-intent")]
     CommandSurface {
         path: "storage-intent policy show",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::PassiveDiagnostic,
-        summary: "render staged dataset prefetch/residency policy source documents",
+        summary: "render staged filesystem or volume prefetch/residency policy source documents",
     },
     #[cfg(feature = "storage-intent")]
     CommandSurface {
@@ -687,7 +735,7 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::PassiveDiagnostic,
         summary:
-            "compile staged dataset prefetch/residency policy source and render blocked support",
+            "compile staged filesystem or volume prefetch/residency policy source and render blocked support",
     },
     CommandSurface {
         path: "mount",
@@ -847,11 +895,11 @@ pub(crate) fn root_long_about() -> String {
 pub(crate) fn root_after_help() -> &'static str {
     #[cfg(feature = "diagnostics")]
     {
-        "Start with `tidefsctl pool --help`, `tidefsctl dataset --help`, `tidefsctl kernel --help`, or `tidefsctl diag --help`. Command classification is checked by the repo authority docs and claims gate."
+        "Start with `tidefsctl pool --help`, `tidefsctl filesystem --help`, `tidefsctl volume --help`, `tidefsctl kernel --help`, or `tidefsctl diag --help`. Command classification is checked by the repo authority docs and claims gate."
     }
     #[cfg(not(feature = "diagnostics"))]
     {
-        "Start with `tidefsctl pool --help`, `tidefsctl dataset --help`, or `tidefsctl snapshot --help`. Command classification is checked by the repo authority docs and claims gate."
+        "Start with `tidefsctl pool --help`, `tidefsctl filesystem --help`, `tidefsctl volume --help`, or `tidefsctl snapshot --help`. Command classification is checked by the repo authority docs and claims gate."
     }
 }
 
@@ -948,8 +996,8 @@ mod tests {
             "pool list-props",
             "pool scrub",
             "pool repair",
-            "dataset create",
-            "dataset resize",
+            "filesystem create",
+            "volume resize",
             "snapshot create",
             "snapshot clone create",
             "snapshot bookmark create",

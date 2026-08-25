@@ -72,7 +72,7 @@ pub struct PoolMountRuntimeArgs {
     #[arg(long = "compress-algo")]
     pub compress_algo: Option<String>,
 
-    /// Enable deduplication for the mounted dataset
+    /// Enable deduplication for the mounted filesystem
     #[arg(long = "enable-dedup")]
     pub enable_dedup: bool,
 
@@ -145,9 +145,9 @@ pub struct PoolMountArgs {
     #[arg(long = "relatime", default_value_t = false)]
     pub relatime: bool,
 
-    /// Dataset path to mount (default "root"). Resolved through the dataset catalog.
-    #[arg(long = "dataset", default_value = "root")]
-    pub dataset: String,
+    /// Filesystem path to mount (default "root"). Resolved through the internal catalog.
+    #[arg(long = "filesystem", default_value = "root")]
+    pub filesystem: String,
 
     /// Path to a sealed pool key envelope file (84 bytes, "VEKF" magic).
     /// When set, the pool is opened with per-object encryption using the
@@ -554,7 +554,7 @@ fn cluster_client_uses_local_mount_inputs(args: &PoolMountArgs) -> bool {
         || args.rebuild_only
         || args.devices.is_some()
         || args.relatime
-        || args.dataset != "root"
+        || args.filesystem != "root"
         || args.encryption_envelope.is_some()
         || args.encryption_passphrase.is_some()
         || args.encryption_salt.is_some()
@@ -743,7 +743,7 @@ pub fn handle_mount(args: PoolMountArgs) {
         ("read_only", LivePoolAdminArg::Bool(args.read_only)),
         ("rebuild_only", LivePoolAdminArg::Bool(args.rebuild_only)),
         ("relatime", LivePoolAdminArg::Bool(args.relatime)),
-        ("dataset", LivePoolAdminArg::String(args.dataset.clone())),
+        ("dataset", LivePoolAdminArg::String(args.filesystem.clone())),
     ]);
 
     #[cfg(feature = "cluster")]
@@ -1135,7 +1135,7 @@ pub fn handle_mount(args: PoolMountArgs) {
         coherency_profile,
         block_devices: args.devices.clone(),
         import_owner: Some(import_owner),
-        dataset_path: Some(args.dataset.clone()),
+        dataset_path: Some(args.filesystem.clone()),
         encryption: encryption_config,
         snapshot_name: args.runtime.snapshot.clone(),
         mount_authority,
@@ -1392,7 +1392,7 @@ mod tests {
             rebuild_only: true,
             devices: Some(vec![PathBuf::from("/dev/survivor")]),
             relatime: false,
-            dataset: "root".into(),
+            filesystem: "root".into(),
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,
@@ -1486,7 +1486,7 @@ mod tests {
             rebuild_only: false,
             devices: None,
             relatime: false,
-            dataset: "root".into(),
+            filesystem: "root".into(),
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,
@@ -1515,7 +1515,7 @@ mod tests {
             rebuild_only: false,
             devices: None,
             relatime: false,
-            dataset: "root".into(),
+            filesystem: "root".into(),
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,
@@ -1671,7 +1671,7 @@ mod tests {
     #[test]
     fn mount_args_bind_expected_fields() {
         let args = PoolMountArgs {
-            dataset: "root".into(),
+            filesystem: "root".into(),
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,
@@ -1726,7 +1726,7 @@ mod tests {
             cluster_vfs_rpc_addr: Vec::new(),
             #[cfg(feature = "cluster")]
             cluster_pool_guid: None,
-            dataset: "root".into(),
+            filesystem: "root".into(),
             #[cfg(feature = "cluster")]
             cluster: false,
             #[cfg(feature = "cluster")]
@@ -1752,7 +1752,7 @@ mod tests {
             rebuild_only: false,
             devices: None,
             relatime: true,
-            dataset: "root".into(),
+            filesystem: "root".into(),
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,
@@ -1788,7 +1788,7 @@ mod tests {
             rebuild_only: false,
             devices: None,
             relatime: true,
-            dataset: "root".into(),
+            filesystem: "root".into(),
             encryption_envelope: None,
             encryption_passphrase: None,
             encryption_salt: None,

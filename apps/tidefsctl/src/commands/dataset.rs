@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Dataset subcommands split imported-pool authority from offline access.
+//! Filesystem and volume commands over the internal dataset catalog.
 //!
-//! Pool-name-only dataset commands must route through the runtime owner that
+//! Pool-name-only object commands must route through the runtime owner that
 //! imported the pool. Explicit `--devices` are the offline/not-yet-imported
 //! escape hatch; if a live owner has published an interface for those devices,
 //! the command must use that owner instead of opening storage directly.
@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::process;
 
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 use tidefs_dataset_lifecycle::{
     DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
 };
@@ -32,43 +32,59 @@ fn feature_available_in_current_build(feature: &FeatureName) -> bool {
     !is_data_policy || cfg!(feature = "data-policy")
 }
 
-/// Sub-subcommands for `tidefsctl dataset`.
+/// Subcommands for the Product Contract filesystem object.
 #[derive(Subcommand, Debug)]
-pub enum DatasetCommand {
-    /// Create a new dataset in the pool-wide catalog
-    Create(DatasetCreateArgs),
-    /// List datasets in the pool-wide catalog
+pub enum FilesystemCommand {
+    /// Create a mountable filesystem in the pool-wide catalog
+    Create(FilesystemCreateArgs),
+    /// List filesystems in the pool-wide catalog
     List(DatasetListArgs),
-    /// Resize one Pool-backed block volume
-    Resize(DatasetResizeArgs),
-    /// Destroy a dataset, removing its catalog entry
+    /// Destroy a filesystem, removing its catalog entry
     Destroy(DatasetDestroyArgs),
-    /// Rename a dataset, preserving its stable DatasetId
+    /// Rename a filesystem, preserving its stable internal identity
     Rename(DatasetRenameArgs),
-    /// Enable, disable, or list dataset feature flags through canonical authority
+    /// Enable, disable, or list filesystem feature flags through canonical authority
     SetStrategy(DatasetSetStrategyArgs),
-    /// Seal a dataset encryption key under a passphrase-derived wrapping key.
-    /// Stores the sealed DEK in the pool's keystore for later key rotation.
+    /// Seal a filesystem encryption key under a passphrase-derived wrapping key
     SealKey(DatasetSealKeyArgs),
-    /// Rotate the pool wrapping key (change passphrase) and re-wrap all
-    /// dataset DEKs.  Requires the old passphrase to unwrap existing DEKs
-    /// and a new passphrase + salt to re-wrap them.
-    RotateKey(DatasetRotateKeyArgs),
-    /// Enable all supported-but-not-yet-enabled features in one operation
+    /// Enable all supported-but-not-yet-enabled filesystem features
     Upgrade(DatasetUpgradeArgs),
-    /// Get a typed dataset property value with source annotation
+    /// Get a typed filesystem property value with source annotation
     Get(DatasetGetArgs),
-    /// Set a typed dataset property value with validation
+    /// Set a typed filesystem property value with validation
     Set(DatasetSetArgs),
-    /// List all registry properties for a dataset with effective values and sources
+    /// List all registry properties for a filesystem with effective values and sources
     ListProps(DatasetListPropsArgs),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum DatasetTypeArg {
+/// Subcommands for the Product Contract volume object.
+#[derive(Subcommand, Debug)]
+pub enum VolumeCommand {
+    /// Create a block volume in the pool-wide catalog
+    Create(VolumeCreateArgs),
+    /// List block volumes in the pool-wide catalog
+    List(DatasetListArgs),
+    /// Resize one Pool-backed block volume
+    Resize(DatasetResizeArgs),
+    /// Destroy a volume, removing its catalog entry
+    Destroy(DatasetDestroyArgs),
+    /// Rename a volume, preserving its stable internal identity
+    Rename(DatasetRenameArgs),
+    /// Seal a volume encryption key under a passphrase-derived wrapping key
+    /// Stores the sealed DEK in the pool's keystore for later key rotation.
+    SealKey(DatasetSealKeyArgs),
+    /// Get a typed volume property value with source annotation
+    Get(DatasetGetArgs),
+    /// Set a typed volume property value with validation
+    Set(DatasetSetArgs),
+    /// List all registry properties for a volume with effective values and sources
+    ListProps(DatasetListPropsArgs),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DatasetTypeArg {
     Filesystem,
     Volume,
-    Snapshot,
 }
 
 impl DatasetTypeArg {
@@ -76,7 +92,6 @@ impl DatasetTypeArg {
         match self {
             Self::Filesystem => DatasetType::Filesystem,
             Self::Volume => DatasetType::Volume,
-            Self::Snapshot => DatasetType::Snapshot,
         }
     }
 
@@ -84,7 +99,31 @@ impl DatasetTypeArg {
         match self {
             Self::Filesystem => "filesystem",
             Self::Volume => "volume",
-            Self::Snapshot => "snapshot",
+        }
+    }
+
+    fn command(self, operation: &str) -> &'static str {
+        match (self, operation) {
+            (Self::Filesystem, "create") => "filesystem create",
+            (Self::Filesystem, "list") => "filesystem list",
+            (Self::Filesystem, "destroy") => "filesystem destroy",
+            (Self::Filesystem, "rename") => "filesystem rename",
+            (Self::Filesystem, "set-strategy") => "filesystem set-strategy",
+            (Self::Filesystem, "seal-key") => "filesystem seal-key",
+            (Self::Filesystem, "upgrade") => "filesystem upgrade",
+            (Self::Filesystem, "get") => "filesystem get",
+            (Self::Filesystem, "set") => "filesystem set",
+            (Self::Filesystem, "list-props") => "filesystem list-props",
+            (Self::Volume, "create") => "volume create",
+            (Self::Volume, "list") => "volume list",
+            (Self::Volume, "resize") => "volume resize",
+            (Self::Volume, "destroy") => "volume destroy",
+            (Self::Volume, "rename") => "volume rename",
+            (Self::Volume, "seal-key") => "volume seal-key",
+            (Self::Volume, "get") => "volume get",
+            (Self::Volume, "set") => "volume set",
+            (Self::Volume, "list-props") => "volume list-props",
+            _ => panic!("unsupported object command {} {operation}", self.label()),
         }
     }
 }
@@ -126,7 +165,7 @@ impl DestroyAdmission {
     fn hazards(&self) -> Vec<String> {
         let mut hazards = Vec::new();
         if self.child_count > 0 {
-            hazards.push(format!("{} child dataset(s)", self.child_count));
+            hazards.push(format!("{} child object(s)", self.child_count));
         }
         if self.snapshot_count > 0 {
             hazards.push(format!("{} snapshot(s)", self.snapshot_count));
@@ -138,40 +177,19 @@ impl DestroyAdmission {
     }
 }
 
-/// `dataset create <pool>/<name> [--devices <dev>...]`
+/// Arguments for `filesystem create`.
 #[derive(Args, Debug)]
-pub struct DatasetCreateArgs {
-    /// Dataset target in <pool>/<name> form
+pub struct FilesystemCreateArgs {
+    /// Filesystem target in <pool>/<name> form
     pub target: String,
 
     /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
-    /// Mountpoint metadata to pass to the live owner
-    #[arg(long = "mountpoint", value_name = "PATH")]
-    pub mountpoint: Option<PathBuf>,
-
-    /// Dataset type to create
-    #[arg(long = "type", value_enum, default_value_t = DatasetTypeArg::Filesystem)]
-    pub dataset_type: DatasetTypeArg,
-
-    /// Exact volume capacity in bytes; required for --type volume
-    #[arg(long = "size", value_name = "BYTES")]
-    pub size: Option<u64>,
-
-    /// Initial dataset property in key=value form
+    /// Initial filesystem property in key=value form
     #[arg(long = "property", value_name = "KEY=VALUE")]
     pub properties: Vec<String>,
-
-    /// Canonical dataset feature flag to request at creation
-    #[arg(
-        long = "feature",
-        alias = "feature-flag",
-        value_name = "FEATURE",
-        value_delimiter = ','
-    )]
-    pub features: Vec<String>,
 
     /// Emit machine-parseable JSON
     #[arg(long = "json")]
@@ -182,7 +200,71 @@ pub struct DatasetCreateArgs {
     #[arg(long = "sync", default_value = "local")]
     pub sync: String,
 }
-/// `dataset list [-p <pool>] [-t <type>] [--devices <dev>...]`
+
+/// Arguments for `volume create`.
+#[derive(Args, Debug)]
+pub struct VolumeCreateArgs {
+    /// Volume target in <pool>/<name> form
+    pub target: String,
+
+    /// Block devices for offline/not-yet-imported catalog access
+    #[arg(short = 'd', long = "devices", num_args = 1..)]
+    pub devices: Option<Vec<PathBuf>>,
+
+    /// Exact volume capacity in bytes
+    #[arg(long = "size", value_name = "BYTES")]
+    pub size: u64,
+
+    /// Initial volume property in key=value form
+    #[arg(long = "property", value_name = "KEY=VALUE")]
+    pub properties: Vec<String>,
+
+    /// Emit machine-parseable JSON
+    #[arg(long = "json")]
+    pub json: bool,
+
+    /// Write-acknowledgment sync guarantee: local, remote-copy, or
+    /// full-redundancy. Defaults to local (single-node safety).
+    #[arg(long = "sync", default_value = "local")]
+    pub sync: String,
+}
+
+#[derive(Debug)]
+struct DatasetCreateArgs {
+    target: String,
+    devices: Option<Vec<PathBuf>>,
+    size: Option<u64>,
+    properties: Vec<String>,
+    json: bool,
+    sync: String,
+}
+
+impl From<FilesystemCreateArgs> for DatasetCreateArgs {
+    fn from(args: FilesystemCreateArgs) -> Self {
+        Self {
+            target: args.target,
+            devices: args.devices,
+            size: None,
+            properties: args.properties,
+            json: args.json,
+            sync: args.sync,
+        }
+    }
+}
+
+impl From<VolumeCreateArgs> for DatasetCreateArgs {
+    fn from(args: VolumeCreateArgs) -> Self {
+        Self {
+            target: args.target,
+            devices: args.devices,
+            size: Some(args.size),
+            properties: args.properties,
+            json: args.json,
+            sync: args.sync,
+        }
+    }
+}
+/// Shared arguments for `filesystem list` and `volume list`.
 #[derive(Args, Debug)]
 pub struct DatasetListArgs {
     /// Pool name filter (imported-pool identity; routed through the live owner)
@@ -193,15 +275,11 @@ pub struct DatasetListArgs {
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
-    /// Dataset type filter
-    #[arg(short = 't', long = "type", value_enum)]
-    pub dataset_type: Option<DatasetTypeArg>,
-
     /// Emit machine-parseable JSON
     #[arg(long = "json")]
     pub json: bool,
 }
-/// `dataset resize <pool>/<volume> --size <bytes> [--devices <dev>...]`
+/// `volume resize <pool>/<volume> --size <bytes> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetResizeArgs {
     /// Volume target in <pool>/<name> form
@@ -219,33 +297,33 @@ pub struct DatasetResizeArgs {
     #[arg(long = "json")]
     pub json: bool,
 }
-/// `dataset rename <pool> <old-name> <new-name> [--devices <dev>...]`
+/// Shared arguments for filesystem and volume rename.
 #[derive(Args, Debug)]
 pub struct DatasetRenameArgs {
     /// Pool name (imported-pool identity; routed through the live owner)
     pub pool: String,
 
-    /// Current dataset name to rename
+    /// Current object name to rename
     pub old_name: String,
 
-    /// New dataset name
+    /// New object name
     pub new_name: String,
 
     /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 }
-/// `dataset destroy <pool>/<name> [--devices <dev>...]`
+/// Shared arguments for filesystem and volume destroy.
 #[derive(Args, Debug)]
 pub struct DatasetDestroyArgs {
-    /// Dataset target in <pool>/<name> form
+    /// Object target in <pool>/<name> form
     pub target: String,
 
     /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
-    /// Required when the dataset has children, snapshots, or a live mount
+    /// Required when the object has children, snapshots, or a live mount
     #[arg(long = "force")]
     pub force: bool,
 
@@ -253,13 +331,13 @@ pub struct DatasetDestroyArgs {
     #[arg(long = "json")]
     pub json: bool,
 }
-/// `dataset set-strategy <pool> <name> [--devices <dev>...] [--enable <features>] [--disable <features>] [--list] [--class <class>]`
+/// `filesystem set-strategy <pool> <name> [--devices <dev>...]`.
 #[derive(Args, Debug)]
 pub struct DatasetSetStrategyArgs {
     /// Pool name (imported-pool identity; routed through the live owner)
     pub pool: String,
 
-    /// Dataset name to configure
+    /// Filesystem name to configure
     pub name: String,
 
     /// Block devices for offline/not-yet-imported catalog access
@@ -283,13 +361,13 @@ pub struct DatasetSetStrategyArgs {
     pub class: String,
 }
 
-/// `dataset seal-key <pool> <name> [--devices <dev>...] --passphrase <phrase>`
+/// Shared arguments for filesystem and volume key sealing.
 #[derive(Args, Debug)]
 pub struct DatasetSealKeyArgs {
     /// Pool name (imported-pool identity; routed through the live owner)
     pub pool: String,
 
-    /// Dataset name whose DEK to seal
+    /// Object name whose encryption key to seal
     pub name: String,
 
     /// Block devices for offline/not-yet-imported key access
@@ -300,9 +378,9 @@ pub struct DatasetSealKeyArgs {
     #[arg(long = "passphrase", short = 'P')]
     pub passphrase: String,
 }
-/// `dataset rotate-key <pool> [--devices <dev>...] --old-passphrase <phrase> --old-salt <hex> --new-passphrase <phrase>`
+/// `pool rotate-key <pool> [--devices <dev>...]`.
 #[derive(Args, Debug)]
-pub struct DatasetRotateKeyArgs {
+pub struct PoolRotateKeyArgs {
     /// Pool name (imported-pool identity; routed through the live owner)
     pub pool: String,
 
@@ -323,9 +401,9 @@ pub struct DatasetRotateKeyArgs {
     pub new_passphrase: String,
 }
 
-/// `dataset upgrade <pool> <name> [--devices <dev>...]`
+/// `filesystem upgrade <pool> <name> [--devices <dev>...]`
 ///
-/// Enables all canonical V1 features that are not yet enabled on the dataset.
+/// Enables all canonical V1 features that are not yet enabled on the filesystem.
 /// Uses the upgrade table ([`tidefs_dataset_feature_flags::SupportedFeaturesV1`])
 /// to determine which features the current software version supports, then
 /// enables each supported-but-not-yet-enabled feature with prerequisite checking.
@@ -334,7 +412,7 @@ pub struct DatasetUpgradeArgs {
     /// Pool name (imported-pool identity; routed through the live owner)
     pub pool: String,
 
-    /// Dataset name to upgrade
+    /// Filesystem name to upgrade
     pub name: String,
 
     /// Block devices for offline/not-yet-imported catalog access
@@ -342,10 +420,10 @@ pub struct DatasetUpgradeArgs {
     pub devices: Option<Vec<PathBuf>>,
 }
 
-/// `dataset get <pool>/<name> <property> [--devices <dev>...]`
+/// Shared arguments for filesystem and volume property reads.
 #[derive(Args, Debug)]
 pub struct DatasetGetArgs {
-    /// Dataset target in <pool>/<name> form
+    /// Object target in <pool>/<name> form
     pub target: String,
 
     /// Property name (e.g. "access.readonly", "layout.recordsize")
@@ -360,10 +438,10 @@ pub struct DatasetGetArgs {
     pub json: bool,
 }
 
-/// `dataset set <pool>/<name> <property>=<value> [--devices <dev>...]`
+/// Shared arguments for filesystem and volume property writes.
 #[derive(Args, Debug)]
 pub struct DatasetSetArgs {
-    /// Dataset target in <pool>/<name> form
+    /// Object target in <pool>/<name> form
     pub target: String,
 
     /// Property assignment in key=value form (e.g. "access.readonly=on")
@@ -377,13 +455,13 @@ pub struct DatasetSetArgs {
     #[arg(long = "json")]
     pub json: bool,
 }
-/// `dataset list-props <pool> <name> [--devices <dev>...]`
+/// Shared arguments for filesystem and volume property listing.
 #[derive(Args, Debug)]
 pub struct DatasetListPropsArgs {
     /// Pool name (imported-pool identity; routed through the live owner)
     pub pool: String,
 
-    /// Dataset name to list properties for
+    /// Object name to list properties for
     pub name: String,
 
     /// Block devices for offline/not-yet-imported property access
@@ -395,33 +473,49 @@ pub struct DatasetListPropsArgs {
     pub family: Option<String>,
 }
 
-/// Dispatch the dataset subcommand.
-pub fn handle_dataset(cmd: DatasetCommand) {
+/// Dispatch a Product Contract filesystem command.
+pub fn handle_filesystem(cmd: FilesystemCommand) {
     match cmd {
-        DatasetCommand::Create(args) => handle_create(args),
-        DatasetCommand::List(args) => handle_list(args),
-        DatasetCommand::Resize(args) => handle_resize(args),
-        DatasetCommand::Destroy(args) => handle_destroy(args),
-        DatasetCommand::Rename(args) => handle_rename(args),
-        DatasetCommand::SetStrategy(args) => handle_set_strategy(args),
-        DatasetCommand::SealKey(args) => handle_seal_key(args),
-        DatasetCommand::RotateKey(args) => handle_rotate_key(args),
-        DatasetCommand::Upgrade(args) => handle_upgrade(args),
-        DatasetCommand::Get(args) => handle_get(args),
-        DatasetCommand::Set(args) => handle_set(args),
-        DatasetCommand::ListProps(args) => handle_list_props(args),
+        FilesystemCommand::Create(args) => handle_create(args.into(), DatasetTypeArg::Filesystem),
+        FilesystemCommand::List(args) => handle_list(args, DatasetTypeArg::Filesystem),
+        FilesystemCommand::Destroy(args) => handle_destroy(args, DatasetTypeArg::Filesystem),
+        FilesystemCommand::Rename(args) => handle_rename(args, DatasetTypeArg::Filesystem),
+        FilesystemCommand::SetStrategy(args) => {
+            handle_set_strategy(args, DatasetTypeArg::Filesystem)
+        }
+        FilesystemCommand::SealKey(args) => handle_seal_key(args, DatasetTypeArg::Filesystem),
+        FilesystemCommand::Upgrade(args) => handle_upgrade(args, DatasetTypeArg::Filesystem),
+        FilesystemCommand::Get(args) => handle_get(args, DatasetTypeArg::Filesystem),
+        FilesystemCommand::Set(args) => handle_set(args, DatasetTypeArg::Filesystem),
+        FilesystemCommand::ListProps(args) => handle_list_props(args, DatasetTypeArg::Filesystem),
+    }
+}
+
+/// Dispatch a Product Contract volume command.
+pub fn handle_volume(cmd: VolumeCommand) {
+    match cmd {
+        VolumeCommand::Create(args) => handle_create(args.into(), DatasetTypeArg::Volume),
+        VolumeCommand::List(args) => handle_list(args, DatasetTypeArg::Volume),
+        VolumeCommand::Resize(args) => handle_resize(args),
+        VolumeCommand::Destroy(args) => handle_destroy(args, DatasetTypeArg::Volume),
+        VolumeCommand::Rename(args) => handle_rename(args, DatasetTypeArg::Volume),
+        VolumeCommand::SealKey(args) => handle_seal_key(args, DatasetTypeArg::Volume),
+        VolumeCommand::Get(args) => handle_get(args, DatasetTypeArg::Volume),
+        VolumeCommand::Set(args) => handle_set(args, DatasetTypeArg::Volume),
+        VolumeCommand::ListProps(args) => handle_list_props(args, DatasetTypeArg::Volume),
     }
 }
 fn open_filesystem_with_live_args(
     pool: &str,
     devices: Option<&[PathBuf]>,
     operation: &str,
+    surface: &str,
     recovery_policy: RecoveryPolicy,
     json: bool,
     live_args: LivePoolAdminArgs,
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
-        let config = scan_device_pool_config(pool, devs, operation);
+        let config = scan_device_pool_config(pool, devs, surface);
         super::live_owner::route_or_refuse_active_for_uuid_with_format_and_args(
             "dataset",
             operation,
@@ -435,7 +529,7 @@ fn open_filesystem_with_live_args(
         let metadata_dir =
             super::offline_pool::metadata_dir("dataset", operation, &config.pool_uuid);
 
-        let root_auth_key = super::root_authentication_key_or_exit(&format!("dataset {operation}"));
+        let root_auth_key = super::root_authentication_key_or_exit(surface);
         return match LocalFileSystem::open_with_block_devices_and_recovery_policy(
             &metadata_dir,
             devs,
@@ -448,7 +542,7 @@ fn open_filesystem_with_live_args(
             Ok(fs) => fs,
             Err(err) => {
                 eprintln!(
-                    "tidefsctl dataset {operation}: failed to open block-device-backed pool '{pool}' at {}: {err}",
+                    "tidefsctl {surface}: failed to open block-device-backed pool '{pool}' at {}: {err}",
                     metadata_dir.display()
                 );
                 process::exit(1);
@@ -462,25 +556,25 @@ fn open_filesystem_with_live_args(
 fn scan_device_pool_config(
     pool: &str,
     devices: &[PathBuf],
-    operation: &str,
+    surface: &str,
 ) -> tidefs_pool_scan::PoolConfig {
     let entries = match tidefs_pool_scan::scan_labels(devices) {
         Ok(entries) => entries,
         Err(err) => {
-            eprintln!("tidefsctl dataset {operation}: pool label scan failed for '{pool}': {err}");
+            eprintln!("tidefsctl {surface}: pool label scan failed for '{pool}': {err}");
             process::exit(1);
         }
     };
     let config = match tidefs_pool_scan::PoolAssembler::assemble(&entries, None) {
         Ok(config) => config,
         Err(err) => {
-            eprintln!("tidefsctl dataset {operation}: pool assembly failed for '{pool}': {err}");
+            eprintln!("tidefsctl {surface}: pool assembly failed for '{pool}': {err}");
             process::exit(1);
         }
     };
     if config.pool_name != pool {
         eprintln!(
-            "tidefsctl dataset {operation}: devices belong to pool '{}', not '{pool}'",
+            "tidefsctl {surface}: devices belong to pool '{}', not '{pool}'",
             config.pool_name
         );
         process::exit(1);
@@ -492,11 +586,12 @@ fn with_offline_pool_runtime<T>(
     pool: &str,
     devices: &[PathBuf],
     operation: &str,
+    surface: &str,
     json: bool,
     live_args: &LivePoolAdminArgs,
     mutate: impl FnOnce(&mut PoolRuntime) -> Result<T, String>,
 ) -> T {
-    let config = scan_device_pool_config(pool, devices, operation);
+    let config = scan_device_pool_config(pool, devices, surface);
     let lock_dir = PathBuf::from("/run/tidefs/import");
     let import_owner = match tidefs_pool_import::pool_import_owned(devices, &lock_dir, false, None)
     {
@@ -511,7 +606,7 @@ fn with_offline_pool_runtime<T>(
                 live_args.clone(),
             )
         }
-        Err(err) => exit_dataset_error(operation, format!("pool import failed: {err}"), json),
+        Err(err) => exit_dataset_error(surface, format!("pool import failed: {err}"), json),
     };
     let metadata_dir = super::offline_pool::metadata_dir("dataset", operation, &config.pool_uuid);
     let result = (|| -> Result<T, String> {
@@ -525,13 +620,13 @@ fn with_offline_pool_runtime<T>(
     })();
     let export_result = import_owner
         .export()
-        .map_err(|err| format!("failed to export Pool after dataset {operation}: {err}"));
+        .map_err(|err| format!("failed to export Pool after {surface}: {err}"));
     match (result, export_result) {
         (Ok(value), Ok(())) => value,
-        (Err(error), Ok(())) => exit_dataset_error(operation, error, json),
-        (Ok(_), Err(export_error)) => exit_dataset_error(operation, export_error, json),
+        (Err(error), Ok(())) => exit_dataset_error(surface, error, json),
+        (Ok(_), Err(export_error)) => exit_dataset_error(surface, export_error, json),
         (Err(error), Err(export_error)) => exit_dataset_error(
-            operation,
+            surface,
             format!("{error}; additionally {export_error}"),
             json,
         ),
@@ -562,17 +657,21 @@ fn dataset_id_from_name(name: &str) -> DatasetId {
     DatasetId::from_bytes(id_bytes)
 }
 
-fn exit_dataset_error(operation: &str, message: impl Into<String>, json: bool) -> ! {
+fn exit_dataset_error(surface: &str, message: impl Into<String>, json: bool) -> ! {
     let message = message.into();
+    let operation = surface
+        .rsplit_once(' ')
+        .map_or(surface, |(_, operation)| operation);
     if json {
         let out = serde_json::json!({
             "ok": false,
+            "command": surface,
             "operation": operation,
             "error": message,
         });
         print_json_or_exit(out);
     } else {
-        eprintln!("tidefsctl dataset {operation}: {message}");
+        eprintln!("tidefsctl {surface}: {message}");
     }
     process::exit(1);
 }
@@ -581,7 +680,7 @@ fn print_json_or_exit(value: serde_json::Value) {
     match serde_json::to_string_pretty(&value) {
         Ok(text) => println!("{text}"),
         Err(err) => {
-            eprintln!("tidefsctl dataset: failed to encode JSON output: {err}");
+            eprintln!("tidefsctl: failed to encode JSON output: {err}");
             process::exit(1);
         }
     }
@@ -616,31 +715,13 @@ fn parse_property_assignments_or_exit(
         if !seen.insert(assignment.key.clone()) {
             exit_dataset_error(
                 operation,
-                format!("duplicate dataset property key: {}", assignment.key),
+                format!("duplicate object property key: {}", assignment.key),
                 json,
             );
         }
         assignments.push(assignment);
     }
     assignments
-}
-
-fn parse_feature_names_or_exit(raw_values: &[String], operation: &str, json: bool) -> Vec<String> {
-    let mut features = Vec::with_capacity(raw_values.len());
-    let mut seen = std::collections::BTreeSet::new();
-    for raw in raw_values {
-        let feature = parser::parse_dataset_feature_name(raw)
-            .unwrap_or_else(|err| exit_dataset_error(operation, err, json));
-        if !seen.insert(feature.clone()) {
-            exit_dataset_error(
-                operation,
-                format!("duplicate dataset feature flag: {feature}"),
-                json,
-            );
-        }
-        features.push(feature);
-    }
-    features
 }
 
 fn parse_sync_or_exit(raw: &str, operation: &str, json: bool) -> SyncGuarantee {
@@ -774,6 +855,26 @@ fn dataset_type_matches(dataset_type: DatasetType, filter: Option<DatasetTypeArg
         .unwrap_or(true)
 }
 
+fn require_catalog_object_type(
+    catalog: &DatasetCatalog,
+    name: &str,
+    expected: DatasetTypeArg,
+) -> Result<DatasetId, String> {
+    let dataset_id = catalog
+        .lookup(name)
+        .map_err(|_| format!("{} '{name}' does not exist", expected.label()))?;
+    let (_, _, actual, _, _, _) = catalog
+        .get_by_id(&dataset_id)
+        .ok_or_else(|| format!("{} '{name}' lost its catalog identity", expected.label()))?;
+    if actual != expected.to_dataset_type() {
+        return Err(format!(
+            "'{name}' is a {actual}, not a {}",
+            expected.label()
+        ));
+    }
+    Ok(dataset_id)
+}
+
 fn dataset_rows_from_catalog(
     pool: &str,
     catalog: &DatasetCatalog,
@@ -800,7 +901,7 @@ fn print_dataset_rows(pool: Option<&str>, rows: &[DatasetListRow], json: bool) {
         print_json_or_exit(serde_json::json!({
             "ok": true,
             "pool": pool,
-            "datasets": dataset_rows_json(rows),
+            "items": dataset_rows_json(rows),
         }));
         return;
     }
@@ -857,9 +958,9 @@ fn dataset_capacity_projection_from_statfs(stats: FileSystemStatfs) -> DatasetCa
     }
 }
 
-fn list_pool_from_args(args: &DatasetListArgs) -> Option<String> {
+fn list_pool_from_args(args: &DatasetListArgs, surface: &str) -> Option<String> {
     if let Some(pool) = args.pool.as_deref() {
-        return Some(parse_pool_or_exit(pool, "list", args.json));
+        return Some(parse_pool_or_exit(pool, surface, args.json));
     }
     let devices = args
         .devices
@@ -867,11 +968,13 @@ fn list_pool_from_args(args: &DatasetListArgs) -> Option<String> {
         .filter(|devices| !devices.is_empty())?;
     let entries = match tidefs_pool_scan::scan_labels(devices) {
         Ok(entries) => entries,
-        Err(err) => exit_dataset_error("list", format!("pool label scan failed: {err}"), args.json),
+        Err(err) => {
+            exit_dataset_error(surface, format!("pool label scan failed: {err}"), args.json)
+        }
     };
     let config = match tidefs_pool_scan::PoolAssembler::assemble(&entries, None) {
         Ok(config) => config,
-        Err(err) => exit_dataset_error("list", format!("pool assembly failed: {err}"), args.json),
+        Err(err) => exit_dataset_error(surface, format!("pool assembly failed: {err}"), args.json),
     };
     Some(config.pool_name)
 }
@@ -883,11 +986,11 @@ fn require_create_admission(
 ) -> Result<(), String> {
     if path.contains('/') && !catalog.contains(parent) {
         return Err(format!(
-            "parent dataset '{parent}' does not exist in the catalog"
+            "parent object '{parent}' does not exist in the catalog"
         ));
     }
     if catalog.contains(path) {
-        return Err(format!("dataset '{path}' already exists in the catalog"));
+        return Err(format!("object '{path}' already exists in the catalog"));
     }
     Ok(())
 }
@@ -903,9 +1006,9 @@ fn validate_create_capacity(
         }
         (DatasetTypeArg::Volume, Some(size)) => Ok(Some(size)),
         (DatasetTypeArg::Volume, None) => {
-            Err("--size <bytes> is required for --type volume".to_string())
+            Err("--size <bytes> is required for volume creation".to_string())
         }
-        (_, Some(_)) => Err("--size is valid only with --type volume".to_string()),
+        (_, Some(_)) => Err("--size is valid only for volume creation".to_string()),
         (_, None) => Ok(None),
     }
 }
@@ -950,7 +1053,7 @@ fn require_destroy_admission(
         return Ok(());
     }
     Err(format!(
-        "dataset '{path}' has {}; retry with --force to destroy it",
+        "object '{path}' has {}; retry with --force to destroy it",
         admission.hazards().join(", ")
     ))
 }
@@ -978,88 +1081,47 @@ fn destroy_catalog_subtree(catalog: &mut DatasetCatalog, path: &str) -> Result<u
     Ok(destroyed + 1)
 }
 
-fn handle_create(args: DatasetCreateArgs) {
-    let _guard = super::authz::require_local_only("dataset create");
+fn handle_create(args: DatasetCreateArgs, object_type: DatasetTypeArg) {
+    let command = object_type.command("create");
+    let _guard = super::authz::require_local_only(command);
 
-    let target = parse_target_or_exit(&args.target, "create", args.json);
+    let target = parse_target_or_exit(&args.target, command, args.json);
     let devices_ref = args.devices.as_deref();
     let full_path = target.dataset.clone();
     let (parent, leaf) = create_parent_and_leaf(&full_path);
-    let sync_guarantee = parse_sync_or_exit(&args.sync, "create", args.json);
-    let properties = parse_property_assignments_or_exit(&args.properties, "create", args.json);
-    let features = parse_feature_names_or_exit(&args.features, "create", args.json);
-    let dataset_type = args.dataset_type.to_dataset_type();
-    let capacity = validate_create_capacity(args.dataset_type, args.size)
-        .unwrap_or_else(|err| exit_dataset_error("create", err, args.json));
-    let mountpoint = args
-        .mountpoint
-        .as_ref()
-        .map(|path| path.display().to_string());
+    let sync_guarantee = parse_sync_or_exit(&args.sync, command, args.json);
+    let properties = parse_property_assignments_or_exit(&args.properties, command, args.json);
+    let dataset_type = object_type.to_dataset_type();
+    let capacity = validate_create_capacity(object_type, args.size)
+        .unwrap_or_else(|err| exit_dataset_error(command, err, args.json));
 
     if full_path == "root" {
         exit_dataset_error(
-            "create",
-            "'root' dataset cannot be re-created; it is created automatically with the pool",
+            command,
+            "'root' filesystem cannot be re-created; it is created automatically with the pool",
             args.json,
         );
     }
 
-    if args.dataset_type == DatasetTypeArg::Snapshot {
-        exit_dataset_error(
-            "create",
-            "snapshots must be created by the owning filesystem or volume engine",
-            args.json,
-        );
-    }
-
-    match args.dataset_type {
+    match object_type {
         DatasetTypeArg::Filesystem => {
-            if mountpoint.is_some() {
-                exit_dataset_error(
-                    "create",
-                    "--mountpoint is not available for local filesystem creation; mount the dataset explicitly with 'pool mount --dataset'",
-                    args.json,
-                );
-            }
-            if !features.is_empty() {
-                exit_dataset_error(
-                    "create",
-                    "filesystem feature flags are not available until the named filesystem engine consumes them",
-                    args.json,
-                );
-            }
             if sync_guarantee != SyncGuarantee::Local {
                 exit_dataset_error(
-                    "create",
+                    command,
                     "local filesystem creation supports only --sync local; clustered guarantees require committed cluster ownership",
                     args.json,
                 );
             }
         }
         DatasetTypeArg::Volume => {
-            if mountpoint.is_some() {
-                exit_dataset_error(
-                    "create",
-                    "--mountpoint is not valid for a block volume",
-                    args.json,
-                );
-            }
-            if !features.is_empty() {
-                exit_dataset_error(
-                    "create",
-                    "volume feature flags are not available until the volume engine consumes them",
-                    args.json,
-                );
-            }
             if sync_guarantee != SyncGuarantee::Local {
                 exit_dataset_error(
-                    "create",
+                    command,
                     "local volume creation supports only --sync local; clustered guarantees require committed cluster ownership",
                     args.json,
                 );
             }
         }
-        DatasetTypeArg::Snapshot => unreachable!("snapshot create was refused above"),
     }
 
     let live_args = super::live_owner::live_admin_args([
@@ -1068,27 +1130,11 @@ fn handle_create(args: DatasetCreateArgs) {
         ("parent", LivePoolAdminArg::String(parent.clone())),
         (
             "type",
-            LivePoolAdminArg::String(args.dataset_type.label().to_string()),
-        ),
-        (
-            "mountpoint",
-            super::live_owner::live_admin_optional_string(
-                mountpoint.as_ref().map(|path| path.to_string()),
-            ),
+            LivePoolAdminArg::String(object_type.label().to_string()),
         ),
         (
             "properties",
             LivePoolAdminArg::Array(property_assignments_live_admin_args(&properties)),
-        ),
-        (
-            "features",
-            LivePoolAdminArg::Array(
-                features
-                    .iter()
-                    .cloned()
-                    .map(LivePoolAdminArg::String)
-                    .collect(),
-            ),
         ),
         ("size", super::live_owner::live_admin_optional_u64(capacity)),
         ("sync", LivePoolAdminArg::String(args.sync.clone())),
@@ -1096,7 +1142,7 @@ fn handle_create(args: DatasetCreateArgs) {
     let dataset_id = dataset_id_from_name(&full_path);
     let property_set = property_set_from_assignments(&properties);
     let geometry = if let Some(devs) = devices_ref.filter(|devs| !devs.is_empty()) {
-        let config = scan_device_pool_config(&target.pool, devs, "create");
+        let config = scan_device_pool_config(&target.pool, devs, command);
         let lock_dir = PathBuf::from("/run/tidefs/import");
         let import_owner = match tidefs_pool_import::pool_import_owned(devs, &lock_dir, false, None)
         {
@@ -1112,7 +1158,7 @@ fn handle_create(args: DatasetCreateArgs) {
                 )
             }
             Err(err) => {
-                exit_dataset_error("create", format!("pool import failed: {err}"), args.json)
+                exit_dataset_error(command, format!("pool import failed: {err}"), args.json)
             }
         };
         let metadata_dir =
@@ -1127,10 +1173,9 @@ fn handle_create(args: DatasetCreateArgs) {
             )
             .map_err(|err| format!("failed to open canonical Pool runtime: {err}"))?;
             require_create_admission(runtime.dataset_catalog(), &full_path, &parent)?;
-            match args.dataset_type {
+            match object_type {
                 DatasetTypeArg::Filesystem => {
-                    let root_authentication_key =
-                        super::root_authentication_key_or_exit("dataset create");
+                    let root_authentication_key = super::root_authentication_key_or_exit(command);
                     tidefs_local_filesystem::create_filesystem_dataset_in_pool_runtime(
                         &mut runtime,
                         &full_path,
@@ -1154,18 +1199,17 @@ fn handle_create(args: DatasetCreateArgs) {
                     )
                     .map(Some)
                     .map_err(|err| format!("failed to create canonical Pool volume: {err}")),
-                DatasetTypeArg::Snapshot => unreachable!("snapshot create was refused above"),
             }
         })();
         let export_result = import_owner
             .export()
-            .map_err(|err| format!("failed to export Pool after volume creation: {err}"));
+            .map_err(|err| format!("failed to export Pool after {command}: {err}"));
         match (result, export_result) {
             (Ok(geometry), Ok(())) => geometry,
-            (Err(error), Ok(())) => exit_dataset_error("create", error, args.json),
-            (Ok(_), Err(export_error)) => exit_dataset_error("create", export_error, args.json),
+            (Err(error), Ok(())) => exit_dataset_error(command, error, args.json),
+            (Ok(_), Err(export_error)) => exit_dataset_error(command, export_error, args.json),
             (Err(error), Err(export_error)) => exit_dataset_error(
-                "create",
+                command,
                 format!("{error}; additionally {export_error}"),
                 args.json,
             ),
@@ -1185,18 +1229,20 @@ fn handle_create(args: DatasetCreateArgs) {
             "ok": true,
             "operation": "create",
             "pool": target.pool,
-            "dataset": full_path,
+            "name": full_path,
             "id": dataset_id.to_string(),
             "type": dataset_type.to_string(),
             "size": geometry.as_ref().map(|geometry| geometry.capacity_bytes),
             "block_size": geometry.as_ref().map(|geometry| geometry.block_size_bytes),
             "parent": parent,
-            "mountpoint": mountpoint,
             "properties": property_assignments_json(&properties),
-            "features": features,
         }));
     } else {
-        println!("dataset '{full_path}' created in pool '{}'", target.pool);
+        println!(
+            "{} '{full_path}' created in pool '{}'",
+            object_type.label(),
+            target.pool
+        );
         if let Some(geometry) = geometry {
             println!(
                 "  id={}  parent='{parent}'  size={}  block_size={}",
@@ -1212,8 +1258,9 @@ fn handle_create(args: DatasetCreateArgs) {
         }
     }
 }
-fn handle_list(args: DatasetListArgs) {
-    let pool = list_pool_from_args(&args);
+fn handle_list(args: DatasetListArgs, object_type: DatasetTypeArg) {
+    let command = object_type.command("list");
+    let pool = list_pool_from_args(&args, command);
 
     let Some(pool) = pool else {
         print_dataset_rows(None, &[], args.json);
@@ -1222,40 +1269,46 @@ fn handle_list(args: DatasetListArgs) {
 
     let live_args = super::live_owner::live_admin_args([(
         "type",
-        super::live_owner::live_admin_optional_string(
-            args.dataset_type
-                .map(|dataset_type| dataset_type.label().to_string()),
-        ),
+        LivePoolAdminArg::String(object_type.label().to_string()),
     )]);
     let (catalog, capacity) = if let Some(devices) = args
         .devices
         .as_deref()
         .filter(|devices| !devices.is_empty())
     {
-        with_offline_pool_runtime(&pool, devices, "list", args.json, &live_args, |runtime| {
-            Ok((
-                runtime.dataset_catalog().clone(),
-                DatasetCapacityProjection::default(),
-            ))
-        })
+        with_offline_pool_runtime(
+            &pool,
+            devices,
+            "list",
+            command,
+            args.json,
+            &live_args,
+            |runtime| {
+                Ok((
+                    runtime.dataset_catalog().clone(),
+                    DatasetCapacityProjection::default(),
+                ))
+            },
+        )
     } else {
         super::live_owner::route_with_format_and_args(
             "dataset", "list", &pool, args.json, live_args,
         )
     };
-    let rows = dataset_rows_from_catalog(&pool, &catalog, args.dataset_type, capacity);
+    let rows = dataset_rows_from_catalog(&pool, &catalog, Some(object_type), capacity);
     print_dataset_rows(Some(&pool), &rows, args.json);
 }
 
 fn handle_resize(args: DatasetResizeArgs) {
-    let _guard = super::authz::require_local_only("dataset resize");
-    let target = parse_target_or_exit(&args.target, "resize", args.json);
+    let command = "volume resize";
+    let _guard = super::authz::require_local_only("volume resize");
+    let target = parse_target_or_exit(&args.target, command, args.json);
     if target.dataset == "root" {
-        exit_dataset_error("resize", "'root' dataset is not a volume", args.json);
+        exit_dataset_error(command, "'root' filesystem is not a volume", args.json);
     }
     if args.size == 0 || args.size % 4096 != 0 {
         exit_dataset_error(
-            "resize",
+            command,
             "--size must be nonzero and aligned to 4096 bytes",
             args.json,
         );
@@ -1263,6 +1316,7 @@ fn handle_resize(args: DatasetResizeArgs) {
 
     let live_args = super::live_owner::live_admin_args([
         ("name", LivePoolAdminArg::String(target.dataset.clone())),
+        ("type", LivePoolAdminArg::String("volume".to_string())),
         ("size", LivePoolAdminArg::U64(args.size)),
     ]);
     let result = if let Some(devices) = args
@@ -1274,9 +1328,15 @@ fn handle_resize(args: DatasetResizeArgs) {
             &target.pool,
             devices,
             "resize",
+            command,
             args.json,
             &live_args,
             |runtime| {
+                require_catalog_object_type(
+                    runtime.dataset_catalog(),
+                    &target.dataset,
+                    DatasetTypeArg::Volume,
+                )?;
                 runtime
                     .resize_volume(&target.dataset, args.size)
                     .map_err(|err| err.to_string())
@@ -1296,7 +1356,7 @@ fn handle_resize(args: DatasetResizeArgs) {
             "ok": true,
             "operation": "resize",
             "pool": target.pool,
-            "dataset": target.dataset,
+            "volume": target.dataset,
             "size": result.geometry.capacity_bytes,
             "block_size": result.geometry.block_size_bytes,
             "generation": result.generation,
@@ -1304,7 +1364,7 @@ fn handle_resize(args: DatasetResizeArgs) {
         }));
     } else {
         println!(
-            "dataset '{}' resized in pool '{}'\n  size={}  block_size={}  generation={}  resize_generation={}",
+            "volume '{}' resized in pool '{}'\n  size={}  block_size={}  generation={}  resize_generation={}",
             target.dataset,
             target.pool,
             result.geometry.capacity_bytes,
@@ -1315,22 +1375,28 @@ fn handle_resize(args: DatasetResizeArgs) {
     }
 }
 
-fn handle_rename(args: DatasetRenameArgs) {
-    let _guard = super::authz::require_local_only("dataset rename");
+fn handle_rename(args: DatasetRenameArgs, object_type: DatasetTypeArg) {
+    let command = object_type.command("rename");
+    let _guard = super::authz::require_local_only(command);
 
     let old_name = &args.old_name;
     let new_name = &args.new_name;
 
     if old_name == "root" {
-        eprintln!("tidefsctl dataset rename: 'root' dataset cannot be renamed");
+        eprintln!("tidefsctl {command}: 'root' filesystem cannot be renamed");
         process::exit(1);
     }
     if new_name == "root" {
-        eprintln!("tidefsctl dataset rename: cannot rename to 'root'");
+        eprintln!("tidefsctl {command}: cannot rename to 'root'");
         process::exit(1);
     }
 
     let live_args = super::live_owner::live_admin_args([
+        ("name", LivePoolAdminArg::String(args.old_name.clone())),
+        (
+            "type",
+            LivePoolAdminArg::String(object_type.label().to_string()),
+        ),
         ("old_name", LivePoolAdminArg::String(args.old_name.clone())),
         ("new_name", LivePoolAdminArg::String(args.new_name.clone())),
     ]);
@@ -1343,9 +1409,11 @@ fn handle_rename(args: DatasetRenameArgs) {
             &args.pool,
             devices,
             "rename",
+            command,
             false,
             &live_args,
             |runtime| {
+                require_catalog_object_type(runtime.dataset_catalog(), old_name, object_type)?;
                 runtime
                     .rename_dataset(old_name, new_name)
                     .map_err(|err| err.to_string())
@@ -1356,23 +1424,30 @@ fn handle_rename(args: DatasetRenameArgs) {
     }
 
     println!(
-        "dataset '{old_name}' renamed to '{new_name}' in pool '{}'",
+        "{} '{old_name}' renamed to '{new_name}' in pool '{}'",
+        object_type.label(),
         args.pool
     );
 }
-fn handle_set_strategy(args: DatasetSetStrategyArgs) {
+fn handle_set_strategy(args: DatasetSetStrategyArgs, object_type: DatasetTypeArg) {
     let mutates = !args.enable.is_empty() || !args.disable.is_empty();
-    let _guard = super::authz::require_local_only_when_mutating("dataset set-strategy", mutates);
+    let command = object_type.command("set-strategy");
+    let _guard = super::authz::require_local_only_when_mutating(command, mutates);
 
     let devices_ref = args.devices.as_deref();
     let mut fs = open_filesystem_with_live_args(
         &args.pool,
         devices_ref,
         "set-strategy",
+        command,
         RecoveryPolicy::default(),
         false,
         super::live_owner::live_admin_args([
             ("name", LivePoolAdminArg::String(args.name.clone())),
+            (
+                "type",
+                LivePoolAdminArg::String(object_type.label().to_string()),
+            ),
             (
                 "enable",
                 LivePoolAdminArg::Array(
@@ -1401,21 +1476,20 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
         ]),
     );
 
-    // Verify dataset exists in catalog
-    if !fs.dataset_catalog().contains(&args.name) {
-        eprintln!(
-            "tidefsctl dataset set-strategy: dataset '{}' does not exist in the catalog",
-            args.name
-        );
-        process::exit(1);
-    }
+    require_catalog_object_type(fs.dataset_catalog(), &args.name, object_type).unwrap_or_else(
+        |error| {
+            eprintln!("tidefsctl {command}: {error}");
+            process::exit(1);
+        },
+    );
+
     let target_id = fs
         .dataset_catalog()
         .lookup(&args.name)
         .expect("existing dataset retains identity");
     if *target_id.as_bytes() != fs.mounted_dataset_id() {
         eprintln!(
-            "tidefsctl dataset set-strategy: named filesystem feature flags require that dataset's mounted owner; refusing to mutate the root filesystem"
+            "tidefsctl {command}: named filesystem feature flags require that filesystem's mounted owner; refusing to mutate the root filesystem"
         );
         process::exit(1);
     }
@@ -1424,9 +1498,9 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
     if args.list {
         let ff = fs.feature_flags();
         if ff.is_empty() {
-            println!("dataset '{}' has no feature flags enabled", args.name);
+            println!("filesystem '{}' has no feature flags enabled", args.name);
         } else {
-            println!("dataset '{}' feature flags:", args.name);
+            println!("filesystem '{}' feature flags:", args.name);
             for (class, name, value) in ff.all_features() {
                 println!("  {class}  {name}  ({})", value.to_u8());
             }
@@ -1445,7 +1519,7 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
             "auto" => None,
             other => {
                 eprintln!(
-                    "tidefsctl dataset set-strategy: unknown feature class '{other}'; expected auto, compat, ro_compat, or incompat"
+                    "tidefsctl {command}: unknown feature class '{other}'; expected auto, compat, ro_compat, or incompat"
                 );
                 process::exit(1);
             }
@@ -1467,13 +1541,13 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
                     Some(class) => class,
                     None => {
                         eprintln!(
-                            "tidefsctl dataset set-strategy: cannot auto-resolve class for '{first}' (unknown feature); specify --class explicitly"
+                            "tidefsctl {command}: cannot auto-resolve class for '{first}' (unknown feature); specify --class explicitly"
                         );
                         process::exit(1);
                     }
                 },
                 None => {
-                    eprintln!("tidefsctl dataset set-strategy: invalid feature name '{first}'");
+                    eprintln!("tidefsctl {command}: invalid feature name '{first}'");
                     process::exit(1);
                 }
             }
@@ -1492,7 +1566,7 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
             Some(name) => {
                 if !feature_available_in_current_build(&name) {
                     eprintln!(
-                        "tidefsctl dataset set-strategy: feature '{feature_str}' requires a data-policy build"
+                        "tidefsctl {command}: feature '{feature_str}' requires a data-policy build"
                     );
                     process::exit(1);
                 }
@@ -1500,7 +1574,7 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
                     Ok(flags) => flags,
                     Err(err) => {
                         eprintln!(
-                            "tidefsctl dataset set-strategy: filesystem mutation requires reopen: {err}"
+                            "tidefsctl {command}: filesystem mutation requires reopen: {err}"
                         );
                         process::exit(1);
                     }
@@ -1511,16 +1585,14 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
                         changed = true;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "tidefsctl dataset set-strategy: failed to enable '{feature_str}': {e}"
-                        );
+                        eprintln!("tidefsctl {command}: failed to enable '{feature_str}': {e}");
                         process::exit(1);
                     }
                 }
             }
             None => {
                 eprintln!(
-                    "tidefsctl dataset set-strategy: invalid feature name '{feature_str}'; expected format org.tidefs:<name>"
+                    "tidefsctl {command}: invalid feature name '{feature_str}'; expected format org.tidefs:<name>"
                 );
                 process::exit(1);
             }
@@ -1539,7 +1611,7 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
                     Ok(flags) => flags,
                     Err(err) => {
                         eprintln!(
-                            "tidefsctl dataset set-strategy: filesystem mutation requires reopen: {err}"
+                            "tidefsctl {command}: filesystem mutation requires reopen: {err}"
                         );
                         process::exit(1);
                     }
@@ -1550,16 +1622,14 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
                         changed = true;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "tidefsctl dataset set-strategy: failed to disable '{feature_str}': {e}"
-                        );
+                        eprintln!("tidefsctl {command}: failed to disable '{feature_str}': {e}");
                         process::exit(1);
                     }
                 }
             }
             None => {
                 eprintln!(
-                    "tidefsctl dataset set-strategy: invalid feature name '{feature_str}'; expected format org.tidefs:<name>"
+                    "tidefsctl {command}: invalid feature name '{feature_str}'; expected format org.tidefs:<name>"
                 );
                 process::exit(1);
             }
@@ -1570,33 +1640,32 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
     if changed {
         match fs.persist_feature_flags() {
             Ok(()) => {
-                eprintln!("feature flags persisted for dataset '{}'", args.name);
+                eprintln!("feature flags persisted for filesystem '{}'", args.name);
                 // Refresh runtime policies so new writes use the updated
                 // compression/dedup settings immediately, without remount.
                 #[cfg(feature = "data-policy")]
                 if let Err(e) = fs.refresh_policies_from_features() {
-                    eprintln!(
-                        "tidefsctl dataset set-strategy: failed to refresh mounted policies: {e}"
-                    );
+                    eprintln!("tidefsctl {command}: failed to refresh mounted policies: {e}");
                     process::exit(1);
                 }
             }
             Err(e) => {
-                eprintln!("tidefsctl dataset set-strategy: failed to persist feature flags: {e}");
+                eprintln!("tidefsctl {command}: failed to persist feature flags: {e}");
                 process::exit(1);
             }
         }
     }
 }
-/// Enable all supported features that are not yet enabled on the dataset.
+/// Enable all supported features that are not yet enabled on the filesystem.
 ///
 /// Uses [`tidefs_dataset_feature_flags::FeatureFlags::supported_features`]
 /// (the upgrade table) to enumerate every feature the current software version
 /// understands, then enables each one that is not already active.  Features
 /// are enabled with prerequisite checking (transitive dependencies are
 /// automatically satisfied in dependency order).
-fn handle_upgrade(args: DatasetUpgradeArgs) {
-    let _guard = super::authz::require_local_only("dataset upgrade");
+fn handle_upgrade(args: DatasetUpgradeArgs, object_type: DatasetTypeArg) {
+    let command = object_type.command("upgrade");
+    let _guard = super::authz::require_local_only(command);
 
     use tidefs_dataset_feature_flags::SupportedFeaturesV1;
     use tidefs_types_dataset_feature_flags_core::get_feature_class;
@@ -1606,26 +1675,32 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
         &args.pool,
         devices_ref,
         "upgrade",
+        command,
         RecoveryPolicy::default(),
         false,
-        super::live_owner::live_admin_args([("name", LivePoolAdminArg::String(args.name.clone()))]),
+        super::live_owner::live_admin_args([
+            ("name", LivePoolAdminArg::String(args.name.clone())),
+            (
+                "type",
+                LivePoolAdminArg::String(object_type.label().to_string()),
+            ),
+        ]),
     );
 
-    // Verify dataset exists in catalog
-    if !fs.dataset_catalog().contains(&args.name) {
-        eprintln!(
-            "tidefsctl dataset upgrade: dataset '{}' does not exist in the catalog",
-            args.name
-        );
-        process::exit(1);
-    }
+    require_catalog_object_type(fs.dataset_catalog(), &args.name, object_type).unwrap_or_else(
+        |error| {
+            eprintln!("tidefsctl {command}: {error}");
+            process::exit(1);
+        },
+    );
+
     let target_id = fs
         .dataset_catalog()
         .lookup(&args.name)
         .expect("existing dataset retains identity");
     if *target_id.as_bytes() != fs.mounted_dataset_id() {
         eprintln!(
-            "tidefsctl dataset upgrade: named filesystem feature flags require that dataset's mounted owner; refusing to mutate the root filesystem"
+            "tidefsctl {command}: named filesystem feature flags require that filesystem's mounted owner; refusing to mutate the root filesystem"
         );
         process::exit(1);
     }
@@ -1651,7 +1726,7 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
 
     if to_enable.is_empty() {
         println!(
-            "dataset '{}': all {} supported features are already enabled",
+            "filesystem '{}': all {} supported features are already enabled",
             args.name,
             available.len()
         );
@@ -1659,7 +1734,7 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
     }
 
     println!(
-        "dataset '{}': upgrading from {} enabled to {} supported features...",
+        "filesystem '{}': upgrading from {} enabled to {} supported features...",
         args.name,
         ff.len(),
         available.len()
@@ -1687,9 +1762,7 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
             let enable_result = match fs.feature_flags_mut() {
                 Ok(flags) => flags.enable_feature_with_prereqs(name.clone(), class),
                 Err(err) => {
-                    eprintln!(
-                        "tidefsctl dataset upgrade: filesystem mutation requires reopen: {err}"
-                    );
+                    eprintln!("tidefsctl {command}: filesystem mutation requires reopen: {err}");
                     process::exit(1);
                 }
             };
@@ -1723,7 +1796,7 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
                     Ok(flags) => flags.enable_feature_with_prereqs(name.clone(), class),
                     Err(err) => {
                         eprintln!(
-                            "tidefsctl dataset upgrade: filesystem mutation requires reopen: {err}"
+                            "tidefsctl {command}: filesystem mutation requires reopen: {err}"
                         );
                         process::exit(1);
                     }
@@ -1743,22 +1816,22 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
     if enabled_count > 0 {
         match fs.persist_feature_flags() {
             Ok(()) => {
-                eprintln!("feature flags persisted for dataset '{}'", args.name);
+                eprintln!("feature flags persisted for filesystem '{}'", args.name);
                 #[cfg(feature = "data-policy")]
                 if let Err(e) = fs.refresh_policies_from_features() {
-                    eprintln!("tidefsctl dataset upgrade: failed to refresh mounted policies: {e}");
+                    eprintln!("tidefsctl {command}: failed to refresh mounted policies: {e}");
                     process::exit(1);
                 }
             }
             Err(e) => {
-                eprintln!("tidefsctl dataset upgrade: failed to persist feature flags: {e}");
+                eprintln!("tidefsctl {command}: failed to persist feature flags: {e}");
                 process::exit(1);
             }
         }
     }
 
     println!(
-        "dataset '{}' upgrade complete: {} enabled, {} skipped, {} failed",
+        "filesystem '{}' upgrade complete: {} enabled, {} skipped, {} failed",
         args.name,
         enabled_count,
         skipped_count,
@@ -1774,29 +1847,38 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
     }
 }
 
-fn handle_get(args: DatasetGetArgs) {
-    let target = parse_target_or_exit(&args.target, "get", args.json);
-    let property = parse_property_key_or_exit(&args.property, "get", args.json);
+fn handle_get(args: DatasetGetArgs, object_type: DatasetTypeArg) {
+    let command = object_type.command("get");
+    let target = parse_target_or_exit(&args.target, command, args.json);
+    let property = parse_property_key_or_exit(&args.property, command, args.json);
     let fs = open_filesystem_with_live_args(
         &target.pool,
         args.devices.as_deref(),
         "get",
+        command,
         RecoveryPolicy::ReadOnly,
         args.json,
         super::live_owner::live_admin_args([
             ("target", LivePoolAdminArg::String(args.target.clone())),
             ("name", LivePoolAdminArg::String(target.dataset.clone())),
+            (
+                "type",
+                LivePoolAdminArg::String(object_type.label().to_string()),
+            ),
             ("property", LivePoolAdminArg::String(property.to_string())),
         ]),
     );
 
+    require_catalog_object_type(fs.dataset_catalog(), &target.dataset, object_type)
+        .unwrap_or_else(|error| exit_dataset_error(command, error, args.json));
+
     let path = target.dataset.as_str();
     // Resolve properties with full parent-chain inheritance.
-    let effective = match fs.dataset_catalog().get_properties_with_inheritance(&path) {
+    let effective = match fs.dataset_catalog().get_properties_with_inheritance(path) {
         Ok(props) => props,
         Err(e) => {
             exit_dataset_error(
-                "get",
+                command,
                 format!("cannot read properties for '{}': {e}", target.dataset),
                 args.json,
             );
@@ -1813,7 +1895,8 @@ fn handle_get(args: DatasetGetArgs) {
                     "ok": true,
                     "operation": "get",
                     "pool": target.pool,
-                    "dataset": target.dataset,
+                    "name": target.dataset,
+                    "type": object_type.label(),
                     "property": property,
                     "value": property_value_json(&entry.value),
                     "display_value": entry.value.to_string(),
@@ -1827,28 +1910,34 @@ fn handle_get(args: DatasetGetArgs) {
         }
         None => {
             exit_dataset_error(
-                "get",
+                command,
                 format!("internal error resolving '{property}'"),
                 args.json,
             );
         }
     }
 }
-fn handle_set(args: DatasetSetArgs) {
-    let _guard = super::authz::require_local_only("dataset set");
+fn handle_set(args: DatasetSetArgs, object_type: DatasetTypeArg) {
+    let command = object_type.command("set");
+    let _guard = super::authz::require_local_only(command);
 
-    let target = parse_target_or_exit(&args.target, "set", args.json);
-    let assignment = parse_property_assignment_or_exit(&args.assignment, "set", args.json);
+    let target = parse_target_or_exit(&args.target, command, args.json);
+    let assignment = parse_property_assignment_or_exit(&args.assignment, command, args.json);
     let live_assignment = normalized_assignment(&assignment);
     let mut fs = open_filesystem_with_live_args(
         &target.pool,
         args.devices.as_deref(),
         "set",
+        command,
         RecoveryPolicy::RepairWriteback,
         args.json,
         super::live_owner::live_admin_args([
             ("target", LivePoolAdminArg::String(args.target.clone())),
             ("name", LivePoolAdminArg::String(target.dataset.clone())),
+            (
+                "type",
+                LivePoolAdminArg::String(object_type.label().to_string()),
+            ),
             (
                 "property",
                 LivePoolAdminArg::String(assignment.key.to_string()),
@@ -1863,14 +1952,17 @@ fn handle_set(args: DatasetSetArgs) {
         ]),
     );
 
+    require_catalog_object_type(fs.dataset_catalog(), &target.dataset, object_type)
+        .unwrap_or_else(|error| exit_dataset_error(command, error, args.json));
+
     let registry = tidefs_dataset_properties::build_registry();
     let key = PropertyKey::new(&assignment.key);
 
     let def = match tidefs_dataset_properties::lookup_property(&registry, &key) {
         Some(def) => def,
         None => exit_dataset_error(
-            "set",
-            format!("unsupported dataset property key: {}", assignment.key),
+            command,
+            format!("unsupported object property key: {}", assignment.key),
             args.json,
         ),
     };
@@ -1879,13 +1971,13 @@ fn handle_set(args: DatasetSetArgs) {
     let path = target.dataset.as_str();
     let existing_props = fs
         .dataset_catalog()
-        .get_properties(&path)
+        .get_properties(path)
         .unwrap_or_default();
 
     if let Err(verr) =
         tidefs_dataset_properties::validate_set(&key, &assignment.value, def, &existing_props)
     {
-        exit_dataset_error("set", format!("validation failed: {verr}"), args.json);
+        exit_dataset_error(command, format!("validation failed: {verr}"), args.json);
     }
 
     // Apply the change: clear or set.
@@ -1898,16 +1990,16 @@ fn handle_set(args: DatasetSetArgs) {
 
     let catalog = fs.dataset_catalog_mut().unwrap_or_else(|err| {
         exit_dataset_error(
-            "set",
+            command,
             format!("filesystem mutation requires reopen: {err}"),
             args.json,
         )
     });
-    match catalog.set_properties(&path, &props) {
+    match catalog.set_properties(path, &props) {
         Ok(()) => {
             if let Err(e) = fs.persist_dataset_catalog() {
                 exit_dataset_error(
-                    "set",
+                    command,
                     format!("property set but catalog persist failed: {e}"),
                     args.json,
                 );
@@ -1917,7 +2009,8 @@ fn handle_set(args: DatasetSetArgs) {
                     "ok": true,
                     "operation": "set",
                     "pool": target.pool,
-                    "dataset": target.dataset,
+                    "name": target.dataset,
+                    "type": object_type.label(),
                     "property": assignment.key,
                     "value": property_value_json(&assignment.value),
                     "display_value": assignment.value.to_string(),
@@ -1931,7 +2024,7 @@ fn handle_set(args: DatasetSetArgs) {
         }
         Err(e) => {
             exit_dataset_error(
-                "set",
+                command,
                 format!("cannot write properties for '{}': {e}", target.dataset),
                 args.json,
             );
@@ -1939,15 +2032,21 @@ fn handle_set(args: DatasetSetArgs) {
     }
 }
 
-fn handle_list_props(args: DatasetListPropsArgs) {
+fn handle_list_props(args: DatasetListPropsArgs, object_type: DatasetTypeArg) {
+    let command = object_type.command("list-props");
     let fs = open_filesystem_with_live_args(
         &args.pool,
         args.devices.as_deref(),
         "list-props",
+        command,
         RecoveryPolicy::ReadOnly,
         false,
         super::live_owner::live_admin_args([
             ("name", LivePoolAdminArg::String(args.name.clone())),
+            (
+                "type",
+                LivePoolAdminArg::String(object_type.label().to_string()),
+            ),
             (
                 "family",
                 super::live_owner::live_admin_optional_string(args.family.clone()),
@@ -1955,12 +2054,19 @@ fn handle_list_props(args: DatasetListPropsArgs) {
         ]),
     );
 
+    require_catalog_object_type(fs.dataset_catalog(), &args.name, object_type).unwrap_or_else(
+        |error| {
+            eprintln!("tidefsctl {} list-props: {error}", object_type.label());
+            process::exit(1);
+        },
+    );
+
     let path = args.name.as_str();
-    let props = match fs.dataset_catalog().get_properties(&path) {
+    let props = match fs.dataset_catalog().get_properties(path) {
         Ok(props) => props,
         Err(e) => {
             eprintln!(
-                "tidefsctl dataset list-props: cannot read properties for '{}': {e}",
+                "tidefsctl {command}: cannot read properties for '{}': {e}",
                 &args.name
             );
             process::exit(1);
@@ -1981,7 +2087,7 @@ fn handle_list_props(args: DatasetListPropsArgs) {
             "performance" | "perf" => tidefs_dataset_properties::PropertyFamily::Performance,
             "snapshot" => tidefs_dataset_properties::PropertyFamily::Snapshot,
             other => {
-                eprintln!("tidefsctl dataset list-props: unknown family '{}'", other);
+                eprintln!("tidefsctl {command}: unknown family '{}'", other);
                 eprintln!("  valid families: compression, encryption, space, layout, integrity, access, performance, snapshot");
                 process::exit(1);
             }
@@ -2031,19 +2137,24 @@ fn handle_list_props(args: DatasetListPropsArgs) {
         );
     }
 }
-fn handle_destroy(args: DatasetDestroyArgs) {
-    let _guard = super::authz::require_local_only("dataset destroy");
+fn handle_destroy(args: DatasetDestroyArgs, object_type: DatasetTypeArg) {
+    let command = object_type.command("destroy");
+    let _guard = super::authz::require_local_only(command);
 
-    let target = parse_target_or_exit(&args.target, "destroy", args.json);
+    let target = parse_target_or_exit(&args.target, command, args.json);
     let name = target.dataset.clone();
 
     if name == "root" {
-        exit_dataset_error("destroy", "'root' dataset cannot be destroyed", args.json);
+        exit_dataset_error(command, "'root' filesystem cannot be destroyed", args.json);
     }
 
     let live_args = super::live_owner::live_admin_args([
         ("target", LivePoolAdminArg::String(args.target.clone())),
         ("name", LivePoolAdminArg::String(name.clone())),
+        (
+            "type",
+            LivePoolAdminArg::String(object_type.label().to_string()),
+        ),
         ("force", LivePoolAdminArg::Bool(args.force)),
     ]);
 
@@ -2056,18 +2167,12 @@ fn handle_destroy(args: DatasetDestroyArgs) {
             &target.pool,
             devices,
             "destroy",
+            command,
             args.json,
             &live_args,
             |runtime| {
-                let dataset_id = runtime
-                    .dataset_catalog()
-                    .lookup(&name)
-                    .map_err(|_| format!("dataset '{name}' does not exist in the catalog"))?;
-                let (_, _, dataset_type, _, _, _) = runtime
-                    .dataset_catalog()
-                    .get_by_id(&dataset_id)
-                    .ok_or_else(|| format!("dataset '{name}' lost its catalog identity"))?;
-                if dataset_type != DatasetType::Volume {
+                require_catalog_object_type(runtime.dataset_catalog(), &name, object_type)?;
+                if object_type != DatasetTypeArg::Volume {
                     return Ok(None);
                 }
                 runtime
@@ -2082,8 +2187,9 @@ fn handle_destroy(args: DatasetDestroyArgs) {
                     "ok": true,
                     "operation": "destroy",
                     "pool": target.pool,
-                    "dataset": name,
-                    "dataset_id": result.dataset_id.to_string(),
+                    "name": name,
+                    "type": object_type.label(),
+                    "id": result.dataset_id.to_string(),
                     "force": args.force,
                     "destroyed_entries": 1,
                     "reclaim": volume_reclaim_json(&result.reclaim),
@@ -2095,7 +2201,7 @@ fn handle_destroy(args: DatasetDestroyArgs) {
                 }));
             } else {
                 println!(
-                    "dataset '{name}' logically destroyed; {}",
+                    "volume '{name}' logically destroyed; {}",
                     volume_reclaim_line(&result.reclaim),
                 );
             }
@@ -2108,25 +2214,20 @@ fn handle_destroy(args: DatasetDestroyArgs) {
         &target.pool,
         devices_ref,
         "destroy",
+        command,
         RecoveryPolicy::default(),
         args.json,
         live_args,
     );
 
-    // Check dataset exists
-    if !fs.dataset_catalog().contains(&name) {
-        exit_dataset_error(
-            "destroy",
-            format!("dataset '{name}' does not exist in the catalog"),
-            args.json,
-        );
-    }
+    require_catalog_object_type(fs.dataset_catalog(), &name, object_type)
+        .unwrap_or_else(|error| exit_dataset_error(command, error, args.json));
 
     let admission =
         destroy_admission_from_catalog(fs.dataset_catalog(), &name, fs.mounted_dataset_id())
-            .unwrap_or_else(|err| exit_dataset_error("destroy", err, args.json));
+            .unwrap_or_else(|err| exit_dataset_error(command, err, args.json));
     if let Err(err) = require_destroy_admission(&name, &admission, args.force) {
-        exit_dataset_error("destroy", err, args.json);
+        exit_dataset_error(command, err, args.json);
     }
 
     let dataset_id = fs
@@ -2140,14 +2241,15 @@ fn handle_destroy(args: DatasetDestroyArgs) {
     if is_volume {
         let result = fs
             .destroy_volume_dataset(&name)
-            .unwrap_or_else(|err| exit_dataset_error("destroy", err.to_string(), args.json));
+            .unwrap_or_else(|err| exit_dataset_error(command, err.to_string(), args.json));
         if args.json {
             print_json_or_exit(serde_json::json!({
                 "ok": true,
                 "operation": "destroy",
                 "pool": target.pool,
-                "dataset": name,
-                "dataset_id": result.dataset_id.to_string(),
+                "name": name,
+                "type": object_type.label(),
+                "id": result.dataset_id.to_string(),
                 "force": args.force,
                 "destroyed_entries": 1,
                 "reclaim": volume_reclaim_json(&result.reclaim),
@@ -2159,7 +2261,7 @@ fn handle_destroy(args: DatasetDestroyArgs) {
             }));
         } else {
             println!(
-                "dataset '{name}' logically destroyed; {}",
+                "volume '{name}' logically destroyed; {}",
                 volume_reclaim_line(&result.reclaim),
             );
         }
@@ -2168,20 +2270,21 @@ fn handle_destroy(args: DatasetDestroyArgs) {
 
     if admission.child_count != 0 || admission.snapshot_count != 0 || admission.live_mount {
         exit_dataset_error(
-            "destroy",
+            command,
             "recursive or live filesystem destruction is not implemented; destroy snapshots and children and unmount the target first",
             args.json,
         );
     }
     fs.destroy_filesystem_dataset(&name)
-        .unwrap_or_else(|err| exit_dataset_error("destroy", err.to_string(), args.json));
+        .unwrap_or_else(|err| exit_dataset_error(command, err.to_string(), args.json));
 
     if args.json {
         print_json_or_exit(serde_json::json!({
             "ok": true,
             "operation": "destroy",
             "pool": target.pool,
-            "dataset": name,
+            "name": name,
+            "type": object_type.label(),
             "force": args.force,
             "destroyed_entries": 1,
             "admission": {
@@ -2191,7 +2294,7 @@ fn handle_destroy(args: DatasetDestroyArgs) {
             },
         }));
     } else {
-        println!("dataset '{name}' destroyed");
+        println!("filesystem '{name}' destroyed");
     }
 }
 
@@ -2228,8 +2331,9 @@ fn format_dataset_id(id: &DatasetId) -> String {
 
 // ── seal-key handler ─────────────────────────────────────────────────
 
-fn handle_seal_key(args: DatasetSealKeyArgs) {
-    let _guard = super::authz::require_local_only("dataset seal-key");
+fn handle_seal_key(args: DatasetSealKeyArgs, object_type: DatasetTypeArg) {
+    let command = object_type.command("seal-key");
+    let _guard = super::authz::require_local_only(command);
 
     use tidefs_encryption::key_hierarchy::{DatasetDEK, PoolWrappingKey};
     use tidefs_encryption::key_manager::{KeyManager, KeyStore};
@@ -2241,13 +2345,23 @@ fn handle_seal_key(args: DatasetSealKeyArgs) {
             tidefs_vfs_engine::LivePoolAdminArg::String(args.name.clone()),
         ),
         (
+            "type",
+            tidefs_vfs_engine::LivePoolAdminArg::String(object_type.label().to_string()),
+        ),
+        (
             "passphrase",
             tidefs_vfs_engine::LivePoolAdminArg::String(args.passphrase.clone()),
         ),
     ]);
     let devices_ref = args.devices.as_deref();
-    let pool_path =
-        resolve_pool_path_with_live_args(&args.pool, devices_ref, "seal-key", live_args);
+    let pool_path = resolve_pool_path_with_live_args(
+        &args.pool,
+        devices_ref,
+        "seal-key",
+        command,
+        live_args,
+        Some((&args.name, object_type)),
+    );
 
     // Generate a random salt for the wrapping key derivation.
     let salt = PoolWrappingKey::generate_salt();
@@ -2256,7 +2370,7 @@ fn handle_seal_key(args: DatasetSealKeyArgs) {
     let wk = match PoolWrappingKey::derive(&args.passphrase, &salt) {
         Ok(key) => key,
         Err(e) => {
-            eprintln!("tidefsctl dataset seal-key: failed to derive wrapping key: {e}");
+            eprintln!("tidefsctl {command}: failed to derive wrapping key: {e}");
             process::exit(1);
         }
     };
@@ -2268,7 +2382,7 @@ fn handle_seal_key(args: DatasetSealKeyArgs) {
     let sealed = match KeyManager::seal_dek(&dek, &wk, &args.name, 1) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tidefsctl dataset seal-key: failed to seal DEK: {e}");
+            eprintln!("tidefsctl {command}: failed to seal DEK: {e}");
             process::exit(1);
         }
     };
@@ -2278,7 +2392,7 @@ fn handle_seal_key(args: DatasetSealKeyArgs) {
         Ok(ks) => ks,
         Err(e) => {
             eprintln!(
-                "tidefsctl dataset seal-key: failed to open keystore at {}: {e}",
+                "tidefsctl {command}: failed to open keystore at {}: {e}",
                 pool_path.display()
             );
             process::exit(1);
@@ -2286,14 +2400,15 @@ fn handle_seal_key(args: DatasetSealKeyArgs) {
     };
 
     if let Err(e) = keystore.store_sealed_dek(&sealed) {
-        eprintln!("tidefsctl dataset seal-key: failed to store sealed DEK: {e}");
+        eprintln!("tidefsctl {command}: failed to store sealed DEK: {e}");
         process::exit(1);
     }
 
     let salt_hex: String = salt.iter().map(|b| format!("{b:02x}")).collect();
     println!(
-        "dataset '{}' encryption key sealed (kek_generation=1)",
-        args.name
+        "{} '{}' encryption key sealed (kek_generation=1)",
+        object_type.label(),
+        args.name,
     );
     println!("  salt: {salt_hex}");
     println!("  save this salt; it is required for key rotation");
@@ -2301,8 +2416,8 @@ fn handle_seal_key(args: DatasetSealKeyArgs) {
 
 // ── rotate-key handler ───────────────────────────────────────────────
 
-fn handle_rotate_key(args: DatasetRotateKeyArgs) {
-    let _guard = super::authz::require_local_only("dataset rotate-key");
+pub fn handle_pool_rotate_key(args: PoolRotateKeyArgs) {
+    let _guard = super::authz::require_local_only("pool rotate-key");
 
     use tidefs_encryption::key_hierarchy::PoolWrappingKey;
     use tidefs_encryption::key_manager::{KeyRotation, KeyStore};
@@ -2323,14 +2438,20 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
         ),
     ]);
     let devices_ref = args.devices.as_deref();
-    let pool_path =
-        resolve_pool_path_with_live_args(&args.pool, devices_ref, "rotate-key", live_args);
+    let pool_path = resolve_pool_path_with_live_args(
+        &args.pool,
+        devices_ref,
+        "rotate-key",
+        "pool rotate-key",
+        live_args,
+        None,
+    );
 
     // Decode the old salt from hex.
     let old_salt = match hex_to_salt(&args.old_salt) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tidefsctl dataset rotate-key: invalid --old-salt: {e}");
+            eprintln!("tidefsctl pool rotate-key: invalid --old-salt: {e}");
             process::exit(1);
         }
     };
@@ -2343,7 +2464,7 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
             Ok(ks) => ks,
             Err(e) => {
                 eprintln!(
-                    "tidefsctl dataset rotate-key: failed to open keystore at {}: {e}",
+                    "tidefsctl pool rotate-key: failed to open keystore at {}: {e}",
                     pool_path.display()
                 );
                 process::exit(1);
@@ -2354,14 +2475,14 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
     let datasets = match keystore.list_datasets() {
         Ok(ds) => ds,
         Err(e) => {
-            eprintln!("tidefsctl dataset rotate-key: failed to list datasets: {e}");
+            eprintln!("tidefsctl pool rotate-key: failed to list sealed object keys: {e}");
             process::exit(1);
         }
     };
 
     if datasets.is_empty() {
         eprintln!(
-            "tidefsctl dataset rotate-key: no datasets with sealed DEKs in pool '{}'",
+            "tidefsctl pool rotate-key: no objects with sealed DEKs in pool '{}'",
             args.pool
         );
         process::exit(1);
@@ -2375,7 +2496,7 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
     ) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tidefsctl dataset rotate-key: key rotation failed: {e}");
+            eprintln!("tidefsctl pool rotate-key: key rotation failed: {e}");
             eprintln!(
                 "  (verify the old passphrase and salt match the original seal-key invocation)"
             );
@@ -2385,7 +2506,7 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
 
     let new_salt_hex: String = new_salt.iter().map(|b| format!("{b:02x}")).collect();
     println!(
-        "key rotation complete: {} dataset(s) re-wrapped",
+        "key rotation complete: {} object key(s) re-wrapped",
         stats.keys_rotated
     );
     println!("  new salt: {new_salt_hex}");
@@ -2403,10 +2524,12 @@ fn resolve_pool_path_with_live_args(
     pool: &str,
     devices: Option<&[PathBuf]>,
     operation: &str,
+    surface: &str,
     live_args: LivePoolAdminArgs,
+    expected_object: Option<(&str, DatasetTypeArg)>,
 ) -> PathBuf {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
-        let config = scan_device_pool_config(pool, devs, operation);
+        let config = scan_device_pool_config(pool, devs, surface);
         super::live_owner::route_or_refuse_active_for_uuid_with_args(
             "dataset",
             operation,
@@ -2416,7 +2539,20 @@ fn resolve_pool_path_with_live_args(
             live_args,
         );
 
-        return super::offline_pool::metadata_dir("dataset", operation, &config.pool_uuid);
+        let metadata_dir =
+            super::offline_pool::metadata_dir("dataset", operation, &config.pool_uuid);
+        if let Some((name, object_type)) = expected_object {
+            let runtime = open_offline_pool_runtime(
+                &metadata_dir,
+                devs,
+                pool,
+                PoolRedundancyPolicy::from_label_policy(config.redundancy_policy),
+            )
+            .unwrap_or_else(|error| exit_dataset_error(surface, error, false));
+            require_catalog_object_type(runtime.dataset_catalog(), name, object_type)
+                .unwrap_or_else(|error| exit_dataset_error(surface, error, false));
+        }
+        return metadata_dir;
     }
 
     super::live_owner::route_with_args("dataset", operation, pool, live_args)
@@ -2614,7 +2750,6 @@ mod dataset_lifecycle_command_tests {
         assert!(validate_create_capacity(DatasetTypeArg::Volume, Some(0)).is_err());
         assert!(validate_create_capacity(DatasetTypeArg::Volume, Some(4097)).is_err());
         assert!(validate_create_capacity(DatasetTypeArg::Filesystem, Some(4096)).is_err());
-        assert!(validate_create_capacity(DatasetTypeArg::Snapshot, Some(4096)).is_err());
     }
 
     #[test]

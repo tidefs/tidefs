@@ -4,7 +4,6 @@
 use tidefs_dataset_properties::{
     lookup_property, validate_set, PropertyKey, PropertySet, PropertyType, PropertyValue,
 };
-use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureName};
 
 const MAX_POOL_NAME_LEN: usize = 63;
 const MAX_DATASET_PATH_LEN: usize = 4096;
@@ -28,7 +27,7 @@ pub(crate) struct PropertyAssignment {
 pub(crate) fn parse_dataset_target(raw: &str) -> Result<DatasetTarget, String> {
     let (pool, dataset) = raw
         .split_once('/')
-        .ok_or_else(|| "expected dataset target in <pool>/<name> form".to_string())?;
+        .ok_or_else(|| "expected target in <pool>/<name> form".to_string())?;
     let pool = parse_pool_name(pool)?;
     let dataset = parse_dataset_path(dataset)?;
     Ok(DatasetTarget { pool, dataset })
@@ -64,24 +63,26 @@ pub(crate) fn parse_pool_name(raw: &str) -> Result<String, String> {
 
 pub(crate) fn parse_dataset_path(raw: &str) -> Result<String, String> {
     if raw.is_empty() {
-        return Err("dataset name must not be empty".to_string());
+        return Err("object name must not be empty".to_string());
     }
     if raw.trim() != raw {
-        return Err("dataset name must not contain leading or trailing whitespace".to_string());
+        return Err("object name must not contain leading or trailing whitespace".to_string());
     }
     if raw.len() > MAX_DATASET_PATH_LEN {
-        return Err(format!("dataset path exceeds {MAX_DATASET_PATH_LEN} bytes"));
+        return Err(format!("object path exceeds {MAX_DATASET_PATH_LEN} bytes"));
     }
     if raw.starts_with('/') || raw.ends_with('/') || raw.contains("//") {
         return Err(
-            "dataset path must be relative and must not contain empty components".to_string(),
+            "object path must be relative and must not contain empty components".to_string(),
         );
     }
     if raw.contains('\0') {
-        return Err("dataset path must not contain NUL bytes".to_string());
+        return Err("object path must not contain NUL bytes".to_string());
     }
     if raw.contains('@') {
-        return Err("dataset lifecycle commands do not accept snapshot selectors".to_string());
+        return Err(
+            "filesystem and volume lifecycle commands do not accept snapshot selectors".to_string(),
+        );
     }
     for component in raw.split('/') {
         parse_dataset_component(component)?;
@@ -108,7 +109,7 @@ pub(crate) fn parse_property_key(raw: &str) -> Result<String, String> {
     let registry = tidefs_dataset_properties::build_registry();
     let property_key = PropertyKey::new(key);
     if lookup_property(&registry, &property_key).is_none() {
-        return Err(format!("unsupported dataset property key: {key}"));
+        return Err(format!("unsupported object property key: {key}"));
     }
     Ok(key.to_string())
 }
@@ -140,31 +141,21 @@ pub(crate) fn parse_property_assignment(raw: &str) -> Result<PropertyAssignment,
     })
 }
 
-pub(crate) fn parse_dataset_feature_name(raw: &str) -> Result<String, String> {
-    let name = raw.trim();
-    let parsed = FeatureName::from_str(name)
-        .ok_or_else(|| format!("invalid dataset feature flag name: {name}"))?;
-    if get_feature_class(&parsed).is_none() {
-        return Err(format!("unsupported dataset feature flag: {name}"));
-    }
-    Ok(name.to_string())
-}
-
 fn parse_dataset_component(component: &str) -> Result<(), String> {
     if component.is_empty() {
-        return Err("dataset component must not be empty".to_string());
+        return Err("object name component must not be empty".to_string());
     }
     if component.len() > MAX_DATASET_COMPONENT_LEN {
         return Err(format!(
-            "dataset component exceeds {MAX_DATASET_COMPONENT_LEN} bytes: {component}"
+            "object name component exceeds {MAX_DATASET_COMPONENT_LEN} bytes: {component}"
         ));
     }
     if matches!(component, "." | "..") {
-        return Err("dataset component must not be . or ..".to_string());
+        return Err("object name component must not be . or ..".to_string());
     }
     if !component.bytes().all(is_identity_byte) {
         return Err(
-            "dataset components may contain only ASCII letters, digits, '.', '_', and '-'"
+            "object name components may contain only ASCII letters, digits, '.', '_', and '-'"
                 .to_string(),
         );
     }
@@ -302,15 +293,5 @@ mod tests {
         assert!(parse_property_assignment("not.a.property=on").is_err());
         assert!(parse_property_assignment("access.readonly=maybe").is_err());
         assert!(parse_property_assignment("layout.recordsize=128").is_err());
-    }
-
-    #[test]
-    fn feature_parser_accepts_only_supported_feature_names() {
-        assert_eq!(
-            parse_dataset_feature_name("org.tidefs:compression_zstd").unwrap(),
-            "org.tidefs:compression_zstd"
-        );
-        assert!(parse_dataset_feature_name("com.example:future").is_err());
-        assert!(parse_dataset_feature_name("org.tidefs:BAD").is_err());
     }
 }
