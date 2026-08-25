@@ -819,9 +819,8 @@ fn volume_mutation_targets(
     {
         return Ok(Vec::new());
     }
-    let target = target.ok_or_else(|| {
-        LivePoolAdminError::malformed(format!("dataset mutation requires {name}"))
-    })?;
+    let target = target
+        .ok_or_else(|| LivePoolAdminError::malformed(format!("object mutation requires {name}")))?;
     if matches!(
         request.command,
         LivePoolAdminCommand::SnapshotCreate
@@ -836,7 +835,7 @@ fn volume_mutation_targets(
 #[cfg(feature = "block-volume")]
 fn volume_snapshot_source(target: &str) -> Result<&str, LivePoolAdminError> {
     let (source, snapshot) = target.rsplit_once('@').ok_or_else(|| {
-        LivePoolAdminError::malformed("volume snapshot target requires <dataset>@<snapshot>")
+        LivePoolAdminError::malformed("volume snapshot target requires <volume>@<snapshot>")
     })?;
     if source.is_empty() || snapshot.is_empty() || source.contains('@') {
         return Err(LivePoolAdminError::malformed(
@@ -1153,6 +1152,50 @@ fn standalone_block_admin_request(
         Err(_) => return LivePoolAdminResponse::error(1, "shared Pool runtime lock poisoned"),
     };
     let wants_json = request.output.wants_json();
+    if matches!(
+        request.command,
+        LivePoolAdminCommand::DatasetResize
+            | LivePoolAdminCommand::DatasetRename
+            | LivePoolAdminCommand::DatasetDestroy
+    ) {
+        let requested_type = match required_request_arg_str(&request.args, "type") {
+            Ok(requested_type) => requested_type,
+            Err(error) => return live_admin_typed_error(error),
+        };
+        if requested_type != "volume" {
+            return LivePoolAdminResponse::error(
+                1,
+                format!("standalone block owner serves volumes, not {requested_type} objects"),
+            );
+        }
+        let name_key = if request.command == LivePoolAdminCommand::DatasetRename {
+            "old_name"
+        } else {
+            "name"
+        };
+        let name = match required_request_arg_str(&request.args, name_key) {
+            Ok(name) => name,
+            Err(error) => return live_admin_typed_error(error),
+        };
+        let dataset_id = match runtime.dataset_catalog().lookup(name) {
+            Ok(dataset_id) => dataset_id,
+            Err(_) => {
+                return LivePoolAdminResponse::error(1, format!("volume '{name}' does not exist"))
+            }
+        };
+        let Some((_, _, actual, _, _, _)) = runtime.dataset_catalog().get_by_id(&dataset_id) else {
+            return LivePoolAdminResponse::error(
+                1,
+                format!("volume '{name}' lost its catalog identity"),
+            );
+        };
+        if actual != tidefs_dataset_lifecycle::DatasetType::Volume {
+            return LivePoolAdminResponse::error(
+                1,
+                format!("'{name}' is a {actual}, not a volume"),
+            );
+        }
+    }
     match request.command {
         LivePoolAdminCommand::DatasetResize => {
             let name = match required_request_arg_str(&request.args, "name") {
@@ -1162,7 +1205,7 @@ fn standalone_block_admin_request(
             let size = match request_arg_u64(&request.args, "size") {
                 Ok(Some(size)) => size,
                 Ok(None) => {
-                    return live_admin_malformed("dataset resize requires size");
+                    return live_admin_malformed("volume resize requires size");
                 }
                 Err(error) => return live_admin_typed_error(error),
             };
@@ -1172,7 +1215,8 @@ fn standalone_block_admin_request(
                         "ok": true,
                         "operation": "resize",
                         "pool": request.pool,
-                        "dataset": name,
+                        "name": name,
+                        "type": "volume",
                         "size": result.geometry.capacity_bytes,
                         "block_size": result.geometry.block_size_bytes,
                         "generation": result.generation,
@@ -1181,7 +1225,7 @@ fn standalone_block_admin_request(
                     .to_string(),
                 ),
                 Ok(result) => LivePoolAdminResponse::ok_text(format!(
-                    "dataset '{name}' resized in imported pool '{}': size={} block_size={} generation={} resize_generation={}",
+                    "volume '{name}' resized in imported pool '{}': size={} block_size={} generation={} resize_generation={}",
                     request.pool,
                     result.geometry.capacity_bytes,
                     result.geometry.block_size_bytes,
@@ -1189,7 +1233,7 @@ fn standalone_block_admin_request(
                     result.resize_generation,
                 )),
                 Err(error) => {
-                    LivePoolAdminResponse::error(1, format!("dataset resize: {error}"))
+                    LivePoolAdminResponse::error(1, format!("volume resize: {error}"))
                 }
             }
         }
@@ -1204,13 +1248,13 @@ fn standalone_block_admin_request(
             };
             match runtime.rename_dataset(old_name, new_name) {
                 Ok(_) => LivePoolAdminResponse::ok_text(format!(
-                    "dataset '{old_name}' renamed to '{new_name}' in imported pool '{}'",
+                    "volume '{old_name}' renamed to '{new_name}' in imported pool '{}'",
                     request.pool
                 )),
                 Err(error) => LivePoolAdminResponse::error(
                     1,
                     format!(
-                        "dataset rename: failed to rename '{old_name}' -> '{new_name}': {error}"
+                        "volume rename: failed to rename '{old_name}' -> '{new_name}': {error}"
                     ),
                 ),
             }
@@ -1225,8 +1269,9 @@ fn standalone_block_admin_request(
                     json!({
                         "ok": true,
                         "operation": "destroy",
-                        "dataset": name,
-                        "dataset_id": result.dataset_id.to_string(),
+                        "name": name,
+                        "type": "volume",
+                        "id": result.dataset_id.to_string(),
                         "reclaim": standalone_reclaim_json(
                             result.reclaim.candidate_objects,
                             result.reclaim.handed_off_objects,
@@ -1238,7 +1283,7 @@ fn standalone_block_admin_request(
                     .to_string(),
                 ),
                 Ok(result) => LivePoolAdminResponse::ok_text(format!(
-                    "dataset '{name}' logically destroyed; {}",
+                    "volume '{name}' logically destroyed; {}",
                     standalone_reclaim_line(
                         result.reclaim.candidate_objects,
                         result.reclaim.handed_off_objects,
@@ -1247,7 +1292,7 @@ fn standalone_block_admin_request(
                         result.reclaim.handoff_error.as_deref(),
                     ),
                 )),
-                Err(error) => LivePoolAdminResponse::error(1, format!("dataset destroy: {error}")),
+                Err(error) => LivePoolAdminResponse::error(1, format!("volume destroy: {error}")),
             }
         }
         LivePoolAdminCommand::SnapshotCreate => standalone_volume_snapshot_response(
@@ -1272,7 +1317,7 @@ fn standalone_block_admin_request(
                 return LivePoolAdminResponse::error(
                     1,
                     format!(
-                        "snapshot clone create: source '{source}' is not a canonical volume snapshot; filesystem SnapshotRecord clones are metadata aliases, not independently writable datasets, and are unsupported by the product clone command: {}",
+                        "snapshot clone create: source '{source}' is not a canonical volume snapshot; filesystem SnapshotRecord clones are metadata aliases, not independently writable clones, and are unsupported by the product clone command: {}",
                         error.message
                     ),
                 );
@@ -1566,7 +1611,16 @@ fn standalone_volume_snapshot_json(summary: &PoolVolumeSnapshotSummary) -> serde
 
 fn unsupported_admin_command_response(request: &LivePoolAdminRequest) -> LivePoolAdminResponse {
     let (command, operation) = request.command.parts();
-    live_admin_typed_error(LivePoolAdminError::unsupported_command(command, operation))
+    let surface = match request.command {
+        LivePoolAdminCommand::DatasetRotateKey => "pool",
+        _ if command == "dataset" => request_arg_str(&request.args, "type")
+            .ok()
+            .flatten()
+            .filter(|value| matches!(*value, "filesystem" | "volume"))
+            .unwrap_or("object"),
+        _ => command,
+    };
+    live_admin_typed_error(LivePoolAdminError::unsupported_command(surface, operation))
 }
 
 fn pool_status(
@@ -1843,7 +1897,7 @@ fn pool_mount_refused(
             Err(err) => return live_admin_typed_error(err),
         };
     let message = format!(
-        "pool mount for already-imported pool '{}' must be performed by the live owner; the current {} owner has no secondary mount implementation for mountpoint '{}' dataset '{}' (read_only={}, rebuild_only={}, relatime={})",
+        "pool mount for already-imported pool '{}' must be performed by the live owner; the current {} owner has no secondary mount implementation for mountpoint '{}' filesystem '{}' (read_only={}, rebuild_only={}, relatime={})",
         manifest.pool_name,
         manifest.owner_kind,
         mountpoint,
@@ -2334,6 +2388,109 @@ mod tests {
 
     #[cfg(feature = "block-volume")]
     #[test]
+    fn standalone_block_admin_refuses_non_volume_type_and_filesystem_catalog_entry() {
+        use std::fs::OpenOptions;
+
+        use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, DatasetType, SyncGuarantee};
+        use tidefs_local_object_store::{PoolRedundancyPolicy, StoreOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("device.img");
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&device)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let mut runtime = PoolRuntime::open_block_devices(
+            &dir.path().join("metadata"),
+            std::slice::from_ref(&device),
+            "tank",
+            PoolRedundancyPolicy::default(),
+            &StoreOptions::default(),
+        )
+        .unwrap();
+        runtime
+            .create_volume(
+                "vol",
+                DatasetId::from_bytes([7; 16]),
+                4 * 1024 * 1024,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+            )
+            .unwrap();
+        runtime
+            .create_dataset_with_root(
+                "fs",
+                DatasetId::from_bytes([8; 16]),
+                DatasetType::Filesystem,
+                Vec::new(),
+                DatasetFlags::NONE,
+                SyncGuarantee::Local,
+                1,
+                b"filesystem-root",
+            )
+            .unwrap();
+        let runtime = Arc::new(Mutex::new(runtime));
+
+        let mut filesystem_resize =
+            LivePoolAdminRequest::new(LivePoolAdminCommand::DatasetResize, "tank");
+        filesystem_resize.args = LivePoolAdminArgs(
+            [
+                ("name".to_string(), LivePoolAdminArg::String("vol".into())),
+                (
+                    "type".to_string(),
+                    LivePoolAdminArg::String("filesystem".into()),
+                ),
+                ("size".to_string(), LivePoolAdminArg::U64(8 * 1024 * 1024)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let response = standalone_block_admin_request(&filesystem_resize, &runtime);
+        assert_eq!(response.exit_code, 1);
+        let LivePoolAdminResponseBody::Error { message, .. } = response.body else {
+            panic!("filesystem resize should be refused");
+        };
+        assert!(message.contains("serves volumes, not filesystem objects"));
+
+        let mut filesystem_destroy =
+            LivePoolAdminRequest::new(LivePoolAdminCommand::DatasetDestroy, "tank");
+        filesystem_destroy.args = LivePoolAdminArgs(
+            [
+                ("name".to_string(), LivePoolAdminArg::String("fs".into())),
+                (
+                    "type".to_string(),
+                    LivePoolAdminArg::String("volume".into()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let response = standalone_block_admin_request(&filesystem_destroy, &runtime);
+        assert_eq!(response.exit_code, 1);
+        let LivePoolAdminResponseBody::Error { message, .. } = response.body else {
+            panic!("filesystem catalog entry should be refused");
+        };
+        assert!(message.contains("is a filesystem, not a volume"));
+
+        let runtime = runtime.lock().unwrap();
+        assert!(runtime.dataset_catalog().contains("fs"));
+        assert_eq!(
+            runtime
+                .open_volume("vol")
+                .unwrap()
+                .geometry()
+                .capacity_bytes,
+            4 * 1024 * 1024
+        );
+    }
+
+    #[cfg(feature = "block-volume")]
+    #[test]
     fn standalone_block_owner_routes_volume_clone_and_snapshot_to_active_export_admission() {
         use std::fs::OpenOptions;
 
@@ -2396,6 +2553,10 @@ mod tests {
                 LivePoolAdminCommand::DatasetResize,
                 [
                     ("name".to_string(), LivePoolAdminArg::String("vol".into())),
+                    (
+                        "type".to_string(),
+                        LivePoolAdminArg::String("volume".into()),
+                    ),
                     ("size".to_string(), LivePoolAdminArg::U64(8 * 1024 * 1024)),
                 ]
                 .into_iter()
@@ -2404,6 +2565,10 @@ mod tests {
             (
                 LivePoolAdminCommand::DatasetRename,
                 [
+                    (
+                        "type".to_string(),
+                        LivePoolAdminArg::String("volume".into()),
+                    ),
                     (
                         "old_name".to_string(),
                         LivePoolAdminArg::String("vol".into()),
@@ -2418,9 +2583,15 @@ mod tests {
             ),
             (
                 LivePoolAdminCommand::DatasetDestroy,
-                [("name".to_string(), LivePoolAdminArg::String("vol".into()))]
-                    .into_iter()
-                    .collect(),
+                [
+                    ("name".to_string(), LivePoolAdminArg::String("vol".into())),
+                    (
+                        "type".to_string(),
+                        LivePoolAdminArg::String("volume".into()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
             ),
             (
                 LivePoolAdminCommand::SnapshotCreate,
@@ -2754,7 +2925,15 @@ mod tests {
 
     #[test]
     fn delegated_unsupported_admin_request_uses_typed_command_error() {
-        let request = LivePoolAdminRequest::new(LivePoolAdminCommand::DatasetList, "tank");
+        let mut request = LivePoolAdminRequest::new(LivePoolAdminCommand::DatasetList, "tank");
+        request.args = LivePoolAdminArgs(
+            [(
+                "type".to_string(),
+                LivePoolAdminArg::String("filesystem".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        );
 
         let response = unsupported_admin_command_response(&request);
 
@@ -2768,7 +2947,7 @@ mod tests {
         };
         assert_eq!(
             message,
-            "unsupported live-owner command tidefsctl dataset list"
+            "unsupported live-owner command tidefsctl filesystem list"
         );
         let value: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
         assert_eq!(
@@ -2777,12 +2956,33 @@ mod tests {
         );
         assert_eq!(
             value.get("command").and_then(serde_json::Value::as_str),
-            Some("dataset")
+            Some("filesystem")
         );
         assert_eq!(
             value.get("operation").and_then(serde_json::Value::as_str),
             Some("list")
         );
+    }
+
+    #[test]
+    fn delegated_unsupported_pool_rotation_uses_public_pool_command() {
+        let request = LivePoolAdminRequest::new(LivePoolAdminCommand::DatasetRotateKey, "tank");
+        let response = unsupported_admin_command_response(&request);
+
+        let LivePoolAdminResponseBody::Error {
+            message,
+            machine_json: Some(machine_json),
+        } = response.body
+        else {
+            panic!("unsupported Pool rotation should carry typed machine JSON");
+        };
+        assert_eq!(
+            message,
+            "unsupported live-owner command tidefsctl pool rotate-key"
+        );
+        let value: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+        assert_eq!(value["command"], "pool");
+        assert_eq!(value["operation"], "rotate-key");
     }
 
     #[test]

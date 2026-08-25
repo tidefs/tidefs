@@ -118,14 +118,19 @@ const LOCAL_ONLY_COMMANDS: &[&str] = &[
     "snapshot prune-scheduled disable",
     "block attach",
     "block detach",
-    "dataset create",
-    "dataset resize",
-    "dataset destroy",
-    "dataset rename",
-    "dataset seal-key",
-    "dataset rotate-key",
-    "dataset upgrade",
-    "dataset set",
+    "filesystem create",
+    "filesystem destroy",
+    "filesystem rename",
+    "filesystem seal-key",
+    "filesystem upgrade",
+    "filesystem set",
+    "volume create",
+    "volume resize",
+    "volume destroy",
+    "volume rename",
+    "volume seal-key",
+    "volume set",
+    "pool rotate-key",
     "storage-intent policy set",
     "storage-intent policy clear",
     #[cfg(feature = "cluster")]
@@ -133,7 +138,7 @@ const LOCAL_ONLY_COMMANDS: &[&str] = &[
     "defrag",
 ];
 
-const LOCAL_ONLY_WHEN_MUTATING_COMMANDS: &[&str] = &["dataset set-strategy"];
+const LOCAL_ONLY_WHEN_MUTATING_COMMANDS: &[&str] = &["filesystem set-strategy"];
 
 const UNGUARDED_COMMANDS: &[&str] = &[
     "pool scan",
@@ -148,9 +153,12 @@ const UNGUARDED_COMMANDS: &[&str] = &[
     "snapshot prune-scheduled refusals",
     "snapshot prune-scheduled results",
     "block list",
-    "dataset list",
-    "dataset get",
-    "dataset list-props",
+    "filesystem list",
+    "filesystem get",
+    "filesystem list-props",
+    "volume list",
+    "volume get",
+    "volume list-props",
     "storage-intent explain",
     "storage-intent policy show",
     "storage-intent policy dry-run",
@@ -399,15 +407,20 @@ mod tests {
             "block attach",
             #[cfg(feature = "block-volume")]
             "block detach",
-            "dataset create",
-            "dataset resize",
-            "dataset destroy",
-            "dataset rename",
-            "dataset set-strategy",
-            "dataset seal-key",
-            "dataset rotate-key",
-            "dataset upgrade",
-            "dataset set",
+            "filesystem create",
+            "filesystem destroy",
+            "filesystem rename",
+            "filesystem set-strategy",
+            "filesystem seal-key",
+            "filesystem upgrade",
+            "filesystem set",
+            "volume create",
+            "volume resize",
+            "volume destroy",
+            "volume rename",
+            "volume seal-key",
+            "volume set",
+            "pool rotate-key",
             "defrag",
         ] {
             let admission = command_admission(command).expect("classified command admission");
@@ -429,9 +442,12 @@ mod tests {
             "snapshot holds",
             #[cfg(feature = "block-volume")]
             "block list",
-            "dataset list",
-            "dataset get",
-            "dataset list-props",
+            "filesystem list",
+            "filesystem get",
+            "filesystem list-props",
+            "volume list",
+            "volume get",
+            "volume list-props",
             #[cfg(feature = "storage-intent")]
             "storage-intent explain",
             "pool integrity-check",
@@ -466,9 +482,9 @@ mod tests {
     }
 
     #[test]
-    fn dataset_set_strategy_only_guards_mutation_mode() {
+    fn filesystem_set_strategy_only_guards_mutation_mode() {
         assert_eq!(
-            command_admission("dataset set-strategy"),
+            command_admission("filesystem set-strategy"),
             Some(CommandAdmission::LocalOnlyWhenMutating)
         );
     }

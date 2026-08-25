@@ -235,15 +235,15 @@ clone promotion/destroy are refused before mutation while their volume is
 actively exported. Detached non-carrier volume handles may still stage private
 data, but cannot publish it over the active export's root.
 Filesystem `SnapshotRecord::Clone` entries remain shared-root snapshot-table
-metadata, not independently mountable writable datasets. The product clone
+metadata, not independently mountable writable filesystems. The product clone
 command explicitly refuses filesystem snapshot sources until filesystem roots
-have a dataset-scoped object namespace capable of supporting an independent
-writable filesystem dataset.
+have an object namespace capable of supporting an independent writable
+filesystem.
 
 The local operator path is:
 
 ```text
-tidefsctl dataset create <pool>/<volume> --type volume --size <bytes>
+tidefsctl volume create <pool>/<volume> --size <bytes>
   -> shared Pool-backed catalog plus volume root publication
 tidefsctl block attach <pool>/<volume>
   -> local pool owner -> named volume engine -> owned ublk runtime

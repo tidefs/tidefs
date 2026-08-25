@@ -85,9 +85,10 @@ mirrors.
 - `apps/tidefs-posix-filesystem-adapter-daemon/`: production capacity dispatch
   points at the local-filesystem `CapacityAuthority`; the old
   `CapacityFacade`, admission lifecycle, and tracker are test-only fixtures.
-- `apps/tidefsctl/`: `dataset list`, including its live-owner route, reports
+- `apps/tidefsctl/`: `filesystem list`, including its live-owner route, reports
   `used` and `available` from one `LocalFileSystem::statfs()` result;
-  `dataset list-props` reports property metadata such as `space.quota`. It is
+  `filesystem list-props` and `volume list-props` report property metadata such
+  as `space.quota`. They are
   a projection surface.
 - Current GitHub state: PR #613 and PR #761 have merged, admitting issue #1191
   as the runtime closeout slice for the remaining mounted local-filesystem and
@@ -107,7 +108,7 @@ mirrors.
 | Dedup crates and local dedup refcount | Dedup identity, canonical refcount, bytes-saved/accounting observations, reclaim obligations. | Delta/reclaim producers. Authority accounts only committed logical/physical effects. |
 | Inode table | Inode slot allocation, generations, free-list persistence, inode counts. | Inode authority. Capacity projects inode counts into statfs only. |
 | POSIX adapter daemon capacity module | Production module documents that capacity semantics live in local filesystem; legacy facade/tracker remain under `cfg(test)`. | Adapter/reply projection. No independent production capacity lifecycle. |
-| `tidefsctl` dataset commands | Operator projection of `statfs` availability and dataset property records. | Reporting consumer. No authority decisions. |
+| `tidefsctl` filesystem and volume commands | Operator projection of `statfs` availability and internal catalog property records. | Reporting consumer. No authority decisions. |
 
 ## Authority Models Compared
 
@@ -216,7 +217,7 @@ capacity, quota, reserve, reclaim, dedup, or mounted statfs readiness.
 |---|---|---|---|
 | Scope overclaim cleanup | #857 | `crates/tidefs-block-allocator/README.md`, `crates/tidefs-block-allocator/src/lib.rs` docs/comments only | Narrow allocator wording to physical placement, transactional reservation/fencing, and lower free-space input. |
 | Adapter facade retirement | #858 | `apps/tidefs-posix-filesystem-adapter-daemon/src/capacity/` and adapter tests that import it | Delete or further quarantine the test-only `CapacityFacade`, admission lifecycle, and tracker so release code cannot consume an adapter-local capacity API. |
-| Operator capacity projection | #859 and #2610 | `apps/tidefsctl/src/commands/dataset.rs`, `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs`, and focused CLI/live-owner tests/docs only | Report authority-derived used/available fields from one `statfs` result through both offline and live-owner `dataset list` paths. |
+| Operator capacity projection | #859 and #2610 | `apps/tidefsctl/src/commands/dataset.rs`, `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs`, and focused CLI/live-owner tests/docs only | Report authority-derived used/available fields from one `statfs` result through both offline and live-owner filesystem and volume list paths. |
 | Dataset quota input bridge | #860 | `crates/tidefs-dataset-properties/` plus focused property-resolution tests | Expose resolved `space.quota` as a typed authority input. Runtime enforcement in local filesystem/space-accounting is a separate gated row. |
 | Runtime authority closeout | #1191 | `crates/tidefs-local-filesystem/src/capacity_authority.rs`, `crates/tidefs-local-filesystem/src/statfs.rs`, `crates/tidefs-local-filesystem/src/lib.rs`, `crates/tidefs-space-accounting/src/lib.rs`, `crates/tidefs-types-space-accounting-core/src/lib.rs`, `crates/tidefs-local-object-store/src/store.rs` | Closed by PR #1464 for the mounted `fallocate_file()` / `zero_range()` admission and statfs projection slice; post-#1191 residuals remain split below. |
 | Store `SpaceBook` persistence boundary | #1504 | `crates/tidefs-space-accounting/src/lib.rs`, `crates/tidefs-local-object-store/src/store.rs` | Closed. Historical row for making store-layer `SpaceBook` either a committed `SpaceAccounting` persistence/projection sink or a typed producer; it no longer represents a live blocker in this map. |

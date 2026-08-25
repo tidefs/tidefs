@@ -154,7 +154,7 @@ pub enum PoolCommand {
         #[arg(short = 'd', long = "devices", num_args = 1..)]
         devices: Option<Vec<PathBuf>>,
 
-        /// Force export even if datasets are mounted
+        /// Force export even if storage objects are mounted or exported
         #[arg(long = "force")]
         force: bool,
     },
@@ -183,15 +183,15 @@ pub enum PoolCommand {
         #[arg(long = "relatime")]
         relatime: bool,
 
-        /// Dataset path to mount (default "root")
-        #[arg(long = "dataset", default_value = "root")]
-        dataset: String,
+        /// Filesystem path to mount (default "root")
+        #[arg(long = "filesystem", default_value = "root")]
+        filesystem: String,
 
         /// Path to a sealed pool key envelope file
         #[arg(long = "encryption-envelope", value_name = "PATH")]
         encryption_envelope: Option<PathBuf>,
 
-        /// Passphrase for unwrapping dataset encryption keys from the
+        /// Passphrase for unwrapping object encryption keys from the
         /// pool keystore (verification pre-mount).
         #[arg(long = "encryption-passphrase")]
         encryption_passphrase: Option<String>,
@@ -336,6 +336,9 @@ pub enum PoolCommand {
         json: bool,
     },
 
+    /// Rotate the Pool wrapping key and re-wrap every sealed object key
+    RotateKey(super::dataset::PoolRotateKeyArgs),
+
     /// Get a typed pool property value with source annotation
     Get {
         /// Pool name (imported-pool identity; routed through the live owner)
@@ -456,7 +459,7 @@ pub fn handle_pool(cmd: PoolCommand) {
             rebuild_only,
             devices,
             relatime,
-            dataset,
+            filesystem,
             encryption_envelope,
             encryption_passphrase,
             encryption_salt,
@@ -487,7 +490,7 @@ pub fn handle_pool(cmd: PoolCommand) {
                 rebuild_only,
                 devices,
                 relatime,
-                dataset,
+                filesystem,
                 encryption_envelope,
                 encryption_passphrase,
                 encryption_salt,
@@ -524,6 +527,7 @@ pub fn handle_pool(cmd: PoolCommand) {
         }
         PoolCommand::Scrub { pool, json } => handle_pool_scrub(pool, json),
         PoolCommand::Repair { pool, json } => handle_pool_repair(pool, json),
+        PoolCommand::RotateKey(args) => super::dataset::handle_pool_rotate_key(args),
         PoolCommand::Get {
             property,
             pool,
@@ -568,13 +572,13 @@ fn handle_pool_create(
     let _guard = super::authz::require_local_only("pool create");
 
     // encryption is a pool-level feature; all other feature flags are
-    // per-dataset (set via `tidefsctl dataset set-strategy`).
+    // per-filesystem (set via `tidefsctl filesystem set-strategy`).
     let encrypt_pool = feature_flags.contains("encryption");
     if !feature_flags.is_empty() && !encrypt_pool {
         eprintln!(
             "tidefsctl pool create: --feature-flags is not a pool-level setting.\n\
-            Use 'tidefsctl dataset set-strategy <pool> <dataset> --enable <features>' to enable\n\
-            per-dataset feature flags after pool creation."
+            Use 'tidefsctl filesystem set-strategy <pool> <filesystem> --enable <features>' to enable\n\
+            per-filesystem feature flags after pool creation."
         );
         process::exit(1);
     }

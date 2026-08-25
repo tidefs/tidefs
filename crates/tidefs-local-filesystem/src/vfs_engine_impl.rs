@@ -1247,6 +1247,54 @@ impl VfsLocalFileSystem {
         }
     }
 
+    fn validate_live_dataset_object_type(
+        &self,
+        command: LivePoolAdminCommand,
+        args: &Value,
+    ) -> Result<(), LivePoolAdminResponse> {
+        let expected =
+            live_dataset_mutation_type_arg(args).map_err(|error| live_admin_error(1, error))?;
+        match command {
+            LivePoolAdminCommand::DatasetResize if expected != DatasetType::Volume => {
+                return Err(live_admin_error(
+                    1,
+                    "filesystem objects do not support resize; use volume resize",
+                ));
+            }
+            LivePoolAdminCommand::DatasetSetStrategy | LivePoolAdminCommand::DatasetUpgrade
+                if expected != DatasetType::Filesystem =>
+            {
+                return Err(live_admin_error(
+                    1,
+                    "volume objects do not support filesystem feature operations",
+                ));
+            }
+            _ => {}
+        }
+        let name_key = if command == LivePoolAdminCommand::DatasetRename {
+            "old_name"
+        } else {
+            "name"
+        };
+        let name = live_admin_arg(args, name_key).map_err(|error| live_admin_error(2, error))?;
+        let fs = self.fs.borrow();
+        let dataset_id = fs
+            .dataset_catalog()
+            .lookup(name)
+            .map_err(|_| live_admin_error(1, format!("{expected} '{name}' does not exist")))?;
+        let (_, _, actual, _, _, _) =
+            fs.dataset_catalog().get_by_id(&dataset_id).ok_or_else(|| {
+                live_admin_error(1, format!("{expected} '{name}' lost its catalog identity"))
+            })?;
+        if actual != expected {
+            return Err(live_admin_error(
+                1,
+                format!("'{name}' is a {actual}, not a {expected}"),
+            ));
+        }
+        Ok(())
+    }
+
     fn handle_live_pool_admin_request(
         &self,
         request: &LivePoolAdminRequest,
@@ -1266,6 +1314,22 @@ impl VfsLocalFileSystem {
             }
             command => {
                 let args = live_admin_args_to_json(&request.args);
+                if matches!(
+                    *command,
+                    LivePoolAdminCommand::DatasetResize
+                        | LivePoolAdminCommand::DatasetRename
+                        | LivePoolAdminCommand::DatasetDestroy
+                        | LivePoolAdminCommand::DatasetSetStrategy
+                        | LivePoolAdminCommand::DatasetUpgrade
+                        | LivePoolAdminCommand::DatasetGet
+                        | LivePoolAdminCommand::DatasetSet
+                        | LivePoolAdminCommand::DatasetListProps
+                        | LivePoolAdminCommand::DatasetSealKey
+                ) {
+                    if let Err(response) = self.validate_live_dataset_object_type(*command, &args) {
+                        return Ok(response);
+                    }
+                }
                 match command {
                     LivePoolAdminCommand::DatasetCreate => {
                         self.live_dataset_create(pool, &args, wants_json)
@@ -1498,23 +1562,27 @@ impl VfsLocalFileSystem {
         };
         let mountpoint = live_admin_optional_arg(args, "mountpoint");
         let capacity = args.get("size").and_then(Value::as_u64);
+        let object_label = dataset_type.to_string();
 
         if name == "root" {
-            return live_admin_error(1, "dataset create: 'root' dataset cannot be re-created");
+            return live_admin_error(
+                1,
+                format!("{object_label} create: 'root' filesystem cannot be re-created"),
+            );
         }
 
         if dataset_type == DatasetType::Snapshot {
             return live_admin_error(
                 1,
-                "dataset create: snapshots must be created by the owning filesystem or volume engine",
+                "snapshot create: snapshots must be created by the owning filesystem or volume engine",
             );
         }
         if mountpoint.is_some() {
             return live_admin_error(
                 1,
                 match dataset_type {
-                    DatasetType::Filesystem => "dataset create: --mountpoint is not available for local filesystem creation; mount the dataset explicitly with 'pool mount --dataset'",
-                    DatasetType::Volume => "dataset create: --mountpoint is not valid for a block volume",
+                    DatasetType::Filesystem => "filesystem create: --mountpoint is not available; mount the filesystem explicitly with 'pool mount --filesystem'",
+                    DatasetType::Volume => "volume create: --mountpoint is not valid for a block volume",
                     DatasetType::Snapshot => unreachable!(),
                 },
             );
@@ -1523,8 +1591,8 @@ impl VfsLocalFileSystem {
             return live_admin_error(
                 1,
                 match dataset_type {
-                    DatasetType::Filesystem => "dataset create: filesystem feature flags are not available until the named filesystem engine consumes them",
-                    DatasetType::Volume => "dataset create: volume feature flags are not available until the volume engine consumes them",
+                    DatasetType::Filesystem => "filesystem create: feature flags are not available until the named filesystem engine consumes them",
+                    DatasetType::Volume => "volume create: feature flags are not available until the volume engine consumes them",
                     DatasetType::Snapshot => unreachable!(),
                 },
             );
@@ -1536,7 +1604,7 @@ impl VfsLocalFileSystem {
                 return live_admin_error(
                     1,
                     format!(
-                        "dataset create: invalid sync value {sync}; expected local, remote-copy, or full-redundancy"
+                        "{object_label} create: invalid sync value {sync}; expected local, remote-copy, or full-redundancy"
                     ),
                 )
             }
@@ -1544,7 +1612,7 @@ impl VfsLocalFileSystem {
         if sync_guarantee != SyncGuarantee::Local {
             return live_admin_error(
                 1,
-                "dataset create: local dataset creation supports only --sync local; clustered guarantees require committed cluster ownership",
+                format!("{object_label} create: local creation supports only --sync local; clustered guarantees require committed cluster ownership"),
             );
         }
         let capacity = match (dataset_type, capacity) {
@@ -1552,7 +1620,7 @@ impl VfsLocalFileSystem {
             (DatasetType::Filesystem, Some(_)) => {
                 return live_admin_error(
                     1,
-                    "dataset create: --size is valid only for block volumes",
+                    "filesystem create: --size is valid only for block volumes",
                 )
             }
             (DatasetType::Volume, Some(capacity)) if capacity > 0 && capacity % 4096 == 0 => {
@@ -1561,14 +1629,11 @@ impl VfsLocalFileSystem {
             (DatasetType::Volume, Some(_)) => {
                 return live_admin_error(
                     1,
-                    "dataset create: volume size must be nonzero and aligned to 4096 bytes",
+                    "volume create: size must be nonzero and aligned to 4096 bytes",
                 )
             }
             (DatasetType::Volume, None) => {
-                return live_admin_error(
-                    1,
-                    "dataset create: --size <bytes> is required for --type volume",
-                )
+                return live_admin_error(1, "volume create: --size <bytes> is required")
             }
             (DatasetType::Snapshot, _) => unreachable!(),
         };
@@ -1584,13 +1649,17 @@ impl VfsLocalFileSystem {
         if !fs.dataset_catalog().contains(parent) {
             return live_admin_error(
                 1,
-                format!("dataset create: parent dataset '{parent}' does not exist in the catalog"),
+                format!(
+                    "{object_label} create: parent object '{parent}' does not exist in the catalog"
+                ),
             );
         }
         if fs.dataset_catalog().contains(&full_path) {
             return live_admin_error(
                 1,
-                format!("dataset create: dataset '{full_path}' already exists in the catalog"),
+                format!(
+                    "{object_label} create: object '{full_path}' already exists in the catalog"
+                ),
             );
         }
 
@@ -1603,7 +1672,7 @@ impl VfsLocalFileSystem {
                 sync_guarantee,
             ) {
                 Ok(_) => None,
-                Err(err) => return live_admin_error(1, format!("dataset create: {err}")),
+                Err(err) => return live_admin_error(1, format!("filesystem create: {err}")),
             },
             DatasetType::Volume => match fs.create_volume_dataset(
                 &full_path,
@@ -1614,7 +1683,7 @@ impl VfsLocalFileSystem {
                 sync_guarantee,
             ) {
                 Ok(geometry) => Some(geometry),
-                Err(err) => return live_admin_error(1, format!("dataset create: {err}")),
+                Err(err) => return live_admin_error(1, format!("volume create: {err}")),
             },
             DatasetType::Snapshot => unreachable!(),
         };
@@ -1626,15 +1695,13 @@ impl VfsLocalFileSystem {
                 "ok": true,
                 "operation": "create",
                 "pool": pool,
-                "dataset": full_path,
+                "name": full_path,
                 "id": dataset_id.to_string(),
                 "type": dataset_type.to_string(),
                 "size": geometry.as_ref().map(|geometry| geometry.capacity_bytes),
                 "block_size": geometry.as_ref().map(|geometry| geometry.block_size_bytes),
                 "parent": parent,
-                "mountpoint": mountpoint,
                 "properties": requested_properties,
-                "features": features,
             }));
         }
 
@@ -1648,7 +1715,7 @@ impl VfsLocalFileSystem {
             },
         );
         live_admin_ok_text(format!(
-            "dataset '{full_path}' created in imported pool '{pool}'\n  id={}  parent='{parent}'  {detail}",
+            "{object_label} '{full_path}' created in imported pool '{pool}'\n  id={}  parent='{parent}'  {detail}",
             format_dataset_id(&dataset_id),
         ))
     }
@@ -1713,12 +1780,18 @@ impl VfsLocalFileSystem {
             return live_admin_ok_json(json!({
                 "ok": true,
                 "pool": pool,
-                "datasets": values,
+                "items": values,
             }));
         }
 
         if entries.is_empty() {
-            return live_admin_ok_text(format!("pool '{pool}' has no datasets"));
+            let objects = match type_filter {
+                Some(DatasetType::Filesystem) => "filesystems",
+                Some(DatasetType::Volume) => "volumes",
+                Some(DatasetType::Snapshot) => "snapshots",
+                None => "objects",
+            };
+            return live_admin_ok_text(format!("pool '{pool}' has no {objects}"));
         }
 
         let mut out = format!(
@@ -1759,20 +1832,21 @@ impl VfsLocalFileSystem {
             Err(err) => return live_admin_error(2, err),
         };
         let Some(capacity_bytes) = args.get("size").and_then(Value::as_u64) else {
-            return live_admin_error(2, "dataset resize: --size <bytes> is required");
+            return live_admin_error(2, "volume resize: --size <bytes> is required");
         };
 
         let mut fs = self.fs.borrow_mut();
         let result = match fs.resize_volume_dataset(name, capacity_bytes) {
             Ok(result) => result,
-            Err(err) => return live_admin_error(1, format!("dataset resize: {err}")),
+            Err(err) => return live_admin_error(1, format!("volume resize: {err}")),
         };
         if wants_json {
             return live_admin_ok_json(json!({
                 "ok": true,
                 "operation": "resize",
                 "pool": pool,
-                "dataset": name,
+                "name": name,
+                "type": "volume",
                 "size": result.geometry.capacity_bytes,
                 "block_size": result.geometry.block_size_bytes,
                 "generation": result.generation,
@@ -1780,7 +1854,7 @@ impl VfsLocalFileSystem {
             }));
         }
         live_admin_ok_text(format!(
-            "dataset '{name}' resized in imported pool '{pool}'\n  size={}  block_size={}  generation={}  resize_generation={}",
+            "volume '{name}' resized in imported pool '{pool}'\n  size={}  block_size={}  generation={}  resize_generation={}",
             result.geometry.capacity_bytes,
             result.geometry.block_size_bytes,
             result.generation,
@@ -1789,6 +1863,9 @@ impl VfsLocalFileSystem {
     }
 
     fn live_dataset_rename(&self, pool: &str, args: &Value) -> LivePoolAdminResponse {
+        let object_label = live_dataset_mutation_type_arg(args)
+            .expect("rename object type was validated")
+            .to_string();
         let old_name = match live_admin_arg(args, "old_name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -1798,18 +1875,23 @@ impl VfsLocalFileSystem {
             Err(err) => return live_admin_error(2, err),
         };
         if old_name == "root" || new_name == "root" {
-            return live_admin_error(1, "dataset rename: root dataset cannot be renamed");
+            return live_admin_error(
+                1,
+                format!("{object_label} rename: root filesystem cannot be renamed"),
+            );
         }
 
         if let Err(err) = self.fs.borrow_mut().rename_pool_dataset(old_name, new_name) {
             return live_admin_error(
                 1,
-                format!("dataset rename: failed to rename '{old_name}' -> '{new_name}': {err}"),
+                format!(
+                    "{object_label} rename: failed to rename '{old_name}' -> '{new_name}': {err}"
+                ),
             );
         }
 
         live_admin_ok_text(format!(
-            "dataset '{old_name}' renamed to '{new_name}' in imported pool '{pool}'"
+            "{object_label} '{old_name}' renamed to '{new_name}' in imported pool '{pool}'"
         ))
     }
 
@@ -1819,20 +1901,23 @@ impl VfsLocalFileSystem {
         args: &Value,
         wants_json: bool,
     ) -> LivePoolAdminResponse {
+        let object_label = live_dataset_mutation_type_arg(args)
+            .expect("destroy object type was validated")
+            .to_string();
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
         };
         let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
         if name == "root" {
-            return live_admin_error(1, "dataset destroy: 'root' dataset cannot be destroyed");
+            return live_admin_error(1, "filesystem destroy: 'root' cannot be destroyed");
         }
 
         let mut fs = self.fs.borrow_mut();
         if !fs.dataset_catalog().contains(name) {
             return live_admin_error(
                 1,
-                format!("dataset destroy: dataset '{name}' does not exist in the catalog"),
+                format!("{object_label} destroy: '{name}' does not exist in the catalog"),
             );
         }
         let child_count = match fs.dataset_catalog().list_children(name) {
@@ -1840,7 +1925,9 @@ impl VfsLocalFileSystem {
             Err(err) => {
                 return live_admin_error(
                     1,
-                    format!("dataset destroy: catalog error listing children of '{name}': {err}"),
+                    format!(
+                        "{object_label} destroy: catalog error listing children of '{name}': {err}"
+                    ),
                 )
             }
         };
@@ -1855,7 +1942,7 @@ impl VfsLocalFileSystem {
             .unwrap_or(false);
         let mut hazards = Vec::new();
         if child_count > 0 {
-            hazards.push(format!("{child_count} child dataset(s)"));
+            hazards.push(format!("{child_count} child object(s)"));
         }
         if snapshot_count > 0 {
             hazards.push(format!("{snapshot_count} snapshot(s)"));
@@ -1867,7 +1954,7 @@ impl VfsLocalFileSystem {
             return live_admin_error(
                 1,
                 format!(
-                    "dataset destroy: dataset '{name}' has {}; retry with --force to destroy it",
+                    "{object_label} destroy: '{name}' has {}; retry with --force to destroy it",
                     hazards.join(", ")
                 ),
             );
@@ -1890,7 +1977,8 @@ impl VfsLocalFileSystem {
                             "ok": true,
                             "operation": "destroy",
                             "pool": pool,
-                            "dataset": name,
+                            "name": name,
+                            "type": "volume",
                             "force": force,
                             "destroyed_entries": 1,
                             "child_count": child_count,
@@ -1900,33 +1988,34 @@ impl VfsLocalFileSystem {
                         }));
                     }
                     return live_admin_ok_text(format!(
-                        "dataset '{name}' logically destroyed; {}",
+                        "volume '{name}' logically destroyed; {}",
                         volume_reclaim_line(&result.reclaim),
                     ));
                 }
                 Err(err) => {
-                    return live_admin_error(1, format!("dataset destroy: {err}"));
+                    return live_admin_error(1, format!("volume destroy: {err}"));
                 }
             }
         }
         if dataset_type != DatasetType::Filesystem {
-            return live_admin_error(1, "dataset destroy: unsupported dataset type");
+            return live_admin_error(1, "object destroy: unsupported object type");
         }
         if child_count != 0 || snapshot_count != 0 || live_mount {
             return live_admin_error(
                 1,
-                "dataset destroy: recursive or live filesystem destruction is not implemented; destroy snapshots and children and unmount the target first",
+                "filesystem destroy: recursive or live destruction is not implemented; destroy snapshots and children and unmount the target first",
             );
         }
         if let Err(err) = fs.destroy_filesystem_dataset(name) {
-            return live_admin_error(1, format!("dataset destroy: {err}"));
+            return live_admin_error(1, format!("filesystem destroy: {err}"));
         }
         if wants_json {
             return live_admin_ok_json(json!({
                 "ok": true,
                 "operation": "destroy",
                 "pool": pool,
-                "dataset": name,
+                "name": name,
+                "type": "filesystem",
                 "force": force,
                 "destroyed_entries": 1,
                 "child_count": child_count,
@@ -1934,7 +2023,7 @@ impl VfsLocalFileSystem {
                 "live_mount": live_mount,
             }));
         }
-        live_admin_ok_text(format!("dataset '{name}' destroyed"))
+        live_admin_ok_text(format!("filesystem '{name}' destroyed"))
     }
 
     fn live_dataset_set_strategy(&self, args: &Value) -> LivePoolAdminResponse {
@@ -1957,7 +2046,7 @@ impl VfsLocalFileSystem {
         if !fs.dataset_catalog().contains(name) {
             return live_admin_error(
                 1,
-                format!("dataset set-strategy: dataset '{name}' does not exist in the catalog"),
+                format!("filesystem set-strategy: filesystem '{name}' does not exist"),
             );
         }
         let target_id = fs
@@ -1967,7 +2056,7 @@ impl VfsLocalFileSystem {
         if *target_id.as_bytes() != fs.mounted_dataset_id() {
             return live_admin_error(
                 1,
-                "dataset set-strategy: named filesystem feature flags require that dataset's mounted owner; refusing to mutate the root filesystem",
+                "filesystem set-strategy: named feature flags require that filesystem's mounted owner; refusing to mutate the root filesystem",
             );
         }
 
@@ -1975,10 +2064,10 @@ impl VfsLocalFileSystem {
             let flags = fs.feature_flags();
             if flags.is_empty() {
                 return live_admin_ok_text(format!(
-                    "dataset '{name}' has no feature flags enabled"
+                    "filesystem '{name}' has no feature flags enabled"
                 ));
             }
-            let mut out = format!("dataset '{name}' feature flags:");
+            let mut out = format!("filesystem '{name}' feature flags:");
             for (class, feature, value) in flags.all_features() {
                 let _ = write!(out, "\n  {class}  {feature}  ({})", value.to_u8());
             }
@@ -2001,7 +2090,7 @@ impl VfsLocalFileSystem {
                 return live_admin_error(
                     1,
                     format!(
-                        "dataset set-strategy: invalid feature name '{feature_str}'; expected format org.tidefs:<name>"
+                        "filesystem set-strategy: invalid feature name '{feature_str}'; expected format org.tidefs:<name>"
                     ),
                 );
             };
@@ -2009,7 +2098,7 @@ impl VfsLocalFileSystem {
                 return live_admin_error(
                     1,
                     format!(
-                        "dataset set-strategy: feature '{feature_str}' requires a data-policy build"
+                        "filesystem set-strategy: feature '{feature_str}' requires a data-policy build"
                     ),
                 );
             }
@@ -2018,7 +2107,7 @@ impl VfsLocalFileSystem {
                 Err(err) => {
                     return live_admin_error(
                         1,
-                        format!("dataset set-strategy: mutation requires reopen: {err}"),
+                        format!("filesystem set-strategy: mutation requires reopen: {err}"),
                     )
                 }
             };
@@ -2032,7 +2121,7 @@ impl VfsLocalFileSystem {
                 Err(err) => {
                     return live_admin_error(
                         1,
-                        format!("dataset set-strategy: failed to enable '{feature_str}': {err}"),
+                        format!("filesystem set-strategy: failed to enable '{feature_str}': {err}"),
                     )
                 }
             }
@@ -2046,7 +2135,7 @@ impl VfsLocalFileSystem {
                 return live_admin_error(
                     1,
                     format!(
-                        "dataset set-strategy: invalid feature name '{feature_str}'; expected format org.tidefs:<name>"
+                        "filesystem set-strategy: invalid feature name '{feature_str}'; expected format org.tidefs:<name>"
                     ),
                 );
             };
@@ -2055,7 +2144,7 @@ impl VfsLocalFileSystem {
                 Err(err) => {
                     return live_admin_error(
                         1,
-                        format!("dataset set-strategy: mutation requires reopen: {err}"),
+                        format!("filesystem set-strategy: mutation requires reopen: {err}"),
                     )
                 }
             };
@@ -2067,7 +2156,9 @@ impl VfsLocalFileSystem {
                 Err(err) => {
                     return live_admin_error(
                         1,
-                        format!("dataset set-strategy: failed to disable '{feature_str}': {err}"),
+                        format!(
+                            "filesystem set-strategy: failed to disable '{feature_str}': {err}"
+                        ),
                     )
                 }
             }
@@ -2077,21 +2168,21 @@ impl VfsLocalFileSystem {
             if let Err(err) = fs.persist_feature_flags() {
                 return live_admin_error(
                     1,
-                    format!("dataset set-strategy: failed to persist feature flags: {err}"),
+                    format!("filesystem set-strategy: failed to persist feature flags: {err}"),
                 );
             }
             #[cfg(feature = "data-policy")]
             if let Err(err) = fs.refresh_policies_from_features() {
                 return live_admin_error(
                     1,
-                    format!("dataset set-strategy: failed to refresh mounted policies: {err}"),
+                    format!("filesystem set-strategy: failed to refresh mounted policies: {err}"),
                 );
             }
-            out.push(format!("feature flags persisted for dataset '{name}'"));
+            out.push(format!("feature flags persisted for filesystem '{name}'"));
         }
 
         if out.is_empty() {
-            live_admin_ok_text(format!("dataset '{name}' feature flags unchanged"))
+            live_admin_ok_text(format!("filesystem '{name}' feature flags unchanged"))
         } else {
             live_admin_ok_text(out.join("\n"))
         }
@@ -2107,7 +2198,7 @@ impl VfsLocalFileSystem {
         if !fs.dataset_catalog().contains(name) {
             return live_admin_error(
                 1,
-                format!("dataset upgrade: dataset '{name}' does not exist in the catalog"),
+                format!("filesystem upgrade: filesystem '{name}' does not exist"),
             );
         }
         let target_id = fs
@@ -2117,7 +2208,7 @@ impl VfsLocalFileSystem {
         if *target_id.as_bytes() != fs.mounted_dataset_id() {
             return live_admin_error(
                 1,
-                "dataset upgrade: named filesystem feature flags require that dataset's mounted owner; refusing to mutate the root filesystem",
+                "filesystem upgrade: named feature flags require that filesystem's mounted owner; refusing to mutate the root filesystem",
             );
         }
 
@@ -2136,7 +2227,7 @@ impl VfsLocalFileSystem {
 
         if to_enable.is_empty() {
             return live_admin_ok_text(format!(
-                "dataset '{name}': all {} supported features are already enabled",
+                "filesystem '{name}': all {} supported features are already enabled",
                 available.len()
             ));
         }
@@ -2146,7 +2237,7 @@ impl VfsLocalFileSystem {
         let mut skipped_count = 0u32;
         let mut failed = Vec::new();
         let mut out = vec![format!(
-            "dataset '{name}': upgrading from {before_count} enabled to {} supported features...",
+            "filesystem '{name}': upgrading from {before_count} enabled to {} supported features...",
             available.len()
         )];
 
@@ -2168,7 +2259,7 @@ impl VfsLocalFileSystem {
                     Err(err) => {
                         return live_admin_error(
                             1,
-                            format!("dataset upgrade: mutation requires reopen: {err}"),
+                            format!("filesystem upgrade: mutation requires reopen: {err}"),
                         )
                     }
                 };
@@ -2203,7 +2294,7 @@ impl VfsLocalFileSystem {
                         Err(err) => {
                             return live_admin_error(
                                 1,
-                                format!("dataset upgrade: mutation requires reopen: {err}"),
+                                format!("filesystem upgrade: mutation requires reopen: {err}"),
                             )
                         }
                     };
@@ -2222,21 +2313,21 @@ impl VfsLocalFileSystem {
             if let Err(err) = fs.persist_feature_flags() {
                 return live_admin_error(
                     1,
-                    format!("dataset upgrade: failed to persist feature flags: {err}"),
+                    format!("filesystem upgrade: failed to persist feature flags: {err}"),
                 );
             }
             #[cfg(feature = "data-policy")]
             if let Err(err) = fs.refresh_policies_from_features() {
                 return live_admin_error(
                     1,
-                    format!("dataset upgrade: failed to refresh mounted policies: {err}"),
+                    format!("filesystem upgrade: failed to refresh mounted policies: {err}"),
                 );
             }
-            out.push(format!("feature flags persisted for dataset '{name}'"));
+            out.push(format!("feature flags persisted for filesystem '{name}'"));
         }
 
         out.push(format!(
-            "dataset '{name}' upgrade complete: {enabled_count} enabled, {skipped_count} skipped, {} failed",
+            "filesystem '{name}' upgrade complete: {enabled_count} enabled, {skipped_count} skipped, {} failed",
             failed.len()
         ));
 
@@ -2252,14 +2343,17 @@ impl VfsLocalFileSystem {
 
     #[cfg(feature = "encryption")]
     fn live_dataset_seal_key(&self, args: &Value) -> LivePoolAdminResponse {
+        let object_label = live_dataset_mutation_type_arg(args)
+            .expect("seal-key object type was validated")
+            .to_string();
         if let Err(err) = self
             .fs
             .borrow()
-            .ensure_mutation_allowed("seal mounted dataset encryption key")
+            .ensure_mutation_allowed("seal mounted object encryption key")
         {
             return live_admin_error(
                 1,
-                format!("dataset seal-key: mutation requires reopen: {err}"),
+                format!("{object_label} seal-key: mutation requires reopen: {err}"),
             );
         }
         let name = match live_admin_arg(args, "name") {
@@ -2274,7 +2368,7 @@ impl VfsLocalFileSystem {
         if !self.fs.borrow().dataset_catalog().contains(name) {
             return live_admin_error(
                 1,
-                format!("dataset seal-key: dataset '{name}' does not exist in the catalog"),
+                format!("{object_label} seal-key: '{name}' does not exist in the catalog"),
             );
         }
 
@@ -2284,7 +2378,7 @@ impl VfsLocalFileSystem {
             Err(err) => {
                 return live_admin_error(
                     1,
-                    format!("dataset seal-key: failed to derive wrapping key: {err}"),
+                    format!("{object_label} seal-key: failed to derive wrapping key: {err}"),
                 )
             }
         };
@@ -2292,7 +2386,10 @@ impl VfsLocalFileSystem {
         let sealed = match KeyManager::seal_dek(&dek, &wk, name, 1) {
             Ok(sealed) => sealed,
             Err(err) => {
-                return live_admin_error(1, format!("dataset seal-key: failed to seal DEK: {err}"))
+                return live_admin_error(
+                    1,
+                    format!("{object_label} seal-key: failed to seal DEK: {err}"),
+                )
             }
         };
 
@@ -2301,21 +2398,23 @@ impl VfsLocalFileSystem {
         if let Err(err) = keystore.store_sealed_dek(&sealed) {
             return live_admin_error(
                 1,
-                format!("dataset seal-key: failed to store sealed DEK: {err}"),
+                format!("{object_label} seal-key: failed to store sealed DEK: {err}"),
             );
         }
 
         let salt_hex = salt_to_hex(&salt);
         live_admin_ok_text(format!(
-            "dataset '{name}' encryption key sealed (kek_generation=1)\n  salt: {salt_hex}\n  save this salt; it is required for key rotation"
+            "{object_label} '{name}' encryption key sealed (kek_generation=1)\n  salt: {salt_hex}\n  save this salt; it is required for key rotation"
         ))
     }
 
     #[cfg(not(feature = "encryption"))]
-    fn live_dataset_seal_key(&self, _args: &Value) -> LivePoolAdminResponse {
+    fn live_dataset_seal_key(&self, args: &Value) -> LivePoolAdminResponse {
+        let object_label =
+            live_dataset_mutation_type_arg(args).expect("seal-key object type was validated");
         live_admin_error(
             1,
-            "dataset seal-key: live owner was built without encryption support",
+            format!("{object_label} seal-key: live owner was built without encryption support"),
         )
     }
 
@@ -2324,11 +2423,11 @@ impl VfsLocalFileSystem {
         if let Err(err) = self
             .fs
             .borrow()
-            .ensure_mutation_allowed("rotate mounted dataset encryption key")
+            .ensure_mutation_allowed("rotate Pool wrapping key")
         {
             return live_admin_error(
                 1,
-                format!("dataset rotate-key: mutation requires reopen: {err}"),
+                format!("pool rotate-key: mutation requires reopen: {err}"),
             );
         }
         let old_passphrase = match live_admin_arg(args, "old_passphrase") {
@@ -2346,7 +2445,7 @@ impl VfsLocalFileSystem {
         let old_salt = match live_admin_hex_to_salt(old_salt_hex) {
             Ok(salt) => salt,
             Err(err) => {
-                return live_admin_error(1, format!("dataset rotate-key: invalid old_salt: {err}"))
+                return live_admin_error(1, format!("pool rotate-key: invalid old_salt: {err}"))
             }
         };
         let new_salt = PoolWrappingKey::generate_salt();
@@ -2359,14 +2458,14 @@ impl VfsLocalFileSystem {
             Err(err) => {
                 return live_admin_error(
                     1,
-                    format!("dataset rotate-key: failed to list datasets: {err}"),
+                    format!("pool rotate-key: failed to list sealed object keys: {err}"),
                 )
             }
         };
         if datasets.is_empty() {
             return live_admin_error(
                 1,
-                "dataset rotate-key: no datasets with sealed DEKs in imported pool",
+                "pool rotate-key: no objects with sealed keys in imported pool",
             );
         }
 
@@ -2378,16 +2477,13 @@ impl VfsLocalFileSystem {
         ) {
             Ok(stats) => stats,
             Err(err) => {
-                return live_admin_error(
-                    1,
-                    format!("dataset rotate-key: key rotation failed: {err}"),
-                )
+                return live_admin_error(1, format!("pool rotate-key: key rotation failed: {err}"))
             }
         };
 
         let new_salt_hex = salt_to_hex(&new_salt);
         live_admin_ok_text(format!(
-            "key rotation complete: {} dataset(s) re-wrapped\n  new salt: {new_salt_hex}\n  save this salt for future rotations",
+            "key rotation complete: {} object key(s) re-wrapped\n  new salt: {new_salt_hex}\n  save this salt for future rotations",
             stats.keys_rotated
         ))
     }
@@ -2396,7 +2492,7 @@ impl VfsLocalFileSystem {
     fn live_dataset_rotate_key(&self, _args: &Value) -> LivePoolAdminResponse {
         live_admin_error(
             1,
-            "dataset rotate-key: live owner was built without encryption support",
+            "pool rotate-key: live owner was built without encryption support",
         )
     }
 
@@ -2406,6 +2502,9 @@ impl VfsLocalFileSystem {
         args: &Value,
         wants_json: bool,
     ) -> LivePoolAdminResponse {
+        let object_label = live_dataset_mutation_type_arg(args)
+            .expect("get object type was validated")
+            .to_string();
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2417,17 +2516,20 @@ impl VfsLocalFileSystem {
         let registry = tidefs_dataset_properties::build_registry();
         let key = tidefs_dataset_properties::PropertyKey::new(property);
         if tidefs_dataset_properties::lookup_property(&registry, &key).is_none() {
-            return live_admin_error(1, format!("dataset get: unknown property '{property}'"));
+            return live_admin_error(
+                1,
+                format!("{object_label} get: unknown property '{property}'"),
+            );
         }
 
         let path = name;
         let fs = self.fs.borrow();
-        let effective = match fs.dataset_catalog().get_properties_with_inheritance(&path) {
+        let effective = match fs.dataset_catalog().get_properties_with_inheritance(path) {
             Ok(props) => props,
             Err(err) => {
                 return live_admin_error(
                     1,
-                    format!("dataset get: cannot read properties for '{name}': {err}"),
+                    format!("{object_label} get: cannot read properties for '{name}': {err}"),
                 )
             }
         };
@@ -2438,7 +2540,8 @@ impl VfsLocalFileSystem {
                         "ok": true,
                         "operation": "get",
                         "pool": pool,
-                        "dataset": name,
+                        "name": name,
+                        "type": object_label,
                         "property": property,
                         "value": live_property_value_json(&entry.value),
                         "display_value": entry.value.to_string(),
@@ -2453,7 +2556,7 @@ impl VfsLocalFileSystem {
             }
             None => live_admin_error(
                 1,
-                format!("dataset get: internal error resolving '{property}'"),
+                format!("{object_label} get: internal error resolving '{property}'"),
             ),
         }
     }
@@ -2464,6 +2567,9 @@ impl VfsLocalFileSystem {
         args: &Value,
         wants_json: bool,
     ) -> LivePoolAdminResponse {
+        let object_label = live_dataset_mutation_type_arg(args)
+            .expect("set object type was validated")
+            .to_string();
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2480,7 +2586,7 @@ impl VfsLocalFileSystem {
                     return live_admin_error(
                         1,
                         format!(
-                            "dataset set: invalid assignment '{}' (expected key=value)",
+                            "{object_label} set: invalid assignment '{}' (expected key=value)",
                             assignment.unwrap_or("")
                         ),
                     )
@@ -2488,7 +2594,10 @@ impl VfsLocalFileSystem {
             },
         };
         if prop_name.is_empty() {
-            return live_admin_error(1, "dataset set: property name must not be empty");
+            return live_admin_error(
+                1,
+                format!("{object_label} set: property name must not be empty"),
+            );
         }
 
         let registry = tidefs_dataset_properties::build_registry();
@@ -2496,7 +2605,10 @@ impl VfsLocalFileSystem {
         let def = match tidefs_dataset_properties::lookup_property(&registry, &key) {
             Some(def) => def,
             None => {
-                return live_admin_error(1, format!("dataset set: unknown property '{prop_name}'"))
+                return live_admin_error(
+                    1,
+                    format!("{object_label} set: unknown property '{prop_name}'"),
+                )
             }
         };
         let is_clear = args
@@ -2508,27 +2620,30 @@ impl VfsLocalFileSystem {
         } else if let Some(value_json) = args.get("value") {
             match live_property_value_from_json(value_json, def.value_type) {
                 Ok(value) => value,
-                Err(err) => return live_admin_error(1, format!("dataset set: {err}")),
+                Err(err) => return live_admin_error(1, format!("{object_label} set: {err}")),
             }
         } else {
             let Some(prop_val_str) = prop_val_str else {
-                return live_admin_error(1, "dataset set: property value must not be empty");
+                return live_admin_error(
+                    1,
+                    format!("{object_label} set: property value must not be empty"),
+                );
             };
             match live_property_value_from_str(prop_val_str, def.value_type) {
                 Ok(value) => value,
-                Err(err) => return live_admin_error(1, format!("dataset set: {err}")),
+                Err(err) => return live_admin_error(1, format!("{object_label} set: {err}")),
             }
         };
         let path = name;
         let mut fs = self.fs.borrow_mut();
         let existing_props = fs
             .dataset_catalog()
-            .get_properties(&path)
+            .get_properties(path)
             .unwrap_or_default();
         if let Err(err) =
             tidefs_dataset_properties::validate_set(&key, &value, def, &existing_props)
         {
-            return live_admin_error(1, format!("dataset set: validation failed: {err}"));
+            return live_admin_error(1, format!("{object_label} set: validation failed: {err}"));
         }
         let mut props = existing_props;
         if is_clear {
@@ -2539,19 +2654,22 @@ impl VfsLocalFileSystem {
         let catalog = match fs.dataset_catalog_mut() {
             Ok(catalog) => catalog,
             Err(err) => {
-                return live_admin_error(1, format!("dataset set: mutation requires reopen: {err}"))
+                return live_admin_error(
+                    1,
+                    format!("{object_label} set: mutation requires reopen: {err}"),
+                )
             }
         };
-        if let Err(err) = catalog.set_properties(&path, &props) {
+        if let Err(err) = catalog.set_properties(path, &props) {
             return live_admin_error(
                 1,
-                format!("dataset set: cannot write properties for '{name}': {err}"),
+                format!("{object_label} set: cannot write properties for '{name}': {err}"),
             );
         }
         if let Err(err) = fs.persist_dataset_catalog() {
             return live_admin_error(
                 1,
-                format!("dataset set: property set but catalog persist failed: {err}"),
+                format!("{object_label} set: property set but catalog persist failed: {err}"),
             );
         }
         if wants_json {
@@ -2559,7 +2677,8 @@ impl VfsLocalFileSystem {
                 "ok": true,
                 "operation": "set",
                 "pool": pool,
-                "dataset": name,
+                "name": name,
+                "type": object_label,
                 "property": prop_name,
                 "value": live_property_value_json(&value),
                 "display_value": value.to_string(),
@@ -2575,6 +2694,9 @@ impl VfsLocalFileSystem {
     }
 
     fn live_dataset_list_props(&self, _pool: &str, args: &Value) -> LivePoolAdminResponse {
+        let object_label = live_dataset_mutation_type_arg(args)
+            .expect("list-props object type was validated")
+            .to_string();
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2582,16 +2704,18 @@ impl VfsLocalFileSystem {
         let family = live_admin_optional_arg(args, "family");
         let path = name;
         let fs = self.fs.borrow();
-        let props = match fs.dataset_catalog().get_properties(&path) {
+        let props = match fs.dataset_catalog().get_properties(path) {
             Ok(props) => props,
             Err(err) => {
                 return live_admin_error(
                     1,
-                    format!("dataset list-props: cannot read properties for '{name}': {err}"),
+                    format!(
+                        "{object_label} list-props: cannot read properties for '{name}': {err}"
+                    ),
                 )
             }
         };
-        live_property_table("dataset list-props", &props, family)
+        live_property_table(&format!("{object_label} list-props"), &props, family)
     }
 
     fn live_snapshot_create(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
@@ -4624,7 +4748,7 @@ impl PoolDatasetOwner {
                     if flags.contains(DatasetFlags::CLONE) || lifecycle_state.to_u8() != 0 {
                         return Err(FileSystemError::Unsupported {
                             operation,
-                            reason: "filesystem clones or non-active filesystem datasets require a separate lifecycle authority row",
+                            reason: "filesystem clones or non-active filesystems require a separate lifecycle authority row",
                         });
                     }
                     let (state, root) = crate::load_canonical_committed_state_for_dataset(
@@ -4668,7 +4792,7 @@ impl PoolDatasetOwner {
             if snapshot.source_reference.kind != tidefs_pool_runtime::DatasetRootKind::Volume {
                 return Err(FileSystemError::Unsupported {
                     operation,
-                    reason: "a filesystem-sourced snapshot root belongs to a non-active or independently mounted dataset",
+                    reason: "a filesystem-sourced snapshot root belongs to a non-active or independently mounted filesystem",
                 });
             }
             has_pool_owned_volume_roots = true;
@@ -5396,12 +5520,22 @@ fn live_admin_typed_optional_string_arg<'a>(
 }
 
 fn live_dataset_type_arg(args: &Value) -> Result<DatasetType, String> {
-    match live_admin_optional_arg(args, "type").unwrap_or("filesystem") {
+    match live_admin_arg(args, "type")? {
         "filesystem" => Ok(DatasetType::Filesystem),
         "volume" => Ok(DatasetType::Volume),
         "snapshot" => Ok(DatasetType::Snapshot),
         other => Err(format!(
-            "dataset create: invalid dataset type '{other}' (expected filesystem, volume, or snapshot)"
+            "object create: invalid object type '{other}' (expected filesystem, volume, or snapshot)"
+        )),
+    }
+}
+
+fn live_dataset_mutation_type_arg(args: &Value) -> Result<DatasetType, String> {
+    match live_admin_arg(args, "type")? {
+        "filesystem" => Ok(DatasetType::Filesystem),
+        "volume" => Ok(DatasetType::Volume),
+        other => Err(format!(
+            "invalid object type '{other}' (expected filesystem or volume)"
         )),
     }
 }
@@ -5412,7 +5546,7 @@ fn live_dataset_type_filter_arg(args: &Value) -> Result<Option<DatasetType>, Str
         Some("volume") => Ok(Some(DatasetType::Volume)),
         Some("snapshot") => Ok(Some(DatasetType::Snapshot)),
         Some(other) => Err(format!(
-            "dataset list: invalid dataset type '{other}' (expected filesystem, volume, or snapshot)"
+            "object list: invalid object type '{other}' (expected filesystem, volume, or snapshot)"
         )),
         None => Ok(None),
     }
@@ -5424,7 +5558,7 @@ fn live_property_set_from_request(args: &Value) -> Result<PropertySet, String> {
     };
     let values = values
         .as_array()
-        .ok_or_else(|| "dataset create: properties must be an array argument".to_string())?;
+        .ok_or_else(|| "object create: properties must be an array argument".to_string())?;
     let registry = tidefs_dataset_properties::build_registry();
     let mut properties = PropertySet::new();
     let mut seen = BTreeSet::new();
@@ -5432,26 +5566,23 @@ fn live_property_set_from_request(args: &Value) -> Result<PropertySet, String> {
         let key_name = entry
             .get("key")
             .and_then(Value::as_str)
-            .ok_or_else(|| "dataset create: property entry is missing key".to_string())?;
+            .ok_or_else(|| "object create: property entry is missing key".to_string())?;
         let key = tidefs_dataset_properties::PropertyKey::new(key_name);
         if !seen.insert(key_name.to_string()) {
-            return Err(format!(
-                "dataset create: duplicate dataset property key: {key_name}"
-            ));
+            return Err(format!("object create: duplicate property key: {key_name}"));
         }
-        let def = tidefs_dataset_properties::lookup_property(&registry, &key).ok_or_else(|| {
-            format!("dataset create: unsupported dataset property key: {key_name}")
-        })?;
+        let def = tidefs_dataset_properties::lookup_property(&registry, &key)
+            .ok_or_else(|| format!("object create: unsupported property key: {key_name}"))?;
         let clear = entry.get("clear").and_then(Value::as_bool).unwrap_or(false);
         if clear {
             continue;
         }
         let value_json = entry
             .get("value")
-            .ok_or_else(|| format!("dataset create: property '{key_name}' is missing value"))?;
+            .ok_or_else(|| format!("object create: property '{key_name}' is missing value"))?;
         let value = live_property_value_from_json(value_json, def.value_type)?;
         tidefs_dataset_properties::validate_set(&key, &value, def, &properties)
-            .map_err(|err| format!("dataset create: invalid value for {key_name}: {err}"))?;
+            .map_err(|err| format!("object create: invalid value for {key_name}: {err}"))?;
         properties.set_local(key, value);
     }
     Ok(properties)
@@ -5463,24 +5594,22 @@ fn live_feature_names_from_request(args: &Value) -> Result<Vec<String>, String> 
     };
     let values = values
         .as_array()
-        .ok_or_else(|| "dataset create: features must be an array argument".to_string())?;
+        .ok_or_else(|| "object create: features must be an array argument".to_string())?;
     let mut features = Vec::with_capacity(values.len());
     let mut seen = BTreeSet::new();
     for value in values {
         let feature = value
             .as_str()
-            .ok_or_else(|| "dataset create: feature names must be strings".to_string())?;
+            .ok_or_else(|| "object create: feature names must be strings".to_string())?;
         let name = FeatureName::from_str(feature)
-            .ok_or_else(|| format!("dataset create: invalid feature flag name: {feature}"))?;
+            .ok_or_else(|| format!("object create: invalid feature flag name: {feature}"))?;
         if get_feature_class(&name).is_none() {
             return Err(format!(
-                "dataset create: unsupported dataset feature flag: {feature}"
+                "object create: unsupported feature flag: {feature}"
             ));
         }
         if !seen.insert(feature.to_string()) {
-            return Err(format!(
-                "dataset create: duplicate dataset feature flag: {feature}"
-            ));
+            return Err(format!("object create: duplicate feature flag: {feature}"));
         }
         features.push(feature.to_string());
     }
@@ -5490,14 +5619,14 @@ fn live_feature_names_from_request(args: &Value) -> Result<Vec<String>, String> 
 fn live_dataset_snapshot_count(catalog: &DatasetCatalog, path: &str) -> Result<usize, String> {
     let target_id = catalog
         .lookup(path)
-        .map_err(|err| format!("dataset destroy: catalog error resolving '{path}': {err}"))?;
+        .map_err(|err| format!("object destroy: catalog error resolving '{path}': {err}"))?;
     let mut count = 0;
     for (snapshot_path, _, dataset_type, _, _, _) in catalog.list_all() {
         if dataset_type != DatasetType::Snapshot {
             continue;
         }
         if catalog.lineage_parent(&snapshot_path).map_err(|err| {
-            format!("dataset destroy: catalog error resolving lineage for '{snapshot_path}': {err}")
+            format!("object destroy: catalog error resolving lineage for '{snapshot_path}': {err}")
         })? == Some(target_id)
         {
             count += 1;
@@ -6029,7 +6158,7 @@ fn resolve_feature_class(class: &str, enable: &[String]) -> Result<FeatureClass,
         "auto" => None,
         other => {
             return Err(format!(
-                "dataset set-strategy: unknown feature class '{other}'; expected auto, compat, ro_compat, or incompat"
+                "filesystem set-strategy: unknown feature class '{other}'; expected auto, compat, ro_compat, or incompat"
             ))
         }
     };
@@ -6047,12 +6176,12 @@ fn resolve_feature_class(class: &str, enable: &[String]) -> Result<FeatureClass,
     };
     let Some(name) = FeatureName::from_str(first) else {
         return Err(format!(
-            "dataset set-strategy: invalid feature name '{first}'"
+            "filesystem set-strategy: invalid feature name '{first}'"
         ));
     };
     get_feature_class(&name).ok_or_else(|| {
         format!(
-            "dataset set-strategy: cannot auto-resolve class for '{first}' (unknown feature); specify --class explicitly"
+            "filesystem set-strategy: cannot auto-resolve class for '{first}' (unknown feature); specify --class explicitly"
         )
     })
 }
@@ -6148,7 +6277,7 @@ fn filesystem_clone_unsupported(operation: &str, source: &str) -> LivePoolAdminR
     live_admin_error(
         1,
         format!(
-            "snapshot clone {operation}: source '{source}' is not a canonical volume snapshot; filesystem SnapshotRecord clones are metadata aliases, not independently writable datasets, and are unsupported by the product clone command"
+            "snapshot clone {operation}: source '{source}' is not a canonical volume snapshot; filesystem SnapshotRecord clones are metadata aliases, not independently writable clones, and are unsupported by the product clone command"
         ),
     )
 }
@@ -8506,7 +8635,11 @@ mod tests {
 
         let mut strategy =
             LivePoolAdminRequest::new(LivePoolAdminCommand::DatasetSetStrategy, "tank");
-        strategy.args = live_admin_args_from_json(json!({ "name": "root", "list": true }));
+        strategy.args = live_admin_args_from_json(json!({
+            "name": "root",
+            "type": "filesystem",
+            "list": true,
+        }));
         assert!(engine.live_pool_admin_request(&strategy).is_ok());
     }
 
@@ -8542,26 +8675,38 @@ mod tests {
             )
         };
 
-        let listed = live_admin(&engine, "dataset", "list", json!({}), true);
-        assert_eq!(listed["ok"], true, "dataset list response: {listed}");
-        let datasets = listed["json"]["datasets"].as_array().expect("dataset rows");
-        assert_eq!(datasets.len(), 2, "dataset list response: {listed}");
-        for dataset in datasets {
-            assert_eq!(dataset["used"], expected_used, "dataset row: {dataset}");
+        let listed = live_admin(
+            &engine,
+            "dataset",
+            "list",
+            json!({"type": "filesystem"}),
+            true,
+        );
+        assert_eq!(listed["ok"], true, "filesystem list response: {listed}");
+        let items = listed["json"]["items"].as_array().expect("filesystem rows");
+        assert_eq!(items.len(), 2, "filesystem list response: {listed}");
+        for item in items {
+            assert_eq!(item["used"], expected_used, "filesystem row: {item}");
             assert_eq!(
-                dataset["available"], expected_available,
-                "dataset row: {dataset}"
+                item["available"], expected_available,
+                "filesystem row: {item}"
             );
         }
         assert!(expected_used > 0);
 
-        let human = live_admin(&engine, "dataset", "list", json!({}), false);
+        let human = live_admin(
+            &engine,
+            "dataset",
+            "list",
+            json!({"type": "filesystem"}),
+            false,
+        );
         assert!(
             human["text"].as_str().is_some_and(|text| {
                 text.contains(&expected_used.to_string())
                     && text.contains(&expected_available.to_string())
             }),
-            "human dataset list should carry the same capacity projection: {human}",
+            "human filesystem list should carry the same capacity projection: {human}",
         );
     }
 
@@ -8581,22 +8726,34 @@ mod tests {
         );
         assert_eq!(created["ok"], true, "dataset create response: {created}");
 
-        let listed = live_admin(&engine, "dataset", "list", json!({}), true);
-        assert_eq!(listed["ok"], true, "dataset list response: {listed}");
-        let datasets = listed["json"]["datasets"].as_array().expect("dataset rows");
-        let root = datasets
+        let listed = live_admin(
+            &engine,
+            "dataset",
+            "list",
+            json!({"type": "filesystem"}),
+            true,
+        );
+        assert_eq!(listed["ok"], true, "filesystem list response: {listed}");
+        let items = listed["json"]["items"].as_array().expect("filesystem rows");
+        let root = items
             .iter()
-            .find(|dataset| dataset["path"] == "root")
-            .expect("root dataset row");
-        let child = datasets
+            .find(|item| item["path"] == "root")
+            .expect("root filesystem row");
+        let child = items
             .iter()
-            .find(|dataset| dataset["path"] == "childfs")
-            .expect("child dataset row");
+            .find(|item| item["path"] == "childfs")
+            .expect("child filesystem row");
         assert_eq!(root["mountpoint"], "/mnt/tank");
         assert_eq!(child["mountpoint"], Value::Null);
 
-        let human = live_admin(&engine, "dataset", "list", json!({}), false);
-        let text = human["text"].as_str().expect("human dataset list");
+        let human = live_admin(
+            &engine,
+            "dataset",
+            "list",
+            json!({"type": "filesystem"}),
+            false,
+        );
+        let text = human["text"].as_str().expect("human filesystem list");
         let root = text
             .lines()
             .find(|line| line.starts_with("tank/root"))
@@ -9290,6 +9447,79 @@ mod tests {
     }
 
     #[test]
+    fn live_dataset_mutations_refuse_cross_object_types_before_catalog_change() {
+        let (engine, _td) = temp_fs();
+        let created = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "volume0",
+                "parent": "root",
+                "type": "volume",
+                "size": 8192,
+                "sync": "local",
+            }),
+        );
+        assert_eq!(created["ok"], true, "create response: {created}");
+
+        let missing_type =
+            live_dataset_admin(&engine, "resize", json!({"name": "volume0", "size": 16384}));
+        assert_eq!(missing_type["ok"], false, "resize response: {missing_type}");
+        assert!(missing_type["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("argument 'type'")));
+
+        let filesystem_rename = live_dataset_admin(
+            &engine,
+            "rename",
+            json!({
+                "old_name": "volume0",
+                "new_name": "renamed",
+                "type": "filesystem",
+            }),
+        );
+        assert_eq!(
+            filesystem_rename["ok"], false,
+            "rename response: {filesystem_rename}"
+        );
+        assert!(filesystem_rename["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("is a volume, not a filesystem")));
+
+        let volume_set = live_dataset_admin(
+            &engine,
+            "set",
+            json!({
+                "name": "root",
+                "type": "volume",
+                "assignment": "access.readonly=on",
+            }),
+        );
+        assert_eq!(volume_set["ok"], false, "set response: {volume_set}");
+        assert!(volume_set["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("is a filesystem, not a volume")));
+
+        let fs = engine.fs.borrow();
+        assert!(fs.dataset_catalog().contains("volume0"));
+        assert!(!fs.dataset_catalog().contains("renamed"));
+        let readonly = tidefs_dataset_properties::PropertyKey::new("access.readonly");
+        assert!(fs
+            .dataset_catalog()
+            .get_properties("root")
+            .expect("root properties")
+            .get(&readonly)
+            .is_none());
+        assert_eq!(
+            fs.open_pool_volume("volume0")
+                .expect("unchanged volume")
+                .geometry()
+                .capacity_bytes,
+            8192
+        );
+    }
+
+    #[test]
     fn live_volume_reclaim_lifecycle_resizes_then_destroys_canonical_root() {
         let (engine, _td) = temp_fs();
         let created = live_dataset_admin(
@@ -9305,8 +9535,11 @@ mod tests {
         );
         assert_eq!(created["ok"], true, "create response: {created}");
 
-        let resized =
-            live_dataset_admin(&engine, "resize", json!({"name": "volume0", "size": 16384}));
+        let resized = live_dataset_admin(
+            &engine,
+            "resize",
+            json!({"name": "volume0", "type": "volume", "size": 16384}),
+        );
         assert_eq!(resized["ok"], true, "resize response: {resized}");
         assert!(resized["text"].as_str().is_some_and(|text| {
             text.contains("size=16384") && text.contains("resize_generation=2")
@@ -9325,7 +9558,7 @@ mod tests {
         let destroyed = live_dataset_admin(
             &engine,
             "destroy",
-            json!({"name": "volume0", "force": false}),
+            json!({"name": "volume0", "type": "volume", "force": false}),
         );
         assert_eq!(destroyed["ok"], true, "destroy response: {destroyed}");
         assert!(destroyed["text"].as_str().is_some_and(|text| {
@@ -9375,7 +9608,11 @@ mod tests {
         let renamed = live_dataset_admin(
             &engine,
             "rename",
-            json!({"old_name": "volume0", "new_name": "renamed"}),
+            json!({
+                "old_name": "volume0",
+                "new_name": "renamed",
+                "type": "volume",
+            }),
         );
         assert_eq!(renamed["ok"], true, "rename response: {renamed}");
         let listed = live_snapshot_admin(&engine, "list", json!({}), true);
@@ -9614,19 +9851,43 @@ mod tests {
     }
 
     #[test]
-    fn live_dataset_create_refuses_rootless_or_invalid_objects() {
+    fn live_dataset_create_publishes_filesystems_and_refuses_invalid_objects() {
         let (engine, _td) = temp_fs();
+
+        let filesystem = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "filesystem0",
+                "parent": "root",
+                "type": "filesystem",
+                "sync": "local",
+            }),
+        );
+        assert_eq!(filesystem["ok"], true, "create response: {filesystem}");
+        let fs = engine.fs.borrow();
+        let filesystem_id = fs
+            .dataset_catalog()
+            .lookup("filesystem0")
+            .expect("cataloged filesystem");
+        assert_eq!(
+            fs.store
+                .dataset_root(filesystem_id)
+                .expect("typed filesystem root")
+                .kind,
+            tidefs_pool_runtime::DatasetRootKind::Filesystem
+        );
+        drop(fs);
 
         for (name, args, expected) in [
             (
-                "filesystem0",
+                "missing-type",
                 json!({
-                    "name": "filesystem0",
+                    "name": "missing-type",
                     "parent": "root",
-                    "type": "filesystem",
                     "sync": "local",
                 }),
-                "filesystem engine can publish its typed root",
+                "argument 'type'",
             ),
             (
                 "snapshot0",
@@ -9705,6 +9966,7 @@ mod tests {
             "set",
             json!({
                 "name": "demo",
+                "type": "volume",
                 "assignment": "access.readonly=on",
             }),
         );
@@ -9715,6 +9977,7 @@ mod tests {
             "get",
             json!({
                 "name": "demo",
+                "type": "volume",
                 "property": "access.readonly",
             }),
         );
@@ -9890,24 +10153,12 @@ mod tests {
     #[cfg(feature = "data-policy")]
     fn live_dataset_set_strategy_updates_mounted_feature_flags() {
         let (engine, _td) = temp_fs();
-        let created = live_dataset_admin(
-            &engine,
-            "create",
-            json!({
-                "name": "demo",
-                "parent": "root",
-                "type": "volume",
-                "size": 4096,
-                "sync": "local",
-            }),
-        );
-        assert_eq!(created["ok"], true, "create response: {created}");
-
         let set = live_dataset_admin(
             &engine,
             "set-strategy",
             json!({
-                "name": "demo",
+                "name": "root",
+                "type": "filesystem",
                 "enable": ["org.tidefs:compression_lz4"],
                 "disable": [],
                 "list": false,
@@ -9926,24 +10177,12 @@ mod tests {
     #[test]
     fn live_dataset_upgrade_uses_mounted_feature_flags() {
         let (engine, _td) = temp_fs();
-        let created = live_dataset_admin(
-            &engine,
-            "create",
-            json!({
-                "name": "demo",
-                "parent": "root",
-                "type": "volume",
-                "size": 4096,
-                "sync": "local",
-            }),
-        );
-        assert_eq!(created["ok"], true, "create response: {created}");
-
         let upgraded = live_dataset_admin(
             &engine,
             "upgrade",
             json!({
-                "name": "demo",
+                "name": "root",
+                "type": "filesystem",
             }),
         );
 
@@ -12031,6 +12270,7 @@ mod tests {
             "seal-key",
             json!({
                 "name": "demo",
+                "type": "volume",
                 "passphrase": "initial passphrase",
             }),
         );
@@ -12073,6 +12313,7 @@ mod tests {
             "seal-key",
             json!({
                 "name": "demo",
+                "type": "volume",
                 "passphrase": "initial passphrase",
             }),
         );

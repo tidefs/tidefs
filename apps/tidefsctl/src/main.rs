@@ -61,9 +61,9 @@ enum Command {
         #[arg(long)]
         debug: bool,
 
-        /// Dataset path to mount (default "root"). Resolved through the dataset catalog.
-        #[arg(long = "dataset", default_value = "root")]
-        dataset: String,
+        /// Filesystem path to mount (default "root"). Resolved through the internal catalog.
+        #[arg(long = "filesystem", default_value = "root")]
+        filesystem: String,
 
         /// Path to a sealed pool key envelope file (84 bytes, "VEKF" magic).
         /// When set, the pool is opened with per-object encryption.
@@ -88,10 +88,16 @@ enum Command {
         cmd: commands::snapshot::SnapshotCommand,
     },
 
-    /// Manage datasets in the pool-wide catalog
-    Dataset {
+    /// Manage mountable filesystems in a TideFS pool
+    Filesystem {
         #[command(subcommand)]
-        cmd: commands::dataset::DatasetCommand,
+        cmd: commands::dataset::FilesystemCommand,
+    },
+
+    /// Manage block volumes in a TideFS pool
+    Volume {
+        #[command(subcommand)]
+        cmd: commands::dataset::VolumeCommand,
     },
 
     #[cfg(feature = "storage-intent")]
@@ -164,14 +170,14 @@ fn main() {
             mountpoint,
             foreground,
             debug,
-            dataset,
+            filesystem,
             encryption_envelope,
         } => handle_mount(
             backing_dir,
             mountpoint,
             foreground,
             debug,
-            dataset,
+            filesystem,
             encryption_envelope,
         ),
 
@@ -182,7 +188,8 @@ fn main() {
         Command::Block { cmd } => commands::block::handle_block(cmd),
         Command::Device { cmd } => commands::device::handle_device(cmd),
         Command::Snapshot { cmd } => commands::snapshot::handle_snapshot(cmd),
-        Command::Dataset { cmd } => commands::dataset::handle_dataset(cmd),
+        Command::Filesystem { cmd } => commands::dataset::handle_filesystem(cmd),
+        Command::Volume { cmd } => commands::dataset::handle_volume(cmd),
         #[cfg(feature = "storage-intent")]
         Command::StorageIntent { cmd } => commands::storage_intent::handle_storage_intent(cmd),
 
@@ -206,7 +213,7 @@ fn handle_mount(
     mountpoint: PathBuf,
     foreground: bool,
     debug: bool,
-    dataset: String,
+    filesystem: String,
     encryption_envelope: Option<PathBuf>,
 ) {
     commands::refuse_runtime_pool_path("mount", "mount", &backing_dir);
@@ -247,7 +254,7 @@ fn handle_mount(
         coherency_profile: CoherencyProfile::Writeback,
         block_devices: None,
         import_owner: None,
-        dataset_path: Some(dataset),
+        dataset_path: Some(filesystem),
         encryption: encryption_config,
         snapshot_name: None,
         mount_authority: MountAuthority::standalone(),
@@ -288,8 +295,19 @@ mod tests {
             "/tmp/mountpoint",
             "--foreground",
             "--debug",
+            "--filesystem",
+            "root",
         ]);
         assert!(args.is_ok(), "mount with flags should parse");
+        assert!(Cli::try_parse_from([
+            "tidefsctl",
+            "mount",
+            "/tmp/backing",
+            "/tmp/mountpoint",
+            "--dataset",
+            "root",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1640,65 +1658,88 @@ mod tests {
         );
     }
 
-    // -- Dataset CLI parse tests ------------------------------------------
+    // -- Filesystem and volume CLI parse tests -----------------------------
 
     #[test]
-    fn cli_parse_dataset_create_target_with_options() {
+    fn cli_parse_filesystem_create_target_with_options() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
-            "dataset",
+            "filesystem",
             "create",
             "tank/data",
-            "--mountpoint",
-            "/srv/data",
             "--property",
             "access.readonly=on",
-            "--feature",
-            "org.tidefs:compression_zstd",
             "--json",
         ]);
         assert!(
             args.is_ok(),
-            "dataset create with target, mountpoint, properties, features, and json should parse"
+            "filesystem create with target, properties, and json should parse"
         );
+        assert!(Cli::try_parse_from([
+            "tidefsctl",
+            "filesystem",
+            "create",
+            "tank/data",
+            "--size",
+            "4096",
+        ])
+        .is_err());
     }
 
     #[test]
-    fn cli_parse_dataset_create_rejects_legacy_pool_name_shape() {
+    fn cli_parse_filesystem_create_rejects_separate_pool_name_shape() {
         use clap::Parser;
-        let args = Cli::try_parse_from(["tidefsctl", "dataset", "create", "mypool", "data"]);
+        let args = Cli::try_parse_from(["tidefsctl", "filesystem", "create", "mypool", "data"]);
         assert!(
             args.is_err(),
-            "dataset create no longer accepts separate pool and name positionals"
+            "filesystem create accepts one pool/name target"
         );
     }
 
     #[test]
-    fn cli_parse_dataset_list_filters() {
+    fn cli_parse_filesystem_list_has_fixed_object_type() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
-            "dataset",
+            "filesystem",
+            "list",
+            "--pool",
+            "mypool",
+            "--json",
+        ]);
+        assert!(
+            args.is_ok(),
+            "filesystem list with pool filter and json should parse"
+        );
+        assert!(Cli::try_parse_from([
+            "tidefsctl",
+            "filesystem",
             "list",
             "--pool",
             "mypool",
             "--type",
-            "filesystem",
-            "--json",
-        ]);
-        assert!(
-            args.is_ok(),
-            "dataset list with pool/type filters and json should parse"
-        );
+            "volume",
+        ])
+        .is_err());
     }
 
     #[test]
-    fn cli_parse_dataset_resize_target_size_and_devices() {
+    fn cli_parse_volume_create_and_resize() {
         use clap::Parser;
-        let args = Cli::try_parse_from([
+        let create = Cli::try_parse_from([
             "tidefsctl",
-            "dataset",
+            "volume",
+            "create",
+            "tank/vol",
+            "--size",
+            "1048576",
+        ]);
+        assert!(create.is_ok(), "volume create owns exact capacity");
+
+        let resize = Cli::try_parse_from([
+            "tidefsctl",
+            "volume",
             "resize",
             "tank/vol",
             "--size",
@@ -1708,17 +1749,26 @@ mod tests {
             "--json",
         ]);
         assert!(
-            args.is_ok(),
-            "dataset resize with target, exact size, devices, and json should parse"
+            resize.is_ok(),
+            "volume resize with target, exact size, devices, and json should parse"
         );
+        assert!(Cli::try_parse_from([
+            "tidefsctl",
+            "filesystem",
+            "resize",
+            "tank/data",
+            "--size",
+            "1048576",
+        ])
+        .is_err());
     }
 
     #[test]
-    fn cli_parse_dataset_set_strategy_positional_pool() {
+    fn cli_parse_filesystem_set_strategy_positional_pool() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
-            "dataset",
+            "filesystem",
             "set-strategy",
             "mypool",
             "data",
@@ -1727,16 +1777,25 @@ mod tests {
         ]);
         assert!(
             args.is_ok(),
-            "dataset set-strategy with positional pool should parse"
+            "filesystem set-strategy with positional pool should parse"
         );
+        assert!(Cli::try_parse_from([
+            "tidefsctl",
+            "volume",
+            "set-strategy",
+            "mypool",
+            "vol",
+            "--list",
+        ])
+        .is_err());
     }
 
     #[test]
-    fn cli_parse_dataset_destroy_target_force_json() {
+    fn cli_parse_filesystem_destroy_target_force_json() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
-            "dataset",
+            "filesystem",
             "destroy",
             "tank/data",
             "--force",
@@ -1744,32 +1803,71 @@ mod tests {
         ]);
         assert!(
             args.is_ok(),
-            "dataset destroy target with force and json should parse"
+            "filesystem destroy target with force and json should parse"
         );
     }
 
     #[test]
-    fn cli_parse_dataset_get_set_targets() {
+    fn cli_parse_volume_get_set_targets() {
         use clap::Parser;
         let get = Cli::try_parse_from([
             "tidefsctl",
-            "dataset",
+            "volume",
             "get",
             "tank/data",
             "access.readonly",
             "--json",
         ]);
-        assert!(get.is_ok(), "dataset get target property should parse");
+        assert!(get.is_ok(), "volume get target property should parse");
 
         let set = Cli::try_parse_from([
             "tidefsctl",
-            "dataset",
+            "volume",
             "set",
             "tank/data",
             "access.readonly=off",
             "--json",
         ]);
-        assert!(set.is_ok(), "dataset set target assignment should parse");
+        assert!(set.is_ok(), "volume set target assignment should parse");
+    }
+
+    #[test]
+    fn cli_rejects_generic_dataset_object_and_parses_pool_key_rotation() {
+        use clap::Parser;
+        let root = Cli::command();
+        let root_commands: Vec<_> = root
+            .get_subcommands()
+            .map(|command| command.get_name())
+            .collect();
+        assert!(root_commands.contains(&"filesystem"));
+        assert!(root_commands.contains(&"volume"));
+        assert!(!root_commands.contains(&"dataset"));
+
+        assert!(Cli::try_parse_from(["tidefsctl", "dataset", "list"]).is_err());
+        assert!(Cli::try_parse_from([
+            "tidefsctl",
+            "volume",
+            "create",
+            "tank/vol",
+            "--type",
+            "filesystem",
+            "--size",
+            "4096",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "rotate-key",
+            "tank",
+            "--old-passphrase",
+            "old",
+            "--old-salt",
+            "00000000000000000000000000000000",
+            "--new-passphrase",
+            "new",
+        ])
+        .is_ok());
     }
 
     // ── Pool mount CLI parse tests ─────────────────────────────────
@@ -2152,8 +2250,20 @@ mod tests {
             "/mnt/tidefs",
             "--read-only",
             "--relatime",
+            "--filesystem",
+            "root",
         ]);
         assert!(args.is_ok(), "pool mount with all flags should parse");
+        assert!(Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "mount",
+            "testpool",
+            "/mnt/tidefs",
+            "--dataset",
+            "root",
+        ])
+        .is_err());
     }
 
     #[test]
