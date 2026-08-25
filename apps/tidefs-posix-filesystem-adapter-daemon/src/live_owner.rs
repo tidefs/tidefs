@@ -1585,39 +1585,62 @@ fn pool_status(
         umask: 0,
         groups: vec![0],
     };
-    let statfs = match admin {
-        LiveOwnerAdmin::Fuse { engine, .. } => match engine.lock() {
-            Ok(engine) => match engine.statfs(&ctx) {
-                Ok(statfs) => statfs,
+    let (carrier_statfs, physical_capacity) = match admin {
+        LiveOwnerAdmin::Fuse {
+            engine, pool_owner, ..
+        } => {
+            let statfs = match engine.lock() {
+                Ok(engine) => match engine.statfs(&ctx) {
+                    Ok(statfs) => statfs,
+                    Err(errno) => {
+                        return LivePoolAdminResponse::error(
+                            1,
+                            format!("live owner statfs failed with {errno:?}"),
+                        )
+                    }
+                },
+                Err(_) => {
+                    return LivePoolAdminResponse::error(1, "live owner engine lock poisoned")
+                }
+            };
+            let capacity = match pool_owner.borrow().pool_runtime().physical_capacity() {
+                Ok(capacity) => capacity,
+                Err(error) => {
+                    return LivePoolAdminResponse::error(
+                        1,
+                        format!("live Pool physical capacity failed: {error}"),
+                    )
+                }
+            };
+            (
+                Some(statfs),
+                PoolStatusPhysicalCapacity {
+                    total_bytes: capacity.total_bytes,
+                    used_bytes: capacity.used_bytes,
+                    available_bytes: capacity.available_bytes,
+                    object_count: capacity.object_count,
+                },
+            )
+        }
+        #[cfg(feature = "block-volume")]
+        LiveOwnerAdmin::StandaloneBlock { runtime } => match runtime.lock() {
+            Ok(runtime) => match runtime.physical_capacity() {
+                Ok(capacity) => (
+                    None,
+                    PoolStatusPhysicalCapacity {
+                        total_bytes: capacity.total_bytes,
+                        used_bytes: capacity.used_bytes,
+                        available_bytes: capacity.available_bytes,
+                        object_count: capacity.object_count,
+                    },
+                ),
                 Err(errno) => {
                     return LivePoolAdminResponse::error(
                         1,
-                        format!("live owner statfs failed with {errno:?}"),
+                        format!("live Pool physical capacity failed: {errno}"),
                     )
                 }
             },
-            Err(_) => return LivePoolAdminResponse::error(1, "live owner engine lock poisoned"),
-        },
-        #[cfg(feature = "block-volume")]
-        LiveOwnerAdmin::StandaloneBlock { runtime } => match runtime.lock() {
-            Ok(runtime) => {
-                let stats = runtime.pool().pool_stats();
-                let block_size = 4096_u64;
-                let files =
-                    u64::try_from(runtime.dataset_catalog().list_all().len()).unwrap_or(u64::MAX);
-                tidefs_types_vfs_core::StatFs::new(
-                    block_size as u32,
-                    block_size as u32,
-                    stats.total_capacity_bytes / block_size,
-                    stats.available_bytes / block_size,
-                    stats.available_bytes / block_size,
-                    files,
-                    u64::MAX.saturating_sub(files),
-                    255,
-                    0,
-                    0,
-                )
-            }
             Err(_) => return LivePoolAdminResponse::error(1, "shared Pool runtime lock poisoned"),
         },
     };
@@ -1630,34 +1653,47 @@ fn pool_status(
             Err(_) => return LivePoolAdminResponse::error(1, "shared Pool runtime lock poisoned"),
         },
     };
-    let health = pool_health_label(topology.health);
-    let access = if topology.read_only {
-        "ReadOnly"
+    if request.output.wants_json() {
+        LivePoolAdminResponse::ok_machine_json(
+            pool_status_json(
+                manifest,
+                carrier_statfs.as_ref(),
+                &physical_capacity,
+                &topology,
+            )
+            .to_string(),
+        )
     } else {
-        "ReadWrite"
-    };
+        LivePoolAdminResponse::ok_text(pool_status_text(
+            manifest,
+            carrier_statfs.as_ref(),
+            &physical_capacity,
+            &topology,
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PoolStatusPhysicalCapacity {
+    total_bytes: u64,
+    used_bytes: u64,
+    available_bytes: u64,
+    object_count: u64,
+}
+
+fn pool_status_json(
+    manifest: &LiveOwnerManifest,
+    carrier_statfs: Option<&tidefs_types_vfs_core::StatFs>,
+    physical_capacity: &PoolStatusPhysicalCapacity,
+    topology: &PoolTopologyStatus,
+) -> serde_json::Value {
     let members: Vec<_> = topology
         .members
         .iter()
         .map(pool_member_status_json)
         .collect();
-
-    let value = json!({
-        "pool_name": manifest.pool_name,
-        "pool_uuid": manifest.pool_uuid,
-        "state": "Active",
-        "owner_kind": manifest.owner_kind,
-        "pid": manifest.pid,
-        "owner_metadata_dir": manifest.backing_dir,
-        "mountpoint": manifest.mountpoint,
-        "socket_path": manifest.socket_path,
-        "health": health,
-        "access": access,
-        "members_expected": topology.expected_members,
-        "members_present": topology.present_members,
-        "members_missing": topology.missing_members,
-        "members": members,
-        "statfs": {
+    let carrier_statfs = carrier_statfs.map(|statfs| {
+        json!({
             "block_size": statfs.block_size,
             "fragment_size": statfs.fragment_size,
             "total_blocks": statfs.total_blocks,
@@ -1668,14 +1704,31 @@ fn pool_status(
             "name_max": statfs.name_max,
             "fsid_hi": statfs.fsid_hi,
             "fsid_lo": statfs.fsid_lo,
-        }
+        })
     });
-
-    if request.output.wants_json() {
-        LivePoolAdminResponse::ok_machine_json(value.to_string())
-    } else {
-        LivePoolAdminResponse::ok_text(pool_status_text(manifest, &statfs, &topology))
-    }
+    json!({
+        "pool_name": manifest.pool_name,
+        "pool_uuid": manifest.pool_uuid,
+        "state": "Active",
+        "owner_kind": manifest.owner_kind,
+        "pid": manifest.pid,
+        "owner_metadata_dir": manifest.backing_dir,
+        "mountpoint": manifest.mountpoint,
+        "socket_path": manifest.socket_path,
+        "health": pool_health_label(topology.health),
+        "access": if topology.read_only { "ReadOnly" } else { "ReadWrite" },
+        "members_expected": topology.expected_members,
+        "members_present": topology.present_members,
+        "members_missing": topology.missing_members,
+        "members": members,
+        "physical_capacity": {
+            "total_bytes": physical_capacity.total_bytes,
+            "used_bytes": physical_capacity.used_bytes,
+            "available_bytes": physical_capacity.available_bytes,
+            "object_count": physical_capacity.object_count,
+        },
+        "carrier_statfs": carrier_statfs,
+    })
 }
 
 fn pool_member_status_json(member: &PoolMemberStatus) -> serde_json::Value {
@@ -1689,11 +1742,12 @@ fn pool_member_status_json(member: &PoolMemberStatus) -> serde_json::Value {
 
 fn pool_status_text(
     manifest: &LiveOwnerManifest,
-    statfs: &tidefs_types_vfs_core::StatFs,
+    carrier_statfs: Option<&tidefs_types_vfs_core::StatFs>,
+    physical_capacity: &PoolStatusPhysicalCapacity,
     topology: &PoolTopologyStatus,
 ) -> String {
     let mut text = format!(
-        "pool: {}\n  pool uuid:   {}\n  state:       Active\n  health:      {}\n  access:      {}\n  owner:       {} (pid {})\n  owner metadata dir: {}\n  mountpoint:  {}\n  members:     expected={} present={} missing={}\n  blocks:      total={} free={} avail={}\n  files:       total={} free={}",
+        "pool: {}\n  pool uuid:   {}\n  state:       Active\n  health:      {}\n  access:      {}\n  owner:       {} (pid {})\n  owner metadata dir: {}\n  mountpoint:  {}\n  members:     expected={} present={} missing={}\n  physical bytes: total={} used={} available={} objects={}",
             manifest.pool_name,
             manifest.pool_uuid,
             pool_health_label(topology.health),
@@ -1709,12 +1763,21 @@ fn pool_status_text(
             topology.expected_members,
             topology.present_members,
             topology.missing_members,
+            physical_capacity.total_bytes,
+            physical_capacity.used_bytes,
+            physical_capacity.available_bytes,
+            physical_capacity.object_count,
+        );
+    if let Some(statfs) = carrier_statfs {
+        text.push_str(&format!(
+            "\n  carrier statfs blocks: total={} free={} avail={}\n  carrier statfs files: total={} free={}",
             statfs.total_blocks,
             statfs.free_blocks,
             statfs.avail_blocks,
             statfs.files,
-            statfs.files_free
-        );
+            statfs.files_free,
+        ));
+    }
     for member in &topology.members {
         text.push_str(&format!(
             "\n  member {}:   {} {} locator={}",
@@ -2120,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn live_pool_status_text_reports_exact_degraded_member_identity() {
+    fn live_pool_status_reports_physical_capacity_and_exact_degraded_member_identity() {
         let topology = PoolTopologyStatus {
             health: PoolHealth::Degraded,
             read_only: true,
@@ -2146,14 +2209,24 @@ mod tests {
         };
         let statfs =
             tidefs_types_vfs_core::StatFs::new(4096, 4096, 1024, 768, 768, 10, 9, 255, 0, 0);
+        let physical_capacity = PoolStatusPhysicalCapacity {
+            total_bytes: 16 * 1024 * 1024,
+            used_bytes: 4 * 1024 * 1024,
+            available_bytes: 12 * 1024 * 1024,
+            object_count: 42,
+        };
 
-        let text = pool_status_text(&manifest(), &statfs, &topology);
+        let text = pool_status_text(&manifest(), Some(&statfs), &physical_capacity, &topology);
 
         assert!(text.contains("health:      Degraded"));
         assert!(text.contains("access:      ReadOnly"));
         assert!(text.contains("owner metadata dir: /var/lib/tidefs/tank"));
         assert!(!text.contains("backing dir:"));
         assert!(text.contains("members:     expected=2 present=1 missing=1"));
+        assert!(text
+            .contains("physical bytes: total=16777216 used=4194304 available=12582912 objects=42"));
+        assert!(text.contains("carrier statfs blocks: total=1024 free=768 avail=768"));
+        assert!(text.contains("carrier statfs files: total=10 free=9"));
         assert!(text.contains("member 0:   11111111111111111111111111111111 Missing locator=-"));
         assert!(text.contains(
             "member 1:   22222222222222222222222222222222 Present locator=/dev/tidefs-member-1"
@@ -2163,6 +2236,22 @@ mod tests {
         assert_eq!(missing_json["runtime_locator"], serde_json::Value::Null);
         let present_json = pool_member_status_json(&topology.members[1]);
         assert_eq!(present_json["runtime_locator"], "/dev/tidefs-member-1");
+
+        let value = pool_status_json(&manifest(), Some(&statfs), &physical_capacity, &topology);
+        assert_eq!(value["physical_capacity"]["total_bytes"], 16 * 1024 * 1024);
+        assert_eq!(value["physical_capacity"]["used_bytes"], 4 * 1024 * 1024);
+        assert_eq!(
+            value["physical_capacity"]["available_bytes"],
+            12 * 1024 * 1024
+        );
+        assert_eq!(value["physical_capacity"]["object_count"], 42);
+        assert_eq!(value["carrier_statfs"]["total_blocks"], 1024);
+        assert!(value.get("statfs").is_none());
+
+        let block_value = pool_status_json(&manifest(), None, &physical_capacity, &topology);
+        assert_eq!(block_value["carrier_statfs"], serde_json::Value::Null);
+        let block_text = pool_status_text(&manifest(), None, &physical_capacity, &topology);
+        assert!(!block_text.contains("carrier statfs"));
     }
 
     #[test]
