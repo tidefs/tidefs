@@ -1803,16 +1803,20 @@ impl VfsLocalFileSystem {
             let values: Vec<_> = entries
                 .iter()
                 .map(|(path, id, dataset_type, _, _, _)| {
-                    let mountpoint = (*id.as_bytes() == mounted_dataset_id)
-                        .then_some(live_mountpoint)
-                        .flatten();
+                    let is_mounted = *id.as_bytes() == mounted_dataset_id;
+                    let mountpoint = is_mounted.then_some(live_mountpoint).flatten();
+                    let (row_used_bytes, row_available_bytes) = if is_mounted {
+                        (used_bytes, available_bytes)
+                    } else {
+                        (None, None)
+                    };
                     json!({
                         "pool": pool,
                         "name": format!("{pool}/{path}"),
                         "path": path,
                         "type": dataset_type.to_string(),
-                        "used": used_bytes,
-                        "available": available_bytes,
+                        "used": row_used_bytes,
+                        "available": row_available_bytes,
                         "mountpoint": mountpoint,
                         "id": id.to_string(),
                         "sync": catalog.sync_guarantee(path).ok().map(|value| value.to_string()),
@@ -1842,20 +1846,26 @@ impl VfsLocalFileSystem {
             "NAME", "TYPE", "USED", "AVAILABLE", "MOUNTPOINT"
         );
         for (path, id, dataset_type, _, _, _) in &entries {
-            let mountpoint = if *id.as_bytes() == mounted_dataset_id {
+            let is_mounted = *id.as_bytes() == mounted_dataset_id;
+            let mountpoint = if is_mounted {
                 live_mountpoint.unwrap_or("-")
             } else {
                 "-"
+            };
+            let (row_used_bytes, row_available_bytes) = if is_mounted {
+                (used_bytes, available_bytes)
+            } else {
+                (None, None)
             };
             let _ = write!(
                 out,
                 "\n{:<40} {:<12} {:>14} {:>14} {}",
                 format!("{pool}/{path}"),
                 dataset_type,
-                used_bytes
+                row_used_bytes
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
-                available_bytes
+                row_available_bytes
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
                 mountpoint
@@ -8774,7 +8784,7 @@ mod tests {
     }
 
     #[test]
-    fn live_dataset_list_reports_one_statfs_capacity_projection() {
+    fn live_dataset_list_reports_capacity_only_for_mounted_dataset() {
         let (engine, _td) = temp_fs();
         let created = live_dataset_admin(
             &engine,
@@ -8815,13 +8825,32 @@ mod tests {
         assert_eq!(listed["ok"], true, "filesystem list response: {listed}");
         let items = listed["json"]["items"].as_array().expect("filesystem rows");
         assert_eq!(items.len(), 2, "filesystem list response: {listed}");
-        for item in items {
-            assert_eq!(item["used"], expected_used, "filesystem row: {item}");
-            assert_eq!(
-                item["available"], expected_available,
-                "filesystem row: {item}"
-            );
-        }
+        let root = items
+            .iter()
+            .find(|item| item["path"] == "root")
+            .expect("mounted root filesystem row");
+        let child = items
+            .iter()
+            .find(|item| item["path"] == "childfs")
+            .expect("unmounted child filesystem row");
+        assert_eq!(
+            root["used"], expected_used,
+            "mounted filesystem row: {root}"
+        );
+        assert_eq!(
+            root["available"], expected_available,
+            "mounted filesystem row: {root}"
+        );
+        assert_eq!(
+            child["used"],
+            Value::Null,
+            "unmounted filesystem row: {child}"
+        );
+        assert_eq!(
+            child["available"],
+            Value::Null,
+            "unmounted filesystem row: {child}"
+        );
         assert!(expected_used > 0);
 
         let human = live_admin(
@@ -8831,13 +8860,22 @@ mod tests {
             json!({"type": "filesystem"}),
             false,
         );
-        assert!(
-            human["text"].as_str().is_some_and(|text| {
-                text.contains(&expected_used.to_string())
-                    && text.contains(&expected_available.to_string())
-            }),
-            "human filesystem list should carry the same capacity projection: {human}",
-        );
+        let text = human["text"].as_str().expect("human filesystem list");
+        let root = text
+            .lines()
+            .find(|line| line.starts_with("tank/root"))
+            .expect("human mounted root row")
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let child = text
+            .lines()
+            .find(|line| line.starts_with("tank/childfs"))
+            .expect("human unmounted child row")
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        assert_eq!(root[2], expected_used.to_string());
+        assert_eq!(root[3], expected_available.to_string());
+        assert_eq!(&child[2..], &["-", "-", "-"]);
     }
 
     #[test]
