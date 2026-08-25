@@ -8189,6 +8189,11 @@ impl PoolDatasetOwner {
                 .max(previous_state.next_inode_id_raw()),
         );
         restored.generation = next_generation_after(previous_state.generation);
+        let restored_capacity = Self::capacity_authority_from_committed_content(
+            &self.store,
+            self.filesystem.allocator_policy.content_capacity_bytes,
+            &mut restored,
+        )?;
         let report = SnapshotRollbackReport {
             spec: LOCAL_SNAPSHOT_ROLLBACK_SPEC,
             snapshot: snapshot.summary(),
@@ -8201,7 +8206,11 @@ impl PoolDatasetOwner {
         self.begin_mutation("rollback mounted filesystem to snapshot")?;
         self.snapshot_write_buffers_for_rollback();
         self.filesystem.inode_cache.borrow_mut().clear();
+        self.filesystem
+            .authenticated_content_allocation_cache
+            .invalidate();
         self.filesystem.state = restored;
+        self.filesystem.dataset_capacity = restored_capacity;
         // Clear stale write buffers so queued overwrites do not corrupt the restored state.
         self.filesystem.write_buffers.clear();
         self.mark_all_state_dirty();
@@ -16030,27 +16039,39 @@ impl PoolDatasetOwner {
             .authenticated_content_allocation_cache
             .invalidate();
         let total_bytes = self.filesystem.allocator_policy.content_capacity_bytes;
-        let used_bytes = match committed_extent_data_bytes(&self.filesystem.state)? {
+        self.filesystem.dataset_capacity = Self::capacity_authority_from_committed_content(
+            &self.store,
+            total_bytes,
+            &mut self.filesystem.state,
+        )?;
+        Ok(())
+    }
+
+    fn capacity_authority_from_committed_content(
+        store: &PoolRuntime,
+        total_bytes: u64,
+        state: &mut FileSystemState,
+    ) -> Result<DatasetCapacityProjection> {
+        let used_bytes = match committed_extent_data_bytes(state)? {
             Some(bytes) => bytes,
             None => allocation_bytes(&content_allocation_entries_for_state_pool(
-                self.store.pool(),
-                &self.filesystem.state,
+                store.pool(),
+                state,
             )?)?,
         }
         .min(total_bytes);
-        let mut counters = *self.filesystem.state.space_accounting.counters();
+        let mut counters = *state.space_accounting.counters();
         if counters.logical_used_bytes < used_bytes {
             counters.logical_used_bytes = used_bytes;
-            self.filesystem.state.space_accounting =
-                SpaceAccounting::new(counters, self.filesystem.state.space_accounting.domain_id());
+            state.space_accounting =
+                SpaceAccounting::new(counters, state.space_accounting.domain_id());
         }
-        self.filesystem.dataset_capacity = DatasetCapacityProjection::from_committed_accounting(
+        Ok(DatasetCapacityProjection::from_committed_accounting(
             total_bytes,
-            &self.filesystem.state.space_accounting,
+            &state.space_accounting,
             StatfsResult::DEFAULT_BLOCK_SIZE as u32,
             0,
-        );
-        Ok(())
+        ))
     }
 
     fn begin_mutation(&mut self, operation: &'static str) -> Result<()> {
