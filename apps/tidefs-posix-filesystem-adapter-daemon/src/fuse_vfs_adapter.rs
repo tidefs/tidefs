@@ -11471,8 +11471,10 @@ mod tests {
     }
 
     #[test]
-    fn dataset_replacement_rollback_restores_bytes_and_fences_adapter_caches() {
-        let mut fixture = adapter_fixture();
+    fn dataset_replacement_rollback_restores_bytes_and_capacity() {
+        const RESTORED_CAPACITY_BYTES: usize = 1024 * 1024;
+
+        let mut fixture = adapter_fixture_with_content_capacity(8 * 1024 * 1024);
         let ctx = root_ctx();
         let root = {
             let engine = fixture.adapter.engine.lock().unwrap();
@@ -11499,6 +11501,37 @@ mod tests {
             .dispatch_fsync(&ctx, ino, fh)
             .expect("fsync snapshot bytes");
 
+        let capacity_file = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"capacity.bin",
+                0o644,
+                libc::O_RDWR as u32,
+            )
+            .expect("create snapshot capacity file");
+        let capacity_ino = capacity_file.attr.inode_id.get();
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                capacity_ino,
+                capacity_file.adapter_fh,
+                0,
+                &vec![0x5a; RESTORED_CAPACITY_BYTES],
+                0,
+            )
+            .expect("write snapshot capacity bytes");
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, capacity_ino, capacity_file.adapter_fh)
+            .expect("fsync snapshot capacity bytes");
+        fixture
+            .adapter
+            .dispatch_release(capacity_ino, capacity_file.adapter_fh, 0, None, false)
+            .expect("close snapshot capacity file");
+
         {
             let engine = fixture.adapter.engine.lock().unwrap();
             assert_live_admin_ok(
@@ -11510,6 +11543,10 @@ mod tests {
                     .expect("create snapshot through mounted engine"),
             );
         }
+        fixture
+            .adapter
+            .dispatch_unlink(&ctx, root.get(), b"capacity.bin")
+            .expect("remove capacity bytes after snapshot");
 
         let enumerated_ino = {
             let engine = fixture.adapter.engine.lock().unwrap();
@@ -11610,6 +11647,22 @@ mod tests {
                 .dispatch_read(&ctx, ino, fh, 0, 6, None)
                 .expect("read restored snapshot bytes"),
             b"before"
+        );
+        fixture
+            .adapter
+            .dispatch_lookup(&ctx, root.get(), b"capacity.bin")
+            .expect("lookup restored capacity file");
+        let restored_statfs = fixture
+            .adapter
+            .dispatch_statfs(&ctx, root.get())
+            .expect("statfs after rollback");
+        let restored_used_bytes = restored_statfs
+            .total_blocks
+            .saturating_sub(restored_statfs.free_blocks)
+            .saturating_mul(u64::from(restored_statfs.block_size));
+        assert!(
+            restored_used_bytes >= RESTORED_CAPACITY_BYTES as u64,
+            "restored content must immediately contribute to mounted statfs: {restored_statfs:?}"
         );
     }
 
