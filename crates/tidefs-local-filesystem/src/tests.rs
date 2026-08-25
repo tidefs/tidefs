@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, DatasetType};
+use tidefs_dataset_properties::{PropertyKey, PropertySet, PropertyValue};
 use tidefs_local_object_store::CompressionAlgorithm;
 use tidefs_local_object_store::{checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey};
 use tidefs_recovery_loop::RecoveryPolicy;
@@ -531,6 +532,154 @@ fn mounted_capacity_combines_dataset_accounting_with_live_pool_capacity() {
         store_projection.blocks >= mounted_after.blocks,
         "the Pool projection may exceed the more restrictive dataset ceiling"
     );
+
+    cleanup(&root);
+}
+
+#[test]
+fn mounted_space_quota_inherits_and_refuses_growth_before_mutation() {
+    let root = temp_root("mounted-space-quota-inherited");
+    let chunk_bytes = content_chunk_size() as u64;
+    let quota_bytes = chunk_bytes * 2;
+    let pool_capacity_bytes = quota_bytes * 8;
+    let allocator_policy = LocalStorageAllocatorPolicy {
+        content_capacity_bytes: pool_capacity_bytes,
+        ..LocalStorageAllocatorPolicy::default()
+    };
+    let parent_id = DatasetId::from_bytes([0x61; 16]);
+    let child_id = DatasetId::from_bytes([0x62; 16]);
+    let mut parent_properties = PropertySet::new();
+    parent_properties.set_local(
+        PropertyKey::new(tidefs_dataset_properties::SPACE_QUOTA_PROPERTY_NAME),
+        PropertyValue::Size(quota_bytes),
+    );
+
+    {
+        let mut fs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
+            &root,
+            LocalFileSystemOpenConfig {
+                options: options(),
+                allocator_policy,
+                root_authentication_key: RootAuthenticationKey::demo_key(),
+                encryption: None,
+                compression: None,
+                log_device_device_path: None,
+                recovery_policy: RecoveryPolicy::default(),
+                block_devices: None,
+            },
+        )
+        .expect("open root filesystem");
+        fs.create_filesystem_dataset(
+            "parent",
+            parent_id,
+            parent_properties.to_key_value_blob(),
+            DatasetFlags::default_create(),
+            SyncGuarantee::Local,
+        )
+        .expect("create quota parent filesystem");
+        fs.create_filesystem_dataset(
+            "parent/child",
+            child_id,
+            Vec::new(),
+            DatasetFlags::default_create(),
+            SyncGuarantee::Local,
+        )
+        .expect("create child filesystem");
+    }
+
+    {
+        let mut fs = LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+            &root,
+            "tidefs",
+            PoolRedundancyPolicy::default(),
+            "parent/child",
+            LocalFileSystemOpenConfig {
+                options: options(),
+                allocator_policy,
+                root_authentication_key: RootAuthenticationKey::demo_key(),
+                encryption: None,
+                compression: None,
+                log_device_device_path: None,
+                recovery_policy: RecoveryPolicy::default(),
+                block_devices: None,
+            },
+        )
+        .expect("open quota child filesystem");
+        let mounted = fs.statfs().expect("quota-clamped statfs");
+        assert_eq!(
+            mounted.blocks,
+            quota_bytes / u64::from(mounted.bsize),
+            "inherited catalog quota must set the mounted capacity ceiling",
+        );
+        assert_eq!(fs.space_counters().quota_bytes, quota_bytes);
+
+        let initial = vec![0x5a; chunk_bytes as usize];
+        fs.create_file("/data.bin", DEFAULT_FILE_PERMISSIONS)
+            .expect("create quota file");
+        fs.write_file("/data.bin", 0, &initial)
+            .expect("write within quota");
+        fs.fsync_file("/data.bin").expect("commit quota file");
+        let before_record = fs.stat("/data.bin").expect("stat before refusal");
+        let before_counters = fs.space_counters();
+        let before_pool = fs
+            .pool_runtime()
+            .physical_capacity()
+            .expect("pool capacity before refusal");
+        let oversized = vec![0xa5; quota_bytes as usize];
+
+        let error = fs
+            .write_file("/data.bin", chunk_bytes, &oversized)
+            .expect_err("growth beyond inherited quota must fail");
+        assert!(matches!(error, FileSystemError::NoSpace { .. }));
+        assert_eq!(
+            fs.read_file("/data.bin").expect("read after refusal"),
+            initial,
+            "quota refusal must preserve committed file content",
+        );
+        assert_eq!(
+            fs.stat("/data.bin").expect("stat after refusal"),
+            before_record,
+        );
+        assert_eq!(fs.space_counters(), before_counters);
+        assert_eq!(
+            fs.pool_runtime()
+                .physical_capacity()
+                .expect("pool capacity after refusal"),
+            before_pool,
+            "quota refusal must not consume Pool capacity",
+        );
+    }
+
+    {
+        let mut reopened = LocalFileSystem::open_named_pool_filesystem_dataset_with_allocator_policy_and_root_authentication_key(
+            &root,
+            "tidefs",
+            PoolRedundancyPolicy::default(),
+            "parent/child",
+            LocalFileSystemOpenConfig {
+                options: options(),
+                allocator_policy,
+                root_authentication_key: RootAuthenticationKey::demo_key(),
+                encryption: None,
+                compression: None,
+                log_device_device_path: None,
+                recovery_policy: RecoveryPolicy::default(),
+                block_devices: None,
+            },
+        )
+        .expect("reopen quota child filesystem");
+        let mounted = reopened
+            .statfs()
+            .expect("quota-clamped statfs after reopen");
+        assert_eq!(mounted.blocks, quota_bytes / u64::from(mounted.bsize),);
+        assert_eq!(reopened.space_counters().quota_bytes, quota_bytes);
+        assert_eq!(
+            reopened
+                .read_file("/data.bin")
+                .expect("read committed content after reopen"),
+            vec![0x5a; chunk_bytes as usize],
+        );
+    }
 
     cleanup(&root);
 }

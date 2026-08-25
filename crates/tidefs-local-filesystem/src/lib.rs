@@ -397,7 +397,7 @@ use tidefs_dataset_lifecycle::{
     DatasetCatalog, DatasetFlags, DatasetId, DatasetLifecycle, DatasetType, PoisonNotification,
     SyncGuarantee,
 };
-use tidefs_dataset_properties::PropertySet;
+use tidefs_dataset_properties::{resolve_space_quota_for_capacity_authority, PropertySet};
 use tidefs_extent_map::ExtentAllocator;
 use tidefs_local_object_store::{
     device_layout::DeviceMediaClass, CompressionConfig, CrashInjectionPoint, DeviceBacking,
@@ -698,6 +698,34 @@ pub fn create_filesystem_dataset_in_pool_runtime(
         signed.generation,
         &root_bytes,
     )?)
+}
+
+fn mounted_space_quota_from_catalog(
+    catalog: &DatasetCatalog,
+    dataset_path: &str,
+) -> Result<Option<u64>> {
+    let local =
+        catalog
+            .get_properties(dataset_path)
+            .map_err(|_| FileSystemError::CorruptState {
+                reason: "mounted dataset properties are absent from the canonical catalog",
+            })?;
+    let mut parent_sets = Vec::new();
+    let mut current_path = dataset_path;
+    while let Some((parent_path, _)) = current_path.rsplit_once('/') {
+        parent_sets.push(catalog.get_properties(parent_path).map_err(|_| {
+            FileSystemError::CorruptState {
+                reason: "mounted dataset property ancestry is incomplete",
+            }
+        })?);
+        current_path = parent_path;
+    }
+    let parent_refs: Vec<&PropertySet> = parent_sets.iter().collect();
+    resolve_space_quota_for_capacity_authority(&local, &parent_refs)
+        .map(|input| input.quota_bytes)
+        .map_err(|_| FileSystemError::CorruptState {
+            reason: "mounted dataset space.quota property is invalid",
+        })
 }
 
 pub fn audit_recovery(
@@ -2967,6 +2995,23 @@ impl PoolDatasetOwner {
         &self.filesystem.mounted_dataset_path
     }
 
+    fn refresh_mounted_space_quota_from_catalog(&mut self) -> Result<()> {
+        let mounted_path = self.filesystem.mounted_dataset_path.clone();
+        let quota_bytes = mounted_space_quota_from_catalog(self.dataset_catalog(), &mounted_path)?;
+        self.filesystem
+            .state
+            .space_accounting
+            .set_quota(quota_bytes.unwrap_or(0));
+        let dataset_capacity = self.derive_dataset_capacity_counters();
+        self.filesystem
+            .dataset_capacity
+            .refresh_committed_accounting(
+                &self.filesystem.state.space_accounting,
+                dataset_capacity,
+            );
+        Ok(())
+    }
+
     fn object_keyspace(&self) -> FilesystemObjectKeyspace {
         FilesystemObjectKeyspace::new(DatasetId::from_bytes(self.filesystem.mounted_dataset_id))
     }
@@ -4738,6 +4783,8 @@ impl PoolDatasetOwner {
                 )?;
             (state, dataset_id, pending_repair)
         };
+        let mounted_quota_bytes =
+            mounted_space_quota_from_catalog(store.dataset_catalog(), dataset_path)?;
         let open_recovery = MountedOpenRecoveryAuthority::raw_only_for_dataset(
             store.pool_mut(),
             mounted_dataset_id,
@@ -4782,6 +4829,13 @@ impl PoolDatasetOwner {
         // so we take the max of each counter to avoid regressing on crash
         // recovery.
         open_recovery.merge_dataset_usage_into(&mut state);
+        // The canonical catalog property is the quota configuration
+        // authority. Persisted space counters retain usage, but an older
+        // counter value must not override a set, cleared, or inherited
+        // `space.quota` property when the dataset is reopened.
+        state
+            .space_accounting
+            .set_quota(mounted_quota_bytes.unwrap_or(0));
 
         // Load persisted orphan index; start empty if missing or corrupt.
         let orphan_index_inner = open_recovery.load_orphan_index();
