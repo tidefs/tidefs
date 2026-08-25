@@ -2672,6 +2672,16 @@ impl VfsLocalFileSystem {
                 format!("{object_label} set: property set but catalog persist failed: {err}"),
             );
         }
+        if prop_name == tidefs_dataset_properties::SPACE_QUOTA_PROPERTY_NAME {
+            if let Err(err) = fs.refresh_mounted_space_quota_from_catalog() {
+                return live_admin_error(
+                    1,
+                    format!(
+                        "{object_label} set: property persisted but mounted quota refresh failed: {err}"
+                    ),
+                );
+            }
+        }
         if wants_json {
             live_admin_ok_json(json!({
                 "ok": true,
@@ -8829,6 +8839,69 @@ mod tests {
             .expect("human child row");
         assert!(root.ends_with("/mnt/tank"), "root row: {root}");
         assert!(child.ends_with('-'), "child row: {child}");
+    }
+
+    #[test]
+    fn live_dataset_space_quota_refreshes_persists_and_clears() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let quota_bytes = 4 * u64::from(crate::constants::content_chunk_size());
+        let engine = VfsLocalFileSystem::new(
+            PoolDatasetOwner::open(dir.path()).expect("open mounted root filesystem"),
+        );
+
+        let set = live_dataset_admin(
+            &engine,
+            "set",
+            json!({
+                "name": "root",
+                "type": "filesystem",
+                "assignment": format!("space.quota={quota_bytes}"),
+            }),
+        );
+        assert_eq!(set["ok"], true, "quota set response: {set}");
+        let mounted = VfsEngineStatFs::statfs(&engine, &ctx()).expect("quota statfs");
+        assert_eq!(
+            mounted.total_blocks,
+            quota_bytes / u64::from(mounted.block_size),
+        );
+        assert_eq!(
+            engine.fs.borrow().space_counters().quota_bytes,
+            quota_bytes,
+            "live property publication must immediately refresh write admission",
+        );
+        drop(engine);
+
+        let reopened = VfsLocalFileSystem::new(
+            PoolDatasetOwner::open(dir.path()).expect("reopen mounted root filesystem"),
+        );
+        let persisted = VfsEngineStatFs::statfs(&reopened, &ctx()).expect("reopened quota statfs");
+        assert_eq!(
+            persisted.total_blocks,
+            quota_bytes / u64::from(persisted.block_size),
+        );
+        assert_eq!(
+            reopened.fs.borrow().space_counters().quota_bytes,
+            quota_bytes
+        );
+
+        let clear = live_dataset_admin(
+            &reopened,
+            "set",
+            json!({
+                "name": "root",
+                "type": "filesystem",
+                "assignment": "space.quota=-",
+            }),
+        );
+        assert_eq!(clear["ok"], true, "quota clear response: {clear}");
+        let expanded =
+            VfsEngineStatFs::statfs(&reopened, &ctx()).expect("unlimited mounted statfs");
+        assert!(expanded.total_blocks > persisted.total_blocks);
+        assert_eq!(
+            reopened.fs.borrow().space_counters().quota_bytes,
+            0,
+            "clearing the catalog property must remove the mounted quota",
+        );
     }
 
     #[test]
