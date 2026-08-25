@@ -352,10 +352,12 @@ pub enum PoolHealth {
 
 /// One durable Pool member identity and whether its device is present in this
 /// imported runtime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolMemberStatus {
     pub device_index: u32,
     pub device_guid: [u8; 16],
+    /// Descriptive path selected for this exact GUID by the current runtime.
+    pub runtime_locator: Option<PathBuf>,
     pub present: bool,
     pub operational_state: Option<DeviceState>,
 }
@@ -10774,15 +10776,20 @@ impl Pool {
             .enumerate()
             .filter_map(|(index, &device_guid)| {
                 let device_index = u32::try_from(index).ok()?;
-                let operational_state = self
+                let runtime_index = self
                     .device_guids
                     .iter()
-                    .position(|guid| *guid == device_guid)
+                    .position(|guid| *guid == device_guid);
+                let operational_state = runtime_index
                     .and_then(|runtime_index| self.devices.get(runtime_index))
                     .map(|device| device.status().state);
+                let runtime_locator = runtime_index
+                    .and_then(|runtime_index| self.config.devices.get(runtime_index))
+                    .map(|config| config.path.clone());
                 Some(PoolMemberStatus {
                     device_index,
                     device_guid,
+                    runtime_locator,
                     present: present_indices.contains(&device_index),
                     operational_state,
                 })
@@ -13631,7 +13638,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_pool_open_preserves_multi_device_state() {
+    fn read_only_pool_topology_status_preserves_multi_device_state() {
         let root = temp_dir("read-only-existing-multi-device");
         let metadata_root = root.join("metadata");
         let config = PoolConfig {
@@ -13716,12 +13723,14 @@ mod tests {
                     PoolMemberStatus {
                         device_index: 0,
                         device_guid: first_device_guid,
+                        runtime_locator: None,
                         present: false,
                         operational_state: None,
                     },
                     PoolMemberStatus {
                         device_index: 1,
                         device_guid: removal_target_guid,
+                        runtime_locator: Some(config.devices[1].path.clone()),
                         present: true,
                         operational_state: Some(DeviceState::Online),
                     },
@@ -14525,18 +14534,21 @@ mod tests {
             &test_options(),
         )
         .expect("survivor-only recovery import uses upgraded roster");
+        let survivor_path = recovery.config().devices[0].path.clone();
         assert_eq!(
             recovery.topology_status().members,
             vec![
                 PoolMemberStatus {
                     device_index: 0,
                     device_guid: device_guids[0],
+                    runtime_locator: None,
                     present: false,
                     operational_state: None,
                 },
                 PoolMemberStatus {
                     device_index: 1,
                     device_guid: device_guids[1],
+                    runtime_locator: Some(survivor_path),
                     present: true,
                     operational_state: Some(DeviceState::Online),
                 },
