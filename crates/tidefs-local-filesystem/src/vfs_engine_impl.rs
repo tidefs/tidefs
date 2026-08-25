@@ -151,6 +151,13 @@ fn map_errno(err: &FileSystemError) -> Errno {
     }
 }
 
+fn dataset_path_is_same_or_ancestor(candidate: &str, mounted_path: &str) -> bool {
+    candidate == mounted_path
+        || mounted_path
+            .strip_prefix(candidate)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 // ── VfsLocalFileSystem ────────────────────────────────────────────────────
 
 /// VfsEngine adapter wrapping `PoolDatasetOwner` with interior mutability.
@@ -1299,8 +1306,20 @@ impl VfsLocalFileSystem {
         &self,
         request: &LivePoolAdminRequest,
     ) -> std::result::Result<LivePoolAdminResponse, Errno> {
+        let mounted_access_readonly_target =
+            self.live_mounted_access_readonly_change_target(request);
         if Self::live_admin_request_mutates_mounted_state(request) {
-            self.ensure_mounted_mutation_allowed("administer mounted pool")?;
+            if let Err(error) = self.ensure_mounted_mutation_allowed("administer mounted pool") {
+                if let Some(mounted_path) = mounted_access_readonly_target {
+                    return Ok(live_admin_error(
+                        1,
+                        format!(
+                            "filesystem set: access.readonly for mounted dataset '{mounted_path}' or its ancestry cannot change live; unmount and set or clear the property offline before remounting"
+                        ),
+                    ));
+                }
+                return Err(error);
+            }
         }
         if let Err(err) = request.validate_version() {
             return Ok(live_admin_typed_error(err));
@@ -1393,6 +1412,30 @@ impl VfsLocalFileSystem {
                 }
             }
         })
+    }
+
+    fn live_mounted_access_readonly_change_target(
+        &self,
+        request: &LivePoolAdminRequest,
+    ) -> Option<String> {
+        if request.command != LivePoolAdminCommand::DatasetSet {
+            return None;
+        }
+        let args = live_admin_args_to_json(&request.args);
+        let name = live_admin_arg(&args, "name").ok()?;
+        let property = live_admin_optional_arg(&args, "property")
+            .map(str::trim)
+            .or_else(|| {
+                live_admin_optional_arg(&args, "assignment")
+                    .and_then(|assignment| assignment.split_once('='))
+                    .map(|(property, _)| property.trim())
+            })?;
+        if property != tidefs_dataset_properties::ACCESS_READONLY_PROPERTY_NAME {
+            return None;
+        }
+        let fs = self.fs.borrow();
+        dataset_path_is_same_or_ancestor(name, fs.mounted_dataset_path())
+            .then(|| fs.mounted_dataset_path().to_string())
     }
 
     fn live_admin_request_mutates_mounted_state(request: &LivePoolAdminRequest) -> bool {
@@ -2637,10 +2680,7 @@ impl VfsLocalFileSystem {
         let path = name;
         let mut fs = self.fs.borrow_mut();
         let mounted_path = fs.mounted_dataset_path();
-        let targets_mounted_access = path == mounted_path
-            || mounted_path
-                .strip_prefix(path)
-                .is_some_and(|suffix| suffix.starts_with('/'));
+        let targets_mounted_access = dataset_path_is_same_or_ancestor(path, mounted_path);
         if prop_name == tidefs_dataset_properties::ACCESS_READONLY_PROPERTY_NAME
             && targets_mounted_access
         {
@@ -10212,7 +10252,8 @@ mod tests {
 
     #[test]
     fn live_access_readonly_change_refuses_before_mounted_catalog_mutation() {
-        let (engine, _td) = temp_fs();
+        let (mut engine, _td) = temp_fs();
+        engine.read_only = true;
 
         let set = live_dataset_admin(
             &engine,
