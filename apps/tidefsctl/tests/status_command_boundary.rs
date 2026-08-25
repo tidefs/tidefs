@@ -731,6 +731,166 @@ fn pool_destroy_zero_superblock_retires_redundant_labels() {
 }
 
 #[test]
+fn filesystem_root_create_lists_canonical_root_after_named_filesystem() {
+    let fixture = tempfile::tempdir().expect("create root filesystem fixture");
+    let device = fixture.path().join("member-0.img");
+    File::create(&device)
+        .expect("create regular-file Pool member")
+        .set_len(64 * 1024 * 1024)
+        .expect("size regular-file Pool member");
+    let pool_name = format!(
+        "filesystem-root-{}-{}",
+        std::process::id(),
+        NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let device = device.to_str().expect("UTF-8 device path");
+    let root_authentication_key = "a".repeat(64);
+
+    let pool_create = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args([
+            "pool",
+            "create",
+            &pool_name,
+            "--file-devices",
+            "--devices",
+            device,
+            "--json",
+        ])
+        .output()
+        .expect("create exported Pool through tidefsctl");
+    assert!(pool_create.status.success(), "{pool_create:?}");
+
+    let named_create = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .env(
+            "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX",
+            &root_authentication_key,
+        )
+        .args([
+            "filesystem",
+            "create",
+            &format!("{pool_name}/data"),
+            "--devices",
+            device,
+            "--json",
+        ])
+        .output()
+        .expect("create named filesystem through tidefsctl");
+    assert!(named_create.status.success(), "{named_create:?}");
+
+    let root_create = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .env(
+            "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX",
+            &root_authentication_key,
+        )
+        .args([
+            "filesystem",
+            "create",
+            &format!("{pool_name}/root"),
+            "--devices",
+            device,
+            "--json",
+        ])
+        .output()
+        .expect("create canonical root filesystem through tidefsctl");
+    assert!(root_create.status.success(), "{root_create:?}");
+    assert!(root_create.stderr.is_empty(), "{root_create:?}");
+    let created: serde_json::Value =
+        serde_json::from_slice(&root_create.stdout).expect("parse root create JSON");
+    assert_eq!(created["ok"], true, "{created}");
+    assert_eq!(created["name"], "root", "{created}");
+    assert_eq!(
+        created["id"],
+        tidefs_pool_runtime::ROOT_DATASET_ID.to_string(),
+        "{created}"
+    );
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .env(
+            "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX",
+            &root_authentication_key,
+        )
+        .args([
+            "filesystem",
+            "list",
+            "--pool",
+            &pool_name,
+            "--devices",
+            device,
+            "--json",
+        ])
+        .output()
+        .expect("list filesystems through tidefsctl");
+    assert!(listed.status.success(), "{listed:?}");
+    assert!(listed.stderr.is_empty(), "{listed:?}");
+    let listed: serde_json::Value =
+        serde_json::from_slice(&listed.stdout).expect("parse filesystem list JSON");
+    let items = listed["items"].as_array().expect("filesystem list items");
+    assert_eq!(items.len(), 2, "{listed}");
+    assert!(
+        items
+            .iter()
+            .any(|item| item["path"] == "root" && item["type"] == "filesystem"),
+        "{listed}"
+    );
+
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .env(
+            "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX",
+            &root_authentication_key,
+        )
+        .args([
+            "filesystem",
+            "create",
+            &format!("{pool_name}/root"),
+            "--devices",
+            device,
+            "--json",
+        ])
+        .output()
+        .expect("refuse duplicate root filesystem through tidefsctl");
+    assert_eq!(duplicate.status.code(), Some(1), "{duplicate:?}");
+    assert!(duplicate.stderr.is_empty(), "{duplicate:?}");
+    let duplicate: serde_json::Value =
+        serde_json::from_slice(&duplicate.stdout).expect("parse duplicate refusal JSON");
+    assert_eq!(duplicate["ok"], false, "{duplicate}");
+    assert!(
+        duplicate["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("already exists")),
+        "{duplicate}"
+    );
+
+    let volume = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .env(
+            "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX",
+            &root_authentication_key,
+        )
+        .args([
+            "volume",
+            "create",
+            &format!("{pool_name}/root"),
+            "--size",
+            "4096",
+            "--devices",
+            device,
+            "--json",
+        ])
+        .output()
+        .expect("refuse root block volume through tidefsctl");
+    assert_eq!(volume.status.code(), Some(1), "{volume:?}");
+    assert!(volume.stderr.is_empty(), "{volume:?}");
+    let volume: serde_json::Value =
+        serde_json::from_slice(&volume.stdout).expect("parse root volume refusal JSON");
+    assert_eq!(volume["ok"], false, "{volume}");
+    assert!(
+        volume["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("reserved for the canonical filesystem")),
+        "{volume}"
+    );
+}
+
+#[test]
 fn live_device_remove_cli_commits_survivor_topology() {
     let fixture = tempfile::tempdir().expect("create live removal fixture");
     let metadata_dir = fixture.path().join("metadata");
