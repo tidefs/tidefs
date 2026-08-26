@@ -695,6 +695,12 @@ pub struct LocalObjectStore {
     /// scan-bounded batch before the final tail rewrite and readback.
     prepublication_append_start: Option<u64>,
     prepublication_append_bytes: Vec<u8>,
+    /// Exact block range installed by the current prepublication batch.
+    /// After the Pool barrier, one positioned read loads this range so the
+    /// existing strict per-object verifier can decode every record from the
+    /// persisted bytes without issuing one read per header and payload.
+    prepublication_readback_range: Option<(u64, usize)>,
+    prepublication_readback_bytes: Vec<u8>,
     prepublication_tail_verification_deferred: bool,
     #[cfg(test)]
     block_device_tail_terminator_verifications: u64,
@@ -2343,6 +2349,8 @@ impl LocalObjectStore {
             prepublication_checksums_dirty: false,
             prepublication_append_start: None,
             prepublication_append_bytes: Vec::new(),
+            prepublication_readback_range: None,
+            prepublication_readback_bytes: Vec::new(),
             prepublication_tail_verification_deferred: false,
             #[cfg(test)]
             block_device_tail_terminator_verifications: 0,
@@ -2691,6 +2699,8 @@ impl LocalObjectStore {
             prepublication_checksums_dirty: false,
             prepublication_append_start: None,
             prepublication_append_bytes: Vec::new(),
+            prepublication_readback_range: None,
+            prepublication_readback_bytes: Vec::new(),
             prepublication_tail_verification_deferred: false,
             #[cfg(test)]
             block_device_tail_terminator_verifications: 0,
@@ -6002,6 +6012,8 @@ impl LocalObjectStore {
     /// successor header in memory, then install and strictly close that prefix
     /// when the Pool finishes the batch. Store replicas join the same boundary.
     pub(crate) fn begin_prepublication_append_batch(&mut self) {
+        self.prepublication_readback_range = None;
+        self.prepublication_readback_bytes.clear();
         // A failed final verification deliberately leaves the flag set so a
         // later write and finish can recover the same scan boundary.
         self.prepublication_tail_verification_deferred = true;
@@ -6020,6 +6032,7 @@ impl LocalObjectStore {
             .ok_or(StoreError::InvalidOptions {
                 reason: "prepublication append bytes are missing their block offset",
             })?;
+        let readback_len = self.prepublication_append_bytes.len();
         self.current_file
             .write_all_at(&self.prepublication_append_bytes, start)
             .map_err(|source| {
@@ -6029,6 +6042,7 @@ impl LocalObjectStore {
                     source,
                 )
             })?;
+        self.prepublication_readback_range = Some((start, readback_len));
         self.prepublication_append_bytes.clear();
         self.prepublication_append_start = None;
         Ok(())
@@ -6061,6 +6075,63 @@ impl LocalObjectStore {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Load the just-synced append range with one positioned read.
+    ///
+    /// The Pool calls this only after its durability barrier and holds
+    /// exclusive mutable authority until strict payload and receipt readback
+    /// completes. Ordinary record decoding still validates every header,
+    /// payload checksum, footer, integrity trailer, location identity and
+    /// configured read checksum from these persisted bytes.
+    pub(crate) fn load_prepublication_batch_readback(&mut self) -> Result<()> {
+        self.prepublication_readback_bytes.clear();
+        let mut first_error = None;
+        if let Some((start, len)) = self.prepublication_readback_range {
+            let end = start
+                .checked_add(u64::try_from(len).map_err(|_| StoreError::InvalidOptions {
+                    reason: "prepublication readback length exceeds u64",
+                })?)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "prepublication readback range overflows u64",
+                })?;
+            let data_end = self
+                .block_device_capacity
+                .unwrap_or(0)
+                .saturating_sub(POOL_LABEL_SIZE as u64);
+            if !self.block_device_mode || end > data_end {
+                first_error = Some(StoreError::InvalidOptions {
+                    reason: "prepublication readback range leaves the block data region",
+                });
+            } else {
+                self.prepublication_readback_bytes.resize(len, 0);
+                if let Err(source) = self
+                    .current_file
+                    .read_exact_at(&mut self.prepublication_readback_bytes, start)
+                {
+                    self.prepublication_readback_bytes.clear();
+                    first_error = Some(io_error(
+                        "read coalesced prepublication records and tail",
+                        &self.root,
+                        source,
+                    ));
+                }
+            }
+        }
+        for replica in &mut self.replicas {
+            if let Err(error) = replica.load_prepublication_batch_readback() {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn clear_prepublication_batch_readback(&mut self) {
+        self.prepublication_readback_range = None;
+        self.prepublication_readback_bytes.clear();
+        for replica in &mut self.replicas {
+            replica.clear_prepublication_batch_readback();
+        }
     }
 
     fn verify_deferred_prepublication_tail_before_barrier(&mut self) -> Result<()> {
@@ -8572,6 +8643,48 @@ impl LocalObjectStore {
                 .block_device_capacity
                 .unwrap_or(0)
                 .saturating_sub(POOL_LABEL_SIZE as u64);
+            if let Some((start, len)) = self
+                .prepublication_readback_range
+                .filter(|(_, len)| self.prepublication_readback_bytes.len() == *len)
+            {
+                if let Some(relative) = location.record_offset.checked_sub(start) {
+                    let range_len = u64::try_from(len).map_err(|_| StoreError::InvalidOptions {
+                        reason: "prepublication readback length exceeds u64",
+                    })?;
+                    if relative < range_len {
+                        let relative =
+                            usize::try_from(relative).map_err(|_| StoreError::InvalidOptions {
+                                reason: "prepublication readback offset exceeds platform usize",
+                            })?;
+                        let header_end = relative.checked_add(RECORD_HEADER_LEN).ok_or(
+                            StoreError::InvalidOptions {
+                                reason: "prepublication readback header range overflows usize",
+                            },
+                        )?;
+                        let header_slice = self
+                            .prepublication_readback_bytes
+                            .get(relative..header_end)
+                            .ok_or(StoreError::CorruptHeader {
+                                segment_id: location.segment_id,
+                                offset: location.record_offset,
+                                reason: "coalesced prepublication readback is truncated",
+                            })?;
+                        let mut header = [0_u8; RECORD_HEADER_LEN];
+                        header.copy_from_slice(header_slice);
+                        let mut tail =
+                            io::Cursor::new(&self.prepublication_readback_bytes[header_end..]);
+                        let decoded = decode_stored_record_after_header(
+                            &mut tail,
+                            path,
+                            location.segment_id,
+                            location.record_offset,
+                            data_end,
+                            header,
+                        )?;
+                        return validate_location_record(location, decoded);
+                    }
+                }
+            }
             let mut header = [0_u8; RECORD_HEADER_LEN];
             self.current_file
                 .read_exact_at(&mut header, location.record_offset)
@@ -11778,6 +11891,25 @@ mod block_device_open_tests {
             "the final durable tail is rewritten and verified once"
         );
         store.sync_all().expect("sync prepublication batch");
+        store
+            .load_prepublication_batch_readback()
+            .expect("load the persisted append range once");
+        assert_eq!(
+            store.prepublication_readback_range.map(|(start, _)| start),
+            Some(batch_start)
+        );
+        assert!(!store.prepublication_readback_bytes.is_empty());
+        assert_eq!(
+            store.get(payload_key).expect("read cached payload record"),
+            Some(b"immutable payload".to_vec())
+        );
+        assert_eq!(
+            store.get(receipt_key).expect("read cached receipt record"),
+            Some(b"placement receipt".to_vec())
+        );
+        store.clear_prepublication_batch_readback();
+        assert_eq!(store.prepublication_readback_range, None);
+        assert!(store.prepublication_readback_bytes.is_empty());
         drop(store);
 
         let reopened = LocalObjectStore::open_block_device(&image, options)

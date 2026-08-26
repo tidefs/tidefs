@@ -7596,50 +7596,74 @@ impl Pool {
         }
 
         self.sync_all()?;
-        for (&key, &payload) in &expected_payloads {
-            if newly_staged.contains(&key) {
-                let receipt = expected_receipts
-                    .get(&key)
-                    .ok_or(StoreError::InvalidOptions {
-                        reason: "prepublication batch lost an expected placement receipt",
-                    })?;
-                self.verify_prepublication_batch_readback(
-                    class,
-                    &authority_indices,
-                    key,
-                    payload,
-                    receipt,
-                )?;
-                continue;
+        if !newly_staged.is_empty() {
+            let mut readback_error = None;
+            for &idx in &authority_indices {
+                if let Err(error) = self.devices[idx].load_prepublication_batch_readback() {
+                    readback_error.get_or_insert(error);
+                }
             }
-            match self.get_with_current_receipt(class, key)? {
-                Some((current, receipt))
-                    if current.as_slice() == payload
-                        && expected_receipts.get(&key) == Some(&receipt) => {}
-                Some((_current, _receipt)) => {
-                    return Err(StoreError::InvalidOptions {
-                        reason:
-                            "prepublication batch readback changed payload or receipt authority",
-                    });
+            if let Some(error) = readback_error {
+                for &idx in &authority_indices {
+                    self.devices[idx].clear_prepublication_batch_readback();
                 }
-                None => {
-                    return Err(StoreError::InvalidOptions {
-                        reason: "prepublication batch readback found no current receipt authority",
-                    });
-                }
+                return Err(error);
             }
         }
-        entries
-            .iter()
-            .map(|(key, _payload)| {
-                expected_receipts
-                    .get(key)
-                    .cloned()
-                    .ok_or(StoreError::InvalidOptions {
-                        reason: "prepublication batch lost an expected placement receipt",
-                    })
-            })
-            .collect()
+        let readback_result = (|| {
+            for (&key, &payload) in &expected_payloads {
+                if newly_staged.contains(&key) {
+                    let receipt =
+                        expected_receipts
+                            .get(&key)
+                            .ok_or(StoreError::InvalidOptions {
+                                reason: "prepublication batch lost an expected placement receipt",
+                            })?;
+                    self.verify_prepublication_batch_readback(
+                        class,
+                        &authority_indices,
+                        key,
+                        payload,
+                        receipt,
+                    )?;
+                    continue;
+                }
+                match self.get_with_current_receipt(class, key)? {
+                    Some((current, receipt))
+                        if current.as_slice() == payload
+                            && expected_receipts.get(&key) == Some(&receipt) => {}
+                    Some((_current, _receipt)) => {
+                        return Err(StoreError::InvalidOptions {
+                            reason:
+                                "prepublication batch readback changed payload or receipt authority",
+                        });
+                    }
+                    None => {
+                        return Err(StoreError::InvalidOptions {
+                            reason:
+                                "prepublication batch readback found no current receipt authority",
+                        });
+                    }
+                }
+            }
+            entries
+                .iter()
+                .map(|(key, _payload)| {
+                    expected_receipts
+                        .get(key)
+                        .cloned()
+                        .ok_or(StoreError::InvalidOptions {
+                            reason: "prepublication batch lost an expected placement receipt",
+                        })
+                })
+                .collect()
+        })();
+        if !newly_staged.is_empty() {
+            for &idx in &authority_indices {
+                self.devices[idx].clear_prepublication_batch_readback();
+            }
+        }
+        readback_result
     }
 
     /// Durably publish one immutable filesystem-metadata transaction batch.

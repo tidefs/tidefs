@@ -4088,6 +4088,53 @@ impl Device {
         }
     }
 
+    pub(crate) fn load_prepublication_batch_readback(&mut self) -> Result<()> {
+        let mut first_error = None;
+        match self {
+            Self::Single(device) => device.store.load_prepublication_batch_readback(),
+            Self::Mirror(device) => {
+                for member in &mut device.members {
+                    if let Err(error) = member.store.load_prepublication_batch_readback() {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            }
+            Self::Compressed(device) => device.inner.load_prepublication_batch_readback(),
+            Self::Encrypted(device) => device.inner.load_prepublication_batch_readback(),
+            Self::LogDevice(device) => device.store.load_prepublication_batch_readback(),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                for child in &mut device.children {
+                    if let Err(error) = child.store.load_prepublication_batch_readback() {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            }
+        }
+    }
+
+    pub(crate) fn clear_prepublication_batch_readback(&mut self) {
+        match self {
+            Self::Single(device) => device.store.clear_prepublication_batch_readback(),
+            Self::Mirror(device) => {
+                for member in &mut device.members {
+                    member.store.clear_prepublication_batch_readback();
+                }
+            }
+            Self::Compressed(device) => device.inner.clear_prepublication_batch_readback(),
+            Self::Encrypted(device) => device.inner.clear_prepublication_batch_readback(),
+            Self::LogDevice(device) => device.store.clear_prepublication_batch_readback(),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                for child in &mut device.children {
+                    child.store.clear_prepublication_batch_readback();
+                }
+            }
+        }
+    }
+
     pub(crate) fn sync_strict_pool_authority(&mut self) -> Result<()> {
         match self {
             Self::Single(device) => device.store.sync_strict_pool_authority(),
