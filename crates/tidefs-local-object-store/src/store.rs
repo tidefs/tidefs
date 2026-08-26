@@ -698,7 +698,10 @@ pub struct LocalObjectStore {
     /// Exact block range installed by the current prepublication batch.
     /// After the Pool barrier, one positioned read loads this range so the
     /// existing strict per-object verifier can decode every record from the
-    /// persisted bytes without issuing one read per header and payload.
+    /// persisted bytes without issuing one read per header and payload. The
+    /// range includes the successor-header slot that closed the batch, but a
+    /// later Pool sync may legitimately overwrite that slot with its next
+    /// record before readback; it is outside the indexed batch records.
     prepublication_readback_range: Option<(u64, usize)>,
     prepublication_readback_bytes: Vec<u8>,
     prepublication_readback_records: BTreeMap<ObjectLocation, (usize, usize, u8)>,
@@ -6149,19 +6152,6 @@ impl LocalObjectStore {
             .ok_or(StoreError::InvalidOptions {
                 reason: "prepublication readback omits its successor header",
             })?;
-        let successor = self
-            .prepublication_readback_bytes
-            .get(records_len..len)
-            .ok_or(StoreError::InvalidOptions {
-                reason: "prepublication readback successor header is truncated",
-            })?;
-        if successor != [0_u8; RECORD_HEADER_LEN] {
-            return Err(StoreError::CorruptHeader {
-                segment_id: self.current_segment_id,
-                offset: start.saturating_add(records_len as u64),
-                reason: "prepublication readback successor header is not zero",
-            });
-        }
         let records_end = start
             .checked_add(
                 u64::try_from(records_len).map_err(|_| StoreError::InvalidOptions {
@@ -12047,6 +12037,7 @@ mod block_device_open_tests {
             LocalObjectStore::open_block_device_writable_unbound(&image, options.clone())
                 .expect("open block image");
         let payload_key = ObjectKey::from_name(b"block-device/prepublication/payload");
+        let successor_key = ObjectKey::from_name(b"block-device/prepublication/successor");
         let mut receipt_key_bytes = [0x45; 32];
         receipt_key_bytes[..8].copy_from_slice(&crate::POOL_PLACEMENT_RECEIPT_KEY_PREFIX);
         let receipt_key = ObjectKey(receipt_key_bytes);
@@ -12085,6 +12076,9 @@ mod block_device_open_tests {
             verifications_before + 1,
             "the final durable tail is rewritten and verified once"
         );
+        store
+            .put_direct(successor_key, b"successor payload")
+            .expect("append Pool sync record over the batch successor slot");
         store.sync_all().expect("sync prepublication batch");
         store
             .load_prepublication_batch_readback()
@@ -12102,6 +12096,10 @@ mod block_device_open_tests {
         assert_eq!(
             store.get(receipt_key).expect("read cached receipt record"),
             Some(b"placement receipt".to_vec())
+        );
+        assert_eq!(
+            store.get(successor_key).expect("read successor record"),
+            Some(b"successor payload".to_vec())
         );
         store.clear_prepublication_batch_readback();
         assert_eq!(store.prepublication_readback_range, None);
@@ -12122,6 +12120,12 @@ mod block_device_open_tests {
                 .get(receipt_key)
                 .expect("read receipt after reopen"),
             Some(b"placement receipt".to_vec())
+        );
+        assert_eq!(
+            reopened
+                .get(successor_key)
+                .expect("read successor after reopen"),
+            Some(b"successor payload".to_vec())
         );
     }
 
