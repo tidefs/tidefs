@@ -7720,14 +7720,11 @@ impl VfsEngine for VfsLocalFileSystem {
         if self.read_only {
             return Ok(());
         }
-        // FUSE FLUSH is a per-close writeback/error boundary, not fsync.
-        // Materialize accepted bytes while leaving root publication and the
-        // recovery-safe barrier to fsync, commit-group pressure, or unmount.
-        self.fs
-            .borrow_mut()
-            .materialize_write_buffer(fh.inode_id)
-            .map(|_| ())
-            .map_err(|e| map_errno(&e))?;
+        // FUSE FLUSH runs on each close and may repeat for dup/fork handles;
+        // unlike fsync, it does not require pending writes to reach storage.
+        // Accepted bytes remain owned by the dirty write buffer until fsync,
+        // admission pressure, or clean unmount publishes them. The adapter
+        // separately releases this close owner's POSIX locks.
         Ok(())
     }
 
@@ -18633,7 +18630,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_stages_writeback_without_fsync_durability_barrier() {
+    fn flush_retains_dirty_writeback_until_fsync_durability_barrier() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (_attr, fh) = engine
@@ -18654,13 +18651,13 @@ mod tests {
         engine.flush(&fh, &ctx()).unwrap();
         let after = engine.fs.borrow().fsync_stats_snapshot();
 
-        assert!(
+        assert_eq!(
             engine
                 .fs
                 .borrow()
-                .read_from_write_buffer(fh.inode_id, 0, b"flush-only".len())
-                .is_none(),
-            "close-path flush should stage buffered bytes into Pool content"
+                .read_from_write_buffer(fh.inode_id, 0, b"flush-only".len()),
+            Some(b"flush-only".to_vec()),
+            "close-path flush should retain accepted dirty bytes for the writeback owner"
         );
         assert_eq!(
             engine.fs.borrow().durable_commit_group(),
@@ -18674,6 +18671,14 @@ mod tests {
         );
 
         engine.fsync(&fh, false, &ctx()).unwrap();
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(fh.inode_id, 0, b"flush-only".len())
+                .is_none(),
+            "fsync should materialize accepted dirty bytes"
+        );
         assert!(
             engine.fs.borrow().durable_commit_group() > durable_before,
             "fsync must still advance the recovery-safe commit boundary"
