@@ -689,6 +689,13 @@ pub struct LocalObjectStore {
     /// Prepublication writes deliberately do not enter the ordinary transaction
     /// group, so their checksum-index update must join the next explicit sync.
     prepublication_checksums_dirty: bool,
+    /// Block-device prepublication batches keep writing a zero successor
+    /// header after every record, but only the last one survives the next
+    /// append. Defer those intermediate readbacks until the Pool finishes the
+    /// batch, then rewrite and verify the one final durable terminator.
+    prepublication_tail_verification_deferred: bool,
+    #[cfg(test)]
+    block_device_tail_terminator_verifications: u64,
     /// When true, the store operates directly on a block device instead of
     /// a directory of segment files. Segment files are not created;
     /// all I/O goes through current_file which points to the block device.
@@ -2332,6 +2339,9 @@ impl LocalObjectStore {
             current_dataset_id: None,
             checksums: BTreeMap::new(),
             prepublication_checksums_dirty: false,
+            prepublication_tail_verification_deferred: false,
+            #[cfg(test)]
+            block_device_tail_terminator_verifications: 0,
             block_device_mode: true,
         };
 
@@ -2675,6 +2685,9 @@ impl LocalObjectStore {
             current_dataset_id: None,
             checksums: BTreeMap::new(),
             prepublication_checksums_dirty: false,
+            prepublication_tail_verification_deferred: false,
+            #[cfg(test)]
+            block_device_tail_terminator_verifications: 0,
             block_device_mode: false,
         };
         if let Some(payload) = store.get(physical_lifetime_sequence_high_water_key())? {
@@ -5977,6 +5990,59 @@ impl LocalObjectStore {
         self.put_authorized_with_transaction_tracking(key, payload, false)
     }
 
+    /// Start one Pool-owned prepublication append batch.
+    ///
+    /// Block stores still write a zero successor header after every record so
+    /// a stopped prefix remains scan-bounded. The readback of each transient
+    /// header is deferred because the next append immediately overwrites it.
+    /// Store replicas join the same batch boundary.
+    pub(crate) fn begin_prepublication_append_batch(&mut self) {
+        // A failed final verification deliberately leaves the flag set so a
+        // later write and finish can recover the same scan boundary.
+        self.prepublication_tail_verification_deferred = true;
+        for replica in &mut self.replicas {
+            replica.begin_prepublication_append_batch();
+        }
+    }
+
+    /// End a Pool-owned prepublication append batch by rewriting and reading
+    /// back the one tail terminator that survives the complete append set.
+    pub(crate) fn finish_prepublication_append_batch(&mut self) -> Result<()> {
+        let mut first_error = None;
+        if self.prepublication_tail_verification_deferred {
+            let result = if self.block_device_mode {
+                self.write_and_verify_block_device_tail_terminator(self.current_offset)
+            } else {
+                Ok(())
+            };
+            match result {
+                Ok(()) => self.prepublication_tail_verification_deferred = false,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        for replica in &mut self.replicas {
+            if let Err(error) = replica.finish_prepublication_append_batch() {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn verify_deferred_prepublication_tail_before_barrier(&mut self) -> Result<()> {
+        if self.prepublication_tail_verification_deferred {
+            if self.block_device_mode {
+                self.write_and_verify_block_device_tail_terminator(self.current_offset)?;
+            }
+            // A barrier closes the append batch. Any later write verifies its
+            // own tail, so metadata appended by the barrier cannot inherit the
+            // earlier payload batch's deferred state.
+            self.prepublication_tail_verification_deferred = false;
+        }
+        Ok(())
+    }
+
     pub(crate) fn put_pool_internal(
         &mut self,
         key: ObjectKey,
@@ -6969,6 +7035,7 @@ impl LocalObjectStore {
     pub fn sync_all(&mut self) -> Result<()> {
         self.ensure_pool_raw_mutation_allowed()?;
         self.ensure_writable("sync_all")?;
+        self.verify_deferred_prepublication_tail_before_barrier()?;
         // Pool-internal reclaim changes join this existing store commit
         // boundary instead of crossing a separate fsync per queue transition.
         let prepared_dead_object_reclaim = self.prepare_dead_object_reclaim_queue_authority()?;
@@ -7155,6 +7222,7 @@ impl LocalObjectStore {
 
     fn sync_pool_authority_storage(&mut self, publish_pending_reclaim: bool) -> Result<()> {
         self.ensure_writable("sync strict pool authority")?;
+        self.verify_deferred_prepublication_tail_before_barrier()?;
         // Receipt publication and exact cleanup require the ordinary strict
         // barrier to publish their staged root-owned reclaim delta. The
         // receipt-generation reservation barrier deliberately skips it while
@@ -7227,6 +7295,7 @@ impl LocalObjectStore {
     pub fn sync_data(&mut self) -> Result<()> {
         self.ensure_pool_raw_mutation_allowed()?;
         self.ensure_writable("sync_data")?;
+        self.verify_deferred_prepublication_tail_before_barrier()?;
         let path = segment_path(&self.segments_dir, self.current_segment_id);
         self.current_file
             .sync_data()
@@ -7557,7 +7626,15 @@ impl LocalObjectStore {
             .write_all(&trailer)
             .map_err(|source| io_error("write production integrity trailer", &path, source))?;
         if self.block_device_mode {
-            self.write_and_verify_block_device_tail_terminator(record_range.end_offset)?;
+            self.write_block_device_tail_terminator(record_range.end_offset)?;
+            if !self.prepublication_tail_verification_deferred || self.options.sync_on_write {
+                self.verify_block_device_tail_terminator(record_range.end_offset)?;
+                // Per-write durability is itself a batch boundary. Continue
+                // with ordinary per-record verification after it.
+                if self.options.sync_on_write {
+                    self.prepublication_tail_verification_deferred = false;
+                }
+            }
         }
         if self.options.sync_on_write {
             self.current_file
@@ -7942,12 +8019,28 @@ impl LocalObjectStore {
 
     fn write_and_verify_block_device_tail_terminator(&mut self, offset: u64) -> Result<()> {
         debug_assert!(self.block_device_mode);
+        self.write_block_device_tail_terminator(offset)?;
+        self.verify_block_device_tail_terminator(offset)
+    }
+
+    fn write_block_device_tail_terminator(&mut self, offset: u64) -> Result<()> {
+        debug_assert!(self.block_device_mode);
         self.current_file
             .seek(SeekFrom::Start(offset))
             .map_err(|source| io_error("block_device_compact_seek_tail", &self.root, source))?;
         self.current_file
             .write_all(&[0_u8; RECORD_HEADER_LEN])
-            .map_err(|source| io_error("block_device_compact_clear_tail", &self.root, source))?;
+            .map_err(|source| io_error("block_device_compact_clear_tail", &self.root, source))
+    }
+
+    fn verify_block_device_tail_terminator(&mut self, offset: u64) -> Result<()> {
+        debug_assert!(self.block_device_mode);
+        #[cfg(test)]
+        {
+            self.block_device_tail_terminator_verifications = self
+                .block_device_tail_terminator_verifications
+                .saturating_add(1);
+        }
         let mut terminator = [0xff_u8; RECORD_HEADER_LEN];
         self.current_file
             .read_exact_at(&mut terminator, offset)
@@ -11527,6 +11620,101 @@ mod block_device_open_tests {
             Some(append_payload.to_vec())
         );
         assert_eq!(reopened.get(stale_key).expect("get stale tail"), None);
+    }
+
+    #[test]
+    fn block_device_prepublication_batch_verifies_only_its_final_tail() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let options = block_options(80 * 1024);
+        let mut store =
+            LocalObjectStore::open_block_device_writable_unbound(&image, options.clone())
+                .expect("open block image");
+        let payload_key = ObjectKey::from_name(b"block-device/prepublication/payload");
+        let mut receipt_key_bytes = [0x45; 32];
+        receipt_key_bytes[..8].copy_from_slice(&crate::POOL_PLACEMENT_RECEIPT_KEY_PREFIX);
+        let receipt_key = ObjectKey(receipt_key_bytes);
+
+        let verifications_before = store.block_device_tail_terminator_verifications;
+        store.begin_prepublication_append_batch();
+        store
+            .put_prepublication_pool_internal(payload_key, b"immutable payload")
+            .expect("stage prepublication payload");
+        store
+            .put_pool_internal(receipt_key, b"placement receipt")
+            .expect("stage placement receipt");
+        assert_eq!(
+            store.block_device_tail_terminator_verifications, verifications_before,
+            "intermediate tails are overwritten inside the append batch"
+        );
+        store
+            .finish_prepublication_append_batch()
+            .expect("verify final batch tail");
+        assert_eq!(
+            store.block_device_tail_terminator_verifications,
+            verifications_before + 1,
+            "the final durable tail is rewritten and verified once"
+        );
+        store.sync_all().expect("sync prepublication batch");
+        drop(store);
+
+        let reopened = LocalObjectStore::open_block_device(&image, options)
+            .expect("reopen prepublication block image");
+        assert_eq!(
+            reopened
+                .get(payload_key)
+                .expect("read payload after reopen"),
+            Some(b"immutable payload".to_vec())
+        );
+        assert_eq!(
+            reopened
+                .get(receipt_key)
+                .expect("read receipt after reopen"),
+            Some(b"placement receipt".to_vec())
+        );
+    }
+
+    #[test]
+    fn block_device_prepublication_barrier_closes_tail_batch() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let mut store =
+            LocalObjectStore::open_block_device_writable_unbound(&image, block_options(80 * 1024))
+                .expect("open block image");
+        let first_key = ObjectKey::from_name(b"block-device/prepublication/before-barrier");
+        let second_key = ObjectKey::from_name(b"block-device/prepublication/after-barrier");
+
+        let verifications_before = store.block_device_tail_terminator_verifications;
+        store.begin_prepublication_append_batch();
+        store
+            .put_prepublication_pool_internal(first_key, b"before barrier")
+            .expect("stage first payload");
+        assert_eq!(
+            store.block_device_tail_terminator_verifications,
+            verifications_before
+        );
+
+        store.sync_data().expect("close batch at data barrier");
+        assert_eq!(
+            store.block_device_tail_terminator_verifications,
+            verifications_before + 1,
+            "the barrier must verify the deferred tail"
+        );
+        store
+            .put_prepublication_pool_internal(second_key, b"after barrier")
+            .expect("stage payload after barrier");
+        assert_eq!(
+            store.block_device_tail_terminator_verifications,
+            verifications_before + 2,
+            "writes after the barrier must verify their own tails"
+        );
+        store
+            .finish_prepublication_append_batch()
+            .expect("an already closed batch finishes idempotently");
+        assert_eq!(
+            store.block_device_tail_terminator_verifications,
+            verifications_before + 2
+        );
     }
 
     #[test]

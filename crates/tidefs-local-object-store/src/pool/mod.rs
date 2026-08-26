@@ -5456,6 +5456,54 @@ impl Pool {
         )
     }
 
+    /// Extend durable receipt-generation authority for a known batch before
+    /// its raw append boundary starts. Individual allocations then cannot
+    /// publish a high-water marker and sync a partially staged batch.
+    fn reserve_placement_receipt_generations(&mut self, count: usize) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.validate_receipt_generation_high_water()?;
+        let count = u64::try_from(count).map_err(|_| StoreError::InvalidOptions {
+            reason: "placement receipt batch size exceeds u64",
+        })?;
+        let last = self
+            .next_placement_receipt_generation
+            .checked_add(count.saturating_sub(1))
+            .filter(|last| *last < u64::MAX)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "placement receipt generation exhausted",
+            })?;
+        if last <= self.reserved_placement_receipt_generation_through {
+            return self.ensure_receipt_generation_authority_converged();
+        }
+
+        let new_reserved_through =
+            last.saturating_add(RECEIPT_GENERATION_RESERVATION_SIZE.saturating_sub(1));
+        match self.receipt_generation_authority_state {
+            ReceiptGenerationAuthorityState::Converged => {
+                self.set_receipt_generation_authority_state(
+                    ReceiptGenerationAuthorityState::ReservationPending {
+                        from: self.reserved_placement_receipt_generation_through,
+                        through: new_reserved_through,
+                    },
+                );
+            }
+            ReceiptGenerationAuthorityState::ReservationPending { from, through }
+                if from == self.reserved_placement_receipt_generation_through
+                    && through == new_reserved_through => {}
+            _ => self.ensure_receipt_generation_authority_converged()?,
+        }
+        publish_receipt_generation_high_water(
+            &mut self.devices,
+            self.pool_guid,
+            self.reserved_placement_receipt_generation_through,
+            new_reserved_through,
+        )?;
+        self.reserved_placement_receipt_generation_through = new_reserved_through;
+        self.converge_receipt_generation_authority()
+    }
+
     fn allocate_placement_receipt_generation_reporting_writeback(
         &mut self,
         persistent_write_started: &mut bool,
@@ -7339,6 +7387,70 @@ impl Pool {
         )
     }
 
+    /// Verify one newly staged immutable object after its enclosing batch
+    /// barrier.
+    ///
+    /// The receipt is already the exact placement selected and written by this
+    /// exclusive `&mut Pool` operation. Read every payload target through that
+    /// receipt first, then finish with one physical current-receipt traversal
+    /// and one exact target-copy traversal. This leaves receipt authority as
+    /// the last observed state without repeating the generic current-read
+    /// scan that is needed for independently concurrent callers.
+    fn verify_prepublication_batch_readback(
+        &self,
+        class: IoClass,
+        indices: &[usize],
+        key: ObjectKey,
+        expected_payload: &[u8],
+        expected_receipt: &PlacementReceipt,
+    ) -> Result<()> {
+        if expected_receipt.object_key != key
+            || expected_receipt.epoch == 0
+            || expected_receipt.generation == 0
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "prepublication batch expected receipt has invalid identity",
+            });
+        }
+        self.ensure_receipt_replay_authority(expected_receipt)?;
+        validate_strict_receipt_structure(expected_receipt)?;
+        if self.pending_deletion_hides_generation(class, key, Some(expected_receipt.generation)) {
+            return Err(StoreError::InvalidOptions {
+                reason: "prepublication batch readback found pending deletion authority",
+            });
+        }
+
+        let payload =
+            self.get_with_receipt_strict(expected_receipt)?
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "prepublication batch readback could not recover its expected payload",
+                })?;
+        let expected_len = usize::try_from(expected_receipt.payload_len).map_err(|_| {
+            StoreError::InvalidOptions {
+                reason: "prepublication batch receipt payload length exceeds platform usize",
+            }
+        })?;
+        if payload.as_slice() != expected_payload
+            || payload.len() != expected_len
+            || digest32(&payload) != expected_receipt.payload_digest
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "prepublication batch readback changed its expected payload",
+            });
+        }
+
+        let current = map_strict_read_object_io(
+            self.load_current_placement_receipt_strict(indices, key),
+            "prepublication batch could not inspect every placement receipt copy",
+        )?;
+        if current.as_ref() != Some(expected_receipt) {
+            return Err(StoreError::InvalidOptions {
+                reason: "prepublication batch readback changed receipt authority",
+            });
+        }
+        self.verify_strict_receipt_target_copies(expected_receipt)
+    }
+
     fn put_prepublication_batch_with_receipts(
         &mut self,
         class: IoClass,
@@ -7437,28 +7549,69 @@ impl Pool {
             }
         }
 
-        for (key, payload, placement) in absent {
-            let result = (|| {
-                if matches!(class, IoClass::Data) {
-                    self.check_write_admission(class, payload.len() as u64)?;
+        let mut newly_staged = BTreeSet::new();
+        if !absent.is_empty() {
+            self.reserve_placement_receipt_generations(absent.len())?;
+            for &idx in &authority_indices {
+                self.devices[idx].begin_prepublication_append_batch();
+            }
+
+            let mut stage_error = None;
+            for (key, payload, placement) in absent {
+                let result = (|| {
+                    if matches!(class, IoClass::Data) {
+                        self.check_write_admission(class, payload.len() as u64)?;
+                    }
+                    self.put_preflighted_absent_pool_wide(
+                        key,
+                        payload,
+                        &authority_indices,
+                        placement,
+                    )
+                })();
+                match result {
+                    Ok((_stored, receipt)) => {
+                        expected_receipts.insert(key, receipt);
+                        newly_staged.insert(key);
+                    }
+                    Err(error) => {
+                        stage_error = Some(error);
+                        break;
+                    }
                 }
-                self.put_preflighted_absent_pool_wide(key, payload, &authority_indices, placement)
-            })();
-            match result {
-                Ok((_stored, receipt)) => {
-                    expected_receipts.insert(key, receipt);
+            }
+
+            let mut tail_error = None;
+            for &idx in &authority_indices {
+                if let Err(error) = self.devices[idx].finish_prepublication_append_batch() {
+                    tail_error.get_or_insert(error);
                 }
-                Err(error) => {
-                    return match self.sync_all() {
-                        Ok(()) => Err(error),
-                        Err(sync_error) => Err(sync_error),
-                    };
-                }
+            }
+            if let Some(error) = stage_error.or(tail_error) {
+                return match self.sync_all() {
+                    Ok(()) => Err(error),
+                    Err(sync_error) => Err(sync_error),
+                };
             }
         }
 
         self.sync_all()?;
         for (&key, &payload) in &expected_payloads {
+            if newly_staged.contains(&key) {
+                let receipt = expected_receipts
+                    .get(&key)
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "prepublication batch lost an expected placement receipt",
+                    })?;
+                self.verify_prepublication_batch_readback(
+                    class,
+                    &authority_indices,
+                    key,
+                    payload,
+                    receipt,
+                )?;
+                continue;
+            }
             match self.get_with_current_receipt(class, key)? {
                 Some((current, receipt))
                     if current.as_slice() == payload
@@ -23257,6 +23410,31 @@ mod tests {
         assert_eq!(
             pool.next_placement_receipt_generation, generation_before_retry,
             "an exact batch retry must not allocate receipt generations"
+        );
+
+        let reserved_before_boundary = pool.reserved_placement_receipt_generation_through;
+        pool.next_placement_receipt_generation = reserved_before_boundary;
+        let boundary_batch = vec![
+            (
+                ObjectKey::from_name(b"prepublication-data-reservation-boundary-first"),
+                b"reservation boundary first".to_vec(),
+            ),
+            (
+                ObjectKey::from_name(b"prepublication-data-reservation-boundary-second"),
+                b"reservation boundary second".to_vec(),
+            ),
+        ];
+        let boundary_receipts = pool
+            .put_prepublication_data_batch(&boundary_batch)
+            .expect("publish batch across receipt reservation boundary");
+        assert_eq!(boundary_receipts[0].generation, reserved_before_boundary);
+        assert_eq!(
+            boundary_receipts[1].generation,
+            reserved_before_boundary + 1
+        );
+        assert!(
+            pool.reserved_placement_receipt_generation_through > reserved_before_boundary,
+            "the full batch reservation must publish before raw staging starts"
         );
 
         let refused_new_key = ObjectKey::from_name(b"prepublication-data-refused-new");

@@ -4041,6 +4041,53 @@ impl Device {
         }
     }
 
+    pub(crate) fn begin_prepublication_append_batch(&mut self) {
+        match self {
+            Self::Single(device) => device.store.begin_prepublication_append_batch(),
+            Self::Mirror(device) => {
+                for member in &mut device.members {
+                    member.store.begin_prepublication_append_batch();
+                }
+            }
+            Self::Compressed(device) => device.inner.begin_prepublication_append_batch(),
+            Self::Encrypted(device) => device.inner.begin_prepublication_append_batch(),
+            Self::LogDevice(device) => device.store.begin_prepublication_append_batch(),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                for child in &mut device.children {
+                    child.store.begin_prepublication_append_batch();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn finish_prepublication_append_batch(&mut self) -> Result<()> {
+        let mut first_error = None;
+        match self {
+            Self::Single(device) => device.store.finish_prepublication_append_batch(),
+            Self::Mirror(device) => {
+                for member in &mut device.members {
+                    if let Err(error) = member.store.finish_prepublication_append_batch() {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            }
+            Self::Compressed(device) => device.inner.finish_prepublication_append_batch(),
+            Self::Encrypted(device) => device.inner.finish_prepublication_append_batch(),
+            Self::LogDevice(device) => device.store.finish_prepublication_append_batch(),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                for child in &mut device.children {
+                    if let Err(error) = child.store.finish_prepublication_append_batch() {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            }
+        }
+    }
+
     pub(crate) fn sync_strict_pool_authority(&mut self) -> Result<()> {
         match self {
             Self::Single(device) => device.store.sync_strict_pool_authority(),
