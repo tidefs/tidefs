@@ -7610,26 +7610,38 @@ impl LocalObjectStore {
         let trailer = encode_integrity_trailer_v2(&trailer_v2);
 
         let path = segment_path(&self.segments_dir, self.current_segment_id);
-        if self.block_device_mode && self.prepublication_tail_verification_deferred {
+        let prepublication_record_includes_tail =
+            self.block_device_mode && self.prepublication_tail_verification_deferred;
+        if prepublication_record_includes_tail {
             // A Pool prepublication batch already owns the complete immutable
-            // record in memory. Write its unchanged on-disk representation in
-            // one positioned operation instead of seeking and issuing four
-            // small writes per payload and receipt. Positioned I/O also leaves
-            // the shared file cursor irrelevant while successive records
-            // overwrite their predecessor's zero tail header.
+            // record in memory. Write its unchanged on-disk representation and
+            // zero successor header in one positioned operation. This retains
+            // a scan-bounded prefix after every completed append without a
+            // second write per payload and receipt. Successive records
+            // overwrite their predecessor's zero tail header, and finish()
+            // still rewrites and reads back the one surviving batch tail.
             let record_len =
                 usize::try_from(record_len).map_err(|_| StoreError::InvalidOptions {
                     reason: "object-store record length exceeds platform usize",
                 })?;
-            let mut encoded = Vec::with_capacity(record_len);
+            let encoded_len =
+                record_len
+                    .checked_add(RECORD_HEADER_LEN)
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "object-store record and tail length exceeds platform usize",
+                    })?;
+            let mut encoded = Vec::with_capacity(encoded_len);
             encoded.extend_from_slice(&header);
             encoded.extend_from_slice(payload);
             encoded.extend_from_slice(&footer);
             encoded.extend_from_slice(&trailer);
-            debug_assert_eq!(encoded.len(), record_len);
+            encoded.resize(encoded_len, 0);
+            debug_assert_eq!(encoded.len(), record_len + RECORD_HEADER_LEN);
             self.current_file
                 .write_all_at(&encoded, record_offset)
-                .map_err(|source| io_error("write prepublication record", &path, source))?;
+                .map_err(|source| {
+                    io_error("write prepublication record and tail", &path, source)
+                })?;
         } else {
             self.current_file
                 .seek(SeekFrom::Start(record_offset))
@@ -7648,7 +7660,9 @@ impl LocalObjectStore {
                 .map_err(|source| io_error("write production integrity trailer", &path, source))?;
         }
         if self.block_device_mode {
-            self.write_block_device_tail_terminator(record_range.end_offset)?;
+            if !prepublication_record_includes_tail {
+                self.write_block_device_tail_terminator(record_range.end_offset)?;
+            }
             if !self.prepublication_tail_verification_deferred || self.options.sync_on_write {
                 self.verify_block_device_tail_terminator(record_range.end_offset)?;
                 // Per-write durability is itself a batch boundary. Continue
