@@ -27273,7 +27273,7 @@ mod tests {
             .expect("removed lookup-referenced inode remains stat-able");
         assert_eq!(attr.attr.ino, ino);
         assert_eq!(attr.attr.mode & libc::S_IFMT, libc::S_IFDIR);
-        assert_eq!(attr.attr.nlink, 2);
+        assert_eq!(attr.attr.nlink, 0);
 
         assert!(fixture.adapter.dispatch_forget(ino, 1));
         assert!(!fixture

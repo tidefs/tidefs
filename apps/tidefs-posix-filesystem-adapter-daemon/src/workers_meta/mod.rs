@@ -1655,11 +1655,10 @@ fn mode_type_bits_for_kind(kind: NodeKind) -> u32 {
 #[must_use]
 pub fn fuse_attr_out(ino: u64, posix: &PosixAttrs, kind: NodeKind) -> FuseAttrOut {
     let mut attr = posix_attrs_to_fuse_attr(ino, posix, kind);
-    // POSIX: directories must report nlink >= 2 (. and ..).
-    // The stored value may be stale or zero-initialized; clamp here
-    // so that find(1), stat(1), and POSIX conformance tests see the
-    // correct minimum link count.
-    if kind == NodeKind::Dir && attr.nlink < 2 {
+    // A linked directory must report at least two links (`.` and its parent),
+    // but zero is the canonical value for an unlinked directory retained by
+    // an open description. Preserve that detached state on the FUSE wire.
+    if kind == NodeKind::Dir && attr.nlink == 1 {
         attr.nlink = 2;
     }
     FuseAttrOut {
@@ -3406,8 +3405,7 @@ mod tests {
     }
 
     #[test]
-    fn fuse_attr_out_dir_clamps_zero_nlink() {
-        // Zero nlink for a directory is clearly wrong; clamp to 2.
+    fn fuse_attr_out_dir_preserves_zero_nlink_for_detached_directory() {
         let posix = PosixAttrs {
             mode: S_IFDIR | 0o700,
             nlink: 0,
@@ -3415,7 +3413,7 @@ mod tests {
             ..Default::default()
         };
         let out = fuse_attr_out(300, &posix, NodeKind::Dir);
-        assert_eq!(out.attr.nlink, 2, "zero nlink dir clamped to 2");
+        assert_eq!(out.attr.nlink, 0, "detached dir must keep zero links");
     }
 
     #[test]
