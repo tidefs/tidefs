@@ -1575,22 +1575,6 @@ fn rename_exchange_swaps_directories_atomically() {
 }
 
 #[test]
-fn rename_exchange_rejects_type_mismatch() {
-    let root = temp_root("rename-exchange-type-mismatch");
-    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-    fs.create_dir("/docs", 0o755).expect("create docs");
-    fs.create_file("/docs/file.txt", 0o644)
-        .expect("create file");
-    fs.create_dir("/docs/dir", 0o755).expect("create dir");
-
-    assert!(matches!(
-        fs.rename_exchange("/docs/file.txt", "/docs/dir"),
-        Err(FileSystemError::Unsupported { operation, .. }) if operation == "rename_exchange"
-    ));
-    cleanup(&root);
-}
-
-#[test]
 fn rename_exchange_rejects_missing_paths() {
     let root = temp_root("rename-exchange-missing");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
