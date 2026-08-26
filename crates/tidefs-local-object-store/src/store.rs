@@ -7610,21 +7610,43 @@ impl LocalObjectStore {
         let trailer = encode_integrity_trailer_v2(&trailer_v2);
 
         let path = segment_path(&self.segments_dir, self.current_segment_id);
-        self.current_file
-            .seek(SeekFrom::Start(record_offset))
-            .map_err(|source| io_error("seek", &path, source))?;
-        self.current_file
-            .write_all(&header)
-            .map_err(|source| io_error("write header", &path, source))?;
-        self.current_file
-            .write_all(payload)
-            .map_err(|source| io_error("write payload", &path, source))?;
-        self.current_file
-            .write_all(&footer)
-            .map_err(|source| io_error("write footer", &path, source))?;
-        self.current_file
-            .write_all(&trailer)
-            .map_err(|source| io_error("write production integrity trailer", &path, source))?;
+        if self.block_device_mode && self.prepublication_tail_verification_deferred {
+            // A Pool prepublication batch already owns the complete immutable
+            // record in memory. Write its unchanged on-disk representation in
+            // one positioned operation instead of seeking and issuing four
+            // small writes per payload and receipt. Positioned I/O also leaves
+            // the shared file cursor irrelevant while successive records
+            // overwrite their predecessor's zero tail header.
+            let record_len =
+                usize::try_from(record_len).map_err(|_| StoreError::InvalidOptions {
+                    reason: "object-store record length exceeds platform usize",
+                })?;
+            let mut encoded = Vec::with_capacity(record_len);
+            encoded.extend_from_slice(&header);
+            encoded.extend_from_slice(payload);
+            encoded.extend_from_slice(&footer);
+            encoded.extend_from_slice(&trailer);
+            debug_assert_eq!(encoded.len(), record_len);
+            self.current_file
+                .write_all_at(&encoded, record_offset)
+                .map_err(|source| io_error("write prepublication record", &path, source))?;
+        } else {
+            self.current_file
+                .seek(SeekFrom::Start(record_offset))
+                .map_err(|source| io_error("seek", &path, source))?;
+            self.current_file
+                .write_all(&header)
+                .map_err(|source| io_error("write header", &path, source))?;
+            self.current_file
+                .write_all(payload)
+                .map_err(|source| io_error("write payload", &path, source))?;
+            self.current_file
+                .write_all(&footer)
+                .map_err(|source| io_error("write footer", &path, source))?;
+            self.current_file
+                .write_all(&trailer)
+                .map_err(|source| io_error("write production integrity trailer", &path, source))?;
+        }
         if self.block_device_mode {
             self.write_block_device_tail_terminator(record_range.end_offset)?;
             if !self.prepublication_tail_verification_deferred || self.options.sync_on_write {
@@ -8026,10 +8048,7 @@ impl LocalObjectStore {
     fn write_block_device_tail_terminator(&mut self, offset: u64) -> Result<()> {
         debug_assert!(self.block_device_mode);
         self.current_file
-            .seek(SeekFrom::Start(offset))
-            .map_err(|source| io_error("block_device_compact_seek_tail", &self.root, source))?;
-        self.current_file
-            .write_all(&[0_u8; RECORD_HEADER_LEN])
+            .write_all_at(&[0_u8; RECORD_HEADER_LEN], offset)
             .map_err(|source| io_error("block_device_compact_clear_tail", &self.root, source))
     }
 
