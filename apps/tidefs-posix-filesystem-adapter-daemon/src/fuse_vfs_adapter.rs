@@ -3062,6 +3062,87 @@ impl FusePruneNotifySink for UnsupportedFusePruneNotifySink {
     }
 }
 
+#[derive(Clone, Default)]
+struct FuseForegroundDemand {
+    state: Arc<FuseForegroundDemandState>,
+}
+
+#[derive(Default)]
+struct FuseForegroundDemandState {
+    active_requests: Mutex<usize>,
+    preempt_signal: Arc<AtomicBool>,
+}
+
+#[must_use = "foreground demand must remain guarded for the complete FUSE request"]
+pub(crate) struct FuseForegroundDemandGuard {
+    state: Arc<FuseForegroundDemandState>,
+}
+
+#[must_use = "FUSE admission owns foreground demand until the request returns"]
+struct FuseRequestAdmission {
+    _foreground_demand: FuseForegroundDemandGuard,
+    result: Result<(), Errno>,
+}
+
+impl FuseRequestAdmission {
+    fn new(foreground_demand: FuseForegroundDemandGuard, result: Result<(), Errno>) -> Self {
+        Self {
+            _foreground_demand: foreground_demand,
+            result,
+        }
+    }
+
+    fn as_ref(&self) -> Result<&(), &Errno> {
+        self.result.as_ref()
+    }
+
+    #[cfg(test)]
+    fn err(self) -> Option<Errno> {
+        self.result.err()
+    }
+
+    #[cfg(test)]
+    fn is_ok(&self) -> bool {
+        self.result.is_ok()
+    }
+}
+
+impl FuseForegroundDemand {
+    fn begin(&self) -> FuseForegroundDemandGuard {
+        let mut active_requests = self
+            .state
+            .active_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active_requests = active_requests
+            .checked_add(1)
+            .expect("active FUSE request count overflow");
+        self.state.preempt_signal.store(true, Ordering::Release);
+        FuseForegroundDemandGuard {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    fn preempt_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.state.preempt_signal)
+    }
+}
+
+impl Drop for FuseForegroundDemandGuard {
+    fn drop(&mut self) {
+        let mut active_requests = self
+            .state
+            .active_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(*active_requests > 0);
+        *active_requests = active_requests.saturating_sub(1);
+        if *active_requests == 0 {
+            self.state.preempt_signal.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// FUSE filesystem adapter backed by a `VfsEngine`.
 pub struct FuseVfsAdapter {
     pub(crate) engine: Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>,
@@ -3113,6 +3194,9 @@ pub struct FuseVfsAdapter {
     writeback_cache: Arc<Mutex<WritebackInodeCache>>,
     /// Background scheduler for deferred maintenance services (writeback, cleaning, compaction).
     background_scheduler: Arc<Mutex<Option<BackgroundScheduler>>>,
+    /// Counts in-flight FUSE requests and preempts maintenance until the last
+    /// concurrent request has replied.
+    foreground_demand: FuseForegroundDemand,
 
     /// When true, the kernel writeback cache is active. FUSE_WRITE_CACHE
     /// flagged writes are accepted and routed through the dirty-page tracker.
@@ -3228,6 +3312,7 @@ impl FuseVfsAdapter {
             rename_dispatch: FuseRenameDispatch::new(),
             writeback_cache: Arc::new(Mutex::new(WritebackInodeCache::new(1024))),
             background_scheduler: Arc::new(Mutex::new(None)),
+            foreground_demand: FuseForegroundDemand::default(),
             read_only: false,
             writeback_cache_enabled: false,
             writeback_cache_timeout: 60,
@@ -3420,11 +3505,13 @@ impl FuseVfsAdapter {
             .unwrap_or(false)
     }
 
-    fn admit_fuse_request(&self, op: FuseAdmissionOp) -> Result<(), Errno> {
+    fn admit_fuse_request(&self, op: FuseAdmissionOp) -> FuseRequestAdmission {
         use crate::observability::FuseAdmissionReason;
 
+        let foreground_demand = self.begin_foreground_demand();
+
         if self.read_only && op.requires_writable_mount() {
-            return Err(Errno::EROFS);
+            return FuseRequestAdmission::new(foreground_demand, Err(Errno::EROFS));
         }
 
         let class = op.class();
@@ -3455,11 +3542,11 @@ impl FuseVfsAdapter {
 
         if let Some((reason, errno)) = rejection {
             crate::observability::record_fuse_admission_reason(reason);
-            return Err(errno);
+            return FuseRequestAdmission::new(foreground_demand, Err(errno));
         }
 
         crate::observability::record_fuse_admission_reason(FuseAdmissionReason::Accepted);
-        Ok(())
+        FuseRequestAdmission::new(foreground_demand, Ok(()))
     }
 
     pub fn with_block_volume(self, target: Box<dyn BlockVolumeWriteTarget + Send>) -> Self {
@@ -3647,7 +3734,8 @@ impl FuseVfsAdapter {
     ///
     /// When `None` (default), background services are not driven.
     #[must_use]
-    pub fn with_background_scheduler(mut self, scheduler: BackgroundScheduler) -> Self {
+    pub fn with_background_scheduler(mut self, mut scheduler: BackgroundScheduler) -> Self {
+        scheduler.set_preempt_signal(self.foreground_demand.preempt_signal());
         self.background_scheduler = Arc::new(Mutex::new(Some(scheduler)));
         self
     }
@@ -3672,18 +3760,8 @@ impl FuseVfsAdapter {
         }
     }
 
-    /// Attach a demand-preemption signal to the background scheduler.
-    ///
-    /// When another thread (e.g. FUSE dispatch) sets this flag, the
-    /// scheduler yields after completing the current service tick.
-    /// This prevents background work from starving foreground I/O.
-    pub fn set_scheduler_preempt_signal(
-        &self,
-        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        if let Some(ref mut sched) = *self.background_scheduler.lock().unwrap() {
-            sched.set_preempt_signal(flag);
-        }
+    pub(crate) fn begin_foreground_demand(&self) -> FuseForegroundDemandGuard {
+        self.foreground_demand.begin()
     }
     /// Attach a [`PageCache`] from tidefs-cache-core for writeback dirty
     /// tracking and flush/fsync dirty-page iteration.
@@ -9397,19 +9475,20 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        let _ = self.admit_fuse_request(FuseAdmissionOp::Forget);
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Forget);
         self.dispatch_forget(ino, nlookup);
     }
 
     fn batch_forget(&mut self, _req: &Request<'_>, nodes: &[fuser::fuse_forget_one]) {
-        let _ = self.admit_fuse_request(FuseAdmissionOp::BatchForget);
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::BatchForget);
         for node in nodes {
             self.dispatch_forget(node.nodeid, node.nlookup);
         }
     }
 
     fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Lookup) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Lookup);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9432,7 +9511,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn getattr(&mut self, req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Getattr) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Getattr);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9448,7 +9528,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn access(&mut self, req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Access) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Access);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9475,7 +9556,8 @@ impl Filesystem for FuseVfsAdapter {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Setattr) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Setattr);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9519,7 +9601,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn readlink(&mut self, req: &Request<'_>, ino: u64, reply: ReplyData) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Readlink) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Readlink);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9542,7 +9625,8 @@ impl Filesystem for FuseVfsAdapter {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Mknod) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Mknod);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9579,7 +9663,8 @@ impl Filesystem for FuseVfsAdapter {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Mkdir) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Mkdir);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9606,7 +9691,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Unlink) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Unlink);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9619,7 +9705,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Rmdir) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Rmdir);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9639,7 +9726,8 @@ impl Filesystem for FuseVfsAdapter {
         link: &std::path::Path,
         reply: ReplyEntry,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Symlink) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Symlink);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9663,7 +9751,8 @@ impl Filesystem for FuseVfsAdapter {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Rename) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Rename);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9710,7 +9799,8 @@ impl Filesystem for FuseVfsAdapter {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Link) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Link);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9738,7 +9828,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Open) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Open);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9761,7 +9852,8 @@ impl Filesystem for FuseVfsAdapter {
         lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Read) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Read);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9809,7 +9901,8 @@ impl Filesystem for FuseVfsAdapter {
     ) {
         let _start = std::time::Instant::now();
         let diagnostic = fuse_op_diagnostics_enabled();
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Write) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Write);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             crate::observability::HIST_WRITE.record(_start.elapsed());
             crate::observability::FuseErrorCode::from_errno(errno, "write", ino).emit();
             reply.reply_errno(errno);
@@ -9899,7 +9992,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn flush(&mut self, req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Flush) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Flush);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9930,7 +10024,8 @@ impl Filesystem for FuseVfsAdapter {
         flush: bool,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Release) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Release);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9941,7 +10036,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn fsync(&mut self, req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Fsync) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Fsync);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9990,7 +10086,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn opendir(&mut self, req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Opendir) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Opendir);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10017,7 +10114,8 @@ impl Filesystem for FuseVfsAdapter {
             reply.reply_errno(Errno::EINVAL);
             return;
         }
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Readdir) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Readdir);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10085,7 +10183,8 @@ impl Filesystem for FuseVfsAdapter {
             reply.reply_errno(Errno::EINVAL);
             return;
         }
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Readdirplus) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Readdirplus);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10146,7 +10245,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn releasedir(&mut self, req: &Request<'_>, ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Releasedir) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Releasedir);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10165,7 +10265,8 @@ impl Filesystem for FuseVfsAdapter {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Fsyncdir) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Fsyncdir);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10186,7 +10287,8 @@ impl Filesystem for FuseVfsAdapter {
         reply: ReplyCreate,
     ) {
         let _start = std::time::Instant::now();
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Create) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Create);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             crate::observability::HIST_CREATE.record(_start.elapsed());
             crate::observability::FuseErrorCode::from_errno(errno, "create", parent).emit();
             reply.reply_errno(errno);
@@ -10236,7 +10338,8 @@ impl Filesystem for FuseVfsAdapter {
     ) {
         let diagnostic = fuse_op_diagnostics_enabled();
         let start = std::time::Instant::now();
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Fallocate) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Fallocate);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10279,7 +10382,8 @@ impl Filesystem for FuseVfsAdapter {
         whence: i32,
         reply: ReplyLseek,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Lseek) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Lseek);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10293,7 +10397,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn bmap(&mut self, req: &Request<'_>, ino: u64, _blocksize: u32, _idx: u64, reply: ReplyBmap) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Bmap) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Bmap);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10312,7 +10417,8 @@ impl Filesystem for FuseVfsAdapter {
         out_size: u32,
         reply: ReplyIoctl,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Ioctl) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Ioctl);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10353,7 +10459,8 @@ impl Filesystem for FuseVfsAdapter {
         flags: u32,
         reply: ReplyPoll,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Poll) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Poll);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10377,7 +10484,8 @@ impl Filesystem for FuseVfsAdapter {
         pid: u32,
         reply: ReplyLock,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Getlk) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Getlk);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10425,7 +10533,8 @@ impl Filesystem for FuseVfsAdapter {
         sleep: bool,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Setlk) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Setlk);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10496,7 +10605,8 @@ impl Filesystem for FuseVfsAdapter {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Flock) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Flock);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10526,7 +10636,8 @@ impl Filesystem for FuseVfsAdapter {
     ) {
         let diagnostic = fuse_op_diagnostics_enabled();
         let start = std::time::Instant::now();
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::CopyFileRange) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::CopyFileRange);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10660,7 +10771,8 @@ impl Filesystem for FuseVfsAdapter {
         size: u32,
         reply: ReplyXattr,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Getxattr) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Getxattr);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10691,7 +10803,8 @@ impl Filesystem for FuseVfsAdapter {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Setxattr) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Setxattr);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10704,7 +10817,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn listxattr(&mut self, req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Listxattr) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Listxattr);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10726,7 +10840,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn removexattr(&mut self, req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Removexattr) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Removexattr);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10737,7 +10852,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn statfs(&mut self, req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Statfs) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Statfs);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10759,7 +10875,8 @@ impl Filesystem for FuseVfsAdapter {
         }
     }
     fn syncfs(&mut self, req: &Request<'_>, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Syncfs) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Syncfs);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10769,7 +10886,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn statx(&mut self, req: &Request<'_>, ino: u64, _flags: u32, mask: u32, reply: ReplyStatx) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Statx) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Statx);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10799,7 +10917,8 @@ impl Filesystem for FuseVfsAdapter {
         options: u64,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Exchange) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Exchange);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -11206,8 +11325,8 @@ mod tests {
         let before = crate::observability::fuse_admission_reason_snapshot();
 
         assert_eq!(
-            adapter.admit_fuse_request(FuseAdmissionOp::Lookup),
-            Err(Errno::EAGAIN)
+            adapter.admit_fuse_request(FuseAdmissionOp::Lookup).err(),
+            Some(Errno::EAGAIN)
         );
 
         let after = crate::observability::fuse_admission_reason_snapshot();
@@ -11220,7 +11339,7 @@ mod tests {
         let adapter = fresh_test_adapter().with_governor(governor);
         let before = crate::observability::fuse_admission_reason_snapshot();
 
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Mkdir), Ok(()));
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Mkdir).is_ok());
 
         let after = crate::observability::fuse_admission_reason_snapshot();
         assert!(after.accepted >= before.accepted + 1);
@@ -11233,8 +11352,8 @@ mod tests {
         let before = crate::observability::fuse_admission_reason_snapshot();
 
         assert_eq!(
-            adapter.admit_fuse_request(FuseAdmissionOp::Write),
-            Err(Errno::ENOMEM)
+            adapter.admit_fuse_request(FuseAdmissionOp::Write).err(),
+            Some(Errno::ENOMEM)
         );
 
         let after = crate::observability::fuse_admission_reason_snapshot();
@@ -11249,8 +11368,8 @@ mod tests {
             .with_read_only();
 
         assert_eq!(
-            adapter.admit_fuse_request(FuseAdmissionOp::Unlink),
-            Err(Errno::EROFS)
+            adapter.admit_fuse_request(FuseAdmissionOp::Unlink).err(),
+            Some(Errno::EROFS)
         );
     }
 
@@ -11258,8 +11377,8 @@ mod tests {
     fn fuse_admission_read_only_fence_preserves_advisory_locks() {
         let adapter = fresh_test_adapter().with_read_only();
 
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Flock), Ok(()));
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Setlk), Ok(()));
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Flock).is_ok());
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Setlk).is_ok());
     }
 
     #[test]
@@ -11267,7 +11386,7 @@ mod tests {
         let governor = governor_with_used(BudgetCategory::DirtyBytes, 950);
         let adapter = fresh_test_adapter().with_governor(governor);
 
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Read), Ok(()));
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Read).is_ok());
     }
 
     #[test]
@@ -11279,8 +11398,8 @@ mod tests {
         let before = crate::observability::fuse_admission_reason_snapshot();
 
         assert_eq!(
-            adapter.admit_fuse_request(FuseAdmissionOp::Getattr),
-            Err(Errno::ENOMEM)
+            adapter.admit_fuse_request(FuseAdmissionOp::Getattr).err(),
+            Some(Errno::ENOMEM)
         );
 
         let after = crate::observability::fuse_admission_reason_snapshot();
@@ -11293,11 +11412,11 @@ mod tests {
         let adapter = fresh_test_adapter().with_governor(governor.clone());
 
         assert_eq!(
-            adapter.admit_fuse_request(FuseAdmissionOp::Lookup),
-            Err(Errno::EAGAIN)
+            adapter.admit_fuse_request(FuseAdmissionOp::Lookup).err(),
+            Some(Errno::EAGAIN)
         );
         governor.release(BudgetCategory::MetaCache, 701);
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Lookup), Ok(()));
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Lookup).is_ok());
     }
 
     #[test]
@@ -11308,8 +11427,8 @@ mod tests {
             .with_fuse_admission_hard_policy(FuseAdmissionHardPolicy::AllRequests);
 
         assert!(adapter.forget_refcounts.lock().unwrap().is_empty());
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Forget), Ok(()));
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Release), Ok(()));
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Forget).is_ok());
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Release).is_ok());
         assert!(adapter.forget_refcounts.lock().unwrap().is_empty());
     }
 
@@ -11428,7 +11547,7 @@ mod tests {
             .with_prune_notify_sink(sink.clone());
         adapter.bump_forget_refcount(42);
 
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Forget), Ok(()));
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Forget).is_ok());
 
         assert_eq!(sink.inodes(), vec![42]);
         assert_eq!(adapter.forget_refcounts.lock().unwrap().get(&42), Some(&1));

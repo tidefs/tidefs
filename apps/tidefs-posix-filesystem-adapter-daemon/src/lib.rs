@@ -1508,7 +1508,7 @@ mod mounted_local_reclaim_service_tests {
     use super::*;
 
     #[test]
-    fn mounted_local_reclaim_service_defers_to_engine_and_honors_item_budget() {
+    fn mounted_local_reclaim_service_defers_to_all_foreground_demand_and_honors_item_budget() {
         let root = tempfile::tempdir().expect("create mounted reclaim fixture");
         let mut filesystem =
             tidefs_local_filesystem::PoolDatasetOwner::open_with_root_authentication_key(
@@ -1543,31 +1543,57 @@ mod mounted_local_reclaim_service_tests {
         let base_engine =
             tidefs_local_filesystem::vfs_engine_impl::VfsLocalFileSystem::new(filesystem);
         let pool_owner = base_engine.shared_pool_owner();
-        let engine: live_owner::LiveOwnerEngine = Arc::new(Mutex::new(Box::new(base_engine)));
-        let mut service = MountedLocalReclaimService::new(pool_owner.clone(), Arc::clone(&engine));
-
-        let engine_guard = engine.lock().unwrap();
-        assert!(
-            !service.has_work(),
-            "scheduler must not enter maintenance behind active engine demand"
-        );
-        let skipped = service
-            .tick(&ServiceBudget::MAINTENANCE_TICK)
-            .expect("skip busy mounted owner");
-        assert_eq!(skipped.skipped, 1);
-        drop(engine_guard);
-
-        assert!(service.has_work());
-        let depth_before = pool_owner.borrow().reclaim_queue_depth();
-        let report = service
-            .tick(&ServiceBudget {
+        let adapter = fuse_vfs_adapter::FuseVfsAdapter::new(Box::new(base_engine))
+            .expect("create mounted reclaim adapter")
+            .with_background_scheduler(BackgroundScheduler::new(ServiceBudget {
                 max_items: 1,
                 max_bytes: ServiceBudget::MAINTENANCE_TICK.max_bytes,
                 max_ms: ServiceBudget::MAINTENANCE_TICK.max_ms,
-            })
-            .expect("run bounded mounted reclaim service");
-        assert_eq!(report.processed, 1);
-        assert_eq!(report.items_consumed, 1);
+            }));
+        let engine = adapter.engine_handle();
+        adapter.register_background_service(Box::new(MountedLocalReclaimService::new(
+            pool_owner.clone(),
+            engine,
+        )));
+        let scheduler = adapter.background_scheduler_handle();
+        let depth_before = pool_owner.borrow().reclaim_queue_depth();
+
+        let first_request = adapter.begin_foreground_demand();
+        let second_request = adapter.begin_foreground_demand();
+        assert!(
+            scheduler
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .tick_if_idle()
+                .is_none(),
+            "mounted reclaim must not start during concurrent FUSE demand"
+        );
+        assert_eq!(pool_owner.borrow().reclaim_queue_depth(), depth_before);
+
+        drop(first_request);
+        assert!(
+            scheduler
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .tick_if_idle()
+                .is_none(),
+            "one completed request must not clear another request's demand"
+        );
+        assert_eq!(pool_owner.borrow().reclaim_queue_depth(), depth_before);
+
+        drop(second_request);
+        let report = scheduler
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .tick_if_idle()
+            .expect("resume mounted reclaim after the final FUSE request");
+        assert_eq!(report.total_processed, 1);
         assert_eq!(pool_owner.borrow().reclaim_queue_depth(), depth_before - 1);
     }
 }
@@ -2159,10 +2185,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     let background_scheduler = if effective_mode.read_only {
         None
     } else {
-        let scheduler = adapter.background_scheduler_handle();
-        let fuse_demand = Arc::new(AtomicBool::new(false));
-        adapter.set_scheduler_preempt_signal(fuse_demand);
-        Some(scheduler)
+        Some(adapter.background_scheduler_handle())
     };
     if effective_mode.background_scrub_interval_secs > 0 {
         let scrub_options = tidefs_local_object_store::StoreOptions {
