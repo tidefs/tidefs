@@ -2974,8 +2974,8 @@ fn metadata_mutations_count_once_toward_commit_group_target() {
 }
 
 #[test]
-fn deferred_buffered_writes_commit_before_permit_cap_rejection() {
-    let root = temp_root("deferred-write-permit-backpressure");
+fn contiguous_buffered_writes_share_one_admission_permit() {
+    let root = temp_root("contiguous-write-admission-coalescing");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.stop_background_scheduler();
     fs.create_file("/pressure.bin", 0o644)
@@ -2989,24 +2989,41 @@ fn deferred_buffered_writes_commit_before_permit_cap_rejection() {
 
     let permit_cap = fs.admission_config().hard_max_permits;
     let start_commit_group = fs.commit_group.current_commit_group().0;
-    for index in 0..permit_cap.saturating_add(2) {
-        let byte = u8::try_from(index % 251).unwrap_or(0).saturating_add(1);
-        fs.write_file("/pressure.bin", 0, &[byte])
+    let write_count = permit_cap.saturating_add(2);
+    for index in 0..write_count {
+        let offset = u64::from(index).saturating_mul(4);
+        fs.write_file("/pressure.bin", offset, &index.to_le_bytes())
             .unwrap_or_else(|error| {
                 panic!("buffered write {index} must apply backpressure: {error}")
             });
     }
 
     let snapshot = fs.take_admission_snapshot().expect("read admission usage");
-    assert_eq!(snapshot.peak_outstanding_permits, permit_cap);
-    assert!(
-        snapshot.current_outstanding_permits < permit_cap,
-        "foreground commit must release the full prior permit group"
+    assert_eq!(snapshot.peak_outstanding_permits, 1);
+    assert_eq!(snapshot.current_outstanding_permits, 1);
+    assert_eq!(snapshot.current_dirty_ops, 1);
+    assert_eq!(
+        snapshot.current_dirty_bytes,
+        u64::from(write_count).saturating_mul(4)
     );
-    assert!(
-        fs.commit_group.current_commit_group().0 > start_commit_group,
-        "crossing the permit boundary must publish the prior group"
+    assert_eq!(
+        fs.commit_group.current_commit_group().0,
+        start_commit_group,
+        "more than 2,048 contiguous tiny writes must not force a root commit"
     );
+
+    let disconnected_offset = u64::from(write_count)
+        .saturating_mul(4)
+        .saturating_add(4096);
+    fs.write_file(
+        "/pressure.bin",
+        disconnected_offset,
+        &write_count.to_le_bytes(),
+    )
+    .expect("disconnected buffered range admitted");
+    let disconnected = fs.take_admission_snapshot().expect("read range accounting");
+    assert_eq!(disconnected.current_outstanding_permits, 1);
+    assert_eq!(disconnected.current_dirty_ops, 2);
 
     fs.do_commit().expect("commit remaining buffered writes");
     let final_snapshot = fs.take_admission_snapshot().expect("read final usage");

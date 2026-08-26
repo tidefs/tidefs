@@ -256,6 +256,19 @@ pub enum LocalAdmissionError {
         permit_id: u64,
         permit: LocalAdmissionPermit,
     },
+    #[error("permit {permit_id} for issuer {issuer_id} is not a dirty-write permit")]
+    PermitKindMismatch {
+        issuer_id: u64,
+        permit_id: u64,
+        permit: LocalAdmissionPermit,
+    },
+    #[error("dirty-write permit {permit_id} expansion failed for issuer {issuer_id}: {reason}")]
+    DirtyWriteExpansionRejected {
+        issuer_id: u64,
+        permit_id: u64,
+        reason: Box<LocalAdmissionError>,
+        permit: LocalAdmissionPermit,
+    },
     #[error("permit {permit_id} cannot be released because issuer {issuer_id}'s {counter} counter is inconsistent")]
     ReleaseAccountingInvariant {
         issuer_id: u64,
@@ -273,6 +286,8 @@ impl LocalAdmissionError {
             Self::ForeignPermit { permit, .. }
             | Self::StalePermit { permit, .. }
             | Self::PermitChargeMismatch { permit, .. }
+            | Self::PermitKindMismatch { permit, .. }
+            | Self::DirtyWriteExpansionRejected { permit, .. }
             | Self::ReleaseAccountingInvariant { permit, .. } => Some(permit),
             _ => None,
         }
@@ -373,6 +388,22 @@ impl LocalWriteAdmission {
             .map(|_| ())
     }
 
+    /// Check additional dirty debt for an already-issued dirty-write permit.
+    ///
+    /// Unlike [`Self::check_dirty_write`], this does not reserve another
+    /// permit slot and permits a zero-operation increment when a write joins
+    /// an existing dirty range. The owning permit is validated by
+    /// [`Self::try_expand_dirty_write`] before any counters change.
+    pub fn check_dirty_write_expansion(
+        &mut self,
+        dirty_bytes: u64,
+        dirty_ops: u32,
+    ) -> Result<(), LocalAdmissionError> {
+        self.refresh_tick();
+        self.checked_dirty_write_growth(dirty_bytes, dirty_ops)
+            .map(|_| ())
+    }
+
     fn checked_dirty_write_usage(
         &self,
         dirty_bytes: u64,
@@ -381,6 +412,16 @@ impl LocalWriteAdmission {
         if dirty_ops == 0 {
             return Err(LocalAdmissionError::ZeroDirtyOperations);
         }
+        let (new_bytes, new_ops) = self.checked_dirty_write_growth(dirty_bytes, dirty_ops)?;
+        let new_permits = self.checked_permit_count()?;
+        Ok((new_bytes, new_ops, new_permits))
+    }
+
+    fn checked_dirty_write_growth(
+        &self,
+        dirty_bytes: u64,
+        dirty_ops: u32,
+    ) -> Result<(u64, u32), LocalAdmissionError> {
         self.check_dirty_age(self.current_tick)?;
 
         let max_bytes = self.config.effective_max_dirty_bytes();
@@ -413,8 +454,93 @@ impl LocalWriteAdmission {
             });
         }
 
-        let new_permits = self.checked_permit_count()?;
-        Ok((new_bytes, new_ops, new_permits))
+        Ok((new_bytes, new_ops))
+    }
+
+    /// Expand one active dirty-write permit without allocating another slot.
+    ///
+    /// The permit is returned with its conserved charge updated on success.
+    /// Every failure returns the original permit through
+    /// [`LocalAdmissionError::into_permit`] and leaves the active ledger and
+    /// dirty usage counters unchanged.
+    pub fn try_expand_dirty_write(
+        &mut self,
+        permit: LocalAdmissionPermit,
+        dirty_bytes: u64,
+        dirty_ops: u32,
+    ) -> Result<LocalAdmissionPermit, LocalAdmissionError> {
+        self.refresh_tick();
+        let permit_id = permit.id;
+        if permit.issuer_id != self.issuer_id {
+            return Err(LocalAdmissionError::ForeignPermit {
+                expected_issuer_id: self.issuer_id,
+                actual_issuer_id: permit.issuer_id,
+                permit,
+            });
+        }
+
+        let Some(active_charge) = self.active_permits.get(&permit_id).copied() else {
+            return Err(LocalAdmissionError::StalePermit {
+                issuer_id: self.issuer_id,
+                permit_id,
+                permit,
+            });
+        };
+        if active_charge != permit.charge {
+            return Err(LocalAdmissionError::PermitChargeMismatch {
+                issuer_id: self.issuer_id,
+                permit_id,
+                permit,
+            });
+        }
+        if !active_charge.is_dirty_write() {
+            return Err(LocalAdmissionError::PermitKindMismatch {
+                issuer_id: self.issuer_id,
+                permit_id,
+                permit,
+            });
+        }
+
+        let expanded = (|| {
+            let (new_bytes, new_ops) = self.checked_dirty_write_growth(dirty_bytes, dirty_ops)?;
+            let charge_bytes = active_charge
+                .dirty_bytes
+                .checked_add(dirty_bytes)
+                .ok_or(LocalAdmissionError::DirtyBytesOverflow)?;
+            let charge_ops = active_charge
+                .dirty_ops
+                .checked_add(dirty_ops)
+                .ok_or(LocalAdmissionError::DirtyOpsOverflow)?;
+            Ok((
+                LocalAdmissionCharge::dirty_write(
+                    charge_bytes,
+                    charge_ops,
+                    active_charge.admitted_tick,
+                ),
+                new_bytes,
+                new_ops,
+            ))
+        })();
+        let (expanded_charge, new_bytes, new_ops) = match expanded {
+            Ok(expanded) => expanded,
+            Err(reason) => {
+                return Err(LocalAdmissionError::DirtyWriteExpansionRejected {
+                    issuer_id: self.issuer_id,
+                    permit_id,
+                    reason: Box::new(reason),
+                    permit,
+                });
+            }
+        };
+
+        self.active_permits.insert(permit_id, expanded_charge);
+        self.usage.dirty_bytes = new_bytes;
+        self.usage.dirty_ops = new_ops;
+        self.update_peaks();
+        Ok(LocalAdmissionPermit {
+            charge: expanded_charge,
+            ..permit
+        })
     }
 
     /// Admit one metadata mutation against the permit-slot cap only.
@@ -687,6 +813,97 @@ mod tests {
         assert_eq!(charge.dirty_bytes, 4096);
         assert_eq!(charge.dirty_ops, 1);
         assert_eq!(admission.usage(), LocalAdmissionUsage::default());
+    }
+
+    #[test]
+    fn dirty_permit_expansion_conserves_one_slot_and_original_age() {
+        let mut admission = test_admission(LocalAdmissionConfig::default());
+        let permit = admission
+            .try_admit_dirty_write(512, 1)
+            .expect("initial range admitted");
+        let permit_id = permit.id();
+        let admitted_tick = permit.charge().admitted_tick;
+
+        let permit = admission
+            .try_expand_dirty_write(permit, 256, 0)
+            .expect("contiguous growth admitted");
+        let permit = admission
+            .try_expand_dirty_write(permit, 128, 1)
+            .expect("disconnected range admitted");
+
+        assert_eq!(permit.id(), permit_id);
+        assert_eq!(permit.charge().dirty_bytes, 896);
+        assert_eq!(permit.charge().dirty_ops, 2);
+        assert_eq!(permit.charge().admitted_tick, admitted_tick);
+        assert_eq!(admission.usage().dirty_bytes, 896);
+        assert_eq!(admission.usage().dirty_ops, 2);
+        assert_eq!(admission.usage().outstanding_permits, 1);
+        admission.release(permit).expect("expanded permit released");
+        assert_eq!(admission.usage(), LocalAdmissionUsage::default());
+    }
+
+    #[test]
+    fn failed_dirty_permit_expansion_is_atomic_and_returns_original_permit() {
+        let mut admission = test_admission(LocalAdmissionConfig::new(1024, 2, 8, 1));
+        let permit = admission
+            .try_admit_dirty_write(768, 1)
+            .expect("initial range admitted");
+        let original_charge = permit.charge();
+        let original_usage = admission.usage();
+
+        let error = admission
+            .try_expand_dirty_write(permit, 257, 1)
+            .expect_err("byte cap rejects expansion");
+        assert!(matches!(
+            &error,
+            LocalAdmissionError::DirtyWriteExpansionRejected { reason, .. }
+                if matches!(reason.as_ref(), LocalAdmissionError::DirtyBytesHardCap { .. })
+        ));
+        assert_eq!(admission.usage(), original_usage);
+        let permit = error
+            .into_permit()
+            .expect("failed expansion returns permit");
+        assert_eq!(permit.charge(), original_charge);
+        admission
+            .release(permit)
+            .expect("unchanged permit remains active");
+    }
+
+    #[test]
+    fn dirty_permit_expansion_validates_issuer_and_active_charge() {
+        let mut owner = test_admission(LocalAdmissionConfig::default());
+        let mut foreign = test_admission(LocalAdmissionConfig::default());
+        let permit = owner
+            .try_admit_dirty_write(128, 1)
+            .expect("owner admitted write");
+        let owner_usage = owner.usage();
+        let foreign_usage = foreign.usage();
+
+        let error = foreign
+            .try_expand_dirty_write(permit, 64, 0)
+            .expect_err("foreign issuer rejects expansion");
+        assert!(matches!(&error, LocalAdmissionError::ForeignPermit { .. }));
+        assert_eq!(owner.usage(), owner_usage);
+        assert_eq!(foreign.usage(), foreign_usage);
+        let mut permit = error.into_permit().expect("foreign error returns permit");
+        permit.charge.dirty_bytes = permit.charge.dirty_bytes.saturating_add(1);
+
+        let error = owner
+            .try_expand_dirty_write(permit, 64, 0)
+            .expect_err("changed charge rejects expansion");
+        assert!(matches!(
+            &error,
+            LocalAdmissionError::PermitChargeMismatch { .. }
+        ));
+        assert_eq!(owner.usage(), owner_usage);
+        let mut permit = error.into_permit().expect("charge error returns permit");
+        permit.charge = *owner
+            .active_permits
+            .get(&permit.id)
+            .expect("active charge retained");
+        owner
+            .release(permit)
+            .expect("restored permit remains releasable");
     }
 
     #[test]

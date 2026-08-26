@@ -2153,9 +2153,11 @@ pub struct FilesystemDatasetEngine {
     /// Every dirty producer must acquire a [`LocalAdmissionPermit`] before
     /// work enters any tracked queue or buffer.
     write_admission: LocalWriteAdmission,
-    /// Outstanding admission permits for dirty writes not yet committed.
-    /// Released en masse when dirty_set is cleared after a successful SYNC.
-    pending_permits: Vec<LocalAdmissionPermit>,
+    /// One outstanding admission permit per dirty inode not yet committed.
+    /// Contiguous writes expand the owning inode's conserved charge; newly
+    /// disconnected ranges add dirty-operation debt without another slot.
+    /// Permits are released when dirty_set is cleared after a successful SYNC.
+    pending_permits: BTreeMap<InodeId, LocalAdmissionPermit>,
     /// Centralised dirty-state tracker for the writeback layer (§4 of #1190).
     /// Accounts data bytes, metadata ops, inode/dir dirty sets, and catalog
     /// dirty flag.  Read by commit_group auto-sync triggers; cleared on successful SYNC.
@@ -5246,7 +5248,7 @@ impl PoolDatasetOwner {
                 domain_registry: SpaceDomainRegistry::new(),
                 state_before_transaction: None,
                 write_admission: LocalWriteAdmission::new(Default::default())?,
-                pending_permits: Vec::new(),
+                pending_permits: BTreeMap::new(),
                 dirty_set: DirtySet::default(),
                 intent_log,
                 ack_receipts: LocalAckReceiptLedger::new(),
@@ -10389,17 +10391,70 @@ impl PoolDatasetOwner {
         Ok(Some(bytes))
     }
 
+    /// Return the admission operation increment for one buffered write.
+    ///
+    /// A write that overlaps or is contiguous with an existing buffered range
+    /// extends that range without adding another dirty operation. A write with
+    /// no permit yet always establishes at least one range charge.
+    fn buffered_write_dirty_op_delta(&self, inode_id: InodeId, offset: u64, end: u64) -> u32 {
+        if !self.filesystem.pending_permits.contains_key(&inode_id) {
+            return 1;
+        }
+        let joins_existing_range =
+            self.filesystem
+                .write_buffers
+                .get(&inode_id)
+                .is_some_and(|write_buffer| {
+                    write_buffer
+                        .dirty_ranges()
+                        .into_iter()
+                        .any(|(range_start, range_end)| range_start <= end && range_end >= offset)
+                });
+        u32::from(!joins_existing_range)
+    }
+
     /// Try to admit a dirty write operation through filesystem-owned limits.
     ///
     /// Acquires a `LocalAdmissionPermit` that conserves dirty-byte and dirty-op
-    /// budget. The permit is stored in `pending_permits` and released
-    /// en masse when the dirty set is cleared after a successful commit.
-    fn try_admit_write(&mut self, dirty_bytes: u64, dirty_ops: u32) -> Result<()> {
-        let permit = self
+    /// budget. The first dirty range for an inode allocates the permit;
+    /// subsequent ranges expand its charge until a successful commit.
+    fn try_admit_write(
+        &mut self,
+        inode_id: InodeId,
+        dirty_bytes: u64,
+        dirty_ops: u32,
+    ) -> Result<()> {
+        let Some(permit) = self.filesystem.pending_permits.remove(&inode_id) else {
+            let permit = self
+                .filesystem
+                .write_admission
+                .try_admit_dirty_write(dirty_bytes, dirty_ops)?;
+            let replaced = self.filesystem.pending_permits.insert(inode_id, permit);
+            debug_assert!(replaced.is_none());
+            return Ok(());
+        };
+
+        match self
+            .filesystem
             .write_admission
-            .try_admit_dirty_write(dirty_bytes, dirty_ops)?;
-        self.filesystem.pending_permits.push(permit);
-        Ok(())
+            .try_expand_dirty_write(permit, dirty_bytes, dirty_ops)
+        {
+            Ok(permit) => {
+                let replaced = self.filesystem.pending_permits.insert(inode_id, permit);
+                debug_assert!(replaced.is_none());
+                Ok(())
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                if let Some(permit) = error.into_permit() {
+                    let replaced = self.filesystem.pending_permits.insert(inode_id, permit);
+                    debug_assert!(replaced.is_none());
+                } else {
+                    self.filesystem.mutation_requires_reopen = true;
+                }
+                Err(FileSystemError::DirtyAdmissionRejected { reason })
+            }
+        }
     }
 
     /// Close an existing deferred group before its next write would exceed
@@ -10411,14 +10466,17 @@ impl PoolDatasetOwner {
     /// normal rejection result.
     fn commit_deferred_group_for_write_admission(
         &mut self,
+        inode_id: InodeId,
         dirty_bytes: u64,
         dirty_ops: u32,
     ) -> Result<bool> {
-        match self
-            .filesystem
-            .write_admission
-            .check_dirty_write(dirty_bytes, dirty_ops)
-        {
+        let admission = &mut self.filesystem.write_admission;
+        let check = if self.filesystem.pending_permits.contains_key(&inode_id) {
+            admission.check_dirty_write_expansion(dirty_bytes, dirty_ops)
+        } else {
+            admission.check_dirty_write(dirty_bytes, dirty_ops)
+        };
+        match check {
             Ok(()) => Ok(false),
             Err(_)
                 if !self.filesystem.in_transaction
@@ -10433,11 +10491,11 @@ impl PoolDatasetOwner {
 
     /// Release all outstanding admission permits after a successful SYNC.
     fn release_pending_permits(&mut self) -> Result<()> {
-        while let Some(permit) = self.filesystem.pending_permits.pop() {
+        while let Some((inode_id, permit)) = self.filesystem.pending_permits.pop_first() {
             if let Err(error) = self.filesystem.write_admission.release(permit) {
                 let reason = error.to_string();
                 if let Some(permit) = error.into_permit() {
-                    self.filesystem.pending_permits.push(permit);
+                    self.filesystem.pending_permits.insert(inode_id, permit);
                 }
                 return Err(FileSystemError::DirtyAdmissionRejected { reason });
             }
@@ -10535,6 +10593,7 @@ impl PoolDatasetOwner {
             committed_record,
             replacement_credit_bytes,
             write_space_delta,
+            dirty_ops,
         ) = loop {
             let record = self.inode(inode_id)?.clone();
             let new_size = record.size.max(end);
@@ -10550,7 +10609,12 @@ impl PoolDatasetOwner {
             let dirty_charge_ranges =
                 self.write_buffer_uncovered_ranges(inode_id, offset, bytes_len);
             let physical_admit_bytes = Self::range_bytes(&dirty_charge_ranges)?;
-            if self.commit_deferred_group_for_write_admission(physical_admit_bytes, 1)? {
+            let dirty_ops = self.buffered_write_dirty_op_delta(inode_id, offset, end);
+            if self.commit_deferred_group_for_write_admission(
+                inode_id,
+                physical_admit_bytes,
+                dirty_ops,
+            )? {
                 continue;
             }
 
@@ -10583,7 +10647,11 @@ impl PoolDatasetOwner {
             )?;
             let write_space_delta =
                 self.data_write_space_delta(inode_id, &[(offset, bytes_len)])?;
-            if self.commit_deferred_group_for_write_admission(physical_admit_bytes, 1)? {
+            if self.commit_deferred_group_for_write_admission(
+                inode_id,
+                physical_admit_bytes,
+                dirty_ops,
+            )? {
                 continue;
             }
             break (
@@ -10594,6 +10662,7 @@ impl PoolDatasetOwner {
                 committed_record,
                 replacement_credit_bytes,
                 write_space_delta,
+                dirty_ops,
             );
         };
         let capacity_admit_bytes = physical_admit_bytes.saturating_sub(replacement_credit_bytes);
@@ -10684,7 +10753,7 @@ impl PoolDatasetOwner {
         // Acquire a write-admission permit before dirty bytes enter
         // any tracked buffer.  The permit conserves dirty-byte and
         // dirty-op budget until the commit group SYNC releases it.
-        if let Err(err) = self.try_admit_write(physical_admit_bytes, 1) {
+        if let Err(err) = self.try_admit_write(inode_id, physical_admit_bytes, dirty_ops) {
             if mutation_was_active {
                 self.filesystem
                     .dataset_capacity
