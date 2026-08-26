@@ -7653,11 +7653,10 @@ impl LocalObjectStore {
         let trailer = encode_integrity_trailer_v2(&trailer_v2);
 
         let path = segment_path(&self.segments_dir, self.current_segment_id);
+        let prepublication_batch_active = self.prepublication_tail_verification_deferred;
         let prepublication_record_includes_tail =
-            self.block_device_mode && self.prepublication_tail_verification_deferred;
-        let coalesce_prepublication_record =
-            prepublication_record_includes_tail && !self.options.sync_on_write;
-        if coalesce_prepublication_record {
+            self.block_device_mode && prepublication_batch_active;
+        if prepublication_record_includes_tail {
             // A Pool prepublication batch already owns the complete immutable
             // records in memory. Coalesce their unchanged representations and
             // one zero successor header so finish() can install the complete
@@ -7718,30 +7717,6 @@ impl LocalObjectStore {
                     reason: "prepublication append tail exceeds platform usize",
                 })?;
             self.prepublication_append_bytes.resize(tail_end, 0);
-        } else if prepublication_record_includes_tail {
-            // sync_on_write makes this record its own batch boundary. Retain
-            // the single-call representation without deferring its I/O.
-            let record_len =
-                usize::try_from(record_len).map_err(|_| StoreError::InvalidOptions {
-                    reason: "object-store record length exceeds platform usize",
-                })?;
-            let encoded_len =
-                record_len
-                    .checked_add(RECORD_HEADER_LEN)
-                    .ok_or(StoreError::InvalidOptions {
-                        reason: "object-store record and tail length exceeds platform usize",
-                    })?;
-            let mut encoded = Vec::with_capacity(encoded_len);
-            encoded.extend_from_slice(&header);
-            encoded.extend_from_slice(payload);
-            encoded.extend_from_slice(&footer);
-            encoded.extend_from_slice(&trailer);
-            encoded.resize(encoded_len, 0);
-            self.current_file
-                .write_all_at(&encoded, record_offset)
-                .map_err(|source| {
-                    io_error("write prepublication record and tail", &path, source)
-                })?;
         } else {
             self.current_file
                 .seek(SeekFrom::Start(record_offset))
@@ -7763,16 +7738,15 @@ impl LocalObjectStore {
             if !prepublication_record_includes_tail {
                 self.write_block_device_tail_terminator(record_range.end_offset)?;
             }
-            if !self.prepublication_tail_verification_deferred || self.options.sync_on_write {
+            if !prepublication_batch_active {
                 self.verify_block_device_tail_terminator(record_range.end_offset)?;
-                // Per-write durability is itself a batch boundary. Continue
-                // with ordinary per-record verification after it.
-                if self.options.sync_on_write {
-                    self.prepublication_tail_verification_deferred = false;
-                }
             }
         }
-        if self.options.sync_on_write {
+        // Durable stores normally sync every record. A Pool-owned
+        // prepublication batch instead keeps payload and receipt records
+        // unreachable, closes their final tail at batch finish, and crosses
+        // one Pool-wide barrier before strict readback.
+        if self.options.sync_on_write && !prepublication_batch_active {
             self.current_file
                 .sync_data()
                 .map_err(|source| io_error("sync_data", &path, source))?;
@@ -11759,7 +11733,8 @@ mod block_device_open_tests {
     fn block_device_prepublication_batch_verifies_only_its_final_tail() {
         let dir = tempdir().expect("tempdir");
         let image = create_block_image(&dir);
-        let options = block_options(80 * 1024);
+        let mut options = block_options(80 * 1024);
+        options.sync_on_write = true;
         let mut store =
             LocalObjectStore::open_block_device_writable_unbound(&image, options.clone())
                 .expect("open block image");
