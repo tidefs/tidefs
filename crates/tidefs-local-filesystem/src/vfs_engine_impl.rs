@@ -7720,9 +7720,13 @@ impl VfsEngine for VfsLocalFileSystem {
         if self.read_only {
             return Ok(());
         }
+        // FUSE FLUSH is a per-close writeback/error boundary, not fsync.
+        // Materialize accepted bytes while leaving root publication and the
+        // recovery-safe barrier to fsync, commit-group pressure, or unmount.
         self.fs
             .borrow_mut()
-            .flush_write_buffer(fh.inode_id)
+            .materialize_write_buffer(fh.inode_id)
+            .map(|_| ())
             .map_err(|e| map_errno(&e))?;
         Ok(())
     }
@@ -18629,22 +18633,50 @@ mod tests {
     }
 
     #[test]
-    fn flush_does_not_record_fsync_durability_barrier() {
+    fn flush_stages_writeback_without_fsync_durability_barrier() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (_attr, fh) = engine
             .create(root, b"flush-not-fsync.txt", 0o644, O_RDWR, &ctx())
             .unwrap();
 
+        let durable_before = engine.fs.borrow().durable_commit_group();
         engine.write(&fh, 0, b"flush-only", &ctx()).unwrap();
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(fh.inode_id, 0, b"flush-only".len())
+                .is_some(),
+            "accepted bytes should remain buffered before close-path flush"
+        );
         let before = engine.fs.borrow().fsync_stats_snapshot();
         engine.flush(&fh, &ctx()).unwrap();
         let after = engine.fs.borrow().fsync_stats_snapshot();
 
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(fh.inode_id, 0, b"flush-only".len())
+                .is_none(),
+            "close-path flush should stage buffered bytes into Pool content"
+        );
+        assert_eq!(
+            engine.fs.borrow().durable_commit_group(),
+            durable_before,
+            "FUSE flush is not an fsync durability barrier"
+        );
         assert_eq!(after.fsync_count, before.fsync_count);
         assert_eq!(
             after.fsync_do_commit_fallback_count,
             before.fsync_do_commit_fallback_count
+        );
+
+        engine.fsync(&fh, false, &ctx()).unwrap();
+        assert!(
+            engine.fs.borrow().durable_commit_group() > durable_before,
+            "fsync must still advance the recovery-safe commit boundary"
         );
     }
 
