@@ -6341,7 +6341,12 @@ impl Pool {
         }
         let mut last_object = None;
         for (target_pos, idx) in target_indices {
-            let result = self.devices[idx].put(key, payload);
+            let result = match durability {
+                ReceiptPublicationDurability::Immediate => self.devices[idx].put(key, payload),
+                ReceiptPublicationDurability::PrepublicationBatch => {
+                    self.devices[idx].put_prepublication(key, payload)
+                }
+            };
             self.record_device_write_result(idx, payload.len(), &result);
             match result {
                 Ok(object) => {
@@ -6448,7 +6453,14 @@ impl Pool {
                     reason: "erasure placement lost a validated encoded shard",
                 });
             };
-            let result = self.devices[idx].put_pool_internal(shard_key, &shard.bytes);
+            let result = match durability {
+                ReceiptPublicationDurability::Immediate => {
+                    self.devices[idx].put_pool_internal(shard_key, &shard.bytes)
+                }
+                ReceiptPublicationDurability::PrepublicationBatch => {
+                    self.devices[idx].put_prepublication(shard_key, &shard.bytes)
+                }
+            };
             self.record_device_write_result(idx, shard.bytes.len(), &result);
             match result {
                 Ok(_) => {
@@ -23127,12 +23139,10 @@ mod tests {
     fn prepublication_data_batch_returns_reuses_and_preflights_receipts() {
         let root = temp_dir("prepublication-data-batch");
         let _ = std::fs::remove_dir_all(&root);
-        let mut pool = Pool::create(
-            single_device_config(&root),
-            PoolProperties::default(),
-            &test_options(),
-        )
-        .unwrap();
+        let config = single_device_config(&root);
+        let properties = PoolProperties::default();
+        let options = test_options();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &options).unwrap();
         let first_key = ObjectKey::from_name(b"prepublication-data-first");
         let second_key = ObjectKey::from_name(b"prepublication-data-second");
         let batch = vec![
@@ -23152,6 +23162,16 @@ mod tests {
             assert_eq!(
                 pool.get_with_current_receipt(IoClass::Data, *key)
                     .expect("strictly read batched data object"),
+                Some((payload.clone(), receipt.clone()))
+            );
+        }
+
+        drop(pool);
+        let mut pool = Pool::open(config, properties, &options).expect("reopen data pool");
+        for ((key, payload), receipt) in batch.iter().zip(&receipts) {
+            assert_eq!(
+                pool.get_with_current_receipt(IoClass::Data, *key)
+                    .expect("strictly reread batched data object after reopen"),
                 Some((payload.clone(), receipt.clone()))
             );
         }

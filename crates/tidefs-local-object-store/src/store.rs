@@ -683,8 +683,12 @@ pub struct LocalObjectStore {
     #[cfg(test)]
     pub(crate) current_dataset_id: Option<[u8; 16]>,
     /// Per-object BLAKE3 domain-separated checksums for read-path verification.
-    /// Computed on every `put` and persisted within the transaction group commit.
+    /// Computed on every write and persisted by its transaction or explicit
+    /// Pool-prepublication sync boundary.
     pub(crate) checksums: BTreeMap<ObjectKey, ObjectDigest>,
+    /// Prepublication writes deliberately do not enter the ordinary transaction
+    /// group, so their checksum-index update must join the next explicit sync.
+    prepublication_checksums_dirty: bool,
     /// When true, the store operates directly on a block device instead of
     /// a directory of segment files. Segment files are not created;
     /// all I/O goes through current_file which points to the block device.
@@ -2327,6 +2331,7 @@ impl LocalObjectStore {
             #[cfg(test)]
             current_dataset_id: None,
             checksums: BTreeMap::new(),
+            prepublication_checksums_dirty: false,
             block_device_mode: true,
         };
 
@@ -2669,6 +2674,7 @@ impl LocalObjectStore {
             #[cfg(test)]
             current_dataset_id: None,
             checksums: BTreeMap::new(),
+            prepublication_checksums_dirty: false,
             block_device_mode: false,
         };
         if let Some(payload) = store.get(physical_lifetime_sequence_high_water_key())? {
@@ -5842,7 +5848,12 @@ impl LocalObjectStore {
         }
     }
 
-    fn put_authorized(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+    fn put_authorized_with_transaction_tracking(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+        track_transaction: bool,
+    ) -> Result<StoredObject> {
         // Pool-owned generation and deletion publication deliberately uses
         // this path, so configured write faults exercise those durability
         // transitions too. Only lower put_inner/put_preencoded_internal
@@ -5902,6 +5913,16 @@ impl LocalObjectStore {
             return Ok(result);
         }
 
+        // Immutable prepublication payloads are not independently reachable:
+        // Pool receipt publication, followed by the owning manifest and
+        // authenticated filesystem root, is their commit authority. Keep the
+        // ordinary storage, transform, replica, checksum and fault paths above,
+        // but do not duplicate these bytes into a second raw-store transaction.
+        if !track_transaction {
+            self.prepublication_checksums_dirty = true;
+            return Ok(result);
+        }
+
         // Track this write in the current transaction group for
         // committed-root anchoring on flush/sync. If tracking fails
         // (phase rejection), abort the current commit_group so subsequent
@@ -5930,10 +5951,30 @@ impl LocalObjectStore {
         Ok(result)
     }
 
+    fn put_authorized(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.put_authorized_with_transaction_tracking(key, payload, true)
+    }
+
     pub fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         self.ensure_pool_raw_mutation_allowed()?;
         Self::ensure_public_pool_key_mutation_allowed(key)?;
         self.put_authorized(key, payload)
+    }
+
+    /// Store one immutable Pool-prepublication payload without copying it into
+    /// the raw store's separate commit group and intent log.
+    ///
+    /// The caller must publish and durably verify the corresponding Pool
+    /// placement receipt before making the object reachable. All ordinary raw
+    /// storage behavior, including fault injection, transforms, replication,
+    /// liveness accounting and read-verification checksums, remains active.
+    pub(crate) fn put_prepublication_pool_internal(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<StoredObject> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        self.put_authorized_with_transaction_tracking(key, payload, false)
     }
 
     pub(crate) fn put_pool_internal(
@@ -7060,8 +7101,9 @@ impl LocalObjectStore {
                 let _ = self.persist_space_accounting();
 
                 // Persist per-object checksum index for read-path verification (#5273).
-                if let Err(e) = write_checksums(&self.segments_dir, &self.checksums) {
-                    tracing::warn!("checksum index write failed: {e}");
+                match write_checksums(&self.segments_dir, &self.checksums) {
+                    Ok(()) => self.prepublication_checksums_dirty = false,
+                    Err(e) => tracing::warn!("checksum index write failed: {e}"),
                 }
 
                 // Sync the segment file so user data is durable.
@@ -7082,6 +7124,14 @@ impl LocalObjectStore {
                 self.intent_log_tx_open = false;
                 self.commit_group.abort_current();
             }
+        }
+
+        // A batch containing only prepublication payloads has no ordinary
+        // commit group, but its explicit Pool barrier still has to carry the
+        // read-verification checksum index across close and reopen.
+        if self.prepublication_checksums_dirty {
+            write_checksums(&self.segments_dir, &self.checksums)?;
+            self.prepublication_checksums_dirty = false;
         }
 
         Ok(())

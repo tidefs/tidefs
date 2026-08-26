@@ -412,6 +412,10 @@ pub trait DeviceImpl {
     /// Store an object.
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject>;
 
+    /// Store an immutable Pool-prepublication object without enrolling the
+    /// underlying raw payload in its separate commit group and intent log.
+    fn put_prepublication(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject>;
+
     /// Retrieve an object, if it exists.
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>>;
 
@@ -532,6 +536,13 @@ pub trait DeviceImpl {
 
 fn store_error_counts_as_device_write_fault(error: &StoreError) -> bool {
     matches!(error, StoreError::Io { .. })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DevicePutKind {
+    Public,
+    PoolInternal,
+    Prepublication,
 }
 
 // ---------------------------------------------------------------------------
@@ -802,6 +813,26 @@ impl SingleDevice {
 impl DeviceImpl for SingleDevice {
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         match self.store.put(key, payload) {
+            Ok(obj) => {
+                self.write_ops = self.write_ops.saturating_add(1);
+                Ok(obj)
+            }
+            Err(e) => {
+                if store_error_counts_as_device_write_fault(&e) {
+                    self.health_tracker
+                        .get_mut()
+                        .record_error(DeviceErrorKind::Write);
+                    self.status.write_errors = self.health_tracker.get_mut().total_write_errors;
+                }
+                self.status.last_error = Some(format!("{e:?}"));
+                self.evaluate_health();
+                Err(e)
+            }
+        }
+    }
+
+    fn put_prepublication(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        match self.store.put_prepublication_pool_internal(key, payload) {
             Ok(obj) => {
                 self.write_ops = self.write_ops.saturating_add(1);
                 Ok(obj)
@@ -1263,7 +1294,7 @@ impl MirrorDevice {
         &mut self,
         key: ObjectKey,
         payload: &[u8],
-        pool_internal: bool,
+        kind: DevicePutKind,
     ) -> Result<StoredObject> {
         let mut last_ok: Option<StoredObject> = None;
         let mut ok_count = 0_usize;
@@ -1273,10 +1304,10 @@ impl MirrorDevice {
             if member.status.state != DeviceState::Online {
                 continue;
             }
-            let result = if pool_internal {
-                member.put_pool_internal(key, payload)
-            } else {
-                member.put(key, payload)
+            let result = match kind {
+                DevicePutKind::Public => member.put(key, payload),
+                DevicePutKind::PoolInternal => member.put_pool_internal(key, payload),
+                DevicePutKind::Prepublication => member.put_prepublication(key, payload),
             };
             if let Ok(obj) = result {
                 ok_count += 1;
@@ -1328,7 +1359,7 @@ impl MirrorDevice {
     fn put_pool_internal(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         let strict_pool_authority = crate::store::is_strict_pool_authority_key(key);
         if !strict_pool_authority {
-            return self.put_with_pool_authority(key, payload, true);
+            return self.put_with_pool_authority(key, payload, DevicePutKind::PoolInternal);
         }
 
         let mut first_error = None;
@@ -1399,7 +1430,11 @@ impl MirrorDevice {
 
 impl DeviceImpl for MirrorDevice {
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
-        self.put_with_pool_authority(key, payload, false)
+        self.put_with_pool_authority(key, payload, DevicePutKind::Public)
+    }
+
+    fn put_prepublication(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.put_with_pool_authority(key, payload, DevicePutKind::Prepublication)
     }
 
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
@@ -1944,11 +1979,11 @@ impl ParityRaidDevice {
         &mut self,
         key: ObjectKey,
         payload: &[u8],
-        pool_internal: bool,
+        kind: DevicePutKind,
     ) -> Result<StoredObject> {
         use crate::parity_raid::ParityRaidLayout;
         let strict_pool_authority =
-            pool_internal && crate::store::is_strict_pool_authority_key(key);
+            kind == DevicePutKind::PoolInternal && crate::store::is_strict_pool_authority_key(key);
         let stripes =
             ParityRaidLayout::stripe_write(payload, self.n_data, self.n_parity).map_err(|_e| {
                 StoreError::InvalidOptions {
@@ -1957,10 +1992,12 @@ impl ParityRaidDevice {
             })?;
         let len_key = Self::len_key(key);
         let len_bytes = (payload.len() as u64).to_le_bytes();
-        let len_result = if pool_internal {
-            self.children[0].put_pool_internal(len_key, &len_bytes)
-        } else {
-            self.children[0].put(len_key, &len_bytes)
+        let len_result = match kind {
+            DevicePutKind::Public => self.children[0].put(len_key, &len_bytes),
+            DevicePutKind::PoolInternal => self.children[0].put_pool_internal(len_key, &len_bytes),
+            DevicePutKind::Prepublication => {
+                self.children[0].put_prepublication(len_key, &len_bytes)
+            }
         };
         let mut first_error = None;
         if strict_pool_authority {
@@ -1975,10 +2012,12 @@ impl ParityRaidDevice {
         let mut ok_count = 0;
         for (i, stripe) in stripes.iter().enumerate().take(total) {
             let col_key = Self::column_key(key, i as u8);
-            let result = if pool_internal {
-                self.children[i].put_pool_internal(col_key, stripe)
-            } else {
-                self.children[i].put(col_key, stripe)
+            let result = match kind {
+                DevicePutKind::Public => self.children[i].put(col_key, stripe),
+                DevicePutKind::PoolInternal => self.children[i].put_pool_internal(col_key, stripe),
+                DevicePutKind::Prepublication => {
+                    self.children[i].put_prepublication(col_key, stripe)
+                }
             };
             match result {
                 Ok(obj) => {
@@ -2062,7 +2101,7 @@ impl ParityRaidDevice {
     }
 
     fn put_pool_internal(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
-        self.put_with_pool_authority(key, payload, true)
+        self.put_with_pool_authority(key, payload, DevicePutKind::PoolInternal)
     }
 
     fn delete_pool_internal(&mut self, key: ObjectKey) -> Result<bool> {
@@ -2117,7 +2156,11 @@ impl ParityRaidDevice {
 #[cfg(any(feature = "distributed-repair", test))]
 impl DeviceImpl for ParityRaidDevice {
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
-        self.put_with_pool_authority(key, payload, false)
+        self.put_with_pool_authority(key, payload, DevicePutKind::Public)
+    }
+
+    fn put_prepublication(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.put_with_pool_authority(key, payload, DevicePutKind::Prepublication)
     }
 
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
@@ -2679,6 +2722,21 @@ impl DeviceImpl for LogDevice {
             e
         })
     }
+    fn put_prepublication(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.store
+            .put_prepublication_pool_internal(key, payload)
+            .map_err(|e| {
+                if store_error_counts_as_device_write_fault(&e) {
+                    self.health_tracker
+                        .get_mut()
+                        .record_error(DeviceErrorKind::Write);
+                    self.status.write_errors = self.health_tracker.get_mut().total_write_errors;
+                }
+                self.status.last_error = Some(format!("{e:?}"));
+                self.evaluate_health();
+                e
+            })
+    }
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
         self.store.get(key)
     }
@@ -2890,6 +2948,24 @@ impl DeviceImpl for CompressedDevice {
         self.inner.put(key, &framed)
     }
 
+    fn put_prepublication(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.write_ops = self.write_ops.saturating_add(1);
+
+        let mut frame_stats = crate::compress::CompressionStats::default();
+        let framed = crate::compress::compress_frame(payload, &self.config, &mut frame_stats);
+
+        self.bytes_in = self.bytes_in.saturating_add(frame_stats.bytes_in);
+        self.bytes_out = self.bytes_out.saturating_add(frame_stats.bytes_out);
+        self.objects_compressed = self
+            .objects_compressed
+            .saturating_add(frame_stats.objects_compressed);
+        self.objects_uncompressed = self
+            .objects_uncompressed
+            .saturating_add(frame_stats.objects_uncompressed);
+
+        self.inner.put_prepublication(key, &framed)
+    }
+
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
         if crate::store::is_strict_pool_authority_key(key) {
             return self.inner.get(key);
@@ -3064,6 +3140,12 @@ impl DeviceImpl for EncryptedDevice {
         let ciphertext = crate::encrypt::encrypt_object(&self.config.key, payload);
         self.objects_encrypted = self.objects_encrypted.saturating_add(1);
         self.inner.put(key, &ciphertext)
+    }
+
+    fn put_prepublication(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        let ciphertext = crate::encrypt::encrypt_object(&self.config.key, payload);
+        self.objects_encrypted = self.objects_encrypted.saturating_add(1);
+        self.inner.put_prepublication(key, &ciphertext)
     }
 
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
@@ -4604,6 +4686,10 @@ impl Device {
 impl DeviceImpl for Device {
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         self.inner_mut().put(key, payload)
+    }
+
+    fn put_prepublication(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.inner_mut().put_prepublication(key, payload)
     }
 
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
