@@ -2315,6 +2315,44 @@ impl SharedPoolDatasetOwner {
         self.borrow()
     }
 
+    /// Return whether mounted mutation maintenance is pending without waiting
+    /// behind a foreground carrier operation.
+    ///
+    /// `None` means the mounted owner is currently busy. Embedders should
+    /// defer the maintenance tick instead of joining the foreground lock
+    /// queue.
+    #[must_use]
+    pub fn try_background_services_pending(&self) -> Option<bool> {
+        match self.0.try_lock() {
+            Ok(owner) => Some(owner.background_services_pending()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(poisoned.into_inner().background_services_pending())
+            }
+        }
+    }
+
+    /// Run one mounted mutation-maintenance tick without waiting behind a
+    /// foreground carrier operation.
+    ///
+    /// `None` means another owner user won the lock and the caller must retry
+    /// on a later idle-period scheduler cycle.
+    pub fn try_tick_background_services(
+        &self,
+        max_reclaim_entries: usize,
+    ) -> Result<Option<ReclaimDrainStats>> {
+        match self.0.try_lock() {
+            Ok(mut owner) => owner
+                .tick_background_services_with_reclaim_limit(max_reclaim_entries)
+                .map(Some),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                .into_inner()
+                .tick_background_services_with_reclaim_limit(max_reclaim_entries)
+                .map(Some),
+        }
+    }
+
     pub fn into_inner(self) -> PoolDatasetOwner {
         match Arc::try_unwrap(self.0) {
             Ok(owner) => owner
@@ -6377,15 +6415,31 @@ impl PoolDatasetOwner {
     /// reclaim consumer's normal batch size and the background-service
     /// DEFAULT_TICK item budget.
     pub fn drain_local_reclaim_queue_into_store(&mut self) -> Result<ReclaimDrainStats> {
+        self.drain_local_reclaim_queue_into_store_with_limit(1024)
+    }
+
+    /// Drain at most `max_entries` local reclaim obligations into Pool
+    /// deletion authority. A zero limit selects the normal 1024-entry cap.
+    fn drain_local_reclaim_queue_into_store_with_limit(
+        &mut self,
+        max_entries: usize,
+    ) -> Result<ReclaimDrainStats> {
         self.ensure_mutation_allowed("drain local reclaim queue")?;
         const MAX_RECLAIM_PER_TICK: usize = 1024;
+        let max_entries = if max_entries == 0 {
+            MAX_RECLAIM_PER_TICK
+        } else {
+            max_entries.min(MAX_RECLAIM_PER_TICK)
+        };
+
+        if self.filesystem.reclaim_queue.lock().unwrap().is_empty() {
+            return Ok(ReclaimDrainStats { entries_drained: 0 });
+        }
 
         // Make every current obligation durable before any logical deletion.
         // Receipt-authority preflight below is read-only; entries without
         // exact current authority stay in this queue for a later cycle.
-        if !self.filesystem.reclaim_queue.lock().unwrap().is_empty() {
-            self.persist_local_reclaim_queue(true)?;
-        }
+        self.persist_local_reclaim_queue(true)?;
 
         // Protect every root the mounted recovery/retention authority can
         // select, including recursively retained snapshot and clone roots.
@@ -6404,7 +6458,7 @@ impl PoolDatasetOwner {
             tidefs_types_reclaim_queue_core::ReclaimQueueEntry,
         )> = {
             let q = self.filesystem.reclaim_queue.lock().unwrap();
-            q.dequeue_batch(None, MAX_RECLAIM_PER_TICK)
+            q.dequeue_batch(None, max_entries)
         };
         let mut entries_drained = 0;
 
@@ -6702,8 +6756,9 @@ impl PoolDatasetOwner {
     /// and removes the pair from the deferred list.  Pairs whose
     /// replacement is not yet durable stay in the list for a future cycle.
     ///
-    /// Called after each commit_group commit to bound deferred-trim
-    /// accumulation and prevent unbounded capacity drift.
+    /// Called after replacement writeback and before committed-root
+    /// publication so the promoted obligations are durable in the same
+    /// transaction. Background maintenance performs the later delete handoff.
     pub fn process_deferred_rewrite_trims(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("process deferred rewrite trims")?;
         if self.filesystem.deferred_rewrite_trims.is_empty() {
@@ -7148,13 +7203,49 @@ impl PoolDatasetOwner {
         Ok(applied)
     }
 
-    /// Drive one cycle of the background service scheduler.
+    fn background_services_pending(&self) -> bool {
+        if !self
+            .filesystem
+            .pending_orphan_deletions
+            .lock()
+            .unwrap()
+            .is_empty()
+            || !self.filesystem.deferred_rewrite_trims.is_empty()
+            || !self.filesystem.reclaim_queue.lock().unwrap().is_empty()
+        {
+            return true;
+        }
+
+        #[cfg(feature = "distributed-repair")]
+        if self
+            .filesystem
+            .scrub_corruption_detected
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return true;
+        }
+
+        false
+    }
+
+    /// Drive one cycle of mounted background mutation services.
     ///
     /// Dispatches ticks to all registered services that have work,
     /// in priority order with round-robin fairness. Call periodically
     /// (e.g. after commits, on a timer, or from the embedding application)
     /// to keep background work progressing.
     pub fn tick_background_services(&mut self) -> Result<()> {
+        self.tick_background_services_with_reclaim_limit(1024)
+            .map(|_| ())
+    }
+
+    /// Drive one mounted background mutation cycle while limiting local
+    /// reclaim handoff to `max_reclaim_entries`.
+    fn tick_background_services_with_reclaim_limit(
+        &mut self,
+        max_reclaim_entries: usize,
+    ) -> Result<ReclaimDrainStats> {
         self.ensure_mutation_allowed("run background mutation services")?;
         // --- Duty 1: record reclaim deltas for orphaned inodes ---
         let pending: Vec<u64> = {
@@ -7192,7 +7283,7 @@ impl PoolDatasetOwner {
         // freeing needs exact obsolete-placement tokens bound to an
         // authenticated filesystem root, which the current queue does not
         // persist.
-        self.drain_local_reclaim_queue_into_store()?;
+        let reclaim = self.drain_local_reclaim_queue_into_store_with_limit(max_reclaim_entries)?;
 
         // --- Duty 3: dispatch pending scrub-triggered repairs ---
         // The background scrubber sets scrub_corruption_detected when it finds
@@ -7218,7 +7309,7 @@ impl PoolDatasetOwner {
                     .tick(self.store.pool_mut());
             }
         }
-        Ok(())
+        Ok(reclaim)
     }
 
     /// Prepare exact content and inode reclaim entries for every orphan whose
@@ -15628,6 +15719,11 @@ impl PoolDatasetOwner {
         }
         if must_persist {
             self.sync_extent_allocator_to_state()?;
+            // Replacement receipts are durable after write-buffer flushing.
+            // Promote their predecessor keys before root publication so the
+            // exact reclaim obligations survive a crash even though the
+            // expensive root scan and Pool deletion handoff run later.
+            self.process_deferred_rewrite_trims()?;
             // Reclaim obligations created by this mutation must reach Pool
             // placement authority before the transaction sync and committed
             // root can make their source objects unreachable. The transaction
@@ -15770,10 +15866,6 @@ impl PoolDatasetOwner {
                 .notify_committed(CommitGroupId(commit_log.commit_group.0));
         }
         check_crash_hook(CrashInjectionPoint::CommitGroupAfterFlush);
-        // Progress background services after each commit so that
-        // orphan reclamation and other deferred work advances
-        // under per-tick budget without blocking mount or I/O.
-        self.tick_background_services()?;
 
         // ── Space pressure update after commit ──────────────────────────
         // Update space pressure tracking from current pool capacity stats.
@@ -18261,6 +18353,8 @@ mod orphan_index_integration_tests {
         fs.write_file("/dedup.bin", 0, &payload)
             .expect("write dedup file");
         fs.sync_all().expect("commit dedup file");
+        fs.tick_background_services()
+            .expect("drain initial dedup reclaim work");
 
         let record = fs.stat("/dedup.bin").expect("stat dedup file");
         let layout = MountedContentReadAuthority::new(fs.store.pool())
@@ -18323,6 +18417,113 @@ mod orphan_index_integration_tests {
     }
 
     #[test]
+    fn mounted_reclaim_commit_persists_queue_without_foreground_drain() {
+        let (root, mut fs) =
+            make_test_fs("mounted_reclaim_deferred_commit").expect("open mounted reclaim fixture");
+        fs.stop_background_scheduler();
+        fs.set_auto_commit(false)
+            .expect("disable automatic fixture commits");
+
+        let first =
+            enqueue_exact_reclaim_entry(&fs, ObjectKey::from_name(b"mounted-reclaim-absent-first"));
+        let second = enqueue_exact_reclaim_entry(
+            &fs,
+            ObjectKey::from_name(b"mounted-reclaim-absent-second"),
+        );
+        fs.create_file("/commit-marker", DEFAULT_FILE_PERMISSIONS)
+            .expect("dirty mounted state");
+        fs.do_commit().expect("commit durable reclaim obligations");
+
+        assert_eq!(
+            fs.reclaim_queue_depth(),
+            2,
+            "foreground commit must not perform strict reclaim reads or deletion handoff"
+        );
+        drop(fs);
+
+        let mut reopened = LocalFileSystem::open(&root).expect("reopen durable reclaim queue");
+        reopened.stop_background_scheduler();
+        assert_eq!(reopened.reclaim_queue_depth(), 2);
+
+        let first_tick = reopened
+            .tick_background_services_with_reclaim_limit(1)
+            .expect("run one bounded mounted reclaim tick");
+        assert_eq!(first_tick.entries_drained, 1);
+        assert_eq!(reopened.reclaim_queue_depth(), 1);
+
+        let remaining = reopened.reclaim_queue.lock().unwrap().entries();
+        assert!(
+            remaining == vec![(first.object_key, first)]
+                || remaining == vec![(second.object_key, second)],
+            "one exact durable obligation must remain after a one-item tick"
+        );
+
+        let second_tick = reopened
+            .tick_background_services_with_reclaim_limit(1)
+            .expect("run second bounded mounted reclaim tick");
+        assert_eq!(second_tick.entries_drained, 1);
+        assert_eq!(reopened.reclaim_queue_depth(), 0);
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mounted_reclaim_commit_promotes_rewrite_trims_before_root() {
+        let (root, mut fs) = make_test_fs("mounted_reclaim_rewrite_promotion")
+            .expect("open mounted rewrite fixture");
+        fs.stop_background_scheduler();
+        fs.set_auto_commit(false)
+            .expect("disable automatic fixture commits");
+
+        let created = fs
+            .create_file("/commit-marker", DEFAULT_FILE_PERMISSIONS)
+            .expect("dirty mounted state");
+        let replacement_bytes = b"durable replacement";
+        let mut replacement_record = created.clone();
+        replacement_record.data_version = created.data_version.saturating_add(1);
+        replacement_record.metadata_version = replacement_record.data_version;
+        replacement_record.size = replacement_bytes.len() as u64;
+        let old_key = content_object_key_for_version(created.inode_id, created.data_version);
+        let new_key = content_object_key_for_version(
+            replacement_record.inode_id,
+            replacement_record.data_version,
+        );
+        let keyspace = fs.object_keyspace();
+        fs.store
+            .pool_mut()
+            .put_with_receipt(
+                DeviceIoClass::Data,
+                keyspace.scope(new_key),
+                &encode_content(&replacement_record, replacement_bytes),
+            )
+            .expect("publish replacement receipt");
+        fs.deferred_rewrite_trims.push((old_key, new_key));
+
+        fs.do_commit().expect("commit replacement content");
+        assert!(
+            fs.deferred_rewrite_trims.is_empty(),
+            "durable replacement receipts must promote trims before root publication"
+        );
+        assert!(
+            fs.reclaim_queue
+                .lock()
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|(key, _entry)| key.0 == *keyspace.scope(old_key).as_bytes()),
+            "foreground commit must retain promoted obligations for background handoff"
+        );
+        drop(fs);
+
+        let reopened = LocalFileSystem::open(&root).expect("reopen promoted reclaim queue");
+        assert!(reopened.reclaim_queue_depth() > 0);
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn reclaim_keeps_entries_pending_when_snapshot_root_authority_is_unprovable() {
         let (root, mut fs) =
             make_test_fs("reclaim_uncertain_snapshot_root").expect("open filesystem");
@@ -18334,6 +18535,8 @@ mod orphan_index_integration_tests {
         fs.replace_file("/snapshot.bin", b"snapshot-protected payload")
             .expect("write snapshot file");
         fs.sync_all().expect("commit snapshot payload");
+        fs.tick_background_services()
+            .expect("drain pre-snapshot reclaim work");
         fs.create_snapshot("keep").expect("create snapshot");
 
         let record = fs.stat("/snapshot.bin").expect("stat snapshot file");
@@ -18511,6 +18714,8 @@ mod orphan_index_integration_tests {
                 .expect("advance redirect fallback ring");
             fs.do_commit()
                 .expect("commit redirect fallback-ring advance");
+            fs.tick_background_services()
+                .expect("run redirect fallback-ring reclaim tick");
         }
         assert!(
             !fs.collect_reclaim_protected_content_keys()
@@ -18624,6 +18829,8 @@ mod orphan_index_integration_tests {
         fs.create_file("/file", 0o644).expect("create_file");
         fs.write_file("/file", 0, &[0u8; 4096]).expect("write");
         fs.do_commit().expect("commit");
+        fs.tick_background_services()
+            .expect("drain initial background reclaim");
 
         // Before unlink, reclaim queue should be empty.
         assert!(fs.reclaim_queue_depth() == 0);
@@ -18710,6 +18917,8 @@ mod orphan_index_integration_tests {
         fs.create_file("/file", 0o644).expect("create_file");
         fs.write_file("/file", 0, &[0u8; 8192]).expect("write");
         fs.do_commit().expect("commit");
+        fs.tick_background_services()
+            .expect("drain initial background reclaim");
 
         assert!(fs.reclaim_queue_depth() == 0);
 
@@ -18787,6 +18996,8 @@ mod orphan_index_integration_tests {
         fs.write_file("/drop", 0, &[0xAAu8; 4096])
             .expect("write drop");
         fs.do_commit().expect("commit");
+        fs.tick_background_services()
+            .expect("drain initial background reclaim");
 
         // Both files must be reachable pre-op.
         let s_keep = fs.stat("/keep").expect("stat keep");
@@ -18832,6 +19043,8 @@ mod orphan_index_integration_tests {
             fs.create_file(format!("/root-advance-{index}"), 0o644)
                 .expect("advance fallback ring");
             fs.do_commit().expect("commit fallback-ring advance");
+            fs.tick_background_services()
+                .expect("run fallback-ring reclaim tick");
         }
         assert_eq!(
             fs.reclaim_queue_depth(),
@@ -18889,6 +19102,8 @@ mod orphan_index_integration_tests {
                 .expect("write_file");
         }
         fs.do_commit().expect("initial commit");
+        fs.tick_background_services()
+            .expect("drain initial background reclaim");
         assert_eq!(
             fs.reclaim_queue_depth(),
             0,
@@ -18922,6 +19137,8 @@ mod orphan_index_integration_tests {
             fs.create_file(format!("/burst-root-advance-{index}"), 0o644)
                 .expect("advance burst fallback ring");
             fs.do_commit().expect("commit burst fallback-ring advance");
+            fs.tick_background_services()
+                .expect("run burst fallback-ring reclaim tick");
         }
         assert_eq!(
             fs.reclaim_queue_depth(),

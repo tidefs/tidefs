@@ -1389,6 +1389,189 @@ fn fuse_mount_options_for_mode(
     effective.to_fuse_mount_options()
 }
 
+struct MountedLocalReclaimService {
+    pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
+    engine: live_owner::LiveOwnerEngine,
+    retry_not_before: std::time::Instant,
+}
+
+impl MountedLocalReclaimService {
+    const NAME: &'static str = "mounted-local-reclaim";
+    const MAX_ITEMS_PER_TICK: usize = 1024;
+
+    fn new(
+        pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
+        engine: live_owner::LiveOwnerEngine,
+    ) -> Self {
+        Self {
+            pool_owner,
+            engine,
+            retry_not_before: std::time::Instant::now(),
+        }
+    }
+
+    fn item_limit(budget: &ServiceBudget) -> usize {
+        if budget.max_items == 0 {
+            Self::MAX_ITEMS_PER_TICK
+        } else {
+            usize::try_from(budget.max_items)
+                .unwrap_or(usize::MAX)
+                .min(Self::MAX_ITEMS_PER_TICK)
+        }
+    }
+}
+
+impl BackgroundService for MountedLocalReclaimService {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn priority(&self) -> ServicePriority {
+        ServicePriority::LatencySensitive
+    }
+
+    fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
+        // Match the foreground lock order and never wait for an active FUSE
+        // or live-owner operation. The scheduler will retry after that demand
+        // has released the engine.
+        let _engine = match self.engine.try_lock() {
+            Ok(engine) => engine,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(TickReport {
+                    skipped: 1,
+                    has_more: true,
+                    ..TickReport::default()
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+
+        let reclaim = self
+            .pool_owner
+            .try_tick_background_services(Self::item_limit(budget))
+            .map_err(|error| {
+                eprintln!("mounted-local-reclaim: scheduled tick failed: {error}");
+                ServiceError::Internal {
+                    service: Self::NAME,
+                    message: "mounted reclaim tick failed",
+                }
+            })?;
+        let Some(reclaim) = reclaim else {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        };
+
+        let processed = u64::try_from(reclaim.entries_drained).unwrap_or(u64::MAX);
+        let has_more = self
+            .pool_owner
+            .try_background_services_pending()
+            .unwrap_or(true);
+        if has_more && processed == 0 {
+            // Protected roots or temporarily uncertain receipts cannot make
+            // progress until authority changes. Avoid a hot retry loop while
+            // retaining the durable queue for the next idle cycle.
+            self.retry_not_before = std::time::Instant::now()
+                + std::time::Duration::from_millis(budget.max_ms.max(500));
+        }
+
+        Ok(TickReport {
+            processed,
+            skipped: 0,
+            errors: 0,
+            items_consumed: processed,
+            bytes_consumed: 0,
+            has_more,
+        })
+    }
+
+    fn has_work(&self) -> bool {
+        if std::time::Instant::now() < self.retry_not_before {
+            return false;
+        }
+
+        let _engine = match self.engine.try_lock() {
+            Ok(engine) => engine,
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        self.pool_owner
+            .try_background_services_pending()
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod mounted_local_reclaim_service_tests {
+    use super::*;
+
+    #[test]
+    fn mounted_local_reclaim_service_defers_to_engine_and_honors_item_budget() {
+        let root = tempfile::tempdir().expect("create mounted reclaim fixture");
+        let mut filesystem =
+            tidefs_local_filesystem::PoolDatasetOwner::open_with_root_authentication_key(
+                root.path(),
+                tidefs_local_object_store::StoreOptions::default(),
+                tidefs_local_filesystem::RootAuthenticationKey::demo_key(),
+            )
+            .expect("open mounted reclaim fixture");
+        filesystem
+            .set_auto_commit(false)
+            .expect("disable automatic fixture commits");
+        filesystem
+            .create_file("/drop", 0o644)
+            .expect("create reclaim fixture file");
+        filesystem
+            .write_file("/drop", 0, b"mounted reclaim payload")
+            .expect("write reclaim fixture file");
+        filesystem.sync_all().expect("commit fixture file");
+        filesystem.unlink("/drop").expect("unlink fixture file");
+        filesystem.sync_all().expect("commit unlink");
+
+        // Retire every fallback root that can still name /drop. Foreground
+        // commits retain the durable queue but no longer drain it.
+        for index in 0..8 {
+            filesystem
+                .create_file(format!("/root-advance-{index}"), 0o644)
+                .expect("advance retained root ring");
+            filesystem.sync_all().expect("commit root-ring advance");
+        }
+        assert!(filesystem.reclaim_queue_depth() > 0);
+
+        let base_engine =
+            tidefs_local_filesystem::vfs_engine_impl::VfsLocalFileSystem::new(filesystem);
+        let pool_owner = base_engine.shared_pool_owner();
+        let engine: live_owner::LiveOwnerEngine = Arc::new(Mutex::new(Box::new(base_engine)));
+        let mut service = MountedLocalReclaimService::new(pool_owner.clone(), Arc::clone(&engine));
+
+        let engine_guard = engine.lock().unwrap();
+        assert!(
+            !service.has_work(),
+            "scheduler must not enter maintenance behind active engine demand"
+        );
+        let skipped = service
+            .tick(&ServiceBudget::MAINTENANCE_TICK)
+            .expect("skip busy mounted owner");
+        assert_eq!(skipped.skipped, 1);
+        drop(engine_guard);
+
+        assert!(service.has_work());
+        let depth_before = pool_owner.borrow().reclaim_queue_depth();
+        let report = service
+            .tick(&ServiceBudget {
+                max_items: 1,
+                max_bytes: ServiceBudget::MAINTENANCE_TICK.max_bytes,
+                max_ms: ServiceBudget::MAINTENANCE_TICK.max_ms,
+            })
+            .expect("run bounded mounted reclaim service");
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.items_consumed, 1);
+        assert_eq!(pool_owner.borrow().reclaim_queue_depth(), depth_before - 1);
+    }
+}
+
 struct MountedBackgroundScrubService {
     store: tidefs_local_object_store::LocalObjectStore,
     next_tick_not_before: std::time::Instant,
@@ -1967,6 +2150,12 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     let queue_depth_engine = Arc::clone(&live_owner_engine);
     let notifier_cell = adapter.notifier_cell();
     let mmap_coherency = adapter.mmap_coherency_cell();
+    if !effective_mode.read_only {
+        adapter.register_background_service(Box::new(MountedLocalReclaimService::new(
+            shared_pool_owner.clone(),
+            Arc::clone(&live_owner_engine),
+        )));
+    }
     let background_scheduler = if effective_mode.read_only {
         None
     } else {
