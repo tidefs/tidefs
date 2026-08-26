@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
+use std::ops::Range;
 use std::vec;
 
 use tidefs_dataset_lifecycle::DatasetId;
@@ -20,8 +21,9 @@ use crate::constants::*;
 use crate::dedup::DedupIndex;
 use crate::encoding::{
     decode_content, decode_content_chunk, decode_content_manifest, decode_dedup_redirect,
-    encode_content, encode_content_chunk, encode_content_manifest, encode_content_manifest_sparse,
-    is_dedup_redirect, split_inline_checksum,
+    encode_content, encode_content_chunk, encode_content_chunk_into, encode_content_manifest,
+    encode_content_manifest_sparse, is_dedup_redirect, split_inline_checksum,
+    CONTENT_CHUNK_ENCODED_HEADER_BYTES,
 };
 use crate::error::FileSystemError;
 use crate::object_keys::{
@@ -1576,6 +1578,73 @@ fn encode_chunk_with_dedup<S: ContentWriteStore>(
     }
 }
 
+#[derive(Debug)]
+struct StagedContentChunk {
+    key: ObjectKey,
+    chunk_index: u64,
+    len: u32,
+    checksum: IntegrityDigest64,
+    payload: Range<usize>,
+}
+
+fn staged_content_capacity(candidate_chunks: usize) -> Result<usize> {
+    let bytes_per_chunk = (content_chunk_size() as usize)
+        .checked_add(CONTENT_CHUNK_ENCODED_HEADER_BYTES)
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?;
+    candidate_chunks
+        .checked_mul(bytes_per_chunk)
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_encoded_chunk_with_dedup<S: ContentWriteStore>(
+    dedup_enabled: bool,
+    store: &mut S,
+    record: &InodeRecord,
+    chunk_index: u64,
+    chunk_bytes: &[u8],
+    dedup_index: &mut DedupIndex,
+    #[cfg(feature = "quorum-write")] quorum_store: &mut Option<
+        &mut tidefs_quorum_write_runtime::QuorumObjectStore,
+    >,
+    compression_policy: &ContentCompressionPolicy,
+    staged_bytes: &mut Vec<u8>,
+) -> Result<Range<usize>> {
+    if !dedup_enabled {
+        return encode_content_chunk_into(
+            staged_bytes,
+            record,
+            chunk_index,
+            chunk_bytes,
+            compression_policy,
+        );
+    }
+
+    let encoded = encode_chunk_with_dedup(
+        true,
+        store,
+        record,
+        chunk_index,
+        chunk_bytes,
+        dedup_index,
+        #[cfg(feature = "quorum-write")]
+        quorum_store,
+        compression_policy,
+    )?;
+    let start = staged_bytes.len();
+    let end = start
+        .checked_add(encoded.len())
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?;
+    staged_bytes.extend_from_slice(&encoded);
+    Ok(start..end)
+}
+
 pub(crate) fn write_chunked_content<S: ContentWriteStore>(
     dedup_enabled: bool,
     store: &mut S,
@@ -1829,8 +1898,20 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
     }
 
     let mut chunks_by_index = BTreeMap::new();
-    let mut chunk_batch = Vec::new();
-    let mut chunk_descriptors = Vec::new();
+    // A size change can rewrite at most one otherwise-unpatched boundary
+    // chunk. Dirty patches provide the remaining candidates. Retain one exact
+    // contiguous payload batch instead of hundreds of independently grown
+    // encoded Vec allocations until the shared Pool barrier completes.
+    let candidate_chunks =
+        patches_by_chunk
+            .len()
+            .checked_add(1)
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+    let mut staged_bytes = Vec::with_capacity(staged_content_capacity(candidate_chunks)?);
+    let mut staged_chunks = Vec::with_capacity(candidate_chunks);
+    let mut chunk_bytes = Vec::with_capacity(content_chunk_size() as usize);
     for old_ref in &old_manifest.chunks {
         if old_ref.chunk_index >= chunk_count {
             continue;
@@ -1853,7 +1934,8 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             continue;
         }
 
-        let mut chunk_bytes = vec![0_u8; new_len as usize];
+        chunk_bytes.clear();
+        chunk_bytes.resize(new_len as usize, 0);
         copy_old_content_into_chunk(
             store,
             old_layout,
@@ -1866,7 +1948,7 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             new_record.data_version,
             old_ref.chunk_index,
         );
-        let encoded = encode_chunk_with_dedup(
+        let payload = stage_encoded_chunk_with_dedup(
             dedup_enabled,
             store,
             new_record,
@@ -1876,11 +1958,17 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             compression_policy,
+            &mut staged_bytes,
         )?;
         dedup_index.record_chunk_written();
-        let checksum = checksum64(&encoded);
-        chunk_descriptors.push((old_ref.chunk_index, chunk_bytes.len() as u32, checksum));
-        chunk_batch.push((per_inode_key, encoded));
+        let checksum = checksum64(&staged_bytes[payload.clone()]);
+        staged_chunks.push(StagedContentChunk {
+            key: per_inode_key,
+            chunk_index: old_ref.chunk_index,
+            len: chunk_bytes.len() as u32,
+            checksum,
+            payload,
+        });
     }
 
     for (chunk_index, chunk_patches) in patches_by_chunk {
@@ -1904,7 +1992,8 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             continue;
         }
 
-        let mut chunk_bytes = vec![0_u8; chunk_len];
+        chunk_bytes.clear();
+        chunk_bytes.resize(chunk_len, 0);
         copy_old_content_into_chunk(
             store,
             old_layout,
@@ -1924,7 +2013,7 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             new_record.data_version,
             chunk_index,
         );
-        let encoded = encode_chunk_with_dedup(
+        let payload = stage_encoded_chunk_with_dedup(
             dedup_enabled,
             store,
             new_record,
@@ -1934,44 +2023,49 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             compression_policy,
+            &mut staged_bytes,
         )?;
         dedup_index.record_chunk_written();
-        let checksum = checksum64(&encoded);
-        chunk_descriptors.push((chunk_index, chunk_bytes.len() as u32, checksum));
-        chunk_batch.push((per_inode_key, encoded));
+        let checksum = checksum64(&staged_bytes[payload.clone()]);
+        staged_chunks.push(StagedContentChunk {
+            key: per_inode_key,
+            chunk_index,
+            len: chunk_bytes.len() as u32,
+            checksum,
+            payload,
+        });
     }
 
-    let chunk_payloads = chunk_batch
+    let chunk_payloads = staged_chunks
         .iter()
-        .map(|(key, payload)| (*key, payload.as_slice()))
+        .map(|chunk| (chunk.key, &staged_bytes[chunk.payload.clone()]))
         .collect::<Vec<_>>();
     let chunk_receipts = store.put_prepublication_batch_with_receipts(&chunk_payloads)?;
-    if chunk_receipts.len() != chunk_batch.len() {
+    if chunk_receipts.len() != staged_chunks.len() {
         return Err(FileSystemError::CorruptState {
             reason: "prepublication content batch returned the wrong receipt count",
         });
     }
-    for (((chunk_key, _encoded), (chunk_index, len, checksum)), receipt) in chunk_batch
-        .iter()
-        .zip(chunk_descriptors)
-        .zip(chunk_receipts)
-    {
-        if receipt.object_key != store.physical_key(*chunk_key) {
+    for (chunk, receipt) in staged_chunks.into_iter().zip(chunk_receipts) {
+        if receipt.object_key != store.physical_key(chunk.key) {
             return Err(FileSystemError::CorruptState {
                 reason: "prepublication content batch returned a receipt for another object",
             });
         }
         #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
-            let _ = qs.quorum_put(store.physical_key(*chunk_key), _encoded);
+            let _ = qs.quorum_put(
+                store.physical_key(chunk.key),
+                &staged_bytes[chunk.payload.clone()],
+            );
         }
         chunks_by_index.insert(
-            chunk_index,
+            chunk.chunk_index,
             ContentChunkRef {
-                chunk_index,
+                chunk_index: chunk.chunk_index,
                 data_version: new_record.data_version,
-                len,
-                checksum,
+                len: chunk.len,
+                checksum: chunk.checksum,
                 placement_receipt_generation: receipt.generation,
             },
         );
@@ -2029,13 +2123,26 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
     }
 
     let mut chunks_by_index = BTreeMap::new();
-    let mut chunk_batch = Vec::new();
-    let mut chunk_descriptors = Vec::new();
+    let inline_candidates =
+        usize::try_from(old_chunk_count.min(new_chunk_count)).map_err(|_| {
+            FileSystemError::SizeOverflow {
+                requested: new_record.size,
+            }
+        })?;
+    let candidate_chunks = inline_candidates
+        .checked_add(patches_by_chunk.len())
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: new_record.size,
+        })?;
+    let mut staged_bytes = Vec::with_capacity(staged_content_capacity(candidate_chunks)?);
+    let mut staged_chunks = Vec::with_capacity(candidate_chunks);
+    let mut chunk_bytes = Vec::with_capacity(content_chunk_size() as usize);
     {
         let mut stage_chunk =
             |chunk_index: u64, chunk_patches: Vec<ContentOverlayPatch<'_>>| -> Result<()> {
                 let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
-                let mut chunk_bytes = vec![0_u8; chunk_len];
+                chunk_bytes.clear();
+                chunk_bytes.resize(chunk_len, 0);
                 copy_old_content_into_chunk(
                     store,
                     old_layout,
@@ -2055,7 +2162,7 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
                     new_record.data_version,
                     chunk_index,
                 );
-                let encoded = encode_chunk_with_dedup(
+                let payload = stage_encoded_chunk_with_dedup(
                     dedup_enabled,
                     store,
                     new_record,
@@ -2065,11 +2172,17 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
                     #[cfg(feature = "quorum-write")]
                     &mut quorum_store,
                     compression_policy,
+                    &mut staged_bytes,
                 )?;
                 dedup_index.record_chunk_written();
-                let checksum = checksum64(&encoded);
-                chunk_descriptors.push((chunk_index, chunk_bytes.len() as u32, checksum));
-                chunk_batch.push((per_inode_key, encoded));
+                let checksum = checksum64(&staged_bytes[payload.clone()]);
+                staged_chunks.push(StagedContentChunk {
+                    key: per_inode_key,
+                    chunk_index,
+                    len: chunk_bytes.len() as u32,
+                    checksum,
+                    payload,
+                });
                 Ok(())
             };
 
@@ -2088,37 +2201,36 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
         }
     }
 
-    let chunk_payloads = chunk_batch
+    let chunk_payloads = staged_chunks
         .iter()
-        .map(|(key, payload)| (*key, payload.as_slice()))
+        .map(|chunk| (chunk.key, &staged_bytes[chunk.payload.clone()]))
         .collect::<Vec<_>>();
     let chunk_receipts = store.put_prepublication_batch_with_receipts(&chunk_payloads)?;
-    if chunk_receipts.len() != chunk_batch.len() {
+    if chunk_receipts.len() != staged_chunks.len() {
         return Err(FileSystemError::CorruptState {
             reason: "prepublication content batch returned the wrong receipt count",
         });
     }
-    for (((chunk_key, _encoded), (chunk_index, len, checksum)), receipt) in chunk_batch
-        .iter()
-        .zip(chunk_descriptors)
-        .zip(chunk_receipts)
-    {
-        if receipt.object_key != store.physical_key(*chunk_key) {
+    for (chunk, receipt) in staged_chunks.into_iter().zip(chunk_receipts) {
+        if receipt.object_key != store.physical_key(chunk.key) {
             return Err(FileSystemError::CorruptState {
                 reason: "prepublication content batch returned a receipt for another object",
             });
         }
         #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
-            let _ = qs.quorum_put(store.physical_key(*chunk_key), _encoded);
+            let _ = qs.quorum_put(
+                store.physical_key(chunk.key),
+                &staged_bytes[chunk.payload.clone()],
+            );
         }
         chunks_by_index.insert(
-            chunk_index,
+            chunk.chunk_index,
             ContentChunkRef {
-                chunk_index,
+                chunk_index: chunk.chunk_index,
                 data_version: new_record.data_version,
-                len,
-                checksum,
+                len: chunk.len,
+                checksum: chunk.checksum,
                 placement_receipt_generation: receipt.generation,
             },
         );
