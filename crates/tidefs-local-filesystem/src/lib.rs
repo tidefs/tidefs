@@ -2236,6 +2236,9 @@ pub struct FilesystemDatasetEngine {
     /// identity changes and explicit Pool-authority invalidation force the
     /// normal strict reads before an entry can be reused.
     authenticated_content_allocation_cache: AuthenticatedContentAllocationCache,
+    /// Receipt-authenticated immutable layouts for exact live content
+    /// identities. Chunk payload reads remain strict on every request.
+    authenticated_content_layout_cache: RefCell<AuthenticatedContentLayoutCache>,
     write_buffer_config: WriteBufferConfig,
     fsync_stats: FsyncStats,
     /// Sync gate for TXG group commit durability fence coordination.
@@ -5305,6 +5308,9 @@ impl PoolDatasetOwner {
                 buffered_write_base_records: BTreeMap::new(),
                 authenticated_content_allocation_cache:
                     AuthenticatedContentAllocationCache::default(),
+                authenticated_content_layout_cache: RefCell::new(
+                    AuthenticatedContentLayoutCache::default(),
+                ),
                 write_buffer_config: WriteBufferConfig::default(),
                 pool_uuid,
                 fsync_stats: FsyncStats::default(),
@@ -6652,6 +6658,19 @@ impl PoolDatasetOwner {
             .map(|(key, grains)| (keyspace.scope(key), grains))
             .collect();
         Ok((plan, Some(allocation_entries)))
+    }
+
+    fn record_receipted_content_layout(
+        &self,
+        record: &InodeRecord,
+        content_write: &ContentWriteOutcome,
+    ) {
+        if let Some(layout) = content_write.receipted_layout() {
+            self.filesystem
+                .authenticated_content_layout_cache
+                .borrow_mut()
+                .record(record, layout.clone());
+        }
     }
 
     fn apply_rewrite_trim_plan(&mut self, plan: RewriteTrimPlan) {
@@ -8211,6 +8230,10 @@ impl PoolDatasetOwner {
         self.filesystem
             .authenticated_content_allocation_cache
             .invalidate();
+        self.filesystem
+            .authenticated_content_layout_cache
+            .borrow_mut()
+            .invalidate();
         self.filesystem.state = restored;
         self.filesystem.dataset_capacity = restored_capacity;
         // Clear stale write buffers so queued overwrites do not corrupt the restored state.
@@ -9727,6 +9750,7 @@ impl PoolDatasetOwner {
                 .authenticated_content_allocation_cache
                 .record_live_entries(&committed, entries);
         }
+        self.record_receipted_content_layout(&committed, &content_write);
         self.apply_rewrite_trim_plan(rewrite_trim_plan);
         Ok(committed)
     }
@@ -14155,6 +14179,7 @@ impl PoolDatasetOwner {
                 .authenticated_content_allocation_cache
                 .record_live_entries(&committed, entries);
         }
+        self.record_receipted_content_layout(&committed, &content_write);
         self.apply_rewrite_trim_plan(rewrite_trim_plan);
         Ok(committed)
     }
@@ -14291,6 +14316,7 @@ impl PoolDatasetOwner {
                 .authenticated_content_allocation_cache
                 .record_live_entries(&committed, entries);
         }
+        self.record_receipted_content_layout(&committed, &content_write);
         self.apply_rewrite_trim_plan(rewrite_trim_plan);
         Ok(committed)
     }
@@ -16086,6 +16112,10 @@ impl PoolDatasetOwner {
             .inode_cache
             .borrow_mut()
             .invalidate(inode_id);
+        self.filesystem
+            .authenticated_content_layout_cache
+            .borrow_mut()
+            .remove(inode_id);
         self.page_cache_evict_inode_unchecked(inode_id);
         self.filesystem
             .writeback_range_tracker
@@ -16167,6 +16197,10 @@ impl PoolDatasetOwner {
         // authentication result across that authority boundary.
         self.filesystem
             .authenticated_content_allocation_cache
+            .invalidate();
+        self.filesystem
+            .authenticated_content_layout_cache
+            .borrow_mut()
             .invalidate();
         let total_bytes = self.filesystem.allocator_policy.content_capacity_bytes;
         self.filesystem.dataset_capacity = Self::capacity_authority_from_committed_content(
@@ -16261,6 +16295,10 @@ impl PoolDatasetOwner {
 
     fn rollback_mutation_delta(&mut self) {
         self.filesystem.inode_cache.borrow_mut().clear();
+        self.filesystem
+            .authenticated_content_layout_cache
+            .borrow_mut()
+            .invalidate();
         self.store.discard_metadata_candidate();
         self.filesystem.pending_snapshot_root_rewrites.clear();
         if let Some(delta) = self.filesystem.mutation_delta.take() {
@@ -16589,9 +16627,10 @@ impl PoolDatasetOwner {
         if self.filesystem.state.corrupted_inodes.contains(&inode_id) {
             return Err(FileSystemError::CorruptContent { inode_id });
         }
-
-        let content_reader = self.mounted_content_reader();
-        content_reader.read_all(inode_id, record)
+        let length = usize::try_from(record.size).map_err(|_| FileSystemError::SizeOverflow {
+            requested: record.size,
+        })?;
+        self.read_committed_content_range(inode_id, record, 0, length)
     }
 
     fn read_content_range(
@@ -16633,11 +16672,6 @@ impl PoolDatasetOwner {
             usize::try_from(clipped_len_u64).map_err(|_| FileSystemError::SizeOverflow {
                 requested: clipped_len_u64,
             })?;
-        if offset == 0 && length_u64 >= record.size {
-            let content_reader = self.mounted_content_reader();
-            return content_reader.read_all(inode_id, record);
-        }
-
         let layout = self.read_committed_content_layout(inode_id, record)?;
         let content_reader = self.mounted_content_reader();
         let bytes = content_reader.read_range(&layout, offset, clipped_len)?;
@@ -16655,8 +16689,22 @@ impl PoolDatasetOwner {
                 kind: record.kind(),
             });
         }
+        if let Some(layout) = self
+            .filesystem
+            .authenticated_content_layout_cache
+            .borrow()
+            .layout(inode_id, record)
+            .cloned()
+        {
+            return Ok(layout);
+        }
         let content_reader = self.mounted_content_reader();
-        content_reader.read_layout(inode_id, record)
+        let layout = content_reader.read_layout(inode_id, record)?;
+        self.filesystem
+            .authenticated_content_layout_cache
+            .borrow_mut()
+            .record(record, layout.clone());
+        Ok(layout)
     }
 
     fn resolve_parent_and_name(&self, path: &str) -> Result<(InodeId, Vec<u8>)> {

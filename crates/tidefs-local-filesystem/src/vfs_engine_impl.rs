@@ -5497,6 +5497,14 @@ impl PoolDatasetOwner {
     }
 
     fn reconcile_relocated_content_receipts(&mut self) -> crate::Result<u64> {
+        // Device lifecycle and repair preparation can make successor receipts
+        // current before the outer operation reports success. Never carry a
+        // predecessor manifest across this reconciliation boundary, including
+        // partial-failure paths that still publish repaired roots.
+        self.filesystem
+            .authenticated_content_layout_cache
+            .borrow_mut()
+            .invalidate();
         let keyspace = self.object_keyspace();
         let replacements = Self::plan_relocated_content_receipts(self.store.pool(), &self.state)?;
 

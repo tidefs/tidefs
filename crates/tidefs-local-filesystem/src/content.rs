@@ -106,6 +106,67 @@ impl ContentWriteOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AuthenticatedContentLayoutIdentity {
+    inode_id: InodeId,
+    size: u64,
+    data_version: u64,
+}
+
+impl From<&InodeRecord> for AuthenticatedContentLayoutIdentity {
+    fn from(record: &InodeRecord) -> Self {
+        Self {
+            inode_id: record.inode_id,
+            size: record.size,
+            data_version: record.data_version,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AuthenticatedContentLayout {
+    identity: AuthenticatedContentLayoutIdentity,
+    layout: ContentLayout,
+}
+
+/// Mount-local immutable layouts already authenticated through current Pool
+/// receipt authority.
+///
+/// Metadata-only inode changes may reuse a layout, while size or data-version
+/// changes must take the strict manifest path. Pool lifecycle operations that
+/// can replace receipt generations invalidate the complete cache before the
+/// mounted owner resumes ordinary reads.
+#[derive(Debug, Default)]
+pub(crate) struct AuthenticatedContentLayoutCache {
+    inodes: BTreeMap<InodeId, AuthenticatedContentLayout>,
+}
+
+impl AuthenticatedContentLayoutCache {
+    pub(crate) fn layout(&self, inode_id: InodeId, record: &InodeRecord) -> Option<&ContentLayout> {
+        let cached = self.inodes.get(&inode_id)?;
+        (cached.identity == AuthenticatedContentLayoutIdentity::from(record))
+            .then_some(&cached.layout)
+    }
+
+    pub(crate) fn record(&mut self, record: &InodeRecord, layout: ContentLayout) {
+        self.inodes.insert(
+            record.inode_id,
+            AuthenticatedContentLayout {
+                identity: AuthenticatedContentLayoutIdentity::from(record),
+                layout,
+            },
+        );
+    }
+
+    pub(crate) fn remove(&mut self, inode_id: InodeId) {
+        self.inodes.remove(&inode_id);
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.inodes.clear();
+    }
+}
+
 /// Dataset-scoped view of content I/O.
 ///
 /// Content encodings retain logical per-filesystem keys (including dedup
@@ -3225,12 +3286,71 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::records::ContentObject;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tidefs_local_object_store::pool::{PoolConfig, PoolProperties};
     use tidefs_local_object_store::{
         DeviceBacking, DeviceClass, DeviceConfig, DeviceKind, StoreOptions,
     };
     use tidefs_types_vfs_core::{Generation, NodeKind};
+
+    #[test]
+    fn authenticated_content_layout_cache_reuses_only_exact_content_identity() {
+        let record = InodeRecord {
+            dir_storage_kind: 0,
+            inode_id: InodeId(42),
+            generation: Generation(1),
+            facets: NodeKind::File.to_facets(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size: 3,
+            data_version: 7,
+            metadata_version: 7,
+            posix_time: PosixTimeRecord::now(),
+            xattr_storage_kind: 0,
+            xattrs: BTreeMap::new(),
+            dir_rev: 0,
+            subtree_rev: 0,
+            rdev: 0,
+        };
+        let layout = ContentLayout::Inline(ContentObject {
+            inode_id: record.inode_id,
+            data_version: record.data_version,
+            bytes: b"abc".to_vec(),
+        });
+        let mut cache = AuthenticatedContentLayoutCache::default();
+
+        assert!(cache.layout(record.inode_id, &record).is_none());
+        cache.record(&record, layout.clone());
+        assert_eq!(cache.layout(record.inode_id, &record), Some(&layout));
+
+        let mut metadata_only_change = record.clone();
+        metadata_only_change.metadata_version += 1;
+        metadata_only_change.nlink += 1;
+        assert_eq!(
+            cache.layout(record.inode_id, &metadata_only_change),
+            Some(&layout)
+        );
+
+        let mut changed_content = record.clone();
+        changed_content.data_version += 1;
+        assert!(cache
+            .layout(changed_content.inode_id, &changed_content)
+            .is_none());
+        changed_content = record.clone();
+        changed_content.size += 1;
+        assert!(cache
+            .layout(changed_content.inode_id, &changed_content)
+            .is_none());
+
+        cache.remove(record.inode_id);
+        assert!(cache.layout(record.inode_id, &record).is_none());
+        cache.record(&record, layout);
+        cache.invalidate();
+        assert!(cache.layout(record.inode_id, &record).is_none());
+    }
 
     fn temp_store(label: &str) -> LocalObjectStore {
         let nanos = SystemTime::now()
