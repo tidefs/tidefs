@@ -560,7 +560,7 @@ pub struct SingleDevice {
     read_errors: Cell<u64>,
     /// Per-device checksum error counter (interior mutability for &self get).
     checksum_errors: Cell<u64>,
-    read_ops: u64,
+    read_ops: Cell<u64>,
     write_ops: u64,
     delete_ops: u64,
 }
@@ -644,7 +644,7 @@ impl SingleDevice {
             },
             read_errors: Cell::new(0),
             checksum_errors: Cell::new(0),
-            read_ops: 0,
+            read_ops: Cell::new(0),
             write_ops: 0,
             delete_ops: 0,
         }
@@ -683,7 +683,7 @@ impl SingleDevice {
             },
             read_errors: Cell::new(0),
             checksum_errors: Cell::new(0),
-            read_ops: 0,
+            read_ops: Cell::new(0),
             write_ops: 0,
             delete_ops: 0,
         }
@@ -852,6 +852,7 @@ impl DeviceImpl for SingleDevice {
     }
 
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        self.read_ops.set(self.read_ops.get().saturating_add(1));
         match self.store.get(key) {
             Ok(val) => Ok(val),
             Err(e) => {
@@ -900,7 +901,7 @@ impl DeviceImpl for SingleDevice {
             live_bytes: s.live_bytes,
             segment_count: s.segment_count,
             next_sequence: s.next_sequence,
-            read_ops: self.read_ops,
+            read_ops: self.read_ops.get(),
             write_ops: self.write_ops,
             delete_ops: self.delete_ops,
             ..Default::default()
@@ -4933,6 +4934,7 @@ mod tests {
 
         assert!(device.delete(key).unwrap());
         assert_eq!(device.get(key).unwrap(), None);
+        assert_eq!(device.stats().read_ops, 2);
 
         let _ = std::fs::remove_dir_all(&path);
     }
