@@ -19,7 +19,10 @@ use tidefs_local_filesystem::{
     human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem,
     RootAuthenticationKey,
 };
-use tidefs_posix_filesystem_adapter_daemon::fuse_vfs_adapter::FuseVfsAdapter;
+use tidefs_posix_filesystem_adapter_daemon::{
+    coherency_profile::CoherencyProfile, fuse_vfs_adapter::FuseVfsAdapter,
+    mount_options::TimestampPolicy,
+};
 
 const RENAME_NOREPLACE: u32 = 1;
 const RENAME_EXCHANGE: u32 = 2;
@@ -61,6 +64,18 @@ struct MountedVfs {
 
 impl MountedVfs {
     fn new() -> Self {
+        Self::new_with_adapter(|adapter| adapter)
+    }
+
+    fn new_with_cacheable_attrs() -> Self {
+        Self::new_with_adapter(|adapter| {
+            adapter
+                .with_coherency_profile(CoherencyProfile::Writeback)
+                .with_timestamp_policy(TimestampPolicy::NoAtime)
+        })
+    }
+
+    fn new_with_adapter(configure: impl FnOnce(FuseVfsAdapter) -> FuseVfsAdapter) -> Self {
         let root = unique_test_root();
         let store = root.join("store");
         let mount = root.join("mnt");
@@ -74,8 +89,11 @@ impl MountedVfs {
         )
         .expect("open local filesystem");
         let engine = VfsLocalFileSystem::new(filesystem);
-        let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create FUSE VFS adapter");
+        let adapter =
+            configure(FuseVfsAdapter::new(Box::new(engine)).expect("create FUSE VFS adapter"));
+        let notifier_cell = adapter.notifier_cell();
         let session = fuser::spawn_mount2(adapter, &mount, &mount_options()).expect("mount FUSE");
+        *notifier_cell.lock().expect("lock FUSE notifier cell") = Some(session.notifier());
 
         Self {
             root,
@@ -597,7 +615,7 @@ fn rename_open_file_handle_reads_correctly_after_rename() {
 #[test]
 fn rename_overwrite_open_directory_fstat_reports_zero_links() {
     let _guard = test_lock();
-    let mnt = MountedVfs::new();
+    let mnt = MountedVfs::new_with_cacheable_attrs();
     let source_path = mnt.path("/source-dir");
     let target_path = mnt.path("/target-dir");
 
