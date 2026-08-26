@@ -3035,6 +3035,116 @@ fn contiguous_buffered_writes_share_one_admission_permit() {
 }
 
 #[test]
+fn admission_pressure_materializes_dirty_bytes_without_publishing_root() {
+    let root = temp_root("admission-pressure-materializes-without-root");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.stop_background_scheduler();
+    let first = fs
+        .create_file("/first.bin", 0o644)
+        .expect("create first file");
+    let second = fs
+        .create_file("/second.bin", 0o644)
+        .expect("create second file");
+    fs.sync_all().expect("commit test fixture");
+    fs.set_auto_commit(false)
+        .expect("disable automatic per-mutation commits");
+    fs.set_commit_group_throughput_profile()
+        .expect("select mounted throughput profile");
+    fs.set_max_uncommitted_mutations(64 * 1024)
+        .expect("retain the mounted mutation bound");
+    fs.set_write_buffer_flush_threshold_bytes(64 * 1024 * 1024)
+        .expect("retain mounted per-inode writeback batching");
+    let admission = fs.admission_config();
+    fs.filesystem
+        .write_admission
+        .apply_dynamic_tuning(crate::admission::LocalAdmissionTuning {
+            max_dirty_bytes: 4096,
+            max_dirty_ops: admission.hard_max_dirty_ops,
+            max_dirty_age_ticks: admission.hard_max_dirty_age_ticks,
+        });
+
+    let commit_group_before = fs.commit_group.current_commit_group();
+    let durable_before = fs.durable_commit_group();
+    let first_bytes = vec![0x31; 3072];
+    let second_bytes = vec![0x52; 2048];
+    fs.write_file("/first.bin", 0, &first_bytes)
+        .expect("buffer first admitted write");
+    fs.write_file("/second.bin", 0, &second_bytes)
+        .expect("materialize first inode and admit second write");
+
+    assert_eq!(fs.commit_group.current_commit_group(), commit_group_before);
+    assert_eq!(fs.durable_commit_group(), durable_before);
+    assert!(fs.is_state_dirty());
+    assert!(!fs.write_buffers.contains_key(&first.inode_id));
+    assert!(!fs
+        .filesystem
+        .buffered_write_base_records
+        .contains_key(&first.inode_id));
+    assert!(fs.write_buffers.contains_key(&second.inode_id));
+    assert!(fs
+        .filesystem
+        .buffered_write_base_records
+        .contains_key(&second.inode_id));
+    assert_eq!(
+        MountedContentReadAuthority::new(fs.store.pool())
+            .read_all(
+                first.inode_id,
+                fs.state
+                    .inodes
+                    .get(&first.inode_id)
+                    .expect("live first inode"),
+            )
+            .expect("read pressure-materialized content through Pool authority"),
+        first_bytes,
+    );
+    assert_eq!(
+        fs.read_file("/second.bin").expect("read second overlay"),
+        second_bytes
+    );
+    let pressure = fs.take_admission_snapshot().expect("read pressure usage");
+    assert_eq!(pressure.current_dirty_bytes, second_bytes.len() as u64);
+    assert_eq!(pressure.current_dirty_ops, 1);
+    assert_eq!(pressure.current_outstanding_permits, 1);
+
+    let second_tail = vec![0x73; 3072];
+    fs.write_file("/second.bin", second_bytes.len() as u64, &second_tail)
+        .expect("materialize and replan same-inode expansion");
+    assert_eq!(fs.commit_group.current_commit_group(), commit_group_before);
+    assert_eq!(fs.durable_commit_group(), durable_before);
+    assert!(fs.is_state_dirty());
+    let mut expected_second = second_bytes.clone();
+    expected_second.extend_from_slice(&second_tail);
+    assert_eq!(
+        fs.read_file("/second.bin")
+            .expect("read materialized base plus new overlay"),
+        expected_second
+    );
+    let same_inode_pressure = fs
+        .take_admission_snapshot()
+        .expect("read same-inode pressure usage");
+    assert_eq!(
+        same_inode_pressure.current_dirty_bytes,
+        second_tail.len() as u64
+    );
+    assert_eq!(same_inode_pressure.current_dirty_ops, 1);
+    assert_eq!(same_inode_pressure.current_outstanding_permits, 1);
+
+    fs.do_commit().expect("publish both admitted files");
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        reopened.read_file("/first.bin").expect("read first"),
+        first_bytes
+    );
+    assert_eq!(
+        reopened.read_file("/second.bin").expect("read second"),
+        expected_second
+    );
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
 fn create_family_parent_preflights_do_not_cache_directory_listing() {
     let root = temp_root("create-parent-preflight-cache");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");

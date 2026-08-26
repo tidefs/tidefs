@@ -10688,36 +10688,90 @@ impl PoolDatasetOwner {
         }
     }
 
-    /// Close an existing deferred group before its next write would exceed
+    /// Relieve an existing deferred group before its next write would exceed
     /// filesystem-owned dirty-work admission.
     ///
-    /// The caller must re-plan against the newly committed state when this
-    /// returns `true`. Explicit transactions are never split, and a request
-    /// that cannot be admitted into an otherwise empty group retains the
-    /// normal rejection result.
-    fn commit_deferred_group_for_write_admission(
+    /// Memory-pressure writeback materializes the oldest admitted inode under
+    /// its current content identity, then releases only that inode's in-memory
+    /// dirty-work permit. The filesystem root and commit group remain dirty;
+    /// fsync, an actual commit-group close, or clean unmount still owns their
+    /// durability boundary. The caller must re-plan against the newly
+    /// Pool-readable live content when this returns `true`.
+    ///
+    /// Explicit transactions are never split. Materializing one inode always
+    /// returns control to the caller so dirty ranges, operation charge,
+    /// capacity, and quota are replanned against the new Pool-backed base.
+    fn relieve_deferred_group_for_write_admission(
         &mut self,
         inode_id: InodeId,
         dirty_bytes: u64,
         dirty_ops: u32,
     ) -> Result<bool> {
-        let admission = &mut self.filesystem.write_admission;
         let check = if self.filesystem.pending_permits.contains_key(&inode_id) {
-            admission.check_dirty_write_expansion(dirty_bytes, dirty_ops)
+            self.filesystem
+                .write_admission
+                .check_dirty_write_expansion(dirty_bytes, dirty_ops)
         } else {
-            admission.check_dirty_write(dirty_bytes, dirty_ops)
+            self.filesystem
+                .write_admission
+                .check_dirty_write(dirty_bytes, dirty_ops)
         };
         match check {
-            Ok(()) => Ok(false),
-            Err(_)
-                if !self.filesystem.in_transaction
-                    && !self.filesystem.pending_permits.is_empty() =>
+            Ok(()) => return Ok(false),
+            Err(error)
+                if self.filesystem.in_transaction || self.filesystem.pending_permits.is_empty() =>
             {
-                self.force_commit(())?;
-                Ok(true)
+                return Err(error.into());
             }
-            Err(error) => Err(error.into()),
+            Err(_) => {}
         }
+
+        let pressure_inode = self
+            .filesystem
+            .pending_permits
+            .iter()
+            .min_by(|(left_inode, left), (right_inode, right)| {
+                let left_charge = left.charge();
+                let right_charge = right.charge();
+                left_charge
+                    .admitted_tick
+                    .cmp(&right_charge.admitted_tick)
+                    .then_with(|| right_charge.dirty_bytes.cmp(&left_charge.dirty_bytes))
+                    .then_with(|| left_inode.cmp(right_inode))
+            })
+            .map(|(candidate, _)| *candidate)
+            .ok_or(FileSystemError::CorruptState {
+                reason: "write admission reported pressure without an owned dirty permit",
+            })?;
+
+        if self.filesystem.write_buffers.contains_key(&pressure_inode)
+            || self
+                .filesystem
+                .buffered_write_base_records
+                .contains_key(&pressure_inode)
+        {
+            self.materialize_write_buffer(pressure_inode)?;
+        }
+
+        let permit = self
+            .filesystem
+            .pending_permits
+            .remove(&pressure_inode)
+            .ok_or(FileSystemError::CorruptState {
+                reason: "materialized write lost its admission permit",
+            })?;
+        if let Err(error) = self.filesystem.write_admission.release(permit) {
+            let reason = error.to_string();
+            if let Some(permit) = error.into_permit() {
+                self.filesystem
+                    .pending_permits
+                    .insert(pressure_inode, permit);
+            } else {
+                self.filesystem.mutation_requires_reopen = true;
+            }
+            return Err(FileSystemError::DirtyAdmissionRejected { reason });
+        }
+        Ok(true)
     }
 
     /// Release all outstanding admission permits after a successful SYNC.
@@ -10841,7 +10895,7 @@ impl PoolDatasetOwner {
                 self.write_buffer_uncovered_ranges(inode_id, offset, bytes_len);
             let physical_admit_bytes = Self::range_bytes(&dirty_charge_ranges)?;
             let dirty_ops = self.buffered_write_dirty_op_delta(inode_id, offset, end);
-            if self.commit_deferred_group_for_write_admission(
+            if self.relieve_deferred_group_for_write_admission(
                 inode_id,
                 physical_admit_bytes,
                 dirty_ops,
@@ -10849,11 +10903,11 @@ impl PoolDatasetOwner {
                 continue;
             }
 
-            // A foreground admission commit can materialize every write
-            // buffer and publish a new root. All capacity, quota, replacement,
-            // and accounting planning below therefore runs only after the
-            // commit decision and is repeated if admission ages out while
-            // Pool-backed planning is in progress.
+            // Admission-pressure writeback can materialize one dirty inode
+            // without publishing its commit group. All capacity,
+            // quota, replacement, and accounting planning below therefore
+            // runs only after that pressure decision and is repeated if
+            // admission ages out while Pool-backed planning is in progress.
             self.ensure_content_write_not_over_capacity(bytes_len)?;
             let old_grains = crate::quota::allocation_grains_for_len(record.size);
             let new_grains = crate::quota::allocation_grains_for_len(new_size);
@@ -10878,7 +10932,7 @@ impl PoolDatasetOwner {
             )?;
             let write_space_delta =
                 self.data_write_space_delta(inode_id, &[(offset, bytes_len)])?;
-            if self.commit_deferred_group_for_write_admission(
+            if self.relieve_deferred_group_for_write_admission(
                 inode_id,
                 physical_admit_bytes,
                 dirty_ops,
