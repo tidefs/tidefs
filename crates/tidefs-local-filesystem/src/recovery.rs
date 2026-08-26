@@ -5578,10 +5578,31 @@ pub(crate) fn validate_namespace_invariants(
         let refs = reference_counts.get(inode_id).copied().unwrap_or(0);
         if inode.carries_child_namespace() {
             let parent_refs = directory_parent_counts.get(inode_id).copied().unwrap_or(0);
+            let is_detached_directory = *inode_id != ROOT_INODE_ID && inode.nlink == 0;
+            let directory = directories
+                .get(inode_id)
+                .ok_or(FileSystemError::CorruptState {
+                    reason: "mount invariant gate: directory inode has no directory table",
+                })?;
             if *inode_id == ROOT_INODE_ID {
                 if parent_refs != 0 {
                     return Err(FileSystemError::CorruptState {
                         reason: "mount invariant gate: root directory has a parent entry",
+                    });
+                }
+            } else if is_detached_directory {
+                // An open directory description may retain an empty directory
+                // after overwrite-rename detaches its last namespace entry.
+                // It remains canonical orphan state until RELEASEDIR or
+                // mount-time orphan recovery removes it.
+                if parent_refs != 0 {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "mount invariant gate: zero-link directory still has a parent",
+                    });
+                }
+                if !directory.is_empty() {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "mount invariant gate: zero-link directory is not empty",
                     });
                 }
             } else if parent_refs != 1 {
@@ -5590,17 +5611,15 @@ pub(crate) fn validate_namespace_invariants(
                         "mount invariant gate: non-root directory does not have exactly one parent",
                 });
             }
-            let child_directory_count = directories
-                .get(inode_id)
-                .ok_or(FileSystemError::CorruptState {
-                    reason: "mount invariant gate: directory inode has no directory table",
-                })?
+            let child_directory_count = directory
                 .values()
                 .filter(|entry| entry.carries_child_namespace())
                 .count() as u64;
-            let expected_nlink = 2_u64.saturating_add(child_directory_count);
-            if u64::from(inode.nlink) != expected_nlink {
-                return Err(FileSystemError::CorruptState { reason: "mount invariant gate: directory link count does not match child-directory topology" });
+            if !is_detached_directory {
+                let expected_nlink = 2_u64.saturating_add(child_directory_count);
+                if u64::from(inode.nlink) != expected_nlink {
+                    return Err(FileSystemError::CorruptState { reason: "mount invariant gate: directory link count does not match child-directory topology" });
+                }
             }
         } else {
             // A live handle may retain a canonical file-like inode after its
@@ -5619,12 +5638,9 @@ pub(crate) fn validate_namespace_invariants(
     }
 
     let reachable = reachable_inodes_from_root(inodes, directories)?;
-    // Zero-link file-like inodes are intentionally outside namespace
-    // reachability while an open handle keeps them live.
-    let zero_link_orphans = inodes
-        .values()
-        .filter(|inode| !inode.carries_child_namespace() && inode.nlink == 0)
-        .count();
+    // Zero-link file-like inodes and empty directories are intentionally
+    // outside namespace reachability while an open handle keeps them live.
+    let zero_link_orphans = inodes.values().filter(|inode| inode.nlink == 0).count();
     if reachable.len().saturating_add(zero_link_orphans) != inodes.len() {
         return Err(FileSystemError::CorruptState {
             reason: "mount invariant gate: committed root contains unreachable inode records",

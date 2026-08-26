@@ -12678,8 +12678,25 @@ impl PoolDatasetOwner {
         if record.nlink != 0 {
             return Ok(false);
         }
+        if record.kind() == NodeKind::Dir {
+            let directory = self.filesystem.state.directories.get(&inode_id).ok_or(
+                FileSystemError::CorruptState {
+                    reason: "refusing to finalize zero-link directory without directory state",
+                },
+            )?;
+            if !directory.is_empty() {
+                return Err(FileSystemError::CorruptState {
+                    reason: "refusing to finalize non-empty zero-link directory",
+                });
+            }
+        }
 
         self.begin_mutation("finalize mounted orphan inode")?;
+        self.mark_inode_metadata_dirty(inode_id);
+        if record.kind() == NodeKind::Dir {
+            self.mark_dir_dirty(inode_id);
+            Arc::make_mut(&mut self.filesystem.state.directories).remove(&inode_id);
+        }
         self.account_final_orphan_release(&record);
         self.record_reclaim_delta(inode_id, record.size);
         self.record_inode_tombstone(inode_id);
@@ -12855,10 +12872,10 @@ impl PoolDatasetOwner {
         self.renameat2_with_retained_overwrite(old_path, new_path, flags, None)
     }
 
-    /// Rename while retaining one overwritten last-link file for a live VFS
-    /// handle. The named source replaces the destination atomically, while
-    /// the detached target remains a committed `nlink == 0` orphan until its
-    /// last handle closes.
+    /// Rename while retaining one overwritten target for a live VFS handle.
+    /// The named source replaces the destination atomically, while the
+    /// detached file or empty directory remains a committed `nlink == 0`
+    /// orphan until its last handle closes.
     pub(crate) fn renameat2_with_retained_overwrite(
         &mut self,
         old_path: impl AsRef<str>,
@@ -13055,15 +13072,41 @@ impl PoolDatasetOwner {
                     // Overwriting a directory: remove dir map, adjust
                     // parent nlink.
                     self.update_parent_metadata_for_subdir_remove(new_parent_id, tick);
-                    // Clear xattrs before removing the overwritten directory inode.
-                    if let Some(stored) =
-                        Arc::make_mut(&mut self.filesystem.state.inodes).get_mut(&target.inode_id)
-                    {
-                        stored.xattrs.clear();
+                    if retained_overwrite_inode == Some(target.inode_id) {
+                        // An open directory description keeps the detached,
+                        // empty target alive after its name is replaced.
+                        // Preserve both the inode and its empty directory map
+                        // until the last RELEASEDIR finalizes the orphan.
+                        if let Some(stored) = Arc::make_mut(&mut self.filesystem.state.inodes)
+                            .get_mut(&target.inode_id)
+                        {
+                            stored.nlink = 0;
+                            stored.posix_time.ctime_ns =
+                                Self::next_metadata_ctime_ns(stored.posix_time.ctime_ns);
+                            stored.metadata_version = tick;
+                            Self::advance_subtree_revision(stored);
+                        }
+                        self.filesystem
+                            .inode_cache
+                            .borrow_mut()
+                            .invalidate(target.inode_id);
+                        self.filesystem
+                            .orphan_index
+                            .lock()
+                            .unwrap()
+                            .insert(target.inode_id.get());
+                    } else {
+                        // Clear xattrs before removing the overwritten directory inode.
+                        if let Some(stored) = Arc::make_mut(&mut self.filesystem.state.inodes)
+                            .get_mut(&target.inode_id)
+                        {
+                            stored.xattrs.clear();
+                        }
+                        Arc::make_mut(&mut self.filesystem.state.directories)
+                            .remove(&target.inode_id);
+                        Arc::make_mut(&mut self.filesystem.state.inodes).remove(&target.inode_id);
+                        self.forget_removed_inode_state(target.inode_id);
                     }
-                    Arc::make_mut(&mut self.filesystem.state.directories).remove(&target.inode_id);
-                    Arc::make_mut(&mut self.filesystem.state.inodes).remove(&target.inode_id);
-                    self.forget_removed_inode_state(target.inode_id);
                 } else if target_record.nlink > 1 {
                     // Still has other links — decrement nlink.
                     let mut updated = target_record;

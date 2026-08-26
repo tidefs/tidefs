@@ -421,6 +421,13 @@ impl VfsLocalFileSystem {
         }
     }
 
+    fn has_active_dir_handle(&self, inode: InodeId) -> bool {
+        self.active_dir_handles
+            .borrow()
+            .values()
+            .any(|active_inode| *active_inode == inode)
+    }
+
     /// Walk the entire directory tree from root, populating the path cache.
     /// Called once on first cache miss.
     fn rebuild_path_cache(&self) {
@@ -7296,13 +7303,16 @@ impl VfsEngine for VfsLocalFileSystem {
         let target_record = self.fs.borrow().stat(&new_path).ok();
         let retained_overwrite_inode = if renameat2_flags != RenameAt2Flags::EXCHANGE {
             target_record.as_ref().and_then(|target| {
-                (target.nlink <= 1
-                    && !target.kind().has_child_namespace()
-                    && self
-                        .file_handle_table
-                        .borrow()
-                        .contains_inode(target.inode_id))
-                .then_some(target.inode_id)
+                let has_live_handle = if target.kind() == NodeKind::Dir {
+                    self.has_active_dir_handle(target.inode_id)
+                } else {
+                    target.nlink <= 1
+                        && self
+                            .file_handle_table
+                            .borrow()
+                            .contains_inode(target.inode_id)
+                };
+                has_live_handle.then_some(target.inode_id)
             })
         } else {
             None
@@ -8258,6 +8268,21 @@ impl VfsEngine for VfsLocalFileSystem {
         match active.get(&dh.dh_id).copied() {
             Some(inode) if inode == dh.inode_id => {
                 active.remove(&dh.dh_id);
+                let has_other_handles = active.values().any(|active_inode| *active_inode == inode);
+                drop(active);
+                if !has_other_handles {
+                    let should_finalize = self
+                        .fs
+                        .borrow()
+                        .get_inode_by_id(inode)
+                        .is_some_and(|record| record.nlink == 0);
+                    if should_finalize {
+                        self.fs
+                            .borrow_mut()
+                            .finalize_orphan_inode(inode)
+                            .map_err(|error| map_errno(&error))?;
+                    }
+                }
                 Ok(())
             }
             _ => Err(Errno::EBADF),
@@ -14797,6 +14822,165 @@ mod tests {
             reopened.lookup("/target.txt").unwrap(),
             source.inode_id,
             "the source inode must own the destination name after reopen"
+        );
+    }
+
+    #[test]
+    fn rename_overwrite_open_directory_survives_until_last_close() {
+        let (engine, td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let source = engine
+            .mkdir(root, b"source-dir", 0o755, &ctx())
+            .expect("create source directory");
+        let target = engine
+            .mkdir(root, b"target-dir", 0o755, &ctx())
+            .expect("create target directory");
+        let target_dh = engine
+            .opendir(target.inode_id, &ctx())
+            .expect("open target directory");
+        let second_target_dh = engine
+            .opendir(target.inode_id, &ctx())
+            .expect("open second target directory handle");
+
+        engine
+            .rename(root, b"source-dir", root, b"target-dir", 0, &ctx())
+            .expect("overwrite target with an open directory handle");
+
+        let detached = engine
+            .getattr(target.inode_id, None, &ctx())
+            .expect("getattr detached target directory");
+        assert_eq!(detached.posix.nlink, 0);
+        let (entries, has_more) = engine
+            .readdir(&target_dh, 0, &ctx())
+            .expect("read detached empty directory");
+        assert!(entries.is_empty());
+        assert!(!has_more);
+        assert_eq!(
+            engine
+                .lookup(root, b"target-dir", &ctx())
+                .expect("replacement directory")
+                .inode_id,
+            source.inode_id
+        );
+
+        engine
+            .releasedir(&target_dh)
+            .expect("first directory handle close");
+        assert_eq!(
+            engine
+                .getattr(target.inode_id, None, &ctx())
+                .expect("detached target must survive the first close")
+                .posix
+                .nlink,
+            0
+        );
+        let (entries, has_more) = engine
+            .readdir(&second_target_dh, 0, &ctx())
+            .expect("second handle must remain usable after first close");
+        assert!(entries.is_empty());
+        assert!(!has_more);
+
+        engine
+            .releasedir(&second_target_dh)
+            .expect("last directory handle close must finalize the orphan");
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .get_inode_by_id(target.inode_id)
+                .is_none(),
+            "last close must remove the overwritten directory inode"
+        );
+        assert!(
+            !engine
+                .fs
+                .borrow()
+                .state
+                .directories
+                .contains_key(&target.inode_id),
+            "last close must remove the overwritten directory map"
+        );
+        engine
+            .fs
+            .borrow()
+            .mount_invariant_report()
+            .expect("directory orphan finalization must preserve namespace invariants");
+
+        let mut owner = engine.into_inner();
+        owner.sync_all().expect("sync renamed state");
+        drop(owner);
+        let reopened = PoolDatasetOwner::open(td.path()).expect("reopen renamed state");
+        reopened
+            .mount_invariant_report()
+            .expect("renamed state must reopen with strict namespace invariants");
+        assert_eq!(
+            reopened.lookup("/target-dir").unwrap(),
+            source.inode_id,
+            "the source directory must own the destination name after reopen"
+        );
+    }
+
+    #[test]
+    fn rename_overwrite_open_directory_orphan_is_reclaimed_on_reopen() {
+        let (engine, td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let source = engine
+            .mkdir(root, b"source-dir", 0o755, &ctx())
+            .expect("create source directory");
+        let target = engine
+            .mkdir(root, b"target-dir", 0o755, &ctx())
+            .expect("create target directory");
+        let _target_dh = engine
+            .opendir(target.inode_id, &ctx())
+            .expect("open target directory");
+
+        engine
+            .rename(root, b"source-dir", root, b"target-dir", 0, &ctx())
+            .expect("overwrite target with an open directory handle");
+        engine
+            .fs
+            .borrow_mut()
+            .sync_all()
+            .expect("commit detached directory orphan");
+        engine
+            .fs
+            .borrow()
+            .mount_invariant_report()
+            .expect("committed directory orphan must preserve namespace invariants");
+
+        // Simulate process loss without RELEASEDIR after the zero-link
+        // directory reached the committed root.
+        drop(engine.into_inner());
+
+        let reopened = PoolDatasetOwner::open(td.path()).expect("reopen orphaned state");
+        assert!(
+            reopened.get_inode_by_id(target.inode_id).is_none(),
+            "mount-time orphan recovery must remove the detached directory inode"
+        );
+        assert!(
+            !reopened.state.directories.contains_key(&target.inode_id),
+            "mount-time orphan recovery must remove the detached directory map"
+        );
+        assert_eq!(
+            reopened.lookup("/target-dir").unwrap(),
+            source.inode_id,
+            "the replacement directory must survive orphan recovery"
+        );
+        reopened
+            .mount_invariant_report()
+            .expect("reopened namespace must preserve strict invariants");
+        drop(reopened);
+
+        let reopened_again =
+            PoolDatasetOwner::open(td.path()).expect("reopen state after durable orphan cleanup");
+        assert!(reopened_again.get_inode_by_id(target.inode_id).is_none());
+        assert!(!reopened_again
+            .state
+            .directories
+            .contains_key(&target.inode_id));
+        assert_eq!(
+            reopened_again.lookup("/target-dir").unwrap(),
+            source.inode_id
         );
     }
 
