@@ -7242,33 +7242,30 @@ impl Pool {
         )
     }
 
-    /// Durably publish one immutable filesystem-metadata transaction batch.
-    ///
-    /// Every key is strictly preflighted before the first mutation. Exact
-    /// receipt-backed retries are reused, while conflicting, receiptless, or
-    /// otherwise ambiguous state is refused. New payloads and their placement
-    /// receipts are staged without per-object device barriers, followed by one
-    /// Pool-wide sync and a strict readback of every exact payload and receipt.
-    ///
-    /// If a later staged write fails, the successful prefix is synced before
-    /// the error is returned. Those immutable objects remain unreachable until
-    /// a separately authenticated filesystem root publishes them, and an exact
-    /// retry reuses their receipt generations.
-    pub fn put_prepublication_metadata_batch(
+    fn put_prepublication_batch_with_receipts(
         &mut self,
-        entries: &[(ObjectKey, Vec<u8>)],
-    ) -> Result<()> {
-        self.ensure_writable("pool prepublication metadata batch")?;
+        class: IoClass,
+        entries: &[(ObjectKey, &[u8])],
+    ) -> Result<Vec<PlacementReceipt>> {
+        let operation = match class {
+            IoClass::Data => "pool prepublication data batch",
+            IoClass::Metadata => "pool prepublication metadata batch",
+            IoClass::IntentLog | IoClass::ReadCache => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "prepublication batch requires data or metadata I/O",
+                });
+            }
+        };
+        self.ensure_writable(operation)?;
         if self.locked {
             return Err(StoreError::InvalidOptions {
                 reason: "pool is locked: encryption key required for I/O",
             });
         }
         if entries.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
-        let class = IoClass::Metadata;
         let indices: Vec<usize> = self.class_map.get(class).to_vec();
         if indices.is_empty() {
             return Err(StoreError::InvalidOptions {
@@ -7300,14 +7297,13 @@ impl Pool {
             }
             match expected_payloads.entry(*key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(payload.as_slice());
+                    entry.insert(*payload);
                 }
-                std::collections::btree_map::Entry::Occupied(entry)
-                    if *entry.get() == payload.as_slice() => {}
+                std::collections::btree_map::Entry::Occupied(entry) if *entry.get() == *payload => {
+                }
                 std::collections::btree_map::Entry::Occupied(_) => {
                     return Err(StoreError::InvalidOptions {
-                        reason:
-                            "prepublication metadata batch repeats a key with different payload",
+                        reason: "prepublication batch repeats a key with different payload",
                     });
                 }
             }
@@ -7318,7 +7314,7 @@ impl Pool {
         for (&key, &payload) in &expected_payloads {
             if self.pending_deletion_for_subject(class, key).is_some() {
                 return Err(StoreError::InvalidOptions {
-                    reason: "prepublication metadata batch refuses pending deletion state",
+                    reason: "prepublication batch refuses pending deletion state",
                 });
             }
             match self.get_with_current_receipt(class, key)? {
@@ -7328,25 +7324,42 @@ impl Pool {
                 Some((_current, _receipt)) => {
                     return Err(StoreError::InvalidOptions {
                         reason:
-                            "prepublication metadata key already has different current receipt-backed payload",
+                            "prepublication key already has different current receipt-backed payload",
                     });
                 }
                 None => {
                     self.plan_pool_wide_placement(class, key, payload.len(), &authority_indices)?;
+                    if matches!(class, IoClass::Data) {
+                        self.check_write_admission(class, payload.len() as u64)?;
+                    }
                     absent.push((key, payload));
                 }
             }
         }
 
         for (key, payload) in absent {
-            let result = self.put_pool_wide_with_durability(
-                class,
-                key,
-                payload,
-                &indices,
-                OldReceiptPolicy::RequireValid,
-                ReceiptPublicationDurability::PrepublicationBatch,
-            );
+            let result = if matches!(class, IoClass::Data) {
+                self.check_write_admission(class, payload.len() as u64)
+                    .and_then(|()| {
+                        self.put_pool_wide_with_durability(
+                            class,
+                            key,
+                            payload,
+                            &indices,
+                            OldReceiptPolicy::RequireValid,
+                            ReceiptPublicationDurability::PrepublicationBatch,
+                        )
+                    })
+            } else {
+                self.put_pool_wide_with_durability(
+                    class,
+                    key,
+                    payload,
+                    &indices,
+                    OldReceiptPolicy::RequireValid,
+                    ReceiptPublicationDurability::PrepublicationBatch,
+                )
+            };
             match result {
                 Ok((_stored, receipt)) => {
                     expected_receipts.insert(key, receipt);
@@ -7369,18 +7382,68 @@ impl Pool {
                 Some((_current, _receipt)) => {
                     return Err(StoreError::InvalidOptions {
                         reason:
-                            "prepublication metadata batch readback changed payload or receipt authority",
+                            "prepublication batch readback changed payload or receipt authority",
                     });
                 }
                 None => {
                     return Err(StoreError::InvalidOptions {
-                        reason:
-                            "prepublication metadata batch readback found no current receipt authority",
+                        reason: "prepublication batch readback found no current receipt authority",
                     });
                 }
             }
         }
-        Ok(())
+        entries
+            .iter()
+            .map(|(key, _payload)| {
+                expected_receipts
+                    .get(key)
+                    .cloned()
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "prepublication batch lost an expected placement receipt",
+                    })
+            })
+            .collect()
+    }
+
+    /// Durably publish one immutable filesystem-metadata transaction batch.
+    ///
+    /// Every key is strictly preflighted before the first mutation. Exact
+    /// receipt-backed retries are reused, while conflicting, receiptless, or
+    /// otherwise ambiguous state is refused. New payloads and their placement
+    /// receipts are staged without per-object device barriers, followed by one
+    /// Pool-wide sync and a strict readback of every exact payload and receipt.
+    ///
+    /// If a later staged write fails, the successful prefix is synced before
+    /// the error is returned. Those immutable objects remain unreachable until
+    /// a separately authenticated filesystem root publishes them, and an exact
+    /// retry reuses their receipt generations.
+    pub fn put_prepublication_metadata_batch(
+        &mut self,
+        entries: &[(ObjectKey, Vec<u8>)],
+    ) -> Result<()> {
+        let borrowed = entries
+            .iter()
+            .map(|(key, payload)| (*key, payload.as_slice()))
+            .collect::<Vec<_>>();
+        self.put_prepublication_batch_with_receipts(IoClass::Metadata, &borrowed)
+            .map(drop)
+    }
+
+    /// Durably publish immutable data objects and return their exact receipts.
+    ///
+    /// The returned receipts follow `entries` order. Payloads and receipt
+    /// records share one Pool-wide durability barrier before strict readback,
+    /// so a caller may safely build an unpublished manifest from their receipt
+    /// generations without paying one device barrier per content chunk.
+    pub fn put_prepublication_data_batch(
+        &mut self,
+        entries: &[(ObjectKey, Vec<u8>)],
+    ) -> Result<Vec<PlacementReceipt>> {
+        let borrowed = entries
+            .iter()
+            .map(|(key, payload)| (*key, payload.as_slice()))
+            .collect::<Vec<_>>();
+        self.put_prepublication_batch_with_receipts(IoClass::Data, &borrowed)
     }
 
     /// Ensure one deterministic pre-publication data object has current
@@ -11690,6 +11753,15 @@ impl<'a> PoolStoreMut<'a> {
         payload: &[u8],
     ) -> Result<(StoredObject, PlacementReceipt)> {
         self.pool.put_with_receipt(IoClass::Data, key, payload)
+    }
+
+    /// Durably publish one batch of immutable prepublication data objects.
+    pub fn put_prepublication_data_batch(
+        &mut self,
+        entries: &[(ObjectKey, &[u8])],
+    ) -> Result<Vec<PlacementReceipt>> {
+        self.pool
+            .put_prepublication_batch_with_receipts(IoClass::Data, entries)
     }
 
     /// Delete an object.
@@ -23046,6 +23118,100 @@ mod tests {
                 .expect("strictly establish refused key absence"),
             None,
             "whole-batch preflight must leave earlier new keys absent"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prepublication_data_batch_returns_reuses_and_preflights_receipts() {
+        let root = temp_dir("prepublication-data-batch");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut pool = Pool::create(
+            single_device_config(&root),
+            PoolProperties::default(),
+            &test_options(),
+        )
+        .unwrap();
+        let first_key = ObjectKey::from_name(b"prepublication-data-first");
+        let second_key = ObjectKey::from_name(b"prepublication-data-second");
+        let batch = vec![
+            (first_key, b"first immutable content chunk".to_vec()),
+            (second_key, b"second immutable content chunk".to_vec()),
+        ];
+
+        let receipts = pool
+            .put_prepublication_data_batch(&batch)
+            .expect("publish data batch");
+        assert_eq!(receipts.len(), batch.len());
+        assert_eq!(receipts[0].object_key, first_key);
+        assert_eq!(receipts[1].object_key, second_key);
+        assert!(receipts[0].generation > 0);
+        assert!(receipts[1].generation > receipts[0].generation);
+        for ((key, payload), receipt) in batch.iter().zip(&receipts) {
+            assert_eq!(
+                pool.get_with_current_receipt(IoClass::Data, *key)
+                    .expect("strictly read batched data object"),
+                Some((payload.clone(), receipt.clone()))
+            );
+        }
+
+        let generation_before_retry = pool.next_placement_receipt_generation;
+        assert_eq!(
+            pool.put_prepublication_data_batch(&batch)
+                .expect("reuse exact data batch"),
+            receipts
+        );
+        assert_eq!(
+            pool.next_placement_receipt_generation, generation_before_retry,
+            "an exact batch retry must not allocate receipt generations"
+        );
+
+        let refused_new_key = ObjectKey::from_name(b"prepublication-data-refused-new");
+        let conflicting_batch = vec![
+            (refused_new_key, b"must remain absent".to_vec()),
+            (first_key, b"conflicting immutable content chunk".to_vec()),
+        ];
+        let generation_before_refusal = pool.next_placement_receipt_generation;
+        assert_invalid_options_reason_contains(
+            pool.put_prepublication_data_batch(&conflicting_batch),
+            "different current receipt-backed payload",
+        );
+        assert_eq!(
+            pool.next_placement_receipt_generation, generation_before_refusal,
+            "whole-batch preflight must refuse before allocating a generation"
+        );
+        assert_eq!(
+            pool.get_with_current_receipt(IoClass::Data, refused_new_key)
+                .expect("strictly establish refused key absence"),
+            None
+        );
+
+        let watermark_first = ObjectKey::from_name(b"prepublication-data-watermark-first");
+        let watermark_second = ObjectKey::from_name(b"prepublication-data-watermark-second");
+        let watermark_batch = vec![
+            (watermark_first, b"watermark payload one".to_vec()),
+            (watermark_second, b"watermark payload two".to_vec()),
+        ];
+        assert_eq!(watermark_batch[0].1.len(), watermark_batch[1].1.len());
+        let available_before = pool.pool_stats().available_bytes;
+        pool.properties.low_watermark_bytes =
+            available_before.saturating_sub(watermark_batch[0].1.len() as u64);
+        assert!(matches!(
+            pool.put_prepublication_data_batch(&watermark_batch),
+            Err(StoreError::NoSpace)
+        ));
+        assert!(
+            pool.get_with_current_receipt(IoClass::Data, watermark_first)
+                .expect("strictly read admitted batch prefix")
+                .is_some(),
+            "the first entry should consume the remaining admitted capacity"
+        );
+        assert_eq!(
+            pool.get_with_current_receipt(IoClass::Data, watermark_second)
+                .expect("strictly establish watermark-refused key absence"),
+            None,
+            "later batch entries must recheck the evolving low watermark"
         );
 
         let _ = std::fs::remove_dir_all(&root);
