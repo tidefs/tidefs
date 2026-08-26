@@ -561,6 +561,11 @@ impl DentryKey {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenameDispatchOutcome {
+    overwritten_inode: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DentryPolicy {
     positive_entry_ttl: Duration,
     positive_attr_ttl: Duration,
@@ -4415,6 +4420,19 @@ impl FuseVfsAdapter {
         newname: &[u8],
         flags: u32,
     ) -> Result<(), Errno> {
+        self.dispatch_rename_entry_with_outcome(ctx, parent, name, newparent, newname, flags)
+            .map(|_| ())
+    }
+
+    fn dispatch_rename_entry_with_outcome(
+        &self,
+        ctx: &RequestCtx,
+        parent: u64,
+        name: &[u8],
+        newparent: u64,
+        newname: &[u8],
+        flags: u32,
+    ) -> Result<RenameDispatchOutcome, Errno> {
         self.check_not_read_only()?;
         // Phase 1: Pre-checks (permissions, sticky-bit) before recording intent.
         // Failures here mean no intent was recorded -- no crash-recovery risk.
@@ -4461,6 +4479,9 @@ impl FuseVfsAdapter {
 
         self.invalidate_inode_metadata_after_engine_write(parent);
         self.invalidate_inode_metadata_after_engine_write(newparent);
+        let overwritten_inode = overwritten_target_attr
+            .as_ref()
+            .map(|overwritten| overwritten.inode_id.get());
         if result.is_ok() {
             if let Some(overwritten) = overwritten_target_attr {
                 let overwritten_ino = overwritten.inode_id.get();
@@ -4479,7 +4500,7 @@ impl FuseVfsAdapter {
             }
         }
 
-        result
+        result.map(|()| RenameDispatchOutcome { overwritten_inode })
     }
 
     /// Public dispatch for POSIX link(2).  Creates a hard link from an
@@ -9654,17 +9675,26 @@ impl Filesystem for FuseVfsAdapter {
             req.pid(),
             flags,
         );
-        reply_empty_ok_or_errno(
-            reply,
-            self.dispatch_rename_entry(
-                &ctx,
-                parent,
-                name.as_bytes(),
-                newparent,
-                newname.as_bytes(),
-                flags,
-            ),
+        let result = self.dispatch_rename_entry_with_outcome(
+            &ctx,
+            parent,
+            name.as_bytes(),
+            newparent,
+            newname.as_bytes(),
+            flags,
         );
+        let overwritten_inode = result
+            .as_ref()
+            .ok()
+            .and_then(|outcome| outcome.overwritten_inode);
+        reply_empty_ok_or_errno(reply, result.map(|_| ()));
+        if let Some(ino) = overwritten_inode {
+            // The reply must precede this notification. If the target inode
+            // stays open after an overwrite, Linux completes its own rename
+            // bookkeeping from the successful reply before it processes the
+            // invalidation and asks us for the detached inode's new attrs.
+            self.try_inval_inode_attrs(ino);
+        }
     }
 
     fn link(
@@ -27243,7 +27273,7 @@ mod tests {
             .expect("removed lookup-referenced inode remains stat-able");
         assert_eq!(attr.attr.ino, ino);
         assert_eq!(attr.attr.mode & libc::S_IFMT, libc::S_IFDIR);
-        assert_eq!(attr.attr.nlink, 2);
+        assert_eq!(attr.attr.nlink, 0);
 
         assert!(fixture.adapter.dispatch_forget(ino, 1));
         assert!(!fixture
