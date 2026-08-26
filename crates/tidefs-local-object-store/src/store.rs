@@ -701,6 +701,7 @@ pub struct LocalObjectStore {
     /// persisted bytes without issuing one read per header and payload.
     prepublication_readback_range: Option<(u64, usize)>,
     prepublication_readback_bytes: Vec<u8>,
+    prepublication_readback_records: BTreeMap<ObjectLocation, (usize, usize, u8)>,
     prepublication_tail_verification_deferred: bool,
     #[cfg(test)]
     block_device_tail_terminator_verifications: u64,
@@ -2351,6 +2352,7 @@ impl LocalObjectStore {
             prepublication_append_bytes: Vec::new(),
             prepublication_readback_range: None,
             prepublication_readback_bytes: Vec::new(),
+            prepublication_readback_records: BTreeMap::new(),
             prepublication_tail_verification_deferred: false,
             #[cfg(test)]
             block_device_tail_terminator_verifications: 0,
@@ -2701,6 +2703,7 @@ impl LocalObjectStore {
             prepublication_append_bytes: Vec::new(),
             prepublication_readback_range: None,
             prepublication_readback_bytes: Vec::new(),
+            prepublication_readback_records: BTreeMap::new(),
             prepublication_tail_verification_deferred: false,
             #[cfg(test)]
             block_device_tail_terminator_verifications: 0,
@@ -6014,6 +6017,7 @@ impl LocalObjectStore {
     pub(crate) fn begin_prepublication_append_batch(&mut self) {
         self.prepublication_readback_range = None;
         self.prepublication_readback_bytes.clear();
+        self.prepublication_readback_records.clear();
         // A failed final verification deliberately leaves the flag set so a
         // later write and finish can recover the same scan boundary.
         self.prepublication_tail_verification_deferred = true;
@@ -6086,6 +6090,7 @@ impl LocalObjectStore {
     /// configured read checksum from these persisted bytes.
     pub(crate) fn load_prepublication_batch_readback(&mut self) -> Result<()> {
         self.prepublication_readback_bytes.clear();
+        self.prepublication_readback_records.clear();
         let mut first_error = None;
         if let Some((start, len)) = self.prepublication_readback_range {
             let end = start
@@ -6115,6 +6120,14 @@ impl LocalObjectStore {
                         &self.root,
                         source,
                     ));
+                } else {
+                    match self.index_prepublication_batch_readback(start, len) {
+                        Ok(records) => self.prepublication_readback_records = records,
+                        Err(error) => {
+                            self.prepublication_readback_bytes.clear();
+                            first_error = Some(error);
+                        }
+                    }
                 }
             }
         }
@@ -6126,9 +6139,219 @@ impl LocalObjectStore {
         first_error.map_or(Ok(()), Err)
     }
 
+    fn index_prepublication_batch_readback(
+        &self,
+        start: u64,
+        len: usize,
+    ) -> Result<BTreeMap<ObjectLocation, (usize, usize, u8)>> {
+        let records_len = len
+            .checked_sub(RECORD_HEADER_LEN)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "prepublication readback omits its successor header",
+            })?;
+        let successor = self
+            .prepublication_readback_bytes
+            .get(records_len..len)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "prepublication readback successor header is truncated",
+            })?;
+        if successor != [0_u8; RECORD_HEADER_LEN] {
+            return Err(StoreError::CorruptHeader {
+                segment_id: self.current_segment_id,
+                offset: start.saturating_add(records_len as u64),
+                reason: "prepublication readback successor header is not zero",
+            });
+        }
+        let records_end = start
+            .checked_add(
+                u64::try_from(records_len).map_err(|_| StoreError::InvalidOptions {
+                    reason: "prepublication record range exceeds u64",
+                })?,
+            )
+            .ok_or(StoreError::InvalidOptions {
+                reason: "prepublication record range overflows u64",
+            })?;
+        let mut records = BTreeMap::new();
+        let mut relative = 0usize;
+        while relative < records_len {
+            let record_offset = start
+                .checked_add(
+                    u64::try_from(relative).map_err(|_| StoreError::InvalidOptions {
+                        reason: "prepublication record offset exceeds u64",
+                    })?,
+                )
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "prepublication record offset overflows u64",
+                })?;
+            let header_end =
+                relative
+                    .checked_add(RECORD_HEADER_LEN)
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "prepublication record header overflows usize",
+                    })?;
+            let header_slice = self
+                .prepublication_readback_bytes
+                .get(relative..header_end)
+                .ok_or(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication record header is truncated",
+                })?;
+            let mut header_bytes = [0_u8; RECORD_HEADER_LEN];
+            header_bytes.copy_from_slice(header_slice);
+            let header = decode_header(&header_bytes, self.current_segment_id, record_offset)?;
+            if header.kind != RecordKind::Put {
+                return Err(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication readback contains a non-put record",
+                });
+            }
+            let range = checked_record_range(header, self.current_segment_id, record_offset)?;
+            if range.end_offset > records_end {
+                return Err(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication record extends beyond its batch",
+                });
+            }
+            let relative_offset = |offset: u64| -> Result<usize> {
+                let relative = offset.checked_sub(start).ok_or(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication record moved before its batch",
+                })?;
+                usize::try_from(relative).map_err(|_| StoreError::InvalidOptions {
+                    reason: "prepublication record range exceeds platform usize",
+                })
+            };
+            let payload_start = relative_offset(range.payload_offset)?;
+            let payload_end = relative_offset(range.payload_end_offset)?;
+            let payload = self
+                .prepublication_readback_bytes
+                .get(payload_start..payload_end)
+                .ok_or(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication record payload is truncated",
+                })?;
+            let actual = checksum64(payload);
+            if actual != header.payload_checksum {
+                return Err(StoreError::ChecksumMismatch {
+                    segment_id: self.current_segment_id,
+                    offset: range.payload_offset,
+                    expected: header.payload_checksum,
+                    actual,
+                });
+            }
+
+            let footer = if record_has_footer(header.format_version) {
+                let footer_start = relative_offset(range.footer_offset)?;
+                let footer_end = footer_start.checked_add(RECORD_FOOTER_LEN).ok_or(
+                    StoreError::InvalidOptions {
+                        reason: "prepublication record footer overflows usize",
+                    },
+                )?;
+                let footer_slice = self
+                    .prepublication_readback_bytes
+                    .get(footer_start..footer_end)
+                    .ok_or(StoreError::CorruptHeader {
+                        segment_id: self.current_segment_id,
+                        offset: range.footer_offset,
+                        reason: "prepublication record footer is truncated",
+                    })?;
+                let mut footer = [0_u8; RECORD_FOOTER_LEN];
+                footer.copy_from_slice(footer_slice);
+                decode_footer(
+                    &footer,
+                    header,
+                    self.current_segment_id,
+                    range.footer_offset,
+                )?;
+                Some(footer)
+            } else {
+                None
+            };
+            if record_has_production_integrity_trailer(header.format_version) {
+                let trailer_offset =
+                    range
+                        .integrity_trailer_offset
+                        .ok_or(StoreError::CorruptHeader {
+                            segment_id: self.current_segment_id,
+                            offset: record_offset,
+                            reason: "prepublication integrity trailer offset is absent",
+                        })?;
+                let trailer_start = relative_offset(trailer_offset)?;
+                let trailer_end = trailer_start.checked_add(INTEGRITY_TRAILER_V2_LEN).ok_or(
+                    StoreError::InvalidOptions {
+                        reason: "prepublication integrity trailer overflows usize",
+                    },
+                )?;
+                let trailer_slice = self
+                    .prepublication_readback_bytes
+                    .get(trailer_start..trailer_end)
+                    .ok_or(StoreError::CorruptHeader {
+                        segment_id: self.current_segment_id,
+                        offset: trailer_offset,
+                        reason: "prepublication integrity trailer is truncated",
+                    })?;
+                let mut trailer = [0_u8; INTEGRITY_TRAILER_V2_LEN];
+                trailer.copy_from_slice(trailer_slice);
+                let decoded_trailer = decode_integrity_trailer_v2(&trailer)?;
+                let footer = footer.ok_or(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication integrity trailer requires a footer",
+                })?;
+                verify_integrity_trailer_v2(
+                    &decoded_trailer,
+                    header,
+                    &header_bytes,
+                    payload,
+                    &footer,
+                    self.current_segment_id,
+                    trailer_offset,
+                )?;
+            }
+
+            let location = ObjectLocation {
+                key: header.key,
+                segment_id: self.current_segment_id,
+                record_offset,
+                payload_offset: range.payload_offset,
+                payload_len: header.payload_len,
+                sequence: header.sequence,
+                payload_checksum: header.payload_checksum,
+            };
+            if records
+                .insert(
+                    location,
+                    (payload_start, payload_end, header.compression_algorithm),
+                )
+                .is_some()
+            {
+                return Err(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication readback repeats a physical record identity",
+                });
+            }
+            relative = relative_offset(range.end_offset)?;
+        }
+        if relative != records_len {
+            return Err(StoreError::CorruptHeader {
+                segment_id: self.current_segment_id,
+                offset: start.saturating_add(relative as u64),
+                reason: "prepublication readback does not end at its successor header",
+            });
+        }
+        Ok(records)
+    }
+
     pub(crate) fn clear_prepublication_batch_readback(&mut self) {
         self.prepublication_readback_range = None;
         self.prepublication_readback_bytes.clear();
+        self.prepublication_readback_records.clear();
         for replica in &mut self.replicas {
             replica.clear_prepublication_batch_readback();
         }
@@ -8643,47 +8866,19 @@ impl LocalObjectStore {
                 .block_device_capacity
                 .unwrap_or(0)
                 .saturating_sub(POOL_LABEL_SIZE as u64);
-            if let Some((start, len)) = self
-                .prepublication_readback_range
-                .filter(|(_, len)| self.prepublication_readback_bytes.len() == *len)
+            if let Some(&(payload_start, payload_end, compression_algorithm)) =
+                self.prepublication_readback_records.get(&location)
             {
-                if let Some(relative) = location.record_offset.checked_sub(start) {
-                    let range_len = u64::try_from(len).map_err(|_| StoreError::InvalidOptions {
-                        reason: "prepublication readback length exceeds u64",
-                    })?;
-                    if relative < range_len {
-                        let relative =
-                            usize::try_from(relative).map_err(|_| StoreError::InvalidOptions {
-                                reason: "prepublication readback offset exceeds platform usize",
-                            })?;
-                        let header_end = relative.checked_add(RECORD_HEADER_LEN).ok_or(
-                            StoreError::InvalidOptions {
-                                reason: "prepublication readback header range overflows usize",
-                            },
-                        )?;
-                        let header_slice = self
-                            .prepublication_readback_bytes
-                            .get(relative..header_end)
-                            .ok_or(StoreError::CorruptHeader {
-                                segment_id: location.segment_id,
-                                offset: location.record_offset,
-                                reason: "coalesced prepublication readback is truncated",
-                            })?;
-                        let mut header = [0_u8; RECORD_HEADER_LEN];
-                        header.copy_from_slice(header_slice);
-                        let mut tail =
-                            io::Cursor::new(&self.prepublication_readback_bytes[header_end..]);
-                        let decoded = decode_stored_record_after_header(
-                            &mut tail,
-                            path,
-                            location.segment_id,
-                            location.record_offset,
-                            data_end,
-                            header,
-                        )?;
-                        return validate_location_record(location, decoded);
-                    }
-                }
+                let payload = self
+                    .prepublication_readback_bytes
+                    .get(payload_start..payload_end)
+                    .ok_or(StoreError::CorruptHeader {
+                        segment_id: location.segment_id,
+                        offset: location.record_offset,
+                        reason: "indexed prepublication payload is outside its readback range",
+                    })?
+                    .to_vec();
+                return Ok((payload, compression_algorithm));
             }
             let mut header = [0_u8; RECORD_HEADER_LEN];
             self.current_file
@@ -11899,6 +12094,7 @@ mod block_device_open_tests {
             Some(batch_start)
         );
         assert!(!store.prepublication_readback_bytes.is_empty());
+        assert_eq!(store.prepublication_readback_records.len(), 2);
         assert_eq!(
             store.get(payload_key).expect("read cached payload record"),
             Some(b"immutable payload".to_vec())
@@ -11910,6 +12106,7 @@ mod block_device_open_tests {
         store.clear_prepublication_batch_readback();
         assert_eq!(store.prepublication_readback_range, None);
         assert!(store.prepublication_readback_bytes.is_empty());
+        assert!(store.prepublication_readback_records.is_empty());
         drop(store);
 
         let reopened = LocalObjectStore::open_block_device(&image, options)
