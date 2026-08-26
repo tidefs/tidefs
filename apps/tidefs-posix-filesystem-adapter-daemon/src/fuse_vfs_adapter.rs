@@ -1687,9 +1687,9 @@ fn fuse_access_requested_from_mask(mask: i32) -> Result<u8, Errno> {
 /// Map Linux open flags to FUSE open reply flags for cache coherence.
 ///
 /// - O_DIRECT -> FOPEN_DIRECT_IO: bypass kernel and adapter page cache.
-/// - O_APPEND under kernel writeback-cache -> FOPEN_DIRECT_IO: keep append
-///   offset authority in the daemon because the engine size is stale until
-///   the kernel writes dirty cached pages back.
+/// - O_APPEND under kernel writeback-cache stays cached: Linux serializes the
+///   append and sends the resulting absolute offsets back under
+///   `FUSE_WRITE_CACHE`.
 /// - Kernel writeback-cache ordinary opens may add FOPEN_KEEP_CACHE in the
 ///   adapter helper below when preserving cached pages is safe for the active
 ///   timestamp policy.
@@ -3810,9 +3810,6 @@ impl FuseVfsAdapter {
         if self.force_direct_io {
             reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
         }
-        if self.writeback_cache_enabled && (open_flags & libc::O_APPEND as u32) != 0 {
-            reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
-        }
         if self.writeback_cache_enabled
             && (reply_flags & fuser::consts::FOPEN_DIRECT_IO) == 0
             && self.writeback_open_should_keep_cache(
@@ -5916,10 +5913,10 @@ impl FuseVfsAdapter {
         // this inode. A synchronous write drops the gate only after its dirty
         // ownership is published, then enters the normal barrier path.
         let write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
-        // O_APPEND: atomically resolve current file size for append-only
-        // writes. POSIX requires all writes to an O_APPEND file descriptor
-        // to land at end-of-file regardless of any prior lseek or concurrent
-        // file-size changes from other file descriptors.
+        // O_APPEND: atomically resolve current file size for uncached append
+        // requests. With negotiated writeback-cache, Linux already serialized
+        // append placement while dirtying the page cache; FUSE_WRITE_CACHE
+        // therefore carries an absolute offset that must not be moved again.
         // ── Immutable / append-only inode flag enforcement ────────────
         // O_APPEND / writeback-cache reconciliation (A11/A16 append-edge
         // gap): when the file descriptor is opened with O_APPEND and
@@ -5928,12 +5925,13 @@ impl FuseVfsAdapter {
         // data hasn't been written through yet.  Reconcile by computing
         // the maximum end offset from the dirty-state ranges and using
         // the larger of the engine size and the dirty-tracked bound.
-        let append_open = (resolved_open_flags & libc::O_APPEND as u32) != 0
+        let append_requested = (resolved_open_flags & libc::O_APPEND as u32) != 0
             || (request_open_flags & libc::O_APPEND as u32) != 0
             || (!handle_allows_write
                 && !request_open_flags_present
                 && inode_open_state.has_writable_append);
-        let max_dirty_end: u64 = if append_open && self.writeback_cache_enabled {
+        let daemon_append = append_requested && !is_writeback_cached;
+        let max_dirty_end: u64 = if daemon_append && self.writeback_cache_enabled {
             self.dirty_state
                 .lock()
                 .unwrap()
@@ -5960,17 +5958,16 @@ impl FuseVfsAdapter {
             enforce_immutable_guard(raw_flags)?;
             let size = attr.posix.size;
             let reconciled_size = size.max(max_dirty_end);
-            let eof_offset = if append_open {
+            let eof_offset = if daemon_append {
                 reconciled_size as i64
             } else {
                 offset
             };
-            // Append-only check: non-EOF writes are rejected
-            if eof_offset != size as i64 {
-                enforce_append_only_write_guard(raw_flags, false)?;
-            } else {
-                enforce_append_only_write_guard(raw_flags, true)?;
-            }
+            // A delayed cached append may legitimately write an earlier page
+            // after the kernel has already extended its authoritative size.
+            let append_position_admitted =
+                (is_writeback_cached && append_requested) || eof_offset == size as i64;
+            enforce_append_only_write_guard(raw_flags, append_position_admitted)?;
             (eof_offset, size)
         };
         let _requested_size = Self::checked_write_end(effective_offset, data.len())?;
@@ -6024,7 +6021,7 @@ impl FuseVfsAdapter {
                 let e = self.engine.lock().unwrap();
                 let fallback_open_flags = {
                     let mut flags = libc::O_RDWR as u32;
-                    if append_open {
+                    if daemon_append {
                         flags |= libc::O_APPEND as u32;
                     }
                     if let Some(datasync) = sync_datasync {
@@ -6036,7 +6033,15 @@ impl FuseVfsAdapter {
                     }
                     flags
                 };
-                let fallback_efh = if handle_allows_write && resolved_efh.is_some() {
+                // The engine still implements ordinary O_APPEND by resolving
+                // EOF itself. Cached writeback must use a temporary non-append
+                // handle so the kernel-provided absolute offset survives that
+                // lower boundary unchanged.
+                let needs_absolute_writeback_handle = is_writeback_cached && append_requested;
+                let fallback_efh = if handle_allows_write
+                    && resolved_efh.is_some()
+                    && !needs_absolute_writeback_handle
+                {
                     None
                 } else {
                     Some(e.open(InodeId::new(ino), fallback_open_flags, ctx)?)
@@ -6047,7 +6052,7 @@ impl FuseVfsAdapter {
                 };
                 let sync_efh = *write_efh;
                 let sparse_zero_noop = is_writeback_cached
-                    && !append_open
+                    && !daemon_append
                     && !posix_direct_io
                     && data.iter().all(|byte| *byte == 0)
                     && Self::writeback_sparse_zero_write_is_noop(
@@ -41502,7 +41507,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_append_open_uses_fuse_direct_io_for_append_authority() {
+    fn writeback_append_open_keeps_kernel_cache_for_append_authority() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let root = {
@@ -41515,15 +41520,20 @@ mod tests {
             .dispatch_create_entry(
                 &ctx,
                 root.get(),
-                b"wb-append-direct-io.txt",
+                b"wb-append-kernel-cache.txt",
                 0o644,
                 libc::O_WRONLY as u32 | libc::O_APPEND as u32,
             )
             .expect("create append writeback-cache handle");
-        assert_ne!(
+        assert_eq!(
             dispatch.fuse_open_flags & fuser::consts::FOPEN_DIRECT_IO,
             0,
-            "O_APPEND writeback-cache opens must keep append offset authority in the daemon"
+            "writeback-cache O_APPEND must not become synchronous direct I/O"
+        );
+        assert_ne!(
+            dispatch.fuse_open_flags & fuser::consts::FOPEN_KEEP_CACHE,
+            0,
+            "writeback-cache O_APPEND must retain Linux page-cache placement"
         );
     }
 
@@ -41761,13 +41771,13 @@ mod tests {
     }
 
     #[test]
-    fn writeback_cached_append_uses_request_open_flags_for_guessed_handle() {
+    fn writeback_append_cached_write_honors_kernel_absolute_offset() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let (inode, adapter_fh) = create_file_with_data_and_open(
             &fixture,
             b"wb-guessed-append.txt",
-            b"prefix",
+            b"prefix-older",
             libc::O_RDONLY as u32,
         );
 
@@ -41777,7 +41787,7 @@ mod tests {
                 &ctx,
                 inode.get(),
                 adapter_fh,
-                0,
+                6,
                 b"-suffix",
                 WriteDispatchFlags {
                     write: FUSE_WRITE_CACHE,
@@ -41790,7 +41800,7 @@ mod tests {
         let read_back = fixture
             .adapter
             .dispatch_read(&ctx, inode.get(), adapter_fh, 0, 13, None)
-            .expect("read appended data");
+            .expect("read cached append placement");
         assert_eq!(read_back, b"prefix-suffix");
     }
 
@@ -43584,13 +43594,13 @@ mod tests {
     }
 
     #[test]
-    fn writeback_mount_infers_active_append_writer_for_guessed_handle() {
+    fn writeback_mount_honors_kernel_offsets_for_guessed_append_handle() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let (inode, guessed_fh) = create_file_with_data_and_open(
             &fixture,
             b"wb-active-append.txt",
-            b"line0\n",
+            b"line0\nstale1stale2",
             libc::O_RDONLY as u32,
         );
         let (_append_fh, _append_engine_fh) = open_adapter_file_handle(
@@ -43606,7 +43616,7 @@ mod tests {
                 &ctx,
                 inode.get(),
                 guessed_fh,
-                0,
+                6,
                 b"line1\n",
                 WriteDispatchFlags {
                     write: FUSE_WRITE_CACHE,
@@ -43620,7 +43630,7 @@ mod tests {
                 &ctx,
                 inode.get(),
                 guessed_fh,
-                0,
+                12,
                 b"line2\n",
                 WriteDispatchFlags {
                     write: FUSE_WRITE_CACHE,
