@@ -924,8 +924,30 @@ pub(crate) fn transaction_manifest_entries_for_pool_content_in_keyspace(
     inode: &InodeRecord,
     keyspace: FilesystemObjectKeyspace,
 ) -> Result<Vec<TransactionManifestEntry>> {
+    transaction_manifest_entries_for_pool_content_in_keyspace_until(
+        pool,
+        inode,
+        keyspace,
+        &mut || false,
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "non-preemptible Pool content validation was preempted",
+    })
+}
+
+/// Build mounted committed-root entries while allowing read-only validation
+/// to yield between exact receipt-authenticated content reads.
+pub(crate) fn transaction_manifest_entries_for_pool_content_in_keyspace_until(
+    pool: &Pool,
+    inode: &InodeRecord,
+    keyspace: FilesystemObjectKeyspace,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<Vec<TransactionManifestEntry>>> {
+    if should_preempt() {
+        return Ok(None);
+    }
     if inode.size == 0 {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
 
     let authority = MountedContentReadAuthority::for_dataset(pool, keyspace.dataset_id());
@@ -937,6 +959,9 @@ pub(crate) fn transaction_manifest_entries_for_pool_content_in_keyspace(
             expected_generation: 0,
         },
     )?;
+    if should_preempt() {
+        return Ok(None);
+    }
     let layout = decode_content_layout(&content_bytes)?;
     validate_content_layout(inode.inode_id, inode, &layout)?;
 
@@ -947,10 +972,16 @@ pub(crate) fn transaction_manifest_entries_for_pool_content_in_keyspace(
     }];
     if let ContentLayout::Chunked(manifest) = layout {
         for chunk_ref in &manifest.chunks {
+            if should_preempt() {
+                return Ok(None);
+            }
             if chunk_ref.is_hole() {
                 continue;
             }
             let _ = authority.read_chunk(manifest.inode_id, chunk_ref)?;
+            if should_preempt() {
+                return Ok(None);
+            }
             entries.push(TransactionManifestEntry {
                 role: TransactionManifestObjectRole::VersionedContentChunk,
                 object_key: keyspace.content_chunk(
@@ -962,7 +993,7 @@ pub(crate) fn transaction_manifest_entries_for_pool_content_in_keyspace(
             });
         }
     }
-    Ok(entries)
+    Ok(Some(entries))
 }
 
 fn pool_content_manifest_entries_for_state(

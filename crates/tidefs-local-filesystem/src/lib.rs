@@ -6418,10 +6418,15 @@ impl PoolDatasetOwner {
     /// reclaim leaves the exact local queue entries pending.
     #[cfg(test)]
     fn collect_reclaim_protected_content_keys(&mut self) -> Result<HashSet<ObjectKey>> {
-        self.collect_reclaim_protected_content_keys_until(&mut || false)?
-            .ok_or(FileSystemError::CorruptState {
-                reason: "non-preemptible reclaim protection scan was preempted",
-            })
+        self.ensure_snapshot_authority_consistent()?;
+        let current_root = self.selected_committed_root_summary()?;
+        reclaim_protected_content_keys_pool(
+            self.store.pool_mut(),
+            self.filesystem.root_authentication_key,
+            &current_root,
+            &self.filesystem.state,
+        )
+        .map(|keys| keys.into_iter().collect())
     }
 
     fn collect_reclaim_protected_content_keys_until(
@@ -6439,12 +6444,16 @@ impl PoolDatasetOwner {
         if should_preempt() {
             return Ok(None);
         }
-        let protected = reclaim_protected_content_keys_pool(
+        let Some(protected) = reclaim_protected_content_keys_pool_until(
             self.store.pool_mut(),
             self.filesystem.root_authentication_key,
             &current_root,
             &self.filesystem.state,
-        )?;
+            should_preempt,
+        )?
+        else {
+            return Ok(None);
+        };
         if should_preempt() {
             return Ok(None);
         }
@@ -18572,6 +18581,86 @@ mod orphan_index_integration_tests {
         assert_eq!(reopened.reclaim_queue_depth(), 0);
 
         drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mounted_reclaim_protection_yields_inside_committed_root_scan() {
+        let (root, mut fs) =
+            make_test_fs("mounted_reclaim_preempt_root_scan").expect("open filesystem");
+        fs.stop_background_scheduler();
+
+        let queued = enqueue_exact_reclaim_entry(
+            &fs,
+            ObjectKey::from_name(b"mounted-reclaim-preempt-root-scan"),
+        );
+        let current_root = fs
+            .selected_committed_root_summary()
+            .expect("select current root");
+        let state = fs.filesystem.state.clone();
+        let root_authentication_key = fs.filesystem.root_authentication_key;
+        let mut preemption_checks = 0;
+        let outcome = reclaim_protected_content_keys_pool_until(
+            fs.store.pool_mut(),
+            root_authentication_key,
+            &current_root,
+            &state,
+            &mut || {
+                preemption_checks += 1;
+                preemption_checks >= 4
+            },
+        )
+        .expect("yield root protection scan");
+
+        assert!(
+            outcome.is_none(),
+            "foreground demand must interrupt committed-root scanning"
+        );
+        assert_eq!(preemption_checks, 4);
+        assert_exact_reclaim_entry_pending(&fs, queued);
+
+        drop(fs);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mounted_reclaim_content_validation_yields_between_strict_chunk_reads() {
+        let (root, mut fs) =
+            make_test_fs("mounted_reclaim_preempt_chunk_scan").expect("open filesystem");
+        fs.stop_background_scheduler();
+        fs.set_auto_commit(false)
+            .expect("disable automatic fixture commits");
+        fs.create_file("/live.bin", DEFAULT_FILE_PERMISSIONS)
+            .expect("create live chunked file");
+        let payload = vec![0x5a; FILESYSTEM_CONTENT_CHUNK_SIZE * 2 + 1];
+        fs.replace_file("/live.bin", &payload)
+            .expect("write live chunked file");
+        fs.sync_all().expect("commit live chunked file");
+
+        let inode = fs.stat("/live.bin").expect("stat live chunked file");
+        let mut preemption_checks = 0;
+        let outcome = transaction_manifest_entries_for_pool_content_in_keyspace_until(
+            fs.store.pool(),
+            &inode,
+            fs.object_keyspace(),
+            &mut || {
+                preemption_checks += 1;
+                preemption_checks >= 4
+            },
+        )
+        .expect("yield receipt-authenticated chunk validation");
+
+        assert!(
+            outcome.is_none(),
+            "foreground demand must interrupt validation after a strict chunk read"
+        );
+        assert_eq!(preemption_checks, 4);
+        assert_eq!(
+            fs.read_file("/live.bin").expect("read retained live file"),
+            payload
+        );
+
+        drop(fs);
         let _ = std::fs::remove_dir_all(root);
     }
 
