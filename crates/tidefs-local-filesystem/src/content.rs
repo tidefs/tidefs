@@ -85,11 +85,16 @@ pub(crate) trait ContentWriteStore {
 /// zero-generation behavior and therefore do not produce that authority.
 pub(crate) struct ContentWriteOutcome {
     layout: ContentLayout,
+    manifest_checksum: IntegrityDigest64,
     has_persisted_receipt_authority: bool,
 }
 
 impl ContentWriteOutcome {
-    fn chunked(manifest: ContentManifestObject, manifest_receipt: PlacementReceipt) -> Self {
+    fn chunked(
+        manifest: ContentManifestObject,
+        manifest_bytes: &[u8],
+        manifest_receipt: PlacementReceipt,
+    ) -> Self {
         let has_persisted_receipt_authority = manifest_receipt.generation > 0
             && manifest
                 .chunks
@@ -97,12 +102,14 @@ impl ContentWriteOutcome {
                 .all(|chunk| chunk.is_hole() || chunk.placement_receipt_generation > 0);
         Self {
             layout: ContentLayout::Chunked(manifest),
+            manifest_checksum: checksum64(manifest_bytes),
             has_persisted_receipt_authority,
         }
     }
 
-    pub(crate) fn receipted_layout(&self) -> Option<&ContentLayout> {
-        self.has_persisted_receipt_authority.then_some(&self.layout)
+    pub(crate) fn receipted_manifest(&self) -> Option<(&ContentLayout, IntegrityDigest64)> {
+        self.has_persisted_receipt_authority
+            .then_some((&self.layout, self.manifest_checksum))
     }
 }
 
@@ -127,6 +134,9 @@ impl From<&InodeRecord> for AuthenticatedContentLayoutIdentity {
 struct AuthenticatedContentLayout {
     identity: AuthenticatedContentLayoutIdentity,
     layout: ContentLayout,
+    /// Checksum of the exact manifest bytes whose write returned current
+    /// nonzero Pool receipt authority for the manifest and every chunk.
+    receipted_manifest_checksum: Option<IntegrityDigest64>,
 }
 
 /// Mount-local immutable layouts already authenticated through current Pool
@@ -154,8 +164,38 @@ impl AuthenticatedContentLayoutCache {
             AuthenticatedContentLayout {
                 identity: AuthenticatedContentLayoutIdentity::from(record),
                 layout,
+                receipted_manifest_checksum: None,
             },
         );
+    }
+
+    pub(crate) fn record_receipted_manifest(
+        &mut self,
+        record: &InodeRecord,
+        layout: ContentLayout,
+        manifest_checksum: IntegrityDigest64,
+    ) {
+        self.inodes.insert(
+            record.inode_id,
+            AuthenticatedContentLayout {
+                identity: AuthenticatedContentLayoutIdentity::from(record),
+                layout,
+                receipted_manifest_checksum: Some(manifest_checksum),
+            },
+        );
+    }
+
+    pub(crate) fn receipted_manifest(
+        &self,
+        record: &InodeRecord,
+    ) -> Option<(&ContentLayout, IntegrityDigest64)> {
+        let cached = self.inodes.get(&record.inode_id)?;
+        if cached.identity != AuthenticatedContentLayoutIdentity::from(record) {
+            return None;
+        }
+        cached
+            .receipted_manifest_checksum
+            .map(|checksum| (&cached.layout, checksum))
     }
 
     pub(crate) fn remove(&mut self, inode_id: InodeId) {
@@ -1617,11 +1657,16 @@ pub(crate) fn write_chunked_content_with_outcome<S: ContentWriteStore>(
         chunk_size: content_chunk_size(),
         chunks,
     };
+    let manifest_encoded = encode_content_manifest(&manifest);
     let manifest_receipt = store.put_with_receipt(
         content_object_key_for_version(record.inode_id, record.data_version),
-        &encode_content_manifest(&manifest),
+        &manifest_encoded,
     )?;
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 fn write_same_size_sparse_overlay<S: ContentWriteStore>(
@@ -1746,7 +1791,11 @@ fn write_same_size_sparse_overlay<S: ContentWriteStore>(
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 fn write_sparse_patch_batch<S: ContentWriteStore>(
@@ -1942,7 +1991,11 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
@@ -2085,7 +2138,11 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 fn write_sparse_size_change<S: ContentWriteStore>(
@@ -2167,7 +2224,11 @@ fn write_sparse_size_change<S: ContentWriteStore>(
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2340,7 +2401,11 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
@@ -2525,7 +2590,11 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 pub(crate) fn write_chunked_content_with_patch_batch<S: ContentWriteStore>(
@@ -3325,6 +3394,14 @@ mod tests {
         assert!(cache.layout(record.inode_id, &record).is_none());
         cache.record(&record, layout.clone());
         assert_eq!(cache.layout(record.inode_id, &record), Some(&layout));
+        assert!(cache.receipted_manifest(&record).is_none());
+
+        let manifest_checksum = checksum64(b"exact emitted manifest");
+        cache.record_receipted_manifest(&record, layout.clone(), manifest_checksum);
+        assert_eq!(
+            cache.receipted_manifest(&record),
+            Some((&layout, manifest_checksum))
+        );
 
         let mut metadata_only_change = record.clone();
         metadata_only_change.metadata_version += 1;
@@ -3333,12 +3410,17 @@ mod tests {
             cache.layout(record.inode_id, &metadata_only_change),
             Some(&layout)
         );
+        assert_eq!(
+            cache.receipted_manifest(&metadata_only_change),
+            Some((&layout, manifest_checksum))
+        );
 
         let mut changed_content = record.clone();
         changed_content.data_version += 1;
         assert!(cache
             .layout(changed_content.inode_id, &changed_content)
             .is_none());
+        assert!(cache.receipted_manifest(&changed_content).is_none());
         changed_content = record.clone();
         changed_content.size += 1;
         assert!(cache

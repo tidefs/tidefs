@@ -5206,6 +5206,7 @@ impl PoolDatasetOwner {
                         transaction_id,
                         self.filesystem.root_authentication_key,
                         &snapshot_rewrites,
+                        None,
                     )?
                     .root;
                 self.store.pool_mut().sync_all()?;

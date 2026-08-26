@@ -6779,7 +6779,7 @@ impl PoolDatasetOwner {
         new_record: &InodeRecord,
         content_write: &ContentWriteOutcome,
     ) -> Result<(RewriteTrimPlan, Option<BTreeMap<ObjectKey, u64>>)> {
-        let Some(new_layout) = content_write.receipted_layout() else {
+        let Some((new_layout, _manifest_checksum)) = content_write.receipted_manifest() else {
             return Ok((
                 self.rewrite_trim_plan_for_layout(inode_id, old_layout, new_record)?,
                 None,
@@ -6808,11 +6808,11 @@ impl PoolDatasetOwner {
         record: &InodeRecord,
         content_write: &ContentWriteOutcome,
     ) {
-        if let Some(layout) = content_write.receipted_layout() {
+        if let Some((layout, manifest_checksum)) = content_write.receipted_manifest() {
             self.filesystem
                 .authenticated_content_layout_cache
                 .borrow_mut()
-                .record(record, layout.clone());
+                .record_receipted_manifest(record, layout.clone(), manifest_checksum);
         }
     }
 
@@ -15848,13 +15848,19 @@ impl PoolDatasetOwner {
             let transaction_id = transaction_id.ok_or(FileSystemError::CorruptState {
                 reason: "mounted commit lost its selected transaction identity",
             })?;
-            let publication = match persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
-                &mut self.store,
-                &self.filesystem.state,
-                transaction_id,
-                self.filesystem.root_authentication_key,
-                &self.filesystem.pending_snapshot_root_rewrites,
-            ) {
+            let publication_result = {
+                let authenticated_content_manifests =
+                    self.filesystem.authenticated_content_layout_cache.borrow();
+                persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
+                    &mut self.store,
+                    &self.filesystem.state,
+                    transaction_id,
+                    self.filesystem.root_authentication_key,
+                    &self.filesystem.pending_snapshot_root_rewrites,
+                    Some(&authenticated_content_manifests),
+                )
+            };
+            let publication = match publication_result {
                 Ok(publication) => publication,
                 Err(error) => {
                     if matches!(&error, FileSystemError::PublishOutcomeUncertain { .. }) {
@@ -15866,11 +15872,11 @@ impl PoolDatasetOwner {
             check_crash_hook(CrashInjectionPoint::CommitGroupAfterAppendData);
             // Re-verify the stored root commit (#870).
             check_crash_hook(CrashInjectionPoint::CommitGroupBeforeCommit);
-            // Persistence already re-read and authenticated the prepared
-            // superblock, manifest, and every changed metadata entry before
-            // publication. Re-read the canonical typed root after publication
-            // without turning each commit into a scrub of every unchanged
-            // content object.
+            // Persistence already authenticated the prepared superblock,
+            // manifest, and every changed metadata entry before publication.
+            // Changed content is covered either by its exact write receipts or
+            // by strict Pool reads. Re-read the canonical typed root after
+            // publication without turning each commit into a content scrub.
             let stored_bytes = self.store.load_dataset_root(
                 DatasetId::from_bytes(self.filesystem.mounted_dataset_id),
                 DatasetRootKind::Filesystem,
