@@ -689,10 +689,12 @@ pub struct LocalObjectStore {
     /// Prepublication writes deliberately do not enter the ordinary transaction
     /// group, so their checksum-index update must join the next explicit sync.
     prepublication_checksums_dirty: bool,
-    /// Block-device prepublication batches keep writing a zero successor
-    /// header after every record, but only the last one survives the next
-    /// append. Defer those intermediate readbacks until the Pool finishes the
-    /// batch, then rewrite and verify the one final durable terminator.
+    /// Block-device prepublication batches retain their contiguous encoded
+    /// records until the Pool closes the append boundary. The buffer always
+    /// ends in a zero successor header, so one positioned write installs a
+    /// scan-bounded batch before the final tail rewrite and readback.
+    prepublication_append_start: Option<u64>,
+    prepublication_append_bytes: Vec<u8>,
     prepublication_tail_verification_deferred: bool,
     #[cfg(test)]
     block_device_tail_terminator_verifications: u64,
@@ -2339,6 +2341,8 @@ impl LocalObjectStore {
             current_dataset_id: None,
             checksums: BTreeMap::new(),
             prepublication_checksums_dirty: false,
+            prepublication_append_start: None,
+            prepublication_append_bytes: Vec::new(),
             prepublication_tail_verification_deferred: false,
             #[cfg(test)]
             block_device_tail_terminator_verifications: 0,
@@ -2685,6 +2689,8 @@ impl LocalObjectStore {
             current_dataset_id: None,
             checksums: BTreeMap::new(),
             prepublication_checksums_dirty: false,
+            prepublication_append_start: None,
+            prepublication_append_bytes: Vec::new(),
             prepublication_tail_verification_deferred: false,
             #[cfg(test)]
             block_device_tail_terminator_verifications: 0,
@@ -5992,10 +5998,9 @@ impl LocalObjectStore {
 
     /// Start one Pool-owned prepublication append batch.
     ///
-    /// Block stores still write a zero successor header after every record so
-    /// a stopped prefix remains scan-bounded. The readback of each transient
-    /// header is deferred because the next append immediately overwrites it.
-    /// Store replicas join the same batch boundary.
+    /// Block stores stage the contiguous encoded records plus one zero
+    /// successor header in memory, then install and strictly close that prefix
+    /// when the Pool finishes the batch. Store replicas join the same boundary.
     pub(crate) fn begin_prepublication_append_batch(&mut self) {
         // A failed final verification deliberately leaves the flag set so a
         // later write and finish can recover the same scan boundary.
@@ -6005,16 +6010,44 @@ impl LocalObjectStore {
         }
     }
 
-    /// End a Pool-owned prepublication append batch by rewriting and reading
-    /// back the one tail terminator that survives the complete append set.
+    fn flush_prepublication_append_bytes(&mut self) -> Result<()> {
+        if self.prepublication_append_bytes.is_empty() {
+            self.prepublication_append_start = None;
+            return Ok(());
+        }
+        let start = self
+            .prepublication_append_start
+            .ok_or(StoreError::InvalidOptions {
+                reason: "prepublication append bytes are missing their block offset",
+            })?;
+        self.current_file
+            .write_all_at(&self.prepublication_append_bytes, start)
+            .map_err(|source| {
+                io_error(
+                    "write coalesced prepublication records and tail",
+                    &self.root,
+                    source,
+                )
+            })?;
+        self.prepublication_append_bytes.clear();
+        self.prepublication_append_start = None;
+        Ok(())
+    }
+
+    fn flush_and_verify_prepublication_tail(&mut self) -> Result<()> {
+        if self.block_device_mode {
+            self.flush_prepublication_append_bytes()?;
+            self.write_and_verify_block_device_tail_terminator(self.current_offset)?;
+        }
+        Ok(())
+    }
+
+    /// End a Pool-owned prepublication append batch by installing all staged
+    /// records, then rewriting and reading back their one surviving tail.
     pub(crate) fn finish_prepublication_append_batch(&mut self) -> Result<()> {
         let mut first_error = None;
         if self.prepublication_tail_verification_deferred {
-            let result = if self.block_device_mode {
-                self.write_and_verify_block_device_tail_terminator(self.current_offset)
-            } else {
-                Ok(())
-            };
+            let result = self.flush_and_verify_prepublication_tail();
             match result {
                 Ok(()) => self.prepublication_tail_verification_deferred = false,
                 Err(error) => {
@@ -6032,9 +6065,7 @@ impl LocalObjectStore {
 
     fn verify_deferred_prepublication_tail_before_barrier(&mut self) -> Result<()> {
         if self.prepublication_tail_verification_deferred {
-            if self.block_device_mode {
-                self.write_and_verify_block_device_tail_terminator(self.current_offset)?;
-            }
+            self.flush_and_verify_prepublication_tail()?;
             // A barrier closes the append batch. Any later write verifies its
             // own tail, so metadata appended by the barrier cannot inherit the
             // earlier payload batch's deferred state.
@@ -7563,7 +7594,19 @@ impl LocalObjectStore {
                     && !self.reclaim_receipts_dirty
                     && !self.snapshot_extent_pin_set_dirty =>
             {
-                self.compact_block_device_live_records()?;
+                // Compaction must read every current live location. Install
+                // and close any successful prepublication prefix before it
+                // inspects the index, then resume batching the retried record.
+                let resume_prepublication_batch = self.prepublication_tail_verification_deferred;
+                if resume_prepublication_batch {
+                    self.flush_and_verify_prepublication_tail()?;
+                    self.prepublication_tail_verification_deferred = false;
+                }
+                let compact_result = self.compact_block_device_live_records();
+                if resume_prepublication_batch {
+                    self.prepublication_tail_verification_deferred = true;
+                }
+                compact_result?;
                 self.append_record_once(
                     kind,
                     key,
@@ -7612,14 +7655,72 @@ impl LocalObjectStore {
         let path = segment_path(&self.segments_dir, self.current_segment_id);
         let prepublication_record_includes_tail =
             self.block_device_mode && self.prepublication_tail_verification_deferred;
-        if prepublication_record_includes_tail {
+        let coalesce_prepublication_record =
+            prepublication_record_includes_tail && !self.options.sync_on_write;
+        if coalesce_prepublication_record {
             // A Pool prepublication batch already owns the complete immutable
-            // record in memory. Write its unchanged on-disk representation and
-            // zero successor header in one positioned operation. This retains
-            // a scan-bounded prefix after every completed append without a
-            // second write per payload and receipt. Successive records
-            // overwrite their predecessor's zero tail header, and finish()
-            // still rewrites and reads back the one surviving batch tail.
+            // records in memory. Coalesce their unchanged representations and
+            // one zero successor header so finish() can install the complete
+            // scan-bounded prefix with one positioned write.
+            let record_len =
+                usize::try_from(record_len).map_err(|_| StoreError::InvalidOptions {
+                    reason: "object-store record length exceeds platform usize",
+                })?;
+            let encoded_len =
+                record_len
+                    .checked_add(RECORD_HEADER_LEN)
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "object-store record and tail length exceeds platform usize",
+                    })?;
+            match self.prepublication_append_start {
+                Some(start) => {
+                    let relative =
+                        record_offset
+                            .checked_sub(start)
+                            .ok_or(StoreError::InvalidOptions {
+                                reason: "prepublication append offset moved before its batch start",
+                            })?;
+                    let relative =
+                        usize::try_from(relative).map_err(|_| StoreError::InvalidOptions {
+                            reason: "prepublication append offset exceeds platform usize",
+                        })?;
+                    let expected_len = relative.checked_add(RECORD_HEADER_LEN).ok_or(
+                        StoreError::InvalidOptions {
+                            reason: "prepublication append length exceeds platform usize",
+                        },
+                    )?;
+                    if self.prepublication_append_bytes.len() != expected_len {
+                        return Err(StoreError::InvalidOptions {
+                            reason: "prepublication append records are not contiguous",
+                        });
+                    }
+                    self.prepublication_append_bytes.truncate(relative);
+                }
+                None => {
+                    if !self.prepublication_append_bytes.is_empty() {
+                        return Err(StoreError::InvalidOptions {
+                            reason: "prepublication append bytes are missing their batch start",
+                        });
+                    }
+                    self.prepublication_append_start = Some(record_offset);
+                }
+            }
+            self.prepublication_append_bytes.reserve(encoded_len);
+            self.prepublication_append_bytes.extend_from_slice(&header);
+            self.prepublication_append_bytes.extend_from_slice(payload);
+            self.prepublication_append_bytes.extend_from_slice(&footer);
+            self.prepublication_append_bytes.extend_from_slice(&trailer);
+            let tail_end = self
+                .prepublication_append_bytes
+                .len()
+                .checked_add(RECORD_HEADER_LEN)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "prepublication append tail exceeds platform usize",
+                })?;
+            self.prepublication_append_bytes.resize(tail_end, 0);
+        } else if prepublication_record_includes_tail {
+            // sync_on_write makes this record its own batch boundary. Retain
+            // the single-call representation without deferring its I/O.
             let record_len =
                 usize::try_from(record_len).map_err(|_| StoreError::InvalidOptions {
                     reason: "object-store record length exceeds platform usize",
@@ -7636,7 +7737,6 @@ impl LocalObjectStore {
             encoded.extend_from_slice(&footer);
             encoded.extend_from_slice(&trailer);
             encoded.resize(encoded_len, 0);
-            debug_assert_eq!(encoded.len(), record_len + RECORD_HEADER_LEN);
             self.current_file
                 .write_all_at(&encoded, record_offset)
                 .map_err(|source| {
@@ -11669,6 +11769,7 @@ mod block_device_open_tests {
         let receipt_key = ObjectKey(receipt_key_bytes);
 
         let verifications_before = store.block_device_tail_terminator_verifications;
+        let batch_start = store.current_offset;
         store.begin_prepublication_append_batch();
         store
             .put_prepublication_pool_internal(payload_key, b"immutable payload")
@@ -11676,6 +11777,17 @@ mod block_device_open_tests {
         store
             .put_pool_internal(receipt_key, b"placement receipt")
             .expect("stage placement receipt");
+        assert_eq!(store.prepublication_append_start, Some(batch_start));
+        assert!(!store.prepublication_append_bytes.is_empty());
+        let mut unpublished_header = [0xff_u8; RECORD_HEADER_LEN];
+        store
+            .current_file
+            .read_exact_at(&mut unpublished_header, batch_start)
+            .expect("read unchanged on-disk batch start");
+        assert_eq!(
+            unpublished_header, [0_u8; RECORD_HEADER_LEN],
+            "the records remain coalesced until the Pool closes the batch"
+        );
         assert_eq!(
             store.block_device_tail_terminator_verifications, verifications_before,
             "intermediate tails are overwritten inside the append batch"
@@ -11683,6 +11795,8 @@ mod block_device_open_tests {
         store
             .finish_prepublication_append_batch()
             .expect("verify final batch tail");
+        assert!(store.prepublication_append_bytes.is_empty());
+        assert_eq!(store.prepublication_append_start, None);
         assert_eq!(
             store.block_device_tail_terminator_verifications,
             verifications_before + 1,
