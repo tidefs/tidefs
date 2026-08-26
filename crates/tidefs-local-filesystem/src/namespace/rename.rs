@@ -8,7 +8,8 @@
 //!
 //! 1. **Pre-check**: Resolve source and destination parent directories;
 //!    validate constraints (source must exist, NOREPLACE/EXCHANGE rules);
-//!    reject file↔directory substitutions; detect rename-to-self no-op.
+//!    reject file↔directory substitutions for ordinary replacement;
+//!    detect rename-to-self no-op.
 //!
 //! 2. **Lock acquisition**: Acquire directory locks on source and
 //!    destination parents in stable inode-number order (deadlock
@@ -188,7 +189,8 @@ pub fn renameat2(
 /// - Source path must exist in the namespace.
 /// - With `RENAME_NOREPLACE`, destination must NOT exist (`EEXIST`).
 /// - With `RENAME_EXCHANGE`, both source AND destination must exist (`ENOENT`).
-/// - A directory cannot be renamed over a non-directory, and vice versa.
+/// - An ordinary rename cannot replace a directory with a non-directory, or
+///   vice versa. `RENAME_EXCHANGE` may swap different entry types.
 /// - A non-empty directory cannot be overwritten by a rename (for plain
 ///   rename with an existing destination directory).
 /// - A directory cannot be moved into itself (prefix check).
@@ -263,46 +265,44 @@ pub(crate) fn pre_check(
         });
     }
 
-    // RENAME_EXCHANGE: both must exist
-    if flags.is_exchange() {
-        if new_entry.is_none() {
-            return Err(FileSystemError::NotFound {
-                path: new_path.to_string(),
-            });
-        }
-
-        // Type mismatch check for exchange
-        let old_kind = old_entry.kind();
-        let new_kind = new_entry
-            .as_ref()
-            .map(|e| e.kind())
-            .unwrap_or(NodeKind::File);
-        if old_kind != new_kind {
-            return Err(FileSystemError::Unsupported {
-                operation: "renameat2",
-                reason: "RENAME_EXCHANGE requires both entries to be the same type",
-            });
-        }
+    // RENAME_EXCHANGE: both must exist. Linux permits the two entries to
+    // have different types because neither entry replaces the other.
+    if flags.is_exchange() && new_entry.is_none() {
+        return Err(FileSystemError::NotFound {
+            path: new_path.to_string(),
+        });
     }
 
     let moving_is_directory = old_entry.kind() == NodeKind::Dir;
+    let target_is_directory = new_entry
+        .as_ref()
+        .is_some_and(|target| target.kind() == NodeKind::Dir);
 
-    // Directory → non-directory substitution (plain rename)
-    if let Some(ref target) = new_entry {
-        if moving_is_directory && target.kind() != NodeKind::Dir {
-            return Err(FileSystemError::NotDirectory {
-                path: new_path.to_string(),
-            });
-        }
-        if !moving_is_directory && target.kind() == NodeKind::Dir {
-            return Err(FileSystemError::IsDirectory {
-                path: new_path.to_string(),
-            });
+    // Directory → non-directory substitution is forbidden only when the
+    // target is replaced. Exchange keeps both entries alive and swaps names.
+    if !flags.is_exchange() {
+        if let Some(ref target) = new_entry {
+            if moving_is_directory && target.kind() != NodeKind::Dir {
+                return Err(FileSystemError::NotDirectory {
+                    path: new_path.to_string(),
+                });
+            }
+            if !moving_is_directory && target.kind() == NodeKind::Dir {
+                return Err(FileSystemError::IsDirectory {
+                    path: new_path.to_string(),
+                });
+            }
         }
     }
 
-    // Directory cannot be moved inside itself
-    if moving_is_directory && path_prefix_matches(&new_parts, &old_parts) {
+    // Neither side of an exchange may move a directory inside itself. The
+    // second check matters when the destination is the directory and the
+    // source is one of its descendants.
+    if (moving_is_directory && path_prefix_matches(&new_parts, &old_parts))
+        || (flags.is_exchange()
+            && target_is_directory
+            && path_prefix_matches(&old_parts, &new_parts))
+    {
         return Err(FileSystemError::InvalidPath {
             path: new_path.to_string(),
             reason: "directory cannot be moved inside itself",
@@ -540,19 +540,46 @@ fn apply_exchange(
         })?
         .insert(pre.new_name.clone(), swapped_old);
 
-    // For directory exchange across different parents, swap parent link counts
-    if pre.old_parent_id != pre.new_parent_id && pre.old_entry.kind() == NodeKind::Dir {
-        // Both are directories (guaranteed by pre-check type-match).
-        // Bump metadata versions on both parents.
-        if let Some(old_parent) = inodes.get_mut(&pre.old_parent_id) {
-            old_parent.metadata_version = pre.old_entry.generation.0;
-        }
-        if let Some(new_parent) = inodes.get_mut(&pre.new_parent_id) {
-            new_parent.metadata_version = pre.old_entry.generation.0;
+    // Account for each directory that crosses a parent boundary. Exchanging
+    // two directories has no net parent link-count change; exchanging one
+    // directory with a non-directory removes a subdirectory from one parent
+    // and adds it to the other.
+    if pre.old_parent_id != pre.new_parent_id {
+        let old_is_directory = pre.old_entry.kind() == NodeKind::Dir;
+        let new_is_directory = new_entry.kind() == NodeKind::Dir;
+
+        if old_is_directory != new_is_directory {
+            if old_is_directory {
+                if let Some(old_parent) = inodes.get_mut(&pre.old_parent_id) {
+                    old_parent.nlink = old_parent.nlink.saturating_sub(1).max(2);
+                }
+                if let Some(new_parent) = inodes.get_mut(&pre.new_parent_id) {
+                    new_parent.nlink = new_parent.nlink.saturating_add(1);
+                }
+            } else {
+                if let Some(old_parent) = inodes.get_mut(&pre.old_parent_id) {
+                    old_parent.nlink = old_parent.nlink.saturating_add(1);
+                }
+                if let Some(new_parent) = inodes.get_mut(&pre.new_parent_id) {
+                    new_parent.nlink = new_parent.nlink.saturating_sub(1).max(2);
+                }
+            }
         }
 
-        // Swap .. entries so each moved directory points to its new parent.
-        let new_entry = pre.new_entry.as_ref().unwrap(); // guaranteed present by pre-check
+        // Bump metadata versions on both parents whenever a directory moved.
+        if let Some(old_parent) = inodes.get_mut(&pre.old_parent_id) {
+            if old_is_directory || new_is_directory {
+                old_parent.metadata_version = pre.old_entry.generation.0;
+            }
+        }
+        if let Some(new_parent) = inodes.get_mut(&pre.new_parent_id) {
+            if old_is_directory || new_is_directory {
+                new_parent.metadata_version = pre.old_entry.generation.0;
+            }
+        }
+
+        // Point each moved directory at its new parent. Non-directories have
+        // no child namespace and therefore no `..` entry to update.
         let old_parent_dotdot = NamespaceEntry {
             name: b"..".to_vec(),
             inode_id: pre.old_parent_id,
@@ -573,11 +600,15 @@ fn apply_exchange(
             },
             mode: 0o40755,
         };
-        if let Some(src_dir) = directories.get_mut(&pre.old_entry.inode_id) {
-            src_dir.insert(b"..".to_vec(), new_parent_dotdot);
+        if old_is_directory {
+            if let Some(src_dir) = directories.get_mut(&pre.old_entry.inode_id) {
+                src_dir.insert(b"..".to_vec(), new_parent_dotdot);
+            }
         }
-        if let Some(dst_dir) = directories.get_mut(&new_entry.inode_id) {
-            dst_dir.insert(b"..".to_vec(), old_parent_dotdot);
+        if new_is_directory {
+            if let Some(dst_dir) = directories.get_mut(&new_entry.inode_id) {
+                dst_dir.insert(b"..".to_vec(), old_parent_dotdot);
+            }
         }
     }
 
@@ -941,10 +972,10 @@ mod tests {
         assert!(pre.new_entry.is_none());
     }
 
-    // ── Test: EXCHANGE type mismatch rejected ──────────────────────
+    // ── Test: EXCHANGE permits mixed entry types ───────────
 
     #[test]
-    fn pre_check_exchange_type_mismatch_rejected() {
+    fn rename_exchange_allows_mixed_entry_types() {
         let mut inodes = BTreeMap::new();
         let mut dirs = BTreeMap::new();
 
@@ -958,9 +989,47 @@ mod tests {
         root_entries.insert(b"dst".to_vec(), entry("dst", 3, true));
         dirs.insert(InodeId::new(1), root_entries);
 
-        let result = pre_check(&inodes, &dirs, "/src", "/dst", RenameAt2Flags::EXCHANGE);
+        renameat2(
+            &mut inodes,
+            &mut dirs,
+            "/src",
+            "/dst",
+            RenameAt2Flags::EXCHANGE,
+        )
+        .expect("mixed file/directory exchange");
 
-        assert!(matches!(result, Err(FileSystemError::Unsupported { .. })));
+        let root = dirs.get(&InodeId::new(1)).expect("root directory");
+        assert_eq!(root.get(b"src".as_ref()).unwrap().inode_id, InodeId::new(3));
+        assert_eq!(root.get(b"dst".as_ref()).unwrap().inode_id, InodeId::new(2));
+        assert_eq!(root.get(b"src".as_ref()).unwrap().kind(), NodeKind::Dir);
+        assert_eq!(root.get(b"dst".as_ref()).unwrap().kind(), NodeKind::File);
+    }
+
+    #[test]
+    fn pre_check_exchange_rejects_directory_cycles_in_either_direction() {
+        let mut inodes = BTreeMap::new();
+        let mut dirs = BTreeMap::new();
+
+        inodes.insert(InodeId::new(1), dir_record(1, 3));
+        inodes.insert(InodeId::new(2), dir_record(2, 2));
+        inodes.insert(InodeId::new(3), file_record(3));
+
+        let mut root_entries = BTreeMap::new();
+        root_entries.insert(b"a".to_vec(), entry("a", 2, true));
+        dirs.insert(InodeId::new(1), root_entries);
+
+        let mut a_entries = BTreeMap::new();
+        a_entries.insert(b"child".to_vec(), entry("child", 3, false));
+        dirs.insert(InodeId::new(2), a_entries);
+
+        assert!(matches!(
+            pre_check(&inodes, &dirs, "/a", "/a/child", RenameAt2Flags::EXCHANGE,),
+            Err(FileSystemError::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            pre_check(&inodes, &dirs, "/a/child", "/a", RenameAt2Flags::EXCHANGE,),
+            Err(FileSystemError::InvalidPath { .. })
+        ));
     }
 
     // ── Test: directory-not-empty rejection ────────────────────────
@@ -1100,6 +1169,83 @@ mod tests {
         assert_eq!(
             dir_b.nlink, 3,
             "dir_b nlink should be 3 (was 2, gained sub)"
+        );
+    }
+
+    #[test]
+    fn exchange_mixed_cross_parent_updates_link_count_and_dotdot() {
+        let mut inodes = BTreeMap::new();
+        let mut dirs = BTreeMap::new();
+
+        inodes.insert(InodeId::new(1), dir_record(1, 4));
+        inodes.insert(InodeId::new(2), dir_record(2, 2));
+        inodes.insert(InodeId::new(3), file_record(3));
+        inodes.insert(InodeId::new(4), dir_record(4, 3));
+        inodes.insert(InodeId::new(5), dir_record(5, 2));
+
+        let mut root_entries = BTreeMap::new();
+        root_entries.insert(b"dir_a".to_vec(), entry("dir_a", 2, true));
+        root_entries.insert(b"dir_b".to_vec(), entry("dir_b", 4, true));
+        dirs.insert(InodeId::new(1), root_entries);
+
+        let mut a_entries = BTreeMap::new();
+        a_entries.insert(b"file".to_vec(), entry("file", 3, false));
+        dirs.insert(InodeId::new(2), a_entries);
+
+        let mut b_entries = BTreeMap::new();
+        b_entries.insert(b"tree".to_vec(), entry("tree", 5, true));
+        dirs.insert(InodeId::new(4), b_entries);
+
+        let mut tree_entries = BTreeMap::new();
+        tree_entries.insert(
+            b"..".to_vec(),
+            NamespaceEntry {
+                name: b"..".to_vec(),
+                inode_id: InodeId::new(4),
+                generation: Generation(4),
+                facets: NodeFacets {
+                    has_byte_space: false,
+                    has_child_namespace: true,
+                },
+                mode: 0o40755,
+            },
+        );
+        dirs.insert(InodeId::new(5), tree_entries);
+
+        renameat2(
+            &mut inodes,
+            &mut dirs,
+            "/dir_a/file",
+            "/dir_b/tree",
+            RenameAt2Flags::EXCHANGE,
+        )
+        .expect("mixed cross-parent exchange");
+
+        assert_eq!(
+            dirs.get(&InodeId::new(2))
+                .unwrap()
+                .get(b"file".as_ref())
+                .unwrap()
+                .inode_id,
+            InodeId::new(5)
+        );
+        assert_eq!(
+            dirs.get(&InodeId::new(4))
+                .unwrap()
+                .get(b"tree".as_ref())
+                .unwrap()
+                .inode_id,
+            InodeId::new(3)
+        );
+        assert_eq!(inodes.get(&InodeId::new(2)).unwrap().nlink, 3);
+        assert_eq!(inodes.get(&InodeId::new(4)).unwrap().nlink, 2);
+        assert_eq!(
+            dirs.get(&InodeId::new(5))
+                .unwrap()
+                .get(b"..".as_ref())
+                .unwrap()
+                .inode_id,
+            InodeId::new(2)
         );
     }
 

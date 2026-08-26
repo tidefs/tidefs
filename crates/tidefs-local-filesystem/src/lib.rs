@@ -12845,7 +12845,7 @@ impl PoolDatasetOwner {
     /// Returns [`FileSystemError::AlreadyExists`] when `RENAME_NOREPLACE`
     /// is set and the destination exists.
     /// Returns [`FileSystemError::NotDirectory`] / [`FileSystemError::IsDirectory`]
-    /// for directory↔file substitutions.
+    /// when a plain rename attempts a directory↔file replacement.
     pub fn renameat2(
         &mut self,
         old_path: impl AsRef<str>,
@@ -12891,6 +12891,9 @@ impl PoolDatasetOwner {
         let old_entry = pre.old_entry;
         let new_entry = pre.new_entry;
         let moving_is_directory = old_entry.kind() == NodeKind::Dir;
+        let target_is_directory = new_entry
+            .as_ref()
+            .is_some_and(|entry| entry.kind() == NodeKind::Dir);
         self.flush_file_write_buffer_for_entry(&old_entry)?;
         if let Some(entry) = new_entry.as_ref() {
             self.flush_file_write_buffer_for_entry(entry)?;
@@ -13006,11 +13009,26 @@ impl PoolDatasetOwner {
                 return Err(err);
             }
 
-            // For cross-directory directory exchange, bump parent
-            // metadata versions (no net link count change).
-            if old_parent_id != new_parent_id && moving_is_directory {
-                self.update_parent_metadata_timestamps(old_parent_id, tick);
-                self.update_parent_metadata_timestamps(new_parent_id, tick);
+            // Account for a directory crossing parent boundaries. Two
+            // directories produce no net nlink change; a mixed exchange
+            // removes one subdirectory from one parent and adds it to the
+            // other.
+            if old_parent_id != new_parent_id {
+                match (moving_is_directory, target_is_directory) {
+                    (true, false) => {
+                        self.update_parent_metadata_for_subdir_remove(old_parent_id, tick);
+                        self.update_parent_metadata_for_subdir_add(new_parent_id, tick);
+                    }
+                    (false, true) => {
+                        self.update_parent_metadata_for_subdir_add(old_parent_id, tick);
+                        self.update_parent_metadata_for_subdir_remove(new_parent_id, tick);
+                    }
+                    (true, true) => {
+                        self.update_parent_metadata_timestamps(old_parent_id, tick);
+                        self.update_parent_metadata_timestamps(new_parent_id, tick);
+                    }
+                    (false, false) => {}
+                }
             }
         } else {
             // ── Plain rename / RENAME_NOREPLACE ────────────────────
@@ -18860,20 +18878,35 @@ mod orphan_index_integration_tests {
     }
 
     #[test]
-    fn rename_exchange_rejects_type_mismatch() {
-        let (_root, mut fs) = make_test_fs("s5_rename_exchange_type_mismatch").expect("open");
-        fs.create_file("/file.txt", DEFAULT_FILE_PERMISSIONS)
+    fn rename_exchange_swaps_file_and_directory() {
+        let (_root, mut fs) = make_test_fs("s5_rename_exchange_mixed").expect("open");
+        let file = fs
+            .create_file("/file.txt", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
-        fs.create_dir("/dir", DEFAULT_DIRECTORY_PERMISSIONS)
+        fs.write_file("/file.txt", 0, b"file-data")
+            .expect("write file");
+        let directory = fs
+            .create_dir("/dir", DEFAULT_DIRECTORY_PERMISSIONS)
             .expect("create dir");
+        fs.create_file("/dir/child.txt", DEFAULT_FILE_PERMISSIONS)
+            .expect("create child");
+        fs.write_file("/dir/child.txt", 0, b"child-data")
+            .expect("write child");
 
-        assert!(matches!(
-            fs.rename_exchange("/file.txt", "/dir"),
-            Err(FileSystemError::Unsupported {
-                operation: "rename_exchange",
-                ..
-            })
-        ));
+        fs.rename_exchange("/file.txt", "/dir")
+            .expect("exchange file and directory");
+
+        assert_eq!(
+            fs.lookup("/file.txt").expect("directory at file name"),
+            directory.inode_id
+        );
+        assert_eq!(fs.lookup("/dir").expect("file at dir name"), file.inode_id);
+        assert_eq!(fs.read_file("/dir").expect("read moved file"), b"file-data");
+        assert_eq!(
+            fs.read_file("/file.txt/child.txt")
+                .expect("read moved directory child"),
+            b"child-data"
+        );
     }
 
     #[test]
@@ -19129,20 +19162,74 @@ mod orphan_index_integration_tests {
     }
 
     #[test]
-    fn renameat2_exchange_rejects_type_mismatch() {
-        let (_root, mut fs) = make_test_fs("rat2_exchange_type_mismatch").expect("open");
-        fs.create_file("/file.txt", DEFAULT_FILE_PERMISSIONS)
+    fn renameat2_exchange_swaps_mixed_types_across_parents_and_reopens() {
+        let (root, mut fs) = make_test_fs("rat2_exchange_mixed_cross").expect("open");
+        fs.create_dir("/left", DEFAULT_DIRECTORY_PERMISSIONS)
+            .expect("create left parent");
+        fs.create_dir("/right", DEFAULT_DIRECTORY_PERMISSIONS)
+            .expect("create right parent");
+        let file = fs
+            .create_file("/left/file", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
-        fs.create_dir("/dir", DEFAULT_DIRECTORY_PERMISSIONS)
-            .expect("create dir");
+        fs.write_file("/left/file", 0, b"file-data")
+            .expect("write file");
+        let tree = fs
+            .create_dir("/right/tree", DEFAULT_DIRECTORY_PERMISSIONS)
+            .expect("create tree");
+        fs.create_file("/right/tree/child", DEFAULT_FILE_PERMISSIONS)
+            .expect("create tree child");
+        fs.write_file("/right/tree/child", 0, b"child-data")
+            .expect("write tree child");
+        let left_nlink = fs.stat("/left").expect("stat left").nlink;
+        let right_nlink = fs.stat("/right").expect("stat right").nlink;
 
-        let result = fs.renameat2(
-            "/file.txt",
-            "/dir",
+        fs.renameat2(
+            "/left/file",
+            "/right/tree",
             crate::namespace::rename::RenameAt2Flags::EXCHANGE,
+        )
+        .expect("cross-parent mixed exchange");
+
+        assert_eq!(
+            fs.lookup("/left/file").expect("tree at file name"),
+            tree.inode_id
+        );
+        assert_eq!(
+            fs.lookup("/right/tree").expect("file at tree name"),
+            file.inode_id
+        );
+        assert_eq!(
+            fs.stat("/left").expect("stat left after exchange").nlink,
+            left_nlink + 1
+        );
+        assert_eq!(
+            fs.stat("/right").expect("stat right after exchange").nlink,
+            right_nlink - 1
+        );
+        assert_eq!(
+            fs.read_file("/right/tree").expect("read moved file"),
+            b"file-data"
+        );
+        assert_eq!(
+            fs.read_file("/left/file/child")
+                .expect("read moved tree child"),
+            b"child-data"
         );
 
-        assert!(matches!(result, Err(FileSystemError::Unsupported { .. })));
+        drop(fs);
+        let reopened = LocalFileSystem::open(&root).expect("reopen filesystem");
+        assert_eq!(
+            reopened
+                .read_file("/right/tree")
+                .expect("read moved file after reopen"),
+            b"file-data"
+        );
+        assert_eq!(
+            reopened
+                .read_file("/left/file/child")
+                .expect("read moved tree child after reopen"),
+            b"child-data"
+        );
     }
 
     #[test]
