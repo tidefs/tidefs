@@ -14,10 +14,13 @@ use tidefs_types_vfs_core::InodeId;
 
 use crate::{FileSystemError, LocalFileSystem};
 
-// Xattr limits shared with the inode-attribute contract.
+// The selected local carrier stores inline xattr entry counts as u16.  Do not
+// inherit the separate inode-attributes store's smaller 256-entry policy here:
+// doing so makes the mounted path refuse sets that its own durable format can
+// represent.
 const MAX_XATTR_VALUE_LEN: usize = 64 * 1024;
 const MAX_XATTR_NAME_LEN: usize = 255;
-const MAX_XATTR_COUNT: usize = 256;
+const MAX_INLINE_XATTR_COUNT: usize = u16::MAX as usize;
 
 // ---------------------------------------------------------------------------
 // Validation helpers
@@ -70,7 +73,7 @@ pub enum XattrDispatchError {
     Range,
     /// Value exceeds the 64 KiB per-xattr limit.
     TooBig,
-    /// Per-inode xattr count limit reached (256).
+    /// Storage capacity or the local inline-format xattr count is exhausted.
     NoSpace,
     /// Invalid name (empty, contains NUL, too long, unsupported namespace).
     Invalid,
@@ -202,7 +205,7 @@ pub fn engine_setxattr(
             if exists {
                 return Err(XattrDispatchError::AlreadyExists);
             }
-            if current_count >= MAX_XATTR_COUNT {
+            if current_count >= MAX_INLINE_XATTR_COUNT {
                 return Err(XattrDispatchError::NoSpace);
             }
         }
@@ -214,7 +217,7 @@ pub fn engine_setxattr(
         }
         _ => {
             // flag 0: create or replace — only check count when adding new
-            if !exists && current_count >= MAX_XATTR_COUNT {
+            if !exists && current_count >= MAX_INLINE_XATTR_COUNT {
                 return Err(XattrDispatchError::NoSpace);
             }
         }
@@ -240,7 +243,7 @@ pub fn engine_setxattr_by_inode(
         return Err(XattrDispatchError::Invalid);
     }
 
-    fs.set_xattr_by_inode_limited(inode, name, value, flags as i32, MAX_XATTR_COUNT)
+    fs.set_xattr_by_inode_limited(inode, name, value, flags as i32, MAX_INLINE_XATTR_COUNT)
         .map_err(|e| inode_xattr_mutation_error(&e))
 }
 
@@ -353,6 +356,53 @@ mod tests {
         engine_setxattr(&mut fs, "/f", b"user.eng", b"second", 0).unwrap();
         let val = engine_getxattr(&fs, "/f", b"user.eng").unwrap();
         assert_eq!(val, Some(b"second".to_vec()));
+    }
+
+    #[test]
+    fn engine_setxattr_persists_generic_020_cardinality() {
+        let (mut fs, dir) = setup();
+        create_file(&mut fs, "/f");
+        let inode = fs.lookup("/f").unwrap();
+        fs.set_auto_commit(false).unwrap();
+        fs.set_max_uncommitted_mutations(16 * 1024).unwrap();
+        fs.set_commit_group_throughput_profile().unwrap();
+
+        for index in 0..1_000 {
+            let name = format!("user.attribute_{index}");
+            let value = format!("value_{index}");
+            engine_setxattr_by_inode(&mut fs, inode, name.as_bytes(), value.as_bytes(), 0).unwrap();
+        }
+
+        let names = engine_listxattr_by_inode(&fs, inode).unwrap();
+        assert_eq!(
+            names
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+                .count(),
+            1_000
+        );
+        fs.sync_all().unwrap();
+        drop(fs);
+
+        let reopened = LocalFileSystem::open_with_root_authentication_key(
+            dir.path(),
+            StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .unwrap();
+        let reopened_inode = reopened.lookup("/f").unwrap();
+        let names = engine_listxattr_by_inode(&reopened, reopened_inode).unwrap();
+        assert_eq!(
+            names
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+                .count(),
+            1_000
+        );
+        assert_eq!(
+            engine_getxattr_by_inode(&reopened, reopened_inode, b"user.attribute_999").unwrap(),
+            Some(b"value_999".to_vec())
+        );
     }
 
     #[test]
