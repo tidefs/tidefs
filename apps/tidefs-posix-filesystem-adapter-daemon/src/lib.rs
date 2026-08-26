@@ -1392,6 +1392,7 @@ fn fuse_mount_options_for_mode(
 struct MountedLocalReclaimService {
     pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
     engine: live_owner::LiveOwnerEngine,
+    foreground_demand: Arc<AtomicBool>,
     retry_not_before: std::time::Instant,
 }
 
@@ -1402,10 +1403,12 @@ impl MountedLocalReclaimService {
     fn new(
         pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
         engine: live_owner::LiveOwnerEngine,
+        foreground_demand: Arc<AtomicBool>,
     ) -> Self {
         Self {
             pool_owner,
             engine,
+            foreground_demand,
             retry_not_before: std::time::Instant::now(),
         }
     }
@@ -1431,6 +1434,14 @@ impl BackgroundService for MountedLocalReclaimService {
     }
 
     fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
+        if self.foreground_demand.load(Ordering::Acquire) {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        }
+
         // Match the foreground lock order and never wait for an active FUSE
         // or live-owner operation. The scheduler will retry after that demand
         // has released the engine.
@@ -1446,9 +1457,19 @@ impl BackgroundService for MountedLocalReclaimService {
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
 
+        if self.foreground_demand.load(Ordering::Acquire) {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        }
+
+        let foreground_demand = Arc::clone(&self.foreground_demand);
+        let mut should_preempt = || foreground_demand.load(Ordering::Acquire);
         let reclaim = self
             .pool_owner
-            .try_tick_background_services(Self::item_limit(budget))
+            .try_tick_background_services_until(Self::item_limit(budget), &mut should_preempt)
             .map_err(|error| {
                 eprintln!("mounted-local-reclaim: scheduled tick failed: {error}");
                 ServiceError::Internal {
@@ -1491,6 +1512,9 @@ impl BackgroundService for MountedLocalReclaimService {
         if std::time::Instant::now() < self.retry_not_before {
             return false;
         }
+        if self.foreground_demand.load(Ordering::Acquire) {
+            return false;
+        }
 
         let _engine = match self.engine.try_lock() {
             Ok(engine) => engine,
@@ -1508,7 +1532,8 @@ mod mounted_local_reclaim_service_tests {
     use super::*;
 
     #[test]
-    fn mounted_local_reclaim_service_defers_to_all_foreground_demand_and_honors_item_budget() {
+    fn mounted_local_reclaim_service_yields_to_arriving_and_concurrent_foreground_demand_and_honors_item_budget(
+    ) {
         let root = tempfile::tempdir().expect("create mounted reclaim fixture");
         let mut filesystem =
             tidefs_local_filesystem::PoolDatasetOwner::open_with_root_authentication_key(
@@ -1551,12 +1576,28 @@ mod mounted_local_reclaim_service_tests {
                 max_ms: ServiceBudget::MAINTENANCE_TICK.max_ms,
             }));
         let engine = adapter.engine_handle();
+        let foreground_demand = adapter.foreground_demand_signal();
         adapter.register_background_service(Box::new(MountedLocalReclaimService::new(
             pool_owner.clone(),
             engine,
+            foreground_demand,
         )));
         let scheduler = adapter.background_scheduler_handle();
         let depth_before = pool_owner.borrow().reclaim_queue_depth();
+
+        let mut preemption_checks = 0;
+        let mut arriving_foreground_demand = || {
+            preemption_checks += 1;
+            preemption_checks >= 5
+        };
+        assert!(
+            pool_owner
+                .try_tick_background_services_until(1, &mut arriving_foreground_demand)
+                .expect("yield mounted reclaim to newly arrived FUSE demand")
+                .is_none(),
+            "a reclaim tick selected during an idle gap must yield when demand arrives"
+        );
+        assert_eq!(pool_owner.borrow().reclaim_queue_depth(), depth_before);
 
         let first_request = adapter.begin_foreground_demand();
         let second_request = adapter.begin_foreground_demand();
@@ -2177,9 +2218,11 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     let notifier_cell = adapter.notifier_cell();
     let mmap_coherency = adapter.mmap_coherency_cell();
     if !effective_mode.read_only {
+        let foreground_demand = adapter.foreground_demand_signal();
         adapter.register_background_service(Box::new(MountedLocalReclaimService::new(
             shared_pool_owner.clone(),
             Arc::clone(&live_owner_engine),
+            foreground_demand,
         )));
     }
     let background_scheduler = if effective_mode.read_only {

@@ -3763,6 +3763,10 @@ impl FuseVfsAdapter {
     pub(crate) fn begin_foreground_demand(&self) -> FuseForegroundDemandGuard {
         self.foreground_demand.begin()
     }
+
+    pub(crate) fn foreground_demand_signal(&self) -> Arc<AtomicBool> {
+        self.foreground_demand.preempt_signal()
+    }
     /// Attach a [`PageCache`] from tidefs-cache-core for writeback dirty
     /// tracking and flush/fsync dirty-page iteration.
     ///

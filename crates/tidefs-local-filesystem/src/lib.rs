@@ -2353,6 +2353,35 @@ impl SharedPoolDatasetOwner {
         }
     }
 
+    /// Run one mounted mutation-maintenance tick while yielding to demand
+    /// that arrives after the caller selected an idle period.
+    ///
+    /// `None` means either the mounted owner is busy or `should_preempt`
+    /// became true before the tick could safely complete more work. Durable
+    /// reclaim obligations remain queued for a later idle period.
+    pub fn try_tick_background_services_until(
+        &self,
+        max_reclaim_entries: usize,
+        should_preempt: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<ReclaimDrainStats>> {
+        if should_preempt() {
+            return Ok(None);
+        }
+        match self.0.try_lock() {
+            Ok(mut owner) => owner.tick_background_services_with_reclaim_limit_until(
+                max_reclaim_entries,
+                should_preempt,
+            ),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                .into_inner()
+                .tick_background_services_with_reclaim_limit_until(
+                    max_reclaim_entries,
+                    should_preempt,
+                ),
+        }
+    }
+
     pub fn into_inner(self) -> PoolDatasetOwner {
         match Arc::try_unwrap(self.0) {
             Ok(owner) => owner
@@ -6387,17 +6416,39 @@ impl PoolDatasetOwner {
     /// fallback and by recursively retained live snapshot/clone roots.
     /// Uncertainty is terminal for this read-only preflight so background
     /// reclaim leaves the exact local queue entries pending.
+    #[cfg(test)]
     fn collect_reclaim_protected_content_keys(&mut self) -> Result<HashSet<ObjectKey>> {
+        self.collect_reclaim_protected_content_keys_until(&mut || false)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "non-preemptible reclaim protection scan was preempted",
+            })
+    }
+
+    fn collect_reclaim_protected_content_keys_until(
+        &mut self,
+        should_preempt: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<HashSet<ObjectKey>>> {
+        if should_preempt() {
+            return Ok(None);
+        }
         self.ensure_snapshot_authority_consistent()?;
+        if should_preempt() {
+            return Ok(None);
+        }
         let current_root = self.selected_committed_root_summary()?;
-        Ok(reclaim_protected_content_keys_pool(
+        if should_preempt() {
+            return Ok(None);
+        }
+        let protected = reclaim_protected_content_keys_pool(
             self.store.pool_mut(),
             self.filesystem.root_authentication_key,
             &current_root,
             &self.filesystem.state,
-        )?
-        .into_iter()
-        .collect())
+        )?;
+        if should_preempt() {
+            return Ok(None);
+        }
+        Ok(Some(protected.into_iter().collect()))
     }
 
     /// Drain entries from the local B+tree reclaim queue and hand them off
@@ -6424,6 +6475,17 @@ impl PoolDatasetOwner {
         &mut self,
         max_entries: usize,
     ) -> Result<ReclaimDrainStats> {
+        self.drain_local_reclaim_queue_into_store_with_limit_until(max_entries, &mut || false)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "non-preemptible local reclaim drain was preempted",
+            })
+    }
+
+    fn drain_local_reclaim_queue_into_store_with_limit_until(
+        &mut self,
+        max_entries: usize,
+        should_preempt: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<ReclaimDrainStats>> {
         self.ensure_mutation_allowed("drain local reclaim queue")?;
         const MAX_RECLAIM_PER_TICK: usize = 1024;
         let max_entries = if max_entries == 0 {
@@ -6433,23 +6495,31 @@ impl PoolDatasetOwner {
         };
 
         if self.filesystem.reclaim_queue.lock().unwrap().is_empty() {
-            return Ok(ReclaimDrainStats { entries_drained: 0 });
+            return Ok(Some(ReclaimDrainStats { entries_drained: 0 }));
+        }
+        if should_preempt() {
+            return Ok(None);
         }
 
         // Make every current obligation durable before any logical deletion.
         // Receipt-authority preflight below is read-only; entries without
         // exact current authority stay in this queue for a later cycle.
         self.persist_local_reclaim_queue(true)?;
+        if should_preempt() {
+            return Ok(None);
+        }
 
         // Protect every root the mounted recovery/retention authority can
         // select, including recursively retained snapshot and clone roots.
-        let protected_keys = match self.collect_reclaim_protected_content_keys() {
-            Ok(keys) => keys,
+        let protected_keys = match self.collect_reclaim_protected_content_keys_until(should_preempt)
+        {
+            Ok(Some(keys)) => keys,
+            Ok(None) => return Ok(None),
             Err(error) => {
                 eprintln!(
                     "background-services: root reclaim protection is uncertain; keeping local reclaim entries pending: {error}"
                 );
-                return Ok(ReclaimDrainStats { entries_drained: 0 });
+                return Ok(Some(ReclaimDrainStats { entries_drained: 0 }));
             }
         };
 
@@ -6476,6 +6546,9 @@ impl PoolDatasetOwner {
         let keyspace = self.object_keyspace();
         let mut strict_preflight = BTreeMap::new();
         for (object_key, _entry) in &batch {
+            if should_preempt() {
+                return Ok(None);
+            }
             let local_key = tidefs_local_object_store::ObjectKey::from_bytes(object_key.0);
             if protected_keys.contains(&local_key) {
                 continue;
@@ -6523,11 +6596,18 @@ impl PoolDatasetOwner {
             );
         }
 
+        if should_preempt() {
+            return Ok(None);
+        }
+
         if !batch.is_empty() {
             let mut completed_keys = BTreeSet::new();
             let mut performed_logical_handoff = false;
 
             for (object_key, _entry) in &batch {
+                if should_preempt() {
+                    break;
+                }
                 let local_key = tidefs_local_object_store::ObjectKey::from_bytes(object_key.0);
                 let Some(preflight) = strict_preflight.get(&local_key) else {
                     continue;
@@ -6618,7 +6698,7 @@ impl PoolDatasetOwner {
             self.filesystem.total_reclaim_entries_drained += entries_drained as u64;
         }
 
-        Ok(ReclaimDrainStats { entries_drained })
+        Ok(Some(ReclaimDrainStats { entries_drained }))
     }
 
     /// Build a deferred extent trim plan for a content rewrite.
@@ -7246,6 +7326,20 @@ impl PoolDatasetOwner {
         &mut self,
         max_reclaim_entries: usize,
     ) -> Result<ReclaimDrainStats> {
+        self.tick_background_services_with_reclaim_limit_until(max_reclaim_entries, &mut || false)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "non-preemptible background maintenance tick was preempted",
+            })
+    }
+
+    fn tick_background_services_with_reclaim_limit_until(
+        &mut self,
+        max_reclaim_entries: usize,
+        should_preempt: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<ReclaimDrainStats>> {
+        if should_preempt() {
+            return Ok(None);
+        }
         self.ensure_mutation_allowed("run background mutation services")?;
         // --- Duty 1: record reclaim deltas for orphaned inodes ---
         let pending: Vec<u64> = {
@@ -7272,10 +7366,17 @@ impl PoolDatasetOwner {
             }
         }
 
+        if should_preempt() {
+            return Ok(None);
+        }
+
         // Process deferred rewrite extent trims: promote old extent keys to
         // the reclaim queue once their replacement receipt is durable.
         // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
         self.process_deferred_rewrite_trims()?;
+        if should_preempt() {
+            return Ok(None);
+        }
 
         // --- Duty 2: drain reclaim queue into object-store authority ---
         // Hands off local B+tree reclaim queue entries through Pool::delete().
@@ -7283,7 +7384,13 @@ impl PoolDatasetOwner {
         // freeing needs exact obsolete-placement tokens bound to an
         // authenticated filesystem root, which the current queue does not
         // persist.
-        let reclaim = self.drain_local_reclaim_queue_into_store_with_limit(max_reclaim_entries)?;
+        let Some(reclaim) = self.drain_local_reclaim_queue_into_store_with_limit_until(
+            max_reclaim_entries,
+            should_preempt,
+        )?
+        else {
+            return Ok(None);
+        };
 
         // --- Duty 3: dispatch pending scrub-triggered repairs ---
         // The background scrubber sets scrub_corruption_detected when it finds
@@ -7309,7 +7416,7 @@ impl PoolDatasetOwner {
                     .tick(self.store.pool_mut());
             }
         }
-        Ok(reclaim)
+        Ok(Some(reclaim))
     }
 
     /// Prepare exact content and inode reclaim entries for every orphan whose
