@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::ops::Range;
+use std::sync::Arc;
 use std::vec;
 
 use tidefs_dataset_lifecycle::DatasetId;
@@ -141,6 +144,35 @@ struct AuthenticatedContentLayout {
     receipted_manifest_checksum: Option<IntegrityDigest64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AuthenticatedContentChunkIdentity {
+    inode_id: InodeId,
+    data_version: u64,
+    chunk_index: u64,
+    len: u32,
+    checksum: IntegrityDigest64,
+    placement_receipt_generation: u64,
+}
+
+impl AuthenticatedContentChunkIdentity {
+    fn new(inode_id: InodeId, chunk_ref: &ContentChunkRef) -> Self {
+        Self {
+            inode_id,
+            data_version: chunk_ref.data_version,
+            chunk_index: chunk_ref.chunk_index,
+            len: chunk_ref.len,
+            checksum: chunk_ref.checksum,
+            placement_receipt_generation: chunk_ref.placement_receipt_generation,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AuthenticatedContentChunk {
+    identity: AuthenticatedContentChunkIdentity,
+    chunk: Arc<ContentChunkObject>,
+}
+
 /// Mount-local immutable layouts already authenticated through current Pool
 /// receipt authority.
 ///
@@ -151,6 +183,11 @@ struct AuthenticatedContentLayout {
 #[derive(Debug, Default)]
 pub(crate) struct AuthenticatedContentLayoutCache {
     inodes: BTreeMap<InodeId, AuthenticatedContentLayout>,
+    /// Last decoded, receipt-authenticated chunk for each cached inode.
+    ///
+    /// This remains a derived acceleration structure: an exact identity miss
+    /// takes the strict Pool receipt, checksum, and decode path below.
+    decoded_chunks: BTreeMap<InodeId, AuthenticatedContentChunk>,
 }
 
 impl AuthenticatedContentLayoutCache {
@@ -161,6 +198,7 @@ impl AuthenticatedContentLayoutCache {
     }
 
     pub(crate) fn record(&mut self, record: &InodeRecord, layout: ContentLayout) {
+        self.decoded_chunks.remove(&record.inode_id);
         self.inodes.insert(
             record.inode_id,
             AuthenticatedContentLayout {
@@ -177,6 +215,7 @@ impl AuthenticatedContentLayoutCache {
         layout: ContentLayout,
         manifest_checksum: IntegrityDigest64,
     ) {
+        self.decoded_chunks.remove(&record.inode_id);
         self.inodes.insert(
             record.inode_id,
             AuthenticatedContentLayout {
@@ -200,12 +239,39 @@ impl AuthenticatedContentLayoutCache {
             .map(|checksum| (&cached.layout, checksum))
     }
 
+    fn decoded_chunk(
+        &self,
+        inode_id: InodeId,
+        chunk_ref: &ContentChunkRef,
+    ) -> Option<&Arc<ContentChunkObject>> {
+        let cached = self.decoded_chunks.get(&inode_id)?;
+        (cached.identity == AuthenticatedContentChunkIdentity::new(inode_id, chunk_ref))
+            .then_some(&cached.chunk)
+    }
+
+    fn record_decoded_chunk(
+        &mut self,
+        inode_id: InodeId,
+        chunk_ref: &ContentChunkRef,
+        chunk: Arc<ContentChunkObject>,
+    ) {
+        self.decoded_chunks.insert(
+            inode_id,
+            AuthenticatedContentChunk {
+                identity: AuthenticatedContentChunkIdentity::new(inode_id, chunk_ref),
+                chunk,
+            },
+        );
+    }
+
     pub(crate) fn remove(&mut self, inode_id: InodeId) {
         self.inodes.remove(&inode_id);
+        self.decoded_chunks.remove(&inode_id);
     }
 
     pub(crate) fn invalidate(&mut self) {
         self.inodes.clear();
+        self.decoded_chunks.clear();
     }
 }
 
@@ -746,6 +812,7 @@ pub(crate) fn read_content_from_write_store<S: ContentWriteStore + ?Sized>(
 pub(crate) struct MountedContentReadAuthority<'a> {
     pool: &'a Pool,
     keyspace: FilesystemObjectKeyspace,
+    authenticated_content_cache: Option<&'a RefCell<AuthenticatedContentLayoutCache>>,
 }
 
 impl<'a> MountedContentReadAuthority<'a> {
@@ -758,6 +825,19 @@ impl<'a> MountedContentReadAuthority<'a> {
         Self {
             pool,
             keyspace: FilesystemObjectKeyspace::new(dataset_id),
+            authenticated_content_cache: None,
+        }
+    }
+
+    pub(crate) fn for_cached_dataset(
+        pool: &'a Pool,
+        dataset_id: DatasetId,
+        cache: &'a RefCell<AuthenticatedContentLayoutCache>,
+    ) -> Self {
+        Self {
+            pool,
+            keyspace: FilesystemObjectKeyspace::new(dataset_id),
+            authenticated_content_cache: Some(cache),
         }
     }
 
@@ -797,8 +877,31 @@ impl<'a> MountedContentReadAuthority<'a> {
         len: usize,
     ) -> Result<Vec<u8>> {
         read_content_range_with(layout, offset, len, |inode_id, chunk_ref| {
-            self.read_chunk(inode_id, chunk_ref)
+            self.read_chunk_shared(inode_id, chunk_ref)
         })
+    }
+
+    fn read_chunk_shared(
+        &self,
+        inode_id: InodeId,
+        chunk_ref: &ContentChunkRef,
+    ) -> Result<Arc<ContentChunkObject>> {
+        if let Some(chunk) = self
+            .authenticated_content_cache
+            .and_then(|cache| cache.borrow().decoded_chunk(inode_id, chunk_ref).cloned())
+        {
+            return Ok(chunk);
+        }
+
+        let chunk = Arc::new(self.read_chunk(inode_id, chunk_ref)?);
+        if !chunk_ref.is_hole() {
+            if let Some(cache) = self.authenticated_content_cache {
+                cache
+                    .borrow_mut()
+                    .record_decoded_chunk(inode_id, chunk_ref, Arc::clone(&chunk));
+            }
+        }
+        Ok(chunk)
     }
 
     pub(crate) fn read_chunk(
@@ -841,15 +944,17 @@ impl<'a> MountedContentReadAuthority<'a> {
             });
         }
 
-        try_validate_chunk_bytes_with_get(inode_id, chunk_ref, &bytes, |canonical_key| {
-            Ok(self
-                .read_current_object(canonical_key)?
-                .map(|(canonical, _receipt)| canonical))
-        })?
-        .map(|(chunk, _resolved_via_dedup)| chunk)
-        .ok_or(FileSystemError::CorruptState {
-            reason: "Pool-authorized content chunk checksum or decode mismatch",
-        })
+        let chunk =
+            try_validate_chunk_bytes_with_get(inode_id, chunk_ref, &bytes, |canonical_key| {
+                Ok(self
+                    .read_current_object(canonical_key)?
+                    .map(|(canonical, _receipt)| canonical))
+            })?
+            .map(|(chunk, _resolved_via_dedup)| chunk)
+            .ok_or(FileSystemError::CorruptState {
+                reason: "Pool-authorized content chunk checksum or decode mismatch",
+            })?;
+        Ok(chunk)
     }
 }
 
@@ -3084,11 +3189,11 @@ fn read_content_range_from_write_store<S: ContentWriteStore + ?Sized>(
     })
 }
 
-fn read_content_range_with(
+fn read_content_range_with<C: Borrow<ContentChunkObject>>(
     layout: &ContentLayout,
     offset: u64,
     len: usize,
-    mut read_chunk: impl FnMut(InodeId, &ContentChunkRef) -> Result<ContentChunkObject>,
+    mut read_chunk: impl FnMut(InodeId, &ContentChunkRef) -> Result<C>,
 ) -> Result<Vec<u8>> {
     if len == 0 {
         return Ok(Vec::new());
@@ -3144,6 +3249,7 @@ fn read_content_range_with(
                     }
 
                     let chunk = read_chunk(manifest.inode_id, chunk_ref)?;
+                    let chunk = chunk.borrow();
                     if in_chunk > chunk.bytes.len() {
                         return Err(FileSystemError::CorruptState {
                             reason: "content range starts beyond chunk length",
@@ -3539,11 +3645,64 @@ mod tests {
             .layout(changed_content.inode_id, &changed_content)
             .is_none());
 
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: record.data_version,
+            len: 3,
+            checksum: checksum64(b"encoded chunk"),
+            placement_receipt_generation: 11,
+        };
+        let chunk = Arc::new(ContentChunkObject {
+            inode_id: record.inode_id,
+            data_version: record.data_version,
+            chunk_index: 0,
+            bytes: b"abc".to_vec(),
+        });
+        cache.record_decoded_chunk(record.inode_id, &chunk_ref, Arc::clone(&chunk));
+        assert!(Arc::ptr_eq(
+            cache
+                .decoded_chunk(record.inode_id, &chunk_ref)
+                .expect("exact chunk identity should reuse shared decoded bytes"),
+            &chunk,
+        ));
+        assert!(cache
+            .decoded_chunk(InodeId::new(record.inode_id.get() + 1), &chunk_ref)
+            .is_none());
+        for changed_chunk_identity in [
+            ContentChunkRef {
+                data_version: chunk_ref.data_version + 1,
+                ..chunk_ref.clone()
+            },
+            ContentChunkRef {
+                chunk_index: chunk_ref.chunk_index + 1,
+                ..chunk_ref.clone()
+            },
+            ContentChunkRef {
+                len: chunk_ref.len + 1,
+                ..chunk_ref.clone()
+            },
+            ContentChunkRef {
+                checksum: checksum64(b"different encoded chunk"),
+                ..chunk_ref.clone()
+            },
+            ContentChunkRef {
+                placement_receipt_generation: chunk_ref.placement_receipt_generation + 1,
+                ..chunk_ref.clone()
+            },
+        ] {
+            assert!(cache
+                .decoded_chunk(record.inode_id, &changed_chunk_identity)
+                .is_none());
+        }
+
         cache.remove(record.inode_id);
         assert!(cache.layout(record.inode_id, &record).is_none());
+        assert!(cache.decoded_chunk(record.inode_id, &chunk_ref).is_none());
         cache.record(&record, layout);
+        cache.record_decoded_chunk(record.inode_id, &chunk_ref, chunk);
         cache.invalidate();
         assert!(cache.layout(record.inode_id, &record).is_none());
+        assert!(cache.decoded_chunk(record.inode_id, &chunk_ref).is_none());
     }
 
     fn temp_store(label: &str) -> LocalObjectStore {

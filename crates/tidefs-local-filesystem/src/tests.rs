@@ -1363,6 +1363,78 @@ fn read_file_range_clips_eof_and_crosses_chunk_boundary() {
 }
 
 #[test]
+fn mounted_small_reads_reuse_exact_receipt_authenticated_chunk() {
+    let root = temp_root("mounted-small-read-receipted-chunk");
+    let chunk_size = content_chunk_size() as usize;
+    let mut payload = vec![0_u8; chunk_size * 2];
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    let record = fs
+        .create_file("/hot.bin", DEFAULT_FILE_PERMISSIONS)
+        .expect("create file");
+    fs.write_file("/hot.bin", 0, &payload)
+        .expect("write chunked content");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("materialize chunked content");
+
+    let reads_before = fs.store.pool().stats().total_read_ops;
+    assert_eq!(
+        fs.read_file_range("/hot.bin", 0, 512)
+            .expect("read first small range"),
+        payload[..512]
+    );
+    let reads_after_first = fs.store.pool().stats().total_read_ops;
+    assert!(
+        reads_after_first > reads_before,
+        "the first range must authenticate its chunk through Pool"
+    );
+
+    for offset in [512_usize, 1024, 1536, 2048] {
+        assert_eq!(
+            fs.read_file_range("/hot.bin", offset as u64, 512)
+                .expect("read another small range from the same chunk"),
+            payload[offset..offset + 512]
+        );
+    }
+    assert_eq!(
+        fs.store.pool().stats().total_read_ops,
+        reads_after_first,
+        "small reads within one exact chunk must not reread Pool objects"
+    );
+
+    assert_eq!(
+        fs.read_file_range("/hot.bin", chunk_size as u64, 512)
+            .expect("read a different chunk"),
+        payload[chunk_size..chunk_size + 512]
+    );
+    assert!(
+        fs.store.pool().stats().total_read_ops > reads_after_first,
+        "a different chunk identity must take the strict Pool path"
+    );
+
+    fs.write_file("/hot.bin", 0, &[0xa5; 512])
+        .expect("replace bytes in the first chunk");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("materialize replacement chunk");
+    let reads_after_replacement = fs.store.pool().stats().total_read_ops;
+    assert_eq!(
+        fs.read_file_range("/hot.bin", 0, 512)
+            .expect("read replacement bytes"),
+        vec![0xa5; 512]
+    );
+    assert!(
+        fs.store.pool().stats().total_read_ops > reads_after_replacement,
+        "content mutation must invalidate the previously decoded chunk"
+    );
+
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
 fn rename_and_truncate_survive_reopen() {
     let root = temp_root("rename-truncate");
     {

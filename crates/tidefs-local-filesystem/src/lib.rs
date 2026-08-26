@@ -2237,7 +2237,8 @@ pub struct FilesystemDatasetEngine {
     /// normal strict reads before an entry can be reused.
     authenticated_content_allocation_cache: AuthenticatedContentAllocationCache,
     /// Receipt-authenticated immutable layouts for exact live content
-    /// identities. Chunk payload reads remain strict on every request.
+    /// identities plus one exact decoded chunk per inode. Cache misses retain
+    /// the strict Pool receipt, checksum, and decode path.
     authenticated_content_layout_cache: RefCell<AuthenticatedContentLayoutCache>,
     write_buffer_config: WriteBufferConfig,
     fsync_stats: FsyncStats,
@@ -3193,9 +3194,10 @@ impl PoolDatasetOwner {
     }
 
     fn mounted_content_reader(&self) -> MountedContentReadAuthority<'_> {
-        MountedContentReadAuthority::for_dataset(
+        MountedContentReadAuthority::for_cached_dataset(
             self.store.pool(),
             DatasetId::from_bytes(self.filesystem.mounted_dataset_id),
+            &self.filesystem.authenticated_content_layout_cache,
         )
     }
 
