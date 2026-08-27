@@ -1981,7 +1981,7 @@ impl BackgroundSchedulerRuntime {
         let cancel_clone = Arc::clone(&cancel);
 
         let handle = thread::spawn(move || loop {
-            thread::sleep(tick_interval);
+            thread::park_timeout(tick_interval);
             if cancel_clone.load(Ordering::Relaxed) {
                 break;
             }
@@ -2006,6 +2006,7 @@ impl BackgroundSchedulerRuntime {
     fn stop(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
             let _ = handle.join();
         }
     }
@@ -4242,6 +4243,17 @@ impl PoolDatasetOwner {
             runtime.stop();
         }
         self.filesystem.background_scheduler = None;
+    }
+
+    /// Transfer periodic maintenance dispatch to an embedding carrier.
+    ///
+    /// The mounted FUSE carrier owns a scheduler that observes foreground
+    /// demand and calls [`tick_background_services`](Self::tick_background_services)
+    /// only during an admitted idle period. Synchronously stop the library's
+    /// autonomous scheduler before attaching that carrier so orphan scanning,
+    /// online defragmentation, and scrub cannot run outside the carrier gate.
+    pub fn delegate_background_maintenance_to_carrier(&mut self) {
+        self.stop_background_scheduler();
     }
 
     /// Return the current durable Pool membership paths owned by this runtime.
@@ -18385,6 +18397,20 @@ mod orphan_index_integration_tests {
             assert!(
                 fs.background_scheduler.is_some(),
                 "background scheduler runtime should be started on open"
+            );
+        }
+
+        #[test]
+        fn carrier_maintenance_handoff_quiesces_internal_scheduler() {
+            let root = tempfile::tempdir().expect("create carrier handoff fixture");
+            let mut fs = LocalFileSystem::open(root.path()).expect("open filesystem");
+            assert!(fs.background_scheduler.is_some());
+
+            fs.delegate_background_maintenance_to_carrier();
+
+            assert!(
+                fs.background_scheduler.is_none(),
+                "an embedding carrier must become the only periodic maintenance authority"
             );
         }
 

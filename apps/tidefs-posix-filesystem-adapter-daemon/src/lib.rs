@@ -1759,6 +1759,7 @@ mod mounted_local_reclaim_service_tests {
                 tidefs_local_filesystem::RootAuthenticationKey::demo_key(),
             )
             .expect("open mounted reclaim fixture");
+        filesystem.delegate_background_maintenance_to_carrier();
         filesystem
             .set_auto_commit(false)
             .expect("disable automatic fixture commits");
@@ -2266,6 +2267,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             recovery_policy
         };
         let mut lfs = open_owner(effective_mode, open_recovery_policy)?;
+        lfs.delegate_background_maintenance_to_carrier();
 
         let catalog_read_only = lfs
             .mounted_access_readonly()
