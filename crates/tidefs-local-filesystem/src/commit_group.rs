@@ -485,6 +485,21 @@ impl<C: Clock> CommitGroupStateMachine<C> {
         self.evaluate_triggers().is_some()
     }
 
+    /// Whether the current group has reached the hard dirty-byte boundary.
+    ///
+    /// Soft operation, byte, and time targets select an asynchronous
+    /// commit-group close. They must not make whichever ordinary mutation
+    /// observes the target publish the whole filesystem root synchronously.
+    /// The hard maximum remains foreground backpressure so dirty state cannot
+    /// grow past its configured bound while an idle-period commit is pending.
+    pub fn requires_foreground_commit(&self) -> bool {
+        self.phase == CommitGroupPhase::Open
+            && matches!(
+                self.evaluate_triggers(),
+                Some(CommitGroupTrigger::ByteMaximum)
+            )
+    }
+
     /// Whether dirty bytes exceed the hard maximum (back-pressure active).
     #[allow(dead_code)] // INTENT: COMMIT_GROUP state machine types for planned transaction-group commit pipeline
     pub fn is_over_max_dirty(&self) -> bool {

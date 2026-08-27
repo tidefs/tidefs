@@ -2979,10 +2979,11 @@ fn overlay_write_records_exact_dirty_range_bytes() {
 }
 
 #[test]
-fn overlay_write_commits_when_exact_dirty_bytes_cross_target() {
+fn overlay_write_defers_soft_target_but_commits_at_hard_maximum() {
     let root = temp_root("overlay-write-byte-target");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     let record = fs.create_file("/pressure.bin", 0o644).expect("create file");
+    fs.sync_all().expect("commit fixture inode");
     fs.set_auto_commit(false)
         .expect("test setup mutation must be admitted");
     fs.set_max_uncommitted_mutations(1_000_000)
@@ -2990,7 +2991,7 @@ fn overlay_write_commits_when_exact_dirty_bytes_cross_target() {
     const WRITE_LEN: usize = 4096;
     fs.commit_group.config.commit_group_target_bytes = WRITE_LEN as u64;
     fs.commit_group.config.commit_group_target_ops = u64::MAX;
-    fs.commit_group.config.commit_group_dirty_max_bytes = u64::MAX;
+    fs.commit_group.config.commit_group_dirty_max_bytes = (WRITE_LEN * 2) as u64;
     fs.commit_group.config.commit_group_target_secs = 3600.0;
     let start_commit_group = fs.commit_group.current_commit_group().0;
 
@@ -2999,9 +3000,21 @@ fn overlay_write_commits_when_exact_dirty_bytes_cross_target() {
     fs.flush_write_buffer(record.inode_id)
         .expect("flush write buffer");
 
+    assert_eq!(
+        fs.commit_group.current_commit_group().0,
+        start_commit_group,
+        "the soft byte target must leave root publication to maintenance"
+    );
+    assert_eq!(fs.commit_group.dirty_bytes, WRITE_LEN as u64);
+
+    fs.write_file("/pressure.bin", WRITE_LEN as u64, &[0x3c; WRITE_LEN])
+        .expect("write second overlay");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush second write buffer");
+
     assert!(
         fs.commit_group.current_commit_group().0 > start_commit_group,
-        "byte target should force a commit-group sync"
+        "the hard byte maximum must retain foreground backpressure"
     );
     assert_eq!(fs.uncommitted_mutation_count(), 0);
     assert_eq!(fs.commit_group.dirty_bytes, 0);
@@ -3033,10 +3046,18 @@ fn metadata_mutations_count_once_toward_commit_group_target() {
     assert_eq!(fs.commit_group.dirty_ops, 2);
 
     fs.create_dir("/c", 0o755).expect("create third dir");
-    assert!(
-        fs.commit_group.current_commit_group().0 > start_commit_group,
-        "third metadata mutation should reach the configured op target"
+    assert_eq!(
+        fs.commit_group.current_commit_group().0,
+        start_commit_group,
+        "the soft operation target must not charge the foreground mutation for root publication"
     );
+    assert_eq!(fs.commit_group.dirty_ops, 3);
+    assert!(
+        fs.commit_group_maintenance_tick()
+            .expect("close the soft-target group during maintenance"),
+        "the soft operation target must remain actionable by maintenance"
+    );
+    assert!(fs.commit_group.current_commit_group().0 > start_commit_group);
     assert_eq!(fs.uncommitted_mutation_count(), 0);
     assert_eq!(fs.commit_group.dirty_ops, 0);
     assert!(fs.dirty_set.is_clean());

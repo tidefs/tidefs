@@ -2333,6 +2333,38 @@ impl SharedPoolDatasetOwner {
         }
     }
 
+    /// Return whether the mounted commit group needs an idle-period close
+    /// without waiting behind a foreground carrier operation.
+    ///
+    /// `None` means the mounted owner is currently busy. Embedders should
+    /// retry on a later idle-period scheduler cycle.
+    #[must_use]
+    pub fn try_commit_group_maintenance_pending(&self) -> Option<bool> {
+        match self.0.try_lock() {
+            Ok(owner) => Some(owner.commit_group_maintenance_pending()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(poisoned.into_inner().commit_group_maintenance_pending())
+            }
+        }
+    }
+
+    /// Close one mounted commit group during an idle scheduler cycle without
+    /// waiting behind a foreground carrier operation.
+    ///
+    /// `None` means another owner user won the lock. `Some(false)` means the
+    /// soft trigger was no longer pending by the time the tick acquired it.
+    pub fn try_commit_group_maintenance_tick(&self) -> Result<Option<bool>> {
+        match self.0.try_lock() {
+            Ok(mut owner) => owner.commit_group_maintenance_tick().map(Some),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                .into_inner()
+                .commit_group_maintenance_tick()
+                .map(Some),
+        }
+    }
+
     /// Run one mounted mutation-maintenance tick without waiting behind a
     /// foreground carrier operation.
     ///
@@ -14601,7 +14633,8 @@ impl PoolDatasetOwner {
             self.filesystem.uncommitted_mutation_count.saturating_add(1);
 
         if self.filesystem.uncommitted_mutation_count >= self.filesystem.max_uncommitted_mutations
-            || (!self.filesystem.in_transaction && self.filesystem.commit_group.should_quiesce())
+            || (!self.filesystem.in_transaction
+                && self.filesystem.commit_group.requires_foreground_commit())
         {
             return self.force_commit(value);
         }
@@ -16115,17 +16148,20 @@ impl PoolDatasetOwner {
     /// for the next explicit fsync or manual commit.
     ///
     /// Returns true if a commit was performed.
-    pub fn commit_group_maintenance_tick(&mut self) -> Result<bool> {
-        self.ensure_mutation_allowed("run commit-group maintenance")?;
-        let should_commit = match self.filesystem.commit_group.phase {
+    fn commit_group_maintenance_pending(&self) -> bool {
+        match self.filesystem.commit_group.phase {
             CommitGroupPhase::Open => self.filesystem.commit_group.should_quiesce(),
             CommitGroupPhase::Quiesce => {
                 self.filesystem.commit_group.quiesce_timed_out()
                     || self.filesystem.commit_group.inflight_writes == 0
             }
             CommitGroupPhase::Sync => false,
-        };
-        if should_commit {
+        }
+    }
+
+    pub fn commit_group_maintenance_tick(&mut self) -> Result<bool> {
+        self.ensure_mutation_allowed("run commit-group maintenance")?;
+        if self.commit_group_maintenance_pending() {
             self.commit_if_dirty()?;
             Ok(true)
         } else {

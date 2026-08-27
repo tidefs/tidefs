@@ -1396,6 +1396,114 @@ struct MountedLocalReclaimService {
     retry_not_before: std::time::Instant,
 }
 
+struct MountedCommitGroupService {
+    pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
+    engine: live_owner::LiveOwnerEngine,
+    foreground_demand: Arc<AtomicBool>,
+}
+
+impl MountedCommitGroupService {
+    const NAME: &'static str = "mounted-commit-group";
+
+    fn new(
+        pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
+        engine: live_owner::LiveOwnerEngine,
+        foreground_demand: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            pool_owner,
+            engine,
+            foreground_demand,
+        }
+    }
+
+    fn try_engine_lock(
+        &self,
+    ) -> Option<std::sync::MutexGuard<'_, Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send>>> {
+        match self.engine.try_lock() {
+            Ok(engine) => Some(engine),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        }
+    }
+}
+
+impl BackgroundService for MountedCommitGroupService {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn priority(&self) -> ServicePriority {
+        ServicePriority::Critical
+    }
+
+    fn tick(&mut self, _budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
+        if self.foreground_demand.load(Ordering::Acquire) {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        }
+        let Some(_engine) = self.try_engine_lock() else {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        };
+        if self.foreground_demand.load(Ordering::Acquire) {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        }
+
+        let committed = self
+            .pool_owner
+            .try_commit_group_maintenance_tick()
+            .map_err(|error| {
+                eprintln!("mounted-commit-group: scheduled commit failed: {error}");
+                ServiceError::Internal {
+                    service: Self::NAME,
+                    message: "mounted commit-group tick failed",
+                }
+            })?;
+        let Some(committed) = committed else {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        };
+        let processed = u64::from(committed);
+        Ok(TickReport {
+            processed,
+            skipped: u64::from(!committed),
+            errors: 0,
+            items_consumed: processed,
+            bytes_consumed: 0,
+            has_more: self
+                .pool_owner
+                .try_commit_group_maintenance_pending()
+                .unwrap_or(true),
+        })
+    }
+
+    fn has_work(&self) -> bool {
+        if self.foreground_demand.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(_engine) = self.try_engine_lock() else {
+            return false;
+        };
+        self.pool_owner
+            .try_commit_group_maintenance_pending()
+            .unwrap_or(false)
+    }
+}
+
 impl MountedLocalReclaimService {
     const NAME: &'static str = "mounted-local-reclaim";
     const MAX_ITEMS_PER_TICK: usize = 1024;
@@ -2219,6 +2327,11 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     let mmap_coherency = adapter.mmap_coherency_cell();
     if !effective_mode.read_only {
         let foreground_demand = adapter.foreground_demand_signal();
+        adapter.register_background_service(Box::new(MountedCommitGroupService::new(
+            shared_pool_owner.clone(),
+            Arc::clone(&live_owner_engine),
+            Arc::clone(&foreground_demand),
+        )));
         adapter.register_background_service(Box::new(MountedLocalReclaimService::new(
             shared_pool_owner.clone(),
             Arc::clone(&live_owner_engine),
