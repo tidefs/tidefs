@@ -10509,51 +10509,48 @@ impl PoolDatasetOwner {
     /// Transfer a suffix that truncate made unreachable out of every
     /// current-group dirty-byte owner while preserving the still-reachable
     /// prefix and its original dirty age.
-    fn retire_superseded_buffered_dirty_debt(
+    fn retire_superseded_dirty_range_debt(
         &mut self,
         inode_id: InodeId,
-        retired_bytes: u64,
+        retired_buffered_bytes: u64,
+        superseded_from: u64,
     ) -> Result<()> {
-        if retired_bytes == 0 {
-            return Ok(());
-        }
-
-        let permit = self.filesystem.pending_permits.remove(&inode_id).ok_or(
-            FileSystemError::CorruptState {
-                reason: "superseded buffered bytes are missing their dirty admission permit",
-            },
-        )?;
-        let shrunk = match self
-            .filesystem
-            .write_admission
-            .try_shrink_dirty_write(permit, retired_bytes)
-        {
-            Ok(permit) => permit,
-            Err(error) => {
-                let reason = error.to_string();
-                if let Some(permit) = error.into_permit() {
-                    self.filesystem.pending_permits.insert(inode_id, permit);
-                } else {
-                    self.filesystem.mutation_requires_reopen = true;
+        if retired_buffered_bytes > 0 {
+            let permit = self.filesystem.pending_permits.remove(&inode_id).ok_or(
+                FileSystemError::CorruptState {
+                    reason: "superseded buffered bytes are missing their dirty admission permit",
+                },
+            )?;
+            let shrunk = match self
+                .filesystem
+                .write_admission
+                .try_shrink_dirty_write(permit, retired_buffered_bytes)
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let reason = error.to_string();
+                    if let Some(permit) = error.into_permit() {
+                        self.filesystem.pending_permits.insert(inode_id, permit);
+                    } else {
+                        self.filesystem.mutation_requires_reopen = true;
+                    }
+                    return Err(FileSystemError::DirtyAdmissionRejected { reason });
                 }
-                return Err(FileSystemError::DirtyAdmissionRejected { reason });
-            }
-        };
-        self.filesystem.pending_permits.insert(inode_id, shrunk);
+            };
+            self.filesystem.pending_permits.insert(inode_id, shrunk);
+        }
 
         let retired = self
             .filesystem
             .dirty_set
-            .retire_data_write(inode_id, retired_bytes);
-        if retired != retired_bytes {
+            .retire_data_write_from(inode_id, superseded_from);
+        if retired < retired_buffered_bytes {
             self.filesystem.mutation_requires_reopen = true;
             return Err(FileSystemError::CorruptState {
-                reason: "superseded buffered bytes exceed current-group dirty data debt",
+                reason: "superseded buffered bytes exceed exact current-group dirty ranges",
             });
         }
-        self.filesystem
-            .commit_group
-            .retire_dirty_bytes(retired_bytes);
+        self.filesystem.commit_group.retire_dirty_bytes(retired);
         Ok(())
     }
 
@@ -10637,9 +10634,10 @@ impl PoolDatasetOwner {
         self.discard_dirty_write_buffer_ranges(inode_id, &[(offset, length)]);
     }
 
-    fn truncate_dirty_write_buffer_for_inode(&mut self, inode_id: InodeId, size: u64) {
+    fn truncate_dirty_write_buffer_for_inode(&mut self, inode_id: InodeId, size: u64) -> u64 {
         let freed = self.truncate_write_buffer_for_inode(inode_id, size);
         self.record_dirty_buffer_discard(freed);
+        freed
     }
 
     fn clear_writeback_ranges_from(&self, inode_id: InodeId, offset: u64) {
@@ -11187,11 +11185,11 @@ impl PoolDatasetOwner {
             .borrow_mut()
             .invalidate(inode_id);
         self.mark_inode_content_dirty(inode_id);
-        self.filesystem
+        let newly_dirty_bytes = self
+            .filesystem
             .dirty_set
-            .record_data_write(inode_id, physical_admit_bytes);
-        let _accepted_by_commit_group =
-            self.record_mutation_commit_group_write(physical_admit_bytes);
+            .record_data_write_range(inode_id, offset, bytes_len);
+        let _accepted_by_commit_group = self.record_mutation_commit_group_write(newly_dirty_bytes);
         // PendingData must exist before a threshold-triggered foreground
         // writeback can finalize this accepted range. Allocating it after the
         // flush would replace the finalized extent with a new pending extent.
@@ -11929,12 +11927,12 @@ impl PoolDatasetOwner {
             self.flush_write_buffer(inode_id)?;
         }
         if size < old_effective_size {
-            if has_pending_content {
-                let retired = self.truncate_pending_write_buffer_for_inode(inode_id, size);
-                self.retire_superseded_buffered_dirty_debt(inode_id, retired)?;
+            let retired_buffered = if has_pending_content {
+                self.truncate_pending_write_buffer_for_inode(inode_id, size)
             } else {
-                self.truncate_dirty_write_buffer_for_inode(inode_id, size);
-            }
+                self.truncate_dirty_write_buffer_for_inode(inode_id, size)
+            };
+            self.retire_superseded_dirty_range_debt(inode_id, retired_buffered, size)?;
             self.clear_writeback_ranges_from(inode_id, size);
         }
         let record = self.committed_inode_record(inode_id)?;
@@ -12017,7 +12015,7 @@ impl PoolDatasetOwner {
             result
         };
         if !has_pending_content {
-            self.truncate_dirty_write_buffer_for_inode(inode_id, size);
+            let _ = self.truncate_dirty_write_buffer_for_inode(inode_id, size);
         }
         // ── Intent-log: record truncate for crash recovery replay ──
         // Record the truncate after all extent and write-buffer mutations

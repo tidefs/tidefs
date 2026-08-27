@@ -3277,6 +3277,35 @@ fn admission_pressure_materializes_dirty_bytes_without_publishing_root() {
     assert_eq!(pressure.current_dirty_ops, 1);
     assert_eq!(pressure.current_outstanding_permits, 1);
 
+    let dirty_bytes_before_rewrite = fs.filesystem.dirty_set.data_bytes;
+    let commit_group_bytes_before_rewrite = fs.commit_group.dirty_bytes;
+    let rewritten_first = vec![0x8f; first_bytes.len()];
+    fs.write_file("/first.bin", 0, &rewritten_first)
+        .expect("rewrite pressure-materialized current-group range");
+
+    assert_eq!(fs.commit_group.current_commit_group(), commit_group_before);
+    assert_eq!(fs.durable_commit_group(), durable_before);
+    assert_eq!(
+        fs.filesystem.dirty_set.data_bytes, dirty_bytes_before_rewrite,
+        "rewriting an already-dirty materialized range must not retain historical I/O debt"
+    );
+    assert_eq!(
+        fs.commit_group.dirty_bytes, commit_group_bytes_before_rewrite,
+        "the open group must charge the live dirty range union"
+    );
+    assert_eq!(
+        fs.read_file("/first.bin")
+            .expect("read rewritten first file"),
+        rewritten_first
+    );
+    let rewrite_pressure = fs.take_admission_snapshot().expect("read rewrite usage");
+    assert_eq!(
+        rewrite_pressure.current_dirty_bytes,
+        first_bytes.len() as u64
+    );
+    assert_eq!(rewrite_pressure.current_dirty_ops, 1);
+    assert_eq!(rewrite_pressure.current_outstanding_permits, 1);
+
     let second_tail = vec![0x73; 3072];
     fs.write_file("/second.bin", second_bytes.len() as u64, &second_tail)
         .expect("materialize and replan same-inode expansion");
@@ -3305,11 +3334,84 @@ fn admission_pressure_materializes_dirty_bytes_without_publishing_root() {
     let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
     assert_eq!(
         reopened.read_file("/first.bin").expect("read first"),
-        first_bytes
+        rewritten_first
     );
     assert_eq!(
         reopened.read_file("/second.bin").expect("read second"),
         expected_second
+    );
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
+fn truncate_retires_materialized_current_group_dirty_suffix() {
+    let root = temp_root("truncate-retires-materialized-dirty-suffix");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.stop_background_scheduler();
+    let first = fs
+        .create_file("/first.bin", 0o644)
+        .expect("create first file");
+    fs.create_file("/second.bin", 0o644)
+        .expect("create second file");
+    fs.sync_all().expect("commit test fixture");
+    fs.set_auto_commit(false)
+        .expect("disable automatic per-mutation commits");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("retain the open commit group");
+    fs.set_write_buffer_flush_threshold_bytes(64 * 1024 * 1024)
+        .expect("retain mounted per-inode writeback batching");
+    let admission = fs.admission_config();
+    fs.filesystem
+        .write_admission
+        .apply_dynamic_tuning(crate::admission::LocalAdmissionTuning {
+            max_dirty_bytes: 4096,
+            max_dirty_ops: admission.hard_max_dirty_ops,
+            max_dirty_age_ticks: admission.hard_max_dirty_age_ticks,
+        });
+    fs.commit_group.config.commit_group_target_ops = u64::MAX;
+    fs.commit_group.config.commit_group_target_bytes = u64::MAX;
+    fs.commit_group.config.commit_group_dirty_max_bytes = u64::MAX;
+    fs.commit_group.config.commit_group_target_secs = 3600.0;
+
+    let first_bytes = vec![0x31; 3072];
+    fs.write_file("/first.bin", 0, &first_bytes)
+        .expect("buffer first write");
+    fs.write_file("/second.bin", 0, &[0x52; 2048])
+        .expect("materialize first inode under admission pressure");
+    assert!(!fs.write_buffers.contains_key(&first.inode_id));
+    assert!(!fs
+        .filesystem
+        .buffered_write_base_records
+        .contains_key(&first.inode_id));
+    assert!(!fs.filesystem.pending_permits.contains_key(&first.inode_id));
+    assert_eq!(fs.filesystem.dirty_set.data_bytes, 5120);
+    assert_eq!(fs.commit_group.dirty_bytes, 5120);
+
+    let commit_group_before = fs.commit_group.current_commit_group();
+    fs.truncate_file("/first.bin", 1024)
+        .expect("truncate materialized current-group suffix");
+
+    assert_eq!(fs.commit_group.current_commit_group(), commit_group_before);
+    assert_eq!(fs.filesystem.dirty_set.data_bytes, 3072);
+    assert_eq!(fs.commit_group.dirty_bytes, 3072);
+    assert_eq!(
+        fs.filesystem.dirty_set.per_inode_bytes.get(&first.inode_id),
+        Some(&1024)
+    );
+    assert_eq!(
+        fs.read_file("/first.bin").expect("read retained prefix"),
+        first_bytes[..1024]
+    );
+
+    fs.do_commit().expect("publish truncated current group");
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        reopened
+            .read_file("/first.bin")
+            .expect("read retained prefix after reopen"),
+        first_bytes[..1024]
     );
     drop(reopened);
     cleanup(&root);
