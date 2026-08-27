@@ -6528,6 +6528,11 @@ impl LocalObjectStore {
                 reason: "prepublication batch readback lost its read-verification checksum",
             });
         }
+        for replica in &self.replicas {
+            if !replica.verify_prepublication_batch_payload(key, expected_payload)? {
+                return Ok(false);
+            }
+        }
         Ok(true)
     }
 

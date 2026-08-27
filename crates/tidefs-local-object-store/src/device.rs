@@ -4206,6 +4206,12 @@ impl Device {
             Self::LogDevice(device) => device
                 .store
                 .verify_prepublication_batch_payload(key, expected_payload),
+            Self::Compressed(device) if crate::store::is_strict_pool_authority_key(key) => device
+                .inner
+                .verify_prepublication_batch_payload(key, expected_payload),
+            Self::Encrypted(device) if crate::store::is_strict_pool_authority_key(key) => device
+                .inner
+                .verify_prepublication_batch_payload(key, expected_payload),
             Self::Compressed(_) | Self::Encrypted(_) => Ok(false),
             #[cfg(any(feature = "distributed-repair", test))]
             Self::ParityRaid1(_) | Self::ParityRaid2(_) | Self::ParityRaid3(_) => Ok(false),

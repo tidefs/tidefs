@@ -7479,6 +7479,29 @@ impl Pool {
             }
         }
 
+        // Payload and receipt records share the same coalesced append and
+        // post-barrier readback. For byte-addressable layouts, consume the
+        // receipt record already decoded and integrity-verified from that
+        // exact persisted range instead of issuing two more object reads for
+        // every batch entry. Every Pool carrier and raw-store replica must
+        // contain the identical encoded receipt before this fast path can
+        // establish current authority; transformed and parity layouts retain
+        // the generic strict traversal below.
+        let receipt_key = placement_receipt_object_key(key);
+        let encoded_receipt = expected_receipt.encode()?;
+        let mut verified_persisted_receipts = true;
+        for &idx in indices {
+            if !self.devices[idx]
+                .verify_prepublication_batch_payload(receipt_key, &encoded_receipt)?
+            {
+                verified_persisted_receipts = false;
+                break;
+            }
+        }
+        if verified_persisted_receipts {
+            return Ok(());
+        }
+
         let current = map_strict_read_object_io(
             self.load_current_placement_receipt_strict(indices, key),
             "prepublication batch could not inspect every placement receipt copy",
