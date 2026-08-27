@@ -2077,11 +2077,14 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
     }
 
     for (chunk_index, chunk_patches) in patches_by_chunk {
-        let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
+        let chunk_len_u32 = content_chunk_len(new_record.size, chunk_index)?;
+        let chunk_len = chunk_len_u32 as usize;
         let old_chunk_is_sparse_zero = match find_chunk_in_manifest(old_manifest, chunk_index) {
             Some(chunk_ref) => chunk_ref.is_hole(),
             None => true,
         };
+        let chunk_fully_overwritten =
+            patches_fully_cover_chunk(chunk_index, chunk_len_u32, &chunk_patches)?;
         let patch_bytes_all_zero = chunk_patches.iter().try_fold(true, |all_zero, patch| {
             Ok::<bool, FileSystemError>(
                 all_zero
@@ -2099,13 +2102,19 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
 
         chunk_bytes.clear();
         chunk_bytes.resize(chunk_len, 0);
-        copy_old_content_into_chunk(
-            store,
-            old_layout,
-            old_record.size,
-            chunk_index,
-            &mut chunk_bytes,
-        )?;
+        // The authenticated predecessor manifest still owns retained and
+        // reclaim identities. Only a partial replacement depends on the old
+        // payload bytes; a fully covered chunk can be encoded directly from
+        // the accepted writeback batch.
+        if !chunk_fully_overwritten {
+            copy_old_content_into_chunk(
+                store,
+                old_layout,
+                old_record.size,
+                chunk_index,
+                &mut chunk_bytes,
+            )?;
+        }
         for patch in chunk_patches {
             overlay_chunk_bytes(chunk_index, patch.offset, patch.bytes, &mut chunk_bytes)?;
         }
@@ -3078,6 +3087,55 @@ pub(crate) fn overlay_chunk_bytes(
     chunk_bytes[chunk_dst..chunk_dst + len]
         .copy_from_slice(&overlay_bytes[overlay_src..overlay_src + len]);
     Ok(())
+}
+
+fn patches_fully_cover_chunk(
+    chunk_index: u64,
+    chunk_len: u32,
+    patches: &[ContentOverlayPatch<'_>],
+) -> Result<bool> {
+    if chunk_len == 0 {
+        return Ok(true);
+    }
+    let chunk_start = content_chunk_start(chunk_index)?;
+    let chunk_end =
+        chunk_start
+            .checked_add(u64::from(chunk_len))
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+    let mut covered_ranges = Vec::with_capacity(patches.len());
+    for patch in patches {
+        let patch_len =
+            u64::try_from(patch.bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+        let patch_end =
+            patch
+                .offset
+                .checked_add(patch_len)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+        let start = patch.offset.max(chunk_start);
+        let end = patch_end.min(chunk_end);
+        if start < end {
+            covered_ranges.push((start, end));
+        }
+    }
+    covered_ranges.sort_unstable();
+
+    let mut covered_end = chunk_start;
+    for (start, end) in covered_ranges {
+        if start > covered_end {
+            return Ok(false);
+        }
+        covered_end = covered_end.max(end);
+        if covered_end >= chunk_end {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn overlay_chunk_writes_only_zeros(
@@ -4550,6 +4608,112 @@ mod tests {
         let rewritten = read_content_from_store(&store.raw, new_record.inode_id, &new_record, None)
             .expect("read rewritten sparse content");
         assert_eq!(rewritten, expected);
+    }
+
+    #[test]
+    fn full_chunk_patch_batch_skips_superseded_payload_read() {
+        let chunk_len = content_chunk_size() as usize;
+        let old_payload = vec![0x19; chunk_len];
+        let old_record = test_record(78, 1, chunk_len as u64);
+        let new_record = test_record(78, 2, chunk_len as u64);
+        let encoded = encode_content_chunk(
+            &old_record,
+            0,
+            &old_payload,
+            &ContentCompressionPolicy::off(),
+        )
+        .expect("encode old chunk");
+        let old_chunk_key =
+            content_chunk_object_key_for_version(old_record.inode_id, old_record.data_version, 0);
+        let manifest = ContentManifestObject {
+            inode_id: old_record.inode_id,
+            data_version: old_record.data_version,
+            file_size: old_record.size,
+            chunk_size: content_chunk_size(),
+            chunks: vec![ContentChunkRef {
+                chunk_index: 0,
+                data_version: old_record.data_version,
+                len: chunk_len as u32,
+                checksum: checksum64(&encoded),
+                placement_receipt_generation: 0,
+            }],
+        };
+        let old_layout_key =
+            content_object_key_for_version(old_record.inode_id, old_record.data_version);
+        let mut routed = BTreeMap::new();
+        routed.insert(old_layout_key, encode_content_manifest_sparse(&manifest));
+        routed.insert(old_chunk_key, encoded);
+        let mut store = RoutedReadStore {
+            raw: temp_store("full-chunk-patch-no-old-read"),
+            routed,
+            read_error_key: Some(old_chunk_key),
+        };
+        let partial_bytes = vec![0x31; chunk_len / 2];
+        let partial_patch = [ContentOverlayPatch {
+            offset: 0,
+            bytes: &partial_bytes,
+        }];
+        let mut partial_dedup_index = DedupIndex::new();
+        let partial_error =
+            match write_chunked_content_with_patch_batch(WriteChunkedContentPatchBatch {
+                dedup_enabled: false,
+                store: &mut store,
+                inode_id: old_record.inode_id,
+                old_record: &old_record,
+                new_record: &new_record,
+                patches: &partial_patch,
+                allow_holes: true,
+                dedup_index: &mut partial_dedup_index,
+                #[cfg(feature = "quorum-write")]
+                quorum_store: None,
+                compression_policy: &ContentCompressionPolicy::off(),
+            }) {
+                Ok(_) => panic!("partial overwrite must retain the old payload read"),
+                Err(error) => error,
+            };
+        assert!(matches!(
+            partial_error,
+            FileSystemError::CorruptState {
+                reason: "routed canonical read failure"
+            }
+        ));
+
+        let first_half = vec![0x42; chunk_len / 2];
+        let second_half = vec![0x73; chunk_len - first_half.len()];
+        let patches = [
+            ContentOverlayPatch {
+                offset: 0,
+                bytes: &first_half,
+            },
+            ContentOverlayPatch {
+                offset: first_half.len() as u64,
+                bytes: &second_half,
+            },
+        ];
+        let mut dedup_index = DedupIndex::new();
+
+        write_chunked_content_with_patch_batch(WriteChunkedContentPatchBatch {
+            dedup_enabled: false,
+            store: &mut store,
+            inode_id: old_record.inode_id,
+            old_record: &old_record,
+            new_record: &new_record,
+            patches: &patches,
+            allow_holes: true,
+            dedup_index: &mut dedup_index,
+            #[cfg(feature = "quorum-write")]
+            quorum_store: None,
+            compression_policy: &ContentCompressionPolicy::off(),
+        })
+        .expect("full overwrite must not read the superseded chunk payload");
+
+        let mut expected = first_half;
+        expected.extend_from_slice(&second_half);
+        assert_eq!(
+            read_content_from_store(&store.raw, new_record.inode_id, &new_record, None)
+                .expect("read rewritten chunk"),
+            expected
+        );
     }
 
     #[test]

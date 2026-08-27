@@ -7811,6 +7811,14 @@ impl FuseVfsAdapter {
         offset: u64,
         length: u64,
     ) -> Result<(), Errno> {
+        // Ordinary mounted writes are already authoritative in the engine and
+        // leave no dirty daemon mirror. Do not turn a clean sparse truncate
+        // into one locked page-cache miss per removed logical page.
+        if !self.dirty_trackers_overlap_range(ino, offset, length)
+            && !self.dirty_page_caches_overlap_range(ino, offset, length)
+        {
+            return Ok(());
+        }
         self.reconcile_dirty_mirrors_for_authoritative_range(
             ino,
             offset,
@@ -24986,6 +24994,40 @@ mod tests {
     }
 
     // ── dispatch_truncate tests (path-based, no file handle) ──────────────
+
+    #[test]
+    fn clean_sparse_setattr_does_not_probe_absent_page_mirrors() {
+        const FSX_FILE_SIZE: u64 = 30 * 1024 * 1024;
+
+        let fixture = adapter_fixture_with_writeback_cache_deferred_commit();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"clean-sparse-ftruncate.bin",
+            libc::O_RDWR as u32,
+        );
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, inode.get(), adapter_fh, FSX_FILE_SIZE)
+            .expect("grow sparse fsx-sized file");
+        let misses_before = fixture.adapter.write_page_cache.miss_count();
+
+        let mut shrink = SetAttr::new();
+        shrink.valid = FATTR_SIZE | FATTR_FH;
+        shrink.size = 0;
+        let shrunk = fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &shrink, Some(adapter_fh))
+            .expect("truncate clean sparse fsx-sized file through FUSE setattr");
+
+        assert_eq!(shrunk.attr.size, 0);
+        assert_eq!(
+            fixture.adapter.write_page_cache.miss_count(),
+            misses_before,
+            "a clean truncate range must not probe every absent page mirror"
+        );
+    }
 
     #[test]
     fn vfs_adapter_dispatch_truncate_to_zero_clears_data() {
