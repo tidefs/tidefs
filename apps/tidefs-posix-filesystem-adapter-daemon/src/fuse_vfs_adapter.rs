@@ -3893,6 +3893,31 @@ impl FuseVfsAdapter {
         datasync
     }
 
+    fn write_request_sync_datasync(
+        &self,
+        is_writeback_cached: bool,
+        resolved_open_flags: u32,
+        request_open_flags: u32,
+        inode_open_state: InodeOpenState,
+    ) -> Option<bool> {
+        let request_sync = self.write_sync_datasync(request_open_flags);
+        if is_writeback_cached {
+            // FUSE_WRITE_CACHE identifies delayed page-cache writeback. The
+            // kernel may guess `fh`, and another live handle says nothing
+            // about whether these bytes came from an O_SYNC write(2). In
+            // particular, shared-mmap writeback from an O_SYNC descriptor
+            // carries no synchronous-write semantics. Honor only the file
+            // flags attached to this exact FUSE request; explicit fsync and
+            // msync barriers continue through their normal handlers.
+            return self.merged_write_sync_datasync(&[request_sync]);
+        }
+        self.merged_write_sync_datasync(&[
+            self.write_sync_datasync(resolved_open_flags),
+            request_sync,
+            inode_open_state.write_sync_datasync(),
+        ])
+    }
+
     fn active_read_atime_policy(&self) -> bool {
         !self.read_only && self.timestamp_policy != TimestampPolicy::NoAtime
     }
@@ -6023,11 +6048,12 @@ impl FuseVfsAdapter {
             InodeOpenState::default()
         };
         let request_open_flags_present = request_open_flags != 0;
-        let sync_datasync = self.merged_write_sync_datasync(&[
-            self.write_sync_datasync(resolved_open_flags),
-            self.write_sync_datasync(request_open_flags),
-            inode_open_state.write_sync_datasync(),
-        ]);
+        let sync_datasync = self.write_request_sync_datasync(
+            is_writeback_cached,
+            resolved_open_flags,
+            request_open_flags,
+            inode_open_state,
+        );
         let request_allows_write = open_flags_allow_write(request_open_flags).unwrap_or(false);
         let writeback_fallback_allowed = self.writeback_cache_enabled
             && (is_writeback_cached || request_allows_write || inode_open_state.has_writable);
@@ -14453,6 +14479,113 @@ mod tests {
                 .write_sync_datasync(libc::O_RDWR as u32 | O_DSYNC),
             Some(false)
         );
+    }
+
+    #[test]
+    fn shared_mmap_writeback_does_not_inherit_sync_from_guessed_handles() {
+        let fixture = adapter_fixture();
+        let inode_open_state = InodeOpenState {
+            has_writable: true,
+            has_sync: true,
+            ..InodeOpenState::default()
+        };
+
+        assert_eq!(
+            fixture.adapter.write_request_sync_datasync(
+                true,
+                libc::O_RDWR as u32 | O_SYNC,
+                0,
+                inode_open_state,
+            ),
+            None,
+            "page-cache writeback has no O_SYNC write(2) boundary to inherit"
+        );
+        assert_eq!(
+            fixture.adapter.write_request_sync_datasync(
+                true,
+                libc::O_RDWR as u32,
+                libc::O_RDWR as u32 | O_DSYNC,
+                InodeOpenState::default(),
+            ),
+            Some(true),
+            "exact FUSE request flags retain synchronous-write semantics"
+        );
+        assert_eq!(
+            fixture.adapter.write_request_sync_datasync(
+                false,
+                libc::O_RDWR as u32 | O_SYNC,
+                0,
+                InodeOpenState::default(),
+            ),
+            Some(false),
+            "ordinary write dispatch retains its resolved O_SYNC boundary"
+        );
+    }
+
+    #[test]
+    fn shared_mmap_writeback_from_sync_handle_defers_root_until_fsync() {
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-vfs-adapter-mmap-sync-{}-{temp_id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let mut local_fs = LocalFileSystem::open_with_root_authentication_key(
+            &root,
+            StoreOptions::test_fast(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open local filesystem");
+        local_fs
+            .set_auto_commit(false)
+            .expect("configure mounted deferred commits");
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let owner = engine.shared_pool_owner();
+        let adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create adapter")
+            .with_writeback_cache_enabled();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &adapter,
+            &ctx,
+            b"mmap-sync.bin",
+            libc::O_RDWR as u32 | O_SYNC,
+        );
+        adapter
+            .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+            .expect("commit fixture creation");
+        let durable_before = owner.borrow().durable_commit_group();
+
+        adapter
+            .dispatch_write_with_request_flags(
+                &ctx,
+                inode.get(),
+                adapter_fh,
+                0,
+                b"shared mmap page writeback",
+                WriteDispatchFlags {
+                    write: FUSE_WRITE_CACHE,
+                    request_open: 0,
+                },
+            )
+            .expect("accept shared mmap page writeback");
+        assert_eq!(
+            owner.borrow().durable_commit_group(),
+            durable_before,
+            "mmap page writeback must not manufacture an O_SYNC committed-root barrier"
+        );
+
+        adapter
+            .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+            .expect("publish through explicit fsync");
+        assert!(
+            owner.borrow().durable_commit_group() > durable_before,
+            "explicit fsync must retain the committed-root durability boundary"
+        );
+
+        drop(adapter);
+        drop(owner);
+        std::fs::remove_dir_all(root).expect("remove temp root");
     }
 
     #[test]

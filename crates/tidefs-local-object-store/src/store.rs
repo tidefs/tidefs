@@ -6279,7 +6279,7 @@ impl LocalObjectStore {
                         segment_id: self.current_segment_id,
                         offset: range.footer_offset,
                         reason: "prepublication record footer is truncated",
-                })?;
+                    })?;
                 let mut footer = [0_u8; RECORD_FOOTER_LEN];
                 footer.copy_from_slice(footer_slice);
                 Some((footer, range.footer_offset))
@@ -6384,12 +6384,7 @@ impl LocalObjectStore {
             }
 
             let footer = if let Some((footer, footer_offset)) = pending.footer_bytes {
-                decode_footer(
-                    &footer,
-                    pending.header,
-                    current_segment_id,
-                    footer_offset,
-                )?;
+                decode_footer(&footer, pending.header, current_segment_id, footer_offset)?;
                 Some(footer)
             } else {
                 None
