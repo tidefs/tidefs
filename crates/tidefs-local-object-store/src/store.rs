@@ -8156,37 +8156,39 @@ impl LocalObjectStore {
             }
         }
 
-        let retained_records: Vec<(ObjectKey, ObjectLocation, Vec<u8>, u8)> = retained_locations
-            .into_iter()
-            .map(|old_location| {
-                self.read_location_stored_payload(old_location).map(
-                    |(payload, compression_algorithm)| {
-                        (
-                            old_location.key,
-                            old_location,
-                            payload,
-                            compression_algorithm,
-                        )
-                    },
-                )
-            })
-            .collect::<Result<_>>()?;
         let sequence_high_water_payload = self.next_sequence.to_le_bytes();
-        let tombstone_keys = retained_records
+        let tombstone_keys = retained_locations
             .iter()
-            .map(|(key, _, _, _)| *key)
+            .map(|location| location.key)
             .filter(|key| !desired_live_locations.contains_key(key))
             .collect::<BTreeSet<_>>();
 
         let data_start = Self::block_device_data_start();
         let usable_end = self.block_device_usable_end()?;
-        let records_end = retained_records
-            .iter()
-            .try_fold(data_start, |offset, record| {
-                offset
-                    .checked_add(Self::checked_record_total_len_u64(record.2.len() as u64))
-                    .ok_or(StoreError::NoSpace)
-            })?;
+        let mut records_end = data_start;
+        let mut previous_source_end = data_start;
+        for location in &retained_locations {
+            let record_len = Self::checked_record_total_len_u64(location.payload_len);
+            let source_end = location
+                .record_offset
+                .checked_add(record_len)
+                .ok_or(StoreError::NoSpace)?;
+            let target_end = records_end
+                .checked_add(record_len)
+                .ok_or(StoreError::NoSpace)?;
+            if location.segment_id != self.current_segment_id
+                || location.record_offset < previous_source_end
+                || records_end > location.record_offset
+                || target_end > source_end
+                || source_end > usable_end
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "block-device compaction cannot safely stream overlapping locations",
+                });
+            }
+            previous_source_end = source_end;
+            records_end = target_end;
+        }
         let high_water_end = records_end
             .checked_add(Self::checked_record_total_len_u64(
                 sequence_high_water_payload.len() as u64,
@@ -8222,20 +8224,64 @@ impl LocalObjectStore {
         let mut tombstone_locations: BTreeMap<ObjectKey, ObjectLocation> = BTreeMap::new();
 
         let compact_result = (|| -> Result<()> {
-            for (key, old_location, payload, compression_algorithm) in &retained_records {
+            let mut retained_locations = retained_locations.into_iter().peekable();
+            let mut prefetched_record = None;
+            while let Some(old_location) = retained_locations.next() {
+                let (payload, compression_algorithm) = match prefetched_record.take() {
+                    Some((prefetched_location, payload, compression_algorithm)) => {
+                        if prefetched_location != old_location {
+                            return Err(StoreError::InvalidOptions {
+                                reason: "block-device compaction prefetched the wrong location",
+                            });
+                        }
+                        (payload, compression_algorithm)
+                    }
+                    None => self.read_location_stored_payload(old_location)?,
+                };
+
+                let target_end = self
+                    .current_offset
+                    .checked_add(Self::checked_record_total_len_u64(old_location.payload_len))
+                    .ok_or(StoreError::NoSpace)?;
+                if let Some(next_location) = retained_locations.peek().copied() {
+                    let tail_end = target_end
+                        .checked_add(RECORD_HEADER_LEN_U64)
+                        .ok_or(StoreError::NoSpace)?;
+                    if tail_end > next_location.record_offset {
+                        // append_record_once() closes every block-device
+                        // record with a zero successor header. When retained
+                        // sources are adjacent, that terminator overwrites the
+                        // next old header. Read exactly that one source first;
+                        // the preflight above proves no record body or later
+                        // source can overlap this target.
+                        let (next_payload, next_algorithm) =
+                            self.read_location_stored_payload(next_location)?;
+                        prefetched_record = Some((next_location, next_payload, next_algorithm));
+                    }
+                }
+
+                let key = old_location.key;
                 let new_location = self.append_record_once(
                     RecordKind::Put,
-                    *key,
-                    payload,
+                    key,
+                    &payload,
                     old_location.payload_checksum,
                     old_location.sequence,
-                    *compression_algorithm,
+                    compression_algorithm,
                 )?;
-                compacted_history
-                    .entry(*key)
-                    .or_default()
-                    .push(new_location);
-                relocated_locations.insert(*old_location, new_location);
+                let (rewritten_payload, rewritten_algorithm) =
+                    self.read_location_stored_payload(new_location)?;
+                if rewritten_payload != payload
+                    || rewritten_algorithm != compression_algorithm
+                    || receipt_bound_physical_lifetime_id(key, old_location)
+                        != receipt_bound_physical_lifetime_id(key, new_location)
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "block-device compaction candidate verification failed",
+                    });
+                }
+                compacted_history.entry(key).or_default().push(new_location);
+                relocated_locations.insert(old_location, new_location);
             }
             let high_water_key = physical_lifetime_sequence_high_water_key();
             let high_water_location = self.append_record_once(
@@ -8273,22 +8319,6 @@ impl LocalObjectStore {
                 });
             }
 
-            // Verify every rewritten record before clearing the old tail. No
-            // durability barrier is issued until the blank terminator is also
-            // present.
-            for (key, old_location, expected_payload, expected_algorithm) in &retained_records {
-                let new_location = relocated_locations[old_location];
-                let (payload, algorithm) = self.read_location_stored_payload(new_location)?;
-                if payload != *expected_payload
-                    || algorithm != *expected_algorithm
-                    || receipt_bound_physical_lifetime_id(*key, *old_location)
-                        != receipt_bound_physical_lifetime_id(*key, new_location)
-                {
-                    return Err(StoreError::InvalidOptions {
-                        reason: "block-device compaction candidate verification failed",
-                    });
-                }
-            }
             for (key, location) in &tombstone_locations {
                 self.verify_block_device_delete_record(*key, *location)?;
             }
@@ -11775,6 +11805,65 @@ mod block_device_open_tests {
         let reopened = LocalObjectStore::open_block_device(&image, block_options(record_bytes))
             .expect("reopen block image");
         assert_eq!(reopened.get(key).expect("get reopened"), Some(latest));
+    }
+
+    #[test]
+    fn block_device_streaming_compaction_preserves_adjacent_unread_sources() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let options = block_options(64 * 1024);
+        let mut store =
+            LocalObjectStore::open_block_device_writable_unbound(&image, options.clone())
+                .expect("open block image");
+        let records = (0..8_u8)
+            .map(|index| {
+                (
+                    ObjectKey::from_name(format!("block-device/stream/{index}").as_bytes()),
+                    vec![index; 4096 + usize::from(index)],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (key, payload) in &records {
+            store.put(*key, payload).expect("put adjacent source");
+        }
+        let retained_locations = records
+            .iter()
+            .map(|(key, _)| (*key, store.location_of(*key).expect("source location")))
+            .collect::<Vec<_>>();
+        let mut source_order = retained_locations
+            .iter()
+            .map(|(_, location)| *location)
+            .collect::<Vec<_>>();
+        source_order.sort_by_key(|location| location.record_offset);
+        for pair in source_order.windows(2) {
+            assert_eq!(
+                pair[0].record_offset
+                    + LocalObjectStore::checked_record_total_len_u64(pair[0].payload_len),
+                pair[1].record_offset,
+                "fixture sources must be adjacent so each compacted tail reaches the next header"
+            );
+        }
+
+        store
+            .compact_block_device_locations(retained_locations)
+            .expect("stream adjacent retained records");
+        for (key, payload) in &records {
+            assert_eq!(
+                store.get(*key).expect("read compacted record"),
+                Some(payload.clone())
+            );
+        }
+        drop(store);
+
+        let reopened = LocalObjectStore::open_block_device(&image, options)
+            .expect("reopen streamed block image");
+        for (key, payload) in records {
+            assert_eq!(
+                reopened.get(key).expect("read reopened compacted record"),
+                Some(payload)
+            );
+        }
     }
 
     #[test]
