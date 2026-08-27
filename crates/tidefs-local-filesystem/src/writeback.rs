@@ -129,6 +129,24 @@ impl DirtySet {
         let entry = self.per_inode_bytes.entry(inode_id).or_insert(0);
         *entry = entry.saturating_add(bytes);
     }
+
+    /// Retire current-group data bytes superseded before publication.
+    ///
+    /// Metadata/content dirtiness remains: the destructive mutation still has
+    /// to publish the new inode and extent state. Only the unreachable data
+    /// byte debt is removed.
+    pub fn retire_data_write(&mut self, inode_id: InodeId, bytes: u64) -> u64 {
+        let Some(per_inode) = self.per_inode_bytes.get_mut(&inode_id) else {
+            return 0;
+        };
+        let retired = (*per_inode).min(bytes);
+        *per_inode -= retired;
+        if *per_inode == 0 {
+            self.per_inode_bytes.remove(&inode_id);
+        }
+        self.data_bytes = self.data_bytes.saturating_sub(retired);
+        retired
+    }
     #[allow(dead_code)] // INTENT: writeback/dirty-set types for planned writeback daemon integration
     /// Record a metadata mutation (chmod, chown, utimes, setxattr,
     /// snapshot create, etc.) on `inode_id`.

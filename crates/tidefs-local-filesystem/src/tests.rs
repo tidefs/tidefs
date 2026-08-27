@@ -3024,6 +3024,84 @@ fn overlay_write_defers_soft_target_but_commits_at_hard_maximum() {
 }
 
 #[test]
+fn truncate_retires_superseded_buffered_dirty_debt() {
+    let root = temp_root("truncate-retires-buffered-dirty-debt");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.stop_background_scheduler();
+    let record = fs
+        .create_file("/pressure.bin", 0o644)
+        .expect("create pressure file");
+    fs.sync_all().expect("commit fixture inode");
+    fs.set_auto_commit(false)
+        .expect("disable automatic per-mutation commits");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("retain the open commit group");
+    fs.set_write_buffer_flush_threshold_bytes(64 * 1024 * 1024)
+        .expect("retain buffered content until explicit durability");
+
+    const WRITE_LEN: usize = 8192;
+    const RETAINED_LEN: usize = 1024;
+    fs.commit_group.config.commit_group_target_ops = u64::MAX;
+    fs.commit_group.config.commit_group_target_bytes = u64::MAX;
+    fs.commit_group.config.commit_group_dirty_max_bytes = WRITE_LEN as u64;
+    fs.commit_group.config.commit_group_target_secs = 3600.0;
+    let start_commit_group = fs.commit_group.current_commit_group();
+    let payload = vec![0x6d; WRITE_LEN];
+
+    fs.write_file("/pressure.bin", 0, &payload)
+        .expect("fill the hard dirty-byte boundary");
+    assert!(fs.commit_group.requires_foreground_commit());
+    assert_eq!(
+        fs.take_admission_snapshot()
+            .expect("read admission before truncate")
+            .current_dirty_bytes,
+        WRITE_LEN as u64
+    );
+
+    fs.truncate_file("/pressure.bin", RETAINED_LEN as u64)
+        .expect("truncate buffered suffix without publishing unrelated state");
+
+    assert_eq!(
+        fs.commit_group.current_commit_group(),
+        start_commit_group,
+        "superseded buffered bytes must not force a foreground root publication"
+    );
+    assert_eq!(fs.commit_group.dirty_bytes, RETAINED_LEN as u64);
+    assert!(!fs.commit_group.requires_foreground_commit());
+    assert_eq!(fs.filesystem.dirty_set.data_bytes, RETAINED_LEN as u64);
+    assert_eq!(
+        fs.filesystem
+            .dirty_set
+            .per_inode_bytes
+            .get(&record.inode_id),
+        Some(&(RETAINED_LEN as u64))
+    );
+    assert_eq!(
+        fs.take_admission_snapshot()
+            .expect("read admission after truncate")
+            .current_dirty_bytes,
+        RETAINED_LEN as u64
+    );
+    assert_eq!(
+        fs.read_file("/pressure.bin")
+            .expect("read retained buffered prefix"),
+        payload[..RETAINED_LEN]
+    );
+
+    fs.do_commit().expect("publish retained prefix");
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        reopened
+            .read_file("/pressure.bin")
+            .expect("read retained prefix after reopen"),
+        payload[..RETAINED_LEN]
+    );
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
 fn metadata_mutations_count_once_toward_commit_group_target() {
     let root = temp_root("metadata-mutations-count-once");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");

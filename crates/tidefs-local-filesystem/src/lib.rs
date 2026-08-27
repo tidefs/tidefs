@@ -10506,6 +10506,57 @@ impl PoolDatasetOwner {
         self.filesystem.dataset_capacity.record_free(bytes);
     }
 
+    /// Transfer a suffix that truncate made unreachable out of every
+    /// current-group dirty-byte owner while preserving the still-reachable
+    /// prefix and its original dirty age.
+    fn retire_superseded_buffered_dirty_debt(
+        &mut self,
+        inode_id: InodeId,
+        retired_bytes: u64,
+    ) -> Result<()> {
+        if retired_bytes == 0 {
+            return Ok(());
+        }
+
+        let permit = self.filesystem.pending_permits.remove(&inode_id).ok_or(
+            FileSystemError::CorruptState {
+                reason: "superseded buffered bytes are missing their dirty admission permit",
+            },
+        )?;
+        let shrunk = match self
+            .filesystem
+            .write_admission
+            .try_shrink_dirty_write(permit, retired_bytes)
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                let reason = error.to_string();
+                if let Some(permit) = error.into_permit() {
+                    self.filesystem.pending_permits.insert(inode_id, permit);
+                } else {
+                    self.filesystem.mutation_requires_reopen = true;
+                }
+                return Err(FileSystemError::DirtyAdmissionRejected { reason });
+            }
+        };
+        self.filesystem.pending_permits.insert(inode_id, shrunk);
+
+        let retired = self
+            .filesystem
+            .dirty_set
+            .retire_data_write(inode_id, retired_bytes);
+        if retired != retired_bytes {
+            self.filesystem.mutation_requires_reopen = true;
+            return Err(FileSystemError::CorruptState {
+                reason: "superseded buffered bytes exceed current-group dirty data debt",
+            });
+        }
+        self.filesystem
+            .commit_group
+            .retire_dirty_bytes(retired_bytes);
+        Ok(())
+    }
+
     fn ensure_content_write_not_over_capacity(&self, requested: u64) -> Result<()> {
         let allocated = self.filesystem.dataset_capacity.used_bytes();
         let capacity = self.filesystem.dataset_capacity.total_bytes();
@@ -11879,7 +11930,8 @@ impl PoolDatasetOwner {
         }
         if size < old_effective_size {
             if has_pending_content {
-                let _ = self.truncate_pending_write_buffer_for_inode(inode_id, size);
+                let retired = self.truncate_pending_write_buffer_for_inode(inode_id, size);
+                self.retire_superseded_buffered_dirty_debt(inode_id, retired)?;
             } else {
                 self.truncate_dirty_write_buffer_for_inode(inode_id, size);
             }
