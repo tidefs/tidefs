@@ -96,8 +96,11 @@ impl Default for LocalAdmissionConfig {
             // 256 MiB bounds dirty accumulation without constraining ordinary
             // local workloads to individual write sizes.
             256 * 1024 * 1024,
-            // Bound both accumulated dirty operations and live token storage.
-            4096,
+            // Bound sparse-range metadata without forcing writeback before
+            // the byte cap can do its job. At one live range per 512-byte
+            // sector, the operation and byte caps now cover the same dirty
+            // working set; smaller fragments remain bounded by this count.
+            512 * 1024,
             // Approximately five minutes when the owner advances one tick/s.
             300,
             2048,
@@ -870,6 +873,11 @@ mod tests {
         assert!(config.hard_max_dirty_ops > 0);
         assert!(config.hard_max_dirty_age_ticks > 0);
         assert!(config.hard_max_permits > 0);
+        assert_eq!(
+            u64::from(config.hard_max_dirty_ops) * 512,
+            config.hard_max_dirty_bytes,
+            "the default sparse-range cap must cover the byte cap at sector granularity"
+        );
     }
 
     #[test]
