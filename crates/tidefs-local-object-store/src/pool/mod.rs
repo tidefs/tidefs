@@ -7543,7 +7543,7 @@ impl Pool {
         }
         self.validate_receipt_generation_high_water()?;
 
-        let mut expected_payloads = BTreeMap::<ObjectKey, &[u8]>::new();
+        let mut expected_payloads = BTreeMap::<ObjectKey, (&[u8], IntegrityDigest64)>::new();
         for (key, payload) in entries {
             if crate::is_pool_placement_scan_internal_key(*key)
                 || crate::store::is_pool_pending_deletion_key(*key)
@@ -7554,10 +7554,14 @@ impl Pool {
             }
             match expected_payloads.entry(*key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(*payload);
+                    // The filesystem manifest, raw-store record header and
+                    // Pool fallback all use this same logical-payload
+                    // checksum. Carry it in the existing keyed preflight map
+                    // instead of sorting the batch into a second map.
+                    entry.insert((*payload, crate::store::checksum64(payload)));
                 }
-                std::collections::btree_map::Entry::Occupied(entry) if *entry.get() == *payload => {
-                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get().0 == *payload => {}
                 std::collections::btree_map::Entry::Occupied(_) => {
                     return Err(StoreError::InvalidOptions {
                         reason: "prepublication batch repeats a key with different payload",
@@ -7565,17 +7569,9 @@ impl Pool {
                 }
             }
         }
-        // The filesystem manifest, raw-store record header and Pool fallback
-        // all use this same logical-payload checksum. Compute it once per
-        // unique batch object and carry the value through publication.
-        let expected_checksums = expected_payloads
-            .iter()
-            .map(|(&key, &payload)| (key, crate::store::checksum64(payload)))
-            .collect::<BTreeMap<_, _>>();
-
         let mut expected_receipts = BTreeMap::new();
         let mut absent = Vec::new();
-        for (&key, &payload) in &expected_payloads {
+        for (&key, &(payload, payload_checksum)) in &expected_payloads {
             if self.pending_deletion_for_subject(class, key).is_some() {
                 return Err(StoreError::InvalidOptions {
                     reason: "prepublication batch refuses pending deletion state",
@@ -7598,7 +7594,7 @@ impl Pool {
                         payload.len(),
                         &authority_indices,
                     )?;
-                    absent.push((key, payload, expected_checksums[&key], placement));
+                    absent.push((key, payload, payload_checksum, placement));
                 }
             }
         }
@@ -7666,7 +7662,7 @@ impl Pool {
             }
         }
         let readback_result = (|| {
-            for (&key, &payload) in &expected_payloads {
+            for (&key, &(payload, _payload_checksum)) in &expected_payloads {
                 if newly_staged.contains(&key) {
                     let receipt =
                         expected_receipts
@@ -7711,7 +7707,7 @@ impl Pool {
                             .ok_or(StoreError::InvalidOptions {
                                 reason: "prepublication batch lost an expected placement receipt",
                             })?;
-                    Ok((receipt, expected_checksums[key]))
+                    Ok((receipt, expected_payloads[key].1))
                 })
                 .collect()
         })();

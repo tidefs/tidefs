@@ -577,6 +577,14 @@ impl ObjectKey {
 }
 
 #[derive(Debug)]
+struct PrepublicationReadbackRecord {
+    location: ObjectLocation,
+    payload_start: usize,
+    payload_end: usize,
+    compression_algorithm: u8,
+}
+
+#[derive(Debug)]
 pub struct LocalObjectStore {
     root: PathBuf,
     segments_dir: PathBuf,
@@ -704,7 +712,11 @@ pub struct LocalObjectStore {
     /// record before readback; it is outside the indexed batch records.
     prepublication_readback_range: Option<(u64, usize)>,
     prepublication_readback_bytes: Vec<u8>,
-    prepublication_readback_records: BTreeMap<ObjectLocation, (usize, usize, u8)>,
+    /// Records decoded from `prepublication_readback_bytes`, in their exact
+    /// monotonically increasing physical-offset order. A binary search by
+    /// offset followed by full `ObjectLocation` equality preserves physical
+    /// identity without rebuilding the append stream as another ordered tree.
+    prepublication_readback_records: Vec<PrepublicationReadbackRecord>,
     prepublication_tail_verification_deferred: bool,
     #[cfg(test)]
     block_device_tail_terminator_verifications: u64,
@@ -2355,7 +2367,7 @@ impl LocalObjectStore {
             prepublication_append_bytes: Vec::new(),
             prepublication_readback_range: None,
             prepublication_readback_bytes: Vec::new(),
-            prepublication_readback_records: BTreeMap::new(),
+            prepublication_readback_records: Vec::new(),
             prepublication_tail_verification_deferred: false,
             #[cfg(test)]
             block_device_tail_terminator_verifications: 0,
@@ -2706,7 +2718,7 @@ impl LocalObjectStore {
             prepublication_append_bytes: Vec::new(),
             prepublication_readback_range: None,
             prepublication_readback_bytes: Vec::new(),
-            prepublication_readback_records: BTreeMap::new(),
+            prepublication_readback_records: Vec::new(),
             prepublication_tail_verification_deferred: false,
             #[cfg(test)]
             block_device_tail_terminator_verifications: 0,
@@ -6164,7 +6176,7 @@ impl LocalObjectStore {
         &self,
         start: u64,
         len: usize,
-    ) -> Result<BTreeMap<ObjectLocation, (usize, usize, u8)>> {
+    ) -> Result<Vec<PrepublicationReadbackRecord>> {
         let records_len = len
             .checked_sub(RECORD_HEADER_LEN)
             .ok_or(StoreError::InvalidOptions {
@@ -6179,7 +6191,7 @@ impl LocalObjectStore {
             .ok_or(StoreError::InvalidOptions {
                 reason: "prepublication record range overflows u64",
             })?;
-        let mut records = BTreeMap::new();
+        let mut records = Vec::new();
         let mut relative = 0usize;
         while relative < records_len {
             let record_offset = start
@@ -6332,18 +6344,23 @@ impl LocalObjectStore {
                 payload_checksum: header.payload_checksum,
             };
             if records
-                .insert(
-                    location,
-                    (payload_start, payload_end, header.compression_algorithm),
-                )
-                .is_some()
+                .last()
+                .is_some_and(|previous: &PrepublicationReadbackRecord| {
+                    previous.location.record_offset >= location.record_offset
+                })
             {
                 return Err(StoreError::CorruptHeader {
                     segment_id: self.current_segment_id,
                     offset: record_offset,
-                    reason: "prepublication readback repeats a physical record identity",
+                    reason: "prepublication readback record offsets are not strictly increasing",
                 });
             }
+            records.push(PrepublicationReadbackRecord {
+                location,
+                payload_start,
+                payload_end,
+                compression_algorithm: header.compression_algorithm,
+            });
             relative = relative_offset(range.end_offset)?;
         }
         if relative != records_len {
@@ -6354,6 +6371,21 @@ impl LocalObjectStore {
             });
         }
         Ok(records)
+    }
+
+    fn prepublication_readback_record(
+        &self,
+        location: ObjectLocation,
+    ) -> Option<&PrepublicationReadbackRecord> {
+        let index = self
+            .prepublication_readback_records
+            .binary_search_by_key(&location.record_offset, |record| {
+                record.location.record_offset
+            })
+            .ok()?;
+        self.prepublication_readback_records
+            .get(index)
+            .filter(|record| record.location == location)
     }
 
     /// Compare one untransformed payload against the exact persisted bytes
@@ -6377,17 +6409,15 @@ impl LocalObjectStore {
             .ok_or(StoreError::InvalidOptions {
                 reason: "prepublication batch readback lost its payload location",
             })?;
-        let Some(&(payload_start, payload_end, compression_algorithm)) =
-            self.prepublication_readback_records.get(&location)
-        else {
+        let Some(record) = self.prepublication_readback_record(location) else {
             return Ok(false);
         };
-        if compression_algorithm != 0 {
+        if record.compression_algorithm != 0 {
             return Ok(false);
         }
         let persisted = self
             .prepublication_readback_bytes
-            .get(payload_start..payload_end)
+            .get(record.payload_start..record.payload_end)
             .ok_or(StoreError::CorruptHeader {
                 segment_id: location.segment_id,
                 offset: location.record_offset,
@@ -8983,19 +9013,17 @@ impl LocalObjectStore {
                 .block_device_capacity
                 .unwrap_or(0)
                 .saturating_sub(POOL_LABEL_SIZE as u64);
-            if let Some(&(payload_start, payload_end, compression_algorithm)) =
-                self.prepublication_readback_records.get(&location)
-            {
+            if let Some(record) = self.prepublication_readback_record(location) {
                 let payload = self
                     .prepublication_readback_bytes
-                    .get(payload_start..payload_end)
+                    .get(record.payload_start..record.payload_end)
                     .ok_or(StoreError::CorruptHeader {
                         segment_id: location.segment_id,
                         offset: location.record_offset,
                         reason: "indexed prepublication payload is outside its readback range",
                     })?
                     .to_vec();
-                return Ok((payload, compression_algorithm));
+                return Ok((payload, record.compression_algorithm));
             }
             let mut header = [0_u8; RECORD_HEADER_LEN];
             self.current_file
