@@ -2150,6 +2150,97 @@ fn unlink_of_buffered_dirty_file_releases_dirty_capacity() {
 }
 
 #[test]
+fn unlink_last_link_discards_buffer_without_pool_materialization() {
+    let root = temp_root("unlink-last-link-discards-buffer");
+    let data_len = content_chunk_size() as usize;
+    let mut fs =
+        LocalFileSystem::open_with_capacity(&root, StoreOptions::test_fast(), data_len as u64)
+            .expect("open fs");
+    fs.stop_background_scheduler();
+    let inode_id = fs
+        .create_file("/dirty.bin", 0o600)
+        .expect("create dirty file")
+        .inode_id;
+    fs.write_file("/dirty.bin", 0, &vec![0x17; data_len])
+        .expect("seed committed content");
+    fs.sync_all().expect("commit seed content");
+    let committed = fs.stat("/dirty.bin").expect("stat committed file");
+    let committed_manifest = ReclaimObjectKey(
+        *content_object_key_for_version(inode_id, committed.data_version).as_bytes(),
+    );
+
+    fs.set_auto_commit(false).expect("defer last-link mutation");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("retain the open commit group");
+    fs.set_write_buffer_flush_threshold_bytes(data_len * 8)
+        .expect("retain the replacement in memory");
+    fs.commit_group.config.commit_group_target_ops = u64::MAX;
+    fs.commit_group.config.commit_group_target_bytes = u64::MAX;
+    fs.commit_group.config.commit_group_dirty_max_bytes = data_len as u64 - 1;
+    fs.commit_group.config.commit_group_target_secs = 3600.0;
+    let start_commit_group = fs.commit_group.current_commit_group();
+
+    fs.write_file("/dirty.bin", 0, &vec![0x83; data_len])
+        .expect("buffer unreachable replacement");
+    let pending = fs.stat("/dirty.bin").expect("stat pending file");
+    let pending_key = content_object_key_for_version(inode_id, pending.data_version);
+    assert!(fs
+        .store
+        .pool()
+        .get(DeviceIoClass::Data, pending_key)
+        .expect("inspect pending content identity")
+        .is_none());
+    assert!(fs.commit_group.requires_foreground_commit());
+
+    fs.unlink("/dirty.bin")
+        .expect("last-link unlink must discard pending content");
+
+    assert_eq!(
+        fs.commit_group.current_commit_group(),
+        start_commit_group,
+        "unreachable dirty bytes must not force root publication"
+    );
+    assert!(!fs.commit_group.requires_foreground_commit());
+    assert!(fs
+        .store
+        .pool()
+        .get(DeviceIoClass::Data, pending_key)
+        .expect("inspect discarded content identity")
+        .is_none());
+    assert!(fs
+        .reclaim_queue
+        .lock()
+        .unwrap()
+        .entries()
+        .into_iter()
+        .any(|(key, _)| key == committed_manifest));
+    assert!(!fs.write_buffers.contains_key(&inode_id));
+    assert!(!fs
+        .filesystem
+        .buffered_write_base_records
+        .contains_key(&inode_id));
+    assert!(!fs.filesystem.pending_permits.contains_key(&inode_id));
+    assert_eq!(fs.capacity_authority().used_bytes(), 0);
+    assert_eq!(fs.capacity_authority().pending_bytes(), 0);
+    let admission = fs
+        .take_admission_snapshot()
+        .expect("inspect admission after unlink");
+    assert_eq!(admission.current_dirty_bytes, 0);
+    assert_eq!(admission.current_dirty_ops, 0);
+    assert_eq!(admission.current_outstanding_permits, 0);
+
+    fs.do_commit().expect("publish last-link removal");
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert!(matches!(
+        reopened.stat("/dirty.bin"),
+        Err(FileSystemError::NotFound { .. })
+    ));
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
 fn unlink_of_foreground_flushed_dirty_file_releases_capacity() {
     let root = temp_root("unlink-flushed-dirty-capacity");
     let data_len = content_chunk_size() as usize;

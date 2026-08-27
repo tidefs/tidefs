@@ -6151,20 +6151,21 @@ impl PoolDatasetOwner {
     /// For full-inode deletion (nlink reaches 0), also inserts per-chunk
     /// keys via `content_chunk_object_key_for_version()`.
     fn record_reclaim_delta(&mut self, inode_id: InodeId, _freed_bytes: u64) {
-        let record = self.filesystem.state.inodes.get(&inode_id).cloned();
-        if record
-            .as_ref()
-            .is_some_and(|record| record.nlink == 0 && record.size == 0)
-        {
-            return;
-        }
-        let Some(record) = record else {
+        let Some(record) = self.filesystem.state.inodes.get(&inode_id).cloned() else {
             return;
         };
+        self.record_reclaim_delta_for_record(&record);
+    }
+
+    fn record_reclaim_delta_for_record(&mut self, record: &InodeRecord) {
+        if record.nlink == 0 && record.size == 0 {
+            return;
+        }
+        let inode_id = record.inode_id;
         let include_chunks = record.nlink == 0;
         let entries = match inode_content_reclaim_entries(
             self.store.pool(),
-            &record,
+            record,
             include_chunks,
             self.object_keyspace(),
         ) {
@@ -12940,7 +12941,6 @@ impl PoolDatasetOwner {
             .ok_or_else(|| FileSystemError::NotFound {
                 path: path_for_error.to_string(),
             })?;
-        self.flush_file_write_buffer_for_entry(&entry)?;
         let record = self.inode(entry.inode_id)?.clone();
         if record.kind() == NodeKind::Dir {
             return Err(FileSystemError::IsDirectory {
@@ -12949,6 +12949,30 @@ impl PoolDatasetOwner {
         }
 
         let was_multilinked = record.nlink > 1;
+        let removes_unreachable_inode = !was_multilinked && !retain_last_link_inode;
+        let discarded_buffer_bytes = if removes_unreachable_inode {
+            self.filesystem
+                .write_buffers
+                .get(&entry.inode_id)
+                .map_or(0, |buffer| buffer.buffered_bytes() as u64)
+        } else {
+            self.flush_file_write_buffer_for_entry(&entry)?;
+            0
+        };
+        // An accepted buffered content version is visible in the live inode
+        // before its objects become Pool-readable. Last-link removal with no
+        // live handle makes that version unreachable, so reclaim only the
+        // last materialized base instead of writing the pending version solely
+        // to delete it.
+        let mut reclaim_record = if removes_unreachable_inode {
+            self.filesystem
+                .buffered_write_base_records
+                .get(&entry.inode_id)
+                .cloned()
+                .unwrap_or_else(|| record.clone())
+        } else {
+            record.clone()
+        };
         let mut orphan_md_permit = if was_multilinked {
             None
         } else {
@@ -12979,12 +13003,20 @@ impl PoolDatasetOwner {
                     .accumulate_delta(SpaceDelta::new_punch_hole(logical_free, reserved_free));
             }
             let physical_free = data_bytes.saturating_add(reserved_bytes);
-            if physical_free > 0 {
+            // `forget_removed_inode_state` returns the buffered component.
+            // Account the remaining live extents here so the whole inode is
+            // freed exactly once even when its newest data never reached the
+            // Pool.
+            let materialized_or_reserved_free =
+                physical_free.saturating_sub(discarded_buffer_bytes);
+            if materialized_or_reserved_free > 0 {
                 self.filesystem
                     .state
                     .space_accounting
-                    .track_physical_free(physical_free);
-                self.filesystem.dataset_capacity.record_free(physical_free);
+                    .track_physical_free(materialized_or_reserved_free);
+                self.filesystem
+                    .dataset_capacity
+                    .record_free(materialized_or_reserved_free);
             }
         }
         // Re-verify parent exists after lock acquisition
@@ -13067,7 +13099,8 @@ impl PoolDatasetOwner {
             if retain_last_link_inode {
                 return self.commit_mutation(());
             }
-            self.record_reclaim_delta(entry.inode_id, record.size);
+            reclaim_record.nlink = 0;
+            self.record_reclaim_delta_for_record(&reclaim_record);
             self.record_inode_tombstone(entry.inode_id);
             // Clear extended attributes before removing the inode record.
             // Although the entire InodeRecord (which owns xattrs) is removed,
@@ -13082,7 +13115,11 @@ impl PoolDatasetOwner {
             Arc::make_mut(&mut self.filesystem.state.inodes).remove(&entry.inode_id);
             self.forget_removed_inode_state(entry.inode_id);
         }
-        self.commit_mutation(())
+        self.commit_mutation(())?;
+        if removes_unreachable_inode {
+            self.release_removed_inode_dirty_permit(entry.inode_id)?;
+        }
+        Ok(())
     }
 
     fn account_final_orphan_release(&mut self, record: &InodeRecord) {
@@ -16441,6 +16478,22 @@ impl PoolDatasetOwner {
         self.release_pending_permits()
     }
 
+    fn release_removed_inode_dirty_permit(&mut self, inode_id: InodeId) -> Result<()> {
+        let Some(permit) = self.filesystem.pending_permits.remove(&inode_id) else {
+            return Ok(());
+        };
+        if let Err(error) = self.filesystem.write_admission.release(permit) {
+            let reason = error.to_string();
+            if let Some(permit) = error.into_permit() {
+                self.filesystem.pending_permits.insert(inode_id, permit);
+            } else {
+                self.filesystem.mutation_requires_reopen = true;
+            }
+            return Err(FileSystemError::DirtyAdmissionRejected { reason });
+        }
+        Ok(())
+    }
+
     fn forget_removed_inode_state(&mut self, inode_id: InodeId) {
         self.snapshot_write_buffers_for_rollback();
         let freed = self
@@ -16475,7 +16528,17 @@ impl PoolDatasetOwner {
         self.filesystem
             .obligation_ledger
             .release_claims_for_inode(inode_id);
+        let retired_dirty_bytes = self
+            .filesystem
+            .dirty_set
+            .per_inode_bytes
+            .get(&inode_id)
+            .copied()
+            .unwrap_or(0);
         self.filesystem.dirty_set.forget_inode(inode_id);
+        self.filesystem
+            .commit_group
+            .retire_dirty_bytes(retired_dirty_bytes);
         self.filesystem
             .inode_cache
             .borrow_mut()
