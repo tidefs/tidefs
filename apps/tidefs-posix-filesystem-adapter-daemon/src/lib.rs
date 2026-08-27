@@ -1394,6 +1394,8 @@ struct MountedLocalReclaimService {
     pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
     engine: live_owner::LiveOwnerEngine,
     foreground_demand: Arc<AtomicBool>,
+    foreground_activity_epoch: Arc<AtomicU64>,
+    idle_gate: Mutex<MountedMaintenanceIdleGate>,
     retry_not_before: std::time::Instant,
 }
 
@@ -1402,16 +1404,16 @@ struct MountedCommitGroupService {
     engine: live_owner::LiveOwnerEngine,
     foreground_demand: Arc<AtomicBool>,
     foreground_activity_epoch: Arc<AtomicU64>,
-    idle_gate: Mutex<MountedCommitGroupIdleGate>,
+    idle_gate: Mutex<MountedMaintenanceIdleGate>,
 }
 
 #[derive(Debug)]
-struct MountedCommitGroupIdleGate {
+struct MountedMaintenanceIdleGate {
     activity_epoch: u64,
     quiet_since: std::time::Instant,
 }
 
-impl MountedCommitGroupIdleGate {
+impl MountedMaintenanceIdleGate {
     fn new(activity_epoch: u64, now: std::time::Instant) -> Self {
         Self {
             activity_epoch,
@@ -1449,7 +1451,7 @@ impl MountedCommitGroupService {
             engine,
             foreground_demand,
             foreground_activity_epoch,
-            idle_gate: Mutex::new(MountedCommitGroupIdleGate::new(
+            idle_gate: Mutex::new(MountedMaintenanceIdleGate::new(
                 activity_epoch,
                 std::time::Instant::now(),
             )),
@@ -1573,13 +1575,39 @@ impl MountedLocalReclaimService {
         pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
         engine: live_owner::LiveOwnerEngine,
         foreground_demand: Arc<AtomicBool>,
+        foreground_activity_epoch: Arc<AtomicU64>,
     ) -> Self {
+        let activity_epoch = foreground_activity_epoch.load(Ordering::Acquire);
         Self {
             pool_owner,
             engine,
             foreground_demand,
+            foreground_activity_epoch,
+            idle_gate: Mutex::new(MountedMaintenanceIdleGate::new(
+                activity_epoch,
+                std::time::Instant::now(),
+            )),
             retry_not_before: std::time::Instant::now(),
         }
+    }
+
+    fn has_stable_idle_window(&self) -> bool {
+        if self.foreground_demand.load(Ordering::Acquire) {
+            return false;
+        }
+        let activity_epoch = self.foreground_activity_epoch.load(Ordering::Acquire);
+        let admitted = self
+            .idle_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admits(
+                activity_epoch,
+                std::time::Instant::now(),
+                MOUNT_BACKGROUND_IDLE_INTERVAL,
+            );
+        admitted
+            && !self.foreground_demand.load(Ordering::Acquire)
+            && self.foreground_activity_epoch.load(Ordering::Acquire) == activity_epoch
     }
 
     fn item_limit(budget: &ServiceBudget) -> usize {
@@ -1603,7 +1631,7 @@ impl BackgroundService for MountedLocalReclaimService {
     }
 
     fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
-        if self.foreground_demand.load(Ordering::Acquire) {
+        if !self.has_stable_idle_window() {
             return Ok(TickReport {
                 skipped: 1,
                 has_more: true,
@@ -1626,7 +1654,7 @@ impl BackgroundService for MountedLocalReclaimService {
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
 
-        if self.foreground_demand.load(Ordering::Acquire) {
+        if !self.has_stable_idle_window() {
             return Ok(TickReport {
                 skipped: 1,
                 has_more: true,
@@ -1635,7 +1663,12 @@ impl BackgroundService for MountedLocalReclaimService {
         }
 
         let foreground_demand = Arc::clone(&self.foreground_demand);
-        let mut should_preempt = || foreground_demand.load(Ordering::Acquire);
+        let foreground_activity_epoch = Arc::clone(&self.foreground_activity_epoch);
+        let selected_activity_epoch = foreground_activity_epoch.load(Ordering::Acquire);
+        let mut should_preempt = || {
+            foreground_demand.load(Ordering::Acquire)
+                || foreground_activity_epoch.load(Ordering::Acquire) != selected_activity_epoch
+        };
         let reclaim = self
             .pool_owner
             .try_tick_background_services_until(Self::item_limit(budget), &mut should_preempt)
@@ -1681,7 +1714,7 @@ impl BackgroundService for MountedLocalReclaimService {
         if std::time::Instant::now() < self.retry_not_before {
             return false;
         }
-        if self.foreground_demand.load(Ordering::Acquire) {
+        if !self.has_stable_idle_window() {
             return false;
         }
 
@@ -1704,7 +1737,7 @@ mod mounted_local_reclaim_service_tests {
     fn mounted_commit_group_idle_gate_requires_a_complete_quiet_interval() {
         let started = std::time::Instant::now();
         let interval = std::time::Duration::from_millis(500);
-        let mut gate = MountedCommitGroupIdleGate::new(7, started);
+        let mut gate = MountedMaintenanceIdleGate::new(7, started);
 
         assert!(!gate.admits(7, started + interval / 2, interval));
         assert!(gate.admits(7, started + interval, interval));
@@ -1761,10 +1794,12 @@ mod mounted_local_reclaim_service_tests {
             }));
         let engine = adapter.engine_handle();
         let foreground_demand = adapter.foreground_demand_signal();
+        let foreground_activity_epoch = adapter.foreground_activity_epoch();
         adapter.register_background_service(Box::new(MountedLocalReclaimService::new(
             pool_owner.clone(),
             engine,
             foreground_demand,
+            foreground_activity_epoch,
         )));
         let scheduler = adapter.background_scheduler_handle();
         let depth_before = pool_owner.borrow().reclaim_queue_depth();
@@ -1811,6 +1846,17 @@ mod mounted_local_reclaim_service_tests {
         assert_eq!(pool_owner.borrow().reclaim_queue_depth(), depth_before);
 
         drop(second_request);
+        assert!(
+            scheduler
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .tick_if_idle()
+                .is_none(),
+            "reclaim must not start in the first gap after foreground demand"
+        );
+        std::thread::sleep(MOUNT_BACKGROUND_IDLE_INTERVAL + std::time::Duration::from_millis(50));
         let report = scheduler
             .lock()
             .unwrap()
@@ -2408,12 +2454,13 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             shared_pool_owner.clone(),
             Arc::clone(&live_owner_engine),
             Arc::clone(&foreground_demand),
-            foreground_activity_epoch,
+            Arc::clone(&foreground_activity_epoch),
         )));
         adapter.register_background_service(Box::new(MountedLocalReclaimService::new(
             shared_pool_owner.clone(),
             Arc::clone(&live_owner_engine),
             foreground_demand,
+            foreground_activity_epoch,
         )));
     }
     let background_scheduler = if effective_mode.read_only {
