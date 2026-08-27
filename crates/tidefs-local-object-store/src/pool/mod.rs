@@ -50,9 +50,9 @@ use crate::device_manager::{DeviceManager, SparePolicy};
 use crate::io_scheduler::IoClass as SchedClass;
 use crate::log_device::{LogDeviceWriter, LOG_DEVICE_HEADER_SIZE};
 use crate::{
-    BlockStoreBootstrapInspection, BlockStoreIdentity, LocalObjectStore, ObjectKey, ObjectLocation,
-    Result, ScrubStats, StoreError, StoreOptions, StoreRetentionCompactionReport, StoreStats,
-    StoredObject,
+    BlockStoreBootstrapInspection, BlockStoreIdentity, IntegrityDigest64, LocalObjectStore,
+    ObjectKey, ObjectLocation, Result, ScrubStats, StoreError, StoreOptions,
+    StoreRetentionCompactionReport, StoreStats, StoredObject,
 };
 use tidefs_block_allocator::{BlockAllocator, BlockId, TrimRequest};
 use tidefs_durability_layout::{
@@ -6315,6 +6315,7 @@ impl Pool {
                 &authority_indices,
                 &mut receipt,
                 durability,
+                None,
             ),
             PoolRedundancyPolicy::Erasure { .. } => self.put_erasure_with_receipt(
                 key,
@@ -6322,6 +6323,7 @@ impl Pool {
                 &authority_indices,
                 &mut receipt,
                 durability,
+                None,
             ),
         }?;
 
@@ -6378,6 +6380,7 @@ impl Pool {
         &mut self,
         key: ObjectKey,
         payload: &[u8],
+        payload_checksum: IntegrityDigest64,
         authority_indices: &[usize],
         mut receipt: PlacementReceipt,
     ) -> Result<(StoredObject, PlacementReceipt)> {
@@ -6402,6 +6405,7 @@ impl Pool {
                 authority_indices,
                 &mut receipt,
                 ReceiptPublicationDurability::PreflightedAbsentBatch,
+                Some(payload_checksum),
             ),
             PoolRedundancyPolicy::Erasure { .. } => self.put_erasure_with_receipt(
                 key,
@@ -6409,6 +6413,7 @@ impl Pool {
                 authority_indices,
                 &mut receipt,
                 ReceiptPublicationDurability::PreflightedAbsentBatch,
+                Some(payload_checksum),
             ),
         }?;
         Ok((stored, receipt))
@@ -6428,6 +6433,7 @@ impl Pool {
             indices,
             receipt,
             ReceiptPublicationDurability::Immediate,
+            None,
         )
     }
 
@@ -6438,6 +6444,7 @@ impl Pool {
         indices: &[usize],
         receipt: &mut PlacementReceipt,
         durability: ReceiptPublicationDurability,
+        precomputed_checksum: Option<IntegrityDigest64>,
     ) -> Result<StoredObject> {
         let target_indices: Vec<(usize, usize)> = receipt
             .targets
@@ -6469,7 +6476,11 @@ impl Pool {
             let result = match durability {
                 ReceiptPublicationDurability::Immediate => self.devices[idx].put(key, payload),
                 ReceiptPublicationDurability::PreflightedAbsentBatch => {
-                    self.devices[idx].put_prepublication(key, payload)
+                    match precomputed_checksum {
+                        Some(checksum) => self.devices[idx]
+                            .put_prepublication_with_checksum(key, payload, checksum),
+                        None => self.devices[idx].put_prepublication(key, payload),
+                    }
                 }
             };
             self.record_device_write_result(idx, payload.len(), &result);
@@ -6507,11 +6518,11 @@ impl Pool {
         }
         self.health = compute_health(&self.devices);
         self.record_health_transitions();
-        Ok(last_object.unwrap_or(StoredObject {
+        Ok(last_object.unwrap_or_else(|| StoredObject {
             key,
             sequence: 0,
             len: payload.len() as u64,
-            checksum: crate::store::checksum64(payload),
+            checksum: precomputed_checksum.unwrap_or_else(|| crate::store::checksum64(payload)),
         }))
     }
 
@@ -6523,6 +6534,7 @@ impl Pool {
         indices: &[usize],
         receipt: &mut PlacementReceipt,
         durability: ReceiptPublicationDurability,
+        precomputed_checksum: Option<IntegrityDigest64>,
     ) -> Result<StoredObject> {
         let PoolRedundancyPolicy::Erasure {
             data_shards,
@@ -6630,7 +6642,7 @@ impl Pool {
             key,
             sequence: 0,
             len: payload.len() as u64,
-            checksum: crate::store::checksum64(payload),
+            checksum: precomputed_checksum.unwrap_or_else(|| crate::store::checksum64(payload)),
         })
     }
 
@@ -6642,6 +6654,7 @@ impl Pool {
         _indices: &[usize],
         _receipt: &mut PlacementReceipt,
         _durability: ReceiptPublicationDurability,
+        _precomputed_checksum: Option<IntegrityDigest64>,
     ) -> Result<StoredObject> {
         Err(StoreError::InvalidOptions {
             reason: "erasure pool operation requires the distributed-repair feature",
@@ -7420,23 +7433,50 @@ impl Pool {
             });
         }
 
-        let payload =
-            self.get_with_receipt_strict(expected_receipt)?
-                .ok_or(StoreError::InvalidOptions {
-                    reason: "prepublication batch readback could not recover its expected payload",
-                })?;
         let expected_len = usize::try_from(expected_receipt.payload_len).map_err(|_| {
             StoreError::InvalidOptions {
                 reason: "prepublication batch receipt payload length exceeds platform usize",
             }
         })?;
-        if payload.as_slice() != expected_payload
-            || payload.len() != expected_len
-            || digest32(&payload) != expected_receipt.payload_digest
-        {
+        if expected_payload.len() != expected_len {
             return Err(StoreError::InvalidOptions {
-                reason: "prepublication batch readback changed its expected payload",
+                reason: "prepublication batch expected payload length changed after staging",
             });
+        }
+
+        let mut verified_persisted_targets = matches!(
+            expected_receipt.policy,
+            PoolRedundancyPolicy::Replicated { .. }
+        );
+        if verified_persisted_targets {
+            for target in &expected_receipt.targets {
+                if target.stored_digest != expected_receipt.payload_digest {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "prepublication batch receipt target digest changed after staging",
+                    });
+                }
+                let idx =
+                    self.resolve_receipt_target(target)
+                        .ok_or(StoreError::InvalidOptions {
+                            reason: "prepublication batch could not resolve its persisted target",
+                        })?;
+                if !self.devices[idx].verify_prepublication_batch_payload(key, expected_payload)? {
+                    verified_persisted_targets = false;
+                    break;
+                }
+            }
+        }
+        if !verified_persisted_targets {
+            let payload = self.get_with_receipt_strict(expected_receipt)?.ok_or(
+                StoreError::InvalidOptions {
+                    reason: "prepublication batch readback could not recover its expected payload",
+                },
+            )?;
+            if payload.as_slice() != expected_payload || payload.len() != expected_len {
+                return Err(StoreError::InvalidOptions {
+                    reason: "prepublication batch readback changed its expected payload",
+                });
+            }
         }
 
         let current = map_strict_read_object_io(
@@ -7451,11 +7491,18 @@ impl Pool {
         self.verify_strict_receipt_target_copies(expected_receipt)
     }
 
+    fn sync_prepublication_batch(&mut self, authority_indices: &[usize]) -> Result<()> {
+        for &idx in authority_indices {
+            self.devices[idx].sync_prepublication_batch()?;
+        }
+        Ok(())
+    }
+
     fn put_prepublication_batch_with_receipts(
         &mut self,
         class: IoClass,
         entries: &[(ObjectKey, &[u8])],
-    ) -> Result<Vec<PlacementReceipt>> {
+    ) -> Result<Vec<(PlacementReceipt, IntegrityDigest64)>> {
         let operation = match class {
             IoClass::Data => "pool prepublication data batch",
             IoClass::Metadata => "pool prepublication metadata batch",
@@ -7518,6 +7565,13 @@ impl Pool {
                 }
             }
         }
+        // The filesystem manifest, raw-store record header and Pool fallback
+        // all use this same logical-payload checksum. Compute it once per
+        // unique batch object and carry the value through publication.
+        let expected_checksums = expected_payloads
+            .iter()
+            .map(|(&key, &payload)| (key, crate::store::checksum64(payload)))
+            .collect::<BTreeMap<_, _>>();
 
         let mut expected_receipts = BTreeMap::new();
         let mut absent = Vec::new();
@@ -7544,7 +7598,7 @@ impl Pool {
                         payload.len(),
                         &authority_indices,
                     )?;
-                    absent.push((key, payload, placement));
+                    absent.push((key, payload, expected_checksums[&key], placement));
                 }
             }
         }
@@ -7557,7 +7611,7 @@ impl Pool {
             }
 
             let mut stage_error = None;
-            for (key, payload, placement) in absent {
+            for (key, payload, payload_checksum, placement) in absent {
                 let result = (|| {
                     if matches!(class, IoClass::Data) {
                         self.check_write_admission(class, payload.len() as u64)?;
@@ -7565,6 +7619,7 @@ impl Pool {
                     self.put_preflighted_absent_pool_wide(
                         key,
                         payload,
+                        payload_checksum,
                         &authority_indices,
                         placement,
                     )
@@ -7588,15 +7643,15 @@ impl Pool {
                 }
             }
             if let Some(error) = stage_error.or(tail_error) {
-                return match self.sync_all() {
+                return match self.sync_prepublication_batch(&authority_indices) {
                     Ok(()) => Err(error),
                     Err(sync_error) => Err(sync_error),
                 };
             }
         }
 
-        self.sync_all()?;
         if !newly_staged.is_empty() {
+            self.sync_prepublication_batch(&authority_indices)?;
             let mut readback_error = None;
             for &idx in &authority_indices {
                 if let Err(error) = self.devices[idx].load_prepublication_batch_readback() {
@@ -7649,12 +7704,14 @@ impl Pool {
             entries
                 .iter()
                 .map(|(key, _payload)| {
-                    expected_receipts
-                        .get(key)
-                        .cloned()
-                        .ok_or(StoreError::InvalidOptions {
-                            reason: "prepublication batch lost an expected placement receipt",
-                        })
+                    let receipt =
+                        expected_receipts
+                            .get(key)
+                            .cloned()
+                            .ok_or(StoreError::InvalidOptions {
+                                reason: "prepublication batch lost an expected placement receipt",
+                            })?;
+                    Ok((receipt, expected_checksums[key]))
                 })
                 .collect()
         })();
@@ -7705,6 +7762,12 @@ impl Pool {
             .map(|(key, payload)| (*key, payload.as_slice()))
             .collect::<Vec<_>>();
         self.put_prepublication_batch_with_receipts(IoClass::Data, &borrowed)
+            .map(|published| {
+                published
+                    .into_iter()
+                    .map(|(receipt, _checksum)| receipt)
+                    .collect()
+            })
     }
 
     /// Ensure one deterministic pre-publication data object has current
@@ -12021,6 +12084,22 @@ impl<'a> PoolStoreMut<'a> {
         &mut self,
         entries: &[(ObjectKey, &[u8])],
     ) -> Result<Vec<PlacementReceipt>> {
+        self.pool
+            .put_prepublication_batch_with_receipts(IoClass::Data, entries)
+            .map(|published| {
+                published
+                    .into_iter()
+                    .map(|(receipt, _checksum)| receipt)
+                    .collect()
+            })
+    }
+
+    /// Durably publish immutable data objects and return both their exact
+    /// placement receipts and logical-payload checksums in input order.
+    pub fn put_prepublication_data_batch_with_checksums(
+        &mut self,
+        entries: &[(ObjectKey, &[u8])],
+    ) -> Result<Vec<(PlacementReceipt, IntegrityDigest64)>> {
         self.pool
             .put_prepublication_batch_with_receipts(IoClass::Data, entries)
     }

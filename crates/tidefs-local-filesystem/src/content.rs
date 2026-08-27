@@ -36,6 +36,11 @@ use crate::object_keys::{
 use crate::types::*;
 use crate::{ContentChunkObject, ContentChunkRef, ContentLayout, ContentManifestObject, Result};
 
+pub(crate) struct PrepublicationContentReceipt {
+    receipt: PlacementReceipt,
+    checksum: IntegrityDigest64,
+}
+
 /// Trait abstracting content-store I/O so that mutation functions can accept
 /// either a receipt-producing [`PoolStoreMut`] (VFS write path) or a raw
 /// [`LocalObjectStore`] (transaction serialisation path). Pool-backed reads
@@ -69,10 +74,14 @@ pub(crate) trait ContentWriteStore {
     fn put_prepublication_batch_with_receipts(
         &mut self,
         entries: &[(ObjectKey, &[u8])],
-    ) -> Result<Vec<PlacementReceipt>> {
+    ) -> Result<Vec<PrepublicationContentReceipt>> {
         entries
             .iter()
-            .map(|(key, payload)| self.put_with_receipt(*key, payload))
+            .map(|(key, payload)| {
+                let checksum = checksum64(payload);
+                let receipt = self.put_with_receipt(*key, payload)?;
+                Ok(PrepublicationContentReceipt { receipt, checksum })
+            })
             .collect()
     }
 
@@ -323,7 +332,7 @@ impl<S: ContentWriteStore> ContentWriteStore for FilesystemContentWriteStore<S> 
     fn put_prepublication_batch_with_receipts(
         &mut self,
         entries: &[(ObjectKey, &[u8])],
-    ) -> Result<Vec<PlacementReceipt>> {
+    ) -> Result<Vec<PrepublicationContentReceipt>> {
         let scoped = entries
             .iter()
             .map(|(key, payload)| (self.keyspace.scope(*key), *payload))
@@ -363,8 +372,13 @@ impl<'a> ContentWriteStore for PoolStoreMut<'a> {
     fn put_prepublication_batch_with_receipts(
         &mut self,
         entries: &[(ObjectKey, &[u8])],
-    ) -> Result<Vec<PlacementReceipt>> {
-        Ok(PoolStoreMut::put_prepublication_data_batch(self, entries)?)
+    ) -> Result<Vec<PrepublicationContentReceipt>> {
+        Ok(
+            PoolStoreMut::put_prepublication_data_batch_with_checksums(self, entries)?
+                .into_iter()
+                .map(|(receipt, checksum)| PrepublicationContentReceipt { receipt, checksum })
+                .collect(),
+        )
     }
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         Ok(PoolStoreMut::put(self, key, payload)?)
@@ -1688,7 +1702,6 @@ struct StagedContentChunk {
     key: ObjectKey,
     chunk_index: u64,
     len: u32,
-    checksum: IntegrityDigest64,
     payload: Range<usize>,
 }
 
@@ -2066,12 +2079,10 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             &mut staged_bytes,
         )?;
         dedup_index.record_chunk_written();
-        let checksum = checksum64(&staged_bytes[payload.clone()]);
         staged_chunks.push(StagedContentChunk {
             key: per_inode_key,
             chunk_index: old_ref.chunk_index,
             len: chunk_bytes.len() as u32,
-            checksum,
             payload,
         });
     }
@@ -2140,12 +2151,10 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             &mut staged_bytes,
         )?;
         dedup_index.record_chunk_written();
-        let checksum = checksum64(&staged_bytes[payload.clone()]);
         staged_chunks.push(StagedContentChunk {
             key: per_inode_key,
             chunk_index,
             len: chunk_bytes.len() as u32,
-            checksum,
             payload,
         });
     }
@@ -2160,7 +2169,8 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             reason: "prepublication content batch returned the wrong receipt count",
         });
     }
-    for (chunk, receipt) in staged_chunks.into_iter().zip(chunk_receipts) {
+    for (chunk, published) in staged_chunks.into_iter().zip(chunk_receipts) {
+        let receipt = published.receipt;
         if receipt.object_key != store.physical_key(chunk.key) {
             return Err(FileSystemError::CorruptState {
                 reason: "prepublication content batch returned a receipt for another object",
@@ -2179,7 +2189,7 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
                 chunk_index: chunk.chunk_index,
                 data_version: new_record.data_version,
                 len: chunk.len,
-                checksum: chunk.checksum,
+                checksum: published.checksum,
                 placement_receipt_generation: receipt.generation,
             },
         );
@@ -2289,12 +2299,10 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
                     &mut staged_bytes,
                 )?;
                 dedup_index.record_chunk_written();
-                let checksum = checksum64(&staged_bytes[payload.clone()]);
                 staged_chunks.push(StagedContentChunk {
                     key: per_inode_key,
                     chunk_index,
                     len: chunk_bytes.len() as u32,
-                    checksum,
                     payload,
                 });
                 Ok(())
@@ -2325,7 +2333,8 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
             reason: "prepublication content batch returned the wrong receipt count",
         });
     }
-    for (chunk, receipt) in staged_chunks.into_iter().zip(chunk_receipts) {
+    for (chunk, published) in staged_chunks.into_iter().zip(chunk_receipts) {
+        let receipt = published.receipt;
         if receipt.object_key != store.physical_key(chunk.key) {
             return Err(FileSystemError::CorruptState {
                 reason: "prepublication content batch returned a receipt for another object",
@@ -2344,7 +2353,7 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
                 chunk_index: chunk.chunk_index,
                 data_version: new_record.data_version,
                 len: chunk.len,
-                checksum: chunk.checksum,
+                checksum: published.checksum,
                 placement_receipt_generation: receipt.generation,
             },
         );

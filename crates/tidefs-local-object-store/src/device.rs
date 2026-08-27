@@ -31,8 +31,8 @@ use crate::device_health::{
 use crate::io_scheduler::IoClass as SchedClass;
 use crate::store::ReceiptBoundPhysicalLifetime;
 use crate::{
-    BlockStoreIdentity, LocalObjectStore, ObjectKey, ObjectLocation, Result, ScrubStats,
-    StoreError, StoreOptions, StoreRetentionCompactionReport, StoredObject,
+    BlockStoreIdentity, IntegrityDigest64, LocalObjectStore, ObjectKey, ObjectLocation, Result,
+    ScrubStats, StoreError, StoreOptions, StoreRetentionCompactionReport, StoredObject,
 };
 use tidefs_types_pool_label_core::{DEVICE_HEALTH_ADMIN_OFFLINE, DEVICE_HEALTH_STATE_MASK};
 use tidefs_types_reclaim_queue_core::{
@@ -807,6 +807,34 @@ impl SingleDevice {
 
     fn install_pool_raw_mutation_guard(&mut self, allowed: Arc<AtomicBool>) {
         self.store.install_pool_raw_mutation_guard(allowed);
+    }
+
+    fn put_prepublication_with_checksum(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+        checksum: IntegrityDigest64,
+    ) -> Result<StoredObject> {
+        match self
+            .store
+            .put_prepublication_pool_internal_with_checksum(key, payload, checksum)
+        {
+            Ok(obj) => {
+                self.write_ops = self.write_ops.saturating_add(1);
+                Ok(obj)
+            }
+            Err(e) => {
+                if store_error_counts_as_device_write_fault(&e) {
+                    self.health_tracker
+                        .get_mut()
+                        .record_error(DeviceErrorKind::Write);
+                    self.status.write_errors = self.health_tracker.get_mut().total_write_errors;
+                }
+                self.status.last_error = Some(format!("{e:?}"));
+                self.evaluate_health();
+                Err(e)
+            }
+        }
     }
 }
 
@@ -3517,6 +3545,18 @@ fn parity_pool_internal_candidates(
 }
 
 impl Device {
+    pub(crate) fn put_prepublication_with_checksum(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+        checksum: IntegrityDigest64,
+    ) -> Result<StoredObject> {
+        match self {
+            Self::Single(device) => device.put_prepublication_with_checksum(key, payload, checksum),
+            _ => self.inner_mut().put_prepublication(key, payload),
+        }
+    }
+
     pub(crate) fn set_administratively_offline(&mut self, offline: bool) -> Result<()> {
         match self {
             Self::Single(device) => {
@@ -4113,6 +4153,62 @@ impl Device {
                 }
                 first_error.map_or(Ok(()), Err)
             }
+        }
+    }
+
+    pub(crate) fn sync_prepublication_batch(&mut self) -> Result<()> {
+        let mut first_error = None;
+        match self {
+            Self::Single(device) => device.store.sync_prepublication_batch(),
+            Self::Mirror(device) => {
+                for member in &mut device.members {
+                    if let Err(error) = member.store.sync_prepublication_batch() {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            }
+            Self::Compressed(device) => device.inner.sync_prepublication_batch(),
+            Self::Encrypted(device) => device.inner.sync_prepublication_batch(),
+            Self::LogDevice(device) => device.store.sync_prepublication_batch(),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(device) | Self::ParityRaid2(device) | Self::ParityRaid3(device) => {
+                for child in &mut device.children {
+                    if let Err(error) = child.store.sync_prepublication_batch() {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            }
+        }
+    }
+
+    pub(crate) fn verify_prepublication_batch_payload(
+        &self,
+        key: ObjectKey,
+        expected_payload: &[u8],
+    ) -> Result<bool> {
+        match self {
+            Self::Single(device) => device
+                .store
+                .verify_prepublication_batch_payload(key, expected_payload),
+            Self::Mirror(device) => {
+                for member in &device.members {
+                    if !member
+                        .store
+                        .verify_prepublication_batch_payload(key, expected_payload)?
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(!device.members.is_empty())
+            }
+            Self::LogDevice(device) => device
+                .store
+                .verify_prepublication_batch_payload(key, expected_payload),
+            Self::Compressed(_) | Self::Encrypted(_) => Ok(false),
+            #[cfg(any(feature = "distributed-repair", test))]
+            Self::ParityRaid1(_) | Self::ParityRaid2(_) | Self::ParityRaid3(_) => Ok(false),
         }
     }
 

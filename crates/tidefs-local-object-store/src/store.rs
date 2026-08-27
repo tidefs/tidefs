@@ -4401,7 +4401,7 @@ impl LocalObjectStore {
         }
         let payload = Self::encode_dead_object_reclaim_entry_state(entry);
         let effective_payload = self.prepare_payload_with_fault_injection(&payload)?;
-        let _ = self.put_inner(key, &effective_payload, 0, false, false)?;
+        let _ = self.put_inner(key, &effective_payload, 0, false, false, None)?;
         let domain_key = DomainTag::ReadVerify.derive_key();
         self.checksums
             .insert(key, ObjectDigest::compute(&payload, &domain_key));
@@ -5679,6 +5679,7 @@ impl LocalObjectStore {
         compression_algorithm: u8,
         track_liveness: bool,
         replicate: bool,
+        precomputed_checksum: Option<IntegrityDigest64>,
     ) -> Result<StoredObject> {
         // I/O class admission: when the scheduler refuses, apply soft backpressure
         // (a brief yield) so bulk I/O slows down without hard-failing callers.
@@ -5719,7 +5720,7 @@ impl LocalObjectStore {
             self.check_reserve_admission(WritePriority::Normal, segments_needed)?;
         }
 
-        let checksum = checksum64(payload);
+        let checksum = precomputed_checksum.unwrap_or_else(|| checksum64(payload));
         let internal_metadata = is_public_scan_internal_key(key);
         let sequence = self.next_sequence;
         let next_sequence = sequence.checked_add(1).ok_or(StoreError::InvalidOptions {
@@ -5888,6 +5889,7 @@ impl LocalObjectStore {
         key: ObjectKey,
         payload: &[u8],
         track_transaction: bool,
+        precomputed_checksum: Option<IntegrityDigest64>,
     ) -> Result<StoredObject> {
         // Pool-owned generation and deletion publication deliberately uses
         // this path, so configured write faults exercise those durability
@@ -5920,6 +5922,9 @@ impl LocalObjectStore {
             compression_algorithm,
             !pool_metadata_family,
             true,
+            (compression_algorithm == 0)
+                .then_some(precomputed_checksum)
+                .flatten(),
         )?;
         if pool_metadata_family
             && self
@@ -5987,7 +5992,7 @@ impl LocalObjectStore {
     }
 
     fn put_authorized(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
-        self.put_authorized_with_transaction_tracking(key, payload, true)
+        self.put_authorized_with_transaction_tracking(key, payload, true, None)
     }
 
     pub fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
@@ -6009,7 +6014,20 @@ impl LocalObjectStore {
         payload: &[u8],
     ) -> Result<StoredObject> {
         self.ensure_pool_raw_mutation_allowed()?;
-        self.put_authorized_with_transaction_tracking(key, payload, false)
+        self.put_authorized_with_transaction_tracking(key, payload, false, None)
+    }
+
+    /// Store one immutable prepublication payload using the checksum already
+    /// computed by its Pool batch. The post-barrier persisted-byte readback
+    /// independently recomputes and verifies this value before publication.
+    pub(crate) fn put_prepublication_pool_internal_with_checksum(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+        checksum: IntegrityDigest64,
+    ) -> Result<StoredObject> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        self.put_authorized_with_transaction_tracking(key, payload, false, Some(checksum))
     }
 
     /// Start one Pool-owned prepublication append batch.
@@ -6338,6 +6356,56 @@ impl LocalObjectStore {
         Ok(records)
     }
 
+    /// Compare one untransformed payload against the exact persisted bytes
+    /// loaded for the current prepublication batch.
+    ///
+    /// [`Self::index_prepublication_batch_readback`] has already decoded the
+    /// record from the post-barrier device read and verified its header,
+    /// payload checksum, footer, production-integrity trailer and physical
+    /// location. Reusing that authenticated slice avoids decoding and hashing
+    /// the same bytes again. Transformed records return `false` so their
+    /// owning Device can retain the generic strict read path.
+    pub(crate) fn verify_prepublication_batch_payload(
+        &self,
+        key: ObjectKey,
+        expected_payload: &[u8],
+    ) -> Result<bool> {
+        let location = self
+            .index
+            .get(&key)
+            .copied()
+            .ok_or(StoreError::InvalidOptions {
+                reason: "prepublication batch readback lost its payload location",
+            })?;
+        let Some(&(payload_start, payload_end, compression_algorithm)) =
+            self.prepublication_readback_records.get(&location)
+        else {
+            return Ok(false);
+        };
+        if compression_algorithm != 0 {
+            return Ok(false);
+        }
+        let persisted = self
+            .prepublication_readback_bytes
+            .get(payload_start..payload_end)
+            .ok_or(StoreError::CorruptHeader {
+                segment_id: location.segment_id,
+                offset: location.record_offset,
+                reason: "indexed prepublication payload is outside its readback range",
+            })?;
+        if persisted != expected_payload {
+            return Err(StoreError::InvalidOptions {
+                reason: "prepublication batch readback changed its expected payload",
+            });
+        }
+        if self.options.verify_read_checksums && !self.checksums.contains_key(&key) {
+            return Err(StoreError::InvalidOptions {
+                reason: "prepublication batch readback lost its read-verification checksum",
+            });
+        }
+        Ok(true)
+    }
+
     pub(crate) fn clear_prepublication_batch_readback(&mut self) {
         self.prepublication_readback_range = None;
         self.prepublication_readback_bytes.clear();
@@ -6372,7 +6440,7 @@ impl LocalObjectStore {
         payload: &[u8],
         compression_algorithm: u8,
     ) -> Result<StoredObject> {
-        self.put_inner(key, payload, compression_algorithm, false, true)
+        self.put_inner(key, payload, compression_algorithm, false, true, None)
     }
 
     /// Write a named object directly to the segment without commit_group tracking.
@@ -6380,7 +6448,7 @@ impl LocalObjectStore {
     /// Used internally by the commit_group commit path to persist journal records
     /// and committed roots without recursing into the commit_group accumulator.
     pub(crate) fn put_direct(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
-        self.put_inner(key, payload, 0, false, true)
+        self.put_inner(key, payload, 0, false, true, None)
     }
 
     /// Return the per-object BLAKE3 domain-separated checksum for `key`,
@@ -7516,6 +7584,35 @@ impl LocalObjectStore {
             self.prepublication_checksums_dirty = false;
         }
 
+        Ok(())
+    }
+
+    /// Cross the durability boundary owned by one Pool prepublication batch.
+    ///
+    /// A block-backed store is a fixed-size data carrier: the batch has
+    /// already installed its complete scan-bounded record prefix and final
+    /// tail, so `sync_data` durably carries both payload and receipt records
+    /// without committing unrelated reclaim, checkpoint, scrub or transaction
+    /// state. Directory-backed compatibility stores retain the full existing
+    /// barrier because their record and sidecar metadata share that authority.
+    pub(crate) fn sync_prepublication_batch(&mut self) -> Result<()> {
+        if !self.block_device_mode {
+            return self.sync_all();
+        }
+        self.ensure_pool_raw_mutation_allowed()?;
+        self.ensure_writable("sync prepublication batch")?;
+        self.verify_deferred_prepublication_tail_before_barrier()?;
+        let path = segment_path(&self.segments_dir, self.current_segment_id);
+        self.current_file
+            .sync_data()
+            .map_err(|source| io_error("sync prepublication batch", &path, source))?;
+        for replica in &mut self.replicas {
+            replica.sync_prepublication_batch()?;
+        }
+        // Block stores have no checksum sidecar; the in-memory index remains
+        // live, while the persisted record checksum and integrity trailer are
+        // the reopen authority verified immediately below the Pool barrier.
+        self.prepublication_checksums_dirty = false;
         Ok(())
     }
 
