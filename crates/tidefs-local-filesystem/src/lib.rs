@@ -16783,7 +16783,6 @@ impl PoolDatasetOwner {
         planned_entries: BTreeMap<ObjectKey, u64>,
     ) -> Result<()> {
         let keyspace = self.object_keyspace();
-        let mut current_entries = BTreeMap::new();
         let pool_readable_records: Vec<InodeRecord> = self
             .filesystem
             .state
@@ -16810,56 +16809,62 @@ impl PoolDatasetOwner {
             .authenticated_content_allocation_cache
             .retain_live_inodes(&live_inode_ids);
         for pool_readable_record in pool_readable_records {
-            // Replaced content is excluded from the capacity union. Still
-            // authenticate a cache miss before superseding it, but do not
-            // clone an already-authenticated entry set only to discard it.
-            if Some(pool_readable_record.inode_id) == replaced_inode {
-                if self
-                    .filesystem
-                    .authenticated_content_allocation_cache
-                    .live_entries(&pool_readable_record)
-                    .is_none()
-                {
-                    let entries = content_allocation_entries_for_inode_pool_in_keyspace(
-                        self.store.pool(),
-                        &pool_readable_record,
-                        keyspace,
-                    )?;
-                    self.filesystem
-                        .authenticated_content_allocation_cache
-                        .record_live_entries(&pool_readable_record, entries);
-                }
-                continue;
-            }
-            let inode_entries = match self
+            if self
                 .filesystem
                 .authenticated_content_allocation_cache
                 .live_entries(&pool_readable_record)
-                .cloned()
+                .is_none()
             {
-                Some(entries) => entries,
-                None => {
-                    let entries = content_allocation_entries_for_inode_pool_in_keyspace(
-                        self.store.pool(),
-                        &pool_readable_record,
-                        keyspace,
-                    )?;
-                    self.filesystem
-                        .authenticated_content_allocation_cache
-                        .record_live_entries(&pool_readable_record, entries.clone());
-                    entries
-                }
-            };
-            merge_allocation_entries(&mut current_entries, inode_entries);
+                let entries = content_allocation_entries_for_inode_pool_in_keyspace(
+                    self.store.pool(),
+                    &pool_readable_record,
+                    keyspace,
+                )?;
+                self.filesystem
+                    .authenticated_content_allocation_cache
+                    .record_live_entries(&pool_readable_record, entries);
+            }
         }
-        merge_allocation_entries(
-            &mut current_entries,
-            planned_entries
-                .into_iter()
-                .map(|(key, grains)| (keyspace.scope(key), grains))
-                .collect(),
-        );
-        self.ensure_content_capacity_for_current_entries(current_entries)
+        let retained_roots = snapshot_retained_roots(&self.filesystem.state);
+        if self
+            .filesystem
+            .authenticated_content_allocation_cache
+            .retained_entries(&retained_roots)
+            .is_none()
+        {
+            let entries = protected_committed_content_entries_pool(
+                self.store.pool_mut(),
+                self.filesystem.root_authentication_key,
+                &self.filesystem.state,
+            )?;
+            self.filesystem
+                .authenticated_content_allocation_cache
+                .record_retained_entries(retained_roots, entries);
+        }
+        let planned_entries = planned_entries
+            .into_iter()
+            .map(|(key, grains)| (keyspace.scope(key), grains))
+            .collect();
+        let allocated = self
+            .filesystem
+            .authenticated_content_allocation_cache
+            .projected_allocation_bytes(replaced_inode, &planned_entries)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "authenticated allocation projection is incomplete after hydration",
+            })?;
+        if allocated > self.filesystem.allocator_policy.content_capacity_bytes {
+            return Err(FileSystemError::NoSpace {
+                resource: LocalStorageResource::ContentBytes,
+                requested: allocated,
+                available: self
+                    .allocator_policy
+                    .content_capacity_bytes
+                    .saturating_sub(allocated),
+                capacity: self.filesystem.allocator_policy.content_capacity_bytes,
+                allocated,
+            });
+        }
+        Ok(())
     }
 
     /// Return allocation bytes already authenticated for this exact live
@@ -16889,47 +16894,6 @@ impl PoolDatasetOwner {
             .authenticated_content_allocation_cache
             .record_live_entries(record, entries);
         Ok(bytes)
-    }
-
-    fn ensure_content_capacity_for_current_entries(
-        &mut self,
-        current_entries: BTreeMap<ObjectKey, u64>,
-    ) -> Result<()> {
-        let retained_roots = snapshot_retained_roots(&self.filesystem.state);
-        let mut reserved_entries = match self
-            .filesystem
-            .authenticated_content_allocation_cache
-            .retained_entries(&retained_roots)
-            .cloned()
-        {
-            Some(entries) => entries,
-            None => {
-                let entries = protected_committed_content_entries_pool(
-                    self.store.pool_mut(),
-                    self.filesystem.root_authentication_key,
-                    &self.filesystem.state,
-                )?;
-                self.filesystem
-                    .authenticated_content_allocation_cache
-                    .record_retained_entries(retained_roots, entries.clone());
-                entries
-            }
-        };
-        merge_allocation_entries(&mut reserved_entries, current_entries);
-        let allocated = allocation_bytes(&reserved_entries)?;
-        if allocated > self.filesystem.allocator_policy.content_capacity_bytes {
-            return Err(FileSystemError::NoSpace {
-                resource: LocalStorageResource::ContentBytes,
-                requested: allocated,
-                available: self
-                    .allocator_policy
-                    .content_capacity_bytes
-                    .saturating_sub(allocated),
-                capacity: self.filesystem.allocator_policy.content_capacity_bytes,
-                allocated,
-            });
-        }
-        Ok(())
     }
 
     /// Gate a policy-observation build's proposed allocation through its
