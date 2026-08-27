@@ -728,6 +728,11 @@ pub struct LocalObjectStore {
     /// identity without rebuilding the append stream as another ordered tree.
     prepublication_readback_records: Vec<PrepublicationReadbackRecord>,
     prepublication_tail_verification_deferred: bool,
+    /// Whether the current Pool prepublication batch has consumed its raw
+    /// store scheduler token. A batch is one admitted foreground operation;
+    /// charging every payload and receipt record separately turns token
+    /// exhaustion into one millisecond of artificial latency per record.
+    prepublication_io_admitted: bool,
     #[cfg(test)]
     block_device_tail_terminator_verifications: u64,
     /// When true, the store operates directly on a block device instead of
@@ -2379,6 +2384,7 @@ impl LocalObjectStore {
             prepublication_readback_bytes: Vec::new(),
             prepublication_readback_records: Vec::new(),
             prepublication_tail_verification_deferred: false,
+            prepublication_io_admitted: false,
             #[cfg(test)]
             block_device_tail_terminator_verifications: 0,
             block_device_mode: true,
@@ -2730,6 +2736,7 @@ impl LocalObjectStore {
             prepublication_readback_bytes: Vec::new(),
             prepublication_readback_records: Vec::new(),
             prepublication_tail_verification_deferred: false,
+            prepublication_io_admitted: false,
             #[cfg(test)]
             block_device_tail_terminator_verifications: 0,
             block_device_mode: false,
@@ -5703,9 +5710,24 @@ impl LocalObjectStore {
         replicate: bool,
         precomputed_checksum: Option<IntegrityDigest64>,
     ) -> Result<StoredObject> {
-        // I/O class admission: when the scheduler refuses, apply soft backpressure
-        // (a brief yield) so bulk I/O slows down without hard-failing callers.
-        if !self.io_scheduler.admit(self.current_io_class) {
+        // I/O class admission: when the scheduler refuses, apply soft
+        // backpressure (a brief yield) so bulk I/O slows down without
+        // hard-failing callers. A Pool prepublication batch is already one
+        // bounded foreground operation, even though it expands into separate
+        // payload and receipt records here. Consume one token for that batch
+        // instead of sleeping once for every raw record after the token bucket
+        // is exhausted.
+        let admitted = if self.prepublication_tail_verification_deferred {
+            if self.prepublication_io_admitted {
+                true
+            } else {
+                self.prepublication_io_admitted = true;
+                self.io_scheduler.admit(self.current_io_class)
+            }
+        } else {
+            self.io_scheduler.admit(self.current_io_class)
+        };
+        if !admitted {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         self.ensure_writable("put")?;
@@ -6061,6 +6083,7 @@ impl LocalObjectStore {
         self.prepublication_readback_range = None;
         self.prepublication_readback_bytes.clear();
         self.prepublication_readback_records.clear();
+        self.prepublication_io_admitted = false;
         // A failed final verification deliberately leaves the flag set so a
         // later write and finish can recover the same scan boundary.
         self.prepublication_tail_verification_deferred = true;
@@ -12412,6 +12435,58 @@ mod block_device_open_tests {
                 .get(successor_key)
                 .expect("read successor after reopen"),
             Some(b"successor payload".to_vec())
+        );
+    }
+
+    #[test]
+    fn block_device_prepublication_batch_consumes_one_scheduler_token() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let mut store =
+            LocalObjectStore::open_block_device_writable_unbound(&image, block_options(80 * 1024))
+                .expect("open block image");
+        store.io_scheduler = IoScheduler::new(&IoSchedulerConfig {
+            async_data_rate: 0.0,
+            async_data_burst: 2.0,
+            ..IoSchedulerConfig::default()
+        });
+
+        store.begin_prepublication_append_batch();
+        store
+            .put_prepublication_pool_internal(
+                ObjectKey::from_name(b"prepublication/scheduler/first"),
+                b"first",
+            )
+            .expect("stage first batch record");
+        store
+            .put_prepublication_pool_internal(
+                ObjectKey::from_name(b"prepublication/scheduler/second"),
+                b"second",
+            )
+            .expect("stage second batch record");
+        assert_eq!(
+            store
+                .io_scheduler
+                .available_tokens(crate::io_scheduler::IoClass::AsyncData),
+            1.0,
+            "one logical batch must consume one scheduler token"
+        );
+        store
+            .finish_prepublication_append_batch()
+            .expect("finish prepublication batch");
+
+        store
+            .put_direct(
+                ObjectKey::from_name(b"prepublication/scheduler/ordinary"),
+                b"ordinary",
+            )
+            .expect("write ordinary successor");
+        assert_eq!(
+            store
+                .io_scheduler
+                .available_tokens(crate::io_scheduler::IoClass::AsyncData),
+            0.0,
+            "an ordinary write after the batch must consume its own token"
         );
     }
 
