@@ -5035,6 +5035,11 @@ impl FuseVfsAdapter {
             .map(|fh| self.resolve_file_handle(ino, fh, 0))
             .and_then(|x| x.ok());
         let inode_id = InodeId::new(ino);
+        let _write_cache_reconciliation_guard = if attr.valid & FATTR_SIZE != 0 {
+            Some(self.write_cache_reconciliation.lock(ino))
+        } else {
+            None
+        };
         let e = self.engine.lock().unwrap();
         let current_attr = match e.getattr(inode_id, engine_fh.as_ref(), ctx) {
             Ok(attr) => attr,
@@ -5092,7 +5097,7 @@ impl FuseVfsAdapter {
                 let new_sz = attr.size;
                 Self::truncate_extents(&**e, inode_id, efh, old_sz, new_sz, ctx)?;
                 if new_sz < old_sz {
-                    self.clear_dirty_for_deallocate_range(ino, new_sz, old_sz - new_sz)?;
+                    self.clear_dirty_for_truncate_shrink(ino, new_sz);
                     data_invalidation_range = Some((new_sz, old_sz - new_sz));
                 } else if new_sz > old_sz {
                     data_invalidation_range = Some((old_sz, new_sz - old_sz));
@@ -5105,7 +5110,7 @@ impl FuseVfsAdapter {
                 let result =
                     Self::truncate_extents(&**e, inode_id, &efh, current_size, new_sz, ctx);
                 if result.is_ok() && new_sz < current_size {
-                    self.clear_dirty_for_deallocate_range(ino, new_sz, current_size - new_sz)?;
+                    self.clear_dirty_for_truncate_shrink(ino, new_sz);
                     data_invalidation_range = Some((new_sz, current_size - new_sz));
                 } else if result.is_ok() && new_sz > current_size {
                     data_invalidation_range = Some((current_size, new_sz - current_size));
@@ -7841,6 +7846,32 @@ impl FuseVfsAdapter {
         Ok(())
     }
 
+    /// Classify every daemon-side dirty mirror at or beyond `new_size` as
+    /// superseded by a successful truncate shrink. The engine has already made
+    /// the suffix unreachable, so cache-core's truncate primitive can discard
+    /// resident clean, dirty, and writeback pages directly instead of probing
+    /// every logical page in a sparse file. Dirty ownership before the new EOF
+    /// remains intact for its ordinary flush/fsync boundary.
+    fn clear_dirty_for_truncate_shrink(&self, ino: u64, new_size: u64) {
+        self.clear_dirty_trackers_for_authoritative_range(
+            ino,
+            new_size,
+            u64::MAX.saturating_sub(new_size),
+        );
+
+        let writeback_cache_aliases_write_page_cache = self
+            .writeback_page_cache
+            .as_ref()
+            .is_some_and(|wb_cache| Arc::ptr_eq(wb_cache, &self.write_page_cache));
+        if let Some(ref wb_cache) = self.writeback_page_cache {
+            let _ = wb_cache.truncate_invalidate(ino, new_size);
+        }
+        if !writeback_cache_aliases_write_page_cache {
+            let _ = self.write_page_cache.truncate_invalidate(ino, new_size);
+        }
+        self.reconcile_writeback_inode_cache_after_authoritative_range(ino);
+    }
+
     // ── shared truncate extent mutation (engine lock already held) ─────────
 
     /// Core truncate extent manipulation: shrink via punch-hole, grow via
@@ -7882,6 +7913,7 @@ impl FuseVfsAdapter {
             Ok(true) => {}
             Ok(false) | Err(_) => return Err(Errno::EBADF),
         }
+        let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
         let e = self.engine.lock().unwrap();
         let inode_id = InodeId::new(ino);
         let current_attr = e.getattr(inode_id, Some(&efh), ctx)?;
@@ -7892,7 +7924,7 @@ impl FuseVfsAdapter {
         let result = Self::truncate_extents(&**e, inode_id, &efh, old_size, size, ctx);
         drop(e);
         if result.is_ok() && size < old_size {
-            self.clear_dirty_for_deallocate_range(ino, size, old_size - size)?;
+            self.clear_dirty_for_truncate_shrink(ino, size);
             self.invalidate_caches_after_engine_data_mutation(ino, size, old_size - size);
         } else if result.is_ok() && size > old_size {
             self.invalidate_caches_after_engine_data_mutation(ino, old_size, size - old_size);
@@ -7910,6 +7942,7 @@ impl FuseVfsAdapter {
     pub fn dispatch_truncate(&self, ctx: &RequestCtx, ino: u64, size: u64) -> Result<(), Errno> {
         self.check_not_read_only()?;
         let inode_id = InodeId::new(ino);
+        let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
         let e = self.engine.lock().unwrap();
         let efh = e.open(inode_id, libc::O_RDWR as u32, ctx)?;
         let current_attr = e.getattr(inode_id, Some(&efh), ctx)?;
@@ -7931,7 +7964,7 @@ impl FuseVfsAdapter {
         let _ = e.release(&efh);
         drop(e);
         if result.is_ok() && size < current_size {
-            self.clear_dirty_for_deallocate_range(ino, size, current_size - size)?;
+            self.clear_dirty_for_truncate_shrink(ino, size);
             self.invalidate_caches_after_engine_data_mutation(ino, size, current_size - size);
         } else if result.is_ok() && size > current_size {
             self.invalidate_caches_after_engine_data_mutation(
@@ -39836,6 +39869,121 @@ mod tests {
             assert_eq!(ranges[0].offset, 8192);
             assert_eq!(ranges[0].length, 4);
         }
+    }
+
+    #[test]
+    fn truncate_shrink_discards_sparse_suffix_without_page_miss_walk() {
+        const NEW_SIZE: u64 = 6 * 1024;
+        const OLD_SIZE: u64 = 30 * 1024 * 1024;
+        const STALE_PAGE_OFFSET: u64 = 16 * 1024 * 1024;
+
+        let (fixture, tracker) = adapter_fixture_with_writeback_tracker();
+        let ino = 101;
+        let inode = InodeId::new(ino);
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, 4096);
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(NEW_SIZE, (OLD_SIZE - NEW_SIZE) as u32);
+        {
+            let mut tracker = tracker.lock().unwrap();
+            tracker.mark_dirty(inode, 0, 4096);
+            tracker.mark_dirty(inode, NEW_SIZE, OLD_SIZE - NEW_SIZE);
+        }
+        let worker_tracker = fixture
+            .adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        {
+            let mut worker_tracker = worker_tracker.lock().unwrap();
+            worker_tracker
+                .mark_dirty(ino, 0, 4096)
+                .expect("mark retained worker range dirty");
+            worker_tracker
+                .mark_dirty(ino, NEW_SIZE, OLD_SIZE)
+                .expect("mark sparse suffix worker range dirty");
+        }
+
+        let cache = Arc::clone(&fixture.adapter.write_page_cache);
+        for offset in [0, 4096, STALE_PAGE_OFFSET] {
+            cache.insert(ino, offset).expect("insert dirty mirror");
+            let mut page = cache.lookup(ino, offset).expect("lookup dirty mirror");
+            page.data_mut().fill(0xA5);
+            page.mark_dirty();
+        }
+        {
+            let mut inode_cache = fixture.adapter.writeback_cache.lock().unwrap();
+            inode_cache.insert(ino);
+            inode_cache.mark_dirty(ino, OLD_SIZE);
+        }
+
+        let misses_before = cache.miss_count();
+        fixture
+            .adapter
+            .clear_dirty_for_truncate_shrink(ino, NEW_SIZE);
+        assert_eq!(
+            cache.miss_count(),
+            misses_before,
+            "truncate must visit resident cache state, not every sparse logical page"
+        );
+
+        {
+            let ds = fixture.adapter.dirty_state.lock().unwrap();
+            assert_eq!(
+                ds.get(&ino).expect("retained dirty prefix").ranges(),
+                &[(0, 4096)]
+            );
+        }
+        assert_eq!(
+            tracker
+                .lock()
+                .unwrap()
+                .dirty_ranges(inode)
+                .expect("retained shared dirty prefix")
+                .iter()
+                .map(|range| (range.offset, range.length))
+                .collect::<Vec<_>>(),
+            vec![(0, 4096)]
+        );
+        assert_eq!(
+            worker_tracker.lock().unwrap().get_dirty_ranges(ino),
+            vec![crate::workers_writeback::DirtyRange::new(ino, 0, 4096)]
+        );
+        assert!(
+            cache.lookup(ino, 0).is_some(),
+            "unrelated pre-EOF cache pages must survive"
+        );
+        assert!(
+            cache.lookup(ino, 4096).is_none(),
+            "the cache page crossing the new EOF must be invalidated"
+        );
+        assert!(
+            cache.lookup(ino, STALE_PAGE_OFFSET).is_none(),
+            "superseded suffix bytes must not remain available for later writeback"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(true),
+            "the retained dirty prefix must keep the inode dirty"
+        );
     }
 
     #[test]
