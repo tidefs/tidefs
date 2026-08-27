@@ -35,6 +35,7 @@
 //! index and segment files without write-path coordination.
 //!
 
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
 use std::fmt;
@@ -582,6 +583,15 @@ struct PrepublicationReadbackRecord {
     payload_start: usize,
     payload_end: usize,
     compression_algorithm: u8,
+}
+
+#[derive(Debug)]
+struct PendingPrepublicationReadbackRecord {
+    indexed: PrepublicationReadbackRecord,
+    header: RecordHeader,
+    header_bytes: [u8; RECORD_HEADER_LEN],
+    footer_bytes: Option<([u8; RECORD_FOOTER_LEN], u64)>,
+    trailer_bytes: Option<([u8; INTEGRITY_TRAILER_V2_LEN], u64)>,
 }
 
 #[derive(Debug)]
@@ -6191,7 +6201,7 @@ impl LocalObjectStore {
             .ok_or(StoreError::InvalidOptions {
                 reason: "prepublication record range overflows u64",
             })?;
-        let mut records = Vec::new();
+        let mut pending_records = Vec::new();
         let mut relative = 0usize;
         while relative < records_len {
             let record_offset = start
@@ -6247,7 +6257,7 @@ impl LocalObjectStore {
             };
             let payload_start = relative_offset(range.payload_offset)?;
             let payload_end = relative_offset(range.payload_end_offset)?;
-            let payload = self
+            let _payload = self
                 .prepublication_readback_bytes
                 .get(payload_start..payload_end)
                 .ok_or(StoreError::CorruptHeader {
@@ -6255,17 +6265,7 @@ impl LocalObjectStore {
                     offset: record_offset,
                     reason: "prepublication record payload is truncated",
                 })?;
-            let actual = checksum64(payload);
-            if actual != header.payload_checksum {
-                return Err(StoreError::ChecksumMismatch {
-                    segment_id: self.current_segment_id,
-                    offset: range.payload_offset,
-                    expected: header.payload_checksum,
-                    actual,
-                });
-            }
-
-            let footer = if record_has_footer(header.format_version) {
+            let footer_bytes = if record_has_footer(header.format_version) {
                 let footer_start = relative_offset(range.footer_offset)?;
                 let footer_end = footer_start.checked_add(RECORD_FOOTER_LEN).ok_or(
                     StoreError::InvalidOptions {
@@ -6279,20 +6279,14 @@ impl LocalObjectStore {
                         segment_id: self.current_segment_id,
                         offset: range.footer_offset,
                         reason: "prepublication record footer is truncated",
-                    })?;
+                })?;
                 let mut footer = [0_u8; RECORD_FOOTER_LEN];
                 footer.copy_from_slice(footer_slice);
-                decode_footer(
-                    &footer,
-                    header,
-                    self.current_segment_id,
-                    range.footer_offset,
-                )?;
-                Some(footer)
+                Some((footer, range.footer_offset))
             } else {
                 None
             };
-            if record_has_production_integrity_trailer(header.format_version) {
+            let trailer_bytes = if record_has_production_integrity_trailer(header.format_version) {
                 let trailer_offset =
                     range
                         .integrity_trailer_offset
@@ -6317,22 +6311,10 @@ impl LocalObjectStore {
                     })?;
                 let mut trailer = [0_u8; INTEGRITY_TRAILER_V2_LEN];
                 trailer.copy_from_slice(trailer_slice);
-                let decoded_trailer = decode_integrity_trailer_v2(&trailer)?;
-                let footer = footer.ok_or(StoreError::CorruptHeader {
-                    segment_id: self.current_segment_id,
-                    offset: record_offset,
-                    reason: "prepublication integrity trailer requires a footer",
-                })?;
-                verify_integrity_trailer_v2(
-                    &decoded_trailer,
-                    header,
-                    &header_bytes,
-                    payload,
-                    &footer,
-                    self.current_segment_id,
-                    trailer_offset,
-                )?;
-            }
+                Some((trailer, trailer_offset))
+            } else {
+                None
+            };
 
             let location = ObjectLocation {
                 key: header.key,
@@ -6343,23 +6325,28 @@ impl LocalObjectStore {
                 sequence: header.sequence,
                 payload_checksum: header.payload_checksum,
             };
-            if records
-                .last()
-                .is_some_and(|previous: &PrepublicationReadbackRecord| {
-                    previous.location.record_offset >= location.record_offset
-                })
-            {
+            if pending_records.last().is_some_and(
+                |previous: &PendingPrepublicationReadbackRecord| {
+                    previous.indexed.location.record_offset >= location.record_offset
+                },
+            ) {
                 return Err(StoreError::CorruptHeader {
                     segment_id: self.current_segment_id,
                     offset: record_offset,
                     reason: "prepublication readback record offsets are not strictly increasing",
                 });
             }
-            records.push(PrepublicationReadbackRecord {
-                location,
-                payload_start,
-                payload_end,
-                compression_algorithm: header.compression_algorithm,
+            pending_records.push(PendingPrepublicationReadbackRecord {
+                indexed: PrepublicationReadbackRecord {
+                    location,
+                    payload_start,
+                    payload_end,
+                    compression_algorithm: header.compression_algorithm,
+                },
+                header,
+                header_bytes,
+                footer_bytes,
+                trailer_bytes,
             });
             relative = relative_offset(range.end_offset)?;
         }
@@ -6370,7 +6357,97 @@ impl LocalObjectStore {
                 reason: "prepublication readback does not end at its successor header",
             });
         }
-        Ok(records)
+        // The batch has already crossed its Pool durability barrier and was
+        // loaded with one exact positioned read. Each record's checksum and
+        // production-integrity trailer are independent, so verify a material
+        // batch across available CPUs. Consume the verification results in
+        // physical record order; small batches stay inline to avoid thread-pool
+        // dispatch overhead.
+        let readback_bytes = self.prepublication_readback_bytes.as_slice();
+        let current_segment_id = self.current_segment_id;
+        let verify_record = |pending: &PendingPrepublicationReadbackRecord| -> Result<()> {
+            let payload = readback_bytes
+                .get(pending.indexed.payload_start..pending.indexed.payload_end)
+                .ok_or(StoreError::CorruptHeader {
+                    segment_id: current_segment_id,
+                    offset: pending.indexed.location.payload_offset,
+                    reason: "prepublication record payload is truncated",
+                })?;
+            let actual = checksum64(payload);
+            if actual != pending.header.payload_checksum {
+                return Err(StoreError::ChecksumMismatch {
+                    segment_id: current_segment_id,
+                    offset: pending.indexed.location.payload_offset,
+                    expected: pending.header.payload_checksum,
+                    actual,
+                });
+            }
+
+            let footer = if let Some((footer, footer_offset)) = pending.footer_bytes {
+                decode_footer(
+                    &footer,
+                    pending.header,
+                    current_segment_id,
+                    footer_offset,
+                )?;
+                Some(footer)
+            } else {
+                None
+            };
+            if let Some((trailer, trailer_offset)) = pending.trailer_bytes {
+                let decoded_trailer = decode_integrity_trailer_v2(&trailer)?;
+                let footer = footer.ok_or(StoreError::CorruptHeader {
+                    segment_id: current_segment_id,
+                    offset: pending.indexed.location.record_offset,
+                    reason: "prepublication integrity trailer requires a footer",
+                })?;
+                verify_integrity_trailer_v2(
+                    &decoded_trailer,
+                    pending.header,
+                    &pending.header_bytes,
+                    payload,
+                    &footer,
+                    current_segment_id,
+                    trailer_offset,
+                )?;
+            }
+            Ok(())
+        };
+
+        const PARALLEL_READBACK_MIN_RECORDS: usize = 4;
+        const PARALLEL_READBACK_MIN_PAYLOAD_BYTES: usize = 512 * 1024;
+        let payload_bytes = pending_records.iter().try_fold(0usize, |total, pending| {
+            total
+                .checked_add(
+                    pending
+                        .indexed
+                        .payload_end
+                        .saturating_sub(pending.indexed.payload_start),
+                )
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "prepublication payload verification size overflows usize",
+                })
+        })?;
+        if pending_records.len() >= PARALLEL_READBACK_MIN_RECORDS
+            && payload_bytes >= PARALLEL_READBACK_MIN_PAYLOAD_BYTES
+        {
+            let results = pending_records
+                .par_iter()
+                .map(verify_record)
+                .collect::<Vec<_>>();
+            for result in results {
+                result?;
+            }
+        } else {
+            for pending in &pending_records {
+                verify_record(pending)?;
+            }
+        }
+
+        Ok(pending_records
+            .into_iter()
+            .map(|pending| pending.indexed)
+            .collect())
     }
 
     fn prepublication_readback_record(

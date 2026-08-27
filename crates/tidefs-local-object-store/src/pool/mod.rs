@@ -23469,9 +23469,13 @@ mod tests {
         let mut pool = Pool::create(config.clone(), properties.clone(), &options).unwrap();
         let first_key = ObjectKey::from_name(b"prepublication-data-first");
         let second_key = ObjectKey::from_name(b"prepublication-data-second");
+        let third_key = ObjectKey::from_name(b"prepublication-data-third");
+        let fourth_key = ObjectKey::from_name(b"prepublication-data-fourth");
         let batch = vec![
-            (first_key, b"first immutable content chunk".to_vec()),
-            (second_key, b"second immutable content chunk".to_vec()),
+            (first_key, vec![0x11; 128 * 1024]),
+            (second_key, vec![0x22; 128 * 1024]),
+            (third_key, vec![0x33; 128 * 1024]),
+            (fourth_key, vec![0x44; 128 * 1024]),
         ];
 
         let receipts = pool
