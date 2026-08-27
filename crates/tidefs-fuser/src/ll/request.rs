@@ -407,6 +407,10 @@ mod op {
             #[cfg(not(feature = "abi-7-23"))]
             None
         }
+        /// Whether the kernel requires killpriv-v2 SUID/SGID clearing.
+        pub fn kill_suidgid(&self) -> bool {
+            self.arg.valid & FATTR_KILL_SUIDGID != 0
+        }
         /// The value set by the [Open] method. See [FileHandle].
         ///
         /// This will only be set if the user passed a file-descriptor to set the
@@ -2784,7 +2788,8 @@ mod tests {
         0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
         0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
         // fuse_setattr_in (88 bytes)
-        0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // valid=SIZE|UID|GID|MODE, padding
+        0x0f, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, // valid=KILL_SUIDGID|SIZE|UID|GID|MODE, padding
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fh=0
         0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // size=4096
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // lock_owner=0
@@ -3036,6 +3041,7 @@ mod tests {
                 assert_eq!(x.uid(), Some(1000));
                 assert_eq!(x.gid(), Some(1000));
                 assert_eq!(x.mode(), Some(0o644));
+                assert!(x.kill_suidgid());
             }
             other => panic!("Expected SetAttr, got {:?}", other),
         }

@@ -473,11 +473,13 @@ pub trait Filesystem {
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
         flags: Option<u32>,
+        kill_suidgid: bool,
         reply: ReplyAttr,
     ) {
         debug!(
             "[Not Implemented] setattr(ino: {ino:#x?}, mode: {mode:?}, uid: {uid:?}, \
-            gid: {gid:?}, size: {size:?}, fh: {fh:?}, flags: {flags:?})"
+            gid: {gid:?}, size: {size:?}, fh: {fh:?}, flags: {flags:?}, \
+            kill_suidgid: {kill_suidgid})"
         );
         reply.error(ENOSYS);
     }

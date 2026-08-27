@@ -31,6 +31,7 @@ use tidefs_types_vfs_core::{LockRange, LockType};
 use tidefs_vfs_engine::{
     LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminError,
     LivePoolAdminRequest, LivePoolAdminResponse, LseekDataRange, VfsEngine, VfsEngineStatFs,
+    WritePrivilegeClear,
 };
 #[cfg(test)]
 use tidefs_vfs_engine::{LivePoolAdminOutput, LivePoolAdminResponseBody};
@@ -7650,6 +7651,17 @@ impl VfsEngine for VfsLocalFileSystem {
         fh: &EngineFileHandle,
         offset: u64,
         data: &[u8],
+        ctx: &RequestCtx,
+    ) -> std::result::Result<u32, Errno> {
+        self.write_with_privilege_clearing(fh, offset, data, WritePrivilegeClear::default(), ctx)
+    }
+
+    fn write_with_privilege_clearing(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        data: &[u8],
+        clear: WritePrivilegeClear,
         _ctx: &RequestCtx,
     ) -> std::result::Result<u32, Errno> {
         self.ensure_writable()?;
@@ -7663,7 +7675,12 @@ impl VfsEngine for VfsLocalFileSystem {
             // respect to other append writers (POSIX O_APPEND semantics).
             let mut fs = self.fs.borrow_mut();
             let write_offset = fs.get_inode_by_id(fh.inode_id).ok_or(Errno::ENOENT)?.size;
-            if let Err(err) = fs.write_file_by_inode(fh.inode_id, write_offset, data) {
+            if let Err(err) = fs.write_file_by_inode_with_privilege_clearing(
+                fh.inode_id,
+                write_offset,
+                data,
+                clear,
+            ) {
                 let errno = map_errno(&err);
                 if errno == Errno::EIO && vfs_op_diagnostics_enabled() {
                     eprintln!(
@@ -7689,7 +7706,9 @@ impl VfsEngine for VfsLocalFileSystem {
         }
 
         let mut fs = self.fs.borrow_mut();
-        if let Err(err) = fs.write_file_by_inode(fh.inode_id, offset, data) {
+        if let Err(err) =
+            fs.write_file_by_inode_with_privilege_clearing(fh.inode_id, offset, data, clear)
+        {
             let errno = map_errno(&err);
             if errno == Errno::EIO && vfs_op_diagnostics_enabled() {
                 eprintln!(

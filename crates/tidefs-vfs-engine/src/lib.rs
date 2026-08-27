@@ -86,6 +86,30 @@ pub struct LseekDataRange {
     pub end: u64,
 }
 
+/// Privileged file metadata that an engine must clear before accepting data.
+///
+/// Linux killpriv v2 always removes `security.capability` on a non-empty
+/// write.  It additionally asks the server to clear SUID, and SGID when the
+/// group-execute bit is set, when the caller lacks `CAP_FSETID`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WritePrivilegeClear {
+    /// Remove the file capability xattr before accepting the write.
+    pub clear_security_capability: bool,
+    /// Clear the write-sensitive SUID/SGID mode bits.
+    pub clear_suid_sgid: bool,
+}
+
+impl WritePrivilegeClear {
+    /// Construct the privilege-clearing request for one killpriv-v2 write.
+    #[must_use]
+    pub const fn killpriv_v2(clear_suid_sgid: bool) -> Self {
+        Self {
+            clear_security_capability: true,
+            clear_suid_sgid,
+        }
+    }
+}
+
 impl LseekDataRange {
     /// Construct a half-open data range.
     #[must_use]
@@ -862,6 +886,53 @@ pub trait VfsEngine {
         data: &[u8],
         ctx: &RequestCtx,
     ) -> Result<u32, Errno>;
+
+    /// Write data after applying the requested privilege clearing.
+    ///
+    /// Engines should override this when they can fold privilege metadata
+    /// into the same inode mutation as the data write.  The default preserves
+    /// the contract for other engines through the ordinary xattr, setattr,
+    /// and write operations.
+    fn write_with_privilege_clearing(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        data: &[u8],
+        clear: WritePrivilegeClear,
+        ctx: &RequestCtx,
+    ) -> Result<u32, Errno> {
+        if data.is_empty() {
+            return self.write(fh, offset, data, ctx);
+        }
+
+        let clear_ctx = RequestCtx {
+            uid: 0,
+            gid: 0,
+            pid: ctx.pid,
+            umask: ctx.umask,
+            groups: alloc::vec![0],
+        };
+        if clear.clear_security_capability {
+            match self.removexattr(fh.inode_id, b"security.capability", &clear_ctx) {
+                Ok(()) | Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {}
+                Err(errno) => return Err(errno),
+            }
+        }
+        if clear.clear_suid_sgid {
+            let current = self.getattr(fh.inode_id, Some(fh), ctx)?;
+            let mut mode = current.posix.mode & !S_ISUID;
+            if current.posix.mode & 0o010 != 0 {
+                mode &= !S_ISGID;
+            }
+            if mode != current.posix.mode {
+                let mut attr = SetAttr::new();
+                attr.valid = FATTR_MODE;
+                attr.mode = mode;
+                self.setattr(fh.inode_id, &attr, Some(fh), &clear_ctx)?;
+            }
+        }
+        self.write(fh, offset, data, ctx)
+    }
 
     /// Copy bytes from one open file handle to another.
     ///

@@ -639,6 +639,7 @@ impl Filesystem for SimpleFS {
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
         _flags: Option<u32>,
+        _kill_suidgid: bool,
         reply: ReplyAttr,
     ) {
         let mut attrs = match self.get_inode(inode) {

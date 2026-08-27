@@ -442,6 +442,7 @@ use tidefs_types_vfs_core::{
     ROOT_INODE_ID,
 };
 use tidefs_types_vfs_core::{LockConflict, LockRange, LockTracker, LockType};
+use tidefs_vfs_engine::WritePrivilegeClear;
 
 use background_orphan_reclamation::BackgroundOrphanReclamation;
 #[cfg(feature = "data-policy")]
@@ -10910,14 +10911,22 @@ impl PoolDatasetOwner {
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
         let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
-        self.write_file_by_inode_with_ancestors(inode_id, &inode_ancestors, path, offset, bytes)
+        self.write_file_by_inode_with_ancestors(
+            inode_id,
+            &inode_ancestors,
+            path,
+            offset,
+            bytes,
+            WritePrivilegeClear::default(),
+        )
     }
 
-    pub(crate) fn write_file_by_inode(
+    pub(crate) fn write_file_by_inode_with_privilege_clearing(
         &mut self,
         inode_id: InodeId,
         offset: u64,
         bytes: &[u8],
+        clear: WritePrivilegeClear,
     ) -> Result<InodeRecord> {
         let inode_ancestors = self.quota_ancestors_for_inode(inode_id);
         self.write_file_by_inode_with_ancestors(
@@ -10926,6 +10935,7 @@ impl PoolDatasetOwner {
             &format!("inode:{}", inode_id.get()),
             offset,
             bytes,
+            clear,
         )
     }
 
@@ -10936,6 +10946,7 @@ impl PoolDatasetOwner {
         target: &str,
         offset: u64,
         bytes: &[u8],
+        clear: WritePrivilegeClear,
     ) -> Result<InodeRecord> {
         self.ensure_mutation_allowed("write mounted file by inode")?;
         let initial_record = self.inode(inode_id)?.clone();
@@ -10958,6 +10969,59 @@ impl PoolDatasetOwner {
         })?;
         if bytes_len == 0 {
             return Ok(initial_record);
+        }
+        let security_capability_present = clear.clear_security_capability
+            && initial_record
+                .xattrs
+                .contains_key(b"security.capability".as_slice());
+        let clear_suid =
+            clear.clear_suid_sgid && initial_record.mode & tidefs_types_vfs_core::S_ISUID != 0;
+        let clear_sgid = clear.clear_suid_sgid
+            && initial_record.mode & tidefs_types_vfs_core::S_ISGID != 0
+            && initial_record.mode & 0o010 != 0;
+        if security_capability_present || clear_suid || clear_sgid {
+            let mut cleared_record = initial_record.clone();
+            if security_capability_present {
+                cleared_record
+                    .xattrs
+                    .remove(b"security.capability".as_slice());
+            }
+            if clear_suid {
+                cleared_record.mode &= !tidefs_types_vfs_core::S_ISUID;
+            }
+            if clear_sgid {
+                cleared_record.mode &= !tidefs_types_vfs_core::S_ISGID;
+            }
+            self.begin_mutation("clear file privileges before write")?;
+            if security_capability_present {
+                let name = b"security.capability";
+                let namespace = Self::xattr_namespace_from_name(name);
+                let key_hash = blake3::hash(name);
+                let ino_u64 = inode_id.get();
+                let _ = self.filesystem.intent_log_buffer.as_ref().map(|buffer| {
+                    let _frame = buffer.append(
+                        tidefs_intent_log::IntentLogRecord::XattrRemove {
+                            ino: ino_u64,
+                            namespace,
+                            key_hash: *key_hash.as_bytes(),
+                        },
+                        0,
+                    );
+                });
+            }
+            let tick = self.bump_generation();
+            cleared_record.metadata_version = tick;
+            cleared_record.posix_time.ctime_ns =
+                Self::next_metadata_ctime_ns(cleared_record.posix_time.ctime_ns);
+            Self::advance_subtree_revision(&mut cleared_record);
+            self.mark_inode_metadata_dirty(inode_id);
+            Arc::make_mut(&mut self.filesystem.state.inodes)
+                .insert(inode_id, cleared_record.clone());
+            self.filesystem
+                .inode_cache
+                .borrow_mut()
+                .invalidate(inode_id);
+            self.commit_mutation(())?;
         }
         let end = offset
             .checked_add(bytes_len)

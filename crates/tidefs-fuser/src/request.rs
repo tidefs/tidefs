@@ -568,6 +568,7 @@ impl<'a> Request<'a> {
                     x.chgtime(),
                     x.bkuptime(),
                     x.flags(),
+                    x.kill_suidgid(),
                     self.reply(),
                 );
             }
@@ -1300,6 +1301,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             dummy_reply_attr(),
         );
     }

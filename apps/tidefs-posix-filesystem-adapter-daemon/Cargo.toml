@@ -15,7 +15,7 @@ description = "POSIX filesystem adapter operator entrypoint and FUSE validation 
 [dependencies]
 tidefs-workload = { workspace = true, optional = true }
 blake3 = { version = "1", default-features = false }
-fuser = { version = "0.14.0", features = ["abi-7-30", "abi-7-32"] }
+fuser = { version = "0.14.0", features = ["abi-7-33"] }
 libc = "0.2"
 tidefs-local-filesystem = { workspace = true, features = ["encryption"] }
 tidefs-block-volume-adapter-daemon = { workspace = true, optional = true }

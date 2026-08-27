@@ -74,7 +74,7 @@ use tidefs_types_vfs_core::{
 };
 use tidefs_vfs_engine::{
     LivePoolAdminRequest, LivePoolAdminResponse, LockSpec, LseekDataRange, VfsEngine,
-    VfsEngineStatFs,
+    VfsEngineStatFs, WritePrivilegeClear,
 };
 
 use crate::mount_options::TimestampPolicy;
@@ -106,6 +106,25 @@ fn validate_fuse_write_flags(write_flags: u32) -> Result<(), Errno> {
 // Matches the committed LocalFileSystem root dataset id.
 const ROOT_DATASET_ID: tidefs_dataset_catalog::DatasetId =
     tidefs_dataset_catalog::DatasetId::from_bytes([0u8; 16]);
+
+const FUSE_CAP_HANDLE_KILLPRIV_V2: u32 = 1 << 28;
+
+const fn required_fuse_capabilities() -> u32 {
+    const CAP_POSIX_LOCKS: u32 = 1 << 1;
+    const CAP_FLOCK_LOCKS: u32 = 1 << 10;
+    const CAP_POSIX_ACL: u32 = 1 << 20;
+    const CAP_PARALLEL_DIROPS: u32 = 1 << 18;
+    const CAP_DO_READDIRPLUS: u32 = 1 << 13;
+    const CAP_DONT_MASK: u32 = 1 << 6;
+
+    CAP_POSIX_LOCKS
+        | CAP_FLOCK_LOCKS
+        | CAP_POSIX_ACL
+        | CAP_PARALLEL_DIROPS
+        | CAP_DO_READDIRPLUS
+        | FUSE_CAP_HANDLE_KILLPRIV_V2
+        | CAP_DONT_MASK
+}
 
 // ── Sticky bit (S_ISVTX) enforcement ──────────────────────────────────────
 
@@ -271,6 +290,7 @@ fn apply_setattr_privilege_mode_rules(
     attr: &SetAttr,
     current: &InodeAttr,
     ctx: &RequestCtx,
+    kill_suidgid: bool,
 ) -> SetAttr {
     let mut effective = *attr;
     let mut mode = if attr.valid & FATTR_MODE != 0 {
@@ -280,8 +300,16 @@ fn apply_setattr_privilege_mode_rules(
     };
     let mut force_mode = false;
 
-    if (attr.valid & (FATTR_UID | FATTR_GID)) != 0 && ctx.uid != 0 {
+    if (attr.valid & (FATTR_UID | FATTR_GID)) != 0 && current.kind != NodeKind::Dir {
         mode = (current.posix.mode & S_IFMT) | (mode & !S_IFMT & !(S_ISUID | S_ISGID));
+        force_mode = true;
+    }
+
+    if kill_suidgid && attr.valid & FATTR_SIZE != 0 && current.kind == NodeKind::File {
+        mode &= !S_ISUID;
+        if mode & 0o010 != 0 {
+            mode &= !S_ISGID;
+        }
         force_mode = true;
     }
 
@@ -299,6 +327,24 @@ fn apply_setattr_privilege_mode_rules(
     }
 
     effective
+}
+
+fn remove_security_capability_for_killpriv(
+    engine: &dyn VfsEngine,
+    inode: InodeId,
+    ctx: &RequestCtx,
+) -> Result<(), Errno> {
+    let clear_ctx = RequestCtx {
+        uid: 0,
+        gid: 0,
+        pid: ctx.pid,
+        umask: ctx.umask,
+        groups: vec![0],
+    };
+    match engine.removexattr(inode, b"security.capability", &clear_ctx) {
+        Ok(()) | Err(Errno::ENODATA | Errno::EOPNOTSUPP) => Ok(()),
+        Err(errno) => Err(errno),
+    }
 }
 /// Check that the caller has write+execute access on a parent directory,
 /// with POSIX ACL support. Retrieves the parent's access ACL from xattr
@@ -3960,37 +4006,8 @@ impl FuseVfsAdapter {
         )
     }
 
-    fn apply_write_killpriv_before_write(
-        engine: &dyn VfsEngine,
-        ctx: &RequestCtx,
-        ino: u64,
-        handle: &EngineFileHandle,
-        write_flags: u32,
-    ) -> Result<(), Errno> {
-        if (write_flags & FUSE_WRITE_KILL_PRIV) == 0 {
-            return Ok(());
-        }
-        let current = engine.getattr(InodeId::new(ino), Some(handle), ctx)?;
-        if ctx.uid == 0 || ctx.uid == current.posix.uid {
-            return Ok(());
-        }
-        let mode = current.posix.mode;
-        if (mode & (S_ISUID | S_ISGID)) == 0 {
-            return Ok(());
-        }
-        let mut set = SetAttr::new();
-        set.valid = FATTR_MODE;
-        set.mode = (mode & S_IFMT) | (mode & !S_IFMT & !(S_ISUID | S_ISGID));
-        let clear_ctx = RequestCtx {
-            uid: 0,
-            gid: 0,
-            pid: ctx.pid,
-            umask: ctx.umask,
-            groups: vec![0],
-        };
-        engine
-            .setattr(InodeId::new(ino), &set, Some(handle), &clear_ctx)
-            .map(|_| ())
+    fn write_privilege_clear(write_flags: u32) -> WritePrivilegeClear {
+        WritePrivilegeClear::killpriv_v2((write_flags & FUSE_WRITE_KILL_PRIV) != 0)
     }
 
     /// Conditionally update atime on a directory after a successful readdir.
@@ -5016,6 +5033,18 @@ impl FuseVfsAdapter {
         attr: &SetAttr,
         fh: Option<u64>,
     ) -> Result<FuseAttrOut, Errno> {
+        self.dispatch_setattr_with_killpriv(ctx, unique, ino, attr, fh, false)
+    }
+
+    fn dispatch_setattr_with_killpriv(
+        &self,
+        ctx: &RequestCtx,
+        _unique: u64,
+        ino: u64,
+        attr: &SetAttr,
+        fh: Option<u64>,
+        kill_suidgid: bool,
+    ) -> Result<FuseAttrOut, Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_METADATA);
         let mutation_requested = attr.valid
             & (FATTR_SIZE
@@ -5071,6 +5100,11 @@ impl FuseVfsAdapter {
         {
             return Err(Errno::EPERM);
         }
+        if current_attr.kind == NodeKind::File
+            && attr.valid & (FATTR_UID | FATTR_GID | FATTR_SIZE) != 0
+        {
+            remove_security_capability_for_killpriv(&**e, inode_id, ctx)?;
+        }
         // Capacity admission and tracking for size changes are handled by the
         // engine's CapacityAuthority during truncate_extents dispatch.
         let mut data_invalidation_range = None;
@@ -5119,7 +5153,8 @@ impl FuseVfsAdapter {
                 result?;
             }
         }
-        let effective_attr = apply_setattr_privilege_mode_rules(attr, &current_attr, ctx);
+        let effective_attr =
+            apply_setattr_privilege_mode_rules(attr, &current_attr, ctx, kill_suidgid);
 
         let updated = match e.setattr(inode_id, &effective_attr, engine_fh.as_ref(), ctx) {
             Ok(updated) => updated,
@@ -5176,11 +5211,12 @@ impl FuseVfsAdapter {
         ino: u64,
         attr: &SetAttr,
         fh: Option<u64>,
+        kill_suidgid: bool,
     ) -> Result<FuseAttrOut, Errno> {
         if is_fuse_read_atime_setattr(attr, fh) {
             return self.dispatch_fuse_read_atime_setattr(ctx, unique, ino, attr);
         }
-        self.dispatch_setattr(ctx, unique, ino, attr, fh)
+        self.dispatch_setattr_with_killpriv(ctx, unique, ino, attr, fh, kill_suidgid)
     }
 
     fn dispatch_fuse_read_atime_setattr(
@@ -6162,59 +6198,55 @@ impl FuseVfsAdapter {
                         pre_write_size,
                         ctx,
                     );
-                let metadata_error = if data.is_empty() {
-                    None
-                } else {
-                    Self::apply_write_killpriv_before_write(&**e, ctx, ino, write_efh, write_flags)
-                        .err()
-                };
-                let result = if let Some(errno) = metadata_error {
-                    Err(errno)
-                } else {
-                    match e.write(write_efh, effective_offset as u64, data, ctx) {
-                        Ok(written) => match usize::try_from(written)
-                            .ok()
-                            .and_then(|written_len| data.get(..written_len))
-                        {
-                            Some(written_data) => {
-                                if written > 0 {
-                                    if posix_direct_io {
-                                        // Direct I/O bypasses the adapter page cache.
-                                        // The engine write is authoritative for
-                                        // read-after-write; flush/fsync/close publish
-                                        // it instead of forcing every O_DIRECT write
-                                        // through a committed-root cycle.
-                                        self.invalidate_caches_after_direct_write(
-                                            ino,
-                                            effective_offset as u64,
-                                            u64::from(written),
-                                        );
-                                    } else if clean_writeback_write_through && !sparse_zero_noop {
-                                        self.record_clean_write_through_after_write(
-                                            ino,
-                                            effective_offset as u64,
-                                            written,
-                                            written_data,
-                                        )?;
-                                    } else if !sparse_zero_noop {
-                                        self.mark_dirty_after_write(
-                                            &**e,
-                                            ctx,
-                                            write_efh,
-                                            ino,
-                                            effective_offset as u64,
-                                            written,
-                                            written_data,
-                                            write_flags,
-                                        );
-                                    }
+                let result = match e.write_with_privilege_clearing(
+                    write_efh,
+                    effective_offset as u64,
+                    data,
+                    Self::write_privilege_clear(write_flags),
+                    ctx,
+                ) {
+                    Ok(written) => match usize::try_from(written)
+                        .ok()
+                        .and_then(|written_len| data.get(..written_len))
+                    {
+                        Some(written_data) => {
+                            if written > 0 {
+                                if posix_direct_io {
+                                    // Direct I/O bypasses the adapter page cache.
+                                    // The engine write is authoritative for
+                                    // read-after-write; flush/fsync/close publish
+                                    // it instead of forcing every O_DIRECT write
+                                    // through a committed-root cycle.
+                                    self.invalidate_caches_after_direct_write(
+                                        ino,
+                                        effective_offset as u64,
+                                        u64::from(written),
+                                    );
+                                } else if clean_writeback_write_through && !sparse_zero_noop {
+                                    self.record_clean_write_through_after_write(
+                                        ino,
+                                        effective_offset as u64,
+                                        written,
+                                        written_data,
+                                    )?;
+                                } else if !sparse_zero_noop {
+                                    self.mark_dirty_after_write(
+                                        &**e,
+                                        ctx,
+                                        write_efh,
+                                        ino,
+                                        effective_offset as u64,
+                                        written,
+                                        written_data,
+                                        write_flags,
+                                    );
                                 }
-                                Ok(written)
                             }
-                            None => Err(Errno::EIO),
-                        },
-                        Err(errno) => Err(errno),
-                    }
+                            Ok(written)
+                        }
+                        None => Err(Errno::EIO),
+                    },
+                    Err(errno) => Err(errno),
                 };
                 let clean_write_through_recorded = matches!(
                     &result,
@@ -6325,55 +6357,52 @@ impl FuseVfsAdapter {
                 // engine's CapacityAuthority during write dispatch; the adapter
                 // no longer maintains a parallel reservation lifecycle on
                 // CapacityFacade.
-                let metadata_error = if data.is_empty() {
-                    None
-                } else {
-                    Self::apply_write_killpriv_before_write(&**e, ctx, ino, &efh, write_flags).err()
-                };
-                if let Some(errno) = metadata_error {
-                    Err(errno)
-                } else {
-                    match e.write(&efh, effective_offset as u64, data, ctx) {
-                        Ok(written) => {
-                            if written > 0 {
-                                if posix_direct_io {
-                                    // Direct I/O bypasses the adapter page cache.
-                                    // The engine write is authoritative for
-                                    // read-after-write; flush/fsync/close publish
-                                    // it instead of forcing every O_DIRECT write
-                                    // through a committed-root cycle.
-                                    self.invalidate_caches_after_direct_write(
-                                        ino,
-                                        effective_offset as u64,
-                                        u64::from(written),
-                                    );
-                                } else if clean_plain_write_through {
-                                    let written_len =
-                                        usize::try_from(written).map_err(|_| Errno::EIO)?;
-                                    let written_data = data.get(..written_len).ok_or(Errno::EIO)?;
-                                    self.record_clean_write_through_after_write(
-                                        ino,
-                                        effective_offset as u64,
-                                        written,
-                                        written_data,
-                                    )?;
-                                } else {
-                                    self.mark_dirty_after_write(
-                                        &**e,
-                                        ctx,
-                                        &efh,
-                                        ino,
-                                        effective_offset as u64,
-                                        written,
-                                        data,
-                                        write_flags,
-                                    );
-                                }
+                match e.write_with_privilege_clearing(
+                    &efh,
+                    effective_offset as u64,
+                    data,
+                    Self::write_privilege_clear(write_flags),
+                    ctx,
+                ) {
+                    Ok(written) => {
+                        if written > 0 {
+                            if posix_direct_io {
+                                // Direct I/O bypasses the adapter page cache.
+                                // The engine write is authoritative for
+                                // read-after-write; flush/fsync/close publish
+                                // it instead of forcing every O_DIRECT write
+                                // through a committed-root cycle.
+                                self.invalidate_caches_after_direct_write(
+                                    ino,
+                                    effective_offset as u64,
+                                    u64::from(written),
+                                );
+                            } else if clean_plain_write_through {
+                                let written_len =
+                                    usize::try_from(written).map_err(|_| Errno::EIO)?;
+                                let written_data = data.get(..written_len).ok_or(Errno::EIO)?;
+                                self.record_clean_write_through_after_write(
+                                    ino,
+                                    effective_offset as u64,
+                                    written,
+                                    written_data,
+                                )?;
+                            } else {
+                                self.mark_dirty_after_write(
+                                    &**e,
+                                    ctx,
+                                    &efh,
+                                    ino,
+                                    effective_offset as u64,
+                                    written,
+                                    data,
+                                    write_flags,
+                                );
                             }
-                            Ok(written)
                         }
-                        Err(errno) => Err(errno),
+                        Ok(written)
                     }
+                    Err(errno) => Err(errno),
                 }
             }; // engine lock dropped here
 
@@ -9472,20 +9501,7 @@ impl Filesystem for FuseVfsAdapter {
         // Use raw u32 values because fuser::consts items are feature-gated.
 
         // Required: mount fails if any rejected.
-        const CAP_POSIX_LOCKS: u32 = 1 << 1;
-        const CAP_FLOCK_LOCKS: u32 = 1 << 10;
-        const CAP_POSIX_ACL: u32 = 1 << 20;
-        const CAP_PARALLEL_DIROPS: u32 = 1 << 18;
-        const CAP_DO_READDIRPLUS: u32 = 1 << 13;
-        const CAP_HANDLE_KILLPRIV: u32 = 1 << 19;
-        const CAP_DONT_MASK: u32 = 1 << 6;
-        let required = CAP_POSIX_LOCKS
-            | CAP_FLOCK_LOCKS
-            | CAP_POSIX_ACL
-            | CAP_PARALLEL_DIROPS
-            | CAP_DO_READDIRPLUS
-            | CAP_HANDLE_KILLPRIV
-            | CAP_DONT_MASK;
+        let required = required_fuse_capabilities();
 
         // Perf: best-effort, mount proceeds either way.
         const CAP_WRITEBACK_CACHE: u32 = 1 << 16;
@@ -9610,6 +9626,7 @@ impl Filesystem for FuseVfsAdapter {
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
         _flags: Option<u32>,
+        kill_suidgid: bool,
         reply: ReplyAttr,
     ) {
         let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Setattr);
@@ -9633,7 +9650,7 @@ impl Filesystem for FuseVfsAdapter {
                 sa.valid
             );
         }
-        let result = self.dispatch_fuse_setattr(&ctx, req.unique(), ino, &sa, fh);
+        let result = self.dispatch_fuse_setattr(&ctx, req.unique(), ino, &sa, fh, kill_suidgid);
         if diagnostic {
             eprintln!(
                 "tidefs-diagnostic: fuse setattr end unique={} ino={} status={} errno={:?} elapsed_ms={}",
@@ -13389,7 +13406,7 @@ mod tests {
         read_atime.valid = FATTR_ATIME_NOW;
         fixture
             .adapter
-            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None)
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None, false)
             .expect("automatic fuse atime setattr");
 
         let after = {
@@ -13439,7 +13456,7 @@ mod tests {
         read_atime.valid = FATTR_ATIME_NOW | FATTR_FH;
         fixture
             .adapter
-            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, Some(adapter_fh))
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, Some(adapter_fh), false)
             .expect("automatic fuse atime setattr with file handle");
 
         let after = {
@@ -13514,7 +13531,7 @@ mod tests {
         read_atime.ctime_ns = before.posix.ctime_ns;
         fixture
             .adapter
-            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None)
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None, false)
             .expect("automatic fuse atime setattr with preserved ctime");
 
         let after = {
@@ -13571,7 +13588,7 @@ mod tests {
         read_atime.ctime_ns = before.posix.ctime_ns;
         fixture
             .adapter
-            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None)
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None, false)
             .expect("automatic fuse specific atime setattr with preserved ctime");
 
         let after = {
@@ -13635,7 +13652,7 @@ mod tests {
         read_atime.valid = FATTR_ATIME_NOW;
         fixture
             .adapter
-            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None)
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None, false)
             .expect("read-only automatic fuse atime setattr");
 
         let after = {
@@ -14039,8 +14056,8 @@ mod tests {
     }
     // ── Killpriv (FUSE_WRITE_KILL_PRIV) tests ───────────────────────
     //
-    // Verify that when FUSE_WRITE_KILL_PRIV is set on a write, S_ISUID
-    // and S_ISGID are cleared for non-owner writers, per POSIX semantics.
+    // FUSE_WRITE_KILL_PRIV is the old name for the v2 SUID/SGID-clear bit.
+    // security.capability is cleared on every non-empty v2 write.
 
     /// Helper: create a file with a specific owner and S_ISUID set,
     /// returning (inode, adapter_fh, engine_fh).
@@ -14064,6 +14081,22 @@ mod tests {
         (inode, adapter_fh, engine_fh)
     }
 
+    fn set_test_security_capability(adapter: &FuseVfsAdapter, inode: InodeId, ctx: &RequestCtx) {
+        adapter
+            .engine
+            .lock()
+            .unwrap()
+            .setxattr(inode, b"security.capability", b"test-capability", 0, ctx)
+            .expect("set test security.capability");
+    }
+
+    #[test]
+    fn required_fuse_caps_negotiate_killpriv_v2_not_v1() {
+        let required = required_fuse_capabilities();
+        assert_ne!(required & FUSE_CAP_HANDLE_KILLPRIV_V2, 0);
+        assert_eq!(required & (1 << 19), 0);
+    }
+
     #[test]
     fn vfs_adapter_dispatch_write_killpriv_clears_setuid_for_non_owner() {
         let fixture = adapter_fixture();
@@ -14076,6 +14109,7 @@ mod tests {
         };
         let (inode, adapter_fh, _engine_fh) =
             create_setuid_file(&fixture.adapter, &ctx_owner, b"setuid-nonowner.txt", 1001);
+        set_test_security_capability(&fixture.adapter, inode, &ctx_owner);
 
         // Write as uid=1000 (non-owner) with FUSE_WRITE_KILL_PRIV.
         let ctx_writer = RequestCtx {
@@ -14108,6 +14142,10 @@ mod tests {
             0,
             "S_ISUID must be cleared after non-owner write with FUSE_WRITE_KILL_PRIV"
         );
+        assert_eq!(
+            engine.getxattr(inode, b"security.capability", &ctx_owner),
+            Err(Errno::ENODATA)
+        );
     }
 
     #[test]
@@ -14122,6 +14160,7 @@ mod tests {
         };
         let (inode, adapter_fh, _engine_fh) =
             create_setuid_file(&fixture.adapter, &ctx_owner, b"setuid-nokillpriv.txt", 1001);
+        set_test_security_capability(&fixture.adapter, inode, &ctx_owner);
 
         // Write as uid=1000 (non-owner) without FUSE_WRITE_KILL_PRIV.
         let ctx_writer = RequestCtx {
@@ -14147,10 +14186,15 @@ mod tests {
             0,
             "S_ISUID must be preserved when FUSE_WRITE_KILL_PRIV is not set"
         );
+        assert_eq!(
+            engine.getxattr(inode, b"security.capability", &ctx_owner),
+            Err(Errno::ENODATA),
+            "killpriv v2 clears file capabilities on every non-empty write"
+        );
     }
 
     #[test]
-    fn vfs_adapter_dispatch_write_killpriv_owner_preserves_setuid() {
+    fn vfs_adapter_dispatch_write_killpriv_flag_is_authoritative_for_owner() {
         let fixture = adapter_fixture();
         let ctx_owner = RequestCtx {
             uid: 1001,
@@ -14162,7 +14206,8 @@ mod tests {
         let (inode, adapter_fh, _engine_fh) =
             create_setuid_file(&fixture.adapter, &ctx_owner, b"setuid-owner.txt", 1001);
 
-        // Write as uid=1001 (owner) with FUSE_WRITE_KILL_PRIV (CAP_FSETID semantics).
+        // The kernel sets this bit only after its CAP_FSETID decision.  The
+        // daemon must obey it rather than inferring capability from ownership.
         let written = fixture
             .adapter
             .dispatch_write(
@@ -14176,15 +14221,14 @@ mod tests {
             .expect("owner write dispatch with killpriv");
         assert_eq!(written, 4);
 
-        // S_ISUID must be preserved for owner writes.
         let engine = fixture.adapter.engine.lock().unwrap();
         let attr = engine
             .getattr(inode, None, &ctx_owner)
             .expect("getattr after owner killpriv write");
-        assert_ne!(
+        assert_eq!(
             attr.posix.mode & S_ISUID,
             0,
-            "S_ISUID must be preserved when owner writes with FUSE_WRITE_KILL_PRIV (CAP_FSETID)"
+            "FUSE_WRITE_KILL_PRIV must clear S_ISUID regardless of file ownership"
         );
     }
 
@@ -14200,6 +14244,7 @@ mod tests {
         };
         let (inode, adapter_fh, _engine_fh) =
             create_setuid_file(&adapter, &ctx_owner, b"wb-killpriv.txt", 1001);
+        set_test_security_capability(&adapter, inode, &ctx_owner);
 
         // Write as uid=1000 (non-owner) with FUSE_WRITE_CACHE | FUSE_WRITE_KILL_PRIV
         // so the writeback-cache path exercises killpriv clearing.
@@ -14232,6 +14277,144 @@ mod tests {
             0,
             "S_ISUID must be cleared after non-owner writeback-cache write with FUSE_WRITE_KILL_PRIV"
         );
+        assert_eq!(
+            engine.getxattr(inode, b"security.capability", &ctx_owner),
+            Err(Errno::ENODATA)
+        );
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_write_killpriv_clears_only_executable_sgid() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (exec_inode, exec_fh, exec_engine_fh) =
+            create_setuid_file(&fixture.adapter, &ctx, b"sgid-exec.txt", 0);
+        let (plain_inode, plain_fh, plain_engine_fh) =
+            create_setuid_file(&fixture.adapter, &ctx, b"sgid-plain.txt", 0);
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let mut mode = SetAttr::new();
+            mode.valid = FATTR_MODE;
+            mode.mode = S_ISGID | 0o750;
+            engine
+                .setattr(exec_inode, &mode, Some(&exec_engine_fh), &ctx)
+                .expect("set executable SGID mode");
+            mode.mode = S_ISGID | 0o740;
+            engine
+                .setattr(plain_inode, &mode, Some(&plain_engine_fh), &ctx)
+                .expect("set non-executable SGID mode");
+        }
+
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                exec_inode.get(),
+                exec_fh,
+                0,
+                b"x",
+                FUSE_WRITE_KILL_PRIV,
+            )
+            .expect("write executable SGID file");
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                plain_inode.get(),
+                plain_fh,
+                0,
+                b"x",
+                FUSE_WRITE_KILL_PRIV,
+            )
+            .expect("write non-executable SGID file");
+
+        let engine = fixture.adapter.engine.lock().unwrap();
+        assert_eq!(
+            engine
+                .getattr(exec_inode, None, &ctx)
+                .expect("executable SGID attr")
+                .posix
+                .mode
+                & S_ISGID,
+            0
+        );
+        assert_ne!(
+            engine
+                .getattr(plain_inode, None, &ctx)
+                .expect("non-executable SGID attr")
+                .posix
+                .mode
+                & S_ISGID,
+            0
+        );
+    }
+
+    #[test]
+    fn vfs_adapter_killpriv_v2_setattr_clears_chown_and_truncate_privileges() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (chown_inode, _chown_fh, chown_engine_fh) =
+            create_setuid_file(&fixture.adapter, &ctx, b"chown-killpriv.txt", 0);
+        let (truncate_inode, _truncate_fh, truncate_engine_fh) =
+            create_setuid_file(&fixture.adapter, &ctx, b"truncate-killpriv.txt", 0);
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let mut mode = SetAttr::new();
+            mode.valid = FATTR_MODE;
+            mode.mode = S_ISUID | S_ISGID | 0o750;
+            engine
+                .setattr(chown_inode, &mode, Some(&chown_engine_fh), &ctx)
+                .expect("set chown privilege mode");
+            engine
+                .setattr(truncate_inode, &mode, Some(&truncate_engine_fh), &ctx)
+                .expect("set truncate privilege mode");
+            engine
+                .setxattr(
+                    chown_inode,
+                    b"security.capability",
+                    b"chown-capability",
+                    0,
+                    &ctx,
+                )
+                .expect("set chown capability");
+            engine
+                .setxattr(
+                    truncate_inode,
+                    b"security.capability",
+                    b"truncate-capability",
+                    0,
+                    &ctx,
+                )
+                .expect("set truncate capability");
+        }
+
+        let mut chown = SetAttr::new();
+        chown.valid = FATTR_UID;
+        chown.uid = 1001;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, chown_inode.get(), &chown, None)
+            .expect("killpriv-v2 chown");
+
+        let mut truncate = SetAttr::new();
+        truncate.valid = FATTR_SIZE;
+        truncate.size = 0;
+        fixture
+            .adapter
+            .dispatch_setattr_with_killpriv(&ctx, 2, truncate_inode.get(), &truncate, None, true)
+            .expect("killpriv-v2 truncate");
+
+        let engine = fixture.adapter.engine.lock().unwrap();
+        for inode in [chown_inode, truncate_inode] {
+            let attr = engine
+                .getattr(inode, None, &ctx)
+                .expect("post-killpriv attr");
+            assert_eq!(attr.posix.mode & (S_ISUID | S_ISGID), 0);
+            assert_eq!(
+                engine.getxattr(inode, b"security.capability", &ctx),
+                Err(Errno::ENODATA)
+            );
+        }
     }
 
     fn write_sync_datasync_classifies_sync_open_flags() {
