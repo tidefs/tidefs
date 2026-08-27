@@ -1620,11 +1620,7 @@ impl MountedLocalReclaimService {
         }
     }
 
-    fn run_tick(
-        &mut self,
-        budget: &ServiceBudget,
-        tick_started: std::time::Instant,
-    ) -> Result<TickReport, ServiceError> {
+    fn run_tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
         if !self.has_stable_idle_window() {
             return Ok(TickReport {
                 skipped: 1,
@@ -1659,12 +1655,9 @@ impl MountedLocalReclaimService {
         let foreground_demand = Arc::clone(&self.foreground_demand);
         let foreground_activity_epoch = Arc::clone(&self.foreground_activity_epoch);
         let selected_activity_epoch = foreground_activity_epoch.load(Ordering::Acquire);
-        let time_budget =
-            (budget.max_ms > 0).then(|| std::time::Duration::from_millis(budget.max_ms));
         let mut should_preempt = || {
             foreground_demand.load(Ordering::Acquire)
                 || foreground_activity_epoch.load(Ordering::Acquire) != selected_activity_epoch
-                || time_budget.is_some_and(|limit| tick_started.elapsed() >= limit)
         };
         let reclaim = self
             .pool_owner
@@ -1677,12 +1670,10 @@ impl MountedLocalReclaimService {
                 }
             })?;
         let Some(reclaim) = reclaim else {
-            // A deadline or newly arrived foreground request can interrupt
-            // the protected-root scan before it produces a drain result.
-            // Require another quiet interval before restarting that
-            // non-resumable scan; otherwise an expired time budget makes the
-            // main mount thread retry it in a hot loop and starves both the
-            // FUSE session and clean teardown.
+            // A newly arrived foreground request can interrupt the
+            // protected-root scan before it produces a drain result. Require
+            // another quiet interval before restarting that non-resumable
+            // scan so the same foreground gap cannot select it again.
             self.retry_not_before = std::time::Instant::now() + MOUNT_BACKGROUND_IDLE_INTERVAL;
             return Ok(TickReport {
                 skipped: 1,
@@ -1725,7 +1716,7 @@ impl BackgroundService for MountedLocalReclaimService {
     }
 
     fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
-        self.run_tick(budget, std::time::Instant::now())
+        self.run_tick(budget)
     }
 
     fn has_work(&self) -> bool {
@@ -1767,8 +1758,7 @@ mod mounted_local_reclaim_service_tests {
     }
 
     #[test]
-    fn mounted_local_reclaim_service_yields_to_foreground_demand_and_honors_item_and_time_budgets()
-    {
+    fn mounted_local_reclaim_service_yields_to_foreground_demand_and_honors_item_budget() {
         let root = tempfile::tempdir().expect("create mounted reclaim fixture");
         let mut filesystem =
             tidefs_local_filesystem::PoolDatasetOwner::open_with_root_authentication_key(
@@ -1814,42 +1804,14 @@ mod mounted_local_reclaim_service_tests {
         let engine = adapter.engine_handle();
         let foreground_demand = adapter.foreground_demand_signal();
         let foreground_activity_epoch = adapter.foreground_activity_epoch();
-        let mut reclaim_service = MountedLocalReclaimService::new(
+        adapter.register_background_service(Box::new(MountedLocalReclaimService::new(
             pool_owner.clone(),
-            Arc::clone(&engine),
+            engine,
             foreground_demand,
             foreground_activity_epoch,
-        );
+        )));
         let scheduler = adapter.background_scheduler_handle();
         let depth_before = pool_owner.borrow().reclaim_queue_depth();
-
-        reclaim_service.idle_gate.lock().unwrap().quiet_since = std::time::Instant::now()
-            .checked_sub(MOUNT_BACKGROUND_IDLE_INTERVAL)
-            .expect("establish elapsed mounted idle interval");
-        let exhausted_budget = ServiceBudget {
-            max_items: 1,
-            max_bytes: ServiceBudget::MAINTENANCE_TICK.max_bytes,
-            max_ms: 1,
-        };
-        let expired_tick_start = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_millis(2))
-            .expect("establish expired mounted reclaim tick");
-        let expired_report = reclaim_service
-            .run_tick(&exhausted_budget, expired_tick_start)
-            .expect("yield mounted reclaim at the service time budget");
-        assert_eq!(expired_report.skipped, 1);
-        assert!(expired_report.has_more);
-        assert_eq!(pool_owner.borrow().reclaim_queue_depth(), depth_before);
-        assert!(
-            !reclaim_service.has_work(),
-            "a preempted protected-root scan must wait for another quiet interval"
-        );
-        assert!(
-            engine.try_lock().is_ok(),
-            "time-budget preemption must release the mounted engine"
-        );
-
-        adapter.register_background_service(Box::new(reclaim_service));
 
         let mut preemption_checks = 0;
         let mut arriving_foreground_demand = || {
