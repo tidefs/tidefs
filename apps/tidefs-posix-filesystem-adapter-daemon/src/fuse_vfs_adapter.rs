@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -3071,6 +3071,7 @@ struct FuseForegroundDemand {
 struct FuseForegroundDemandState {
     active_requests: Mutex<usize>,
     preempt_signal: Arc<AtomicBool>,
+    activity_epoch: Arc<AtomicU64>,
 }
 
 #[must_use = "foreground demand must remain guarded for the complete FUSE request"]
@@ -3109,6 +3110,7 @@ impl FuseRequestAdmission {
 
 impl FuseForegroundDemand {
     fn begin(&self) -> FuseForegroundDemandGuard {
+        self.state.activity_epoch.fetch_add(1, Ordering::AcqRel);
         let mut active_requests = self
             .state
             .active_requests
@@ -3126,6 +3128,10 @@ impl FuseForegroundDemand {
     fn preempt_signal(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.state.preempt_signal)
     }
+
+    fn activity_epoch(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.state.activity_epoch)
+    }
 }
 
 impl Drop for FuseForegroundDemandGuard {
@@ -3137,6 +3143,7 @@ impl Drop for FuseForegroundDemandGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         debug_assert!(*active_requests > 0);
         *active_requests = active_requests.saturating_sub(1);
+        self.state.activity_epoch.fetch_add(1, Ordering::Release);
         if *active_requests == 0 {
             self.state.preempt_signal.store(false, Ordering::Release);
         }
@@ -3766,6 +3773,10 @@ impl FuseVfsAdapter {
 
     pub(crate) fn foreground_demand_signal(&self) -> Arc<AtomicBool> {
         self.foreground_demand.preempt_signal()
+    }
+
+    pub(crate) fn foreground_activity_epoch(&self) -> Arc<AtomicU64> {
+        self.foreground_demand.activity_epoch()
     }
     /// Attach a [`PageCache`] from tidefs-cache-core for writeback dirty
     /// tracking and flush/fsync dirty-page iteration.
@@ -39303,6 +39314,25 @@ mod tests {
         assert!(h2.lock().unwrap().is_none());
         drop(h1);
         drop(h2);
+    }
+
+    #[test]
+    fn foreground_activity_epoch_tracks_request_start_and_completion() {
+        let adapter = make_scheduler_test_adapter();
+        let activity_epoch = adapter.foreground_activity_epoch();
+        let before = activity_epoch.load(Ordering::Acquire);
+
+        let request = adapter.begin_foreground_demand();
+        assert_eq!(
+            activity_epoch.load(Ordering::Acquire),
+            before.wrapping_add(1)
+        );
+
+        drop(request);
+        assert_eq!(
+            activity_epoch.load(Ordering::Acquire),
+            before.wrapping_add(2)
+        );
     }
 
     #[test]

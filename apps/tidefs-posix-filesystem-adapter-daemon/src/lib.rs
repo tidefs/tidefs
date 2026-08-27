@@ -133,7 +133,7 @@ pub mod workers_writeback;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "cluster")]
 use std::time::{Duration, Instant};
@@ -151,6 +151,7 @@ use tidefs_vfs_engine::{
 const MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 const MOUNT_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
 const MOUNT_FUSE_INIT_TIMEOUT_SECS: u64 = 5;
+const MOUNT_BACKGROUND_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 #[cfg(feature = "cluster")]
 pub use tidefs_cluster::{ClusterLeaseGrant, ClusterLeaseSession};
 // The selected local mount owns its bounded scrub work-per-tick policy.
@@ -1400,6 +1401,37 @@ struct MountedCommitGroupService {
     pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
     engine: live_owner::LiveOwnerEngine,
     foreground_demand: Arc<AtomicBool>,
+    foreground_activity_epoch: Arc<AtomicU64>,
+    idle_gate: Mutex<MountedCommitGroupIdleGate>,
+}
+
+#[derive(Debug)]
+struct MountedCommitGroupIdleGate {
+    activity_epoch: u64,
+    quiet_since: std::time::Instant,
+}
+
+impl MountedCommitGroupIdleGate {
+    fn new(activity_epoch: u64, now: std::time::Instant) -> Self {
+        Self {
+            activity_epoch,
+            quiet_since: now,
+        }
+    }
+
+    fn admits(
+        &mut self,
+        activity_epoch: u64,
+        now: std::time::Instant,
+        idle_interval: std::time::Duration,
+    ) -> bool {
+        if self.activity_epoch != activity_epoch {
+            self.activity_epoch = activity_epoch;
+            self.quiet_since = now;
+            return false;
+        }
+        now.saturating_duration_since(self.quiet_since) >= idle_interval
+    }
 }
 
 impl MountedCommitGroupService {
@@ -1409,12 +1441,38 @@ impl MountedCommitGroupService {
         pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
         engine: live_owner::LiveOwnerEngine,
         foreground_demand: Arc<AtomicBool>,
+        foreground_activity_epoch: Arc<AtomicU64>,
     ) -> Self {
+        let activity_epoch = foreground_activity_epoch.load(Ordering::Acquire);
         Self {
             pool_owner,
             engine,
             foreground_demand,
+            foreground_activity_epoch,
+            idle_gate: Mutex::new(MountedCommitGroupIdleGate::new(
+                activity_epoch,
+                std::time::Instant::now(),
+            )),
         }
+    }
+
+    fn has_stable_idle_window(&self) -> bool {
+        if self.foreground_demand.load(Ordering::Acquire) {
+            return false;
+        }
+        let activity_epoch = self.foreground_activity_epoch.load(Ordering::Acquire);
+        let admitted = self
+            .idle_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admits(
+                activity_epoch,
+                std::time::Instant::now(),
+                MOUNT_BACKGROUND_IDLE_INTERVAL,
+            );
+        admitted
+            && !self.foreground_demand.load(Ordering::Acquire)
+            && self.foreground_activity_epoch.load(Ordering::Acquire) == activity_epoch
     }
 
     fn try_engine_lock(
@@ -1438,7 +1496,7 @@ impl BackgroundService for MountedCommitGroupService {
     }
 
     fn tick(&mut self, _budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
-        if self.foreground_demand.load(Ordering::Acquire) {
+        if !self.has_stable_idle_window() {
             return Ok(TickReport {
                 skipped: 1,
                 has_more: true,
@@ -1452,7 +1510,7 @@ impl BackgroundService for MountedCommitGroupService {
                 ..TickReport::default()
             });
         };
-        if self.foreground_demand.load(Ordering::Acquire) {
+        if !self.has_stable_idle_window() {
             return Ok(TickReport {
                 skipped: 1,
                 has_more: true,
@@ -1492,12 +1550,15 @@ impl BackgroundService for MountedCommitGroupService {
     }
 
     fn has_work(&self) -> bool {
-        if self.foreground_demand.load(Ordering::Acquire) {
+        if !self.has_stable_idle_window() {
             return false;
         }
         let Some(_engine) = self.try_engine_lock() else {
             return false;
         };
+        if !self.has_stable_idle_window() {
+            return false;
+        }
         self.pool_owner
             .try_commit_group_maintenance_pending()
             .unwrap_or(false)
@@ -1638,6 +1699,21 @@ impl BackgroundService for MountedLocalReclaimService {
 #[cfg(test)]
 mod mounted_local_reclaim_service_tests {
     use super::*;
+
+    #[test]
+    fn mounted_commit_group_idle_gate_requires_a_complete_quiet_interval() {
+        let started = std::time::Instant::now();
+        let interval = std::time::Duration::from_millis(500);
+        let mut gate = MountedCommitGroupIdleGate::new(7, started);
+
+        assert!(!gate.admits(7, started + interval / 2, interval));
+        assert!(gate.admits(7, started + interval, interval));
+
+        let activity_at = started + interval;
+        assert!(!gate.admits(8, activity_at, interval));
+        assert!(!gate.admits(8, activity_at + interval / 2, interval));
+        assert!(gate.admits(8, activity_at + interval, interval));
+    }
 
     #[test]
     fn mounted_local_reclaim_service_yields_to_arriving_and_concurrent_foreground_demand_and_honors_item_budget(
@@ -2327,10 +2403,12 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     let mmap_coherency = adapter.mmap_coherency_cell();
     if !effective_mode.read_only {
         let foreground_demand = adapter.foreground_demand_signal();
+        let foreground_activity_epoch = adapter.foreground_activity_epoch();
         adapter.register_background_service(Box::new(MountedCommitGroupService::new(
             shared_pool_owner.clone(),
             Arc::clone(&live_owner_engine),
             Arc::clone(&foreground_demand),
+            foreground_activity_epoch,
         )));
         adapter.register_background_service(Box::new(MountedLocalReclaimService::new(
             shared_pool_owner.clone(),
@@ -2744,7 +2822,7 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
             report
         });
         if report.is_none() {
-            std::thread::park_timeout(std::time::Duration::from_millis(500));
+            std::thread::park_timeout(MOUNT_BACKGROUND_IDLE_INTERVAL);
             mmap_coherency.process_tick(16);
         } else {
             std::thread::yield_now();
