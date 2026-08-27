@@ -7694,6 +7694,31 @@ impl PoolDatasetOwner {
         attr
     }
 
+    /// Project live inode attributes without cloning a state-resident record.
+    ///
+    /// Mounted GETATTR is a high-frequency operation. The ordinary `inode()`
+    /// accessor returns an owned record because most of its callers continue
+    /// with content or metadata work, but attribute projection only reads the
+    /// record. Keep the on-demand fallback for an inode not resident in the
+    /// live state and preserve the pending write-buffer size projection.
+    pub(crate) fn inode_attr_by_id(&self, inode_id: InodeId) -> Result<InodeAttr> {
+        if let Some(record) = self.filesystem.state.inodes.get(&inode_id) {
+            let mut attr = self.inode_attr(record);
+            if let Some(buffered_size) = self
+                .filesystem
+                .write_buffers
+                .get(&inode_id)
+                .and_then(WriteBuffer::max_offset)
+            {
+                attr.posix.size = attr.posix.size.max(buffered_size);
+            }
+            return Ok(attr);
+        }
+
+        let record = self.inode(inode_id)?;
+        Ok(self.inode_attr(&record))
+    }
+
     fn data_write_space_delta(
         &self,
         inode_id: InodeId,
@@ -14101,18 +14126,21 @@ impl PoolDatasetOwner {
 
     pub fn get_xattr_by_inode(&self, inode_id: InodeId, name: &[u8]) -> Result<Option<Vec<u8>>> {
         self.ensure_xattr_inode_exists(inode_id)?;
-        let record = self.inode(inode_id)?;
+        let value = match self.filesystem.state.inodes.get(&inode_id) {
+            Some(record) => record.xattrs.get(name).cloned(),
+            None => self.inode(inode_id)?.xattrs.get(name).cloned(),
+        };
         // Re-encode ACL entries from decoded form back to canonical wire format.
         const ACL_ACCESS: &[u8] = b"system.posix_acl_access";
         const ACL_DEFAULT: &[u8] = b"system.posix_acl_default";
         if name == ACL_ACCESS || name == ACL_DEFAULT {
-            if let Some(raw) = record.xattrs.get(name) {
+            if let Some(raw) = value.as_deref() {
                 if let Ok(acl) = tidefs_posix_acl::decode_posix_acl_xattr(raw) {
                     return Ok(Some(tidefs_posix_acl::encode_posix_acl_xattr(&acl)));
                 }
             }
         }
-        Ok(record.xattrs.get(name).cloned())
+        Ok(value)
     }
 
     #[allow(dead_code)] // INTENT: path-dispatch support retained for crate tests; VFS hot path uses inode dispatch.

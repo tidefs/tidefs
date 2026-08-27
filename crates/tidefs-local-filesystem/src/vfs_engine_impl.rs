@@ -342,9 +342,7 @@ impl VfsLocalFileSystem {
     /// the caller already has an inode number.
     pub fn getattr_by_ino(&self, ino: u64) -> std::result::Result<InodeAttr, Errno> {
         let fs = self.fs.borrow();
-        let attr = fuse_getattr::engine_getattr(&fs, ino).map_err(|error| error.to_errno())?;
-        let record = fs.inode(attr.inode_id).map_err(|error| map_errno(&error))?;
-        Ok(fs.inode_attr(&record))
+        fuse_getattr::engine_getattr(&fs, ino).map_err(|error| error.to_errno())
     }
 
     /// Direct inode-ID-based attribute mutation (bypasses path resolution).
