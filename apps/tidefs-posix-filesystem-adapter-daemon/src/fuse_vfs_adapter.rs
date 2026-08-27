@@ -9553,6 +9553,11 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn destroy(&mut self) {
+        // Unmount is foreground lifecycle demand. Publish it before teardown
+        // needs the shared engine so a mounted maintenance scan selected in
+        // the preceding quiet window yields instead of delaying DESTROY.
+        let _foreground_demand = self.begin_foreground_demand();
+
         // Step 1: stop deferred advisory-lock waits before tearing down the
         // carrier. Reset wakes registered waiters; the shutdown flag makes
         // each worker answer EINTR instead of reacquiring against discarded

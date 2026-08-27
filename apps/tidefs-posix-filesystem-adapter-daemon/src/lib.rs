@@ -1677,6 +1677,13 @@ impl MountedLocalReclaimService {
                 }
             })?;
         let Some(reclaim) = reclaim else {
+            // A deadline or newly arrived foreground request can interrupt
+            // the protected-root scan before it produces a drain result.
+            // Require another quiet interval before restarting that
+            // non-resumable scan; otherwise an expired time budget makes the
+            // main mount thread retry it in a hot loop and starves both the
+            // FUSE session and clean teardown.
+            self.retry_not_before = std::time::Instant::now() + MOUNT_BACKGROUND_IDLE_INTERVAL;
             return Ok(TickReport {
                 skipped: 1,
                 has_more: true,
@@ -1722,10 +1729,10 @@ impl BackgroundService for MountedLocalReclaimService {
     }
 
     fn has_work(&self) -> bool {
-        if std::time::Instant::now() < self.retry_not_before {
+        if !self.has_stable_idle_window() {
             return false;
         }
-        if !self.has_stable_idle_window() {
+        if std::time::Instant::now() < self.retry_not_before {
             return false;
         }
 
@@ -1833,6 +1840,10 @@ mod mounted_local_reclaim_service_tests {
         assert_eq!(expired_report.skipped, 1);
         assert!(expired_report.has_more);
         assert_eq!(pool_owner.borrow().reclaim_queue_depth(), depth_before);
+        assert!(
+            !reclaim_service.has_work(),
+            "a preempted protected-root scan must wait for another quiet interval"
+        );
         assert!(
             engine.try_lock().is_ok(),
             "time-budget preemption must release the mounted engine"
