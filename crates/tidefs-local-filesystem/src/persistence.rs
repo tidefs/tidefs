@@ -10,7 +10,7 @@ use tidefs_pool_runtime::{DatasetRootKind, DatasetRootUpdate, PoolRuntime};
 use tidefs_types_vfs_core::InodeId;
 
 use crate::constants::*;
-use crate::content::MountedContentReadAuthority;
+use crate::content::{AuthenticatedContentLayoutCache, MountedContentReadAuthority};
 use crate::decode_content_layout;
 #[cfg(any(test, feature = "replication-io"))]
 use crate::dedup::DedupIndex;
@@ -162,6 +162,19 @@ impl<'a> PriorTransactionManifestIndex<'a> {
             });
         }
         Ok(true)
+    }
+
+    fn contains_exact_content_entry(&self, expected: &TransactionManifestEntry) -> Result<bool> {
+        let Some(position) = self.positions.get(&expected.object_key).copied() else {
+            return Ok(false);
+        };
+        let entry = &self.manifest.entries[position];
+        if entry.role != expected.role {
+            return Err(FileSystemError::CorruptState {
+                reason: "retained content key has the wrong committed manifest role",
+            });
+        }
+        Ok(entry.checksum == expected.checksum)
     }
 
     fn content_entries(
@@ -365,9 +378,10 @@ fn validate_prepared_runtime_successor(
             }
             TransactionManifestObjectRole::VersionedContent
             | TransactionManifestObjectRole::VersionedContentChunk => {
-                // Changed content was strictly read through current Pool
-                // receipts before the transaction objects were prepared.
-                // Clean content retains its authenticated prior-root entry.
+                // Changed content was either strictly read through current
+                // Pool receipts or carried directly from the exact receipts
+                // returned to its exclusive mounted writer. Retained chunks
+                // and clean content keep authenticated prior-root entries.
             }
         }
     }
@@ -466,6 +480,7 @@ pub(crate) fn persist_state_with_runtime_at_transaction(
             transaction_id,
             root_authentication_key,
             &BTreeMap::new(),
+            None,
         )?
         .root,
     )
@@ -485,6 +500,7 @@ pub(crate) fn persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
     transaction_id: u64,
     root_authentication_key: RootAuthenticationKey,
     expected_snapshot_predecessors: &BTreeMap<DatasetId, tidefs_pool_runtime::SnapshotRoot>,
+    authenticated_content_manifests: Option<&AuthenticatedContentLayoutCache>,
 ) -> Result<FilesystemStatePublication> {
     let source_dataset_id = state.dataset_id();
     let prior_manifest =
@@ -495,6 +511,7 @@ pub(crate) fn persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
         transaction_id,
         root_authentication_key,
         &prior_manifest,
+        authenticated_content_manifests,
     )?;
     let successor_manifest = validate_prepared_runtime_successor(
         runtime.pool(),
@@ -588,6 +605,7 @@ pub(crate) fn prepare_state_with_pool_at_transaction(
         transaction_id,
         root_authentication_key,
         None,
+        None,
     )
 }
 
@@ -597,6 +615,7 @@ fn prepare_state_with_pool_at_transaction_reusing_manifest(
     transaction_id: u64,
     root_authentication_key: RootAuthenticationKey,
     prior_manifest: &TransactionManifestRecord,
+    authenticated_content_manifests: Option<&AuthenticatedContentLayoutCache>,
 ) -> Result<RootCommitRecord> {
     prepare_state_with_pool_at_transaction_inner(
         pool,
@@ -604,6 +623,7 @@ fn prepare_state_with_pool_at_transaction_reusing_manifest(
         transaction_id,
         root_authentication_key,
         Some(prior_manifest),
+        authenticated_content_manifests,
     )
 }
 
@@ -613,6 +633,7 @@ fn prepare_state_with_pool_at_transaction_inner(
     transaction_id: u64,
     root_authentication_key: RootAuthenticationKey,
     prior_manifest: Option<&TransactionManifestRecord>,
+    authenticated_content_manifests: Option<&AuthenticatedContentLayoutCache>,
 ) -> Result<RootCommitRecord> {
     if transaction_id < state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID) {
         return Err(FileSystemError::CorruptState {
@@ -623,8 +644,12 @@ fn prepare_state_with_pool_at_transaction_inner(
     let prior_index = prior_manifest
         .map(PriorTransactionManifestIndex::new)
         .transpose()?;
-    let content_entries =
-        pool_content_manifest_entries_for_state(pool, state, prior_index.as_ref())?;
+    let content_entries = pool_content_manifest_entries_for_state(
+        pool,
+        state,
+        prior_index.as_ref(),
+        authenticated_content_manifests,
+    )?;
     let mut batch = PoolTransactionMetadataBatch::new(pool);
     let root = persist_transaction_objects_with_precomputed_content(
         &mut batch,
@@ -666,7 +691,7 @@ pub(crate) fn persist_state_with_pool_at_transaction_until_boundary(
             reason: "mounted transaction id precedes filesystem state generation",
         });
     }
-    let content_entries = pool_content_manifest_entries_for_state(pool, state, None)?;
+    let content_entries = pool_content_manifest_entries_for_state(pool, state, None, None)?;
     let root = persist_transaction_objects_with_precomputed_content(
         pool.raw_primary_store_mut(),
         state,
@@ -924,8 +949,30 @@ pub(crate) fn transaction_manifest_entries_for_pool_content_in_keyspace(
     inode: &InodeRecord,
     keyspace: FilesystemObjectKeyspace,
 ) -> Result<Vec<TransactionManifestEntry>> {
+    transaction_manifest_entries_for_pool_content_in_keyspace_until(
+        pool,
+        inode,
+        keyspace,
+        &mut || false,
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "non-preemptible Pool content validation was preempted",
+    })
+}
+
+/// Build mounted committed-root entries while allowing read-only validation
+/// to yield between exact receipt-authenticated content reads.
+pub(crate) fn transaction_manifest_entries_for_pool_content_in_keyspace_until(
+    pool: &Pool,
+    inode: &InodeRecord,
+    keyspace: FilesystemObjectKeyspace,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<Vec<TransactionManifestEntry>>> {
+    if should_preempt() {
+        return Ok(None);
+    }
     if inode.size == 0 {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
 
     let authority = MountedContentReadAuthority::for_dataset(pool, keyspace.dataset_id());
@@ -937,6 +984,9 @@ pub(crate) fn transaction_manifest_entries_for_pool_content_in_keyspace(
             expected_generation: 0,
         },
     )?;
+    if should_preempt() {
+        return Ok(None);
+    }
     let layout = decode_content_layout(&content_bytes)?;
     validate_content_layout(inode.inode_id, inode, &layout)?;
 
@@ -947,10 +997,16 @@ pub(crate) fn transaction_manifest_entries_for_pool_content_in_keyspace(
     }];
     if let ContentLayout::Chunked(manifest) = layout {
         for chunk_ref in &manifest.chunks {
+            if should_preempt() {
+                return Ok(None);
+            }
             if chunk_ref.is_hole() {
                 continue;
             }
             let _ = authority.read_chunk(manifest.inode_id, chunk_ref)?;
+            if should_preempt() {
+                return Ok(None);
+            }
             entries.push(TransactionManifestEntry {
                 role: TransactionManifestObjectRole::VersionedContentChunk,
                 object_key: keyspace.content_chunk(
@@ -962,13 +1018,14 @@ pub(crate) fn transaction_manifest_entries_for_pool_content_in_keyspace(
             });
         }
     }
-    Ok(entries)
+    Ok(Some(entries))
 }
 
 fn pool_content_manifest_entries_for_state(
     pool: &Pool,
     state: &FileSystemState,
     prior_manifest: Option<&PriorTransactionManifestIndex<'_>>,
+    authenticated_content_manifests: Option<&AuthenticatedContentLayoutCache>,
 ) -> Result<BTreeMap<InodeId, Vec<TransactionManifestEntry>>> {
     let keyspace = FilesystemObjectKeyspace::new(state.dataset_id());
     let mut entries = BTreeMap::new();
@@ -1000,11 +1057,75 @@ fn pool_content_manifest_entries_for_state(
             (Some(prior), Some(last_transaction)) => {
                 prior.content_entries(inode, last_transaction, keyspace)?
             }
-            _ => transaction_manifest_entries_for_pool_content_in_keyspace(pool, inode, keyspace)?,
+            _ => match authenticated_content_manifests
+                .map(|cache| {
+                    receipted_content_manifest_entries(cache, inode, keyspace, prior_manifest)
+                })
+                .transpose()?
+                .flatten()
+            {
+                Some(entries) => entries,
+                None => transaction_manifest_entries_for_pool_content_in_keyspace(
+                    pool, inode, keyspace,
+                )?,
+            },
         };
         entries.insert(inode.inode_id, inode_entries);
     }
     Ok(entries)
+}
+
+/// Reuse exact content entries proven by the write that produced them.
+///
+/// Newly written immutable chunks carry the nonzero Pool receipts returned to
+/// the mounted writer. Unchanged chunks retain their exact key and checksum
+/// from the authenticated prior root. A cache miss or any retained-entry
+/// mismatch falls back to the strict Pool payload path above.
+fn receipted_content_manifest_entries(
+    cache: &AuthenticatedContentLayoutCache,
+    inode: &InodeRecord,
+    keyspace: FilesystemObjectKeyspace,
+    prior_manifest: Option<&PriorTransactionManifestIndex<'_>>,
+) -> Result<Option<Vec<TransactionManifestEntry>>> {
+    if inode.size == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let Some((layout, manifest_checksum)) = cache.receipted_manifest(inode) else {
+        return Ok(None);
+    };
+    validate_content_layout(inode.inode_id, inode, layout)?;
+
+    let mut entries = vec![TransactionManifestEntry {
+        role: TransactionManifestObjectRole::VersionedContent,
+        object_key: keyspace.content(inode.inode_id, inode.data_version),
+        checksum: manifest_checksum,
+    }];
+    if let ContentLayout::Chunked(manifest) = layout {
+        for chunk_ref in &manifest.chunks {
+            if chunk_ref.is_hole() {
+                continue;
+            }
+            let entry = TransactionManifestEntry {
+                role: TransactionManifestObjectRole::VersionedContentChunk,
+                object_key: keyspace.content_chunk(
+                    manifest.inode_id,
+                    chunk_ref.data_version,
+                    chunk_ref.chunk_index,
+                ),
+                checksum: chunk_ref.checksum,
+            };
+            if chunk_ref.data_version != inode.data_version
+                && !prior_manifest
+                    .map(|prior| prior.contains_exact_content_entry(&entry))
+                    .transpose()?
+                    .unwrap_or(false)
+            {
+                return Ok(None);
+            }
+            entries.push(entry);
+        }
+    }
+    Ok(Some(entries))
 }
 
 pub(crate) fn fs_io_error(
@@ -1381,6 +1502,8 @@ pub(crate) fn next_mounted_commit_transaction_id(
 #[cfg(test)]
 mod prior_manifest_tests {
     use super::*;
+    use tidefs_local_object_store::IntegrityDigest64;
+    use tidefs_types_vfs_core::{Generation, NodeKind};
 
     fn manifest_entry(
         role: TransactionManifestObjectRole,
@@ -1479,5 +1602,94 @@ mod prior_manifest_tests {
                 reason: "clean inode content entries do not terminate at their owning inode"
             }
         ));
+    }
+
+    #[test]
+    fn receipted_content_manifest_reuses_exact_prior_chunks_without_payload_reads() {
+        let inode = InodeRecord {
+            dir_storage_kind: 0,
+            inode_id: InodeId(42),
+            generation: Generation(1),
+            facets: NodeKind::File.to_facets(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size: u64::from(content_chunk_size()) * 2,
+            data_version: 9,
+            metadata_version: 9,
+            posix_time: PosixTimeRecord::now(),
+            xattr_storage_kind: 0,
+            xattrs: BTreeMap::new(),
+            dir_rev: 0,
+            subtree_rev: 0,
+            rdev: 0,
+        };
+        let retained_checksum = IntegrityDigest64(0x1122);
+        let written_checksum = IntegrityDigest64(0x3344);
+        let layout = ContentLayout::Chunked(ContentManifestObject {
+            inode_id: inode.inode_id,
+            data_version: inode.data_version,
+            file_size: inode.size,
+            chunk_size: content_chunk_size(),
+            chunks: vec![
+                ContentChunkRef {
+                    chunk_index: 0,
+                    data_version: 8,
+                    len: content_chunk_size(),
+                    checksum: retained_checksum,
+                    placement_receipt_generation: 17,
+                },
+                ContentChunkRef {
+                    chunk_index: 1,
+                    data_version: inode.data_version,
+                    len: content_chunk_size(),
+                    checksum: written_checksum,
+                    placement_receipt_generation: 18,
+                },
+            ],
+        });
+        let manifest_checksum = IntegrityDigest64(0x5566);
+        let mut cache = AuthenticatedContentLayoutCache::default();
+        cache.record_receipted_manifest(&inode, layout, manifest_checksum);
+        let keyspace = FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID);
+
+        assert!(
+            receipted_content_manifest_entries(&cache, &inode, keyspace, None)
+                .expect("inspect cache without prior-root authority")
+                .is_none()
+        );
+
+        let retained_entry = TransactionManifestEntry {
+            role: TransactionManifestObjectRole::VersionedContentChunk,
+            object_key: keyspace.content_chunk(inode.inode_id, 8, 0),
+            checksum: retained_checksum,
+        };
+        let prior = TransactionManifestRecord {
+            transaction_id: 8,
+            generation: 8,
+            entries: vec![retained_entry.clone()],
+        };
+        let prior = PriorTransactionManifestIndex::new(&prior).expect("index retained chunk");
+        let entries = receipted_content_manifest_entries(&cache, &inode, keyspace, Some(&prior))
+            .expect("reuse receipt-authenticated manifest")
+            .expect("receipt and prior-root authority cover every chunk");
+
+        assert_eq!(
+            entries,
+            vec![
+                TransactionManifestEntry {
+                    role: TransactionManifestObjectRole::VersionedContent,
+                    object_key: keyspace.content(inode.inode_id, inode.data_version),
+                    checksum: manifest_checksum,
+                },
+                retained_entry,
+                TransactionManifestEntry {
+                    role: TransactionManifestObjectRole::VersionedContentChunk,
+                    object_key: keyspace.content_chunk(inode.inode_id, inode.data_version, 1,),
+                    checksum: written_checksum,
+                },
+            ]
+        );
     }
 }

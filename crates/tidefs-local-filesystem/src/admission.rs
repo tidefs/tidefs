@@ -96,8 +96,11 @@ impl Default for LocalAdmissionConfig {
             // 256 MiB bounds dirty accumulation without constraining ordinary
             // local workloads to individual write sizes.
             256 * 1024 * 1024,
-            // Bound both accumulated dirty operations and live token storage.
-            4096,
+            // Bound sparse-range metadata without forcing writeback before
+            // the byte cap can do its job. At one live range per 512-byte
+            // sector, the operation and byte caps now cover the same dirty
+            // working set; smaller fragments remain bounded by this count.
+            512 * 1024,
             // Approximately five minutes when the owner advances one tick/s.
             300,
             2048,
@@ -543,6 +546,79 @@ impl LocalWriteAdmission {
         })
     }
 
+    /// Retire bytes that a destructive mutation made unreachable from one
+    /// active dirty-write permit.
+    ///
+    /// The permit identity, operation charge, and original admission tick
+    /// remain unchanged. This is intentionally narrower than releasing and
+    /// reacquiring the permit: a truncate must not reset dirty age or lose the
+    /// remaining prefix's ownership merely because it superseded a suffix.
+    pub fn try_shrink_dirty_write(
+        &mut self,
+        permit: LocalAdmissionPermit,
+        retired_dirty_bytes: u64,
+    ) -> Result<LocalAdmissionPermit, LocalAdmissionError> {
+        let permit_id = permit.id;
+        if permit.issuer_id != self.issuer_id {
+            return Err(LocalAdmissionError::ForeignPermit {
+                expected_issuer_id: self.issuer_id,
+                actual_issuer_id: permit.issuer_id,
+                permit,
+            });
+        }
+
+        let Some(active_charge) = self.active_permits.get(&permit_id).copied() else {
+            return Err(LocalAdmissionError::StalePermit {
+                issuer_id: self.issuer_id,
+                permit_id,
+                permit,
+            });
+        };
+        if active_charge != permit.charge {
+            return Err(LocalAdmissionError::PermitChargeMismatch {
+                issuer_id: self.issuer_id,
+                permit_id,
+                permit,
+            });
+        }
+        if !active_charge.is_dirty_write() {
+            return Err(LocalAdmissionError::PermitKindMismatch {
+                issuer_id: self.issuer_id,
+                permit_id,
+                permit,
+            });
+        }
+
+        let Some(charge_bytes) = active_charge.dirty_bytes.checked_sub(retired_dirty_bytes) else {
+            return Err(LocalAdmissionError::ReleaseAccountingInvariant {
+                issuer_id: self.issuer_id,
+                permit_id,
+                counter: "dirty-write permit bytes",
+                permit,
+            });
+        };
+        let Some(usage_bytes) = self.usage.dirty_bytes.checked_sub(retired_dirty_bytes) else {
+            return Err(LocalAdmissionError::ReleaseAccountingInvariant {
+                issuer_id: self.issuer_id,
+                permit_id,
+                counter: "dirty-byte usage",
+                permit,
+            });
+        };
+
+        let shrunk_charge = LocalAdmissionCharge::dirty_write(
+            charge_bytes,
+            active_charge.dirty_ops,
+            active_charge.admitted_tick,
+        );
+        self.active_permits.insert(permit_id, shrunk_charge);
+        self.usage.dirty_bytes = usage_bytes;
+        Ok(LocalAdmissionPermit {
+            charge: shrunk_charge,
+            ..permit
+        })
+    }
+
     /// Admit one metadata mutation against the permit-slot cap only.
     pub fn try_admit_metadata_mutation(
         &mut self,
@@ -797,6 +873,11 @@ mod tests {
         assert!(config.hard_max_dirty_ops > 0);
         assert!(config.hard_max_dirty_age_ticks > 0);
         assert!(config.hard_max_permits > 0);
+        assert_eq!(
+            u64::from(config.hard_max_dirty_ops) * 512,
+            config.hard_max_dirty_bytes,
+            "the default sparse-range cap must cover the byte cap at sector granularity"
+        );
     }
 
     #[test]

@@ -40,7 +40,7 @@ use crate::types::*;
 use crate::{is_skippable_recovery_error, is_skippable_store_error};
 use crate::{
     transaction_manifest_entries_for_existing_content,
-    transaction_manifest_entries_for_pool_content_in_keyspace,
+    transaction_manifest_entries_for_pool_content_in_keyspace_until,
 };
 use crate::{DatasetInodeAuthority, FileSystemState, QuotaTable, Result, ROOT_DATASET_ID};
 use tidefs_recovery_loop::RecoveryPolicy;
@@ -151,6 +151,20 @@ trait CommittedRootRecoverySource {
         root_authentication_key: RootAuthenticationKey,
     ) -> Result<FileSystemState>;
 
+    fn load_committed_state_until(
+        &mut self,
+        root: &RootCommitRecord,
+        supporting_store_indices: &BTreeSet<usize>,
+        root_authentication_key: RootAuthenticationKey,
+        should_preempt: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<FileSystemState>> {
+        if should_preempt() {
+            return Ok(None);
+        }
+        self.load_committed_state(root, supporting_store_indices, root_authentication_key)
+            .map(Some)
+    }
+
     fn read_current_content_for_retention(&self, key: ObjectKey) -> Result<Option<Vec<u8>>>;
 
     fn load_online_verifier_state(
@@ -214,6 +228,23 @@ impl CommittedRootRecoverySource for Pool {
             root,
             supporting_store_indices,
             root_authentication_key,
+        )
+        .map_err(pool_candidate_content_error)
+    }
+
+    fn load_committed_state_until(
+        &mut self,
+        root: &RootCommitRecord,
+        supporting_store_indices: &BTreeSet<usize>,
+        root_authentication_key: RootAuthenticationKey,
+        should_preempt: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<FileSystemState>> {
+        load_state_from_transaction_pool_candidate_until(
+            self,
+            root,
+            supporting_store_indices,
+            root_authentication_key,
+            should_preempt,
         )
         .map_err(pool_candidate_content_error)
     }
@@ -756,7 +787,21 @@ fn audit_recovery_source_details<S: CommittedRootRecoverySource>(
     source: &mut S,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RecoveryAuditDetails> {
-    let scan = scan_quorum_root_candidates(source)?;
+    audit_recovery_source_details_until(source, root_authentication_key, &mut || false)?.ok_or(
+        FileSystemError::CorruptState {
+            reason: "non-preemptible recovery audit was preempted",
+        },
+    )
+}
+
+fn audit_recovery_source_details_until<S: CommittedRootRecoverySource>(
+    source: &mut S,
+    root_authentication_key: RootAuthenticationKey,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<RecoveryAuditDetails>> {
+    let Some(scan) = scan_quorum_root_candidates_until(source, should_preempt)? else {
+        return Ok(None);
+    };
     if let Some(error) = scan.first_candidate_io_error {
         return Err(error);
     }
@@ -771,6 +816,9 @@ fn audit_recovery_source_details<S: CommittedRootRecoverySource>(
     let mut quorum_candidates = Vec::new();
 
     for (_transaction_id, candidates) in scan.roots_by_transaction.into_iter().rev() {
+        if should_preempt() {
+            return Ok(None);
+        }
         quorum_candidates.extend(candidates.iter().cloned());
         if candidates
             .first()
@@ -781,14 +829,19 @@ fn audit_recovery_source_details<S: CommittedRootRecoverySource>(
 
         let mut validated_for_transaction = Vec::new();
         for candidate in candidates {
-            match source.load_committed_state(
+            if should_preempt() {
+                return Ok(None);
+            }
+            match source.load_committed_state_until(
                 &candidate.root,
                 &candidate.supporting_store_indices,
                 root_authentication_key,
+                should_preempt,
             ) {
-                Ok(state) => {
+                Ok(Some(state)) => {
                     validated_for_transaction.push(ValidatedCommittedRoot { candidate, state })
                 }
+                Ok(None) => return Ok(None),
                 Err(err) if is_skippable_recovery_error(&err) => {
                     report.invalid_root_candidates =
                         report.invalid_root_candidates.saturating_add(1);
@@ -812,6 +865,9 @@ fn audit_recovery_source_details<S: CommittedRootRecoverySource>(
         }
     }
 
+    if should_preempt() {
+        return Ok(None);
+    }
     if report.selected_root.is_some() {
         report.outcome = RecoveryAuditOutcome::SelectedCommittedRoot;
     } else if report.root_slots_seen > 0
@@ -819,11 +875,11 @@ fn audit_recovery_source_details<S: CommittedRootRecoverySource>(
     {
         report.outcome = RecoveryAuditOutcome::ExplicitIntegrityOrMediaError;
     }
-    Ok(RecoveryAuditDetails {
+    Ok(Some(RecoveryAuditDetails {
         report,
         validated_roots,
         quorum_candidates,
-    })
+    }))
 }
 
 pub(crate) fn verify_online_pool(
@@ -1813,12 +1869,35 @@ fn object_keys_for_validated_root_candidate<S: CommittedRootRecoverySource>(
     root_authentication_key: RootAuthenticationKey,
     content_only: bool,
 ) -> Result<BTreeSet<ObjectKey>> {
-    let transaction = read_transaction_candidate_objects(
+    object_keys_for_validated_root_candidate_until(
+        source,
+        candidate,
+        root_authentication_key,
+        content_only,
+        &mut || false,
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "non-preemptible protected-root key scan was preempted",
+    })
+}
+
+fn object_keys_for_validated_root_candidate_until<S: CommittedRootRecoverySource>(
+    source: &S,
+    candidate: &QuorumRootCandidate,
+    root_authentication_key: RootAuthenticationKey,
+    content_only: bool,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<BTreeSet<ObjectKey>>> {
+    let Some(transaction) = read_transaction_candidate_objects_until(
         source.raw_store(),
         &candidate.root,
         &candidate.supporting_store_indices,
         root_authentication_key,
-    )?;
+        should_preempt,
+    )?
+    else {
+        return Ok(None);
+    };
     let mut keys = BTreeSet::new();
     if !content_only {
         keys.insert(root_slot_object_key(candidate.root.slot));
@@ -1843,6 +1922,9 @@ fn object_keys_for_validated_root_candidate<S: CommittedRootRecoverySource>(
     }
 
     for entry in &transaction.manifest.entries {
+        if should_preempt() {
+            return Ok(None);
+        }
         let is_content = matches!(
             entry.role,
             TransactionManifestObjectRole::VersionedContent
@@ -1868,6 +1950,9 @@ fn object_keys_for_validated_root_candidate<S: CommittedRootRecoverySource>(
             .ok_or(FileSystemError::CorruptState {
                 reason: "retention planner: committed content chunk is missing",
             })?;
+        if should_preempt() {
+            return Ok(None);
+        }
         if checksum64(&chunk_bytes) != entry.checksum {
             return Err(FileSystemError::CorruptState {
                 reason: "retention planner: committed content chunk checksum changed",
@@ -1882,6 +1967,9 @@ fn object_keys_for_validated_root_candidate<S: CommittedRootRecoverySource>(
             .ok_or(FileSystemError::CorruptState {
                 reason: "retention planner: dedup redirect target is missing",
             })?;
+        if should_preempt() {
+            return Ok(None);
+        }
         let canonical_chunk = decode_content_chunk(&canonical_bytes)?;
         let fingerprint = compute_content_fingerprint(&canonical_chunk.bytes);
         if content_dedup_object_key(&fingerprint) != canonical_key {
@@ -1909,67 +1997,117 @@ fn object_keys_for_validated_root_candidate<S: CommittedRootRecoverySource>(
         }
         keys.insert(canonical_key);
     }
-    Ok(keys)
+    Ok(Some(keys))
 }
 
+#[cfg(test)]
 pub(crate) fn reclaim_protected_content_keys_pool(
     pool: &mut Pool,
     root_authentication_key: RootAuthenticationKey,
     current_root: &CommittedRootSummary,
     state: &FileSystemState,
 ) -> Result<BTreeSet<ObjectKey>> {
+    reclaim_protected_content_keys_pool_until(
+        pool,
+        root_authentication_key,
+        current_root,
+        state,
+        &mut || false,
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "non-preemptible reclaim protection scan was preempted",
+    })
+}
+
+pub(crate) fn reclaim_protected_content_keys_pool_until(
+    pool: &mut Pool,
+    root_authentication_key: RootAuthenticationKey,
+    current_root: &CommittedRootSummary,
+    state: &FileSystemState,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<BTreeSet<ObjectKey>>> {
     let keyspace = FilesystemObjectKeyspace::new(state.dataset_id());
-    let RecoveryAuditDetails {
+    let Some(RecoveryAuditDetails {
         validated_roots: protected_roots,
         ..
-    } = audit_recovery_source_details(pool, root_authentication_key)?;
+    }) = audit_recovery_source_details_until(pool, root_authentication_key, should_preempt)?
+    else {
+        return Ok(None);
+    };
 
     // Protect every current root-ring fallback. Snapshot sources are
     // independently reachable through canonical typed snapshot roots and do
     // not need to remain the newest physical version of their old slot.
     let mut protected_keys = BTreeSet::new();
     for validated in protected_roots {
-        protected_keys.extend(object_keys_for_validated_root_candidate(
+        if should_preempt() {
+            return Ok(None);
+        }
+        let Some(root_keys) = object_keys_for_validated_root_candidate_until(
             pool,
             &validated.candidate,
             root_authentication_key,
             true,
-        )?);
+            should_preempt,
+        )?
+        else {
+            return Ok(None);
+        };
+        protected_keys.extend(root_keys);
     }
-    protected_keys.extend(object_keys_for_committed_root_summary_in_keyspace(
+    let Some(current_keys) = object_keys_for_committed_root_summary_in_keyspace_until(
         pool.raw_primary_store_mut(),
         current_root,
         root_authentication_key,
         keyspace,
-    )?);
-    protected_keys.extend(snapshot_protected_content_keys_pool(
+        should_preempt,
+    )?
+    else {
+        return Ok(None);
+    };
+    protected_keys.extend(current_keys);
+    let Some(snapshot_keys) = snapshot_protected_content_keys_pool_until(
         pool,
         root_authentication_key,
         state,
-    )?);
-    Ok(protected_keys)
+        should_preempt,
+    )?
+    else {
+        return Ok(None);
+    };
+    protected_keys.extend(snapshot_keys);
+    Ok(Some(protected_keys))
 }
 
 /// Collect objects reachable from live snapshot roots without requiring the
 /// captured root to remain the newest physical version in its two-slot ring.
 /// Canonical typed snapshot roots keep the exact immutable source reference;
 /// the filesystem transaction graph remains validated from that summary.
-fn snapshot_protected_content_keys_pool(
+fn snapshot_protected_content_keys_pool_until(
     pool: &mut Pool,
     root_authentication_key: RootAuthenticationKey,
     state: &FileSystemState,
-) -> Result<BTreeSet<ObjectKey>> {
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<BTreeSet<ObjectKey>>> {
     let keyspace = FilesystemObjectKeyspace::new(state.dataset_id());
     let mut keys = BTreeSet::new();
     for summary in snapshot_retained_roots(state) {
-        keys.extend(object_keys_for_committed_root_summary_in_keyspace(
+        if should_preempt() {
+            return Ok(None);
+        }
+        let Some(snapshot_keys) = object_keys_for_committed_root_summary_in_keyspace_until(
             pool.raw_primary_store_mut(),
             &summary,
             root_authentication_key,
             keyspace,
-        )?);
+            should_preempt,
+        )?
+        else {
+            return Ok(None);
+        };
+        keys.extend(snapshot_keys);
     }
-    Ok(keys)
+    Ok(Some(keys))
 }
 
 pub(crate) fn object_keys_for_committed_root_summary(
@@ -1991,6 +2129,28 @@ fn object_keys_for_committed_root_summary_in_keyspace(
     root_authentication_key: RootAuthenticationKey,
     keyspace: FilesystemObjectKeyspace,
 ) -> Result<BTreeSet<ObjectKey>> {
+    object_keys_for_committed_root_summary_in_keyspace_until(
+        store,
+        summary,
+        root_authentication_key,
+        keyspace,
+        &mut || false,
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "non-preemptible committed-root key scan was preempted",
+    })
+}
+
+fn object_keys_for_committed_root_summary_in_keyspace_until(
+    store: &mut LocalObjectStore,
+    summary: &CommittedRootSummary,
+    root_authentication_key: RootAuthenticationKey,
+    keyspace: FilesystemObjectKeyspace,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<BTreeSet<ObjectKey>>> {
+    if should_preempt() {
+        return Ok(None);
+    }
     let root = root_commit_from_summary(summary);
     let mut keys = BTreeSet::new();
     keys.insert(keyspace.root_slot(root.slot));
@@ -2004,6 +2164,9 @@ fn object_keys_for_committed_root_summary_in_keyspace(
             .ok_or(FileSystemError::CorruptState {
                 reason: "retention planner: committed root manifest is missing",
             })?;
+        if should_preempt() {
+            return Ok(None);
+        }
         if checksum64(&manifest_bytes) != root.manifest_checksum {
             return Err(FileSystemError::CorruptState {
                 reason: "retention planner: committed root manifest checksum changed",
@@ -2019,6 +2182,9 @@ fn object_keys_for_committed_root_summary_in_keyspace(
             });
         }
         for entry in &manifest.entries {
+            if should_preempt() {
+                return Ok(None);
+            }
             keys.insert(entry.object_key);
         }
         // Protect canonical content-dedup keys. The transaction manifest
@@ -2027,6 +2193,9 @@ fn object_keys_for_committed_root_summary_in_keyspace(
         // protection, auto-compaction reclaims the shared canonical data,
         // silently corrupting every inode whose chunk redirects to it.
         for entry in &manifest.entries {
+            if should_preempt() {
+                return Ok(None);
+            }
             if entry.role != TransactionManifestObjectRole::VersionedContentChunk {
                 continue;
             }
@@ -2035,6 +2204,9 @@ fn object_keys_for_committed_root_summary_in_keyspace(
                     if let Ok(canonical_key) = decode_dedup_redirect(&chunk_bytes) {
                         let physical_canonical_key = keyspace.scope(canonical_key);
                         keys.insert(physical_canonical_key);
+                        if should_preempt() {
+                            return Ok(None);
+                        }
                         if let Ok(Some(canonical_bytes)) = store.get(physical_canonical_key) {
                             if let Ok(canonical_chunk) = decode_content_chunk(&canonical_bytes) {
                                 let fingerprint =
@@ -2048,9 +2220,12 @@ fn object_keys_for_committed_root_summary_in_keyspace(
                 }
             }
         }
-        return Ok(keys);
+        return Ok(Some(keys));
     }
 
+    if should_preempt() {
+        return Ok(None);
+    }
     let state = load_state_from_transaction_with_manifest_validation_in_keyspace(
         store,
         &root,
@@ -2059,6 +2234,9 @@ fn object_keys_for_committed_root_summary_in_keyspace(
         keyspace,
     )?;
     for inode in state.inodes.values() {
+        if should_preempt() {
+            return Ok(None);
+        }
         keys.insert(keyspace.transaction_inode(root.transaction_id, inode.inode_id));
         if inode.carries_child_namespace() {
             keys.insert(keyspace.transaction_directory(root.transaction_id, inode.inode_id));
@@ -2070,7 +2248,7 @@ fn object_keys_for_committed_root_summary_in_keyspace(
             }
         }
     }
-    Ok(keys)
+    Ok(Some(keys))
 }
 
 pub(crate) fn root_slot_locations_for_summary(
@@ -2268,6 +2446,18 @@ pub(crate) fn select_latest_committed_root(
 fn scan_quorum_root_candidates<S: CommittedRootRecoverySource>(
     source: &S,
 ) -> Result<QuorumRootCandidateScan> {
+    scan_quorum_root_candidates_until(source, &mut || false)?.ok_or(FileSystemError::CorruptState {
+        reason: "non-preemptible committed-root scan was preempted",
+    })
+}
+
+fn scan_quorum_root_candidates_until<S: CommittedRootRecoverySource>(
+    source: &S,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<QuorumRootCandidateScan>> {
+    if should_preempt() {
+        return Ok(None);
+    }
     let quorum = (source.raw_store().stores_count() / 2) + 1;
     let mut encoded_candidates: BTreeMap<(u64, Vec<u8>), BTreeSet<usize>> = BTreeMap::new();
     let mut slots_with_records = BTreeSet::new();
@@ -2280,6 +2470,9 @@ fn scan_quorum_root_candidates<S: CommittedRootRecoverySource>(
     // group independently quorate roots for ordering and conflict detection;
     // divergent roots must never borrow one another's store votes.
     for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
+        if should_preempt() {
+            return Ok(None);
+        }
         let slot_key = root_slot_object_key(slot);
         let all_store_locations = source.raw_store().version_locations_across_stores(slot_key);
         if all_store_locations
@@ -2290,9 +2483,15 @@ fn scan_quorum_root_candidates<S: CommittedRootRecoverySource>(
         }
 
         for (store_index, locations) in all_store_locations.iter().enumerate() {
+            if should_preempt() {
+                return Ok(None);
+            }
             root_candidate_locations_seen =
                 root_candidate_locations_seen.saturating_add(locations.len() as u64);
             for location in locations.iter().rev().copied() {
+                if should_preempt() {
+                    return Ok(None);
+                }
                 let bytes = match source
                     .raw_store()
                     .read_location_from_store(store_index, location)
@@ -2321,6 +2520,9 @@ fn scan_quorum_root_candidates<S: CommittedRootRecoverySource>(
 
     let mut roots_by_transaction = BTreeMap::new();
     for ((slot, bytes), supporting_store_indices) in encoded_candidates {
+        if should_preempt() {
+            return Ok(None);
+        }
         let root = match decode_quorum_root_candidate(slot, &bytes) {
             Ok(root) => root,
             Err(error) if is_skippable_recovery_error(&error) => {
@@ -2352,14 +2554,14 @@ fn scan_quorum_root_candidates<S: CommittedRootRecoverySource>(
             });
     }
 
-    Ok(QuorumRootCandidateScan {
+    Ok(Some(QuorumRootCandidateScan {
         roots_by_transaction,
         root_slots_seen: slots_with_records.len() as u64,
         root_candidate_locations_seen,
         skipped_root_candidates,
         checked_transaction_manifests,
         first_candidate_io_error,
-    })
+    }))
 }
 
 fn select_latest_committed_root_from_source<S: CommittedRootRecoverySource>(
@@ -4104,21 +4306,31 @@ fn read_pool_transaction_object(
         })
 }
 
-fn read_candidate_object_by_checksum(
+fn read_candidate_object_by_checksum_until(
     store: &LocalObjectStore,
     supporting_store_indices: &BTreeSet<usize>,
     key: ObjectKey,
     expected_checksum: IntegrityDigest64,
     expected_authentication: Option<(&'static [u8], RootAuthenticationDigest)>,
     missing_reason: &'static str,
-) -> Result<Vec<u8>> {
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<Vec<u8>>> {
+    if should_preempt() {
+        return Ok(None);
+    }
     let locations_by_store = store.version_locations_across_stores(key);
     let mut first_io_error = None;
     for store_index in supporting_store_indices.iter().copied() {
+        if should_preempt() {
+            return Ok(None);
+        }
         let Some(locations) = locations_by_store.get(store_index) else {
             continue;
         };
         for location in locations.iter().rev().copied() {
+            if should_preempt() {
+                return Ok(None);
+            }
             match store.read_location_from_store(store_index, location) {
                 Ok(bytes) if checksum64(&bytes) == expected_checksum => {
                     if expected_authentication.is_some_and(|(domain, expected_digest)| {
@@ -4126,7 +4338,7 @@ fn read_candidate_object_by_checksum(
                     }) {
                         continue;
                     }
-                    return Ok(bytes);
+                    return Ok(Some(bytes));
                 }
                 Ok(_) => {}
                 Err(error) if is_skippable_store_error(&error) => {}
@@ -4159,6 +4371,28 @@ fn read_transaction_candidate_objects(
     supporting_store_indices: &BTreeSet<usize>,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<TransactionCandidateObjects> {
+    read_transaction_candidate_objects_until(
+        store,
+        root,
+        supporting_store_indices,
+        root_authentication_key,
+        &mut || false,
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "non-preemptible recovery candidate read was preempted",
+    })
+}
+
+fn read_transaction_candidate_objects_until(
+    store: &LocalObjectStore,
+    root: &RootCommitRecord,
+    supporting_store_indices: &BTreeSet<usize>,
+    root_authentication_key: RootAuthenticationKey,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<TransactionCandidateObjects>> {
+    if should_preempt() {
+        return Ok(None);
+    }
     // Reject an unauthenticated root before it can influence metadata I/O or
     // the error selected for fallback.
     let root_authentication = validate_root_authentication_record(root, root_authentication_key)?;
@@ -4169,7 +4403,7 @@ fn read_transaction_candidate_objects(
     }
 
     let superblock_key = transaction_superblock_object_key(root.transaction_id);
-    let superblock_bytes = read_candidate_object_by_checksum(
+    let Some(superblock_bytes) = read_candidate_object_by_checksum_until(
         store,
         supporting_store_indices,
         superblock_key,
@@ -4179,9 +4413,13 @@ fn read_transaction_candidate_objects(
             root_authentication.superblock_digest,
         )),
         "root candidate has no authenticated transaction superblock on its supporting stores",
-    )?;
+        should_preempt,
+    )?
+    else {
+        return Ok(None);
+    };
     let manifest_key = transaction_manifest_object_key(root.transaction_id);
-    let manifest_bytes = read_candidate_object_by_checksum(
+    let Some(manifest_bytes) = read_candidate_object_by_checksum_until(
         store,
         supporting_store_indices,
         manifest_key,
@@ -4191,13 +4429,20 @@ fn read_transaction_candidate_objects(
             root_authentication.manifest_digest,
         )),
         "root candidate has no authenticated transaction manifest on its supporting stores",
-    )?;
+        should_preempt,
+    )?
+    else {
+        return Ok(None);
+    };
     let manifest =
         validate_root_transaction_manifest_bytes(root, &root_authentication, &manifest_bytes)?;
 
     let mut objects = BTreeMap::new();
     objects.insert(superblock_key, superblock_bytes.clone());
     for entry in &manifest.entries {
+        if should_preempt() {
+            return Ok(None);
+        }
         match entry.role {
             TransactionManifestObjectRole::TransactionSuperblock => {
                 if entry.object_key != superblock_key || entry.checksum != root.superblock_checksum
@@ -4211,14 +4456,18 @@ fn read_transaction_candidate_objects(
             | TransactionManifestObjectRole::TransactionDirectory
             | TransactionManifestObjectRole::TransactionSnapshotCatalogEntry
             | TransactionManifestObjectRole::TransactionExtentMap => {
-                let bytes = read_candidate_object_by_checksum(
+                let Some(bytes) = read_candidate_object_by_checksum_until(
                     store,
                     supporting_store_indices,
                     entry.object_key,
                     entry.checksum,
                     None,
                     "candidate manifest object is absent from its supporting stores",
-                )?;
+                    should_preempt,
+                )?
+                else {
+                    return Ok(None);
+                };
                 if objects.insert(entry.object_key, bytes).is_some() {
                     return Err(FileSystemError::CorruptState {
                         reason: "candidate manifest repeats a transaction metadata object key",
@@ -4230,11 +4479,11 @@ fn read_transaction_candidate_objects(
         }
     }
 
-    Ok(TransactionCandidateObjects {
+    Ok(Some(TransactionCandidateObjects {
         superblock_bytes,
         manifest,
         objects,
-    })
+    }))
 }
 
 fn decode_candidate_superblock(
@@ -4295,22 +4544,52 @@ fn load_state_from_transaction_pool_candidate(
     supporting_store_indices: &BTreeSet<usize>,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<FileSystemState> {
-    let candidate = read_transaction_candidate_objects(
+    load_state_from_transaction_pool_candidate_until(
+        pool,
+        root,
+        supporting_store_indices,
+        root_authentication_key,
+        &mut || false,
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "non-preemptible Pool recovery candidate load was preempted",
+    })
+}
+
+fn load_state_from_transaction_pool_candidate_until(
+    pool: &Pool,
+    root: &RootCommitRecord,
+    supporting_store_indices: &BTreeSet<usize>,
+    root_authentication_key: RootAuthenticationKey,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<FileSystemState>> {
+    let Some(candidate) = read_transaction_candidate_objects_until(
         pool.raw_primary_store(),
         root,
         supporting_store_indices,
         root_authentication_key,
-    )?;
+        should_preempt,
+    )?
+    else {
+        return Ok(None);
+    };
+    if should_preempt() {
+        return Ok(None);
+    }
     let superblock = decode_candidate_superblock(root, &candidate.superblock_bytes)?;
-    let state = load_state_from_superblock_for_content_inspection(
+    let Some(state) = load_state_from_superblock_for_content_inspection_until(
         pool.raw_primary_store(),
         &superblock,
         root.transaction_id,
         &candidate.manifest.entries,
         Some(&candidate.objects),
         FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
-    )?;
-    validate_transaction_manifest_matches_loaded_state_pool(
+        should_preempt,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(()) = validate_transaction_manifest_matches_loaded_state_pool_until(
         pool,
         root,
         &state,
@@ -4318,8 +4597,12 @@ fn load_state_from_transaction_pool_candidate(
         &candidate.superblock_bytes,
         Some(&candidate.objects),
         FilesystemObjectKeyspace::new(tidefs_pool_runtime::ROOT_DATASET_ID),
-    )?;
-    Ok(state)
+        should_preempt,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(state))
 }
 
 fn load_state_from_transaction_for_content_inspection(
@@ -4571,15 +4854,48 @@ fn validate_transaction_manifest_matches_loaded_state_pool(
     candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
     keyspace: FilesystemObjectKeyspace,
 ) -> Result<()> {
-    validate_transaction_manifest_matches_loaded_state_with_content(
+    validate_transaction_manifest_matches_loaded_state_pool_until(
+        pool,
+        root,
+        state,
+        manifest,
+        superblock_bytes,
+        candidate_objects,
+        keyspace,
+        &mut || false,
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "non-preemptible Pool manifest validation was preempted",
+    })
+}
+
+fn validate_transaction_manifest_matches_loaded_state_pool_until(
+    pool: &Pool,
+    root: &RootCommitRecord,
+    state: &FileSystemState,
+    manifest: &TransactionManifestRecord,
+    superblock_bytes: &[u8],
+    candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
+    keyspace: FilesystemObjectKeyspace,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<()>> {
+    validate_transaction_manifest_matches_loaded_state_with_content_until(
         pool.raw_primary_store(),
         root,
         state,
         manifest,
         superblock_bytes,
         candidate_objects,
-        |inode| transaction_manifest_entries_for_pool_content_in_keyspace(pool, inode, keyspace),
+        |inode, should_preempt| {
+            transaction_manifest_entries_for_pool_content_in_keyspace_until(
+                pool,
+                inode,
+                keyspace,
+                should_preempt,
+            )
+        },
         keyspace,
+        should_preempt,
     )
 }
 
@@ -4593,12 +4909,56 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
     mut content_entries: impl FnMut(&InodeRecord) -> Result<Vec<TransactionManifestEntry>>,
     keyspace: FilesystemObjectKeyspace,
 ) -> Result<()> {
-    let (manifest_inode_keys, manifest_directory_keys) =
-        manifest_transaction_object_key_maps(store, &manifest.entries, candidate_objects)?;
+    validate_transaction_manifest_matches_loaded_state_with_content_until(
+        store,
+        root,
+        state,
+        manifest,
+        superblock_bytes,
+        candidate_objects,
+        |inode, _should_preempt| content_entries(inode).map(Some),
+        keyspace,
+        &mut || false,
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "non-preemptible loaded-state manifest validation was preempted",
+    })
+}
+
+fn validate_transaction_manifest_matches_loaded_state_with_content_until(
+    store: &LocalObjectStore,
+    root: &RootCommitRecord,
+    state: &FileSystemState,
+    manifest: &TransactionManifestRecord,
+    superblock_bytes: &[u8],
+    candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
+    mut content_entries: impl FnMut(
+        &InodeRecord,
+        &mut dyn FnMut() -> bool,
+    ) -> Result<Option<Vec<TransactionManifestEntry>>>,
+    keyspace: FilesystemObjectKeyspace,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<()>> {
+    let Some((manifest_inode_keys, manifest_directory_keys)) =
+        manifest_transaction_object_key_maps_until(
+            store,
+            &manifest.entries,
+            candidate_objects,
+            should_preempt,
+        )?
+    else {
+        return Ok(None);
+    };
     let mut expected = Vec::new();
     for inode in state.inodes.values() {
+        if should_preempt() {
+            return Ok(None);
+        }
         if inode.is_file_like() {
-            expected.extend(content_entries(inode)?);
+            let Some(entries) = content_entries(inode, should_preempt)? else {
+                return Ok(None);
+            };
+            expected.extend(entries);
         }
 
         let inode_key =
@@ -4657,6 +5017,9 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
     // add them to the expected set.  During mount, extent maps are loaded
     // in load_state_from_superblock once they are tracked in FileSystemState.
     for entry in &manifest.entries {
+        if should_preempt() {
+            return Ok(None);
+        }
         if entry.role == TransactionManifestObjectRole::TransactionExtentMap {
             if let Some(ext_bytes) =
                 recovery_object_bytes(store, candidate_objects, entry.object_key)?
@@ -4677,6 +5040,9 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
 
     // v3+: snapshot catalog entries
     for snapshot in state.snapshots.values() {
+        if should_preempt() {
+            return Ok(None);
+        }
         let snap_key = keyspace.transaction_snapshot(root.transaction_id, &snapshot.name);
         let snap_bytes = recovery_object_bytes(store, candidate_objects, snap_key)?.ok_or(
             FileSystemError::CorruptState {
@@ -4695,7 +5061,7 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
             reason: "transaction manifest does not exactly match the loaded committed root",
         });
     }
-    Ok(())
+    Ok(Some(()))
 }
 
 /// Find the transaction key where an inode object currently resides,
@@ -4754,14 +5120,18 @@ fn recovery_object_bytes(
     }
 }
 
-fn manifest_transaction_object_key_maps(
+fn manifest_transaction_object_key_maps_until(
     store: &LocalObjectStore,
     entries: &[TransactionManifestEntry],
     candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
-) -> Result<(BTreeMap<InodeId, ObjectKey>, BTreeMap<InodeId, ObjectKey>)> {
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<(BTreeMap<InodeId, ObjectKey>, BTreeMap<InodeId, ObjectKey>)>> {
     let mut inode_keys = BTreeMap::new();
     let mut directory_keys = BTreeMap::new();
     for entry in entries {
+        if should_preempt() {
+            return Ok(None);
+        }
         let target = match entry.role {
             TransactionManifestObjectRole::TransactionInode => &mut inode_keys,
             TransactionManifestObjectRole::TransactionDirectory => &mut directory_keys,
@@ -4790,7 +5160,7 @@ fn manifest_transaction_object_key_maps(
             });
         }
     }
-    Ok((inode_keys, directory_keys))
+    Ok(Some((inode_keys, directory_keys)))
 }
 
 fn manifest_snapshot_records(
@@ -4894,7 +5264,30 @@ fn load_state_from_superblock_for_content_inspection(
     candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
     keyspace: FilesystemObjectKeyspace,
 ) -> Result<FileSystemState> {
-    load_state_from_superblock_with_content_validation(
+    load_state_from_superblock_for_content_inspection_until(
+        store,
+        superblock,
+        transaction_id,
+        manifest_entries,
+        candidate_objects,
+        keyspace,
+        &mut || false,
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "non-preemptible committed-state metadata load was preempted",
+    })
+}
+
+fn load_state_from_superblock_for_content_inspection_until(
+    store: &LocalObjectStore,
+    superblock: &SuperblockRecord,
+    transaction_id: u64,
+    manifest_entries: &[TransactionManifestEntry],
+    candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
+    keyspace: FilesystemObjectKeyspace,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<FileSystemState>> {
+    load_state_from_superblock_with_content_validation_until(
         store,
         superblock,
         Some(transaction_id),
@@ -4902,6 +5295,7 @@ fn load_state_from_superblock_for_content_inspection(
         Some(manifest_entries),
         candidate_objects,
         keyspace,
+        should_preempt,
     )
 }
 
@@ -4914,18 +5308,61 @@ fn load_state_from_superblock_with_content_validation(
     candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
     keyspace: FilesystemObjectKeyspace,
 ) -> Result<FileSystemState> {
-    let (manifest_inode_keys, manifest_directory_keys) = manifest_entries
-        .map(|entries| manifest_transaction_object_key_maps(store, entries, candidate_objects))
-        .transpose()?
-        .map_or((None, None), |(inode_keys, directory_keys)| {
+    load_state_from_superblock_with_content_validation_until(
+        store,
+        superblock,
+        transaction_id,
+        validate_file_content,
+        manifest_entries,
+        candidate_objects,
+        keyspace,
+        &mut || false,
+    )?
+    .ok_or(FileSystemError::CorruptState {
+        reason: "non-preemptible committed-state load was preempted",
+    })
+}
+
+fn load_state_from_superblock_with_content_validation_until(
+    store: &LocalObjectStore,
+    superblock: &SuperblockRecord,
+    transaction_id: Option<u64>,
+    validate_file_content: bool,
+    manifest_entries: Option<&[TransactionManifestEntry]>,
+    candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
+    keyspace: FilesystemObjectKeyspace,
+    should_preempt: &mut dyn FnMut() -> bool,
+) -> Result<Option<FileSystemState>> {
+    if should_preempt() {
+        return Ok(None);
+    }
+    let (manifest_inode_keys, manifest_directory_keys) = match manifest_entries {
+        Some(entries) => {
+            let Some((inode_keys, directory_keys)) = manifest_transaction_object_key_maps_until(
+                store,
+                entries,
+                candidate_objects,
+                should_preempt,
+            )?
+            else {
+                return Ok(None);
+            };
             (Some(inode_keys), Some(directory_keys))
-        });
+        }
+        None => (None, None),
+    };
     let mut known_inode_ids = BTreeSet::new();
     let mut inodes = BTreeMap::new();
     let mut directories = BTreeMap::new();
     for (word_idx, word) in superblock.inode_allocation_bitmap.iter().enumerate() {
+        if should_preempt() {
+            return Ok(None);
+        }
         let mut bits = *word;
         while bits != 0 {
+            if should_preempt() {
+                return Ok(None);
+            }
             let bit = bits.trailing_zeros();
             bits &= bits - 1;
             let inode_id = InodeId::new((word_idx * 64 + bit as usize + 1) as u64);
@@ -4978,6 +5415,9 @@ fn load_state_from_superblock_with_content_validation(
     } else {
         validate_loaded_namespace_state(&inodes, &directories)?;
     }
+    if should_preempt() {
+        return Ok(None);
+    }
     let (extent_maps, last_extent_map_write_tx) = match manifest_entries {
         Some(entries) => manifest_extent_maps(
             store,
@@ -4991,6 +5431,9 @@ fn load_state_from_superblock_with_content_validation(
         )?,
         None => (BTreeMap::new(), BTreeMap::new()),
     };
+    if should_preempt() {
+        return Ok(None);
+    }
     // The current persistence path publishes every tracked map in each
     // successor transaction. Keep recovered maps in that retained set so an
     // unrelated post-reopen metadata commit cannot omit their authority.
@@ -4999,6 +5442,9 @@ fn load_state_from_superblock_with_content_validation(
         Some(entries) => manifest_snapshot_records(store, entries, candidate_objects)?,
         None => BTreeMap::new(),
     };
+    if should_preempt() {
+        return Ok(None);
+    }
     if manifest_entries.is_none() {
         if let Some(cg_id) = transaction_id {
             // Load current snapshot records from transaction manifest entries.
@@ -5006,6 +5452,9 @@ fn load_state_from_superblock_with_content_validation(
             if let Some(manifest_bytes) = store.get(manifest_key)? {
                 let manifest = decode_transaction_manifest(&manifest_bytes)?;
                 for entry in manifest.entries {
+                    if should_preempt() {
+                        return Ok(None);
+                    }
                     if entry.role == TransactionManifestObjectRole::TransactionExtentMap {
                         // Extent maps are now tracked within FileSystemState; skip here.
                         // They are loaded and validated separately during mount.
@@ -5030,7 +5479,7 @@ fn load_state_from_superblock_with_content_validation(
             }
         }
     }
-    Ok(FileSystemState {
+    Ok(Some(FileSystemState {
         inode_authority: DatasetInodeAuthority::from_recovered_inode_ids(
             ROOT_DATASET_ID,
             superblock.next_inode_id,
@@ -5054,7 +5503,7 @@ fn load_state_from_superblock_with_content_validation(
         dirty_extent_maps,
         last_extent_map_write_tx,
         content_compression_policy: ContentCompressionPolicy::default(),
-    })
+    }))
 }
 
 /// Load FileSystemState from a snapshot superblock, reusing unchanged

@@ -35,6 +35,7 @@
 //! index and segment files without write-path coordination.
 //!
 
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
 use std::fmt;
@@ -577,6 +578,23 @@ impl ObjectKey {
 }
 
 #[derive(Debug)]
+struct PrepublicationReadbackRecord {
+    location: ObjectLocation,
+    payload_start: usize,
+    payload_end: usize,
+    compression_algorithm: u8,
+}
+
+#[derive(Debug)]
+struct PendingPrepublicationReadbackRecord {
+    indexed: PrepublicationReadbackRecord,
+    header: RecordHeader,
+    header_bytes: [u8; RECORD_HEADER_LEN],
+    footer_bytes: Option<([u8; RECORD_FOOTER_LEN], u64)>,
+    trailer_bytes: Option<([u8; INTEGRITY_TRAILER_V2_LEN], u64)>,
+}
+
+#[derive(Debug)]
 pub struct LocalObjectStore {
     root: PathBuf,
     segments_dir: PathBuf,
@@ -683,8 +701,40 @@ pub struct LocalObjectStore {
     #[cfg(test)]
     pub(crate) current_dataset_id: Option<[u8; 16]>,
     /// Per-object BLAKE3 domain-separated checksums for read-path verification.
-    /// Computed on every `put` and persisted within the transaction group commit.
+    /// Computed on every write and persisted by its transaction or explicit
+    /// Pool-prepublication sync boundary.
     pub(crate) checksums: BTreeMap<ObjectKey, ObjectDigest>,
+    /// Prepublication writes deliberately do not enter the ordinary transaction
+    /// group, so their checksum-index update must join the next explicit sync.
+    prepublication_checksums_dirty: bool,
+    /// Block-device prepublication batches retain their contiguous encoded
+    /// records until the Pool closes the append boundary. The buffer always
+    /// ends in a zero successor header, so one positioned write installs a
+    /// scan-bounded batch before the final tail rewrite and readback.
+    prepublication_append_start: Option<u64>,
+    prepublication_append_bytes: Vec<u8>,
+    /// Exact block range installed by the current prepublication batch.
+    /// After the Pool barrier, one positioned read loads this range so the
+    /// existing strict per-object verifier can decode every record from the
+    /// persisted bytes without issuing one read per header and payload. The
+    /// range includes the successor-header slot that closed the batch, but a
+    /// later Pool sync may legitimately overwrite that slot with its next
+    /// record before readback; it is outside the indexed batch records.
+    prepublication_readback_range: Option<(u64, usize)>,
+    prepublication_readback_bytes: Vec<u8>,
+    /// Records decoded from `prepublication_readback_bytes`, in their exact
+    /// monotonically increasing physical-offset order. A binary search by
+    /// offset followed by full `ObjectLocation` equality preserves physical
+    /// identity without rebuilding the append stream as another ordered tree.
+    prepublication_readback_records: Vec<PrepublicationReadbackRecord>,
+    prepublication_tail_verification_deferred: bool,
+    /// Whether the current Pool prepublication batch has consumed its raw
+    /// store scheduler token. A batch is one admitted foreground operation;
+    /// charging every payload and receipt record separately turns token
+    /// exhaustion into one millisecond of artificial latency per record.
+    prepublication_io_admitted: bool,
+    #[cfg(test)]
+    block_device_tail_terminator_verifications: u64,
     /// When true, the store operates directly on a block device instead of
     /// a directory of segment files. Segment files are not created;
     /// all I/O goes through current_file which points to the block device.
@@ -2327,6 +2377,16 @@ impl LocalObjectStore {
             #[cfg(test)]
             current_dataset_id: None,
             checksums: BTreeMap::new(),
+            prepublication_checksums_dirty: false,
+            prepublication_append_start: None,
+            prepublication_append_bytes: Vec::new(),
+            prepublication_readback_range: None,
+            prepublication_readback_bytes: Vec::new(),
+            prepublication_readback_records: Vec::new(),
+            prepublication_tail_verification_deferred: false,
+            prepublication_io_admitted: false,
+            #[cfg(test)]
+            block_device_tail_terminator_verifications: 0,
             block_device_mode: true,
         };
 
@@ -2669,6 +2729,16 @@ impl LocalObjectStore {
             #[cfg(test)]
             current_dataset_id: None,
             checksums: BTreeMap::new(),
+            prepublication_checksums_dirty: false,
+            prepublication_append_start: None,
+            prepublication_append_bytes: Vec::new(),
+            prepublication_readback_range: None,
+            prepublication_readback_bytes: Vec::new(),
+            prepublication_readback_records: Vec::new(),
+            prepublication_tail_verification_deferred: false,
+            prepublication_io_admitted: false,
+            #[cfg(test)]
+            block_device_tail_terminator_verifications: 0,
             block_device_mode: false,
         };
         if let Some(payload) = store.get(physical_lifetime_sequence_high_water_key())? {
@@ -4360,7 +4430,7 @@ impl LocalObjectStore {
         }
         let payload = Self::encode_dead_object_reclaim_entry_state(entry);
         let effective_payload = self.prepare_payload_with_fault_injection(&payload)?;
-        let _ = self.put_inner(key, &effective_payload, 0, false, false)?;
+        let _ = self.put_inner(key, &effective_payload, 0, false, false, None)?;
         let domain_key = DomainTag::ReadVerify.derive_key();
         self.checksums
             .insert(key, ObjectDigest::compute(&payload, &domain_key));
@@ -5638,10 +5708,26 @@ impl LocalObjectStore {
         compression_algorithm: u8,
         track_liveness: bool,
         replicate: bool,
+        precomputed_checksum: Option<IntegrityDigest64>,
     ) -> Result<StoredObject> {
-        // I/O class admission: when the scheduler refuses, apply soft backpressure
-        // (a brief yield) so bulk I/O slows down without hard-failing callers.
-        if !self.io_scheduler.admit(self.current_io_class) {
+        // I/O class admission: when the scheduler refuses, apply soft
+        // backpressure (a brief yield) so bulk I/O slows down without
+        // hard-failing callers. A Pool prepublication batch is already one
+        // bounded foreground operation, even though it expands into separate
+        // payload and receipt records here. Consume one token for that batch
+        // instead of sleeping once for every raw record after the token bucket
+        // is exhausted.
+        let admitted = if self.prepublication_tail_verification_deferred {
+            if self.prepublication_io_admitted {
+                true
+            } else {
+                self.prepublication_io_admitted = true;
+                self.io_scheduler.admit(self.current_io_class)
+            }
+        } else {
+            self.io_scheduler.admit(self.current_io_class)
+        };
+        if !admitted {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         self.ensure_writable("put")?;
@@ -5678,7 +5764,7 @@ impl LocalObjectStore {
             self.check_reserve_admission(WritePriority::Normal, segments_needed)?;
         }
 
-        let checksum = checksum64(payload);
+        let checksum = precomputed_checksum.unwrap_or_else(|| checksum64(payload));
         let internal_metadata = is_public_scan_internal_key(key);
         let sequence = self.next_sequence;
         let next_sequence = sequence.checked_add(1).ok_or(StoreError::InvalidOptions {
@@ -5842,7 +5928,13 @@ impl LocalObjectStore {
         }
     }
 
-    fn put_authorized(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+    fn put_authorized_with_transaction_tracking(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+        track_transaction: bool,
+        precomputed_checksum: Option<IntegrityDigest64>,
+    ) -> Result<StoredObject> {
         // Pool-owned generation and deletion publication deliberately uses
         // this path, so configured write faults exercise those durability
         // transitions too. Only lower put_inner/put_preencoded_internal
@@ -5874,6 +5966,9 @@ impl LocalObjectStore {
             compression_algorithm,
             !pool_metadata_family,
             true,
+            (compression_algorithm == 0)
+                .then_some(precomputed_checksum)
+                .flatten(),
         )?;
         if pool_metadata_family
             && self
@@ -5899,6 +5994,16 @@ impl LocalObjectStore {
         // generic replay resurrect an older reservation or deletion after the
         // Pool had synchronously replaced or cleared it.
         if pool_metadata_family {
+            return Ok(result);
+        }
+
+        // Immutable prepublication payloads are not independently reachable:
+        // Pool receipt publication, followed by the owning manifest and
+        // authenticated filesystem root, is their commit authority. Keep the
+        // ordinary storage, transform, replica, checksum and fault paths above,
+        // but do not duplicate these bytes into a second raw-store transaction.
+        if !track_transaction {
+            self.prepublication_checksums_dirty = true;
             return Ok(result);
         }
 
@@ -5930,10 +6035,525 @@ impl LocalObjectStore {
         Ok(result)
     }
 
+    fn put_authorized(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        self.put_authorized_with_transaction_tracking(key, payload, true, None)
+    }
+
     pub fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         self.ensure_pool_raw_mutation_allowed()?;
         Self::ensure_public_pool_key_mutation_allowed(key)?;
         self.put_authorized(key, payload)
+    }
+
+    /// Store one immutable Pool-prepublication payload without copying it into
+    /// the raw store's separate commit group and intent log.
+    ///
+    /// The caller must publish and durably verify the corresponding Pool
+    /// placement receipt before making the object reachable. All ordinary raw
+    /// storage behavior, including fault injection, transforms, replication,
+    /// liveness accounting and read-verification checksums, remains active.
+    pub(crate) fn put_prepublication_pool_internal(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<StoredObject> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        self.put_authorized_with_transaction_tracking(key, payload, false, None)
+    }
+
+    /// Store one immutable prepublication payload using the checksum already
+    /// computed by its Pool batch. The post-barrier persisted-byte readback
+    /// independently recomputes and verifies this value before publication.
+    pub(crate) fn put_prepublication_pool_internal_with_checksum(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+        checksum: IntegrityDigest64,
+    ) -> Result<StoredObject> {
+        self.ensure_pool_raw_mutation_allowed()?;
+        self.put_authorized_with_transaction_tracking(key, payload, false, Some(checksum))
+    }
+
+    /// Start one Pool-owned prepublication append batch.
+    ///
+    /// Block stores stage the contiguous encoded records plus one zero
+    /// successor header in memory, then install and strictly close that prefix
+    /// when the Pool finishes the batch. Store replicas join the same boundary.
+    pub(crate) fn begin_prepublication_append_batch(&mut self) {
+        self.prepublication_readback_range = None;
+        self.prepublication_readback_bytes.clear();
+        self.prepublication_readback_records.clear();
+        self.prepublication_io_admitted = false;
+        // A failed final verification deliberately leaves the flag set so a
+        // later write and finish can recover the same scan boundary.
+        self.prepublication_tail_verification_deferred = true;
+        for replica in &mut self.replicas {
+            replica.begin_prepublication_append_batch();
+        }
+    }
+
+    fn flush_prepublication_append_bytes(&mut self) -> Result<()> {
+        if self.prepublication_append_bytes.is_empty() {
+            self.prepublication_append_start = None;
+            return Ok(());
+        }
+        let start = self
+            .prepublication_append_start
+            .ok_or(StoreError::InvalidOptions {
+                reason: "prepublication append bytes are missing their block offset",
+            })?;
+        let readback_len = self.prepublication_append_bytes.len();
+        self.current_file
+            .write_all_at(&self.prepublication_append_bytes, start)
+            .map_err(|source| {
+                io_error(
+                    "write coalesced prepublication records and tail",
+                    &self.root,
+                    source,
+                )
+            })?;
+        self.prepublication_readback_range = Some((start, readback_len));
+        self.prepublication_append_bytes.clear();
+        self.prepublication_append_start = None;
+        Ok(())
+    }
+
+    fn flush_and_verify_prepublication_tail(&mut self) -> Result<()> {
+        if self.block_device_mode {
+            self.flush_prepublication_append_bytes()?;
+            self.write_and_verify_block_device_tail_terminator(self.current_offset)?;
+        }
+        Ok(())
+    }
+
+    /// End a Pool-owned prepublication append batch by installing all staged
+    /// records, then rewriting and reading back their one surviving tail.
+    pub(crate) fn finish_prepublication_append_batch(&mut self) -> Result<()> {
+        let mut first_error = None;
+        if self.prepublication_tail_verification_deferred {
+            let result = self.flush_and_verify_prepublication_tail();
+            match result {
+                Ok(()) => self.prepublication_tail_verification_deferred = false,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        for replica in &mut self.replicas {
+            if let Err(error) = replica.finish_prepublication_append_batch() {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Load the just-synced append range with one positioned read.
+    ///
+    /// The Pool calls this only after its durability barrier and holds
+    /// exclusive mutable authority until strict payload and receipt readback
+    /// completes. Ordinary record decoding still validates every header,
+    /// payload checksum, footer, integrity trailer, location identity and
+    /// configured read checksum from these persisted bytes.
+    pub(crate) fn load_prepublication_batch_readback(&mut self) -> Result<()> {
+        self.prepublication_readback_bytes.clear();
+        self.prepublication_readback_records.clear();
+        let mut first_error = None;
+        if let Some((start, len)) = self.prepublication_readback_range {
+            let end = start
+                .checked_add(u64::try_from(len).map_err(|_| StoreError::InvalidOptions {
+                    reason: "prepublication readback length exceeds u64",
+                })?)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "prepublication readback range overflows u64",
+                })?;
+            let data_end = self
+                .block_device_capacity
+                .unwrap_or(0)
+                .saturating_sub(POOL_LABEL_SIZE as u64);
+            if !self.block_device_mode || end > data_end {
+                first_error = Some(StoreError::InvalidOptions {
+                    reason: "prepublication readback range leaves the block data region",
+                });
+            } else {
+                self.prepublication_readback_bytes.resize(len, 0);
+                if let Err(source) = self
+                    .current_file
+                    .read_exact_at(&mut self.prepublication_readback_bytes, start)
+                {
+                    self.prepublication_readback_bytes.clear();
+                    first_error = Some(io_error(
+                        "read coalesced prepublication records and tail",
+                        &self.root,
+                        source,
+                    ));
+                } else {
+                    match self.index_prepublication_batch_readback(start, len) {
+                        Ok(records) => self.prepublication_readback_records = records,
+                        Err(error) => {
+                            self.prepublication_readback_bytes.clear();
+                            first_error = Some(error);
+                        }
+                    }
+                }
+            }
+        }
+        for replica in &mut self.replicas {
+            if let Err(error) = replica.load_prepublication_batch_readback() {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn index_prepublication_batch_readback(
+        &self,
+        start: u64,
+        len: usize,
+    ) -> Result<Vec<PrepublicationReadbackRecord>> {
+        let records_len = len
+            .checked_sub(RECORD_HEADER_LEN)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "prepublication readback omits its successor header",
+            })?;
+        let records_end = start
+            .checked_add(
+                u64::try_from(records_len).map_err(|_| StoreError::InvalidOptions {
+                    reason: "prepublication record range exceeds u64",
+                })?,
+            )
+            .ok_or(StoreError::InvalidOptions {
+                reason: "prepublication record range overflows u64",
+            })?;
+        let mut pending_records = Vec::new();
+        let mut relative = 0usize;
+        while relative < records_len {
+            let record_offset = start
+                .checked_add(
+                    u64::try_from(relative).map_err(|_| StoreError::InvalidOptions {
+                        reason: "prepublication record offset exceeds u64",
+                    })?,
+                )
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "prepublication record offset overflows u64",
+                })?;
+            let header_end =
+                relative
+                    .checked_add(RECORD_HEADER_LEN)
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "prepublication record header overflows usize",
+                    })?;
+            let header_slice = self
+                .prepublication_readback_bytes
+                .get(relative..header_end)
+                .ok_or(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication record header is truncated",
+                })?;
+            let mut header_bytes = [0_u8; RECORD_HEADER_LEN];
+            header_bytes.copy_from_slice(header_slice);
+            let header = decode_header(&header_bytes, self.current_segment_id, record_offset)?;
+            if header.kind != RecordKind::Put {
+                return Err(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication readback contains a non-put record",
+                });
+            }
+            let range = checked_record_range(header, self.current_segment_id, record_offset)?;
+            if range.end_offset > records_end {
+                return Err(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication record extends beyond its batch",
+                });
+            }
+            let relative_offset = |offset: u64| -> Result<usize> {
+                let relative = offset.checked_sub(start).ok_or(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication record moved before its batch",
+                })?;
+                usize::try_from(relative).map_err(|_| StoreError::InvalidOptions {
+                    reason: "prepublication record range exceeds platform usize",
+                })
+            };
+            let payload_start = relative_offset(range.payload_offset)?;
+            let payload_end = relative_offset(range.payload_end_offset)?;
+            let _payload = self
+                .prepublication_readback_bytes
+                .get(payload_start..payload_end)
+                .ok_or(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication record payload is truncated",
+                })?;
+            let footer_bytes = if record_has_footer(header.format_version) {
+                let footer_start = relative_offset(range.footer_offset)?;
+                let footer_end = footer_start.checked_add(RECORD_FOOTER_LEN).ok_or(
+                    StoreError::InvalidOptions {
+                        reason: "prepublication record footer overflows usize",
+                    },
+                )?;
+                let footer_slice = self
+                    .prepublication_readback_bytes
+                    .get(footer_start..footer_end)
+                    .ok_or(StoreError::CorruptHeader {
+                        segment_id: self.current_segment_id,
+                        offset: range.footer_offset,
+                        reason: "prepublication record footer is truncated",
+                    })?;
+                let mut footer = [0_u8; RECORD_FOOTER_LEN];
+                footer.copy_from_slice(footer_slice);
+                Some((footer, range.footer_offset))
+            } else {
+                None
+            };
+            let trailer_bytes = if record_has_production_integrity_trailer(header.format_version) {
+                let trailer_offset =
+                    range
+                        .integrity_trailer_offset
+                        .ok_or(StoreError::CorruptHeader {
+                            segment_id: self.current_segment_id,
+                            offset: record_offset,
+                            reason: "prepublication integrity trailer offset is absent",
+                        })?;
+                let trailer_start = relative_offset(trailer_offset)?;
+                let trailer_end = trailer_start.checked_add(INTEGRITY_TRAILER_V2_LEN).ok_or(
+                    StoreError::InvalidOptions {
+                        reason: "prepublication integrity trailer overflows usize",
+                    },
+                )?;
+                let trailer_slice = self
+                    .prepublication_readback_bytes
+                    .get(trailer_start..trailer_end)
+                    .ok_or(StoreError::CorruptHeader {
+                        segment_id: self.current_segment_id,
+                        offset: trailer_offset,
+                        reason: "prepublication integrity trailer is truncated",
+                    })?;
+                let mut trailer = [0_u8; INTEGRITY_TRAILER_V2_LEN];
+                trailer.copy_from_slice(trailer_slice);
+                Some((trailer, trailer_offset))
+            } else {
+                None
+            };
+
+            let location = ObjectLocation {
+                key: header.key,
+                segment_id: self.current_segment_id,
+                record_offset,
+                payload_offset: range.payload_offset,
+                payload_len: header.payload_len,
+                sequence: header.sequence,
+                payload_checksum: header.payload_checksum,
+            };
+            if pending_records.last().is_some_and(
+                |previous: &PendingPrepublicationReadbackRecord| {
+                    previous.indexed.location.record_offset >= location.record_offset
+                },
+            ) {
+                return Err(StoreError::CorruptHeader {
+                    segment_id: self.current_segment_id,
+                    offset: record_offset,
+                    reason: "prepublication readback record offsets are not strictly increasing",
+                });
+            }
+            pending_records.push(PendingPrepublicationReadbackRecord {
+                indexed: PrepublicationReadbackRecord {
+                    location,
+                    payload_start,
+                    payload_end,
+                    compression_algorithm: header.compression_algorithm,
+                },
+                header,
+                header_bytes,
+                footer_bytes,
+                trailer_bytes,
+            });
+            relative = relative_offset(range.end_offset)?;
+        }
+        if relative != records_len {
+            return Err(StoreError::CorruptHeader {
+                segment_id: self.current_segment_id,
+                offset: start.saturating_add(relative as u64),
+                reason: "prepublication readback does not end at its successor header",
+            });
+        }
+        // The batch has already crossed its Pool durability barrier and was
+        // loaded with one exact positioned read. Each record's checksum and
+        // production-integrity trailer are independent, so verify a material
+        // batch across available CPUs. Consume the verification results in
+        // physical record order; small batches stay inline to avoid thread-pool
+        // dispatch overhead.
+        let readback_bytes = self.prepublication_readback_bytes.as_slice();
+        let current_segment_id = self.current_segment_id;
+        let verify_record = |pending: &PendingPrepublicationReadbackRecord| -> Result<()> {
+            let payload = readback_bytes
+                .get(pending.indexed.payload_start..pending.indexed.payload_end)
+                .ok_or(StoreError::CorruptHeader {
+                    segment_id: current_segment_id,
+                    offset: pending.indexed.location.payload_offset,
+                    reason: "prepublication record payload is truncated",
+                })?;
+            let actual = checksum64(payload);
+            if actual != pending.header.payload_checksum {
+                return Err(StoreError::ChecksumMismatch {
+                    segment_id: current_segment_id,
+                    offset: pending.indexed.location.payload_offset,
+                    expected: pending.header.payload_checksum,
+                    actual,
+                });
+            }
+
+            let footer = if let Some((footer, footer_offset)) = pending.footer_bytes {
+                decode_footer(&footer, pending.header, current_segment_id, footer_offset)?;
+                Some(footer)
+            } else {
+                None
+            };
+            if let Some((trailer, trailer_offset)) = pending.trailer_bytes {
+                let decoded_trailer = decode_integrity_trailer_v2(&trailer)?;
+                let footer = footer.ok_or(StoreError::CorruptHeader {
+                    segment_id: current_segment_id,
+                    offset: pending.indexed.location.record_offset,
+                    reason: "prepublication integrity trailer requires a footer",
+                })?;
+                verify_integrity_trailer_v2(
+                    &decoded_trailer,
+                    pending.header,
+                    &pending.header_bytes,
+                    payload,
+                    &footer,
+                    current_segment_id,
+                    trailer_offset,
+                )?;
+            }
+            Ok(())
+        };
+
+        const PARALLEL_READBACK_MIN_RECORDS: usize = 4;
+        const PARALLEL_READBACK_MIN_PAYLOAD_BYTES: usize = 512 * 1024;
+        let payload_bytes = pending_records.iter().try_fold(0usize, |total, pending| {
+            total
+                .checked_add(
+                    pending
+                        .indexed
+                        .payload_end
+                        .saturating_sub(pending.indexed.payload_start),
+                )
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "prepublication payload verification size overflows usize",
+                })
+        })?;
+        if pending_records.len() >= PARALLEL_READBACK_MIN_RECORDS
+            && payload_bytes >= PARALLEL_READBACK_MIN_PAYLOAD_BYTES
+        {
+            let results = pending_records
+                .par_iter()
+                .map(verify_record)
+                .collect::<Vec<_>>();
+            for result in results {
+                result?;
+            }
+        } else {
+            for pending in &pending_records {
+                verify_record(pending)?;
+            }
+        }
+
+        Ok(pending_records
+            .into_iter()
+            .map(|pending| pending.indexed)
+            .collect())
+    }
+
+    fn prepublication_readback_record(
+        &self,
+        location: ObjectLocation,
+    ) -> Option<&PrepublicationReadbackRecord> {
+        let index = self
+            .prepublication_readback_records
+            .binary_search_by_key(&location.record_offset, |record| {
+                record.location.record_offset
+            })
+            .ok()?;
+        self.prepublication_readback_records
+            .get(index)
+            .filter(|record| record.location == location)
+    }
+
+    /// Compare one untransformed payload against the exact persisted bytes
+    /// loaded for the current prepublication batch.
+    ///
+    /// [`Self::index_prepublication_batch_readback`] has already decoded the
+    /// record from the post-barrier device read and verified its header,
+    /// payload checksum, footer, production-integrity trailer and physical
+    /// location. Reusing that authenticated slice avoids decoding and hashing
+    /// the same bytes again. Transformed records return `false` so their
+    /// owning Device can retain the generic strict read path.
+    pub(crate) fn verify_prepublication_batch_payload(
+        &self,
+        key: ObjectKey,
+        expected_payload: &[u8],
+    ) -> Result<bool> {
+        let location = self
+            .index
+            .get(&key)
+            .copied()
+            .ok_or(StoreError::InvalidOptions {
+                reason: "prepublication batch readback lost its payload location",
+            })?;
+        let Some(record) = self.prepublication_readback_record(location) else {
+            return Ok(false);
+        };
+        if record.compression_algorithm != 0 {
+            return Ok(false);
+        }
+        let persisted = self
+            .prepublication_readback_bytes
+            .get(record.payload_start..record.payload_end)
+            .ok_or(StoreError::CorruptHeader {
+                segment_id: location.segment_id,
+                offset: location.record_offset,
+                reason: "indexed prepublication payload is outside its readback range",
+            })?;
+        if persisted != expected_payload {
+            return Err(StoreError::InvalidOptions {
+                reason: "prepublication batch readback changed its expected payload",
+            });
+        }
+        if self.options.verify_read_checksums && !self.checksums.contains_key(&key) {
+            return Err(StoreError::InvalidOptions {
+                reason: "prepublication batch readback lost its read-verification checksum",
+            });
+        }
+        for replica in &self.replicas {
+            if !replica.verify_prepublication_batch_payload(key, expected_payload)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn clear_prepublication_batch_readback(&mut self) {
+        self.prepublication_readback_range = None;
+        self.prepublication_readback_bytes.clear();
+        self.prepublication_readback_records.clear();
+        for replica in &mut self.replicas {
+            replica.clear_prepublication_batch_readback();
+        }
+    }
+
+    fn verify_deferred_prepublication_tail_before_barrier(&mut self) -> Result<()> {
+        if self.prepublication_tail_verification_deferred {
+            self.flush_and_verify_prepublication_tail()?;
+            // A barrier closes the append batch. Any later write verifies its
+            // own tail, so metadata appended by the barrier cannot inherit the
+            // earlier payload batch's deferred state.
+            self.prepublication_tail_verification_deferred = false;
+        }
+        Ok(())
     }
 
     pub(crate) fn put_pool_internal(
@@ -5950,7 +6570,7 @@ impl LocalObjectStore {
         payload: &[u8],
         compression_algorithm: u8,
     ) -> Result<StoredObject> {
-        self.put_inner(key, payload, compression_algorithm, false, true)
+        self.put_inner(key, payload, compression_algorithm, false, true, None)
     }
 
     /// Write a named object directly to the segment without commit_group tracking.
@@ -5958,7 +6578,7 @@ impl LocalObjectStore {
     /// Used internally by the commit_group commit path to persist journal records
     /// and committed roots without recursing into the commit_group accumulator.
     pub(crate) fn put_direct(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
-        self.put_inner(key, payload, 0, false, true)
+        self.put_inner(key, payload, 0, false, true, None)
     }
 
     /// Return the per-object BLAKE3 domain-separated checksum for `key`,
@@ -6928,6 +7548,7 @@ impl LocalObjectStore {
     pub fn sync_all(&mut self) -> Result<()> {
         self.ensure_pool_raw_mutation_allowed()?;
         self.ensure_writable("sync_all")?;
+        self.verify_deferred_prepublication_tail_before_barrier()?;
         // Pool-internal reclaim changes join this existing store commit
         // boundary instead of crossing a separate fsync per queue transition.
         let prepared_dead_object_reclaim = self.prepare_dead_object_reclaim_queue_authority()?;
@@ -7060,8 +7681,9 @@ impl LocalObjectStore {
                 let _ = self.persist_space_accounting();
 
                 // Persist per-object checksum index for read-path verification (#5273).
-                if let Err(e) = write_checksums(&self.segments_dir, &self.checksums) {
-                    tracing::warn!("checksum index write failed: {e}");
+                match write_checksums(&self.segments_dir, &self.checksums) {
+                    Ok(()) => self.prepublication_checksums_dirty = false,
+                    Err(e) => tracing::warn!("checksum index write failed: {e}"),
                 }
 
                 // Sync the segment file so user data is durable.
@@ -7084,6 +7706,43 @@ impl LocalObjectStore {
             }
         }
 
+        // A batch containing only prepublication payloads has no ordinary
+        // commit group, but its explicit Pool barrier still has to carry the
+        // read-verification checksum index across close and reopen.
+        if self.prepublication_checksums_dirty {
+            write_checksums(&self.segments_dir, &self.checksums)?;
+            self.prepublication_checksums_dirty = false;
+        }
+
+        Ok(())
+    }
+
+    /// Cross the durability boundary owned by one Pool prepublication batch.
+    ///
+    /// A block-backed store is a fixed-size data carrier: the batch has
+    /// already installed its complete scan-bounded record prefix and final
+    /// tail, so `sync_data` durably carries both payload and receipt records
+    /// without committing unrelated reclaim, checkpoint, scrub or transaction
+    /// state. Directory-backed compatibility stores retain the full existing
+    /// barrier because their record and sidecar metadata share that authority.
+    pub(crate) fn sync_prepublication_batch(&mut self) -> Result<()> {
+        if !self.block_device_mode {
+            return self.sync_all();
+        }
+        self.ensure_pool_raw_mutation_allowed()?;
+        self.ensure_writable("sync prepublication batch")?;
+        self.verify_deferred_prepublication_tail_before_barrier()?;
+        let path = segment_path(&self.segments_dir, self.current_segment_id);
+        self.current_file
+            .sync_data()
+            .map_err(|source| io_error("sync prepublication batch", &path, source))?;
+        for replica in &mut self.replicas {
+            replica.sync_prepublication_batch()?;
+        }
+        // Block stores have no checksum sidecar; the in-memory index remains
+        // live, while the persisted record checksum and integrity trailer are
+        // the reopen authority verified immediately below the Pool barrier.
+        self.prepublication_checksums_dirty = false;
         Ok(())
     }
 
@@ -7105,6 +7764,7 @@ impl LocalObjectStore {
 
     fn sync_pool_authority_storage(&mut self, publish_pending_reclaim: bool) -> Result<()> {
         self.ensure_writable("sync strict pool authority")?;
+        self.verify_deferred_prepublication_tail_before_barrier()?;
         // Receipt publication and exact cleanup require the ordinary strict
         // barrier to publish their staged root-owned reclaim delta. The
         // receipt-generation reservation barrier deliberately skips it while
@@ -7177,6 +7837,7 @@ impl LocalObjectStore {
     pub fn sync_data(&mut self) -> Result<()> {
         self.ensure_pool_raw_mutation_allowed()?;
         self.ensure_writable("sync_data")?;
+        self.verify_deferred_prepublication_tail_before_barrier()?;
         let path = segment_path(&self.segments_dir, self.current_segment_id);
         self.current_file
             .sync_data()
@@ -7444,7 +8105,19 @@ impl LocalObjectStore {
                     && !self.reclaim_receipts_dirty
                     && !self.snapshot_extent_pin_set_dirty =>
             {
-                self.compact_block_device_live_records()?;
+                // Compaction must read every current live location. Install
+                // and close any successful prepublication prefix before it
+                // inspects the index, then resume batching the retried record.
+                let resume_prepublication_batch = self.prepublication_tail_verification_deferred;
+                if resume_prepublication_batch {
+                    self.flush_and_verify_prepublication_tail()?;
+                    self.prepublication_tail_verification_deferred = false;
+                }
+                let compact_result = self.compact_block_device_live_records();
+                if resume_prepublication_batch {
+                    self.prepublication_tail_verification_deferred = true;
+                }
+                compact_result?;
                 self.append_record_once(
                     kind,
                     key,
@@ -7491,25 +8164,100 @@ impl LocalObjectStore {
         let trailer = encode_integrity_trailer_v2(&trailer_v2);
 
         let path = segment_path(&self.segments_dir, self.current_segment_id);
-        self.current_file
-            .seek(SeekFrom::Start(record_offset))
-            .map_err(|source| io_error("seek", &path, source))?;
-        self.current_file
-            .write_all(&header)
-            .map_err(|source| io_error("write header", &path, source))?;
-        self.current_file
-            .write_all(payload)
-            .map_err(|source| io_error("write payload", &path, source))?;
-        self.current_file
-            .write_all(&footer)
-            .map_err(|source| io_error("write footer", &path, source))?;
-        self.current_file
-            .write_all(&trailer)
-            .map_err(|source| io_error("write production integrity trailer", &path, source))?;
-        if self.block_device_mode {
-            self.write_and_verify_block_device_tail_terminator(record_range.end_offset)?;
+        let prepublication_batch_active = self.prepublication_tail_verification_deferred;
+        let prepublication_record_includes_tail =
+            self.block_device_mode && prepublication_batch_active;
+        if prepublication_record_includes_tail {
+            // A Pool prepublication batch already owns the complete immutable
+            // records in memory. Coalesce their unchanged representations and
+            // one zero successor header so finish() can install the complete
+            // scan-bounded prefix with one positioned write.
+            let record_len =
+                usize::try_from(record_len).map_err(|_| StoreError::InvalidOptions {
+                    reason: "object-store record length exceeds platform usize",
+                })?;
+            let encoded_len =
+                record_len
+                    .checked_add(RECORD_HEADER_LEN)
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "object-store record and tail length exceeds platform usize",
+                    })?;
+            match self.prepublication_append_start {
+                Some(start) => {
+                    let relative =
+                        record_offset
+                            .checked_sub(start)
+                            .ok_or(StoreError::InvalidOptions {
+                                reason: "prepublication append offset moved before its batch start",
+                            })?;
+                    let relative =
+                        usize::try_from(relative).map_err(|_| StoreError::InvalidOptions {
+                            reason: "prepublication append offset exceeds platform usize",
+                        })?;
+                    let expected_len = relative.checked_add(RECORD_HEADER_LEN).ok_or(
+                        StoreError::InvalidOptions {
+                            reason: "prepublication append length exceeds platform usize",
+                        },
+                    )?;
+                    if self.prepublication_append_bytes.len() != expected_len {
+                        return Err(StoreError::InvalidOptions {
+                            reason: "prepublication append records are not contiguous",
+                        });
+                    }
+                    self.prepublication_append_bytes.truncate(relative);
+                }
+                None => {
+                    if !self.prepublication_append_bytes.is_empty() {
+                        return Err(StoreError::InvalidOptions {
+                            reason: "prepublication append bytes are missing their batch start",
+                        });
+                    }
+                    self.prepublication_append_start = Some(record_offset);
+                }
+            }
+            self.prepublication_append_bytes.reserve(encoded_len);
+            self.prepublication_append_bytes.extend_from_slice(&header);
+            self.prepublication_append_bytes.extend_from_slice(payload);
+            self.prepublication_append_bytes.extend_from_slice(&footer);
+            self.prepublication_append_bytes.extend_from_slice(&trailer);
+            let tail_end = self
+                .prepublication_append_bytes
+                .len()
+                .checked_add(RECORD_HEADER_LEN)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "prepublication append tail exceeds platform usize",
+                })?;
+            self.prepublication_append_bytes.resize(tail_end, 0);
+        } else {
+            self.current_file
+                .seek(SeekFrom::Start(record_offset))
+                .map_err(|source| io_error("seek", &path, source))?;
+            self.current_file
+                .write_all(&header)
+                .map_err(|source| io_error("write header", &path, source))?;
+            self.current_file
+                .write_all(payload)
+                .map_err(|source| io_error("write payload", &path, source))?;
+            self.current_file
+                .write_all(&footer)
+                .map_err(|source| io_error("write footer", &path, source))?;
+            self.current_file
+                .write_all(&trailer)
+                .map_err(|source| io_error("write production integrity trailer", &path, source))?;
         }
-        if self.options.sync_on_write {
+        if self.block_device_mode {
+            if !prepublication_record_includes_tail {
+                self.write_block_device_tail_terminator(record_range.end_offset)?;
+            }
+            if !prepublication_batch_active {
+                self.verify_block_device_tail_terminator(record_range.end_offset)?;
+            }
+        }
+        // Durable stores normally sync every record. A Pool-owned
+        // prepublication batch instead keeps payload and receipt records
+        // unreachable, closes their final tail at batch finish, and crosses
+        // one Pool-wide barrier before strict readback.
+        if self.options.sync_on_write && !prepublication_batch_active {
             self.current_file
                 .sync_data()
                 .map_err(|source| io_error("sync_data", &path, source))?;
@@ -7635,37 +8383,39 @@ impl LocalObjectStore {
             }
         }
 
-        let retained_records: Vec<(ObjectKey, ObjectLocation, Vec<u8>, u8)> = retained_locations
-            .into_iter()
-            .map(|old_location| {
-                self.read_location_stored_payload(old_location).map(
-                    |(payload, compression_algorithm)| {
-                        (
-                            old_location.key,
-                            old_location,
-                            payload,
-                            compression_algorithm,
-                        )
-                    },
-                )
-            })
-            .collect::<Result<_>>()?;
         let sequence_high_water_payload = self.next_sequence.to_le_bytes();
-        let tombstone_keys = retained_records
+        let tombstone_keys = retained_locations
             .iter()
-            .map(|(key, _, _, _)| *key)
+            .map(|location| location.key)
             .filter(|key| !desired_live_locations.contains_key(key))
             .collect::<BTreeSet<_>>();
 
         let data_start = Self::block_device_data_start();
         let usable_end = self.block_device_usable_end()?;
-        let records_end = retained_records
-            .iter()
-            .try_fold(data_start, |offset, record| {
-                offset
-                    .checked_add(Self::checked_record_total_len_u64(record.2.len() as u64))
-                    .ok_or(StoreError::NoSpace)
-            })?;
+        let mut records_end = data_start;
+        let mut previous_source_end = data_start;
+        for location in &retained_locations {
+            let record_len = Self::checked_record_total_len_u64(location.payload_len);
+            let source_end = location
+                .record_offset
+                .checked_add(record_len)
+                .ok_or(StoreError::NoSpace)?;
+            let target_end = records_end
+                .checked_add(record_len)
+                .ok_or(StoreError::NoSpace)?;
+            if location.segment_id != self.current_segment_id
+                || location.record_offset < previous_source_end
+                || records_end > location.record_offset
+                || target_end > source_end
+                || source_end > usable_end
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "block-device compaction cannot safely stream overlapping locations",
+                });
+            }
+            previous_source_end = source_end;
+            records_end = target_end;
+        }
         let high_water_end = records_end
             .checked_add(Self::checked_record_total_len_u64(
                 sequence_high_water_payload.len() as u64,
@@ -7701,20 +8451,64 @@ impl LocalObjectStore {
         let mut tombstone_locations: BTreeMap<ObjectKey, ObjectLocation> = BTreeMap::new();
 
         let compact_result = (|| -> Result<()> {
-            for (key, old_location, payload, compression_algorithm) in &retained_records {
+            let mut retained_locations = retained_locations.into_iter().peekable();
+            let mut prefetched_record = None;
+            while let Some(old_location) = retained_locations.next() {
+                let (payload, compression_algorithm) = match prefetched_record.take() {
+                    Some((prefetched_location, payload, compression_algorithm)) => {
+                        if prefetched_location != old_location {
+                            return Err(StoreError::InvalidOptions {
+                                reason: "block-device compaction prefetched the wrong location",
+                            });
+                        }
+                        (payload, compression_algorithm)
+                    }
+                    None => self.read_location_stored_payload(old_location)?,
+                };
+
+                let target_end = self
+                    .current_offset
+                    .checked_add(Self::checked_record_total_len_u64(old_location.payload_len))
+                    .ok_or(StoreError::NoSpace)?;
+                if let Some(next_location) = retained_locations.peek().copied() {
+                    let tail_end = target_end
+                        .checked_add(RECORD_HEADER_LEN_U64)
+                        .ok_or(StoreError::NoSpace)?;
+                    if tail_end > next_location.record_offset {
+                        // append_record_once() closes every block-device
+                        // record with a zero successor header. When retained
+                        // sources are adjacent, that terminator overwrites the
+                        // next old header. Read exactly that one source first;
+                        // the preflight above proves no record body or later
+                        // source can overlap this target.
+                        let (next_payload, next_algorithm) =
+                            self.read_location_stored_payload(next_location)?;
+                        prefetched_record = Some((next_location, next_payload, next_algorithm));
+                    }
+                }
+
+                let key = old_location.key;
                 let new_location = self.append_record_once(
                     RecordKind::Put,
-                    *key,
-                    payload,
+                    key,
+                    &payload,
                     old_location.payload_checksum,
                     old_location.sequence,
-                    *compression_algorithm,
+                    compression_algorithm,
                 )?;
-                compacted_history
-                    .entry(*key)
-                    .or_default()
-                    .push(new_location);
-                relocated_locations.insert(*old_location, new_location);
+                let (rewritten_payload, rewritten_algorithm) =
+                    self.read_location_stored_payload(new_location)?;
+                if rewritten_payload != payload
+                    || rewritten_algorithm != compression_algorithm
+                    || receipt_bound_physical_lifetime_id(key, old_location)
+                        != receipt_bound_physical_lifetime_id(key, new_location)
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "block-device compaction candidate verification failed",
+                    });
+                }
+                compacted_history.entry(key).or_default().push(new_location);
+                relocated_locations.insert(old_location, new_location);
             }
             let high_water_key = physical_lifetime_sequence_high_water_key();
             let high_water_location = self.append_record_once(
@@ -7752,22 +8546,6 @@ impl LocalObjectStore {
                 });
             }
 
-            // Verify every rewritten record before clearing the old tail. No
-            // durability barrier is issued until the blank terminator is also
-            // present.
-            for (key, old_location, expected_payload, expected_algorithm) in &retained_records {
-                let new_location = relocated_locations[old_location];
-                let (payload, algorithm) = self.read_location_stored_payload(new_location)?;
-                if payload != *expected_payload
-                    || algorithm != *expected_algorithm
-                    || receipt_bound_physical_lifetime_id(*key, *old_location)
-                        != receipt_bound_physical_lifetime_id(*key, new_location)
-                {
-                    return Err(StoreError::InvalidOptions {
-                        reason: "block-device compaction candidate verification failed",
-                    });
-                }
-            }
             for (key, location) in &tombstone_locations {
                 self.verify_block_device_delete_record(*key, *location)?;
             }
@@ -7892,12 +8670,25 @@ impl LocalObjectStore {
 
     fn write_and_verify_block_device_tail_terminator(&mut self, offset: u64) -> Result<()> {
         debug_assert!(self.block_device_mode);
+        self.write_block_device_tail_terminator(offset)?;
+        self.verify_block_device_tail_terminator(offset)
+    }
+
+    fn write_block_device_tail_terminator(&mut self, offset: u64) -> Result<()> {
+        debug_assert!(self.block_device_mode);
         self.current_file
-            .seek(SeekFrom::Start(offset))
-            .map_err(|source| io_error("block_device_compact_seek_tail", &self.root, source))?;
-        self.current_file
-            .write_all(&[0_u8; RECORD_HEADER_LEN])
-            .map_err(|source| io_error("block_device_compact_clear_tail", &self.root, source))?;
+            .write_all_at(&[0_u8; RECORD_HEADER_LEN], offset)
+            .map_err(|source| io_error("block_device_compact_clear_tail", &self.root, source))
+    }
+
+    fn verify_block_device_tail_terminator(&mut self, offset: u64) -> Result<()> {
+        debug_assert!(self.block_device_mode);
+        #[cfg(test)]
+        {
+            self.block_device_tail_terminator_verifications = self
+                .block_device_tail_terminator_verifications
+                .saturating_add(1);
+        }
         let mut terminator = [0xff_u8; RECORD_HEADER_LEN];
         self.current_file
             .read_exact_at(&mut terminator, offset)
@@ -8322,6 +9113,18 @@ impl LocalObjectStore {
                 .block_device_capacity
                 .unwrap_or(0)
                 .saturating_sub(POOL_LABEL_SIZE as u64);
+            if let Some(record) = self.prepublication_readback_record(location) {
+                let payload = self
+                    .prepublication_readback_bytes
+                    .get(record.payload_start..record.payload_end)
+                    .ok_or(StoreError::CorruptHeader {
+                        segment_id: location.segment_id,
+                        offset: location.record_offset,
+                        reason: "indexed prepublication payload is outside its readback range",
+                    })?
+                    .to_vec();
+                return Ok((payload, record.compression_algorithm));
+            }
             let mut header = [0_u8; RECORD_HEADER_LEN];
             self.current_file
                 .read_exact_at(&mut header, location.record_offset)
@@ -11230,6 +12033,65 @@ mod block_device_open_tests {
     }
 
     #[test]
+    fn block_device_streaming_compaction_preserves_adjacent_unread_sources() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let options = block_options(64 * 1024);
+        let mut store =
+            LocalObjectStore::open_block_device_writable_unbound(&image, options.clone())
+                .expect("open block image");
+        let records = (0..8_u8)
+            .map(|index| {
+                (
+                    ObjectKey::from_name(format!("block-device/stream/{index}").as_bytes()),
+                    vec![index; 4096 + usize::from(index)],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (key, payload) in &records {
+            store.put(*key, payload).expect("put adjacent source");
+        }
+        let retained_locations = records
+            .iter()
+            .map(|(key, _)| (*key, store.location_of(*key).expect("source location")))
+            .collect::<Vec<_>>();
+        let mut source_order = retained_locations
+            .iter()
+            .map(|(_, location)| *location)
+            .collect::<Vec<_>>();
+        source_order.sort_by_key(|location| location.record_offset);
+        for pair in source_order.windows(2) {
+            assert_eq!(
+                pair[0].record_offset
+                    + LocalObjectStore::checked_record_total_len_u64(pair[0].payload_len),
+                pair[1].record_offset,
+                "fixture sources must be adjacent so each compacted tail reaches the next header"
+            );
+        }
+
+        store
+            .compact_block_device_locations(retained_locations)
+            .expect("stream adjacent retained records");
+        for (key, payload) in &records {
+            assert_eq!(
+                store.get(*key).expect("read compacted record"),
+                Some(payload.clone())
+            );
+        }
+        drop(store);
+
+        let reopened = LocalObjectStore::open_block_device(&image, options)
+            .expect("reopen streamed block image");
+        for (key, payload) in records {
+            assert_eq!(
+                reopened.get(key).expect("read reopened compacted record"),
+                Some(payload)
+            );
+        }
+    }
+
+    #[test]
     fn block_device_delete_churn_reuses_append_space() {
         let dir = tempdir().expect("tempdir");
         let image = create_block_image(&dir);
@@ -11477,6 +12339,203 @@ mod block_device_open_tests {
             Some(append_payload.to_vec())
         );
         assert_eq!(reopened.get(stale_key).expect("get stale tail"), None);
+    }
+
+    #[test]
+    fn block_device_prepublication_batch_verifies_only_its_final_tail() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let mut options = block_options(80 * 1024);
+        options.sync_on_write = true;
+        let mut store =
+            LocalObjectStore::open_block_device_writable_unbound(&image, options.clone())
+                .expect("open block image");
+        let payload_key = ObjectKey::from_name(b"block-device/prepublication/payload");
+        let successor_key = ObjectKey::from_name(b"block-device/prepublication/successor");
+        let mut receipt_key_bytes = [0x45; 32];
+        receipt_key_bytes[..8].copy_from_slice(&crate::POOL_PLACEMENT_RECEIPT_KEY_PREFIX);
+        let receipt_key = ObjectKey(receipt_key_bytes);
+
+        let verifications_before = store.block_device_tail_terminator_verifications;
+        let batch_start = store.current_offset;
+        store.begin_prepublication_append_batch();
+        store
+            .put_prepublication_pool_internal(payload_key, b"immutable payload")
+            .expect("stage prepublication payload");
+        store
+            .put_pool_internal(receipt_key, b"placement receipt")
+            .expect("stage placement receipt");
+        assert_eq!(store.prepublication_append_start, Some(batch_start));
+        assert!(!store.prepublication_append_bytes.is_empty());
+        let mut unpublished_header = [0xff_u8; RECORD_HEADER_LEN];
+        store
+            .current_file
+            .read_exact_at(&mut unpublished_header, batch_start)
+            .expect("read unchanged on-disk batch start");
+        assert_eq!(
+            unpublished_header, [0_u8; RECORD_HEADER_LEN],
+            "the records remain coalesced until the Pool closes the batch"
+        );
+        assert_eq!(
+            store.block_device_tail_terminator_verifications, verifications_before,
+            "intermediate tails are overwritten inside the append batch"
+        );
+        store
+            .finish_prepublication_append_batch()
+            .expect("verify final batch tail");
+        assert!(store.prepublication_append_bytes.is_empty());
+        assert_eq!(store.prepublication_append_start, None);
+        assert_eq!(
+            store.block_device_tail_terminator_verifications,
+            verifications_before + 1,
+            "the final durable tail is rewritten and verified once"
+        );
+        store
+            .put_direct(successor_key, b"successor payload")
+            .expect("append Pool sync record over the batch successor slot");
+        store.sync_all().expect("sync prepublication batch");
+        store
+            .load_prepublication_batch_readback()
+            .expect("load the persisted append range once");
+        assert_eq!(
+            store.prepublication_readback_range.map(|(start, _)| start),
+            Some(batch_start)
+        );
+        assert!(!store.prepublication_readback_bytes.is_empty());
+        assert_eq!(store.prepublication_readback_records.len(), 2);
+        assert_eq!(
+            store.get(payload_key).expect("read cached payload record"),
+            Some(b"immutable payload".to_vec())
+        );
+        assert_eq!(
+            store.get(receipt_key).expect("read cached receipt record"),
+            Some(b"placement receipt".to_vec())
+        );
+        assert_eq!(
+            store.get(successor_key).expect("read successor record"),
+            Some(b"successor payload".to_vec())
+        );
+        store.clear_prepublication_batch_readback();
+        assert_eq!(store.prepublication_readback_range, None);
+        assert!(store.prepublication_readback_bytes.is_empty());
+        assert!(store.prepublication_readback_records.is_empty());
+        drop(store);
+
+        let reopened = LocalObjectStore::open_block_device(&image, options)
+            .expect("reopen prepublication block image");
+        assert_eq!(
+            reopened
+                .get(payload_key)
+                .expect("read payload after reopen"),
+            Some(b"immutable payload".to_vec())
+        );
+        assert_eq!(
+            reopened
+                .get(receipt_key)
+                .expect("read receipt after reopen"),
+            Some(b"placement receipt".to_vec())
+        );
+        assert_eq!(
+            reopened
+                .get(successor_key)
+                .expect("read successor after reopen"),
+            Some(b"successor payload".to_vec())
+        );
+    }
+
+    #[test]
+    fn block_device_prepublication_batch_consumes_one_scheduler_token() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let mut store =
+            LocalObjectStore::open_block_device_writable_unbound(&image, block_options(80 * 1024))
+                .expect("open block image");
+        store.io_scheduler = IoScheduler::new(&IoSchedulerConfig {
+            async_data_rate: 0.0,
+            async_data_burst: 2.0,
+            ..IoSchedulerConfig::default()
+        });
+
+        store.begin_prepublication_append_batch();
+        store
+            .put_prepublication_pool_internal(
+                ObjectKey::from_name(b"prepublication/scheduler/first"),
+                b"first",
+            )
+            .expect("stage first batch record");
+        store
+            .put_prepublication_pool_internal(
+                ObjectKey::from_name(b"prepublication/scheduler/second"),
+                b"second",
+            )
+            .expect("stage second batch record");
+        assert_eq!(
+            store
+                .io_scheduler
+                .available_tokens(crate::io_scheduler::IoClass::AsyncData),
+            1.0,
+            "one logical batch must consume one scheduler token"
+        );
+        store
+            .finish_prepublication_append_batch()
+            .expect("finish prepublication batch");
+
+        store
+            .put_direct(
+                ObjectKey::from_name(b"prepublication/scheduler/ordinary"),
+                b"ordinary",
+            )
+            .expect("write ordinary successor");
+        assert_eq!(
+            store
+                .io_scheduler
+                .available_tokens(crate::io_scheduler::IoClass::AsyncData),
+            0.0,
+            "an ordinary write after the batch must consume its own token"
+        );
+    }
+
+    #[test]
+    fn block_device_prepublication_barrier_closes_tail_batch() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let mut store =
+            LocalObjectStore::open_block_device_writable_unbound(&image, block_options(80 * 1024))
+                .expect("open block image");
+        let first_key = ObjectKey::from_name(b"block-device/prepublication/before-barrier");
+        let second_key = ObjectKey::from_name(b"block-device/prepublication/after-barrier");
+
+        let verifications_before = store.block_device_tail_terminator_verifications;
+        store.begin_prepublication_append_batch();
+        store
+            .put_prepublication_pool_internal(first_key, b"before barrier")
+            .expect("stage first payload");
+        assert_eq!(
+            store.block_device_tail_terminator_verifications,
+            verifications_before
+        );
+
+        store.sync_data().expect("close batch at data barrier");
+        assert_eq!(
+            store.block_device_tail_terminator_verifications,
+            verifications_before + 1,
+            "the barrier must verify the deferred tail"
+        );
+        store
+            .put_prepublication_pool_internal(second_key, b"after barrier")
+            .expect("stage payload after barrier");
+        assert_eq!(
+            store.block_device_tail_terminator_verifications,
+            verifications_before + 2,
+            "writes after the barrier must verify their own tails"
+        );
+        store
+            .finish_prepublication_append_batch()
+            .expect("an already closed batch finishes idempotently");
+        assert_eq!(
+            store.block_device_tail_terminator_verifications,
+            verifications_before + 2
+        );
     }
 
     #[test]

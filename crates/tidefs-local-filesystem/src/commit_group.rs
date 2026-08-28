@@ -442,6 +442,21 @@ impl<C: Clock> CommitGroupStateMachine<C> {
         true
     }
 
+    /// Retire dirty bytes that can no longer reach the group being built.
+    ///
+    /// A successful destructive mutation may supersede part of a buffered
+    /// write before root publication. Those bytes no longer consume dirty
+    /// memory or require writeback, so retaining their charge would turn the
+    /// hard maximum into cumulative-I/O accounting and force unrelated
+    /// foreground publication. Operation count remains cumulative because the
+    /// destructive mutation itself still belongs to this group.
+    pub fn retire_dirty_bytes(&mut self, byte_delta: u64) {
+        self.dirty_bytes = self.dirty_bytes.saturating_sub(byte_delta);
+        if self.dirty_bytes <= self.config.commit_group_dirty_max_bytes {
+            self.backpressure_active = false;
+        }
+    }
+
     /// Signal that a write completed (decrement inflight count).
     #[allow(dead_code)] // INTENT: COMMIT_GROUP state machine types for planned transaction-group commit pipeline
     pub fn write_completed(&mut self) {
@@ -483,6 +498,21 @@ impl<C: Clock> CommitGroupStateMachine<C> {
             return false;
         }
         self.evaluate_triggers().is_some()
+    }
+
+    /// Whether the current group has reached the hard dirty-byte boundary.
+    ///
+    /// Soft operation, byte, and time targets select an asynchronous
+    /// commit-group close. They must not make whichever ordinary mutation
+    /// observes the target publish the whole filesystem root synchronously.
+    /// The hard maximum remains foreground backpressure so dirty state cannot
+    /// grow past its configured bound while an idle-period commit is pending.
+    pub fn requires_foreground_commit(&self) -> bool {
+        self.phase == CommitGroupPhase::Open
+            && matches!(
+                self.evaluate_triggers(),
+                Some(CommitGroupTrigger::ByteMaximum)
+            )
     }
 
     /// Whether dirty bytes exceed the hard maximum (back-pressure active).

@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -74,7 +74,7 @@ use tidefs_types_vfs_core::{
 };
 use tidefs_vfs_engine::{
     LivePoolAdminRequest, LivePoolAdminResponse, LockSpec, LseekDataRange, VfsEngine,
-    VfsEngineStatFs,
+    VfsEngineStatFs, WritePrivilegeClear,
 };
 
 use crate::mount_options::TimestampPolicy;
@@ -85,6 +85,13 @@ fn fuse_op_diagnostics_enabled() -> bool {
         std::env::var("TIDEFS_FUSE_OP_DIAGNOSTICS").as_deref(),
         Ok("1") | Ok("true") | Ok("yes")
     )
+}
+
+fn fuse_shutdown_diagnostics_enabled() -> bool {
+    matches!(
+        std::env::var("TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    ) || fuse_op_diagnostics_enabled()
 }
 
 /// Validate protocol flags carried by a FUSE WRITE request.
@@ -106,6 +113,25 @@ fn validate_fuse_write_flags(write_flags: u32) -> Result<(), Errno> {
 // Matches the committed LocalFileSystem root dataset id.
 const ROOT_DATASET_ID: tidefs_dataset_catalog::DatasetId =
     tidefs_dataset_catalog::DatasetId::from_bytes([0u8; 16]);
+
+const FUSE_CAP_HANDLE_KILLPRIV_V2: u32 = 1 << 28;
+
+const fn required_fuse_capabilities() -> u32 {
+    const CAP_POSIX_LOCKS: u32 = 1 << 1;
+    const CAP_FLOCK_LOCKS: u32 = 1 << 10;
+    const CAP_POSIX_ACL: u32 = 1 << 20;
+    const CAP_PARALLEL_DIROPS: u32 = 1 << 18;
+    const CAP_DO_READDIRPLUS: u32 = 1 << 13;
+    const CAP_DONT_MASK: u32 = 1 << 6;
+
+    CAP_POSIX_LOCKS
+        | CAP_FLOCK_LOCKS
+        | CAP_POSIX_ACL
+        | CAP_PARALLEL_DIROPS
+        | CAP_DO_READDIRPLUS
+        | FUSE_CAP_HANDLE_KILLPRIV_V2
+        | CAP_DONT_MASK
+}
 
 // ── Sticky bit (S_ISVTX) enforcement ──────────────────────────────────────
 
@@ -271,6 +297,7 @@ fn apply_setattr_privilege_mode_rules(
     attr: &SetAttr,
     current: &InodeAttr,
     ctx: &RequestCtx,
+    kill_suidgid: bool,
 ) -> SetAttr {
     let mut effective = *attr;
     let mut mode = if attr.valid & FATTR_MODE != 0 {
@@ -280,8 +307,16 @@ fn apply_setattr_privilege_mode_rules(
     };
     let mut force_mode = false;
 
-    if (attr.valid & (FATTR_UID | FATTR_GID)) != 0 && ctx.uid != 0 {
+    if (attr.valid & (FATTR_UID | FATTR_GID)) != 0 && current.kind != NodeKind::Dir {
         mode = (current.posix.mode & S_IFMT) | (mode & !S_IFMT & !(S_ISUID | S_ISGID));
+        force_mode = true;
+    }
+
+    if kill_suidgid && attr.valid & FATTR_SIZE != 0 && current.kind == NodeKind::File {
+        mode &= !S_ISUID;
+        if mode & 0o010 != 0 {
+            mode &= !S_ISGID;
+        }
         force_mode = true;
     }
 
@@ -299,6 +334,24 @@ fn apply_setattr_privilege_mode_rules(
     }
 
     effective
+}
+
+fn remove_security_capability_for_killpriv(
+    engine: &dyn VfsEngine,
+    inode: InodeId,
+    ctx: &RequestCtx,
+) -> Result<(), Errno> {
+    let clear_ctx = RequestCtx {
+        uid: 0,
+        gid: 0,
+        pid: ctx.pid,
+        umask: ctx.umask,
+        groups: vec![0],
+    };
+    match engine.removexattr(inode, b"security.capability", &clear_ctx) {
+        Ok(()) | Err(Errno::ENODATA | Errno::EOPNOTSUPP) => Ok(()),
+        Err(errno) => Err(errno),
+    }
 }
 /// Check that the caller has write+execute access on a parent directory,
 /// with POSIX ACL support. Retrieves the parent's access ACL from xattr
@@ -585,9 +638,20 @@ impl Default for DentryPolicy {
 impl DentryPolicy {
     fn for_timestamp_policy(self, timestamp_policy: TimestampPolicy, read_only: bool) -> Self {
         let mut policy = self;
-        if read_only || timestamp_policy != TimestampPolicy::NoAtime {
+        if read_only {
             policy.positive_entry_ttl = Duration::ZERO;
             policy.positive_attr_ttl = Duration::ZERO;
+            return policy;
+        }
+        match timestamp_policy {
+            TimestampPolicy::NoAtime => {}
+            TimestampPolicy::RelativeAtime => {
+                policy.positive_entry_ttl = Duration::ZERO;
+            }
+            TimestampPolicy::StrictAtime => {
+                policy.positive_entry_ttl = Duration::ZERO;
+                policy.positive_attr_ttl = Duration::ZERO;
+            }
         }
         policy
     }
@@ -3062,6 +3126,94 @@ impl FusePruneNotifySink for UnsupportedFusePruneNotifySink {
     }
 }
 
+#[derive(Clone, Default)]
+struct FuseForegroundDemand {
+    state: Arc<FuseForegroundDemandState>,
+}
+
+#[derive(Default)]
+struct FuseForegroundDemandState {
+    active_requests: Mutex<usize>,
+    preempt_signal: Arc<AtomicBool>,
+    activity_epoch: Arc<AtomicU64>,
+}
+
+#[must_use = "foreground demand must remain guarded for the complete FUSE request"]
+pub(crate) struct FuseForegroundDemandGuard {
+    state: Arc<FuseForegroundDemandState>,
+}
+
+#[must_use = "FUSE admission owns foreground demand until the request returns"]
+struct FuseRequestAdmission {
+    _foreground_demand: FuseForegroundDemandGuard,
+    result: Result<(), Errno>,
+}
+
+impl FuseRequestAdmission {
+    fn new(foreground_demand: FuseForegroundDemandGuard, result: Result<(), Errno>) -> Self {
+        Self {
+            _foreground_demand: foreground_demand,
+            result,
+        }
+    }
+
+    fn as_ref(&self) -> Result<&(), &Errno> {
+        self.result.as_ref()
+    }
+
+    #[cfg(test)]
+    fn err(self) -> Option<Errno> {
+        self.result.err()
+    }
+
+    #[cfg(test)]
+    fn is_ok(&self) -> bool {
+        self.result.is_ok()
+    }
+}
+
+impl FuseForegroundDemand {
+    fn begin(&self) -> FuseForegroundDemandGuard {
+        self.state.activity_epoch.fetch_add(1, Ordering::AcqRel);
+        let mut active_requests = self
+            .state
+            .active_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active_requests = active_requests
+            .checked_add(1)
+            .expect("active FUSE request count overflow");
+        self.state.preempt_signal.store(true, Ordering::Release);
+        FuseForegroundDemandGuard {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    fn preempt_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.state.preempt_signal)
+    }
+
+    fn activity_epoch(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.state.activity_epoch)
+    }
+}
+
+impl Drop for FuseForegroundDemandGuard {
+    fn drop(&mut self) {
+        let mut active_requests = self
+            .state
+            .active_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(*active_requests > 0);
+        *active_requests = active_requests.saturating_sub(1);
+        self.state.activity_epoch.fetch_add(1, Ordering::Release);
+        if *active_requests == 0 {
+            self.state.preempt_signal.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// FUSE filesystem adapter backed by a `VfsEngine`.
 pub struct FuseVfsAdapter {
     pub(crate) engine: Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>,
@@ -3113,6 +3265,9 @@ pub struct FuseVfsAdapter {
     writeback_cache: Arc<Mutex<WritebackInodeCache>>,
     /// Background scheduler for deferred maintenance services (writeback, cleaning, compaction).
     background_scheduler: Arc<Mutex<Option<BackgroundScheduler>>>,
+    /// Counts in-flight FUSE requests and preempts maintenance until the last
+    /// concurrent request has replied.
+    foreground_demand: FuseForegroundDemand,
 
     /// When true, the kernel writeback cache is active. FUSE_WRITE_CACHE
     /// flagged writes are accepted and routed through the dirty-page tracker.
@@ -3228,6 +3383,7 @@ impl FuseVfsAdapter {
             rename_dispatch: FuseRenameDispatch::new(),
             writeback_cache: Arc::new(Mutex::new(WritebackInodeCache::new(1024))),
             background_scheduler: Arc::new(Mutex::new(None)),
+            foreground_demand: FuseForegroundDemand::default(),
             read_only: false,
             writeback_cache_enabled: false,
             writeback_cache_timeout: 60,
@@ -3420,11 +3576,13 @@ impl FuseVfsAdapter {
             .unwrap_or(false)
     }
 
-    fn admit_fuse_request(&self, op: FuseAdmissionOp) -> Result<(), Errno> {
+    fn admit_fuse_request(&self, op: FuseAdmissionOp) -> FuseRequestAdmission {
         use crate::observability::FuseAdmissionReason;
 
+        let foreground_demand = self.begin_foreground_demand();
+
         if self.read_only && op.requires_writable_mount() {
-            return Err(Errno::EROFS);
+            return FuseRequestAdmission::new(foreground_demand, Err(Errno::EROFS));
         }
 
         let class = op.class();
@@ -3455,11 +3613,11 @@ impl FuseVfsAdapter {
 
         if let Some((reason, errno)) = rejection {
             crate::observability::record_fuse_admission_reason(reason);
-            return Err(errno);
+            return FuseRequestAdmission::new(foreground_demand, Err(errno));
         }
 
         crate::observability::record_fuse_admission_reason(FuseAdmissionReason::Accepted);
-        Ok(())
+        FuseRequestAdmission::new(foreground_demand, Ok(()))
     }
 
     pub fn with_block_volume(self, target: Box<dyn BlockVolumeWriteTarget + Send>) -> Self {
@@ -3647,7 +3805,8 @@ impl FuseVfsAdapter {
     ///
     /// When `None` (default), background services are not driven.
     #[must_use]
-    pub fn with_background_scheduler(mut self, scheduler: BackgroundScheduler) -> Self {
+    pub fn with_background_scheduler(mut self, mut scheduler: BackgroundScheduler) -> Self {
+        scheduler.set_preempt_signal(self.foreground_demand.preempt_signal());
         self.background_scheduler = Arc::new(Mutex::new(Some(scheduler)));
         self
     }
@@ -3672,18 +3831,16 @@ impl FuseVfsAdapter {
         }
     }
 
-    /// Attach a demand-preemption signal to the background scheduler.
-    ///
-    /// When another thread (e.g. FUSE dispatch) sets this flag, the
-    /// scheduler yields after completing the current service tick.
-    /// This prevents background work from starving foreground I/O.
-    pub fn set_scheduler_preempt_signal(
-        &self,
-        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        if let Some(ref mut sched) = *self.background_scheduler.lock().unwrap() {
-            sched.set_preempt_signal(flag);
-        }
+    pub(crate) fn begin_foreground_demand(&self) -> FuseForegroundDemandGuard {
+        self.foreground_demand.begin()
+    }
+
+    pub(crate) fn foreground_demand_signal(&self) -> Arc<AtomicBool> {
+        self.foreground_demand.preempt_signal()
+    }
+
+    pub(crate) fn foreground_activity_epoch(&self) -> Arc<AtomicU64> {
+        self.foreground_demand.activity_epoch()
     }
     /// Attach a [`PageCache`] from tidefs-cache-core for writeback dirty
     /// tracking and flush/fsync dirty-page iteration.
@@ -3754,6 +3911,31 @@ impl FuseVfsAdapter {
         datasync
     }
 
+    fn write_request_sync_datasync(
+        &self,
+        is_writeback_cached: bool,
+        resolved_open_flags: u32,
+        request_open_flags: u32,
+        inode_open_state: InodeOpenState,
+    ) -> Option<bool> {
+        let request_sync = self.write_sync_datasync(request_open_flags);
+        if is_writeback_cached {
+            // FUSE_WRITE_CACHE identifies delayed page-cache writeback. The
+            // kernel may guess `fh`, and another live handle says nothing
+            // about whether these bytes came from an O_SYNC write(2). In
+            // particular, shared-mmap writeback from an O_SYNC descriptor
+            // carries no synchronous-write semantics. Honor only the file
+            // flags attached to this exact FUSE request; explicit fsync and
+            // msync barriers continue through their normal handlers.
+            return self.merged_write_sync_datasync(&[request_sync]);
+        }
+        self.merged_write_sync_datasync(&[
+            self.write_sync_datasync(resolved_open_flags),
+            request_sync,
+            inode_open_state.write_sync_datasync(),
+        ])
+    }
+
     fn active_read_atime_policy(&self) -> bool {
         !self.read_only && self.timestamp_policy != TimestampPolicy::NoAtime
     }
@@ -3772,21 +3954,17 @@ impl FuseVfsAdapter {
             .remove(&ino)
     }
 
-    fn has_relatime_read_atime_pending(&self, ino: u64) -> bool {
-        self.relatime_read_atime_pending
-            .lock()
-            .unwrap()
-            .contains(&ino)
-    }
-
     fn writeback_open_should_keep_cache(
         &self,
         open_flags: u32,
         existing_open_state: InodeOpenState,
-        relatime_read_atime_pending: bool,
     ) -> bool {
         if open_flags_allow_write(open_flags).unwrap_or(false) {
-            return true;
+            // Writable truncate opens must start from a cold kernel cache
+            // generation so stale pre-truncate pages cannot leak into the
+            // new file contents. The later read-only reopen may still retain
+            // the post-truncate cache it built during the write phase.
+            return (open_flags & libc::O_TRUNC as u32) == 0;
         }
         if !open_flags_allow_read(open_flags).unwrap_or(false) {
             return true;
@@ -3795,7 +3973,7 @@ impl FuseVfsAdapter {
             return true;
         }
         if self.writeback_cache_enabled && self.timestamp_policy == TimestampPolicy::RelativeAtime {
-            return !relatime_read_atime_pending;
+            return true;
         }
         !self.active_read_atime_policy()
     }
@@ -3804,7 +3982,6 @@ impl FuseVfsAdapter {
         &self,
         open_flags: u32,
         existing_open_state: InodeOpenState,
-        relatime_read_atime_pending: bool,
     ) -> u32 {
         let mut reply_flags = fuse_open_reply_flags(open_flags);
         if self.force_direct_io {
@@ -3812,11 +3989,7 @@ impl FuseVfsAdapter {
         }
         if self.writeback_cache_enabled
             && (reply_flags & fuser::consts::FOPEN_DIRECT_IO) == 0
-            && self.writeback_open_should_keep_cache(
-                open_flags,
-                existing_open_state,
-                relatime_read_atime_pending,
-            )
+            && self.writeback_open_should_keep_cache(open_flags, existing_open_state)
         {
             reply_flags |= fuser::consts::FOPEN_KEEP_CACHE;
         }
@@ -3824,7 +3997,7 @@ impl FuseVfsAdapter {
     }
 
     fn fuse_open_flags_for_request(&self, open_flags: u32) -> u32 {
-        self.fuse_open_flags_for_existing_state(open_flags, InodeOpenState::default(), false)
+        self.fuse_open_flags_for_existing_state(open_flags, InodeOpenState::default())
     }
 
     fn invalidate_inode_metadata_local(&self, ino: u64) {
@@ -3867,37 +4040,8 @@ impl FuseVfsAdapter {
         )
     }
 
-    fn apply_write_killpriv_before_write(
-        engine: &dyn VfsEngine,
-        ctx: &RequestCtx,
-        ino: u64,
-        handle: &EngineFileHandle,
-        write_flags: u32,
-    ) -> Result<(), Errno> {
-        if (write_flags & FUSE_WRITE_KILL_PRIV) == 0 {
-            return Ok(());
-        }
-        let current = engine.getattr(InodeId::new(ino), Some(handle), ctx)?;
-        if ctx.uid == 0 || ctx.uid == current.posix.uid {
-            return Ok(());
-        }
-        let mode = current.posix.mode;
-        if (mode & (S_ISUID | S_ISGID)) == 0 {
-            return Ok(());
-        }
-        let mut set = SetAttr::new();
-        set.valid = FATTR_MODE;
-        set.mode = (mode & S_IFMT) | (mode & !S_IFMT & !(S_ISUID | S_ISGID));
-        let clear_ctx = RequestCtx {
-            uid: 0,
-            gid: 0,
-            pid: ctx.pid,
-            umask: ctx.umask,
-            groups: vec![0],
-        };
-        engine
-            .setattr(InodeId::new(ino), &set, Some(handle), &clear_ctx)
-            .map(|_| ())
+    fn write_privilege_clear(write_flags: u32) -> WritePrivilegeClear {
+        WritePrivilegeClear::killpriv_v2((write_flags & FUSE_WRITE_KILL_PRIV) != 0)
     }
 
     /// Conditionally update atime on a directory after a successful readdir.
@@ -4923,6 +5067,18 @@ impl FuseVfsAdapter {
         attr: &SetAttr,
         fh: Option<u64>,
     ) -> Result<FuseAttrOut, Errno> {
+        self.dispatch_setattr_with_killpriv(ctx, unique, ino, attr, fh, false)
+    }
+
+    fn dispatch_setattr_with_killpriv(
+        &self,
+        ctx: &RequestCtx,
+        _unique: u64,
+        ino: u64,
+        attr: &SetAttr,
+        fh: Option<u64>,
+        kill_suidgid: bool,
+    ) -> Result<FuseAttrOut, Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_METADATA);
         let mutation_requested = attr.valid
             & (FATTR_SIZE
@@ -4942,6 +5098,11 @@ impl FuseVfsAdapter {
             .map(|fh| self.resolve_file_handle(ino, fh, 0))
             .and_then(|x| x.ok());
         let inode_id = InodeId::new(ino);
+        let _write_cache_reconciliation_guard = if attr.valid & FATTR_SIZE != 0 {
+            Some(self.write_cache_reconciliation.lock(ino))
+        } else {
+            None
+        };
         let e = self.engine.lock().unwrap();
         let current_attr = match e.getattr(inode_id, engine_fh.as_ref(), ctx) {
             Ok(attr) => attr,
@@ -4973,6 +5134,11 @@ impl FuseVfsAdapter {
         {
             return Err(Errno::EPERM);
         }
+        if current_attr.kind == NodeKind::File
+            && attr.valid & (FATTR_UID | FATTR_GID | FATTR_SIZE) != 0
+        {
+            remove_security_capability_for_killpriv(&**e, inode_id, ctx)?;
+        }
         // Capacity admission and tracking for size changes are handled by the
         // engine's CapacityAuthority during truncate_extents dispatch.
         let mut data_invalidation_range = None;
@@ -4999,7 +5165,7 @@ impl FuseVfsAdapter {
                 let new_sz = attr.size;
                 Self::truncate_extents(&**e, inode_id, efh, old_sz, new_sz, ctx)?;
                 if new_sz < old_sz {
-                    self.clear_dirty_for_deallocate_range(ino, new_sz, old_sz - new_sz)?;
+                    self.clear_dirty_for_truncate_shrink(ino, new_sz);
                     data_invalidation_range = Some((new_sz, old_sz - new_sz));
                 } else if new_sz > old_sz {
                     data_invalidation_range = Some((old_sz, new_sz - old_sz));
@@ -5012,7 +5178,7 @@ impl FuseVfsAdapter {
                 let result =
                     Self::truncate_extents(&**e, inode_id, &efh, current_size, new_sz, ctx);
                 if result.is_ok() && new_sz < current_size {
-                    self.clear_dirty_for_deallocate_range(ino, new_sz, current_size - new_sz)?;
+                    self.clear_dirty_for_truncate_shrink(ino, new_sz);
                     data_invalidation_range = Some((new_sz, current_size - new_sz));
                 } else if result.is_ok() && new_sz > current_size {
                     data_invalidation_range = Some((current_size, new_sz - current_size));
@@ -5021,7 +5187,8 @@ impl FuseVfsAdapter {
                 result?;
             }
         }
-        let effective_attr = apply_setattr_privilege_mode_rules(attr, &current_attr, ctx);
+        let effective_attr =
+            apply_setattr_privilege_mode_rules(attr, &current_attr, ctx, kill_suidgid);
 
         let updated = match e.setattr(inode_id, &effective_attr, engine_fh.as_ref(), ctx) {
             Ok(updated) => updated,
@@ -5078,11 +5245,12 @@ impl FuseVfsAdapter {
         ino: u64,
         attr: &SetAttr,
         fh: Option<u64>,
+        kill_suidgid: bool,
     ) -> Result<FuseAttrOut, Errno> {
         if is_fuse_read_atime_setattr(attr, fh) {
             return self.dispatch_fuse_read_atime_setattr(ctx, unique, ino, attr);
         }
-        self.dispatch_setattr(ctx, unique, ino, attr, fh)
+        self.dispatch_setattr_with_killpriv(ctx, unique, ino, attr, fh, kill_suidgid)
     }
 
     fn dispatch_fuse_read_atime_setattr(
@@ -5889,11 +6057,12 @@ impl FuseVfsAdapter {
             InodeOpenState::default()
         };
         let request_open_flags_present = request_open_flags != 0;
-        let sync_datasync = self.merged_write_sync_datasync(&[
-            self.write_sync_datasync(resolved_open_flags),
-            self.write_sync_datasync(request_open_flags),
-            inode_open_state.write_sync_datasync(),
-        ]);
+        let sync_datasync = self.write_request_sync_datasync(
+            is_writeback_cached,
+            resolved_open_flags,
+            request_open_flags,
+            inode_open_state,
+        );
         let request_allows_write = open_flags_allow_write(request_open_flags).unwrap_or(false);
         let writeback_fallback_allowed = self.writeback_cache_enabled
             && (is_writeback_cached || request_allows_write || inode_open_state.has_writable);
@@ -6064,59 +6233,55 @@ impl FuseVfsAdapter {
                         pre_write_size,
                         ctx,
                     );
-                let metadata_error = if data.is_empty() {
-                    None
-                } else {
-                    Self::apply_write_killpriv_before_write(&**e, ctx, ino, write_efh, write_flags)
-                        .err()
-                };
-                let result = if let Some(errno) = metadata_error {
-                    Err(errno)
-                } else {
-                    match e.write(write_efh, effective_offset as u64, data, ctx) {
-                        Ok(written) => match usize::try_from(written)
-                            .ok()
-                            .and_then(|written_len| data.get(..written_len))
-                        {
-                            Some(written_data) => {
-                                if written > 0 {
-                                    if posix_direct_io {
-                                        // Direct I/O bypasses the adapter page cache.
-                                        // The engine write is authoritative for
-                                        // read-after-write; flush/fsync/close publish
-                                        // it instead of forcing every O_DIRECT write
-                                        // through a committed-root cycle.
-                                        self.invalidate_caches_after_direct_write(
-                                            ino,
-                                            effective_offset as u64,
-                                            u64::from(written),
-                                        );
-                                    } else if clean_writeback_write_through && !sparse_zero_noop {
-                                        self.record_clean_write_through_after_write(
-                                            ino,
-                                            effective_offset as u64,
-                                            written,
-                                            written_data,
-                                        )?;
-                                    } else if !sparse_zero_noop {
-                                        self.mark_dirty_after_write(
-                                            &**e,
-                                            ctx,
-                                            write_efh,
-                                            ino,
-                                            effective_offset as u64,
-                                            written,
-                                            written_data,
-                                            write_flags,
-                                        );
-                                    }
+                let result = match e.write_with_privilege_clearing(
+                    write_efh,
+                    effective_offset as u64,
+                    data,
+                    Self::write_privilege_clear(write_flags),
+                    ctx,
+                ) {
+                    Ok(written) => match usize::try_from(written)
+                        .ok()
+                        .and_then(|written_len| data.get(..written_len))
+                    {
+                        Some(written_data) => {
+                            if written > 0 {
+                                if posix_direct_io {
+                                    // Direct I/O bypasses the adapter page cache.
+                                    // The engine write is authoritative for
+                                    // read-after-write; flush/fsync/close publish
+                                    // it instead of forcing every O_DIRECT write
+                                    // through a committed-root cycle.
+                                    self.invalidate_caches_after_direct_write(
+                                        ino,
+                                        effective_offset as u64,
+                                        u64::from(written),
+                                    );
+                                } else if clean_writeback_write_through && !sparse_zero_noop {
+                                    self.record_clean_write_through_after_write(
+                                        ino,
+                                        effective_offset as u64,
+                                        written,
+                                        written_data,
+                                    )?;
+                                } else if !sparse_zero_noop {
+                                    self.mark_dirty_after_write(
+                                        &**e,
+                                        ctx,
+                                        write_efh,
+                                        ino,
+                                        effective_offset as u64,
+                                        written,
+                                        written_data,
+                                        write_flags,
+                                    );
                                 }
-                                Ok(written)
                             }
-                            None => Err(Errno::EIO),
-                        },
-                        Err(errno) => Err(errno),
-                    }
+                            Ok(written)
+                        }
+                        None => Err(Errno::EIO),
+                    },
+                    Err(errno) => Err(errno),
                 };
                 let clean_write_through_recorded = matches!(
                     &result,
@@ -6227,55 +6392,52 @@ impl FuseVfsAdapter {
                 // engine's CapacityAuthority during write dispatch; the adapter
                 // no longer maintains a parallel reservation lifecycle on
                 // CapacityFacade.
-                let metadata_error = if data.is_empty() {
-                    None
-                } else {
-                    Self::apply_write_killpriv_before_write(&**e, ctx, ino, &efh, write_flags).err()
-                };
-                if let Some(errno) = metadata_error {
-                    Err(errno)
-                } else {
-                    match e.write(&efh, effective_offset as u64, data, ctx) {
-                        Ok(written) => {
-                            if written > 0 {
-                                if posix_direct_io {
-                                    // Direct I/O bypasses the adapter page cache.
-                                    // The engine write is authoritative for
-                                    // read-after-write; flush/fsync/close publish
-                                    // it instead of forcing every O_DIRECT write
-                                    // through a committed-root cycle.
-                                    self.invalidate_caches_after_direct_write(
-                                        ino,
-                                        effective_offset as u64,
-                                        u64::from(written),
-                                    );
-                                } else if clean_plain_write_through {
-                                    let written_len =
-                                        usize::try_from(written).map_err(|_| Errno::EIO)?;
-                                    let written_data = data.get(..written_len).ok_or(Errno::EIO)?;
-                                    self.record_clean_write_through_after_write(
-                                        ino,
-                                        effective_offset as u64,
-                                        written,
-                                        written_data,
-                                    )?;
-                                } else {
-                                    self.mark_dirty_after_write(
-                                        &**e,
-                                        ctx,
-                                        &efh,
-                                        ino,
-                                        effective_offset as u64,
-                                        written,
-                                        data,
-                                        write_flags,
-                                    );
-                                }
+                match e.write_with_privilege_clearing(
+                    &efh,
+                    effective_offset as u64,
+                    data,
+                    Self::write_privilege_clear(write_flags),
+                    ctx,
+                ) {
+                    Ok(written) => {
+                        if written > 0 {
+                            if posix_direct_io {
+                                // Direct I/O bypasses the adapter page cache.
+                                // The engine write is authoritative for
+                                // read-after-write; flush/fsync/close publish
+                                // it instead of forcing every O_DIRECT write
+                                // through a committed-root cycle.
+                                self.invalidate_caches_after_direct_write(
+                                    ino,
+                                    effective_offset as u64,
+                                    u64::from(written),
+                                );
+                            } else if clean_plain_write_through {
+                                let written_len =
+                                    usize::try_from(written).map_err(|_| Errno::EIO)?;
+                                let written_data = data.get(..written_len).ok_or(Errno::EIO)?;
+                                self.record_clean_write_through_after_write(
+                                    ino,
+                                    effective_offset as u64,
+                                    written,
+                                    written_data,
+                                )?;
+                            } else {
+                                self.mark_dirty_after_write(
+                                    &**e,
+                                    ctx,
+                                    &efh,
+                                    ino,
+                                    effective_offset as u64,
+                                    written,
+                                    data,
+                                    write_flags,
+                                );
                             }
-                            Ok(written)
                         }
-                        Err(errno) => Err(errno),
+                        Ok(written)
                     }
+                    Err(errno) => Err(errno),
                 }
             }; // engine lock dropped here
 
@@ -7433,6 +7595,7 @@ impl FuseVfsAdapter {
     /// and does not require a file handle.
     pub fn dispatch_syncfs(&self, ctx: &RequestCtx) -> Result<(), Errno> {
         let _start = std::time::Instant::now();
+        let diagnostic = fuse_shutdown_diagnostics_enabled();
         // The mount-wide barrier owns every reconciliation stripe so no FUSE
         // write can publish a dirty projection between the snapshots and their
         // post-barrier retirement.
@@ -7465,6 +7628,23 @@ impl FuseVfsAdapter {
             Vec::new()
         };
         dirty_projection_inodes.extend(tracked_ranges.iter().map(|(inode, _)| inode.get()));
+        if diagnostic {
+            let tracked_range_count: usize =
+                tracked_ranges.iter().map(|(_, ranges)| ranges.len()).sum();
+            let writeback_dirty_pages = self
+                .writeback_page_cache
+                .as_ref()
+                .map_or(0, |cache| cache.dirty_pages().len());
+            eprintln!(
+                "tidefs-diagnostic: fuse syncfs start dirty_state_inodes={} worker_dirty_ranges={} tracked_inodes={} tracked_ranges={} write_page_cache_dirty_pages={} writeback_page_cache_dirty_pages={}",
+                dirty_state_snapshots.len(),
+                worker_dirty_ranges.len(),
+                tracked_ranges.len(),
+                tracked_range_count,
+                self.write_page_cache.dirty_pages().len(),
+                writeback_dirty_pages,
+            );
+        }
 
         let sync_result = (|| {
             // Mirror every snapshotted regular-file range into the optional
@@ -7535,6 +7715,14 @@ impl FuseVfsAdapter {
             let engine = self.engine.lock().unwrap();
             engine.syncfs(ctx)
         })();
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse syncfs engine status={} errno={:?} elapsed_ms={}",
+                if sync_result.is_ok() { "ok" } else { "err" },
+                sync_result.as_ref().err(),
+                _start.elapsed().as_millis()
+            );
+        }
 
         let mut tracker_completion_failed = false;
         if let Some(ref tracker) = self.writeback_range_tracker {
@@ -7568,8 +7756,21 @@ impl FuseVfsAdapter {
                 }
             }
         }
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse syncfs tracker_cleanup status={} tracker_completion_failed={} elapsed_ms={}",
+                if sync_result.is_ok() { "ok" } else { "err" },
+                tracker_completion_failed,
+                _start.elapsed().as_millis()
+            );
+        }
         sync_result?;
         if tracker_completion_failed {
+            if diagnostic {
+                eprintln!(
+                    "tidefs-diagnostic: fuse syncfs returning EIO after successful engine barrier because tracked ranges remained after cleanup"
+                );
+            }
             return Err(Errno::EIO);
         }
 
@@ -7729,6 +7930,14 @@ impl FuseVfsAdapter {
         offset: u64,
         length: u64,
     ) -> Result<(), Errno> {
+        // Ordinary mounted writes are already authoritative in the engine and
+        // leave no dirty daemon mirror. Do not turn a clean sparse truncate
+        // into one locked page-cache miss per removed logical page.
+        if !self.dirty_trackers_overlap_range(ino, offset, length)
+            && !self.dirty_page_caches_overlap_range(ino, offset, length)
+        {
+            return Ok(());
+        }
         self.reconcile_dirty_mirrors_for_authoritative_range(
             ino,
             offset,
@@ -7738,6 +7947,32 @@ impl FuseVfsAdapter {
         // Do not mark the whole inode clean here: this helper clears only the
         // deallocated byte range, and unrelated dirty ranges must survive.
         Ok(())
+    }
+
+    /// Classify every daemon-side dirty mirror at or beyond `new_size` as
+    /// superseded by a successful truncate shrink. The engine has already made
+    /// the suffix unreachable, so cache-core's truncate primitive can discard
+    /// resident clean, dirty, and writeback pages directly instead of probing
+    /// every logical page in a sparse file. Dirty ownership before the new EOF
+    /// remains intact for its ordinary flush/fsync boundary.
+    fn clear_dirty_for_truncate_shrink(&self, ino: u64, new_size: u64) {
+        self.clear_dirty_trackers_for_authoritative_range(
+            ino,
+            new_size,
+            u64::MAX.saturating_sub(new_size),
+        );
+
+        let writeback_cache_aliases_write_page_cache = self
+            .writeback_page_cache
+            .as_ref()
+            .is_some_and(|wb_cache| Arc::ptr_eq(wb_cache, &self.write_page_cache));
+        if let Some(ref wb_cache) = self.writeback_page_cache {
+            let _ = wb_cache.truncate_invalidate(ino, new_size);
+        }
+        if !writeback_cache_aliases_write_page_cache {
+            let _ = self.write_page_cache.truncate_invalidate(ino, new_size);
+        }
+        self.reconcile_writeback_inode_cache_after_authoritative_range(ino);
     }
 
     // ── shared truncate extent mutation (engine lock already held) ─────────
@@ -7781,6 +8016,7 @@ impl FuseVfsAdapter {
             Ok(true) => {}
             Ok(false) | Err(_) => return Err(Errno::EBADF),
         }
+        let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
         let e = self.engine.lock().unwrap();
         let inode_id = InodeId::new(ino);
         let current_attr = e.getattr(inode_id, Some(&efh), ctx)?;
@@ -7791,7 +8027,7 @@ impl FuseVfsAdapter {
         let result = Self::truncate_extents(&**e, inode_id, &efh, old_size, size, ctx);
         drop(e);
         if result.is_ok() && size < old_size {
-            self.clear_dirty_for_deallocate_range(ino, size, old_size - size)?;
+            self.clear_dirty_for_truncate_shrink(ino, size);
             self.invalidate_caches_after_engine_data_mutation(ino, size, old_size - size);
         } else if result.is_ok() && size > old_size {
             self.invalidate_caches_after_engine_data_mutation(ino, old_size, size - old_size);
@@ -7809,6 +8045,7 @@ impl FuseVfsAdapter {
     pub fn dispatch_truncate(&self, ctx: &RequestCtx, ino: u64, size: u64) -> Result<(), Errno> {
         self.check_not_read_only()?;
         let inode_id = InodeId::new(ino);
+        let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
         let e = self.engine.lock().unwrap();
         let efh = e.open(inode_id, libc::O_RDWR as u32, ctx)?;
         let current_attr = e.getattr(inode_id, Some(&efh), ctx)?;
@@ -7830,7 +8067,7 @@ impl FuseVfsAdapter {
         let _ = e.release(&efh);
         drop(e);
         if result.is_ok() && size < current_size {
-            self.clear_dirty_for_deallocate_range(ino, size, current_size - size)?;
+            self.clear_dirty_for_truncate_shrink(ino, size);
             self.invalidate_caches_after_engine_data_mutation(ino, size, current_size - size);
         } else if result.is_ok() && size > current_size {
             self.invalidate_caches_after_engine_data_mutation(
@@ -8754,11 +8991,8 @@ impl FuseVfsAdapter {
         let (adapter_fh, fuse_flags) = {
             let mut handles = self.file_handles.lock().unwrap();
             let existing_open_state = handles.inode_open_state(ino);
-            let fuse_flags = self.fuse_open_flags_for_existing_state(
-                engine_open_flags,
-                existing_open_state,
-                self.has_relatime_read_atime_pending(ino),
-            );
+            let fuse_flags =
+                self.fuse_open_flags_for_existing_state(engine_open_flags, existing_open_state);
             let adapter_fh = handles.allocate(ino, engine_open_flags, engine_fh);
             if let Some(handle) = handles.handles.get_mut(&adapter_fh) {
                 handle.fuse_open_flags = fuse_flags;
@@ -9338,20 +9572,7 @@ impl Filesystem for FuseVfsAdapter {
         // Use raw u32 values because fuser::consts items are feature-gated.
 
         // Required: mount fails if any rejected.
-        const CAP_POSIX_LOCKS: u32 = 1 << 1;
-        const CAP_FLOCK_LOCKS: u32 = 1 << 10;
-        const CAP_POSIX_ACL: u32 = 1 << 20;
-        const CAP_PARALLEL_DIROPS: u32 = 1 << 18;
-        const CAP_DO_READDIRPLUS: u32 = 1 << 13;
-        const CAP_HANDLE_KILLPRIV: u32 = 1 << 19;
-        const CAP_DONT_MASK: u32 = 1 << 6;
-        let required = CAP_POSIX_LOCKS
-            | CAP_FLOCK_LOCKS
-            | CAP_POSIX_ACL
-            | CAP_PARALLEL_DIROPS
-            | CAP_DO_READDIRPLUS
-            | CAP_HANDLE_KILLPRIV
-            | CAP_DONT_MASK;
+        let required = required_fuse_capabilities();
 
         // Perf: best-effort, mount proceeds either way.
         const CAP_WRITEBACK_CACHE: u32 = 1 << 16;
@@ -9377,6 +9598,11 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn destroy(&mut self) {
+        // Unmount is foreground lifecycle demand. Publish it before teardown
+        // needs the shared engine so a mounted maintenance scan selected in
+        // the preceding quiet window yields instead of delaying DESTROY.
+        let _foreground_demand = self.begin_foreground_demand();
+
         // Step 1: stop deferred advisory-lock waits before tearing down the
         // carrier. Reset wakes registered waiters; the shutdown flag makes
         // each worker answer EINTR instead of reacquiring against discarded
@@ -9397,19 +9623,20 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        let _ = self.admit_fuse_request(FuseAdmissionOp::Forget);
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Forget);
         self.dispatch_forget(ino, nlookup);
     }
 
     fn batch_forget(&mut self, _req: &Request<'_>, nodes: &[fuser::fuse_forget_one]) {
-        let _ = self.admit_fuse_request(FuseAdmissionOp::BatchForget);
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::BatchForget);
         for node in nodes {
             self.dispatch_forget(node.nodeid, node.nlookup);
         }
     }
 
     fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Lookup) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Lookup);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9432,7 +9659,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn getattr(&mut self, req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Getattr) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Getattr);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9448,7 +9676,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn access(&mut self, req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Access) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Access);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9473,9 +9702,11 @@ impl Filesystem for FuseVfsAdapter {
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
         _flags: Option<u32>,
+        kill_suidgid: bool,
         reply: ReplyAttr,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Setattr) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Setattr);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9495,7 +9726,7 @@ impl Filesystem for FuseVfsAdapter {
                 sa.valid
             );
         }
-        let result = self.dispatch_fuse_setattr(&ctx, req.unique(), ino, &sa, fh);
+        let result = self.dispatch_fuse_setattr(&ctx, req.unique(), ino, &sa, fh, kill_suidgid);
         if diagnostic {
             eprintln!(
                 "tidefs-diagnostic: fuse setattr end unique={} ino={} status={} errno={:?} elapsed_ms={}",
@@ -9519,7 +9750,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn readlink(&mut self, req: &Request<'_>, ino: u64, reply: ReplyData) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Readlink) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Readlink);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9542,7 +9774,8 @@ impl Filesystem for FuseVfsAdapter {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Mknod) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Mknod);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9579,7 +9812,8 @@ impl Filesystem for FuseVfsAdapter {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Mkdir) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Mkdir);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9606,7 +9840,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Unlink) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Unlink);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9619,7 +9854,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Rmdir) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Rmdir);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9639,7 +9875,8 @@ impl Filesystem for FuseVfsAdapter {
         link: &std::path::Path,
         reply: ReplyEntry,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Symlink) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Symlink);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9663,7 +9900,8 @@ impl Filesystem for FuseVfsAdapter {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Rename) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Rename);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9710,7 +9948,8 @@ impl Filesystem for FuseVfsAdapter {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Link) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Link);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9738,7 +9977,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Open) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Open);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9761,7 +10001,8 @@ impl Filesystem for FuseVfsAdapter {
         lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Read) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Read);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9809,7 +10050,8 @@ impl Filesystem for FuseVfsAdapter {
     ) {
         let _start = std::time::Instant::now();
         let diagnostic = fuse_op_diagnostics_enabled();
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Write) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Write);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             crate::observability::HIST_WRITE.record(_start.elapsed());
             crate::observability::FuseErrorCode::from_errno(errno, "write", ino).emit();
             reply.reply_errno(errno);
@@ -9899,7 +10141,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn flush(&mut self, req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Flush) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Flush);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9930,7 +10173,8 @@ impl Filesystem for FuseVfsAdapter {
         flush: bool,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Release) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Release);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9941,7 +10185,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn fsync(&mut self, req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Fsync) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Fsync);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -9990,7 +10235,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn opendir(&mut self, req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Opendir) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Opendir);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10017,7 +10263,8 @@ impl Filesystem for FuseVfsAdapter {
             reply.reply_errno(Errno::EINVAL);
             return;
         }
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Readdir) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Readdir);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10085,7 +10332,8 @@ impl Filesystem for FuseVfsAdapter {
             reply.reply_errno(Errno::EINVAL);
             return;
         }
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Readdirplus) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Readdirplus);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10146,7 +10394,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn releasedir(&mut self, req: &Request<'_>, ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Releasedir) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Releasedir);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10165,7 +10414,8 @@ impl Filesystem for FuseVfsAdapter {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Fsyncdir) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Fsyncdir);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10186,7 +10436,8 @@ impl Filesystem for FuseVfsAdapter {
         reply: ReplyCreate,
     ) {
         let _start = std::time::Instant::now();
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Create) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Create);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             crate::observability::HIST_CREATE.record(_start.elapsed());
             crate::observability::FuseErrorCode::from_errno(errno, "create", parent).emit();
             reply.reply_errno(errno);
@@ -10236,7 +10487,8 @@ impl Filesystem for FuseVfsAdapter {
     ) {
         let diagnostic = fuse_op_diagnostics_enabled();
         let start = std::time::Instant::now();
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Fallocate) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Fallocate);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10279,7 +10531,8 @@ impl Filesystem for FuseVfsAdapter {
         whence: i32,
         reply: ReplyLseek,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Lseek) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Lseek);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10293,7 +10546,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn bmap(&mut self, req: &Request<'_>, ino: u64, _blocksize: u32, _idx: u64, reply: ReplyBmap) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Bmap) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Bmap);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10312,7 +10566,8 @@ impl Filesystem for FuseVfsAdapter {
         out_size: u32,
         reply: ReplyIoctl,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Ioctl) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Ioctl);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10353,7 +10608,8 @@ impl Filesystem for FuseVfsAdapter {
         flags: u32,
         reply: ReplyPoll,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Poll) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Poll);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10377,7 +10633,8 @@ impl Filesystem for FuseVfsAdapter {
         pid: u32,
         reply: ReplyLock,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Getlk) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Getlk);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10425,7 +10682,8 @@ impl Filesystem for FuseVfsAdapter {
         sleep: bool,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Setlk) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Setlk);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10496,7 +10754,8 @@ impl Filesystem for FuseVfsAdapter {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Flock) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Flock);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10526,7 +10785,8 @@ impl Filesystem for FuseVfsAdapter {
     ) {
         let diagnostic = fuse_op_diagnostics_enabled();
         let start = std::time::Instant::now();
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::CopyFileRange) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::CopyFileRange);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10660,7 +10920,8 @@ impl Filesystem for FuseVfsAdapter {
         size: u32,
         reply: ReplyXattr,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Getxattr) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Getxattr);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10691,7 +10952,8 @@ impl Filesystem for FuseVfsAdapter {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Setxattr) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Setxattr);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10704,7 +10966,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn listxattr(&mut self, req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Listxattr) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Listxattr);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10726,7 +10989,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn removexattr(&mut self, req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Removexattr) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Removexattr);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10737,7 +11001,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn statfs(&mut self, req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Statfs) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Statfs);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10759,7 +11024,8 @@ impl Filesystem for FuseVfsAdapter {
         }
     }
     fn syncfs(&mut self, req: &Request<'_>, reply: ReplyEmpty) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Syncfs) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Syncfs);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10769,7 +11035,8 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn statx(&mut self, req: &Request<'_>, ino: u64, _flags: u32, mask: u32, reply: ReplyStatx) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Statx) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Statx);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10799,7 +11066,8 @@ impl Filesystem for FuseVfsAdapter {
         options: u64,
         reply: ReplyEmpty,
     ) {
-        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Exchange) {
+        let _foreground_demand = self.admit_fuse_request(FuseAdmissionOp::Exchange);
+        if let Err(&errno) = _foreground_demand.as_ref() {
             reply.reply_errno(errno);
             return;
         }
@@ -10820,8 +11088,11 @@ impl Filesystem for FuseVfsAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
     use tidefs_background_scheduler::{
         BackgroundScheduler, BackgroundService, ServiceBudget, ServiceError, ServicePriority,
         TickReport,
@@ -11090,6 +11361,95 @@ mod tests {
         }
     }
 
+    struct MountedWritebackFixture {
+        root: PathBuf,
+        store: PathBuf,
+        mount: PathBuf,
+        session: Option<fuser::BackgroundSession>,
+    }
+
+    impl MountedWritebackFixture {
+        fn new() -> Self {
+            let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "tidefs-mounted-writeback-{}-{temp_id}",
+                std::process::id()
+            ));
+            let store = root.join("store");
+            let mount = root.join("mnt");
+            fs::create_dir_all(&store).expect("create mounted store root");
+            fs::create_dir_all(&mount).expect("create mounted mountpoint");
+
+            let mut fixture = Self {
+                root,
+                store,
+                mount,
+                session: None,
+            };
+            fixture.mount();
+            fixture
+        }
+
+        fn mount(&mut self) {
+            let mut local_fs = LocalFileSystem::open_with_root_authentication_key(
+                &self.store,
+                StoreOptions::default(),
+                RootAuthenticationKey::demo_key(),
+            )
+            .expect("open mounted writeback local filesystem");
+            local_fs
+                .set_write_buffer_flush_threshold_bytes(64 * 1024 * 1024)
+                .expect("set mounted write buffer threshold");
+            local_fs
+                .set_auto_commit(false)
+                .expect("disable auto commit for mounted writeback fixture");
+            local_fs
+                .set_commit_group_throughput_profile()
+                .expect("set mounted throughput profile");
+            local_fs
+                .set_max_uncommitted_mutations(64 * 1024)
+                .expect("set mounted uncommitted mutation limit");
+            let writeback_tracker = local_fs
+                .clone_writeback_range_tracker()
+                .expect("clone mounted writeback tracker");
+
+            let engine = VfsLocalFileSystem::new(local_fs);
+            let adapter = FuseVfsAdapter::new(Box::new(engine))
+                .expect("create mounted writeback adapter")
+                .with_writeback_cache_enabled()
+                .with_writeback_range_tracker(writeback_tracker);
+            let options = vec![
+                fuser::MountOption::FSName("tidefs-mounted-writeback".to_string()),
+                fuser::MountOption::RW,
+                fuser::MountOption::NoDev,
+                fuser::MountOption::NoSuid,
+                fuser::MountOption::Subtype("tidefs".to_string()),
+                fuser::MountOption::WritebackCache,
+            ];
+            let session =
+                fuser::spawn_mount2(adapter, &self.mount, &options).expect("mount FUSE writeback");
+            self.session = Some(session);
+        }
+
+        fn unmount(&mut self) {
+            if let Some(session) = self.session.take() {
+                drop(session);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.mount.join(relative.trim_start_matches('/'))
+        }
+    }
+
+    impl Drop for MountedWritebackFixture {
+        fn drop(&mut self) {
+            self.unmount();
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
     fn adapter_fixture() -> AdapterFixture {
@@ -11206,8 +11566,8 @@ mod tests {
         let before = crate::observability::fuse_admission_reason_snapshot();
 
         assert_eq!(
-            adapter.admit_fuse_request(FuseAdmissionOp::Lookup),
-            Err(Errno::EAGAIN)
+            adapter.admit_fuse_request(FuseAdmissionOp::Lookup).err(),
+            Some(Errno::EAGAIN)
         );
 
         let after = crate::observability::fuse_admission_reason_snapshot();
@@ -11220,7 +11580,7 @@ mod tests {
         let adapter = fresh_test_adapter().with_governor(governor);
         let before = crate::observability::fuse_admission_reason_snapshot();
 
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Mkdir), Ok(()));
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Mkdir).is_ok());
 
         let after = crate::observability::fuse_admission_reason_snapshot();
         assert!(after.accepted >= before.accepted + 1);
@@ -11233,8 +11593,8 @@ mod tests {
         let before = crate::observability::fuse_admission_reason_snapshot();
 
         assert_eq!(
-            adapter.admit_fuse_request(FuseAdmissionOp::Write),
-            Err(Errno::ENOMEM)
+            adapter.admit_fuse_request(FuseAdmissionOp::Write).err(),
+            Some(Errno::ENOMEM)
         );
 
         let after = crate::observability::fuse_admission_reason_snapshot();
@@ -11249,8 +11609,8 @@ mod tests {
             .with_read_only();
 
         assert_eq!(
-            adapter.admit_fuse_request(FuseAdmissionOp::Unlink),
-            Err(Errno::EROFS)
+            adapter.admit_fuse_request(FuseAdmissionOp::Unlink).err(),
+            Some(Errno::EROFS)
         );
     }
 
@@ -11258,8 +11618,8 @@ mod tests {
     fn fuse_admission_read_only_fence_preserves_advisory_locks() {
         let adapter = fresh_test_adapter().with_read_only();
 
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Flock), Ok(()));
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Setlk), Ok(()));
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Flock).is_ok());
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Setlk).is_ok());
     }
 
     #[test]
@@ -11267,7 +11627,7 @@ mod tests {
         let governor = governor_with_used(BudgetCategory::DirtyBytes, 950);
         let adapter = fresh_test_adapter().with_governor(governor);
 
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Read), Ok(()));
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Read).is_ok());
     }
 
     #[test]
@@ -11279,8 +11639,8 @@ mod tests {
         let before = crate::observability::fuse_admission_reason_snapshot();
 
         assert_eq!(
-            adapter.admit_fuse_request(FuseAdmissionOp::Getattr),
-            Err(Errno::ENOMEM)
+            adapter.admit_fuse_request(FuseAdmissionOp::Getattr).err(),
+            Some(Errno::ENOMEM)
         );
 
         let after = crate::observability::fuse_admission_reason_snapshot();
@@ -11293,11 +11653,11 @@ mod tests {
         let adapter = fresh_test_adapter().with_governor(governor.clone());
 
         assert_eq!(
-            adapter.admit_fuse_request(FuseAdmissionOp::Lookup),
-            Err(Errno::EAGAIN)
+            adapter.admit_fuse_request(FuseAdmissionOp::Lookup).err(),
+            Some(Errno::EAGAIN)
         );
         governor.release(BudgetCategory::MetaCache, 701);
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Lookup), Ok(()));
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Lookup).is_ok());
     }
 
     #[test]
@@ -11308,8 +11668,8 @@ mod tests {
             .with_fuse_admission_hard_policy(FuseAdmissionHardPolicy::AllRequests);
 
         assert!(adapter.forget_refcounts.lock().unwrap().is_empty());
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Forget), Ok(()));
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Release), Ok(()));
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Forget).is_ok());
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Release).is_ok());
         assert!(adapter.forget_refcounts.lock().unwrap().is_empty());
     }
 
@@ -11428,7 +11788,7 @@ mod tests {
             .with_prune_notify_sink(sink.clone());
         adapter.bump_forget_refcount(42);
 
-        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Forget), Ok(()));
+        assert!(adapter.admit_fuse_request(FuseAdmissionOp::Forget).is_ok());
 
         assert_eq!(sink.inodes(), vec![42]);
         assert_eq!(adapter.forget_refcounts.lock().unwrap().get(&42), Some(&1));
@@ -12390,12 +12750,12 @@ mod tests {
         assert_eq!(
             read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
             0,
-            "active-atime read opens after the writer closes must keep buffered reads enabled"
+            "relatime read opens after the writer closes must keep buffered reads enabled"
         );
-        assert_eq!(
+        assert_ne!(
             read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
             0,
-            "active-atime read opens after the writer closes must not preserve stale kernel pages"
+            "relatime read opens after the writer closes should preserve the post-write kernel cache"
         );
 
         let after_read_open = {
@@ -13214,7 +13574,7 @@ mod tests {
         read_atime.valid = FATTR_ATIME_NOW;
         fixture
             .adapter
-            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None)
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None, false)
             .expect("automatic fuse atime setattr");
 
         let after = {
@@ -13264,7 +13624,7 @@ mod tests {
         read_atime.valid = FATTR_ATIME_NOW | FATTR_FH;
         fixture
             .adapter
-            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, Some(adapter_fh))
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, Some(adapter_fh), false)
             .expect("automatic fuse atime setattr with file handle");
 
         let after = {
@@ -13339,7 +13699,7 @@ mod tests {
         read_atime.ctime_ns = before.posix.ctime_ns;
         fixture
             .adapter
-            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None)
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None, false)
             .expect("automatic fuse atime setattr with preserved ctime");
 
         let after = {
@@ -13396,7 +13756,7 @@ mod tests {
         read_atime.ctime_ns = before.posix.ctime_ns;
         fixture
             .adapter
-            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None)
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None, false)
             .expect("automatic fuse specific atime setattr with preserved ctime");
 
         let after = {
@@ -13460,7 +13820,7 @@ mod tests {
         read_atime.valid = FATTR_ATIME_NOW;
         fixture
             .adapter
-            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None)
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None, false)
             .expect("read-only automatic fuse atime setattr");
 
         let after = {
@@ -13864,8 +14224,8 @@ mod tests {
     }
     // ── Killpriv (FUSE_WRITE_KILL_PRIV) tests ───────────────────────
     //
-    // Verify that when FUSE_WRITE_KILL_PRIV is set on a write, S_ISUID
-    // and S_ISGID are cleared for non-owner writers, per POSIX semantics.
+    // FUSE_WRITE_KILL_PRIV is the old name for the v2 SUID/SGID-clear bit.
+    // security.capability is cleared on every non-empty v2 write.
 
     /// Helper: create a file with a specific owner and S_ISUID set,
     /// returning (inode, adapter_fh, engine_fh).
@@ -13889,6 +14249,22 @@ mod tests {
         (inode, adapter_fh, engine_fh)
     }
 
+    fn set_test_security_capability(adapter: &FuseVfsAdapter, inode: InodeId, ctx: &RequestCtx) {
+        adapter
+            .engine
+            .lock()
+            .unwrap()
+            .setxattr(inode, b"security.capability", b"test-capability", 0, ctx)
+            .expect("set test security.capability");
+    }
+
+    #[test]
+    fn required_fuse_caps_negotiate_killpriv_v2_not_v1() {
+        let required = required_fuse_capabilities();
+        assert_ne!(required & FUSE_CAP_HANDLE_KILLPRIV_V2, 0);
+        assert_eq!(required & (1 << 19), 0);
+    }
+
     #[test]
     fn vfs_adapter_dispatch_write_killpriv_clears_setuid_for_non_owner() {
         let fixture = adapter_fixture();
@@ -13901,6 +14277,7 @@ mod tests {
         };
         let (inode, adapter_fh, _engine_fh) =
             create_setuid_file(&fixture.adapter, &ctx_owner, b"setuid-nonowner.txt", 1001);
+        set_test_security_capability(&fixture.adapter, inode, &ctx_owner);
 
         // Write as uid=1000 (non-owner) with FUSE_WRITE_KILL_PRIV.
         let ctx_writer = RequestCtx {
@@ -13933,6 +14310,10 @@ mod tests {
             0,
             "S_ISUID must be cleared after non-owner write with FUSE_WRITE_KILL_PRIV"
         );
+        assert_eq!(
+            engine.getxattr(inode, b"security.capability", &ctx_owner),
+            Err(Errno::ENODATA)
+        );
     }
 
     #[test]
@@ -13947,6 +14328,7 @@ mod tests {
         };
         let (inode, adapter_fh, _engine_fh) =
             create_setuid_file(&fixture.adapter, &ctx_owner, b"setuid-nokillpriv.txt", 1001);
+        set_test_security_capability(&fixture.adapter, inode, &ctx_owner);
 
         // Write as uid=1000 (non-owner) without FUSE_WRITE_KILL_PRIV.
         let ctx_writer = RequestCtx {
@@ -13972,10 +14354,15 @@ mod tests {
             0,
             "S_ISUID must be preserved when FUSE_WRITE_KILL_PRIV is not set"
         );
+        assert_eq!(
+            engine.getxattr(inode, b"security.capability", &ctx_owner),
+            Err(Errno::ENODATA),
+            "killpriv v2 clears file capabilities on every non-empty write"
+        );
     }
 
     #[test]
-    fn vfs_adapter_dispatch_write_killpriv_owner_preserves_setuid() {
+    fn vfs_adapter_dispatch_write_killpriv_flag_is_authoritative_for_owner() {
         let fixture = adapter_fixture();
         let ctx_owner = RequestCtx {
             uid: 1001,
@@ -13987,7 +14374,8 @@ mod tests {
         let (inode, adapter_fh, _engine_fh) =
             create_setuid_file(&fixture.adapter, &ctx_owner, b"setuid-owner.txt", 1001);
 
-        // Write as uid=1001 (owner) with FUSE_WRITE_KILL_PRIV (CAP_FSETID semantics).
+        // The kernel sets this bit only after its CAP_FSETID decision.  The
+        // daemon must obey it rather than inferring capability from ownership.
         let written = fixture
             .adapter
             .dispatch_write(
@@ -14001,15 +14389,14 @@ mod tests {
             .expect("owner write dispatch with killpriv");
         assert_eq!(written, 4);
 
-        // S_ISUID must be preserved for owner writes.
         let engine = fixture.adapter.engine.lock().unwrap();
         let attr = engine
             .getattr(inode, None, &ctx_owner)
             .expect("getattr after owner killpriv write");
-        assert_ne!(
+        assert_eq!(
             attr.posix.mode & S_ISUID,
             0,
-            "S_ISUID must be preserved when owner writes with FUSE_WRITE_KILL_PRIV (CAP_FSETID)"
+            "FUSE_WRITE_KILL_PRIV must clear S_ISUID regardless of file ownership"
         );
     }
 
@@ -14025,6 +14412,7 @@ mod tests {
         };
         let (inode, adapter_fh, _engine_fh) =
             create_setuid_file(&adapter, &ctx_owner, b"wb-killpriv.txt", 1001);
+        set_test_security_capability(&adapter, inode, &ctx_owner);
 
         // Write as uid=1000 (non-owner) with FUSE_WRITE_CACHE | FUSE_WRITE_KILL_PRIV
         // so the writeback-cache path exercises killpriv clearing.
@@ -14057,6 +14445,144 @@ mod tests {
             0,
             "S_ISUID must be cleared after non-owner writeback-cache write with FUSE_WRITE_KILL_PRIV"
         );
+        assert_eq!(
+            engine.getxattr(inode, b"security.capability", &ctx_owner),
+            Err(Errno::ENODATA)
+        );
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_write_killpriv_clears_only_executable_sgid() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (exec_inode, exec_fh, exec_engine_fh) =
+            create_setuid_file(&fixture.adapter, &ctx, b"sgid-exec.txt", 0);
+        let (plain_inode, plain_fh, plain_engine_fh) =
+            create_setuid_file(&fixture.adapter, &ctx, b"sgid-plain.txt", 0);
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let mut mode = SetAttr::new();
+            mode.valid = FATTR_MODE;
+            mode.mode = S_ISGID | 0o750;
+            engine
+                .setattr(exec_inode, &mode, Some(&exec_engine_fh), &ctx)
+                .expect("set executable SGID mode");
+            mode.mode = S_ISGID | 0o740;
+            engine
+                .setattr(plain_inode, &mode, Some(&plain_engine_fh), &ctx)
+                .expect("set non-executable SGID mode");
+        }
+
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                exec_inode.get(),
+                exec_fh,
+                0,
+                b"x",
+                FUSE_WRITE_KILL_PRIV,
+            )
+            .expect("write executable SGID file");
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                plain_inode.get(),
+                plain_fh,
+                0,
+                b"x",
+                FUSE_WRITE_KILL_PRIV,
+            )
+            .expect("write non-executable SGID file");
+
+        let engine = fixture.adapter.engine.lock().unwrap();
+        assert_eq!(
+            engine
+                .getattr(exec_inode, None, &ctx)
+                .expect("executable SGID attr")
+                .posix
+                .mode
+                & S_ISGID,
+            0
+        );
+        assert_ne!(
+            engine
+                .getattr(plain_inode, None, &ctx)
+                .expect("non-executable SGID attr")
+                .posix
+                .mode
+                & S_ISGID,
+            0
+        );
+    }
+
+    #[test]
+    fn vfs_adapter_killpriv_v2_setattr_clears_chown_and_truncate_privileges() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (chown_inode, _chown_fh, chown_engine_fh) =
+            create_setuid_file(&fixture.adapter, &ctx, b"chown-killpriv.txt", 0);
+        let (truncate_inode, _truncate_fh, truncate_engine_fh) =
+            create_setuid_file(&fixture.adapter, &ctx, b"truncate-killpriv.txt", 0);
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let mut mode = SetAttr::new();
+            mode.valid = FATTR_MODE;
+            mode.mode = S_ISUID | S_ISGID | 0o750;
+            engine
+                .setattr(chown_inode, &mode, Some(&chown_engine_fh), &ctx)
+                .expect("set chown privilege mode");
+            engine
+                .setattr(truncate_inode, &mode, Some(&truncate_engine_fh), &ctx)
+                .expect("set truncate privilege mode");
+            engine
+                .setxattr(
+                    chown_inode,
+                    b"security.capability",
+                    b"chown-capability",
+                    0,
+                    &ctx,
+                )
+                .expect("set chown capability");
+            engine
+                .setxattr(
+                    truncate_inode,
+                    b"security.capability",
+                    b"truncate-capability",
+                    0,
+                    &ctx,
+                )
+                .expect("set truncate capability");
+        }
+
+        let mut chown = SetAttr::new();
+        chown.valid = FATTR_UID;
+        chown.uid = 1001;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, chown_inode.get(), &chown, None)
+            .expect("killpriv-v2 chown");
+
+        let mut truncate = SetAttr::new();
+        truncate.valid = FATTR_SIZE;
+        truncate.size = 0;
+        fixture
+            .adapter
+            .dispatch_setattr_with_killpriv(&ctx, 2, truncate_inode.get(), &truncate, None, true)
+            .expect("killpriv-v2 truncate");
+
+        let engine = fixture.adapter.engine.lock().unwrap();
+        for inode in [chown_inode, truncate_inode] {
+            let attr = engine
+                .getattr(inode, None, &ctx)
+                .expect("post-killpriv attr");
+            assert_eq!(attr.posix.mode & (S_ISUID | S_ISGID), 0);
+            assert_eq!(
+                engine.getxattr(inode, b"security.capability", &ctx),
+                Err(Errno::ENODATA)
+            );
+        }
     }
 
     fn write_sync_datasync_classifies_sync_open_flags() {
@@ -14095,6 +14621,113 @@ mod tests {
                 .write_sync_datasync(libc::O_RDWR as u32 | O_DSYNC),
             Some(false)
         );
+    }
+
+    #[test]
+    fn shared_mmap_writeback_does_not_inherit_sync_from_guessed_handles() {
+        let fixture = adapter_fixture();
+        let inode_open_state = InodeOpenState {
+            has_writable: true,
+            has_sync: true,
+            ..InodeOpenState::default()
+        };
+
+        assert_eq!(
+            fixture.adapter.write_request_sync_datasync(
+                true,
+                libc::O_RDWR as u32 | O_SYNC,
+                0,
+                inode_open_state,
+            ),
+            None,
+            "page-cache writeback has no O_SYNC write(2) boundary to inherit"
+        );
+        assert_eq!(
+            fixture.adapter.write_request_sync_datasync(
+                true,
+                libc::O_RDWR as u32,
+                libc::O_RDWR as u32 | O_DSYNC,
+                InodeOpenState::default(),
+            ),
+            Some(true),
+            "exact FUSE request flags retain synchronous-write semantics"
+        );
+        assert_eq!(
+            fixture.adapter.write_request_sync_datasync(
+                false,
+                libc::O_RDWR as u32 | O_SYNC,
+                0,
+                InodeOpenState::default(),
+            ),
+            Some(false),
+            "ordinary write dispatch retains its resolved O_SYNC boundary"
+        );
+    }
+
+    #[test]
+    fn shared_mmap_writeback_from_sync_handle_defers_root_until_fsync() {
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-vfs-adapter-mmap-sync-{}-{temp_id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let mut local_fs = LocalFileSystem::open_with_root_authentication_key(
+            &root,
+            StoreOptions::test_fast(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open local filesystem");
+        local_fs
+            .set_auto_commit(false)
+            .expect("configure mounted deferred commits");
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let owner = engine.shared_pool_owner();
+        let adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create adapter")
+            .with_writeback_cache_enabled();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &adapter,
+            &ctx,
+            b"mmap-sync.bin",
+            libc::O_RDWR as u32 | O_SYNC,
+        );
+        adapter
+            .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+            .expect("commit fixture creation");
+        let durable_before = owner.borrow().durable_commit_group();
+
+        adapter
+            .dispatch_write_with_request_flags(
+                &ctx,
+                inode.get(),
+                adapter_fh,
+                0,
+                b"shared mmap page writeback",
+                WriteDispatchFlags {
+                    write: FUSE_WRITE_CACHE,
+                    request_open: 0,
+                },
+            )
+            .expect("accept shared mmap page writeback");
+        assert_eq!(
+            owner.borrow().durable_commit_group(),
+            durable_before,
+            "mmap page writeback must not manufacture an O_SYNC committed-root barrier"
+        );
+
+        adapter
+            .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+            .expect("publish through explicit fsync");
+        assert!(
+            owner.borrow().durable_commit_group() > durable_before,
+            "explicit fsync must retain the committed-root durability boundary"
+        );
+
+        drop(adapter);
+        drop(owner);
+        std::fs::remove_dir_all(root).expect("remove temp root");
     }
 
     #[test]
@@ -24865,6 +25498,40 @@ mod tests {
     // ── dispatch_truncate tests (path-based, no file handle) ──────────────
 
     #[test]
+    fn clean_sparse_setattr_does_not_probe_absent_page_mirrors() {
+        const FSX_FILE_SIZE: u64 = 30 * 1024 * 1024;
+
+        let fixture = adapter_fixture_with_writeback_cache_deferred_commit();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"clean-sparse-ftruncate.bin",
+            libc::O_RDWR as u32,
+        );
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, inode.get(), adapter_fh, FSX_FILE_SIZE)
+            .expect("grow sparse fsx-sized file");
+        let misses_before = fixture.adapter.write_page_cache.miss_count();
+
+        let mut shrink = SetAttr::new();
+        shrink.valid = FATTR_SIZE | FATTR_FH;
+        shrink.size = 0;
+        let shrunk = fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &shrink, Some(adapter_fh))
+            .expect("truncate clean sparse fsx-sized file through FUSE setattr");
+
+        assert_eq!(shrunk.attr.size, 0);
+        assert_eq!(
+            fixture.adapter.write_page_cache.miss_count(),
+            misses_before,
+            "a clean truncate range must not probe every absent page mirror"
+        );
+    }
+
+    #[test]
     fn vfs_adapter_dispatch_truncate_to_zero_clears_data() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
@@ -25811,9 +26478,9 @@ mod tests {
         assert_eq!(getattr_out.attr.gid, expected.gid);
         assert_eq!(getattr_out.attr.rdev, expected.rdev);
         assert_eq!(getattr_out.attr.blksize, expected.blksize);
-        // GETATTR must follow the active adapter coherency policy.  The
-        // default test fixture uses RelativeAtime, which intentionally disables
-        // positive attr TTLs so lookup/getattr cannot hide atime updates.
+        // GETATTR must follow the active adapter coherency policy. The default
+        // test fixture uses RelativeAtime, which preserves attr TTLs while
+        // still forcing lookup revalidation through a zero entry TTL.
         assert_eq!(
             fuse_attr_out_ttl(&getattr_out),
             fixture.adapter.dentry_policy.positive_attr_ttl
@@ -39141,6 +39808,25 @@ mod tests {
     }
 
     #[test]
+    fn foreground_activity_epoch_tracks_request_start_and_completion() {
+        let adapter = make_scheduler_test_adapter();
+        let activity_epoch = adapter.foreground_activity_epoch();
+        let before = activity_epoch.load(Ordering::Acquire);
+
+        let request = adapter.begin_foreground_demand();
+        assert_eq!(
+            activity_epoch.load(Ordering::Acquire),
+            before.wrapping_add(1)
+        );
+
+        drop(request);
+        assert_eq!(
+            activity_epoch.load(Ordering::Acquire),
+            before.wrapping_add(2)
+        );
+    }
+
+    #[test]
     fn register_bg_service_with_scheduler_attached() {
         let adapter = make_scheduler_test_adapter()
             .with_background_scheduler(BackgroundScheduler::new(ServiceBudget::MAINTENANCE_TICK));
@@ -39641,6 +40327,121 @@ mod tests {
             assert_eq!(ranges[0].offset, 8192);
             assert_eq!(ranges[0].length, 4);
         }
+    }
+
+    #[test]
+    fn truncate_shrink_discards_sparse_suffix_without_page_miss_walk() {
+        const NEW_SIZE: u64 = 6 * 1024;
+        const OLD_SIZE: u64 = 30 * 1024 * 1024;
+        const STALE_PAGE_OFFSET: u64 = 16 * 1024 * 1024;
+
+        let (fixture, tracker) = adapter_fixture_with_writeback_tracker();
+        let ino = 101;
+        let inode = InodeId::new(ino);
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, 4096);
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(NEW_SIZE, (OLD_SIZE - NEW_SIZE) as u32);
+        {
+            let mut tracker = tracker.lock().unwrap();
+            tracker.mark_dirty(inode, 0, 4096);
+            tracker.mark_dirty(inode, NEW_SIZE, OLD_SIZE - NEW_SIZE);
+        }
+        let worker_tracker = fixture
+            .adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        {
+            let mut worker_tracker = worker_tracker.lock().unwrap();
+            worker_tracker
+                .mark_dirty(ino, 0, 4096)
+                .expect("mark retained worker range dirty");
+            worker_tracker
+                .mark_dirty(ino, NEW_SIZE, OLD_SIZE)
+                .expect("mark sparse suffix worker range dirty");
+        }
+
+        let cache = Arc::clone(&fixture.adapter.write_page_cache);
+        for offset in [0, 4096, STALE_PAGE_OFFSET] {
+            cache.insert(ino, offset).expect("insert dirty mirror");
+            let mut page = cache.lookup(ino, offset).expect("lookup dirty mirror");
+            page.data_mut().fill(0xA5);
+            page.mark_dirty();
+        }
+        {
+            let mut inode_cache = fixture.adapter.writeback_cache.lock().unwrap();
+            inode_cache.insert(ino);
+            inode_cache.mark_dirty(ino, OLD_SIZE);
+        }
+
+        let misses_before = cache.miss_count();
+        fixture
+            .adapter
+            .clear_dirty_for_truncate_shrink(ino, NEW_SIZE);
+        assert_eq!(
+            cache.miss_count(),
+            misses_before,
+            "truncate must visit resident cache state, not every sparse logical page"
+        );
+
+        {
+            let ds = fixture.adapter.dirty_state.lock().unwrap();
+            assert_eq!(
+                ds.get(&ino).expect("retained dirty prefix").ranges(),
+                &[(0, 4096)]
+            );
+        }
+        assert_eq!(
+            tracker
+                .lock()
+                .unwrap()
+                .dirty_ranges(inode)
+                .expect("retained shared dirty prefix")
+                .iter()
+                .map(|range| (range.offset, range.length))
+                .collect::<Vec<_>>(),
+            vec![(0, 4096)]
+        );
+        assert_eq!(
+            worker_tracker.lock().unwrap().get_dirty_ranges(ino),
+            vec![crate::workers_writeback::DirtyRange::new(ino, 0, 4096)]
+        );
+        assert!(
+            cache.lookup(ino, 0).is_some(),
+            "unrelated pre-EOF cache pages must survive"
+        );
+        assert!(
+            cache.lookup(ino, 4096).is_none(),
+            "the cache page crossing the new EOF must be invalidated"
+        );
+        assert!(
+            cache.lookup(ino, STALE_PAGE_OFFSET).is_none(),
+            "superseded suffix bytes must not remain available for later writeback"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(true),
+            "the retained dirty prefix must keep the inode dirty"
+        );
     }
 
     #[test]
@@ -40783,7 +41584,7 @@ mod tests {
         )
         .expect("open local filesystem");
         let mut engine = VfsLocalFileSystem::new(local_fs);
-        engine
+        let _ = engine
             .set_timestamp_policy(tidefs_inode_attributes::timestamp::TimestampPolicy::Strictatime);
         let mut adapter = FuseVfsAdapter::new(Box::new(engine))
             .expect("create adapter")
@@ -40857,6 +41658,115 @@ mod tests {
             .expect("create adapter")
             .with_writeback_cache_enabled();
         AdapterFixture { adapter, root }
+    }
+
+    #[test]
+    fn mounted_writeback_cache_generic074_sparse_truncate_rewrites_survive() {
+        static MOUNTED_WRITEBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        const CHILDREN: usize = 3;
+        const FILES_PER_CHILD: usize = 5;
+        const LOOPS: usize = 10;
+        const FILE_SIZE: usize = 30 * 1024 * 1024;
+        const BLOCK_SIZE: usize = 512;
+        const STRIDE: usize = 1024;
+        const EXPECTED_SIZE: usize = FILE_SIZE - BLOCK_SIZE;
+
+        let _guard = MOUNTED_WRITEBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mounted = MountedWritebackFixture::new();
+
+        let mut workers = Vec::new();
+        for child_idx in 0..CHILDREN {
+            let child_root = mounted.path(&format!("fstest.{child_idx}/child{child_idx}"));
+            fs::create_dir_all(&child_root).expect("create child work directory");
+            workers.push(std::thread::spawn(move || {
+                let mut block = vec![0_u8; BLOCK_SIZE];
+                let mut readback = vec![0_u8; BLOCK_SIZE];
+
+                for loop_idx in 0..LOOPS {
+                    for file_idx in 0..FILES_PER_CHILD {
+                        let path = child_root.join(format!("file{file_idx}.bin"));
+                        {
+                            let mut file = OpenOptions::new()
+                                .create(true)
+                                .truncate(true)
+                                .read(true)
+                                .write(true)
+                                .open(&path)
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "child {child_idx} loop {loop_idx} file {file_idx}: truncate-open failed: {error}"
+                                    )
+                                });
+                            for offset in (0..FILE_SIZE).step_by(STRIDE) {
+                                let expected_byte = (loop_idx
+                                    .wrapping_add(child_idx)
+                                    .wrapping_add(file_idx)
+                                    .wrapping_add(offset / BLOCK_SIZE))
+                                    as u8;
+                                block.fill(expected_byte);
+                                file.seek(SeekFrom::Start(offset as u64)).unwrap_or_else(|error| {
+                                    panic!(
+                                        "child {child_idx} loop {loop_idx} file {file_idx} offset {offset}: seek failed: {error}"
+                                    )
+                                });
+                                file.write_all(&block).unwrap_or_else(|error| {
+                                    panic!(
+                                        "child {child_idx} loop {loop_idx} file {file_idx} offset {offset}: write failed: {error}"
+                                    )
+                                });
+                            }
+                        }
+
+                        let metadata = fs::metadata(&path).unwrap_or_else(|error| {
+                            panic!(
+                                "child {child_idx} loop {loop_idx} file {file_idx}: metadata failed: {error}"
+                            )
+                        });
+                        assert_eq!(
+                            metadata.len(),
+                            EXPECTED_SIZE as u64,
+                            "child {child_idx} loop {loop_idx} file {file_idx}: unexpected truncated sparse size"
+                        );
+
+                        let mut reader = File::open(&path).unwrap_or_else(|error| {
+                            panic!(
+                                "child {child_idx} loop {loop_idx} file {file_idx}: reopen failed: {error}"
+                            )
+                        });
+                        for offset in (0..FILE_SIZE).step_by(STRIDE) {
+                            let expected_byte = (loop_idx
+                                .wrapping_add(child_idx)
+                                .wrapping_add(file_idx)
+                                .wrapping_add(offset / BLOCK_SIZE))
+                                as u8;
+                            block.fill(expected_byte);
+                            reader.seek(SeekFrom::Start(offset as u64)).unwrap_or_else(|error| {
+                                panic!(
+                                    "child {child_idx} loop {loop_idx} file {file_idx} offset {offset}: read seek failed: {error}"
+                                )
+                            });
+                            reader.read_exact(&mut readback).unwrap_or_else(|error| {
+                                panic!(
+                                    "child {child_idx} loop {loop_idx} file {file_idx} offset {offset}: read failed: {error}"
+                                )
+                            });
+                            assert_eq!(
+                                readback,
+                                block,
+                                "child {child_idx} loop {loop_idx} file {file_idx} offset {offset}: sparse rewrite changed after close"
+                            );
+                        }
+                    }
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().expect("mounted writeback worker");
+        }
     }
 
     #[test]
@@ -41391,6 +42301,73 @@ mod tests {
     }
 
     #[test]
+    fn writeback_truncating_open_drops_keep_cache_but_keeps_buffered_io() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+
+        let create = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"wb-truncate-drop-keep-cache.txt",
+                0o644,
+                libc::O_RDWR as u32,
+            )
+            .expect("create writeback-cache file");
+
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                create.attr.inode_id.get(),
+                create.adapter_fh,
+                0,
+                b"seed-before-truncate",
+                0,
+            )
+            .expect("seed file");
+        fixture
+            .adapter
+            .dispatch_release(create.attr.inode_id.get(), create.adapter_fh, 0, None, true)
+            .expect("release seed writer");
+
+        let truncate_open = fixture
+            .adapter
+            .dispatch_open(
+                &ctx,
+                create.attr.inode_id.get(),
+                libc::O_RDWR as u32 | libc::O_TRUNC as u32,
+            )
+            .expect("open existing file with O_TRUNC under writeback cache");
+        assert_eq!(
+            truncate_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
+            0,
+            "writeback-cache O_TRUNC should keep buffered I/O enabled"
+        );
+        assert_eq!(
+            truncate_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
+            0,
+            "truncate-open must drop pre-truncate kernel cache identity"
+        );
+        let mut fixture = fixture;
+        fixture
+            .adapter
+            .dispatch_release(
+                create.attr.inode_id.get(),
+                truncate_open.adapter_fh,
+                0,
+                None,
+                false,
+            )
+            .expect("release truncate-open handle");
+    }
+
+    #[test]
     fn writeback_readonly_open_preserves_kernel_page_cache_while_writer_open() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
@@ -41426,7 +42403,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_active_atime_readonly_reopen_drops_kernel_page_cache() {
+    fn writeback_relatime_readonly_reopen_after_write_keeps_cache_and_updates_atime() {
         let mut fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let root = {
@@ -41446,23 +42423,65 @@ mod tests {
 
         fixture
             .adapter
+            .dispatch_write(
+                &ctx,
+                create.attr.inode_id.get(),
+                create.adapter_fh,
+                0,
+                b"relatime writeback payload",
+                0,
+            )
+            .expect("write payload before read reopen");
+        fixture
+            .adapter
             .dispatch_release(create.attr.inode_id.get(), create.adapter_fh, 0, None, true)
             .expect("release writer");
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(create.attr.inode_id, None, &ctx)
+                .expect("getattr before read reopen")
+        };
 
+        std::thread::sleep(Duration::from_millis(1));
         let read_open = fixture
             .adapter
-            .dispatch_open(&ctx, create.attr.inode_id.get(), libc::O_RDONLY as u32)
-            .expect("open read-only under active atime");
+            .dispatch_open_entry(&ctx, create.attr.inode_id.get(), libc::O_RDONLY as u32)
+            .expect("open read-only after write under relatime");
         assert_eq!(
             read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
             0,
-            "active-atime read-only writeback opens must still use buffered I/O"
+            "relatime read-only writeback reopens must still use buffered I/O"
         );
-        assert_eq!(
+        assert_ne!(
             read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
             0,
-            "clean active-atime read-only reopens must invalidate page cache so reads reach the daemon"
+            "relatime read-only reopens after a write should preserve the post-write kernel cache"
         );
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(create.attr.inode_id, None, &ctx)
+                .expect("getattr after read reopen")
+        };
+        assert!(
+            after.posix.atime_ns > before.posix.atime_ns,
+            "the first relatime read-only reopen after a write must still advance atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "relatime read-open atime update must not advance ctime"
+        );
+        fixture
+            .adapter
+            .dispatch_release(
+                create.attr.inode_id.get(),
+                read_open.adapter_fh,
+                0,
+                None,
+                false,
+            )
+            .expect("release read reopen");
     }
 
     #[test]
@@ -43812,7 +44831,7 @@ mod tests {
     }
 
     #[test]
-    fn read_atime_policy_zeroes_positive_attr_ttl() {
+    fn relatime_policy_preserves_positive_attr_ttl_but_zeroes_lookup_ttl() {
         let adapter = fresh_test_adapter()
             .with_coherency_profile(crate::coherency_profile::CoherencyProfile::Writeback)
             .with_timestamp_policy(TimestampPolicy::RelativeAtime);
@@ -43822,7 +44841,10 @@ mod tests {
             Duration::from_secs(5)
         );
         assert_eq!(adapter.dentry_policy.positive_entry_ttl, Duration::ZERO);
-        assert_eq!(adapter.dentry_policy.positive_attr_ttl, Duration::ZERO);
+        assert_eq!(
+            adapter.dentry_policy.positive_attr_ttl,
+            Duration::from_secs(5)
+        );
         assert_eq!(adapter.dentry_policy.positive_reply_ttl(), Duration::ZERO);
     }
 

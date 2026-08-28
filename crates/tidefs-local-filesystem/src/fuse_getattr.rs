@@ -74,8 +74,6 @@ pub fn engine_getattr(fs: &LocalFileSystem, ino: u64) -> Result<InodeAttr, Getat
     if !fs.inode_id_is_allocated(inode_id) {
         return Err(GetattrDispatchError::NoEntry);
     }
-    let record = fs
-        .inode(inode_id)
-        .map_err(|e| GetattrDispatchError::from(&e))?;
-    Ok(record.to_inode_attr())
+    fs.inode_attr_by_id(inode_id)
+        .map_err(|error| GetattrDispatchError::from(&error))
 }

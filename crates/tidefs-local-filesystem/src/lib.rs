@@ -377,6 +377,19 @@ use std::time::{Duration, Instant};
 
 static NEXT_LOCAL_DATASET_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 
+fn shutdown_diagnostics_enabled() -> bool {
+    fn enabled_var(name: &str) -> bool {
+        matches!(
+            std::env::var(name).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+    }
+
+    enabled_var("TIDEFS_VFS_OP_DIAGNOSTICS")
+        || enabled_var("TIDEFS_FUSE_OP_DIAGNOSTICS")
+        || enabled_var("TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS")
+}
+
 use crate::ack_receipt::{
     LocalAckOperation, LocalAckReceipt, LocalAckReceiptLedger, LocalAckReceiptTarget,
 };
@@ -442,6 +455,7 @@ use tidefs_types_vfs_core::{
     ROOT_INODE_ID,
 };
 use tidefs_types_vfs_core::{LockConflict, LockRange, LockTracker, LockType};
+use tidefs_vfs_engine::WritePrivilegeClear;
 
 use background_orphan_reclamation::BackgroundOrphanReclamation;
 #[cfg(feature = "data-policy")]
@@ -1981,7 +1995,7 @@ impl BackgroundSchedulerRuntime {
         let cancel_clone = Arc::clone(&cancel);
 
         let handle = thread::spawn(move || loop {
-            thread::sleep(tick_interval);
+            thread::park_timeout(tick_interval);
             if cancel_clone.load(Ordering::Relaxed) {
                 break;
             }
@@ -2006,6 +2020,7 @@ impl BackgroundSchedulerRuntime {
     fn stop(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
             let _ = handle.join();
         }
     }
@@ -2236,6 +2251,10 @@ pub struct FilesystemDatasetEngine {
     /// identity changes and explicit Pool-authority invalidation force the
     /// normal strict reads before an entry can be reused.
     authenticated_content_allocation_cache: AuthenticatedContentAllocationCache,
+    /// Receipt-authenticated immutable layouts for exact live content
+    /// identities plus one exact decoded chunk per inode. Cache misses retain
+    /// the strict Pool receipt, checksum, and decode path.
+    authenticated_content_layout_cache: RefCell<AuthenticatedContentLayoutCache>,
     write_buffer_config: WriteBufferConfig,
     fsync_stats: FsyncStats,
     /// Sync gate for TXG group commit durability fence coordination.
@@ -2310,6 +2329,105 @@ impl SharedPoolDatasetOwner {
 
     pub fn borrow_mut(&self) -> MutexGuard<'_, PoolDatasetOwner> {
         self.borrow()
+    }
+
+    /// Return whether mounted mutation maintenance is pending without waiting
+    /// behind a foreground carrier operation.
+    ///
+    /// `None` means the mounted owner is currently busy. Embedders should
+    /// defer the maintenance tick instead of joining the foreground lock
+    /// queue.
+    #[must_use]
+    pub fn try_background_services_pending(&self) -> Option<bool> {
+        match self.0.try_lock() {
+            Ok(owner) => Some(owner.background_services_pending()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(poisoned.into_inner().background_services_pending())
+            }
+        }
+    }
+
+    /// Return whether the mounted commit group needs an idle-period close
+    /// without waiting behind a foreground carrier operation.
+    ///
+    /// `None` means the mounted owner is currently busy. Embedders should
+    /// retry on a later idle-period scheduler cycle.
+    #[must_use]
+    pub fn try_commit_group_maintenance_pending(&self) -> Option<bool> {
+        match self.0.try_lock() {
+            Ok(owner) => Some(owner.commit_group_maintenance_pending()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(poisoned.into_inner().commit_group_maintenance_pending())
+            }
+        }
+    }
+
+    /// Close one mounted commit group during an idle scheduler cycle without
+    /// waiting behind a foreground carrier operation.
+    ///
+    /// `None` means another owner user won the lock. `Some(false)` means the
+    /// soft trigger was no longer pending by the time the tick acquired it.
+    pub fn try_commit_group_maintenance_tick(&self) -> Result<Option<bool>> {
+        match self.0.try_lock() {
+            Ok(mut owner) => owner.commit_group_maintenance_tick().map(Some),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                .into_inner()
+                .commit_group_maintenance_tick()
+                .map(Some),
+        }
+    }
+
+    /// Run one mounted mutation-maintenance tick without waiting behind a
+    /// foreground carrier operation.
+    ///
+    /// `None` means another owner user won the lock and the caller must retry
+    /// on a later idle-period scheduler cycle.
+    pub fn try_tick_background_services(
+        &self,
+        max_reclaim_entries: usize,
+    ) -> Result<Option<ReclaimDrainStats>> {
+        match self.0.try_lock() {
+            Ok(mut owner) => owner
+                .tick_background_services_with_reclaim_limit(max_reclaim_entries)
+                .map(Some),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                .into_inner()
+                .tick_background_services_with_reclaim_limit(max_reclaim_entries)
+                .map(Some),
+        }
+    }
+
+    /// Run one mounted mutation-maintenance tick while yielding to demand
+    /// that arrives after the caller selected an idle period.
+    ///
+    /// `None` means either the mounted owner is busy or `should_preempt`
+    /// became true before the tick could safely complete more work. Durable
+    /// reclaim obligations remain queued for a later idle period.
+    pub fn try_tick_background_services_until(
+        &self,
+        max_reclaim_entries: usize,
+        should_preempt: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<ReclaimDrainStats>> {
+        if should_preempt() {
+            return Ok(None);
+        }
+        match self.0.try_lock() {
+            Ok(mut owner) => owner.tick_background_services_with_reclaim_limit_until(
+                max_reclaim_entries,
+                should_preempt,
+            ),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                .into_inner()
+                .tick_background_services_with_reclaim_limit_until(
+                    max_reclaim_entries,
+                    should_preempt,
+                ),
+        }
     }
 
     pub fn into_inner(self) -> PoolDatasetOwner {
@@ -3123,9 +3241,10 @@ impl PoolDatasetOwner {
     }
 
     fn mounted_content_reader(&self) -> MountedContentReadAuthority<'_> {
-        MountedContentReadAuthority::for_dataset(
+        MountedContentReadAuthority::for_cached_dataset(
             self.store.pool(),
             DatasetId::from_bytes(self.filesystem.mounted_dataset_id),
+            &self.filesystem.authenticated_content_layout_cache,
         )
     }
 
@@ -4140,6 +4259,17 @@ impl PoolDatasetOwner {
         self.filesystem.background_scheduler = None;
     }
 
+    /// Transfer periodic maintenance dispatch to an embedding carrier.
+    ///
+    /// The mounted FUSE carrier owns a scheduler that observes foreground
+    /// demand and calls [`tick_background_services`](Self::tick_background_services)
+    /// only during an admitted idle period. Synchronously stop the library's
+    /// autonomous scheduler before attaching that carrier so orphan scanning,
+    /// online defragmentation, and scrub cannot run outside the carrier gate.
+    pub fn delegate_background_maintenance_to_carrier(&mut self) {
+        self.stop_background_scheduler();
+    }
+
     /// Return the current durable Pool membership paths owned by this runtime.
     ///
     /// Mounted topology operations can replace or remove the paths supplied at
@@ -4167,25 +4297,93 @@ impl PoolDatasetOwner {
     /// On failure the same fence forces recovery through a fresh reopen instead
     /// of giving the destructor an unreportable second publication attempt.
     pub fn close_mounted(&mut self) -> Result<()> {
+        let diagnostic = shutdown_diagnostics_enabled();
+        let started = Instant::now();
         let _released_locks = self.release_all_locks_for_mount();
         self.stop_background_scheduler();
         if let Some(handle) = self.filesystem.writeback_handle.take() {
             handle.shutdown();
         }
 
-        let result = if self.filesystem.recovery_policy.allows_any_mutation() {
-            if self.mounted_mutation_quiescence_failure().is_none() {
-                self.store
+        let mutation_allowed = self.filesystem.recovery_policy.allows_any_mutation();
+        let quiescence_failure = if mutation_allowed {
+            self.mounted_mutation_quiescence_failure()
+        } else {
+            None
+        };
+        if diagnostic {
+            let (shared_tracker_inodes, shared_tracker_ranges, unresolved_writeback) =
+                match self.filesystem.writeback_range_tracker.lock() {
+                    Ok(tracker) => (
+                        tracker.dirty_inode_count(),
+                        tracker.total_dirty_ranges(),
+                        tracker.dirty_ranges_have_unresolved_writeback(),
+                    ),
+                    Err(_) => (usize::MAX, usize::MAX, true),
+                };
+            eprintln!(
+                "tidefs-diagnostic: close_mounted start mutation_allowed={} quiescence_failure={:?} state_dirty={} intent_pending_flush={} intent_entries={} mutation_delta={} in_transaction={} uncommitted_mutations={} pending_permits={} write_buffers={} buffered_bases={} dirty_page_ranges={} shared_writeback_inodes={} shared_writeback_ranges={} unresolved_writeback={} commit_group_phase={:?} commit_group_inflight={} pending_snapshot_roots={}",
+                mutation_allowed,
+                quiescence_failure,
+                self.is_state_dirty(),
+                self.filesystem.intent_log.pending_flush_count(),
+                !self.filesystem.intent_log.is_empty(),
+                self.filesystem.mutation_delta.is_some(),
+                self.filesystem.in_transaction,
+                self.filesystem.uncommitted_mutation_count,
+                self.filesystem.pending_permits.len(),
+                self.filesystem.write_buffers.len(),
+                self.filesystem.buffered_write_base_records.len(),
+                self.filesystem.dirty_page_tracker.borrow().dirty_page_count(),
+                shared_tracker_inodes,
+                shared_tracker_ranges,
+                unresolved_writeback,
+                self.filesystem.commit_group.phase,
+                self.filesystem.commit_group.inflight_writes,
+                self.filesystem.pending_snapshot_root_rewrites.len(),
+            );
+        }
+
+        let result = if mutation_allowed {
+            if quiescence_failure.is_none() {
+                let sync_started = Instant::now();
+                let result = self
+                    .store
                     .pool_mut()
                     .sync_all()
-                    .map_err(FileSystemError::from)
+                    .map_err(FileSystemError::from);
+                if diagnostic {
+                    eprintln!(
+                        "tidefs-diagnostic: close_mounted quiescent_sync status={} elapsed_ms={}",
+                        if result.is_ok() { "ok" } else { "err" },
+                        sync_started.elapsed().as_millis()
+                    );
+                }
+                result
             } else {
-                self.fsync_all()
+                let sync_started = Instant::now();
+                let result = self.fsync_all();
+                if diagnostic {
+                    eprintln!(
+                        "tidefs-diagnostic: close_mounted fsync_all status={} reason={:?} elapsed_ms={}",
+                        if result.is_ok() { "ok" } else { "err" },
+                        quiescence_failure,
+                        sync_started.elapsed().as_millis()
+                    );
+                }
+                result
             }
         } else {
             Ok(())
         };
         self.arm_mutation_reopen_fence();
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: close_mounted end status={} elapsed_ms={}",
+                if result.is_ok() { "ok" } else { "err" },
+                started.elapsed().as_millis()
+            );
+        }
         result
     }
 
@@ -5305,6 +5503,9 @@ impl PoolDatasetOwner {
                 buffered_write_base_records: BTreeMap::new(),
                 authenticated_content_allocation_cache:
                     AuthenticatedContentAllocationCache::default(),
+                authenticated_content_layout_cache: RefCell::new(
+                    AuthenticatedContentLayoutCache::default(),
+                ),
                 write_buffer_config: WriteBufferConfig::default(),
                 pool_uuid,
                 fsync_stats: FsyncStats::default(),
@@ -6032,20 +6233,21 @@ impl PoolDatasetOwner {
     /// For full-inode deletion (nlink reaches 0), also inserts per-chunk
     /// keys via `content_chunk_object_key_for_version()`.
     fn record_reclaim_delta(&mut self, inode_id: InodeId, _freed_bytes: u64) {
-        let record = self.filesystem.state.inodes.get(&inode_id).cloned();
-        if record
-            .as_ref()
-            .is_some_and(|record| record.nlink == 0 && record.size == 0)
-        {
-            return;
-        }
-        let Some(record) = record else {
+        let Some(record) = self.filesystem.state.inodes.get(&inode_id).cloned() else {
             return;
         };
+        self.record_reclaim_delta_for_record(&record);
+    }
+
+    fn record_reclaim_delta_for_record(&mut self, record: &InodeRecord) {
+        if record.nlink == 0 && record.size == 0 {
+            return;
+        }
+        let inode_id = record.inode_id;
         let include_chunks = record.nlink == 0;
         let entries = match inode_content_reclaim_entries(
             self.store.pool(),
-            &record,
+            record,
             include_chunks,
             self.object_keyspace(),
         ) {
@@ -6343,17 +6545,48 @@ impl PoolDatasetOwner {
     /// fallback and by recursively retained live snapshot/clone roots.
     /// Uncertainty is terminal for this read-only preflight so background
     /// reclaim leaves the exact local queue entries pending.
+    #[cfg(test)]
     fn collect_reclaim_protected_content_keys(&mut self) -> Result<HashSet<ObjectKey>> {
         self.ensure_snapshot_authority_consistent()?;
         let current_root = self.selected_committed_root_summary()?;
-        Ok(reclaim_protected_content_keys_pool(
+        reclaim_protected_content_keys_pool(
             self.store.pool_mut(),
             self.filesystem.root_authentication_key,
             &current_root,
             &self.filesystem.state,
+        )
+        .map(|keys| keys.into_iter().collect())
+    }
+
+    fn collect_reclaim_protected_content_keys_until(
+        &mut self,
+        should_preempt: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<HashSet<ObjectKey>>> {
+        if should_preempt() {
+            return Ok(None);
+        }
+        self.ensure_snapshot_authority_consistent()?;
+        if should_preempt() {
+            return Ok(None);
+        }
+        let current_root = self.selected_committed_root_summary()?;
+        if should_preempt() {
+            return Ok(None);
+        }
+        let Some(protected) = reclaim_protected_content_keys_pool_until(
+            self.store.pool_mut(),
+            self.filesystem.root_authentication_key,
+            &current_root,
+            &self.filesystem.state,
+            should_preempt,
         )?
-        .into_iter()
-        .collect())
+        else {
+            return Ok(None);
+        };
+        if should_preempt() {
+            return Ok(None);
+        }
+        Ok(Some(protected.into_iter().collect()))
     }
 
     /// Drain entries from the local B+tree reclaim queue and hand them off
@@ -6371,25 +6604,60 @@ impl PoolDatasetOwner {
     /// reclaim consumer's normal batch size and the background-service
     /// DEFAULT_TICK item budget.
     pub fn drain_local_reclaim_queue_into_store(&mut self) -> Result<ReclaimDrainStats> {
+        self.drain_local_reclaim_queue_into_store_with_limit(1024)
+    }
+
+    /// Drain at most `max_entries` local reclaim obligations into Pool
+    /// deletion authority. A zero limit selects the normal 1024-entry cap.
+    fn drain_local_reclaim_queue_into_store_with_limit(
+        &mut self,
+        max_entries: usize,
+    ) -> Result<ReclaimDrainStats> {
+        self.drain_local_reclaim_queue_into_store_with_limit_until(max_entries, &mut || false)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "non-preemptible local reclaim drain was preempted",
+            })
+    }
+
+    fn drain_local_reclaim_queue_into_store_with_limit_until(
+        &mut self,
+        max_entries: usize,
+        should_preempt: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<ReclaimDrainStats>> {
         self.ensure_mutation_allowed("drain local reclaim queue")?;
         const MAX_RECLAIM_PER_TICK: usize = 1024;
+        let max_entries = if max_entries == 0 {
+            MAX_RECLAIM_PER_TICK
+        } else {
+            max_entries.min(MAX_RECLAIM_PER_TICK)
+        };
+
+        if self.filesystem.reclaim_queue.lock().unwrap().is_empty() {
+            return Ok(Some(ReclaimDrainStats { entries_drained: 0 }));
+        }
+        if should_preempt() {
+            return Ok(None);
+        }
 
         // Make every current obligation durable before any logical deletion.
         // Receipt-authority preflight below is read-only; entries without
         // exact current authority stay in this queue for a later cycle.
-        if !self.filesystem.reclaim_queue.lock().unwrap().is_empty() {
-            self.persist_local_reclaim_queue(true)?;
+        self.persist_local_reclaim_queue(true)?;
+        if should_preempt() {
+            return Ok(None);
         }
 
         // Protect every root the mounted recovery/retention authority can
         // select, including recursively retained snapshot and clone roots.
-        let protected_keys = match self.collect_reclaim_protected_content_keys() {
-            Ok(keys) => keys,
+        let protected_keys = match self.collect_reclaim_protected_content_keys_until(should_preempt)
+        {
+            Ok(Some(keys)) => keys,
+            Ok(None) => return Ok(None),
             Err(error) => {
                 eprintln!(
                     "background-services: root reclaim protection is uncertain; keeping local reclaim entries pending: {error}"
                 );
-                return Ok(ReclaimDrainStats { entries_drained: 0 });
+                return Ok(Some(ReclaimDrainStats { entries_drained: 0 }));
             }
         };
 
@@ -6398,7 +6666,7 @@ impl PoolDatasetOwner {
             tidefs_types_reclaim_queue_core::ReclaimQueueEntry,
         )> = {
             let q = self.filesystem.reclaim_queue.lock().unwrap();
-            q.dequeue_batch(None, MAX_RECLAIM_PER_TICK)
+            q.dequeue_batch(None, max_entries)
         };
         let mut entries_drained = 0;
 
@@ -6416,6 +6684,9 @@ impl PoolDatasetOwner {
         let keyspace = self.object_keyspace();
         let mut strict_preflight = BTreeMap::new();
         for (object_key, _entry) in &batch {
+            if should_preempt() {
+                return Ok(None);
+            }
             let local_key = tidefs_local_object_store::ObjectKey::from_bytes(object_key.0);
             if protected_keys.contains(&local_key) {
                 continue;
@@ -6463,11 +6734,18 @@ impl PoolDatasetOwner {
             );
         }
 
+        if should_preempt() {
+            return Ok(None);
+        }
+
         if !batch.is_empty() {
             let mut completed_keys = BTreeSet::new();
             let mut performed_logical_handoff = false;
 
             for (object_key, _entry) in &batch {
+                if should_preempt() {
+                    break;
+                }
                 let local_key = tidefs_local_object_store::ObjectKey::from_bytes(object_key.0);
                 let Some(preflight) = strict_preflight.get(&local_key) else {
                     continue;
@@ -6558,7 +6836,7 @@ impl PoolDatasetOwner {
             self.filesystem.total_reclaim_entries_drained += entries_drained as u64;
         }
 
-        Ok(ReclaimDrainStats { entries_drained })
+        Ok(Some(ReclaimDrainStats { entries_drained }))
     }
 
     /// Build a deferred extent trim plan for a content rewrite.
@@ -6630,7 +6908,7 @@ impl PoolDatasetOwner {
         new_record: &InodeRecord,
         content_write: &ContentWriteOutcome,
     ) -> Result<(RewriteTrimPlan, Option<BTreeMap<ObjectKey, u64>>)> {
-        let Some(new_layout) = content_write.receipted_layout() else {
+        let Some((new_layout, _manifest_checksum)) = content_write.receipted_manifest() else {
             return Ok((
                 self.rewrite_trim_plan_for_layout(inode_id, old_layout, new_record)?,
                 None,
@@ -6652,6 +6930,19 @@ impl PoolDatasetOwner {
             .map(|(key, grains)| (keyspace.scope(key), grains))
             .collect();
         Ok((plan, Some(allocation_entries)))
+    }
+
+    fn record_receipted_content_layout(
+        &self,
+        record: &InodeRecord,
+        content_write: &ContentWriteOutcome,
+    ) {
+        if let Some((layout, manifest_checksum)) = content_write.receipted_manifest() {
+            self.filesystem
+                .authenticated_content_layout_cache
+                .borrow_mut()
+                .record_receipted_manifest(record, layout.clone(), manifest_checksum);
+        }
     }
 
     fn apply_rewrite_trim_plan(&mut self, plan: RewriteTrimPlan) {
@@ -6683,8 +6974,9 @@ impl PoolDatasetOwner {
     /// and removes the pair from the deferred list.  Pairs whose
     /// replacement is not yet durable stay in the list for a future cycle.
     ///
-    /// Called after each commit_group commit to bound deferred-trim
-    /// accumulation and prevent unbounded capacity drift.
+    /// Called after replacement writeback and before committed-root
+    /// publication so the promoted obligations are durable in the same
+    /// transaction. Background maintenance performs the later delete handoff.
     pub fn process_deferred_rewrite_trims(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("process deferred rewrite trims")?;
         if self.filesystem.deferred_rewrite_trims.is_empty() {
@@ -7129,13 +7421,63 @@ impl PoolDatasetOwner {
         Ok(applied)
     }
 
-    /// Drive one cycle of the background service scheduler.
+    fn background_services_pending(&self) -> bool {
+        if !self
+            .filesystem
+            .pending_orphan_deletions
+            .lock()
+            .unwrap()
+            .is_empty()
+            || !self.filesystem.deferred_rewrite_trims.is_empty()
+            || !self.filesystem.reclaim_queue.lock().unwrap().is_empty()
+        {
+            return true;
+        }
+
+        #[cfg(feature = "distributed-repair")]
+        if self
+            .filesystem
+            .scrub_corruption_detected
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return true;
+        }
+
+        false
+    }
+
+    /// Drive one cycle of mounted background mutation services.
     ///
     /// Dispatches ticks to all registered services that have work,
     /// in priority order with round-robin fairness. Call periodically
     /// (e.g. after commits, on a timer, or from the embedding application)
     /// to keep background work progressing.
     pub fn tick_background_services(&mut self) -> Result<()> {
+        self.tick_background_services_with_reclaim_limit(1024)
+            .map(|_| ())
+    }
+
+    /// Drive one mounted background mutation cycle while limiting local
+    /// reclaim handoff to `max_reclaim_entries`.
+    fn tick_background_services_with_reclaim_limit(
+        &mut self,
+        max_reclaim_entries: usize,
+    ) -> Result<ReclaimDrainStats> {
+        self.tick_background_services_with_reclaim_limit_until(max_reclaim_entries, &mut || false)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "non-preemptible background maintenance tick was preempted",
+            })
+    }
+
+    fn tick_background_services_with_reclaim_limit_until(
+        &mut self,
+        max_reclaim_entries: usize,
+        should_preempt: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<ReclaimDrainStats>> {
+        if should_preempt() {
+            return Ok(None);
+        }
         self.ensure_mutation_allowed("run background mutation services")?;
         // --- Duty 1: record reclaim deltas for orphaned inodes ---
         let pending: Vec<u64> = {
@@ -7162,10 +7504,17 @@ impl PoolDatasetOwner {
             }
         }
 
+        if should_preempt() {
+            return Ok(None);
+        }
+
         // Process deferred rewrite extent trims: promote old extent keys to
         // the reclaim queue once their replacement receipt is durable.
         // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
         self.process_deferred_rewrite_trims()?;
+        if should_preempt() {
+            return Ok(None);
+        }
 
         // --- Duty 2: drain reclaim queue into object-store authority ---
         // Hands off local B+tree reclaim queue entries through Pool::delete().
@@ -7173,7 +7522,13 @@ impl PoolDatasetOwner {
         // freeing needs exact obsolete-placement tokens bound to an
         // authenticated filesystem root, which the current queue does not
         // persist.
-        self.drain_local_reclaim_queue_into_store()?;
+        let Some(reclaim) = self.drain_local_reclaim_queue_into_store_with_limit_until(
+            max_reclaim_entries,
+            should_preempt,
+        )?
+        else {
+            return Ok(None);
+        };
 
         // --- Duty 3: dispatch pending scrub-triggered repairs ---
         // The background scrubber sets scrub_corruption_detected when it finds
@@ -7199,7 +7554,7 @@ impl PoolDatasetOwner {
                     .tick(self.store.pool_mut());
             }
         }
-        Ok(())
+        Ok(Some(reclaim))
     }
 
     /// Prepare exact content and inode reclaim entries for every orphan whose
@@ -7418,6 +7773,31 @@ impl PoolDatasetOwner {
             self.accounted_extent_bytes(record.inode_id, 0, u64::MAX);
         attr.posix.blocks_512 = data_bytes.saturating_add(reserved_bytes).div_ceil(512);
         attr
+    }
+
+    /// Project live inode attributes without cloning a state-resident record.
+    ///
+    /// Mounted GETATTR is a high-frequency operation. The ordinary `inode()`
+    /// accessor returns an owned record because most of its callers continue
+    /// with content or metadata work, but attribute projection only reads the
+    /// record. Keep the on-demand fallback for an inode not resident in the
+    /// live state and preserve the pending write-buffer size projection.
+    pub(crate) fn inode_attr_by_id(&self, inode_id: InodeId) -> Result<InodeAttr> {
+        if let Some(record) = self.filesystem.state.inodes.get(&inode_id) {
+            let mut attr = self.inode_attr(record);
+            if let Some(buffered_size) = self
+                .filesystem
+                .write_buffers
+                .get(&inode_id)
+                .and_then(WriteBuffer::max_offset)
+            {
+                attr.posix.size = attr.posix.size.max(buffered_size);
+            }
+            return Ok(attr);
+        }
+
+        let record = self.inode(inode_id)?;
+        Ok(self.inode_attr(&record))
     }
 
     fn data_write_space_delta(
@@ -7987,12 +8367,22 @@ impl PoolDatasetOwner {
         Ok(fs)
     }
 
-    pub fn sync_all(&mut self) -> Result<()> {
-        self.commit_if_dirty()?;
+    fn sync_mounted_pool_barrier(&mut self) -> Result<()> {
+        // A filesystem-wide barrier must commit dirty mounted state before it
+        // flushes the Pool, but a quiescent mounted owner must not manufacture
+        // fresh raw-store writes just to re-cross the same durable boundary.
+        if self.mounted_mutation_quiescence_failure().is_some() {
+            self.do_commit()?;
+        }
         self.store
             .pool_mut()
             .sync_all()
             .map_err(FileSystemError::from)
+    }
+
+    pub fn sync_all(&mut self) -> Result<()> {
+        self.ensure_mutation_allowed("synchronize mounted filesystem")?;
+        self.sync_mounted_pool_barrier()
     }
 
     pub fn list_snapshots(&self) -> Vec<SnapshotSummary> {
@@ -8210,6 +8600,10 @@ impl PoolDatasetOwner {
         self.filesystem.inode_cache.borrow_mut().clear();
         self.filesystem
             .authenticated_content_allocation_cache
+            .invalidate();
+        self.filesystem
+            .authenticated_content_layout_cache
+            .borrow_mut()
             .invalidate();
         self.filesystem.state = restored;
         self.filesystem.dataset_capacity = restored_capacity;
@@ -9727,6 +10121,7 @@ impl PoolDatasetOwner {
                 .authenticated_content_allocation_cache
                 .record_live_entries(&committed, entries);
         }
+        self.record_receipted_content_layout(&committed, &content_write);
         self.apply_rewrite_trim_plan(rewrite_trim_plan);
         Ok(committed)
     }
@@ -10229,6 +10624,54 @@ impl PoolDatasetOwner {
         self.filesystem.dataset_capacity.record_free(bytes);
     }
 
+    /// Transfer a suffix that truncate made unreachable out of every
+    /// current-group dirty-byte owner while preserving the still-reachable
+    /// prefix and its original dirty age.
+    fn retire_superseded_dirty_range_debt(
+        &mut self,
+        inode_id: InodeId,
+        retired_buffered_bytes: u64,
+        superseded_from: u64,
+    ) -> Result<()> {
+        if retired_buffered_bytes > 0 {
+            let permit = self.filesystem.pending_permits.remove(&inode_id).ok_or(
+                FileSystemError::CorruptState {
+                    reason: "superseded buffered bytes are missing their dirty admission permit",
+                },
+            )?;
+            let shrunk = match self
+                .filesystem
+                .write_admission
+                .try_shrink_dirty_write(permit, retired_buffered_bytes)
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let reason = error.to_string();
+                    if let Some(permit) = error.into_permit() {
+                        self.filesystem.pending_permits.insert(inode_id, permit);
+                    } else {
+                        self.filesystem.mutation_requires_reopen = true;
+                    }
+                    return Err(FileSystemError::DirtyAdmissionRejected { reason });
+                }
+            };
+            self.filesystem.pending_permits.insert(inode_id, shrunk);
+        }
+
+        let retired = self
+            .filesystem
+            .dirty_set
+            .retire_data_write_from(inode_id, superseded_from);
+        if retired < retired_buffered_bytes {
+            self.filesystem.mutation_requires_reopen = true;
+            return Err(FileSystemError::CorruptState {
+                reason: "superseded buffered bytes exceed exact current-group dirty ranges",
+            });
+        }
+        self.filesystem.commit_group.retire_dirty_bytes(retired);
+        Ok(())
+    }
+
     fn ensure_content_write_not_over_capacity(&self, requested: u64) -> Result<()> {
         let allocated = self.filesystem.dataset_capacity.used_bytes();
         let capacity = self.filesystem.dataset_capacity.total_bytes();
@@ -10309,9 +10752,10 @@ impl PoolDatasetOwner {
         self.discard_dirty_write_buffer_ranges(inode_id, &[(offset, length)]);
     }
 
-    fn truncate_dirty_write_buffer_for_inode(&mut self, inode_id: InodeId, size: u64) {
+    fn truncate_dirty_write_buffer_for_inode(&mut self, inode_id: InodeId, size: u64) -> u64 {
         let freed = self.truncate_write_buffer_for_inode(inode_id, size);
         self.record_dirty_buffer_discard(freed);
+        freed
     }
 
     fn clear_writeback_ranges_from(&self, inode_id: InodeId, offset: u64) {
@@ -10457,36 +10901,90 @@ impl PoolDatasetOwner {
         }
     }
 
-    /// Close an existing deferred group before its next write would exceed
+    /// Relieve an existing deferred group before its next write would exceed
     /// filesystem-owned dirty-work admission.
     ///
-    /// The caller must re-plan against the newly committed state when this
-    /// returns `true`. Explicit transactions are never split, and a request
-    /// that cannot be admitted into an otherwise empty group retains the
-    /// normal rejection result.
-    fn commit_deferred_group_for_write_admission(
+    /// Memory-pressure writeback materializes the oldest admitted inode under
+    /// its current content identity, then releases only that inode's in-memory
+    /// dirty-work permit. The filesystem root and commit group remain dirty;
+    /// fsync, an actual commit-group close, or clean unmount still owns their
+    /// durability boundary. The caller must re-plan against the newly
+    /// Pool-readable live content when this returns `true`.
+    ///
+    /// Explicit transactions are never split. Materializing one inode always
+    /// returns control to the caller so dirty ranges, operation charge,
+    /// capacity, and quota are replanned against the new Pool-backed base.
+    fn relieve_deferred_group_for_write_admission(
         &mut self,
         inode_id: InodeId,
         dirty_bytes: u64,
         dirty_ops: u32,
     ) -> Result<bool> {
-        let admission = &mut self.filesystem.write_admission;
         let check = if self.filesystem.pending_permits.contains_key(&inode_id) {
-            admission.check_dirty_write_expansion(dirty_bytes, dirty_ops)
+            self.filesystem
+                .write_admission
+                .check_dirty_write_expansion(dirty_bytes, dirty_ops)
         } else {
-            admission.check_dirty_write(dirty_bytes, dirty_ops)
+            self.filesystem
+                .write_admission
+                .check_dirty_write(dirty_bytes, dirty_ops)
         };
         match check {
-            Ok(()) => Ok(false),
-            Err(_)
-                if !self.filesystem.in_transaction
-                    && !self.filesystem.pending_permits.is_empty() =>
+            Ok(()) => return Ok(false),
+            Err(error)
+                if self.filesystem.in_transaction || self.filesystem.pending_permits.is_empty() =>
             {
-                self.force_commit(())?;
-                Ok(true)
+                return Err(error.into());
             }
-            Err(error) => Err(error.into()),
+            Err(_) => {}
         }
+
+        let pressure_inode = self
+            .filesystem
+            .pending_permits
+            .iter()
+            .min_by(|(left_inode, left), (right_inode, right)| {
+                let left_charge = left.charge();
+                let right_charge = right.charge();
+                left_charge
+                    .admitted_tick
+                    .cmp(&right_charge.admitted_tick)
+                    .then_with(|| right_charge.dirty_bytes.cmp(&left_charge.dirty_bytes))
+                    .then_with(|| left_inode.cmp(right_inode))
+            })
+            .map(|(candidate, _)| *candidate)
+            .ok_or(FileSystemError::CorruptState {
+                reason: "write admission reported pressure without an owned dirty permit",
+            })?;
+
+        if self.filesystem.write_buffers.contains_key(&pressure_inode)
+            || self
+                .filesystem
+                .buffered_write_base_records
+                .contains_key(&pressure_inode)
+        {
+            self.materialize_write_buffer(pressure_inode)?;
+        }
+
+        let permit = self
+            .filesystem
+            .pending_permits
+            .remove(&pressure_inode)
+            .ok_or(FileSystemError::CorruptState {
+                reason: "materialized write lost its admission permit",
+            })?;
+        if let Err(error) = self.filesystem.write_admission.release(permit) {
+            let reason = error.to_string();
+            if let Some(permit) = error.into_permit() {
+                self.filesystem
+                    .pending_permits
+                    .insert(pressure_inode, permit);
+            } else {
+                self.filesystem.mutation_requires_reopen = true;
+            }
+            return Err(FileSystemError::DirtyAdmissionRejected { reason });
+        }
+        Ok(true)
     }
 
     /// Release all outstanding admission permits after a successful SYNC.
@@ -10529,14 +11027,22 @@ impl PoolDatasetOwner {
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
         let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
-        self.write_file_by_inode_with_ancestors(inode_id, &inode_ancestors, path, offset, bytes)
+        self.write_file_by_inode_with_ancestors(
+            inode_id,
+            &inode_ancestors,
+            path,
+            offset,
+            bytes,
+            WritePrivilegeClear::default(),
+        )
     }
 
-    pub(crate) fn write_file_by_inode(
+    pub(crate) fn write_file_by_inode_with_privilege_clearing(
         &mut self,
         inode_id: InodeId,
         offset: u64,
         bytes: &[u8],
+        clear: WritePrivilegeClear,
     ) -> Result<InodeRecord> {
         let inode_ancestors = self.quota_ancestors_for_inode(inode_id);
         self.write_file_by_inode_with_ancestors(
@@ -10545,6 +11051,7 @@ impl PoolDatasetOwner {
             &format!("inode:{}", inode_id.get()),
             offset,
             bytes,
+            clear,
         )
     }
 
@@ -10555,6 +11062,7 @@ impl PoolDatasetOwner {
         target: &str,
         offset: u64,
         bytes: &[u8],
+        clear: WritePrivilegeClear,
     ) -> Result<InodeRecord> {
         self.ensure_mutation_allowed("write mounted file by inode")?;
         let initial_record = self.inode(inode_id)?.clone();
@@ -10577,6 +11085,59 @@ impl PoolDatasetOwner {
         })?;
         if bytes_len == 0 {
             return Ok(initial_record);
+        }
+        let security_capability_present = clear.clear_security_capability
+            && initial_record
+                .xattrs
+                .contains_key(b"security.capability".as_slice());
+        let clear_suid =
+            clear.clear_suid_sgid && initial_record.mode & tidefs_types_vfs_core::S_ISUID != 0;
+        let clear_sgid = clear.clear_suid_sgid
+            && initial_record.mode & tidefs_types_vfs_core::S_ISGID != 0
+            && initial_record.mode & 0o010 != 0;
+        if security_capability_present || clear_suid || clear_sgid {
+            let mut cleared_record = initial_record.clone();
+            if security_capability_present {
+                cleared_record
+                    .xattrs
+                    .remove(b"security.capability".as_slice());
+            }
+            if clear_suid {
+                cleared_record.mode &= !tidefs_types_vfs_core::S_ISUID;
+            }
+            if clear_sgid {
+                cleared_record.mode &= !tidefs_types_vfs_core::S_ISGID;
+            }
+            self.begin_mutation("clear file privileges before write")?;
+            if security_capability_present {
+                let name = b"security.capability";
+                let namespace = Self::xattr_namespace_from_name(name);
+                let key_hash = blake3::hash(name);
+                let ino_u64 = inode_id.get();
+                let _ = self.filesystem.intent_log_buffer.as_ref().map(|buffer| {
+                    let _frame = buffer.append(
+                        tidefs_intent_log::IntentLogRecord::XattrRemove {
+                            ino: ino_u64,
+                            namespace,
+                            key_hash: *key_hash.as_bytes(),
+                        },
+                        0,
+                    );
+                });
+            }
+            let tick = self.bump_generation();
+            cleared_record.metadata_version = tick;
+            cleared_record.posix_time.ctime_ns =
+                Self::next_metadata_ctime_ns(cleared_record.posix_time.ctime_ns);
+            Self::advance_subtree_revision(&mut cleared_record);
+            self.mark_inode_metadata_dirty(inode_id);
+            Arc::make_mut(&mut self.filesystem.state.inodes)
+                .insert(inode_id, cleared_record.clone());
+            self.filesystem
+                .inode_cache
+                .borrow_mut()
+                .invalidate(inode_id);
+            self.commit_mutation(())?;
         }
         let end = offset
             .checked_add(bytes_len)
@@ -10610,7 +11171,7 @@ impl PoolDatasetOwner {
                 self.write_buffer_uncovered_ranges(inode_id, offset, bytes_len);
             let physical_admit_bytes = Self::range_bytes(&dirty_charge_ranges)?;
             let dirty_ops = self.buffered_write_dirty_op_delta(inode_id, offset, end);
-            if self.commit_deferred_group_for_write_admission(
+            if self.relieve_deferred_group_for_write_admission(
                 inode_id,
                 physical_admit_bytes,
                 dirty_ops,
@@ -10618,11 +11179,11 @@ impl PoolDatasetOwner {
                 continue;
             }
 
-            // A foreground admission commit can materialize every write
-            // buffer and publish a new root. All capacity, quota, replacement,
-            // and accounting planning below therefore runs only after the
-            // commit decision and is repeated if admission ages out while
-            // Pool-backed planning is in progress.
+            // Admission-pressure writeback can materialize one dirty inode
+            // without publishing its commit group. All capacity,
+            // quota, replacement, and accounting planning below therefore
+            // runs only after that pressure decision and is repeated if
+            // admission ages out while Pool-backed planning is in progress.
             self.ensure_content_write_not_over_capacity(bytes_len)?;
             let old_grains = crate::quota::allocation_grains_for_len(record.size);
             let new_grains = crate::quota::allocation_grains_for_len(new_size);
@@ -10647,7 +11208,7 @@ impl PoolDatasetOwner {
             )?;
             let write_space_delta =
                 self.data_write_space_delta(inode_id, &[(offset, bytes_len)])?;
-            if self.commit_deferred_group_for_write_admission(
+            if self.relieve_deferred_group_for_write_admission(
                 inode_id,
                 physical_admit_bytes,
                 dirty_ops,
@@ -10805,11 +11366,11 @@ impl PoolDatasetOwner {
             .borrow_mut()
             .invalidate(inode_id);
         self.mark_inode_content_dirty(inode_id);
-        self.filesystem
+        let newly_dirty_bytes = self
+            .filesystem
             .dirty_set
-            .record_data_write(inode_id, physical_admit_bytes);
-        let _accepted_by_commit_group =
-            self.record_mutation_commit_group_write(physical_admit_bytes);
+            .record_data_write_range(inode_id, offset, bytes_len);
+        let _accepted_by_commit_group = self.record_mutation_commit_group_write(newly_dirty_bytes);
         // PendingData must exist before a threshold-triggered foreground
         // writeback can finalize this accepted range. Allocating it after the
         // flush would replace the finalized extent with a new pending extent.
@@ -11547,11 +12108,12 @@ impl PoolDatasetOwner {
             self.flush_write_buffer(inode_id)?;
         }
         if size < old_effective_size {
-            if has_pending_content {
-                let _ = self.truncate_pending_write_buffer_for_inode(inode_id, size);
+            let retired_buffered = if has_pending_content {
+                self.truncate_pending_write_buffer_for_inode(inode_id, size)
             } else {
-                self.truncate_dirty_write_buffer_for_inode(inode_id, size);
-            }
+                self.truncate_dirty_write_buffer_for_inode(inode_id, size)
+            };
+            self.retire_superseded_dirty_range_debt(inode_id, retired_buffered, size)?;
             self.clear_writeback_ranges_from(inode_id, size);
         }
         let record = self.committed_inode_record(inode_id)?;
@@ -11634,7 +12196,7 @@ impl PoolDatasetOwner {
             result
         };
         if !has_pending_content {
-            self.truncate_dirty_write_buffer_for_inode(inode_id, size);
+            let _ = self.truncate_dirty_write_buffer_for_inode(inode_id, size);
         }
         // ── Intent-log: record truncate for crash recovery replay ──
         // Record the truncate after all extent and write-buffer mutations
@@ -12559,7 +13121,6 @@ impl PoolDatasetOwner {
             .ok_or_else(|| FileSystemError::NotFound {
                 path: path_for_error.to_string(),
             })?;
-        self.flush_file_write_buffer_for_entry(&entry)?;
         let record = self.inode(entry.inode_id)?.clone();
         if record.kind() == NodeKind::Dir {
             return Err(FileSystemError::IsDirectory {
@@ -12568,6 +13129,30 @@ impl PoolDatasetOwner {
         }
 
         let was_multilinked = record.nlink > 1;
+        let removes_unreachable_inode = !was_multilinked && !retain_last_link_inode;
+        let discarded_buffer_bytes = if removes_unreachable_inode {
+            self.filesystem
+                .write_buffers
+                .get(&entry.inode_id)
+                .map_or(0, |buffer| buffer.buffered_bytes() as u64)
+        } else {
+            self.flush_file_write_buffer_for_entry(&entry)?;
+            0
+        };
+        // An accepted buffered content version is visible in the live inode
+        // before its objects become Pool-readable. Last-link removal with no
+        // live handle makes that version unreachable, so reclaim only the
+        // last materialized base instead of writing the pending version solely
+        // to delete it.
+        let mut reclaim_record = if removes_unreachable_inode {
+            self.filesystem
+                .buffered_write_base_records
+                .get(&entry.inode_id)
+                .cloned()
+                .unwrap_or_else(|| record.clone())
+        } else {
+            record.clone()
+        };
         let mut orphan_md_permit = if was_multilinked {
             None
         } else {
@@ -12598,12 +13183,20 @@ impl PoolDatasetOwner {
                     .accumulate_delta(SpaceDelta::new_punch_hole(logical_free, reserved_free));
             }
             let physical_free = data_bytes.saturating_add(reserved_bytes);
-            if physical_free > 0 {
+            // `forget_removed_inode_state` returns the buffered component.
+            // Account the remaining live extents here so the whole inode is
+            // freed exactly once even when its newest data never reached the
+            // Pool.
+            let materialized_or_reserved_free =
+                physical_free.saturating_sub(discarded_buffer_bytes);
+            if materialized_or_reserved_free > 0 {
                 self.filesystem
                     .state
                     .space_accounting
-                    .track_physical_free(physical_free);
-                self.filesystem.dataset_capacity.record_free(physical_free);
+                    .track_physical_free(materialized_or_reserved_free);
+                self.filesystem
+                    .dataset_capacity
+                    .record_free(materialized_or_reserved_free);
             }
         }
         // Re-verify parent exists after lock acquisition
@@ -12686,7 +13279,8 @@ impl PoolDatasetOwner {
             if retain_last_link_inode {
                 return self.commit_mutation(());
             }
-            self.record_reclaim_delta(entry.inode_id, record.size);
+            reclaim_record.nlink = 0;
+            self.record_reclaim_delta_for_record(&reclaim_record);
             self.record_inode_tombstone(entry.inode_id);
             // Clear extended attributes before removing the inode record.
             // Although the entire InodeRecord (which owns xattrs) is removed,
@@ -12701,7 +13295,11 @@ impl PoolDatasetOwner {
             Arc::make_mut(&mut self.filesystem.state.inodes).remove(&entry.inode_id);
             self.forget_removed_inode_state(entry.inode_id);
         }
-        self.commit_mutation(())
+        self.commit_mutation(())?;
+        if removes_unreachable_inode {
+            self.release_removed_inode_dirty_permit(entry.inode_id)?;
+        }
+        Ok(())
     }
 
     fn account_final_orphan_release(&mut self, record: &InodeRecord) {
@@ -13619,18 +14217,21 @@ impl PoolDatasetOwner {
 
     pub fn get_xattr_by_inode(&self, inode_id: InodeId, name: &[u8]) -> Result<Option<Vec<u8>>> {
         self.ensure_xattr_inode_exists(inode_id)?;
-        let record = self.inode(inode_id)?;
+        let value = match self.filesystem.state.inodes.get(&inode_id) {
+            Some(record) => record.xattrs.get(name).cloned(),
+            None => self.inode(inode_id)?.xattrs.get(name).cloned(),
+        };
         // Re-encode ACL entries from decoded form back to canonical wire format.
         const ACL_ACCESS: &[u8] = b"system.posix_acl_access";
         const ACL_DEFAULT: &[u8] = b"system.posix_acl_default";
         if name == ACL_ACCESS || name == ACL_DEFAULT {
-            if let Some(raw) = record.xattrs.get(name) {
+            if let Some(raw) = value.as_deref() {
                 if let Ok(acl) = tidefs_posix_acl::decode_posix_acl_xattr(raw) {
                     return Ok(Some(tidefs_posix_acl::encode_posix_acl_xattr(&acl)));
                 }
             }
         }
-        Ok(record.xattrs.get(name).cloned())
+        Ok(value)
     }
 
     #[allow(dead_code)] // INTENT: path-dispatch support retained for crate tests; VFS hot path uses inode dispatch.
@@ -14155,6 +14756,7 @@ impl PoolDatasetOwner {
                 .authenticated_content_allocation_cache
                 .record_live_entries(&committed, entries);
         }
+        self.record_receipted_content_layout(&committed, &content_write);
         self.apply_rewrite_trim_plan(rewrite_trim_plan);
         Ok(committed)
     }
@@ -14291,6 +14893,7 @@ impl PoolDatasetOwner {
                 .authenticated_content_allocation_cache
                 .record_live_entries(&committed, entries);
         }
+        self.record_receipted_content_layout(&committed, &content_write);
         self.apply_rewrite_trim_plan(rewrite_trim_plan);
         Ok(committed)
     }
@@ -14312,7 +14915,8 @@ impl PoolDatasetOwner {
             self.filesystem.uncommitted_mutation_count.saturating_add(1);
 
         if self.filesystem.uncommitted_mutation_count >= self.filesystem.max_uncommitted_mutations
-            || (!self.filesystem.in_transaction && self.filesystem.commit_group.should_quiesce())
+            || (!self.filesystem.in_transaction
+                && self.filesystem.commit_group.requires_foreground_commit())
         {
             return self.force_commit(value);
         }
@@ -15072,12 +15676,7 @@ impl PoolDatasetOwner {
     pub fn fsync_all(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("synchronize mounted filesystem")?;
         let started = Instant::now();
-        self.do_commit()?;
-        let result = self
-            .store
-            .pool_mut()
-            .sync_all()
-            .map_err(FileSystemError::from);
+        let result = self.sync_mounted_pool_barrier();
         self.filesystem
             .fsync_stats
             .fsync_all_count
@@ -15602,6 +16201,11 @@ impl PoolDatasetOwner {
         }
         if must_persist {
             self.sync_extent_allocator_to_state()?;
+            // Replacement receipts are durable after write-buffer flushing.
+            // Promote their predecessor keys before root publication so the
+            // exact reclaim obligations survive a crash even though the
+            // expensive root scan and Pool deletion handoff run later.
+            self.process_deferred_rewrite_trims()?;
             // Reclaim obligations created by this mutation must reach Pool
             // placement authority before the transaction sync and committed
             // root can make their source objects unreachable. The transaction
@@ -15610,13 +16214,19 @@ impl PoolDatasetOwner {
             let transaction_id = transaction_id.ok_or(FileSystemError::CorruptState {
                 reason: "mounted commit lost its selected transaction identity",
             })?;
-            let publication = match persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
-                &mut self.store,
-                &self.filesystem.state,
-                transaction_id,
-                self.filesystem.root_authentication_key,
-                &self.filesystem.pending_snapshot_root_rewrites,
-            ) {
+            let publication_result = {
+                let authenticated_content_manifests =
+                    self.filesystem.authenticated_content_layout_cache.borrow();
+                persist_state_with_runtime_at_transaction_and_snapshot_rewrites(
+                    &mut self.store,
+                    &self.filesystem.state,
+                    transaction_id,
+                    self.filesystem.root_authentication_key,
+                    &self.filesystem.pending_snapshot_root_rewrites,
+                    Some(&authenticated_content_manifests),
+                )
+            };
+            let publication = match publication_result {
                 Ok(publication) => publication,
                 Err(error) => {
                     if matches!(&error, FileSystemError::PublishOutcomeUncertain { .. }) {
@@ -15628,11 +16238,11 @@ impl PoolDatasetOwner {
             check_crash_hook(CrashInjectionPoint::CommitGroupAfterAppendData);
             // Re-verify the stored root commit (#870).
             check_crash_hook(CrashInjectionPoint::CommitGroupBeforeCommit);
-            // Persistence already re-read and authenticated the prepared
-            // superblock, manifest, and every changed metadata entry before
-            // publication. Re-read the canonical typed root after publication
-            // without turning each commit into a scrub of every unchanged
-            // content object.
+            // Persistence already authenticated the prepared superblock,
+            // manifest, and every changed metadata entry before publication.
+            // Changed content is covered either by its exact write receipts or
+            // by strict Pool reads. Re-read the canonical typed root after
+            // publication without turning each commit into a content scrub.
             let stored_bytes = self.store.load_dataset_root(
                 DatasetId::from_bytes(self.filesystem.mounted_dataset_id),
                 DatasetRootKind::Filesystem,
@@ -15744,10 +16354,6 @@ impl PoolDatasetOwner {
                 .notify_committed(CommitGroupId(commit_log.commit_group.0));
         }
         check_crash_hook(CrashInjectionPoint::CommitGroupAfterFlush);
-        // Progress background services after each commit so that
-        // orphan reclamation and other deferred work advances
-        // under per-tick budget without blocking mount or I/O.
-        self.tick_background_services()?;
 
         // ── Space pressure update after commit ──────────────────────────
         // Update space pressure tracking from current pool capacity stats.
@@ -15819,17 +16425,20 @@ impl PoolDatasetOwner {
     /// for the next explicit fsync or manual commit.
     ///
     /// Returns true if a commit was performed.
-    pub fn commit_group_maintenance_tick(&mut self) -> Result<bool> {
-        self.ensure_mutation_allowed("run commit-group maintenance")?;
-        let should_commit = match self.filesystem.commit_group.phase {
+    fn commit_group_maintenance_pending(&self) -> bool {
+        match self.filesystem.commit_group.phase {
             CommitGroupPhase::Open => self.filesystem.commit_group.should_quiesce(),
             CommitGroupPhase::Quiesce => {
                 self.filesystem.commit_group.quiesce_timed_out()
                     || self.filesystem.commit_group.inflight_writes == 0
             }
             CommitGroupPhase::Sync => false,
-        };
-        if should_commit {
+        }
+    }
+
+    pub fn commit_group_maintenance_tick(&mut self) -> Result<bool> {
+        self.ensure_mutation_allowed("run commit-group maintenance")?;
+        if self.commit_group_maintenance_pending() {
             self.commit_if_dirty()?;
             Ok(true)
         } else {
@@ -16047,6 +16656,22 @@ impl PoolDatasetOwner {
         self.release_pending_permits()
     }
 
+    fn release_removed_inode_dirty_permit(&mut self, inode_id: InodeId) -> Result<()> {
+        let Some(permit) = self.filesystem.pending_permits.remove(&inode_id) else {
+            return Ok(());
+        };
+        if let Err(error) = self.filesystem.write_admission.release(permit) {
+            let reason = error.to_string();
+            if let Some(permit) = error.into_permit() {
+                self.filesystem.pending_permits.insert(inode_id, permit);
+            } else {
+                self.filesystem.mutation_requires_reopen = true;
+            }
+            return Err(FileSystemError::DirtyAdmissionRejected { reason });
+        }
+        Ok(())
+    }
+
     fn forget_removed_inode_state(&mut self, inode_id: InodeId) {
         self.snapshot_write_buffers_for_rollback();
         let freed = self
@@ -16081,11 +16706,25 @@ impl PoolDatasetOwner {
         self.filesystem
             .obligation_ledger
             .release_claims_for_inode(inode_id);
+        let retired_dirty_bytes = self
+            .filesystem
+            .dirty_set
+            .per_inode_bytes
+            .get(&inode_id)
+            .copied()
+            .unwrap_or(0);
         self.filesystem.dirty_set.forget_inode(inode_id);
+        self.filesystem
+            .commit_group
+            .retire_dirty_bytes(retired_dirty_bytes);
         self.filesystem
             .inode_cache
             .borrow_mut()
             .invalidate(inode_id);
+        self.filesystem
+            .authenticated_content_layout_cache
+            .borrow_mut()
+            .remove(inode_id);
         self.page_cache_evict_inode_unchecked(inode_id);
         self.filesystem
             .writeback_range_tracker
@@ -16167,6 +16806,10 @@ impl PoolDatasetOwner {
         // authentication result across that authority boundary.
         self.filesystem
             .authenticated_content_allocation_cache
+            .invalidate();
+        self.filesystem
+            .authenticated_content_layout_cache
+            .borrow_mut()
             .invalidate();
         let total_bytes = self.filesystem.allocator_policy.content_capacity_bytes;
         self.filesystem.dataset_capacity = Self::capacity_authority_from_committed_content(
@@ -16261,6 +16904,10 @@ impl PoolDatasetOwner {
 
     fn rollback_mutation_delta(&mut self) {
         self.filesystem.inode_cache.borrow_mut().clear();
+        self.filesystem
+            .authenticated_content_layout_cache
+            .borrow_mut()
+            .invalidate();
         self.store.discard_metadata_candidate();
         self.filesystem.pending_snapshot_root_rewrites.clear();
         if let Some(delta) = self.filesystem.mutation_delta.take() {
@@ -16377,7 +17024,6 @@ impl PoolDatasetOwner {
         planned_entries: BTreeMap<ObjectKey, u64>,
     ) -> Result<()> {
         let keyspace = self.object_keyspace();
-        let mut current_entries = BTreeMap::new();
         let pool_readable_records: Vec<InodeRecord> = self
             .filesystem
             .state
@@ -16404,56 +17050,62 @@ impl PoolDatasetOwner {
             .authenticated_content_allocation_cache
             .retain_live_inodes(&live_inode_ids);
         for pool_readable_record in pool_readable_records {
-            // Replaced content is excluded from the capacity union. Still
-            // authenticate a cache miss before superseding it, but do not
-            // clone an already-authenticated entry set only to discard it.
-            if Some(pool_readable_record.inode_id) == replaced_inode {
-                if self
-                    .filesystem
-                    .authenticated_content_allocation_cache
-                    .live_entries(&pool_readable_record)
-                    .is_none()
-                {
-                    let entries = content_allocation_entries_for_inode_pool_in_keyspace(
-                        self.store.pool(),
-                        &pool_readable_record,
-                        keyspace,
-                    )?;
-                    self.filesystem
-                        .authenticated_content_allocation_cache
-                        .record_live_entries(&pool_readable_record, entries);
-                }
-                continue;
-            }
-            let inode_entries = match self
+            if self
                 .filesystem
                 .authenticated_content_allocation_cache
                 .live_entries(&pool_readable_record)
-                .cloned()
+                .is_none()
             {
-                Some(entries) => entries,
-                None => {
-                    let entries = content_allocation_entries_for_inode_pool_in_keyspace(
-                        self.store.pool(),
-                        &pool_readable_record,
-                        keyspace,
-                    )?;
-                    self.filesystem
-                        .authenticated_content_allocation_cache
-                        .record_live_entries(&pool_readable_record, entries.clone());
-                    entries
-                }
-            };
-            merge_allocation_entries(&mut current_entries, inode_entries);
+                let entries = content_allocation_entries_for_inode_pool_in_keyspace(
+                    self.store.pool(),
+                    &pool_readable_record,
+                    keyspace,
+                )?;
+                self.filesystem
+                    .authenticated_content_allocation_cache
+                    .record_live_entries(&pool_readable_record, entries);
+            }
         }
-        merge_allocation_entries(
-            &mut current_entries,
-            planned_entries
-                .into_iter()
-                .map(|(key, grains)| (keyspace.scope(key), grains))
-                .collect(),
-        );
-        self.ensure_content_capacity_for_current_entries(current_entries)
+        let retained_roots = snapshot_retained_roots(&self.filesystem.state);
+        if self
+            .filesystem
+            .authenticated_content_allocation_cache
+            .retained_entries(&retained_roots)
+            .is_none()
+        {
+            let entries = protected_committed_content_entries_pool(
+                self.store.pool_mut(),
+                self.filesystem.root_authentication_key,
+                &self.filesystem.state,
+            )?;
+            self.filesystem
+                .authenticated_content_allocation_cache
+                .record_retained_entries(retained_roots, entries);
+        }
+        let planned_entries = planned_entries
+            .into_iter()
+            .map(|(key, grains)| (keyspace.scope(key), grains))
+            .collect();
+        let allocated = self
+            .filesystem
+            .authenticated_content_allocation_cache
+            .projected_allocation_bytes(replaced_inode, &planned_entries)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "authenticated allocation projection is incomplete after hydration",
+            })?;
+        if allocated > self.filesystem.allocator_policy.content_capacity_bytes {
+            return Err(FileSystemError::NoSpace {
+                resource: LocalStorageResource::ContentBytes,
+                requested: allocated,
+                available: self
+                    .allocator_policy
+                    .content_capacity_bytes
+                    .saturating_sub(allocated),
+                capacity: self.filesystem.allocator_policy.content_capacity_bytes,
+                allocated,
+            });
+        }
+        Ok(())
     }
 
     /// Return allocation bytes already authenticated for this exact live
@@ -16483,47 +17135,6 @@ impl PoolDatasetOwner {
             .authenticated_content_allocation_cache
             .record_live_entries(record, entries);
         Ok(bytes)
-    }
-
-    fn ensure_content_capacity_for_current_entries(
-        &mut self,
-        current_entries: BTreeMap<ObjectKey, u64>,
-    ) -> Result<()> {
-        let retained_roots = snapshot_retained_roots(&self.filesystem.state);
-        let mut reserved_entries = match self
-            .filesystem
-            .authenticated_content_allocation_cache
-            .retained_entries(&retained_roots)
-            .cloned()
-        {
-            Some(entries) => entries,
-            None => {
-                let entries = protected_committed_content_entries_pool(
-                    self.store.pool_mut(),
-                    self.filesystem.root_authentication_key,
-                    &self.filesystem.state,
-                )?;
-                self.filesystem
-                    .authenticated_content_allocation_cache
-                    .record_retained_entries(retained_roots, entries.clone());
-                entries
-            }
-        };
-        merge_allocation_entries(&mut reserved_entries, current_entries);
-        let allocated = allocation_bytes(&reserved_entries)?;
-        if allocated > self.filesystem.allocator_policy.content_capacity_bytes {
-            return Err(FileSystemError::NoSpace {
-                resource: LocalStorageResource::ContentBytes,
-                requested: allocated,
-                available: self
-                    .allocator_policy
-                    .content_capacity_bytes
-                    .saturating_sub(allocated),
-                capacity: self.filesystem.allocator_policy.content_capacity_bytes,
-                allocated,
-            });
-        }
-        Ok(())
     }
 
     /// Gate a policy-observation build's proposed allocation through its
@@ -16589,9 +17200,10 @@ impl PoolDatasetOwner {
         if self.filesystem.state.corrupted_inodes.contains(&inode_id) {
             return Err(FileSystemError::CorruptContent { inode_id });
         }
-
-        let content_reader = self.mounted_content_reader();
-        content_reader.read_all(inode_id, record)
+        let length = usize::try_from(record.size).map_err(|_| FileSystemError::SizeOverflow {
+            requested: record.size,
+        })?;
+        self.read_committed_content_range(inode_id, record, 0, length)
     }
 
     fn read_content_range(
@@ -16633,11 +17245,6 @@ impl PoolDatasetOwner {
             usize::try_from(clipped_len_u64).map_err(|_| FileSystemError::SizeOverflow {
                 requested: clipped_len_u64,
             })?;
-        if offset == 0 && length_u64 >= record.size {
-            let content_reader = self.mounted_content_reader();
-            return content_reader.read_all(inode_id, record);
-        }
-
         let layout = self.read_committed_content_layout(inode_id, record)?;
         let content_reader = self.mounted_content_reader();
         let bytes = content_reader.read_range(&layout, offset, clipped_len)?;
@@ -16655,8 +17262,22 @@ impl PoolDatasetOwner {
                 kind: record.kind(),
             });
         }
+        if let Some(layout) = self
+            .filesystem
+            .authenticated_content_layout_cache
+            .borrow()
+            .layout(inode_id, record)
+            .cloned()
+        {
+            return Ok(layout);
+        }
         let content_reader = self.mounted_content_reader();
-        content_reader.read_layout(inode_id, record)
+        let layout = content_reader.read_layout(inode_id, record)?;
+        self.filesystem
+            .authenticated_content_layout_cache
+            .borrow_mut()
+            .record(record, layout.clone());
+        Ok(layout)
     }
 
     fn resolve_parent_and_name(&self, path: &str) -> Result<(InodeId, Vec<u8>)> {
@@ -16718,6 +17339,8 @@ impl PoolDatasetOwner {
     /// Apply and persist the accumulated space delta.
     fn commit_space_delta(&mut self) -> Result<()> {
         let phys = self.derive_dataset_capacity_counters();
+        let counters_before = *self.filesystem.state.space_accounting.counters();
+        let pending_delta = self.filesystem.state.space_accounting.pending_delta();
         if !self.filesystem.state.space_accounting.has_pending_delta() {
             self.filesystem
                 .dataset_capacity
@@ -16731,8 +17354,15 @@ impl PoolDatasetOwner {
             .state
             .space_accounting
             .commit_pending(phys)
-            .map_err(|_e| FileSystemError::CorruptState {
-                reason: "space accounting delta application failed",
+            .map_err(|error| {
+                if shutdown_diagnostics_enabled() {
+                    eprintln!(
+                        "tidefs-diagnostic: commit_space_delta failed counters_before={counters_before:?} pending_delta={pending_delta:?} phys={phys:?} error={error:?}"
+                    );
+                }
+                FileSystemError::CorruptState {
+                    reason: "space accounting delta application failed",
+                }
             })?;
         // Persist space counters alongside committed state
         let counters = self.filesystem.state.space_accounting.counters();
@@ -18035,6 +18665,20 @@ mod orphan_index_integration_tests {
         }
 
         #[test]
+        fn carrier_maintenance_handoff_quiesces_internal_scheduler() {
+            let root = tempfile::tempdir().expect("create carrier handoff fixture");
+            let mut fs = LocalFileSystem::open(root.path()).expect("open filesystem");
+            assert!(fs.background_scheduler.is_some());
+
+            fs.delegate_background_maintenance_to_carrier();
+
+            assert!(
+                fs.background_scheduler.is_none(),
+                "an embedding carrier must become the only periodic maintenance authority"
+            );
+        }
+
+        #[test]
         #[cfg(feature = "data-policy")]
         fn online_defrag_stats_are_exposed_on_open() {
             let root = std::env::temp_dir().join("bs_test_online_defrag_stats");
@@ -18213,6 +18857,8 @@ mod orphan_index_integration_tests {
         fs.write_file("/dedup.bin", 0, &payload)
             .expect("write dedup file");
         fs.sync_all().expect("commit dedup file");
+        fs.tick_background_services()
+            .expect("drain initial dedup reclaim work");
 
         let record = fs.stat("/dedup.bin").expect("stat dedup file");
         let layout = MountedContentReadAuthority::new(fs.store.pool())
@@ -18275,6 +18921,193 @@ mod orphan_index_integration_tests {
     }
 
     #[test]
+    fn mounted_reclaim_commit_persists_queue_without_foreground_drain() {
+        let (root, mut fs) =
+            make_test_fs("mounted_reclaim_deferred_commit").expect("open mounted reclaim fixture");
+        fs.stop_background_scheduler();
+        fs.set_auto_commit(false)
+            .expect("disable automatic fixture commits");
+
+        let first =
+            enqueue_exact_reclaim_entry(&fs, ObjectKey::from_name(b"mounted-reclaim-absent-first"));
+        let second = enqueue_exact_reclaim_entry(
+            &fs,
+            ObjectKey::from_name(b"mounted-reclaim-absent-second"),
+        );
+        fs.create_file("/commit-marker", DEFAULT_FILE_PERMISSIONS)
+            .expect("dirty mounted state");
+        fs.do_commit().expect("commit durable reclaim obligations");
+
+        assert_eq!(
+            fs.reclaim_queue_depth(),
+            2,
+            "foreground commit must not perform strict reclaim reads or deletion handoff"
+        );
+        drop(fs);
+
+        let mut reopened = LocalFileSystem::open(&root).expect("reopen durable reclaim queue");
+        reopened.stop_background_scheduler();
+        assert_eq!(reopened.reclaim_queue_depth(), 2);
+
+        let first_tick = reopened
+            .tick_background_services_with_reclaim_limit(1)
+            .expect("run one bounded mounted reclaim tick");
+        assert_eq!(first_tick.entries_drained, 1);
+        assert_eq!(reopened.reclaim_queue_depth(), 1);
+
+        let remaining = reopened.reclaim_queue.lock().unwrap().entries();
+        assert!(
+            remaining == vec![(first.object_key, first)]
+                || remaining == vec![(second.object_key, second)],
+            "one exact durable obligation must remain after a one-item tick"
+        );
+
+        let second_tick = reopened
+            .tick_background_services_with_reclaim_limit(1)
+            .expect("run second bounded mounted reclaim tick");
+        assert_eq!(second_tick.entries_drained, 1);
+        assert_eq!(reopened.reclaim_queue_depth(), 0);
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mounted_reclaim_protection_yields_inside_committed_root_scan() {
+        let (root, mut fs) =
+            make_test_fs("mounted_reclaim_preempt_root_scan").expect("open filesystem");
+        fs.stop_background_scheduler();
+
+        let queued = enqueue_exact_reclaim_entry(
+            &fs,
+            ObjectKey::from_name(b"mounted-reclaim-preempt-root-scan"),
+        );
+        let current_root = fs
+            .selected_committed_root_summary()
+            .expect("select current root");
+        let state = fs.filesystem.state.clone();
+        let root_authentication_key = fs.filesystem.root_authentication_key;
+        let mut preemption_checks = 0;
+        let outcome = reclaim_protected_content_keys_pool_until(
+            fs.store.pool_mut(),
+            root_authentication_key,
+            &current_root,
+            &state,
+            &mut || {
+                preemption_checks += 1;
+                preemption_checks >= 4
+            },
+        )
+        .expect("yield root protection scan");
+
+        assert!(
+            outcome.is_none(),
+            "foreground demand must interrupt committed-root scanning"
+        );
+        assert_eq!(preemption_checks, 4);
+        assert_exact_reclaim_entry_pending(&fs, queued);
+
+        drop(fs);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mounted_reclaim_content_validation_yields_between_strict_chunk_reads() {
+        let (root, mut fs) =
+            make_test_fs("mounted_reclaim_preempt_chunk_scan").expect("open filesystem");
+        fs.stop_background_scheduler();
+        fs.set_auto_commit(false)
+            .expect("disable automatic fixture commits");
+        fs.create_file("/live.bin", DEFAULT_FILE_PERMISSIONS)
+            .expect("create live chunked file");
+        let payload = vec![0x5a; FILESYSTEM_CONTENT_CHUNK_SIZE * 2 + 1];
+        fs.replace_file("/live.bin", &payload)
+            .expect("write live chunked file");
+        fs.sync_all().expect("commit live chunked file");
+
+        let inode = fs.stat("/live.bin").expect("stat live chunked file");
+        let mut preemption_checks = 0;
+        let outcome = transaction_manifest_entries_for_pool_content_in_keyspace_until(
+            fs.store.pool(),
+            &inode,
+            fs.object_keyspace(),
+            &mut || {
+                preemption_checks += 1;
+                preemption_checks >= 4
+            },
+        )
+        .expect("yield receipt-authenticated chunk validation");
+
+        assert!(
+            outcome.is_none(),
+            "foreground demand must interrupt validation after a strict chunk read"
+        );
+        assert_eq!(preemption_checks, 4);
+        assert_eq!(
+            fs.read_file("/live.bin").expect("read retained live file"),
+            payload
+        );
+
+        drop(fs);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mounted_reclaim_commit_promotes_rewrite_trims_before_root() {
+        let (root, mut fs) = make_test_fs("mounted_reclaim_rewrite_promotion")
+            .expect("open mounted rewrite fixture");
+        fs.stop_background_scheduler();
+        fs.set_auto_commit(false)
+            .expect("disable automatic fixture commits");
+
+        let created = fs
+            .create_file("/commit-marker", DEFAULT_FILE_PERMISSIONS)
+            .expect("dirty mounted state");
+        let replacement_bytes = b"durable replacement";
+        let mut replacement_record = created.clone();
+        replacement_record.data_version = created.data_version.saturating_add(1);
+        replacement_record.metadata_version = replacement_record.data_version;
+        replacement_record.size = replacement_bytes.len() as u64;
+        let old_key = content_object_key_for_version(created.inode_id, created.data_version);
+        let new_key = content_object_key_for_version(
+            replacement_record.inode_id,
+            replacement_record.data_version,
+        );
+        let keyspace = fs.object_keyspace();
+        fs.store
+            .pool_mut()
+            .put_with_receipt(
+                DeviceIoClass::Data,
+                keyspace.scope(new_key),
+                &encode_content(&replacement_record, replacement_bytes),
+            )
+            .expect("publish replacement receipt");
+        fs.deferred_rewrite_trims.push((old_key, new_key));
+
+        fs.do_commit().expect("commit replacement content");
+        assert!(
+            fs.deferred_rewrite_trims.is_empty(),
+            "durable replacement receipts must promote trims before root publication"
+        );
+        assert!(
+            fs.reclaim_queue
+                .lock()
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|(key, _entry)| key.0 == *keyspace.scope(old_key).as_bytes()),
+            "foreground commit must retain promoted obligations for background handoff"
+        );
+        drop(fs);
+
+        let reopened = LocalFileSystem::open(&root).expect("reopen promoted reclaim queue");
+        assert!(reopened.reclaim_queue_depth() > 0);
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn reclaim_keeps_entries_pending_when_snapshot_root_authority_is_unprovable() {
         let (root, mut fs) =
             make_test_fs("reclaim_uncertain_snapshot_root").expect("open filesystem");
@@ -18286,6 +19119,8 @@ mod orphan_index_integration_tests {
         fs.replace_file("/snapshot.bin", b"snapshot-protected payload")
             .expect("write snapshot file");
         fs.sync_all().expect("commit snapshot payload");
+        fs.tick_background_services()
+            .expect("drain pre-snapshot reclaim work");
         fs.create_snapshot("keep").expect("create snapshot");
 
         let record = fs.stat("/snapshot.bin").expect("stat snapshot file");
@@ -18463,6 +19298,8 @@ mod orphan_index_integration_tests {
                 .expect("advance redirect fallback ring");
             fs.do_commit()
                 .expect("commit redirect fallback-ring advance");
+            fs.tick_background_services()
+                .expect("run redirect fallback-ring reclaim tick");
         }
         assert!(
             !fs.collect_reclaim_protected_content_keys()
@@ -18576,6 +19413,8 @@ mod orphan_index_integration_tests {
         fs.create_file("/file", 0o644).expect("create_file");
         fs.write_file("/file", 0, &[0u8; 4096]).expect("write");
         fs.do_commit().expect("commit");
+        fs.tick_background_services()
+            .expect("drain initial background reclaim");
 
         // Before unlink, reclaim queue should be empty.
         assert!(fs.reclaim_queue_depth() == 0);
@@ -18662,6 +19501,8 @@ mod orphan_index_integration_tests {
         fs.create_file("/file", 0o644).expect("create_file");
         fs.write_file("/file", 0, &[0u8; 8192]).expect("write");
         fs.do_commit().expect("commit");
+        fs.tick_background_services()
+            .expect("drain initial background reclaim");
 
         assert!(fs.reclaim_queue_depth() == 0);
 
@@ -18739,6 +19580,8 @@ mod orphan_index_integration_tests {
         fs.write_file("/drop", 0, &[0xAAu8; 4096])
             .expect("write drop");
         fs.do_commit().expect("commit");
+        fs.tick_background_services()
+            .expect("drain initial background reclaim");
 
         // Both files must be reachable pre-op.
         let s_keep = fs.stat("/keep").expect("stat keep");
@@ -18784,6 +19627,8 @@ mod orphan_index_integration_tests {
             fs.create_file(format!("/root-advance-{index}"), 0o644)
                 .expect("advance fallback ring");
             fs.do_commit().expect("commit fallback-ring advance");
+            fs.tick_background_services()
+                .expect("run fallback-ring reclaim tick");
         }
         assert_eq!(
             fs.reclaim_queue_depth(),
@@ -18841,6 +19686,8 @@ mod orphan_index_integration_tests {
                 .expect("write_file");
         }
         fs.do_commit().expect("initial commit");
+        fs.tick_background_services()
+            .expect("drain initial background reclaim");
         assert_eq!(
             fs.reclaim_queue_depth(),
             0,
@@ -18874,6 +19721,8 @@ mod orphan_index_integration_tests {
             fs.create_file(format!("/burst-root-advance-{index}"), 0o644)
                 .expect("advance burst fallback ring");
             fs.do_commit().expect("commit burst fallback-ring advance");
+            fs.tick_background_services()
+                .expect("run burst fallback-ring reclaim tick");
         }
         assert_eq!(
             fs.reclaim_queue_depth(),

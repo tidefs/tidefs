@@ -49,6 +49,10 @@ impl From<&InodeRecord> for AuthenticatedContentIdentity {
 struct AuthenticatedInodeAllocation {
     identity: AuthenticatedContentIdentity,
     entries: BTreeMap<ObjectKey, u64>,
+    /// Bytes this inode adds to the union after retained-root keys are
+    /// accounted. Content keys carry the inode id, so live inode maps cannot
+    /// overlap each other; only retained roots can share a live key.
+    union_contribution_bytes: u128,
 }
 
 /// Mount-local allocation maps already authenticated through current Pool
@@ -67,9 +71,27 @@ pub(crate) struct AuthenticatedContentAllocationCache {
     live_inodes: BTreeMap<InodeId, AuthenticatedInodeAllocation>,
     retained_roots: Option<Vec<CommittedRootSummary>>,
     retained_entries: BTreeMap<ObjectKey, u64>,
+    retained_bytes: u128,
+    live_union_contribution_bytes: u128,
 }
 
 impl AuthenticatedContentAllocationCache {
+    fn entry_bytes(entries: &BTreeMap<ObjectKey, u64>) -> u128 {
+        entries.values().copied().map(u128::from).sum()
+    }
+
+    fn live_union_contribution_bytes(
+        entries: &BTreeMap<ObjectKey, u64>,
+        retained_entries: &BTreeMap<ObjectKey, u64>,
+    ) -> u128 {
+        entries
+            .iter()
+            .map(|(key, bytes)| {
+                u128::from(bytes.saturating_sub(retained_entries.get(key).copied().unwrap_or(0)))
+            })
+            .sum()
+    }
+
     pub(crate) fn live_entries(&self, record: &InodeRecord) -> Option<&BTreeMap<ObjectKey, u64>> {
         let cached = self.live_inodes.get(&record.inode_id)?;
         (cached.identity == AuthenticatedContentIdentity::from(record)).then_some(&cached.entries)
@@ -80,11 +102,22 @@ impl AuthenticatedContentAllocationCache {
         record: &InodeRecord,
         entries: BTreeMap<ObjectKey, u64>,
     ) {
+        let union_contribution_bytes =
+            Self::live_union_contribution_bytes(&entries, &self.retained_entries);
+        if let Some(previous) = self.live_inodes.get(&record.inode_id) {
+            self.live_union_contribution_bytes = self
+                .live_union_contribution_bytes
+                .saturating_sub(previous.union_contribution_bytes);
+        }
+        self.live_union_contribution_bytes = self
+            .live_union_contribution_bytes
+            .saturating_add(union_contribution_bytes);
         self.live_inodes.insert(
             record.inode_id,
             AuthenticatedInodeAllocation {
                 identity: AuthenticatedContentIdentity::from(record),
                 entries,
+                union_contribution_bytes,
             },
         );
     }
@@ -92,6 +125,11 @@ impl AuthenticatedContentAllocationCache {
     pub(crate) fn retain_live_inodes(&mut self, live_inodes: &std::collections::BTreeSet<InodeId>) {
         self.live_inodes
             .retain(|inode_id, _| live_inodes.contains(inode_id));
+        self.live_union_contribution_bytes = self
+            .live_inodes
+            .values()
+            .map(|cached| cached.union_contribution_bytes)
+            .sum();
     }
 
     pub(crate) fn retained_entries(
@@ -106,8 +144,54 @@ impl AuthenticatedContentAllocationCache {
         retained_roots: Vec<CommittedRootSummary>,
         entries: BTreeMap<ObjectKey, u64>,
     ) {
+        self.retained_bytes = Self::entry_bytes(&entries);
+        self.live_union_contribution_bytes = 0;
+        for cached in self.live_inodes.values_mut() {
+            cached.union_contribution_bytes =
+                Self::live_union_contribution_bytes(&cached.entries, &entries);
+            self.live_union_contribution_bytes = self
+                .live_union_contribution_bytes
+                .saturating_add(cached.union_contribution_bytes);
+        }
         self.retained_roots = Some(retained_roots);
         self.retained_entries = entries;
+    }
+
+    /// Project the exact retained-plus-live allocation union after replacing
+    /// one live inode map with `planned_entries`.
+    ///
+    /// The cache must first contain the exact Pool-readable identity for every
+    /// live inode and the exact retained-root set. The caller performs that
+    /// authentication. Once hydrated, unrelated live inode maps contribute a
+    /// cached byte total instead of being cloned and merged for every buffered
+    /// writeback batch.
+    pub(crate) fn projected_allocation_bytes(
+        &self,
+        replaced_inode: Option<InodeId>,
+        planned_entries: &BTreeMap<ObjectKey, u64>,
+    ) -> Result<Option<u64>> {
+        if self.retained_roots.is_none() {
+            return Ok(None);
+        }
+        let replaced_contribution = match replaced_inode {
+            Some(inode_id) => match self.live_inodes.get(&inode_id) {
+                Some(cached) => cached.union_contribution_bytes,
+                None => return Ok(None),
+            },
+            None => 0,
+        };
+        let planned_contribution =
+            Self::live_union_contribution_bytes(planned_entries, &self.retained_entries);
+        let projected = self
+            .retained_bytes
+            .saturating_add(self.live_union_contribution_bytes)
+            .saturating_sub(replaced_contribution)
+            .saturating_add(planned_contribution);
+        u64::try_from(projected)
+            .map(Some)
+            .map_err(|_| FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })
     }
 
     pub(crate) fn invalidate(&mut self) {
@@ -1401,6 +1485,11 @@ mod tests {
         let mut cache = AuthenticatedContentAllocationCache::default();
 
         assert!(cache.retained_entries(&[]).is_none());
+        assert_eq!(
+            cache.projected_allocation_bytes(None, &entries).unwrap(),
+            None,
+            "projection requires an authenticated retained-root identity"
+        );
         cache.record_retained_entries(Vec::new(), BTreeMap::new());
         assert_eq!(cache.retained_entries(&[]), Some(&BTreeMap::new()));
 
@@ -1439,6 +1528,46 @@ mod tests {
         cache.invalidate();
         assert!(cache.live_entries(&record).is_none());
         assert!(cache.retained_entries(&[]).is_none());
+    }
+
+    #[test]
+    fn authenticated_allocation_cache_projects_one_inode_against_retained_union() {
+        let mut cache = AuthenticatedContentAllocationCache::default();
+        let retained_shared = content_object_key_for_version(InodeId::new(41), 1);
+        let retained_only = content_object_key_for_version(InodeId::new(90), 1);
+        cache.record_retained_entries(
+            Vec::new(),
+            BTreeMap::from([(retained_shared, 128), (retained_only, 128)]),
+        );
+
+        let replaced = test_record(41, 1, 256);
+        let replaced_only = content_chunk_object_key_for_version(replaced.inode_id, 1, 1);
+        cache.record_live_entries(
+            &replaced,
+            BTreeMap::from([(retained_shared, 128), (replaced_only, 256)]),
+        );
+        let unrelated = test_record(42, 1, 128);
+        let unrelated_key = content_object_key_for_version(unrelated.inode_id, 1);
+        cache.record_live_entries(&unrelated, BTreeMap::from([(unrelated_key, 128)]));
+
+        let replacement_key = content_object_key_for_version(replaced.inode_id, 2);
+        let planned = BTreeMap::from([(retained_shared, 128), (replacement_key, 128)]);
+        assert_eq!(
+            cache
+                .projected_allocation_bytes(Some(replaced.inode_id), &planned)
+                .unwrap(),
+            Some(512),
+            "retained overlap stays counted once while only the replaced inode contribution changes"
+        );
+
+        cache.retain_live_inodes(&std::collections::BTreeSet::from([replaced.inode_id]));
+        assert_eq!(
+            cache
+                .projected_allocation_bytes(Some(replaced.inode_id), &planned)
+                .unwrap(),
+            Some(384),
+            "removing an unrelated live inode must retire its cached union contribution"
+        );
     }
 
     fn receipted_chunk(

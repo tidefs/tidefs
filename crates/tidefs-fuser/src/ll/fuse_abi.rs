@@ -74,8 +74,12 @@ pub const FUSE_KERNEL_MINOR_VERSION: u32 = 28;
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 29;
 #[cfg(all(feature = "abi-7-30", not(feature = "abi-7-31")))]
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 30;
-#[cfg(feature = "abi-7-31")]
+#[cfg(all(feature = "abi-7-31", not(feature = "abi-7-32")))]
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
+#[cfg(all(feature = "abi-7-32", not(feature = "abi-7-33")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 32;
+#[cfg(feature = "abi-7-33")]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 33;
 
 pub const FUSE_ROOT_ID: u64 = 1;
 
@@ -156,6 +160,7 @@ pub mod consts {
     pub const FATTR_LOCKOWNER: u32 = 1 << 9;
     #[cfg(feature = "abi-7-23")]
     pub const FATTR_CTIME: u32 = 1 << 10;
+    pub const FATTR_KILL_SUIDGID: u32 = 1 << 11;
 
     #[cfg(target_os = "macos")]
     pub const FATTR_CRTIME: u32 = 1 << 28;

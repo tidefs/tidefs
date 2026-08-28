@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
+use std::ops::Range;
+use std::sync::Arc;
 use std::vec;
 
 use tidefs_dataset_lifecycle::DatasetId;
@@ -20,8 +24,9 @@ use crate::constants::*;
 use crate::dedup::DedupIndex;
 use crate::encoding::{
     decode_content, decode_content_chunk, decode_content_manifest, decode_dedup_redirect,
-    encode_content, encode_content_chunk, encode_content_manifest, encode_content_manifest_sparse,
-    is_dedup_redirect, split_inline_checksum,
+    encode_content, encode_content_chunk, encode_content_chunk_into, encode_content_manifest,
+    encode_content_manifest_sparse, is_dedup_redirect, split_inline_checksum,
+    CONTENT_CHUNK_ENCODED_HEADER_BYTES,
 };
 use crate::error::FileSystemError;
 use crate::object_keys::{
@@ -30,6 +35,11 @@ use crate::object_keys::{
 };
 use crate::types::*;
 use crate::{ContentChunkObject, ContentChunkRef, ContentLayout, ContentManifestObject, Result};
+
+pub(crate) struct PrepublicationContentReceipt {
+    receipt: PlacementReceipt,
+    checksum: IntegrityDigest64,
+}
 
 /// Trait abstracting content-store I/O so that mutation functions can accept
 /// either a receipt-producing [`PoolStoreMut`] (VFS write path) or a raw
@@ -56,6 +66,25 @@ pub(crate) trait ContentWriteStore {
 
     fn put_with_receipt(&mut self, key: ObjectKey, payload: &[u8]) -> Result<PlacementReceipt>;
 
+    /// Publish immutable prepublication objects and return receipts in input order.
+    ///
+    /// Raw compatibility stores retain the ordinary per-object implementation.
+    /// Pool-backed stores override this with one durability barrier for the
+    /// complete batch before any receipt is returned to a manifest builder.
+    fn put_prepublication_batch_with_receipts(
+        &mut self,
+        entries: &[(ObjectKey, &[u8])],
+    ) -> Result<Vec<PrepublicationContentReceipt>> {
+        entries
+            .iter()
+            .map(|(key, payload)| {
+                let checksum = checksum64(payload);
+                let receipt = self.put_with_receipt(*key, payload)?;
+                Ok(PrepublicationContentReceipt { receipt, checksum })
+            })
+            .collect()
+    }
+
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject>;
 
     fn raw_store(&self) -> &LocalObjectStore;
@@ -70,11 +99,16 @@ pub(crate) trait ContentWriteStore {
 /// zero-generation behavior and therefore do not produce that authority.
 pub(crate) struct ContentWriteOutcome {
     layout: ContentLayout,
+    manifest_checksum: IntegrityDigest64,
     has_persisted_receipt_authority: bool,
 }
 
 impl ContentWriteOutcome {
-    fn chunked(manifest: ContentManifestObject, manifest_receipt: PlacementReceipt) -> Self {
+    fn chunked(
+        manifest: ContentManifestObject,
+        manifest_bytes: &[u8],
+        manifest_receipt: PlacementReceipt,
+    ) -> Self {
         let has_persisted_receipt_authority = manifest_receipt.generation > 0
             && manifest
                 .chunks
@@ -82,12 +116,171 @@ impl ContentWriteOutcome {
                 .all(|chunk| chunk.is_hole() || chunk.placement_receipt_generation > 0);
         Self {
             layout: ContentLayout::Chunked(manifest),
+            manifest_checksum: checksum64(manifest_bytes),
             has_persisted_receipt_authority,
         }
     }
 
-    pub(crate) fn receipted_layout(&self) -> Option<&ContentLayout> {
-        self.has_persisted_receipt_authority.then_some(&self.layout)
+    pub(crate) fn receipted_manifest(&self) -> Option<(&ContentLayout, IntegrityDigest64)> {
+        self.has_persisted_receipt_authority
+            .then_some((&self.layout, self.manifest_checksum))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AuthenticatedContentLayoutIdentity {
+    inode_id: InodeId,
+    size: u64,
+    data_version: u64,
+}
+
+impl From<&InodeRecord> for AuthenticatedContentLayoutIdentity {
+    fn from(record: &InodeRecord) -> Self {
+        Self {
+            inode_id: record.inode_id,
+            size: record.size,
+            data_version: record.data_version,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AuthenticatedContentLayout {
+    identity: AuthenticatedContentLayoutIdentity,
+    layout: ContentLayout,
+    /// Checksum of the exact manifest bytes whose write returned current
+    /// nonzero Pool receipt authority for the manifest and every chunk.
+    receipted_manifest_checksum: Option<IntegrityDigest64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AuthenticatedContentChunkIdentity {
+    inode_id: InodeId,
+    data_version: u64,
+    chunk_index: u64,
+    len: u32,
+    checksum: IntegrityDigest64,
+    placement_receipt_generation: u64,
+}
+
+impl AuthenticatedContentChunkIdentity {
+    fn new(inode_id: InodeId, chunk_ref: &ContentChunkRef) -> Self {
+        Self {
+            inode_id,
+            data_version: chunk_ref.data_version,
+            chunk_index: chunk_ref.chunk_index,
+            len: chunk_ref.len,
+            checksum: chunk_ref.checksum,
+            placement_receipt_generation: chunk_ref.placement_receipt_generation,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AuthenticatedContentChunk {
+    identity: AuthenticatedContentChunkIdentity,
+    chunk: Arc<ContentChunkObject>,
+}
+
+/// Mount-local immutable layouts already authenticated through current Pool
+/// receipt authority.
+///
+/// Metadata-only inode changes may reuse a layout, while size or data-version
+/// changes must take the strict manifest path. Pool lifecycle operations that
+/// can replace receipt generations invalidate the complete cache before the
+/// mounted owner resumes ordinary reads.
+#[derive(Debug, Default)]
+pub(crate) struct AuthenticatedContentLayoutCache {
+    inodes: BTreeMap<InodeId, AuthenticatedContentLayout>,
+    /// Last decoded, receipt-authenticated chunk for each cached inode.
+    ///
+    /// This remains a derived acceleration structure: an exact identity miss
+    /// takes the strict Pool receipt, checksum, and decode path below.
+    decoded_chunks: BTreeMap<InodeId, AuthenticatedContentChunk>,
+}
+
+impl AuthenticatedContentLayoutCache {
+    pub(crate) fn layout(&self, inode_id: InodeId, record: &InodeRecord) -> Option<&ContentLayout> {
+        let cached = self.inodes.get(&inode_id)?;
+        (cached.identity == AuthenticatedContentLayoutIdentity::from(record))
+            .then_some(&cached.layout)
+    }
+
+    pub(crate) fn record(&mut self, record: &InodeRecord, layout: ContentLayout) {
+        self.decoded_chunks.remove(&record.inode_id);
+        self.inodes.insert(
+            record.inode_id,
+            AuthenticatedContentLayout {
+                identity: AuthenticatedContentLayoutIdentity::from(record),
+                layout,
+                receipted_manifest_checksum: None,
+            },
+        );
+    }
+
+    pub(crate) fn record_receipted_manifest(
+        &mut self,
+        record: &InodeRecord,
+        layout: ContentLayout,
+        manifest_checksum: IntegrityDigest64,
+    ) {
+        self.decoded_chunks.remove(&record.inode_id);
+        self.inodes.insert(
+            record.inode_id,
+            AuthenticatedContentLayout {
+                identity: AuthenticatedContentLayoutIdentity::from(record),
+                layout,
+                receipted_manifest_checksum: Some(manifest_checksum),
+            },
+        );
+    }
+
+    pub(crate) fn receipted_manifest(
+        &self,
+        record: &InodeRecord,
+    ) -> Option<(&ContentLayout, IntegrityDigest64)> {
+        let cached = self.inodes.get(&record.inode_id)?;
+        if cached.identity != AuthenticatedContentLayoutIdentity::from(record) {
+            return None;
+        }
+        cached
+            .receipted_manifest_checksum
+            .map(|checksum| (&cached.layout, checksum))
+    }
+
+    fn decoded_chunk(
+        &self,
+        inode_id: InodeId,
+        chunk_ref: &ContentChunkRef,
+    ) -> Option<&Arc<ContentChunkObject>> {
+        let cached = self.decoded_chunks.get(&inode_id)?;
+        (cached.identity == AuthenticatedContentChunkIdentity::new(inode_id, chunk_ref))
+            .then_some(&cached.chunk)
+    }
+
+    fn record_decoded_chunk(
+        &mut self,
+        inode_id: InodeId,
+        chunk_ref: &ContentChunkRef,
+        chunk: Arc<ContentChunkObject>,
+    ) {
+        self.decoded_chunks.insert(
+            inode_id,
+            AuthenticatedContentChunk {
+                identity: AuthenticatedContentChunkIdentity::new(inode_id, chunk_ref),
+                chunk,
+            },
+        );
+    }
+
+    pub(crate) fn remove(&mut self, inode_id: InodeId) {
+        self.inodes.remove(&inode_id);
+        self.decoded_chunks.remove(&inode_id);
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.inodes.clear();
+        self.decoded_chunks.clear();
     }
 }
 
@@ -136,6 +329,17 @@ impl<S: ContentWriteStore> ContentWriteStore for FilesystemContentWriteStore<S> 
             .put_with_receipt(self.keyspace.scope(key), payload)
     }
 
+    fn put_prepublication_batch_with_receipts(
+        &mut self,
+        entries: &[(ObjectKey, &[u8])],
+    ) -> Result<Vec<PrepublicationContentReceipt>> {
+        let scoped = entries
+            .iter()
+            .map(|(key, payload)| (self.keyspace.scope(*key), *payload))
+            .collect::<Vec<_>>();
+        self.inner.put_prepublication_batch_with_receipts(&scoped)
+    }
+
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         self.inner.put(self.keyspace.scope(key), payload)
     }
@@ -164,6 +368,17 @@ impl<'a> ContentWriteStore for PoolStoreMut<'a> {
 
     fn put_with_receipt(&mut self, key: ObjectKey, payload: &[u8]) -> Result<PlacementReceipt> {
         Ok(PoolStoreMut::put_with_receipt(self, key, payload)?.1)
+    }
+    fn put_prepublication_batch_with_receipts(
+        &mut self,
+        entries: &[(ObjectKey, &[u8])],
+    ) -> Result<Vec<PrepublicationContentReceipt>> {
+        Ok(
+            PoolStoreMut::put_prepublication_data_batch_with_checksums(self, entries)?
+                .into_iter()
+                .map(|(receipt, checksum)| PrepublicationContentReceipt { receipt, checksum })
+                .collect(),
+        )
     }
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         Ok(PoolStoreMut::put(self, key, payload)?)
@@ -611,6 +826,7 @@ pub(crate) fn read_content_from_write_store<S: ContentWriteStore + ?Sized>(
 pub(crate) struct MountedContentReadAuthority<'a> {
     pool: &'a Pool,
     keyspace: FilesystemObjectKeyspace,
+    authenticated_content_cache: Option<&'a RefCell<AuthenticatedContentLayoutCache>>,
 }
 
 impl<'a> MountedContentReadAuthority<'a> {
@@ -623,6 +839,19 @@ impl<'a> MountedContentReadAuthority<'a> {
         Self {
             pool,
             keyspace: FilesystemObjectKeyspace::new(dataset_id),
+            authenticated_content_cache: None,
+        }
+    }
+
+    pub(crate) fn for_cached_dataset(
+        pool: &'a Pool,
+        dataset_id: DatasetId,
+        cache: &'a RefCell<AuthenticatedContentLayoutCache>,
+    ) -> Self {
+        Self {
+            pool,
+            keyspace: FilesystemObjectKeyspace::new(dataset_id),
+            authenticated_content_cache: Some(cache),
         }
     }
 
@@ -662,8 +891,31 @@ impl<'a> MountedContentReadAuthority<'a> {
         len: usize,
     ) -> Result<Vec<u8>> {
         read_content_range_with(layout, offset, len, |inode_id, chunk_ref| {
-            self.read_chunk(inode_id, chunk_ref)
+            self.read_chunk_shared(inode_id, chunk_ref)
         })
+    }
+
+    fn read_chunk_shared(
+        &self,
+        inode_id: InodeId,
+        chunk_ref: &ContentChunkRef,
+    ) -> Result<Arc<ContentChunkObject>> {
+        if let Some(chunk) = self
+            .authenticated_content_cache
+            .and_then(|cache| cache.borrow().decoded_chunk(inode_id, chunk_ref).cloned())
+        {
+            return Ok(chunk);
+        }
+
+        let chunk = Arc::new(self.read_chunk(inode_id, chunk_ref)?);
+        if !chunk_ref.is_hole() {
+            if let Some(cache) = self.authenticated_content_cache {
+                cache
+                    .borrow_mut()
+                    .record_decoded_chunk(inode_id, chunk_ref, Arc::clone(&chunk));
+            }
+        }
+        Ok(chunk)
     }
 
     pub(crate) fn read_chunk(
@@ -706,15 +958,17 @@ impl<'a> MountedContentReadAuthority<'a> {
             });
         }
 
-        try_validate_chunk_bytes_with_get(inode_id, chunk_ref, &bytes, |canonical_key| {
-            Ok(self
-                .read_current_object(canonical_key)?
-                .map(|(canonical, _receipt)| canonical))
-        })?
-        .map(|(chunk, _resolved_via_dedup)| chunk)
-        .ok_or(FileSystemError::CorruptState {
-            reason: "Pool-authorized content chunk checksum or decode mismatch",
-        })
+        let chunk =
+            try_validate_chunk_bytes_with_get(inode_id, chunk_ref, &bytes, |canonical_key| {
+                Ok(self
+                    .read_current_object(canonical_key)?
+                    .map(|(canonical, _receipt)| canonical))
+            })?
+            .map(|(chunk, _resolved_via_dedup)| chunk)
+            .ok_or(FileSystemError::CorruptState {
+                reason: "Pool-authorized content chunk checksum or decode mismatch",
+            })?;
+        Ok(chunk)
     }
 }
 
@@ -1443,6 +1697,72 @@ fn encode_chunk_with_dedup<S: ContentWriteStore>(
     }
 }
 
+#[derive(Debug)]
+struct StagedContentChunk {
+    key: ObjectKey,
+    chunk_index: u64,
+    len: u32,
+    payload: Range<usize>,
+}
+
+fn staged_content_capacity(candidate_chunks: usize) -> Result<usize> {
+    let bytes_per_chunk = (content_chunk_size() as usize)
+        .checked_add(CONTENT_CHUNK_ENCODED_HEADER_BYTES)
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?;
+    candidate_chunks
+        .checked_mul(bytes_per_chunk)
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_encoded_chunk_with_dedup<S: ContentWriteStore>(
+    dedup_enabled: bool,
+    store: &mut S,
+    record: &InodeRecord,
+    chunk_index: u64,
+    chunk_bytes: &[u8],
+    dedup_index: &mut DedupIndex,
+    #[cfg(feature = "quorum-write")] quorum_store: &mut Option<
+        &mut tidefs_quorum_write_runtime::QuorumObjectStore,
+    >,
+    compression_policy: &ContentCompressionPolicy,
+    staged_bytes: &mut Vec<u8>,
+) -> Result<Range<usize>> {
+    if !dedup_enabled {
+        return encode_content_chunk_into(
+            staged_bytes,
+            record,
+            chunk_index,
+            chunk_bytes,
+            compression_policy,
+        );
+    }
+
+    let encoded = encode_chunk_with_dedup(
+        true,
+        store,
+        record,
+        chunk_index,
+        chunk_bytes,
+        dedup_index,
+        #[cfg(feature = "quorum-write")]
+        quorum_store,
+        compression_policy,
+    )?;
+    let start = staged_bytes.len();
+    let end = start
+        .checked_add(encoded.len())
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?;
+    staged_bytes.extend_from_slice(&encoded);
+    Ok(start..end)
+}
+
 pub(crate) fn write_chunked_content<S: ContentWriteStore>(
     dedup_enabled: bool,
     store: &mut S,
@@ -1524,11 +1844,16 @@ pub(crate) fn write_chunked_content_with_outcome<S: ContentWriteStore>(
         chunk_size: content_chunk_size(),
         chunks,
     };
+    let manifest_encoded = encode_content_manifest(&manifest);
     let manifest_receipt = store.put_with_receipt(
         content_object_key_for_version(record.inode_id, record.data_version),
-        &encode_content_manifest(&manifest),
+        &manifest_encoded,
     )?;
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 fn write_same_size_sparse_overlay<S: ContentWriteStore>(
@@ -1653,7 +1978,11 @@ fn write_same_size_sparse_overlay<S: ContentWriteStore>(
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 fn write_sparse_patch_batch<S: ContentWriteStore>(
@@ -1687,6 +2016,20 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
     }
 
     let mut chunks_by_index = BTreeMap::new();
+    // A size change can rewrite at most one otherwise-unpatched boundary
+    // chunk. Dirty patches provide the remaining candidates. Retain one exact
+    // contiguous payload batch instead of hundreds of independently grown
+    // encoded Vec allocations until the shared Pool barrier completes.
+    let candidate_chunks =
+        patches_by_chunk
+            .len()
+            .checked_add(1)
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+    let mut staged_bytes = Vec::with_capacity(staged_content_capacity(candidate_chunks)?);
+    let mut staged_chunks = Vec::with_capacity(candidate_chunks);
+    let mut chunk_bytes = Vec::with_capacity(content_chunk_size() as usize);
     for old_ref in &old_manifest.chunks {
         if old_ref.chunk_index >= chunk_count {
             continue;
@@ -1709,7 +2052,8 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             continue;
         }
 
-        let mut chunk_bytes = vec![0_u8; new_len as usize];
+        chunk_bytes.clear();
+        chunk_bytes.resize(new_len as usize, 0);
         copy_old_content_into_chunk(
             store,
             old_layout,
@@ -1722,7 +2066,7 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             new_record.data_version,
             old_ref.chunk_index,
         );
-        let encoded = encode_chunk_with_dedup(
+        let payload = stage_encoded_chunk_with_dedup(
             dedup_enabled,
             store,
             new_record,
@@ -1732,32 +2076,26 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             compression_policy,
+            &mut staged_bytes,
         )?;
         dedup_index.record_chunk_written();
-        let checksum = checksum64(&encoded);
-        let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
-        #[cfg(feature = "quorum-write")]
-        if let Some(ref mut qs) = quorum_store {
-            let _ = qs.quorum_put(store.physical_key(per_inode_key), &encoded);
-        }
-        chunks_by_index.insert(
-            old_ref.chunk_index,
-            ContentChunkRef {
-                chunk_index: old_ref.chunk_index,
-                data_version: new_record.data_version,
-                len: chunk_bytes.len() as u32,
-                checksum,
-                placement_receipt_generation: chunk_receipt.generation,
-            },
-        );
+        staged_chunks.push(StagedContentChunk {
+            key: per_inode_key,
+            chunk_index: old_ref.chunk_index,
+            len: chunk_bytes.len() as u32,
+            payload,
+        });
     }
 
     for (chunk_index, chunk_patches) in patches_by_chunk {
-        let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
+        let chunk_len_u32 = content_chunk_len(new_record.size, chunk_index)?;
+        let chunk_len = chunk_len_u32 as usize;
         let old_chunk_is_sparse_zero = match find_chunk_in_manifest(old_manifest, chunk_index) {
             Some(chunk_ref) => chunk_ref.is_hole(),
             None => true,
         };
+        let chunk_fully_overwritten =
+            patches_fully_cover_chunk(chunk_index, chunk_len_u32, &chunk_patches)?;
         let patch_bytes_all_zero = chunk_patches.iter().try_fold(true, |all_zero, patch| {
             Ok::<bool, FileSystemError>(
                 all_zero
@@ -1773,14 +2111,21 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             continue;
         }
 
-        let mut chunk_bytes = vec![0_u8; chunk_len];
-        copy_old_content_into_chunk(
-            store,
-            old_layout,
-            old_record.size,
-            chunk_index,
-            &mut chunk_bytes,
-        )?;
+        chunk_bytes.clear();
+        chunk_bytes.resize(chunk_len, 0);
+        // The authenticated predecessor manifest still owns retained and
+        // reclaim identities. Only a partial replacement depends on the old
+        // payload bytes; a fully covered chunk can be encoded directly from
+        // the accepted writeback batch.
+        if !chunk_fully_overwritten {
+            copy_old_content_into_chunk(
+                store,
+                old_layout,
+                old_record.size,
+                chunk_index,
+                &mut chunk_bytes,
+            )?;
+        }
         for patch in chunk_patches {
             overlay_chunk_bytes(chunk_index, patch.offset, patch.bytes, &mut chunk_bytes)?;
         }
@@ -1793,7 +2138,7 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             new_record.data_version,
             chunk_index,
         );
-        let encoded = encode_chunk_with_dedup(
+        let payload = stage_encoded_chunk_with_dedup(
             dedup_enabled,
             store,
             new_record,
@@ -1803,22 +2148,49 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
             #[cfg(feature = "quorum-write")]
             &mut quorum_store,
             compression_policy,
+            &mut staged_bytes,
         )?;
         dedup_index.record_chunk_written();
-        let checksum = checksum64(&encoded);
-        let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
+        staged_chunks.push(StagedContentChunk {
+            key: per_inode_key,
+            chunk_index,
+            len: chunk_bytes.len() as u32,
+            payload,
+        });
+    }
+
+    let chunk_payloads = staged_chunks
+        .iter()
+        .map(|chunk| (chunk.key, &staged_bytes[chunk.payload.clone()]))
+        .collect::<Vec<_>>();
+    let chunk_receipts = store.put_prepublication_batch_with_receipts(&chunk_payloads)?;
+    if chunk_receipts.len() != staged_chunks.len() {
+        return Err(FileSystemError::CorruptState {
+            reason: "prepublication content batch returned the wrong receipt count",
+        });
+    }
+    for (chunk, published) in staged_chunks.into_iter().zip(chunk_receipts) {
+        let receipt = published.receipt;
+        if receipt.object_key != store.physical_key(chunk.key) {
+            return Err(FileSystemError::CorruptState {
+                reason: "prepublication content batch returned a receipt for another object",
+            });
+        }
         #[cfg(feature = "quorum-write")]
         if let Some(ref mut qs) = quorum_store {
-            let _ = qs.quorum_put(store.physical_key(per_inode_key), &encoded);
+            let _ = qs.quorum_put(
+                store.physical_key(chunk.key),
+                &staged_bytes[chunk.payload.clone()],
+            );
         }
         chunks_by_index.insert(
-            chunk_index,
+            chunk.chunk_index,
             ContentChunkRef {
-                chunk_index,
+                chunk_index: chunk.chunk_index,
                 data_version: new_record.data_version,
-                len: chunk_bytes.len() as u32,
-                checksum,
-                placement_receipt_generation: chunk_receipt.generation,
+                len: chunk.len,
+                checksum: published.checksum,
+                placement_receipt_generation: receipt.generation,
             },
         );
     }
@@ -1837,7 +2209,11 @@ fn write_sparse_patch_batch<S: ContentWriteStore>(
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
@@ -1871,72 +2247,116 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
     }
 
     let mut chunks_by_index = BTreeMap::new();
-    let mut write_chunk =
-        |chunk_index: u64, chunk_patches: Vec<ContentOverlayPatch<'_>>| -> Result<()> {
-            let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
-            let mut chunk_bytes = vec![0_u8; chunk_len];
-            copy_old_content_into_chunk(
-                store,
-                old_layout,
-                old_record.size,
-                chunk_index,
-                &mut chunk_bytes,
-            )?;
-            for patch in chunk_patches {
-                overlay_chunk_bytes(chunk_index, patch.offset, patch.bytes, &mut chunk_bytes)?;
+    let inline_candidates =
+        usize::try_from(old_chunk_count.min(new_chunk_count)).map_err(|_| {
+            FileSystemError::SizeOverflow {
+                requested: new_record.size,
             }
-            if chunk_bytes.iter().all(|byte| *byte == 0) {
-                return Ok(());
-            }
-
-            let per_inode_key = content_chunk_object_key_for_version(
-                new_record.inode_id,
-                new_record.data_version,
-                chunk_index,
-            );
-            let encoded = encode_chunk_with_dedup(
-                dedup_enabled,
-                store,
-                new_record,
-                chunk_index,
-                &chunk_bytes,
-                dedup_index,
-                #[cfg(feature = "quorum-write")]
-                &mut quorum_store,
-                compression_policy,
-            )?;
-            dedup_index.record_chunk_written();
-            let checksum = checksum64(&encoded);
-            let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?;
-            #[cfg(feature = "quorum-write")]
-            if let Some(ref mut qs) = quorum_store {
-                let _ = qs.quorum_put(store.physical_key(per_inode_key), &encoded);
-            }
-            chunks_by_index.insert(
-                chunk_index,
-                ContentChunkRef {
+        })?;
+    let candidate_chunks = inline_candidates
+        .checked_add(patches_by_chunk.len())
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: new_record.size,
+        })?;
+    let mut staged_bytes = Vec::with_capacity(staged_content_capacity(candidate_chunks)?);
+    let mut staged_chunks = Vec::with_capacity(candidate_chunks);
+    let mut chunk_bytes = Vec::with_capacity(content_chunk_size() as usize);
+    {
+        let mut stage_chunk =
+            |chunk_index: u64, chunk_patches: Vec<ContentOverlayPatch<'_>>| -> Result<()> {
+                let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
+                chunk_bytes.clear();
+                chunk_bytes.resize(chunk_len, 0);
+                copy_old_content_into_chunk(
+                    store,
+                    old_layout,
+                    old_record.size,
                     chunk_index,
-                    data_version: new_record.data_version,
-                    len: chunk_bytes.len() as u32,
-                    checksum,
-                    placement_receipt_generation: chunk_receipt.generation,
-                },
-            );
-            Ok(())
-        };
+                    &mut chunk_bytes,
+                )?;
+                for patch in chunk_patches {
+                    overlay_chunk_bytes(chunk_index, patch.offset, patch.bytes, &mut chunk_bytes)?;
+                }
+                if chunk_bytes.iter().all(|byte| *byte == 0) {
+                    return Ok(());
+                }
 
-    // Inline layouts already contain their full physical payload. Convert that
-    // payload one content chunk at a time, then visit only patched chunks in the
-    // sparse extension. This keeps peak memory bounded by the inline object plus
-    // one chunk instead of allocating the new logical file size.
-    for chunk_index in 0..old_chunk_count.min(new_chunk_count) {
-        write_chunk(
-            chunk_index,
-            patches_by_chunk.remove(&chunk_index).unwrap_or_default(),
-        )?;
+                let per_inode_key = content_chunk_object_key_for_version(
+                    new_record.inode_id,
+                    new_record.data_version,
+                    chunk_index,
+                );
+                let payload = stage_encoded_chunk_with_dedup(
+                    dedup_enabled,
+                    store,
+                    new_record,
+                    chunk_index,
+                    &chunk_bytes,
+                    dedup_index,
+                    #[cfg(feature = "quorum-write")]
+                    &mut quorum_store,
+                    compression_policy,
+                    &mut staged_bytes,
+                )?;
+                dedup_index.record_chunk_written();
+                staged_chunks.push(StagedContentChunk {
+                    key: per_inode_key,
+                    chunk_index,
+                    len: chunk_bytes.len() as u32,
+                    payload,
+                });
+                Ok(())
+            };
+
+        // Inline layouts already contain their full physical payload. Convert
+        // that payload one content chunk at a time, then visit only patched
+        // chunks in the sparse extension instead of allocating the new logical
+        // file size.
+        for chunk_index in 0..old_chunk_count.min(new_chunk_count) {
+            stage_chunk(
+                chunk_index,
+                patches_by_chunk.remove(&chunk_index).unwrap_or_default(),
+            )?;
+        }
+        for (chunk_index, chunk_patches) in patches_by_chunk {
+            stage_chunk(chunk_index, chunk_patches)?;
+        }
     }
-    for (chunk_index, chunk_patches) in patches_by_chunk {
-        write_chunk(chunk_index, chunk_patches)?;
+
+    let chunk_payloads = staged_chunks
+        .iter()
+        .map(|chunk| (chunk.key, &staged_bytes[chunk.payload.clone()]))
+        .collect::<Vec<_>>();
+    let chunk_receipts = store.put_prepublication_batch_with_receipts(&chunk_payloads)?;
+    if chunk_receipts.len() != staged_chunks.len() {
+        return Err(FileSystemError::CorruptState {
+            reason: "prepublication content batch returned the wrong receipt count",
+        });
+    }
+    for (chunk, published) in staged_chunks.into_iter().zip(chunk_receipts) {
+        let receipt = published.receipt;
+        if receipt.object_key != store.physical_key(chunk.key) {
+            return Err(FileSystemError::CorruptState {
+                reason: "prepublication content batch returned a receipt for another object",
+            });
+        }
+        #[cfg(feature = "quorum-write")]
+        if let Some(ref mut qs) = quorum_store {
+            let _ = qs.quorum_put(
+                store.physical_key(chunk.key),
+                &staged_bytes[chunk.payload.clone()],
+            );
+        }
+        chunks_by_index.insert(
+            chunk.chunk_index,
+            ContentChunkRef {
+                chunk_index: chunk.chunk_index,
+                data_version: new_record.data_version,
+                len: chunk.len,
+                checksum: published.checksum,
+                placement_receipt_generation: receipt.generation,
+            },
+        );
     }
 
     let manifest = ContentManifestObject {
@@ -1953,7 +2373,11 @@ fn write_inline_sparse_patch_batch<S: ContentWriteStore>(
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 fn write_sparse_size_change<S: ContentWriteStore>(
@@ -2035,7 +2459,11 @@ fn write_sparse_size_change<S: ContentWriteStore>(
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2208,7 +2636,11 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
@@ -2393,7 +2825,11 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(store.physical_key(manifest_key), &manifest_encoded);
     }
-    Ok(ContentWriteOutcome::chunked(manifest, manifest_receipt))
+    Ok(ContentWriteOutcome::chunked(
+        manifest,
+        &manifest_encoded,
+        manifest_receipt,
+    ))
 }
 
 pub(crate) fn write_chunked_content_with_patch_batch<S: ContentWriteStore>(
@@ -2662,6 +3098,55 @@ pub(crate) fn overlay_chunk_bytes(
     Ok(())
 }
 
+fn patches_fully_cover_chunk(
+    chunk_index: u64,
+    chunk_len: u32,
+    patches: &[ContentOverlayPatch<'_>],
+) -> Result<bool> {
+    if chunk_len == 0 {
+        return Ok(true);
+    }
+    let chunk_start = content_chunk_start(chunk_index)?;
+    let chunk_end =
+        chunk_start
+            .checked_add(u64::from(chunk_len))
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+    let mut covered_ranges = Vec::with_capacity(patches.len());
+    for patch in patches {
+        let patch_len =
+            u64::try_from(patch.bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+        let patch_end =
+            patch
+                .offset
+                .checked_add(patch_len)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+        let start = patch.offset.max(chunk_start);
+        let end = patch_end.min(chunk_end);
+        if start < end {
+            covered_ranges.push((start, end));
+        }
+    }
+    covered_ranges.sort_unstable();
+
+    let mut covered_end = chunk_start;
+    for (start, end) in covered_ranges {
+        if start > covered_end {
+            return Ok(false);
+        }
+        covered_end = covered_end.max(end);
+        if covered_end >= chunk_end {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn overlay_chunk_writes_only_zeros(
     chunk_index: u64,
     chunk_len: u32,
@@ -2771,11 +3256,11 @@ fn read_content_range_from_write_store<S: ContentWriteStore + ?Sized>(
     })
 }
 
-fn read_content_range_with(
+fn read_content_range_with<C: Borrow<ContentChunkObject>>(
     layout: &ContentLayout,
     offset: u64,
     len: usize,
-    mut read_chunk: impl FnMut(InodeId, &ContentChunkRef) -> Result<ContentChunkObject>,
+    mut read_chunk: impl FnMut(InodeId, &ContentChunkRef) -> Result<C>,
 ) -> Result<Vec<u8>> {
     if len == 0 {
         return Ok(Vec::new());
@@ -2831,6 +3316,7 @@ fn read_content_range_with(
                     }
 
                     let chunk = read_chunk(manifest.inode_id, chunk_ref)?;
+                    let chunk = chunk.borrow();
                     if in_chunk > chunk.bytes.len() {
                         return Err(FileSystemError::CorruptState {
                             reason: "content range starts beyond chunk length",
@@ -3154,12 +3640,137 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::records::ContentObject;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tidefs_local_object_store::pool::{PoolConfig, PoolProperties};
     use tidefs_local_object_store::{
         DeviceBacking, DeviceClass, DeviceConfig, DeviceKind, StoreOptions,
     };
     use tidefs_types_vfs_core::{Generation, NodeKind};
+
+    #[test]
+    fn authenticated_content_layout_cache_reuses_only_exact_content_identity() {
+        let record = InodeRecord {
+            dir_storage_kind: 0,
+            inode_id: InodeId(42),
+            generation: Generation(1),
+            facets: NodeKind::File.to_facets(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size: 3,
+            data_version: 7,
+            metadata_version: 7,
+            posix_time: PosixTimeRecord::now(),
+            xattr_storage_kind: 0,
+            xattrs: BTreeMap::new(),
+            dir_rev: 0,
+            subtree_rev: 0,
+            rdev: 0,
+        };
+        let layout = ContentLayout::Inline(ContentObject {
+            inode_id: record.inode_id,
+            data_version: record.data_version,
+            bytes: b"abc".to_vec(),
+        });
+        let mut cache = AuthenticatedContentLayoutCache::default();
+
+        assert!(cache.layout(record.inode_id, &record).is_none());
+        cache.record(&record, layout.clone());
+        assert_eq!(cache.layout(record.inode_id, &record), Some(&layout));
+        assert!(cache.receipted_manifest(&record).is_none());
+
+        let manifest_checksum = checksum64(b"exact emitted manifest");
+        cache.record_receipted_manifest(&record, layout.clone(), manifest_checksum);
+        assert_eq!(
+            cache.receipted_manifest(&record),
+            Some((&layout, manifest_checksum))
+        );
+
+        let mut metadata_only_change = record.clone();
+        metadata_only_change.metadata_version += 1;
+        metadata_only_change.nlink += 1;
+        assert_eq!(
+            cache.layout(record.inode_id, &metadata_only_change),
+            Some(&layout)
+        );
+        assert_eq!(
+            cache.receipted_manifest(&metadata_only_change),
+            Some((&layout, manifest_checksum))
+        );
+
+        let mut changed_content = record.clone();
+        changed_content.data_version += 1;
+        assert!(cache
+            .layout(changed_content.inode_id, &changed_content)
+            .is_none());
+        assert!(cache.receipted_manifest(&changed_content).is_none());
+        changed_content = record.clone();
+        changed_content.size += 1;
+        assert!(cache
+            .layout(changed_content.inode_id, &changed_content)
+            .is_none());
+
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: record.data_version,
+            len: 3,
+            checksum: checksum64(b"encoded chunk"),
+            placement_receipt_generation: 11,
+        };
+        let chunk = Arc::new(ContentChunkObject {
+            inode_id: record.inode_id,
+            data_version: record.data_version,
+            chunk_index: 0,
+            bytes: b"abc".to_vec(),
+        });
+        cache.record_decoded_chunk(record.inode_id, &chunk_ref, Arc::clone(&chunk));
+        assert!(Arc::ptr_eq(
+            cache
+                .decoded_chunk(record.inode_id, &chunk_ref)
+                .expect("exact chunk identity should reuse shared decoded bytes"),
+            &chunk,
+        ));
+        assert!(cache
+            .decoded_chunk(InodeId::new(record.inode_id.get() + 1), &chunk_ref)
+            .is_none());
+        for changed_chunk_identity in [
+            ContentChunkRef {
+                data_version: chunk_ref.data_version + 1,
+                ..chunk_ref.clone()
+            },
+            ContentChunkRef {
+                chunk_index: chunk_ref.chunk_index + 1,
+                ..chunk_ref.clone()
+            },
+            ContentChunkRef {
+                len: chunk_ref.len + 1,
+                ..chunk_ref.clone()
+            },
+            ContentChunkRef {
+                checksum: checksum64(b"different encoded chunk"),
+                ..chunk_ref.clone()
+            },
+            ContentChunkRef {
+                placement_receipt_generation: chunk_ref.placement_receipt_generation + 1,
+                ..chunk_ref.clone()
+            },
+        ] {
+            assert!(cache
+                .decoded_chunk(record.inode_id, &changed_chunk_identity)
+                .is_none());
+        }
+
+        cache.remove(record.inode_id);
+        assert!(cache.layout(record.inode_id, &record).is_none());
+        assert!(cache.decoded_chunk(record.inode_id, &chunk_ref).is_none());
+        cache.record(&record, layout);
+        cache.record_decoded_chunk(record.inode_id, &chunk_ref, chunk);
+        cache.invalidate();
+        assert!(cache.layout(record.inode_id, &record).is_none());
+        assert!(cache.decoded_chunk(record.inode_id, &chunk_ref).is_none());
+    }
 
     fn temp_store(label: &str) -> LocalObjectStore {
         let nanos = SystemTime::now()
@@ -4006,6 +4617,112 @@ mod tests {
         let rewritten = read_content_from_store(&store.raw, new_record.inode_id, &new_record, None)
             .expect("read rewritten sparse content");
         assert_eq!(rewritten, expected);
+    }
+
+    #[test]
+    fn full_chunk_patch_batch_skips_superseded_payload_read() {
+        let chunk_len = content_chunk_size() as usize;
+        let old_payload = vec![0x19; chunk_len];
+        let old_record = test_record(78, 1, chunk_len as u64);
+        let new_record = test_record(78, 2, chunk_len as u64);
+        let encoded = encode_content_chunk(
+            &old_record,
+            0,
+            &old_payload,
+            &ContentCompressionPolicy::off(),
+        )
+        .expect("encode old chunk");
+        let old_chunk_key =
+            content_chunk_object_key_for_version(old_record.inode_id, old_record.data_version, 0);
+        let manifest = ContentManifestObject {
+            inode_id: old_record.inode_id,
+            data_version: old_record.data_version,
+            file_size: old_record.size,
+            chunk_size: content_chunk_size(),
+            chunks: vec![ContentChunkRef {
+                chunk_index: 0,
+                data_version: old_record.data_version,
+                len: chunk_len as u32,
+                checksum: checksum64(&encoded),
+                placement_receipt_generation: 0,
+            }],
+        };
+        let old_layout_key =
+            content_object_key_for_version(old_record.inode_id, old_record.data_version);
+        let mut routed = BTreeMap::new();
+        routed.insert(old_layout_key, encode_content_manifest_sparse(&manifest));
+        routed.insert(old_chunk_key, encoded);
+        let mut store = RoutedReadStore {
+            raw: temp_store("full-chunk-patch-no-old-read"),
+            routed,
+            read_error_key: Some(old_chunk_key),
+        };
+        let partial_bytes = vec![0x31; chunk_len / 2];
+        let partial_patch = [ContentOverlayPatch {
+            offset: 0,
+            bytes: &partial_bytes,
+        }];
+        let mut partial_dedup_index = DedupIndex::new();
+        let partial_error =
+            match write_chunked_content_with_patch_batch(WriteChunkedContentPatchBatch {
+                dedup_enabled: false,
+                store: &mut store,
+                inode_id: old_record.inode_id,
+                old_record: &old_record,
+                new_record: &new_record,
+                patches: &partial_patch,
+                allow_holes: true,
+                dedup_index: &mut partial_dedup_index,
+                #[cfg(feature = "quorum-write")]
+                quorum_store: None,
+                compression_policy: &ContentCompressionPolicy::off(),
+            }) {
+                Ok(_) => panic!("partial overwrite must retain the old payload read"),
+                Err(error) => error,
+            };
+        assert!(matches!(
+            partial_error,
+            FileSystemError::CorruptState {
+                reason: "routed canonical read failure"
+            }
+        ));
+
+        let first_half = vec![0x42; chunk_len / 2];
+        let second_half = vec![0x73; chunk_len - first_half.len()];
+        let patches = [
+            ContentOverlayPatch {
+                offset: 0,
+                bytes: &first_half,
+            },
+            ContentOverlayPatch {
+                offset: first_half.len() as u64,
+                bytes: &second_half,
+            },
+        ];
+        let mut dedup_index = DedupIndex::new();
+
+        write_chunked_content_with_patch_batch(WriteChunkedContentPatchBatch {
+            dedup_enabled: false,
+            store: &mut store,
+            inode_id: old_record.inode_id,
+            old_record: &old_record,
+            new_record: &new_record,
+            patches: &patches,
+            allow_holes: true,
+            dedup_index: &mut dedup_index,
+            #[cfg(feature = "quorum-write")]
+            quorum_store: None,
+            compression_policy: &ContentCompressionPolicy::off(),
+        })
+        .expect("full overwrite must not read the superseded chunk payload");
+
+        let mut expected = first_half;
+        expected.extend_from_slice(&second_half);
+        assert_eq!(
+            read_content_from_store(&store.raw, new_record.inode_id, &new_record, None)
+                .expect("read rewritten chunk"),
+            expected
+        );
     }
 
     #[test]

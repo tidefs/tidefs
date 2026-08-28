@@ -37,7 +37,10 @@ use crate::commit_group::DurabilityClass;
 ///   admission: LocalAdmissionPermit  service_curve: filesystem-owned bounded work
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DirtySet {
-    /// Total data dirty bytes (padded record bytes) since last commit.
+    /// Total live data dirty bytes since the last committed root.
+    ///
+    /// Buffered mounted writes contribute their exact logical range union;
+    /// direct allocation paths contribute their existing unscoped charge.
     pub data_bytes: u64,
 
     /// Count of metadata mutations (inode attrs, dir ops, etc.) since
@@ -57,8 +60,14 @@ pub(crate) struct DirtySet {
     /// Total mutation count since last commit (coarse-grain trigger).
     pub dirty_op_count: u64,
 
-    /// Per-inode cumulative dirty byte counts, keyed by InodeId.
+    /// Per-inode live dirty byte counts, keyed by InodeId.
     pub per_inode_bytes: BTreeMap<InodeId, u64>,
+
+    /// Exact logical ranges whose current-group content differs from the
+    /// committed root. Materializing a write buffer does not clear these
+    /// ranges: only root publication or a later mutation that supersedes a
+    /// range does that.
+    per_inode_data_ranges: BTreeMap<InodeId, Vec<(u64, u64)>>,
 }
 
 impl DirtySet {
@@ -92,12 +101,14 @@ impl DirtySet {
         self.catalog_dirty = false;
         self.dirty_op_count = 0;
         self.per_inode_bytes.clear();
+        self.per_inode_data_ranges.clear();
     }
 
     pub fn forget_inode(&mut self, inode_id: InodeId) {
         if let Some(bytes) = self.per_inode_bytes.remove(&inode_id) {
             self.data_bytes = self.data_bytes.saturating_sub(bytes);
         }
+        self.per_inode_data_ranges.remove(&inode_id);
         self.dirty_inodes.remove(&inode_id);
     }
 
@@ -128,6 +139,85 @@ impl DirtySet {
         self.dirty_op_count = self.dirty_op_count.saturating_add(1);
         let entry = self.per_inode_bytes.entry(inode_id).or_insert(0);
         *entry = entry.saturating_add(bytes);
+    }
+
+    /// Record one exact current-group dirty range and return newly dirty bytes.
+    ///
+    /// Rewrites of an already-dirty range replace live current-group bytes;
+    /// they do not make cumulative historical I/O another dirty range. The
+    /// operation count still advances for every call.
+    pub fn record_data_write_range(&mut self, inode_id: InodeId, offset: u64, length: u64) -> u64 {
+        self.dirty_inodes.insert(inode_id);
+        self.dirty_op_count = self.dirty_op_count.saturating_add(1);
+        if length == 0 {
+            return 0;
+        }
+
+        let end = offset.saturating_add(length);
+        if end <= offset {
+            return 0;
+        }
+        let ranges = self.per_inode_data_ranges.entry(inode_id).or_default();
+        let before = ranges.iter().fold(0_u64, |bytes, (start, end)| {
+            bytes.saturating_add(end - start)
+        });
+        ranges.push((offset, end));
+        ranges.sort_unstable_by_key(|(start, _)| *start);
+
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges.drain(..) {
+            match merged.last_mut() {
+                Some((_, merged_end)) if start <= *merged_end => {
+                    *merged_end = (*merged_end).max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        let after = merged.iter().fold(0_u64, |bytes, (start, end)| {
+            bytes.saturating_add(end - start)
+        });
+        *ranges = merged;
+        let newly_dirty = after.saturating_sub(before);
+        self.data_bytes = self.data_bytes.saturating_add(newly_dirty);
+        let entry = self.per_inode_bytes.entry(inode_id).or_insert(0);
+        *entry = entry.saturating_add(newly_dirty);
+        newly_dirty
+    }
+
+    /// Retire exact current-group dirty ranges at or beyond `offset`.
+    ///
+    /// Metadata/content dirtiness remains because the destructive mutation
+    /// must still publish its inode and extent state. Unscoped byte debt from
+    /// callers of `record_data_write` is deliberately retained.
+    pub fn retire_data_write_from(&mut self, inode_id: InodeId, offset: u64) -> u64 {
+        let Some(ranges) = self.per_inode_data_ranges.remove(&inode_id) else {
+            return 0;
+        };
+        let mut kept = Vec::with_capacity(ranges.len());
+        let mut retired = 0_u64;
+        for (start, end) in ranges {
+            if end <= offset {
+                kept.push((start, end));
+            } else if start < offset {
+                kept.push((start, offset));
+                retired = retired.saturating_add(end - offset);
+            } else {
+                retired = retired.saturating_add(end - start);
+            }
+        }
+        if !kept.is_empty() {
+            self.per_inode_data_ranges.insert(inode_id, kept);
+        }
+
+        if let Some(per_inode) = self.per_inode_bytes.get_mut(&inode_id) {
+            debug_assert!(*per_inode >= retired);
+            *per_inode = per_inode.saturating_sub(retired);
+        }
+        if self.per_inode_bytes.get(&inode_id) == Some(&0) {
+            self.per_inode_bytes.remove(&inode_id);
+        }
+        self.data_bytes = self.data_bytes.saturating_sub(retired);
+        retired
     }
     #[allow(dead_code)] // INTENT: writeback/dirty-set types for planned writeback daemon integration
     /// Record a metadata mutation (chmod, chown, utimes, setxattr,
@@ -194,6 +284,36 @@ mod tests {
     }
 
     #[test]
+    fn data_write_ranges_account_live_union_not_rewrite_history() {
+        let mut ds = DirtySet::default();
+
+        assert_eq!(ds.record_data_write_range(id(1), 0, 4096), 4096);
+        assert_eq!(ds.record_data_write_range(id(1), 2048, 4096), 2048);
+        assert_eq!(ds.record_data_write_range(id(1), 1024, 1024), 0);
+        assert_eq!(ds.record_data_write_range(id(1), 6144, 1024), 1024);
+
+        assert_eq!(ds.data_bytes, 7168);
+        assert_eq!(ds.per_inode_bytes.get(&id(1)), Some(&7168));
+        assert_eq!(ds.per_inode_data_ranges.get(&id(1)), Some(&vec![(0, 7168)]));
+        assert_eq!(ds.dirty_op_count, 4);
+    }
+
+    #[test]
+    fn retiring_data_ranges_preserves_prefix_and_unscoped_charge() {
+        let mut ds = DirtySet::default();
+        ds.record_data_write(id(1), 512);
+        assert_eq!(ds.record_data_write_range(id(1), 0, 4096), 4096);
+        assert_eq!(ds.record_data_write_range(id(1), 8192, 4096), 4096);
+
+        assert_eq!(ds.retire_data_write_from(id(1), 2048), 6144);
+
+        assert_eq!(ds.data_bytes, 2560);
+        assert_eq!(ds.per_inode_bytes.get(&id(1)), Some(&2560));
+        assert_eq!(ds.per_inode_data_ranges.get(&id(1)), Some(&vec![(0, 2048)]));
+        assert_eq!(ds.dirty_op_count, 3);
+    }
+
+    #[test]
     fn metadata_only_yields_metadata_only_class() {
         let mut ds = DirtySet::default();
         ds.record_metadata_op(id(2));
@@ -223,6 +343,7 @@ mod tests {
     fn clear_resets_everything() {
         let mut ds = DirtySet::default();
         ds.record_data_write(id(1), 4096);
+        ds.record_data_write_range(id(1), 8192, 1024);
         ds.record_metadata_op(id(2));
         ds.record_dir_op(id(3));
         ds.mark_catalog_dirty();
@@ -236,12 +357,13 @@ mod tests {
         assert!(!ds.catalog_dirty);
         assert_eq!(ds.dirty_op_count, 0);
         assert!(ds.per_inode_bytes.is_empty());
+        assert!(ds.per_inode_data_ranges.is_empty());
     }
 
     #[test]
     fn forget_inode_drops_per_inode_data_bytes() {
         let mut ds = DirtySet::default();
-        ds.record_data_write(id(1), 4096);
+        ds.record_data_write_range(id(1), 0, 4096);
         ds.record_data_write(id(2), 1024);
 
         ds.forget_inode(id(1));
@@ -249,6 +371,7 @@ mod tests {
         assert_eq!(ds.data_bytes, 1024);
         assert!(!ds.dirty_inodes.contains(&id(1)));
         assert_eq!(ds.per_inode_bytes.get(&id(1)), None);
+        assert_eq!(ds.per_inode_data_ranges.get(&id(1)), None);
         assert!(ds.dirty_inodes.contains(&id(2)));
     }
 

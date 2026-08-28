@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "replication-io")]
 use std::io::Cursor;
+use std::ops::Range;
 
 #[cfg(feature = "replication-io")]
 use tidefs_extent_map::ExtentMap;
@@ -1465,12 +1467,15 @@ pub(crate) fn decode_content_manifest(bytes: &[u8]) -> Result<ContentManifestObj
     })
 }
 
-pub(crate) fn encode_content_chunk(
+pub(crate) const CONTENT_CHUNK_ENCODED_HEADER_BYTES: usize = 8 + 2 + 2 + 8 + 8 + 8 + 8;
+
+pub(crate) fn encode_content_chunk_into(
+    out: &mut Vec<u8>,
     inode: &InodeRecord,
     chunk_index: u64,
     bytes: &[u8],
     policy: &ContentCompressionPolicy,
-) -> Result<Vec<u8>> {
+) -> Result<Range<usize>> {
     policy
         .validate()
         .map_err(|reason| FileSystemError::Unsupported {
@@ -1478,13 +1483,11 @@ pub(crate) fn encode_content_chunk(
             reason,
         })?;
 
-    let mut out = Vec::new();
-    out.extend_from_slice(&CONTENT_CHUNK_MAGIC);
-    push_u16(&mut out, FILESYSTEM_FORMAT_VERSION);
-
     // Apply per-dataset compression policy with threshold gating.
-    let (algorithm, stored) = match policy.algorithm {
-        ContentCompressionAlgorithm::None => (ContentCompressionAlgorithm::None, bytes.to_vec()),
+    let (algorithm, stored): (ContentCompressionAlgorithm, Cow<'_, [u8]>) = match policy.algorithm {
+        ContentCompressionAlgorithm::None => {
+            (ContentCompressionAlgorithm::None, Cow::Borrowed(bytes))
+        }
         ContentCompressionAlgorithm::Zstd => {
             #[cfg(not(feature = "data-policy"))]
             return Err(FileSystemError::Unsupported {
@@ -1495,12 +1498,12 @@ pub(crate) fn encode_content_chunk(
             if bytes.len() >= policy.min_savings_bytes {
                 match zstd::encode_all(bytes, policy.level) {
                     Ok(compressed) if compressed.len() + policy.min_savings_bytes < bytes.len() => {
-                        (ContentCompressionAlgorithm::Zstd, compressed)
+                        (ContentCompressionAlgorithm::Zstd, Cow::Owned(compressed))
                     }
-                    _ => (ContentCompressionAlgorithm::None, bytes.to_vec()),
+                    _ => (ContentCompressionAlgorithm::None, Cow::Borrowed(bytes)),
                 }
             } else {
-                (ContentCompressionAlgorithm::None, bytes.to_vec())
+                (ContentCompressionAlgorithm::None, Cow::Borrowed(bytes))
             }
         }
         ContentCompressionAlgorithm::Lz4 => {
@@ -1515,22 +1518,48 @@ pub(crate) fn encode_content_chunk(
                 // compressed output; decompress_size_prepended recovers it.
                 let compressed = lz4_flex::block::compress_prepend_size(bytes);
                 if compressed.len() + policy.min_savings_bytes < bytes.len() {
-                    (ContentCompressionAlgorithm::Lz4, compressed)
+                    (ContentCompressionAlgorithm::Lz4, Cow::Owned(compressed))
                 } else {
-                    (ContentCompressionAlgorithm::None, bytes.to_vec())
+                    (ContentCompressionAlgorithm::None, Cow::Borrowed(bytes))
                 }
             } else {
-                (ContentCompressionAlgorithm::None, bytes.to_vec())
+                (ContentCompressionAlgorithm::None, Cow::Borrowed(bytes))
             }
         }
     };
 
-    push_u16(&mut out, algorithm.as_u16());
-    push_u64(&mut out, inode.inode_id.get());
-    push_u64(&mut out, inode.data_version);
-    push_u64(&mut out, chunk_index);
-    push_u64(&mut out, stored.len() as u64);
-    out.extend_from_slice(&stored);
+    let encoded_len = CONTENT_CHUNK_ENCODED_HEADER_BYTES
+        .checked_add(stored.len())
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?;
+    let start = out.len();
+    let end = start
+        .checked_add(encoded_len)
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?;
+    out.reserve_exact(encoded_len);
+    out.extend_from_slice(&CONTENT_CHUNK_MAGIC);
+    push_u16(out, FILESYSTEM_FORMAT_VERSION);
+    push_u16(out, algorithm.as_u16());
+    push_u64(out, inode.inode_id.get());
+    push_u64(out, inode.data_version);
+    push_u64(out, chunk_index);
+    push_u64(out, stored.len() as u64);
+    out.extend_from_slice(stored.as_ref());
+    debug_assert_eq!(out.len(), end);
+    Ok(start..end)
+}
+
+pub(crate) fn encode_content_chunk(
+    inode: &InodeRecord,
+    chunk_index: u64,
+    bytes: &[u8],
+    policy: &ContentCompressionPolicy,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_content_chunk_into(&mut out, inode, chunk_index, bytes, policy)?;
     Ok(out)
 }
 

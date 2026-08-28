@@ -133,7 +133,7 @@ pub mod workers_writeback;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "cluster")]
 use std::time::{Duration, Instant};
@@ -151,6 +151,7 @@ use tidefs_vfs_engine::{
 const MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 const MOUNT_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
 const MOUNT_FUSE_INIT_TIMEOUT_SECS: u64 = 5;
+const MOUNT_BACKGROUND_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 #[cfg(feature = "cluster")]
 pub use tidefs_cluster::{ClusterLeaseGrant, ClusterLeaseSession};
 // The selected local mount owns its bounded scrub work-per-tick policy.
@@ -1389,6 +1390,494 @@ fn fuse_mount_options_for_mode(
     effective.to_fuse_mount_options()
 }
 
+struct MountedLocalReclaimService {
+    pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
+    engine: live_owner::LiveOwnerEngine,
+    foreground_demand: Arc<AtomicBool>,
+    foreground_activity_epoch: Arc<AtomicU64>,
+    idle_gate: Mutex<MountedMaintenanceIdleGate>,
+    retry_not_before: std::time::Instant,
+}
+
+struct MountedCommitGroupService {
+    pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
+    engine: live_owner::LiveOwnerEngine,
+    foreground_demand: Arc<AtomicBool>,
+    foreground_activity_epoch: Arc<AtomicU64>,
+    idle_gate: Mutex<MountedMaintenanceIdleGate>,
+}
+
+#[derive(Debug)]
+struct MountedMaintenanceIdleGate {
+    activity_epoch: u64,
+    quiet_since: std::time::Instant,
+}
+
+impl MountedMaintenanceIdleGate {
+    fn new(activity_epoch: u64, now: std::time::Instant) -> Self {
+        Self {
+            activity_epoch,
+            quiet_since: now,
+        }
+    }
+
+    fn admits(
+        &mut self,
+        activity_epoch: u64,
+        now: std::time::Instant,
+        idle_interval: std::time::Duration,
+    ) -> bool {
+        if self.activity_epoch != activity_epoch {
+            self.activity_epoch = activity_epoch;
+            self.quiet_since = now;
+            return false;
+        }
+        now.saturating_duration_since(self.quiet_since) >= idle_interval
+    }
+}
+
+impl MountedCommitGroupService {
+    const NAME: &'static str = "mounted-commit-group";
+
+    fn new(
+        pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
+        engine: live_owner::LiveOwnerEngine,
+        foreground_demand: Arc<AtomicBool>,
+        foreground_activity_epoch: Arc<AtomicU64>,
+    ) -> Self {
+        let activity_epoch = foreground_activity_epoch.load(Ordering::Acquire);
+        Self {
+            pool_owner,
+            engine,
+            foreground_demand,
+            foreground_activity_epoch,
+            idle_gate: Mutex::new(MountedMaintenanceIdleGate::new(
+                activity_epoch,
+                std::time::Instant::now(),
+            )),
+        }
+    }
+
+    fn has_stable_idle_window(&self) -> bool {
+        if self.foreground_demand.load(Ordering::Acquire) {
+            return false;
+        }
+        let activity_epoch = self.foreground_activity_epoch.load(Ordering::Acquire);
+        let admitted = self
+            .idle_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admits(
+                activity_epoch,
+                std::time::Instant::now(),
+                MOUNT_BACKGROUND_IDLE_INTERVAL,
+            );
+        admitted
+            && !self.foreground_demand.load(Ordering::Acquire)
+            && self.foreground_activity_epoch.load(Ordering::Acquire) == activity_epoch
+    }
+
+    fn try_engine_lock(
+        &self,
+    ) -> Option<std::sync::MutexGuard<'_, Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send>>> {
+        match self.engine.try_lock() {
+            Ok(engine) => Some(engine),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        }
+    }
+}
+
+impl BackgroundService for MountedCommitGroupService {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn priority(&self) -> ServicePriority {
+        ServicePriority::Critical
+    }
+
+    fn tick(&mut self, _budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
+        if !self.has_stable_idle_window() {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        }
+        let Some(_engine) = self.try_engine_lock() else {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        };
+        if !self.has_stable_idle_window() {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        }
+
+        let committed = self
+            .pool_owner
+            .try_commit_group_maintenance_tick()
+            .map_err(|error| {
+                eprintln!("mounted-commit-group: scheduled commit failed: {error}");
+                ServiceError::Internal {
+                    service: Self::NAME,
+                    message: "mounted commit-group tick failed",
+                }
+            })?;
+        let Some(committed) = committed else {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        };
+        let processed = u64::from(committed);
+        Ok(TickReport {
+            processed,
+            skipped: u64::from(!committed),
+            errors: 0,
+            items_consumed: processed,
+            bytes_consumed: 0,
+            has_more: self
+                .pool_owner
+                .try_commit_group_maintenance_pending()
+                .unwrap_or(true),
+        })
+    }
+
+    fn has_work(&self) -> bool {
+        if !self.has_stable_idle_window() {
+            return false;
+        }
+        let Some(_engine) = self.try_engine_lock() else {
+            return false;
+        };
+        if !self.has_stable_idle_window() {
+            return false;
+        }
+        self.pool_owner
+            .try_commit_group_maintenance_pending()
+            .unwrap_or(false)
+    }
+}
+
+impl MountedLocalReclaimService {
+    const NAME: &'static str = "mounted-local-reclaim";
+    const MAX_ITEMS_PER_TICK: usize = 1024;
+
+    fn new(
+        pool_owner: tidefs_local_filesystem::SharedPoolDatasetOwner,
+        engine: live_owner::LiveOwnerEngine,
+        foreground_demand: Arc<AtomicBool>,
+        foreground_activity_epoch: Arc<AtomicU64>,
+    ) -> Self {
+        let activity_epoch = foreground_activity_epoch.load(Ordering::Acquire);
+        Self {
+            pool_owner,
+            engine,
+            foreground_demand,
+            foreground_activity_epoch,
+            idle_gate: Mutex::new(MountedMaintenanceIdleGate::new(
+                activity_epoch,
+                std::time::Instant::now(),
+            )),
+            retry_not_before: std::time::Instant::now(),
+        }
+    }
+
+    fn has_stable_idle_window(&self) -> bool {
+        if self.foreground_demand.load(Ordering::Acquire) {
+            return false;
+        }
+        let activity_epoch = self.foreground_activity_epoch.load(Ordering::Acquire);
+        let admitted = self
+            .idle_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admits(
+                activity_epoch,
+                std::time::Instant::now(),
+                MOUNT_BACKGROUND_IDLE_INTERVAL,
+            );
+        admitted
+            && !self.foreground_demand.load(Ordering::Acquire)
+            && self.foreground_activity_epoch.load(Ordering::Acquire) == activity_epoch
+    }
+
+    fn item_limit(budget: &ServiceBudget) -> usize {
+        if budget.max_items == 0 {
+            Self::MAX_ITEMS_PER_TICK
+        } else {
+            usize::try_from(budget.max_items)
+                .unwrap_or(usize::MAX)
+                .min(Self::MAX_ITEMS_PER_TICK)
+        }
+    }
+
+    fn run_tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
+        if !self.has_stable_idle_window() {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        }
+
+        // Match the foreground lock order and never wait for an active FUSE
+        // or live-owner operation. The scheduler will retry after that demand
+        // has released the engine.
+        let _engine = match self.engine.try_lock() {
+            Ok(engine) => engine,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(TickReport {
+                    skipped: 1,
+                    has_more: true,
+                    ..TickReport::default()
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+
+        if !self.has_stable_idle_window() {
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        }
+
+        let foreground_demand = Arc::clone(&self.foreground_demand);
+        let foreground_activity_epoch = Arc::clone(&self.foreground_activity_epoch);
+        let selected_activity_epoch = foreground_activity_epoch.load(Ordering::Acquire);
+        let mut should_preempt = || {
+            foreground_demand.load(Ordering::Acquire)
+                || foreground_activity_epoch.load(Ordering::Acquire) != selected_activity_epoch
+        };
+        let reclaim = self
+            .pool_owner
+            .try_tick_background_services_until(Self::item_limit(budget), &mut should_preempt)
+            .map_err(|error| {
+                eprintln!("mounted-local-reclaim: scheduled tick failed: {error}");
+                ServiceError::Internal {
+                    service: Self::NAME,
+                    message: "mounted reclaim tick failed",
+                }
+            })?;
+        let Some(reclaim) = reclaim else {
+            // A newly arrived foreground request can interrupt the
+            // protected-root scan before it produces a drain result. Require
+            // another quiet interval before restarting that non-resumable
+            // scan so the same foreground gap cannot select it again.
+            self.retry_not_before = std::time::Instant::now() + MOUNT_BACKGROUND_IDLE_INTERVAL;
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: true,
+                ..TickReport::default()
+            });
+        };
+
+        let processed = u64::try_from(reclaim.entries_drained).unwrap_or(u64::MAX);
+        let has_more = self
+            .pool_owner
+            .try_background_services_pending()
+            .unwrap_or(true);
+        if has_more && processed == 0 {
+            // Protected roots or temporarily uncertain receipts cannot make
+            // progress until authority changes. Avoid a hot retry loop while
+            // retaining the durable queue for the next idle cycle.
+            self.retry_not_before = std::time::Instant::now()
+                + std::time::Duration::from_millis(budget.max_ms.max(500));
+        }
+
+        Ok(TickReport {
+            processed,
+            skipped: 0,
+            errors: 0,
+            items_consumed: processed,
+            bytes_consumed: 0,
+            has_more,
+        })
+    }
+}
+
+impl BackgroundService for MountedLocalReclaimService {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn priority(&self) -> ServicePriority {
+        ServicePriority::LatencySensitive
+    }
+
+    fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
+        self.run_tick(budget)
+    }
+
+    fn has_work(&self) -> bool {
+        if !self.has_stable_idle_window() {
+            return false;
+        }
+        if std::time::Instant::now() < self.retry_not_before {
+            return false;
+        }
+
+        let _engine = match self.engine.try_lock() {
+            Ok(engine) => engine,
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        self.pool_owner
+            .try_background_services_pending()
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod mounted_local_reclaim_service_tests {
+    use super::*;
+
+    #[test]
+    fn mounted_commit_group_idle_gate_requires_a_complete_quiet_interval() {
+        let started = std::time::Instant::now();
+        let interval = std::time::Duration::from_millis(500);
+        let mut gate = MountedMaintenanceIdleGate::new(7, started);
+
+        assert!(!gate.admits(7, started + interval / 2, interval));
+        assert!(gate.admits(7, started + interval, interval));
+
+        let activity_at = started + interval;
+        assert!(!gate.admits(8, activity_at, interval));
+        assert!(!gate.admits(8, activity_at + interval / 2, interval));
+        assert!(gate.admits(8, activity_at + interval, interval));
+    }
+
+    #[test]
+    fn mounted_local_reclaim_service_yields_to_foreground_demand_and_honors_item_budget() {
+        let root = tempfile::tempdir().expect("create mounted reclaim fixture");
+        let mut filesystem =
+            tidefs_local_filesystem::PoolDatasetOwner::open_with_root_authentication_key(
+                root.path(),
+                tidefs_local_object_store::StoreOptions::default(),
+                tidefs_local_filesystem::RootAuthenticationKey::demo_key(),
+            )
+            .expect("open mounted reclaim fixture");
+        filesystem.delegate_background_maintenance_to_carrier();
+        filesystem
+            .set_auto_commit(false)
+            .expect("disable automatic fixture commits");
+        filesystem
+            .create_file("/drop", 0o644)
+            .expect("create reclaim fixture file");
+        filesystem
+            .write_file("/drop", 0, b"mounted reclaim payload")
+            .expect("write reclaim fixture file");
+        filesystem.sync_all().expect("commit fixture file");
+        filesystem.unlink("/drop").expect("unlink fixture file");
+        filesystem.sync_all().expect("commit unlink");
+
+        // Retire every fallback root that can still name /drop. Foreground
+        // commits retain the durable queue but no longer drain it.
+        for index in 0..8 {
+            filesystem
+                .create_file(format!("/root-advance-{index}"), 0o644)
+                .expect("advance retained root ring");
+            filesystem.sync_all().expect("commit root-ring advance");
+        }
+        assert!(filesystem.reclaim_queue_depth() > 0);
+
+        let base_engine =
+            tidefs_local_filesystem::vfs_engine_impl::VfsLocalFileSystem::new(filesystem);
+        let pool_owner = base_engine.shared_pool_owner();
+        let adapter = fuse_vfs_adapter::FuseVfsAdapter::new(Box::new(base_engine))
+            .expect("create mounted reclaim adapter")
+            .with_background_scheduler(BackgroundScheduler::new(ServiceBudget {
+                max_items: 1,
+                max_bytes: ServiceBudget::MAINTENANCE_TICK.max_bytes,
+                max_ms: ServiceBudget::MAINTENANCE_TICK.max_ms,
+            }));
+        let engine = adapter.engine_handle();
+        let foreground_demand = adapter.foreground_demand_signal();
+        let foreground_activity_epoch = adapter.foreground_activity_epoch();
+        adapter.register_background_service(Box::new(MountedLocalReclaimService::new(
+            pool_owner.clone(),
+            engine,
+            foreground_demand,
+            foreground_activity_epoch,
+        )));
+        let scheduler = adapter.background_scheduler_handle();
+        let depth_before = pool_owner.borrow().reclaim_queue_depth();
+
+        let mut preemption_checks = 0;
+        let mut arriving_foreground_demand = || {
+            preemption_checks += 1;
+            preemption_checks >= 5
+        };
+        assert!(
+            pool_owner
+                .try_tick_background_services_until(1, &mut arriving_foreground_demand)
+                .expect("yield mounted reclaim to newly arrived FUSE demand")
+                .is_none(),
+            "a reclaim tick selected during an idle gap must yield when demand arrives"
+        );
+        assert_eq!(pool_owner.borrow().reclaim_queue_depth(), depth_before);
+
+        let first_request = adapter.begin_foreground_demand();
+        let second_request = adapter.begin_foreground_demand();
+        assert!(
+            scheduler
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .tick_if_idle()
+                .is_none(),
+            "mounted reclaim must not start during concurrent FUSE demand"
+        );
+        assert_eq!(pool_owner.borrow().reclaim_queue_depth(), depth_before);
+
+        drop(first_request);
+        assert!(
+            scheduler
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .tick_if_idle()
+                .is_none(),
+            "one completed request must not clear another request's demand"
+        );
+        assert_eq!(pool_owner.borrow().reclaim_queue_depth(), depth_before);
+
+        drop(second_request);
+        assert!(
+            scheduler
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .tick_if_idle()
+                .is_none(),
+            "reclaim must not start in the first gap after foreground demand"
+        );
+        std::thread::sleep(MOUNT_BACKGROUND_IDLE_INTERVAL + std::time::Duration::from_millis(50));
+        let report = scheduler
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .tick_if_idle()
+            .expect("resume mounted reclaim after the final FUSE request");
+        assert_eq!(report.total_processed, 1);
+        assert_eq!(pool_owner.borrow().reclaim_queue_depth(), depth_before - 1);
+    }
+}
+
 struct MountedBackgroundScrubService {
     store: tidefs_local_object_store::LocalObjectStore,
     next_tick_not_before: std::time::Instant,
@@ -1786,6 +2275,7 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
             recovery_policy
         };
         let mut lfs = open_owner(effective_mode, open_recovery_policy)?;
+        lfs.delegate_background_maintenance_to_carrier();
 
         let catalog_read_only = lfs
             .mounted_access_readonly()
@@ -1967,13 +2457,26 @@ fn start_mount(config: &MountConfig) -> Result<StartedMount, String> {
     let queue_depth_engine = Arc::clone(&live_owner_engine);
     let notifier_cell = adapter.notifier_cell();
     let mmap_coherency = adapter.mmap_coherency_cell();
+    if !effective_mode.read_only {
+        let foreground_demand = adapter.foreground_demand_signal();
+        let foreground_activity_epoch = adapter.foreground_activity_epoch();
+        adapter.register_background_service(Box::new(MountedCommitGroupService::new(
+            shared_pool_owner.clone(),
+            Arc::clone(&live_owner_engine),
+            Arc::clone(&foreground_demand),
+            Arc::clone(&foreground_activity_epoch),
+        )));
+        adapter.register_background_service(Box::new(MountedLocalReclaimService::new(
+            shared_pool_owner.clone(),
+            Arc::clone(&live_owner_engine),
+            foreground_demand,
+            foreground_activity_epoch,
+        )));
+    }
     let background_scheduler = if effective_mode.read_only {
         None
     } else {
-        let scheduler = adapter.background_scheduler_handle();
-        let fuse_demand = Arc::new(AtomicBool::new(false));
-        adapter.set_scheduler_preempt_signal(fuse_demand);
-        Some(scheduler)
+        Some(adapter.background_scheduler_handle())
     };
     if effective_mode.background_scrub_interval_secs > 0 {
         let scrub_options = tidefs_local_object_store::StoreOptions {
@@ -2376,7 +2879,7 @@ pub fn run_mount(mut config: MountConfig) -> Result<(), String> {
             report
         });
         if report.is_none() {
-            std::thread::park_timeout(std::time::Duration::from_millis(500));
+            std::thread::park_timeout(MOUNT_BACKGROUND_IDLE_INTERVAL);
             mmap_coherency.process_tick(16);
         } else {
             std::thread::yield_now();

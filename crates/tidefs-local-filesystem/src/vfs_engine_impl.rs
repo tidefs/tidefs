@@ -31,6 +31,7 @@ use tidefs_types_vfs_core::{LockRange, LockType};
 use tidefs_vfs_engine::{
     LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminError,
     LivePoolAdminRequest, LivePoolAdminResponse, LseekDataRange, VfsEngine, VfsEngineStatFs,
+    WritePrivilegeClear,
 };
 #[cfg(test)]
 use tidefs_vfs_engine::{LivePoolAdminOutput, LivePoolAdminResponseBody};
@@ -97,6 +98,13 @@ fn vfs_op_diagnostics_enabled() -> bool {
     }
 
     enabled_var("TIDEFS_VFS_OP_DIAGNOSTICS") || enabled_var("TIDEFS_FUSE_OP_DIAGNOSTICS")
+}
+
+fn vfs_shutdown_diagnostics_enabled() -> bool {
+    matches!(
+        std::env::var("TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    ) || vfs_op_diagnostics_enabled()
 }
 
 // ── Path helpers ─────────────────────────────────────────────────────────
@@ -341,9 +349,7 @@ impl VfsLocalFileSystem {
     /// the caller already has an inode number.
     pub fn getattr_by_ino(&self, ino: u64) -> std::result::Result<InodeAttr, Errno> {
         let fs = self.fs.borrow();
-        let attr = fuse_getattr::engine_getattr(&fs, ino).map_err(|error| error.to_errno())?;
-        let record = fs.inode(attr.inode_id).map_err(|error| map_errno(&error))?;
-        Ok(fs.inode_attr(&record))
+        fuse_getattr::engine_getattr(&fs, ino).map_err(|error| error.to_errno())
     }
 
     /// Direct inode-ID-based attribute mutation (bypasses path resolution).
@@ -5206,6 +5212,7 @@ impl PoolDatasetOwner {
                         transaction_id,
                         self.filesystem.root_authentication_key,
                         &snapshot_rewrites,
+                        None,
                     )?
                     .root;
                 self.store.pool_mut().sync_all()?;
@@ -5497,6 +5504,14 @@ impl PoolDatasetOwner {
     }
 
     fn reconcile_relocated_content_receipts(&mut self) -> crate::Result<u64> {
+        // Device lifecycle and repair preparation can make successor receipts
+        // current before the outer operation reports success. Never carry a
+        // predecessor manifest across this reconciliation boundary, including
+        // partial-failure paths that still publish repaired roots.
+        self.filesystem
+            .authenticated_content_layout_cache
+            .borrow_mut()
+            .invalidate();
         let keyspace = self.object_keyspace();
         let replacements = Self::plan_relocated_content_receipts(self.store.pool(), &self.state)?;
 
@@ -7641,6 +7656,17 @@ impl VfsEngine for VfsLocalFileSystem {
         fh: &EngineFileHandle,
         offset: u64,
         data: &[u8],
+        ctx: &RequestCtx,
+    ) -> std::result::Result<u32, Errno> {
+        self.write_with_privilege_clearing(fh, offset, data, WritePrivilegeClear::default(), ctx)
+    }
+
+    fn write_with_privilege_clearing(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        data: &[u8],
+        clear: WritePrivilegeClear,
         _ctx: &RequestCtx,
     ) -> std::result::Result<u32, Errno> {
         self.ensure_writable()?;
@@ -7654,7 +7680,12 @@ impl VfsEngine for VfsLocalFileSystem {
             // respect to other append writers (POSIX O_APPEND semantics).
             let mut fs = self.fs.borrow_mut();
             let write_offset = fs.get_inode_by_id(fh.inode_id).ok_or(Errno::ENOENT)?.size;
-            if let Err(err) = fs.write_file_by_inode(fh.inode_id, write_offset, data) {
+            if let Err(err) = fs.write_file_by_inode_with_privilege_clearing(
+                fh.inode_id,
+                write_offset,
+                data,
+                clear,
+            ) {
                 let errno = map_errno(&err);
                 if errno == Errno::EIO && vfs_op_diagnostics_enabled() {
                     eprintln!(
@@ -7680,7 +7711,9 @@ impl VfsEngine for VfsLocalFileSystem {
         }
 
         let mut fs = self.fs.borrow_mut();
-        if let Err(err) = fs.write_file_by_inode(fh.inode_id, offset, data) {
+        if let Err(err) =
+            fs.write_file_by_inode_with_privilege_clearing(fh.inode_id, offset, data, clear)
+        {
             let errno = map_errno(&err);
             if errno == Errno::EIO && vfs_op_diagnostics_enabled() {
                 eprintln!(
@@ -7711,10 +7744,11 @@ impl VfsEngine for VfsLocalFileSystem {
         if self.read_only {
             return Ok(());
         }
-        self.fs
-            .borrow_mut()
-            .flush_write_buffer(fh.inode_id)
-            .map_err(|e| map_errno(&e))?;
+        // FUSE FLUSH runs on each close and may repeat for dup/fork handles;
+        // unlike fsync, it does not require pending writes to reach storage.
+        // Accepted bytes remain owned by the dirty write buffer until fsync,
+        // admission pressure, or clean unmount publishes them. The adapter
+        // separately releases this close owner's POSIX locks.
         Ok(())
     }
 
@@ -8368,7 +8402,23 @@ impl VfsEngine for VfsLocalFileSystem {
         if self.read_only {
             return Ok(());
         }
-        self.fs.borrow_mut().sync_all().map_err(|e| map_errno(&e))
+        let diagnostic = vfs_shutdown_diagnostics_enabled();
+        let started = std::time::Instant::now();
+        let result = self.fs.borrow_mut().sync_all();
+        if diagnostic {
+            match &result {
+                Ok(()) => eprintln!(
+                    "tidefs-diagnostic: vfs syncfs ok elapsed_ms={}",
+                    started.elapsed().as_millis()
+                ),
+                Err(error) => eprintln!(
+                    "tidefs-diagnostic: vfs syncfs error errno={:?} err={error:?} elapsed_ms={}",
+                    map_errno(error),
+                    started.elapsed().as_millis()
+                ),
+            }
+        }
+        result.map_err(|e| map_errno(&e))
     }
 
     // == Extended attribute operations ======================================
@@ -11140,6 +11190,46 @@ mod tests {
                 .expect("read exact bytes after replacement reimport"),
             payload
         );
+    }
+
+    #[test]
+    fn quiescent_mounted_sync_all_does_not_advance_raw_store_sequence() {
+        let (engine, _td, _devices) = temp_fs_with_block_devices(1);
+        engine
+            .fs
+            .borrow_mut()
+            .set_auto_commit(false)
+            .expect("select deferred mounted commit policy");
+        let root = engine.get_root_inode(&ctx()).expect("root inode");
+        let (_attr, fh) = engine
+            .create(root, b"quiescent-sync.bin", 0o644, O_RDWR, &ctx())
+            .expect("create mounted sync fixture");
+        engine
+            .write(&fh, 0, b"mounted sync payload", &ctx())
+            .expect("write mounted sync fixture");
+        engine.release(&fh).expect("release mounted sync handle");
+
+        {
+            let mut filesystem = engine.fs.borrow_mut();
+            filesystem
+                .sync_all()
+                .expect("commit dirty mounted state once");
+            assert_eq!(filesystem.mounted_mutation_quiescence_failure(), None);
+            let before = filesystem.stats().object_store;
+            filesystem
+                .sync_all()
+                .expect("sync already-quiescent mounted state");
+            let after = filesystem.stats().object_store;
+            assert_eq!(
+                after.next_sequence, before.next_sequence,
+                "quiescent mounted sync_all must not append fresh raw-store state"
+            );
+            assert_eq!(
+                after.live_objects, before.live_objects,
+                "quiescent mounted sync_all must not publish new live objects"
+            );
+        }
+        drop(engine);
     }
 
     #[test]
@@ -18503,6 +18593,139 @@ mod tests {
     }
 
     #[test]
+    fn generic074_sparse_truncate_rewrites_survive_admission_pressure() {
+        const FILE_COUNT: usize = 3;
+        const LOOPS: usize = 3;
+        const BLOCK_SIZE: usize = 512;
+        const STRIDE: usize = 1024;
+        let logical_size = crate::constants::content_chunk_size() as usize * 2;
+        let expected_size = logical_size - BLOCK_SIZE;
+
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        for file_idx in 0..FILE_COUNT {
+            let name = format!("generic074-{file_idx}.bin");
+            let (_attr, fh) = engine
+                .create(root, name.as_bytes(), 0o644, O_RDWR, &ctx())
+                .unwrap();
+            engine.release(&fh).unwrap();
+        }
+
+        {
+            let mut fs = engine.fs.borrow_mut();
+            fs.stop_background_scheduler();
+            fs.sync_all().expect("commit generic/074 fixture files");
+            fs.set_auto_commit(false)
+                .expect("defer mounted commits during sparse rewrite loop");
+            fs.set_max_uncommitted_mutations(1_000_000)
+                .expect("keep the mounted commit group open");
+            fs.set_write_buffer_flush_threshold_bytes(64 * 1024 * 1024)
+                .expect("retain buffered sparse writes until pressure or fsync");
+            let admission = fs.admission_config();
+            fs.filesystem.write_admission.apply_dynamic_tuning(
+                crate::admission::LocalAdmissionTuning {
+                    max_dirty_bytes: (BLOCK_SIZE * 8) as u64,
+                    max_dirty_ops: admission.hard_max_dirty_ops,
+                    max_dirty_age_ticks: admission.hard_max_dirty_age_ticks,
+                },
+            );
+            fs.commit_group.config.commit_group_target_ops = u64::MAX;
+            fs.commit_group.config.commit_group_target_bytes = u64::MAX;
+            fs.commit_group.config.commit_group_dirty_max_bytes = u64::MAX;
+            fs.commit_group.config.commit_group_target_secs = 3600.0;
+        }
+
+        for loop_idx in 0..LOOPS {
+            for file_idx in 0..FILE_COUNT {
+                let name = format!("generic074-{file_idx}.bin");
+                let (attr, fh) = engine
+                    .create(root, name.as_bytes(), 0o644, O_RDWR | O_TRUNC, &ctx())
+                    .unwrap_or_else(|error| {
+                        panic!("loop {loop_idx} file {file_idx}: truncate-open failed: {error:?}")
+                    });
+                let inode_id = attr.inode_id;
+
+                for offset in (0..logical_size).step_by(STRIDE) {
+                    let block_index = offset / BLOCK_SIZE;
+                    let expected_byte =
+                        (loop_idx as u64 + file_idx as u64 + block_index as u64) as u8;
+                    let block = vec![expected_byte; BLOCK_SIZE];
+                    assert_eq!(
+                        engine
+                            .write(&fh, offset as u64, &block, &ctx())
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "loop {loop_idx} file {file_idx} offset {offset}: write failed: {error:?}"
+                                )
+                            }),
+                        BLOCK_SIZE as u32
+                    );
+                }
+
+                engine.flush(&fh, &ctx()).unwrap_or_else(|error| {
+                    panic!("loop {loop_idx} file {file_idx}: flush failed: {error:?}")
+                });
+                engine.release(&fh).unwrap_or_else(|error| {
+                    panic!("loop {loop_idx} file {file_idx}: release failed: {error:?}")
+                });
+
+                let reader = engine
+                    .open(inode_id, O_RDONLY, &ctx())
+                    .unwrap_or_else(|error| {
+                        panic!("loop {loop_idx} file {file_idx}: reopen failed: {error:?}")
+                    });
+                let reopened = engine
+                    .getattr(inode_id, Some(&reader), &ctx())
+                    .unwrap_or_else(|error| {
+                        panic!("loop {loop_idx} file {file_idx}: getattr failed: {error:?}")
+                    });
+                assert_eq!(
+                    reopened.posix.size, expected_size as u64,
+                    "loop {loop_idx} file {file_idx}: unexpected reopened size"
+                );
+
+                for offset in (0..logical_size).step_by(STRIDE) {
+                    let block_index = offset / BLOCK_SIZE;
+                    let expected_byte =
+                        (loop_idx as u64 + file_idx as u64 + block_index as u64) as u8;
+                    let expected = vec![expected_byte; BLOCK_SIZE];
+                    let actual = engine
+                        .read(&reader, offset as u64, BLOCK_SIZE as u32, &ctx())
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "loop {loop_idx} file {file_idx} offset {offset}: data read failed: {error:?}"
+                            )
+                        });
+                    assert_eq!(
+                        actual, expected,
+                        "loop {loop_idx} file {file_idx} offset {offset}: written sparse block changed"
+                    );
+
+                    let hole_offset = offset + BLOCK_SIZE;
+                    if hole_offset < expected_size {
+                        let hole = engine
+                            .read(&reader, hole_offset as u64, BLOCK_SIZE as u32, &ctx())
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "loop {loop_idx} file {file_idx} hole {hole_offset}: hole read failed: {error:?}"
+                                )
+                            });
+                        assert_eq!(
+                            hole,
+                            vec![0; BLOCK_SIZE],
+                            "loop {loop_idx} file {file_idx} hole {hole_offset}: sparse gap lost zero visibility"
+                        );
+                    }
+                }
+
+                engine.release(&reader).unwrap_or_else(|error| {
+                    panic!("loop {loop_idx} file {file_idx}: reader release failed: {error:?}")
+                });
+            }
+        }
+    }
+
+    #[test]
     fn released_file_handle_is_rejected_by_file_io_operations() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
@@ -18620,22 +18843,58 @@ mod tests {
     }
 
     #[test]
-    fn flush_does_not_record_fsync_durability_barrier() {
+    fn flush_retains_dirty_writeback_until_fsync_durability_barrier() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (_attr, fh) = engine
             .create(root, b"flush-not-fsync.txt", 0o644, O_RDWR, &ctx())
             .unwrap();
 
+        let durable_before = engine.fs.borrow().durable_commit_group();
         engine.write(&fh, 0, b"flush-only", &ctx()).unwrap();
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(fh.inode_id, 0, b"flush-only".len())
+                .is_some(),
+            "accepted bytes should remain buffered before close-path flush"
+        );
         let before = engine.fs.borrow().fsync_stats_snapshot();
         engine.flush(&fh, &ctx()).unwrap();
         let after = engine.fs.borrow().fsync_stats_snapshot();
 
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(fh.inode_id, 0, b"flush-only".len()),
+            Some(b"flush-only".to_vec()),
+            "close-path flush should retain accepted dirty bytes for the writeback owner"
+        );
+        assert_eq!(
+            engine.fs.borrow().durable_commit_group(),
+            durable_before,
+            "FUSE flush is not an fsync durability barrier"
+        );
         assert_eq!(after.fsync_count, before.fsync_count);
         assert_eq!(
             after.fsync_do_commit_fallback_count,
             before.fsync_do_commit_fallback_count
+        );
+
+        engine.fsync(&fh, false, &ctx()).unwrap();
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(fh.inode_id, 0, b"flush-only".len())
+                .is_none(),
+            "fsync should materialize accepted dirty bytes"
+        );
+        assert!(
+            engine.fs.borrow().durable_commit_group() > durable_before,
+            "fsync must still advance the recovery-safe commit boundary"
         );
     }
 

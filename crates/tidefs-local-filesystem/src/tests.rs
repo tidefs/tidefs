@@ -1363,6 +1363,78 @@ fn read_file_range_clips_eof_and_crosses_chunk_boundary() {
 }
 
 #[test]
+fn mounted_small_reads_reuse_exact_receipt_authenticated_chunk() {
+    let root = temp_root("mounted-small-read-receipted-chunk");
+    let chunk_size = content_chunk_size() as usize;
+    let mut payload = vec![0_u8; chunk_size * 2];
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    let record = fs
+        .create_file("/hot.bin", DEFAULT_FILE_PERMISSIONS)
+        .expect("create file");
+    fs.write_file("/hot.bin", 0, &payload)
+        .expect("write chunked content");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("materialize chunked content");
+
+    let reads_before = fs.store.pool().stats().total_read_ops;
+    assert_eq!(
+        fs.read_file_range("/hot.bin", 0, 512)
+            .expect("read first small range"),
+        payload[..512]
+    );
+    let reads_after_first = fs.store.pool().stats().total_read_ops;
+    assert!(
+        reads_after_first > reads_before,
+        "the first range must authenticate its chunk through Pool"
+    );
+
+    for offset in [512_usize, 1024, 1536, 2048] {
+        assert_eq!(
+            fs.read_file_range("/hot.bin", offset as u64, 512)
+                .expect("read another small range from the same chunk"),
+            payload[offset..offset + 512]
+        );
+    }
+    assert_eq!(
+        fs.store.pool().stats().total_read_ops,
+        reads_after_first,
+        "small reads within one exact chunk must not reread Pool objects"
+    );
+
+    assert_eq!(
+        fs.read_file_range("/hot.bin", chunk_size as u64, 512)
+            .expect("read a different chunk"),
+        payload[chunk_size..chunk_size + 512]
+    );
+    assert!(
+        fs.store.pool().stats().total_read_ops > reads_after_first,
+        "a different chunk identity must take the strict Pool path"
+    );
+
+    fs.write_file("/hot.bin", 0, &[0xa5; 512])
+        .expect("replace bytes in the first chunk");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("materialize replacement chunk");
+    let reads_after_replacement = fs.store.pool().stats().total_read_ops;
+    assert_eq!(
+        fs.read_file_range("/hot.bin", 0, 512)
+            .expect("read replacement bytes"),
+        vec![0xa5; 512]
+    );
+    assert!(
+        fs.store.pool().stats().total_read_ops > reads_after_replacement,
+        "content mutation must invalidate the previously decoded chunk"
+    );
+
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
 fn rename_and_truncate_survive_reopen() {
     let root = temp_root("rename-truncate");
     {
@@ -2074,6 +2146,97 @@ fn unlink_of_buffered_dirty_file_releases_dirty_capacity() {
     fs.write_file("/next.bin", 0, &vec![0x33; data_len])
         .expect("released dirty capacity admits next write");
 
+    cleanup(&root);
+}
+
+#[test]
+fn unlink_last_link_discards_buffer_without_pool_materialization() {
+    let root = temp_root("unlink-last-link-discards-buffer");
+    let data_len = content_chunk_size() as usize;
+    let mut fs =
+        LocalFileSystem::open_with_capacity(&root, StoreOptions::test_fast(), data_len as u64)
+            .expect("open fs");
+    fs.stop_background_scheduler();
+    let inode_id = fs
+        .create_file("/dirty.bin", 0o600)
+        .expect("create dirty file")
+        .inode_id;
+    fs.write_file("/dirty.bin", 0, &vec![0x17; data_len])
+        .expect("seed committed content");
+    fs.sync_all().expect("commit seed content");
+    let committed = fs.stat("/dirty.bin").expect("stat committed file");
+    let committed_manifest = ReclaimObjectKey(
+        *content_object_key_for_version(inode_id, committed.data_version).as_bytes(),
+    );
+
+    fs.set_auto_commit(false).expect("defer last-link mutation");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("retain the open commit group");
+    fs.set_write_buffer_flush_threshold_bytes(data_len * 8)
+        .expect("retain the replacement in memory");
+    fs.commit_group.config.commit_group_target_ops = u64::MAX;
+    fs.commit_group.config.commit_group_target_bytes = u64::MAX;
+    fs.commit_group.config.commit_group_dirty_max_bytes = data_len as u64 - 1;
+    fs.commit_group.config.commit_group_target_secs = 3600.0;
+    let start_commit_group = fs.commit_group.current_commit_group();
+
+    fs.write_file("/dirty.bin", 0, &vec![0x83; data_len])
+        .expect("buffer unreachable replacement");
+    let pending = fs.stat("/dirty.bin").expect("stat pending file");
+    let pending_key = content_object_key_for_version(inode_id, pending.data_version);
+    assert!(fs
+        .store
+        .pool()
+        .get(DeviceIoClass::Data, pending_key)
+        .expect("inspect pending content identity")
+        .is_none());
+    assert!(fs.commit_group.requires_foreground_commit());
+
+    fs.unlink("/dirty.bin")
+        .expect("last-link unlink must discard pending content");
+
+    assert_eq!(
+        fs.commit_group.current_commit_group(),
+        start_commit_group,
+        "unreachable dirty bytes must not force root publication"
+    );
+    assert!(!fs.commit_group.requires_foreground_commit());
+    assert!(fs
+        .store
+        .pool()
+        .get(DeviceIoClass::Data, pending_key)
+        .expect("inspect discarded content identity")
+        .is_none());
+    assert!(fs
+        .reclaim_queue
+        .lock()
+        .unwrap()
+        .entries()
+        .into_iter()
+        .any(|(key, _)| key == committed_manifest));
+    assert!(!fs.write_buffers.contains_key(&inode_id));
+    assert!(!fs
+        .filesystem
+        .buffered_write_base_records
+        .contains_key(&inode_id));
+    assert!(!fs.filesystem.pending_permits.contains_key(&inode_id));
+    assert_eq!(fs.capacity_authority().used_bytes(), 0);
+    assert_eq!(fs.capacity_authority().pending_bytes(), 0);
+    let admission = fs
+        .take_admission_snapshot()
+        .expect("inspect admission after unlink");
+    assert_eq!(admission.current_dirty_bytes, 0);
+    assert_eq!(admission.current_dirty_ops, 0);
+    assert_eq!(admission.current_outstanding_permits, 0);
+
+    fs.do_commit().expect("publish last-link removal");
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert!(matches!(
+        reopened.stat("/dirty.bin"),
+        Err(FileSystemError::NotFound { .. })
+    ));
+    drop(reopened);
     cleanup(&root);
 }
 
@@ -2907,10 +3070,11 @@ fn overlay_write_records_exact_dirty_range_bytes() {
 }
 
 #[test]
-fn overlay_write_commits_when_exact_dirty_bytes_cross_target() {
+fn overlay_write_defers_soft_target_but_commits_at_hard_maximum() {
     let root = temp_root("overlay-write-byte-target");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     let record = fs.create_file("/pressure.bin", 0o644).expect("create file");
+    fs.sync_all().expect("commit fixture inode");
     fs.set_auto_commit(false)
         .expect("test setup mutation must be admitted");
     fs.set_max_uncommitted_mutations(1_000_000)
@@ -2918,7 +3082,7 @@ fn overlay_write_commits_when_exact_dirty_bytes_cross_target() {
     const WRITE_LEN: usize = 4096;
     fs.commit_group.config.commit_group_target_bytes = WRITE_LEN as u64;
     fs.commit_group.config.commit_group_target_ops = u64::MAX;
-    fs.commit_group.config.commit_group_dirty_max_bytes = u64::MAX;
+    fs.commit_group.config.commit_group_dirty_max_bytes = (WRITE_LEN * 2) as u64;
     fs.commit_group.config.commit_group_target_secs = 3600.0;
     let start_commit_group = fs.commit_group.current_commit_group().0;
 
@@ -2927,14 +3091,104 @@ fn overlay_write_commits_when_exact_dirty_bytes_cross_target() {
     fs.flush_write_buffer(record.inode_id)
         .expect("flush write buffer");
 
+    assert_eq!(
+        fs.commit_group.current_commit_group().0,
+        start_commit_group,
+        "the soft byte target must leave root publication to maintenance"
+    );
+    assert_eq!(fs.commit_group.dirty_bytes, WRITE_LEN as u64);
+
+    fs.write_file("/pressure.bin", WRITE_LEN as u64, &[0x3c; WRITE_LEN])
+        .expect("write second overlay");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush second write buffer");
+
     assert!(
         fs.commit_group.current_commit_group().0 > start_commit_group,
-        "byte target should force a commit-group sync"
+        "the hard byte maximum must retain foreground backpressure"
     );
     assert_eq!(fs.uncommitted_mutation_count(), 0);
     assert_eq!(fs.commit_group.dirty_bytes, 0);
     assert!(fs.dirty_set.is_clean());
     assert!(!fs.is_state_dirty());
+    cleanup(&root);
+}
+
+#[test]
+fn truncate_retires_superseded_buffered_dirty_debt() {
+    let root = temp_root("truncate-retires-buffered-dirty-debt");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.stop_background_scheduler();
+    let record = fs
+        .create_file("/pressure.bin", 0o644)
+        .expect("create pressure file");
+    fs.sync_all().expect("commit fixture inode");
+    fs.set_auto_commit(false)
+        .expect("disable automatic per-mutation commits");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("retain the open commit group");
+    fs.set_write_buffer_flush_threshold_bytes(64 * 1024 * 1024)
+        .expect("retain buffered content until explicit durability");
+
+    const WRITE_LEN: usize = 8192;
+    const RETAINED_LEN: usize = 1024;
+    fs.commit_group.config.commit_group_target_ops = u64::MAX;
+    fs.commit_group.config.commit_group_target_bytes = u64::MAX;
+    fs.commit_group.config.commit_group_dirty_max_bytes = WRITE_LEN as u64;
+    fs.commit_group.config.commit_group_target_secs = 3600.0;
+    let start_commit_group = fs.commit_group.current_commit_group();
+    let payload = vec![0x6d; WRITE_LEN];
+
+    fs.write_file("/pressure.bin", 0, &payload)
+        .expect("fill the hard dirty-byte boundary");
+    assert!(fs.commit_group.requires_foreground_commit());
+    assert_eq!(
+        fs.take_admission_snapshot()
+            .expect("read admission before truncate")
+            .current_dirty_bytes,
+        WRITE_LEN as u64
+    );
+
+    fs.truncate_file("/pressure.bin", RETAINED_LEN as u64)
+        .expect("truncate buffered suffix without publishing unrelated state");
+
+    assert_eq!(
+        fs.commit_group.current_commit_group(),
+        start_commit_group,
+        "superseded buffered bytes must not force a foreground root publication"
+    );
+    assert_eq!(fs.commit_group.dirty_bytes, RETAINED_LEN as u64);
+    assert!(!fs.commit_group.requires_foreground_commit());
+    assert_eq!(fs.filesystem.dirty_set.data_bytes, RETAINED_LEN as u64);
+    assert_eq!(
+        fs.filesystem
+            .dirty_set
+            .per_inode_bytes
+            .get(&record.inode_id),
+        Some(&(RETAINED_LEN as u64))
+    );
+    assert_eq!(
+        fs.take_admission_snapshot()
+            .expect("read admission after truncate")
+            .current_dirty_bytes,
+        RETAINED_LEN as u64
+    );
+    assert_eq!(
+        fs.read_file("/pressure.bin")
+            .expect("read retained buffered prefix"),
+        payload[..RETAINED_LEN]
+    );
+
+    fs.do_commit().expect("publish retained prefix");
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        reopened
+            .read_file("/pressure.bin")
+            .expect("read retained prefix after reopen"),
+        payload[..RETAINED_LEN]
+    );
+    drop(reopened);
     cleanup(&root);
 }
 
@@ -2961,10 +3215,18 @@ fn metadata_mutations_count_once_toward_commit_group_target() {
     assert_eq!(fs.commit_group.dirty_ops, 2);
 
     fs.create_dir("/c", 0o755).expect("create third dir");
-    assert!(
-        fs.commit_group.current_commit_group().0 > start_commit_group,
-        "third metadata mutation should reach the configured op target"
+    assert_eq!(
+        fs.commit_group.current_commit_group().0,
+        start_commit_group,
+        "the soft operation target must not charge the foreground mutation for root publication"
     );
+    assert_eq!(fs.commit_group.dirty_ops, 3);
+    assert!(
+        fs.commit_group_maintenance_tick()
+            .expect("close the soft-target group during maintenance"),
+        "the soft operation target must remain actionable by maintenance"
+    );
+    assert!(fs.commit_group.current_commit_group().0 > start_commit_group);
     assert_eq!(fs.uncommitted_mutation_count(), 0);
     assert_eq!(fs.commit_group.dirty_ops, 0);
     assert!(fs.dirty_set.is_clean());
@@ -3031,6 +3293,218 @@ fn contiguous_buffered_writes_share_one_admission_permit() {
     assert_eq!(final_snapshot.current_dirty_ops, 0);
     assert_eq!(final_snapshot.current_outstanding_permits, 0);
     drop(fs);
+    cleanup(&root);
+}
+
+#[test]
+fn admission_pressure_materializes_dirty_bytes_without_publishing_root() {
+    let root = temp_root("admission-pressure-materializes-without-root");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.stop_background_scheduler();
+    let first = fs
+        .create_file("/first.bin", 0o644)
+        .expect("create first file");
+    let second = fs
+        .create_file("/second.bin", 0o644)
+        .expect("create second file");
+    fs.sync_all().expect("commit test fixture");
+    fs.set_auto_commit(false)
+        .expect("disable automatic per-mutation commits");
+    fs.set_commit_group_throughput_profile()
+        .expect("select mounted throughput profile");
+    fs.set_max_uncommitted_mutations(64 * 1024)
+        .expect("retain the mounted mutation bound");
+    fs.set_write_buffer_flush_threshold_bytes(64 * 1024 * 1024)
+        .expect("retain mounted per-inode writeback batching");
+    let admission = fs.admission_config();
+    fs.filesystem
+        .write_admission
+        .apply_dynamic_tuning(crate::admission::LocalAdmissionTuning {
+            max_dirty_bytes: 4096,
+            max_dirty_ops: admission.hard_max_dirty_ops,
+            max_dirty_age_ticks: admission.hard_max_dirty_age_ticks,
+        });
+
+    let commit_group_before = fs.commit_group.current_commit_group();
+    let durable_before = fs.durable_commit_group();
+    let first_bytes = vec![0x31; 3072];
+    let second_bytes = vec![0x52; 2048];
+    fs.write_file("/first.bin", 0, &first_bytes)
+        .expect("buffer first admitted write");
+    fs.write_file("/second.bin", 0, &second_bytes)
+        .expect("materialize first inode and admit second write");
+
+    assert_eq!(fs.commit_group.current_commit_group(), commit_group_before);
+    assert_eq!(fs.durable_commit_group(), durable_before);
+    assert!(fs.is_state_dirty());
+    assert!(!fs.write_buffers.contains_key(&first.inode_id));
+    assert!(!fs
+        .filesystem
+        .buffered_write_base_records
+        .contains_key(&first.inode_id));
+    assert!(fs.write_buffers.contains_key(&second.inode_id));
+    assert!(fs
+        .filesystem
+        .buffered_write_base_records
+        .contains_key(&second.inode_id));
+    assert_eq!(
+        MountedContentReadAuthority::new(fs.store.pool())
+            .read_all(
+                first.inode_id,
+                fs.state
+                    .inodes
+                    .get(&first.inode_id)
+                    .expect("live first inode"),
+            )
+            .expect("read pressure-materialized content through Pool authority"),
+        first_bytes,
+    );
+    assert_eq!(
+        fs.read_file("/second.bin").expect("read second overlay"),
+        second_bytes
+    );
+    let pressure = fs.take_admission_snapshot().expect("read pressure usage");
+    assert_eq!(pressure.current_dirty_bytes, second_bytes.len() as u64);
+    assert_eq!(pressure.current_dirty_ops, 1);
+    assert_eq!(pressure.current_outstanding_permits, 1);
+
+    let dirty_bytes_before_rewrite = fs.filesystem.dirty_set.data_bytes;
+    let commit_group_bytes_before_rewrite = fs.commit_group.dirty_bytes;
+    let rewritten_first = vec![0x8f; first_bytes.len()];
+    fs.write_file("/first.bin", 0, &rewritten_first)
+        .expect("rewrite pressure-materialized current-group range");
+
+    assert_eq!(fs.commit_group.current_commit_group(), commit_group_before);
+    assert_eq!(fs.durable_commit_group(), durable_before);
+    assert_eq!(
+        fs.filesystem.dirty_set.data_bytes, dirty_bytes_before_rewrite,
+        "rewriting an already-dirty materialized range must not retain historical I/O debt"
+    );
+    assert_eq!(
+        fs.commit_group.dirty_bytes, commit_group_bytes_before_rewrite,
+        "the open group must charge the live dirty range union"
+    );
+    assert_eq!(
+        fs.read_file("/first.bin")
+            .expect("read rewritten first file"),
+        rewritten_first
+    );
+    let rewrite_pressure = fs.take_admission_snapshot().expect("read rewrite usage");
+    assert_eq!(
+        rewrite_pressure.current_dirty_bytes,
+        first_bytes.len() as u64
+    );
+    assert_eq!(rewrite_pressure.current_dirty_ops, 1);
+    assert_eq!(rewrite_pressure.current_outstanding_permits, 1);
+
+    let second_tail = vec![0x73; 3072];
+    fs.write_file("/second.bin", second_bytes.len() as u64, &second_tail)
+        .expect("materialize and replan same-inode expansion");
+    assert_eq!(fs.commit_group.current_commit_group(), commit_group_before);
+    assert_eq!(fs.durable_commit_group(), durable_before);
+    assert!(fs.is_state_dirty());
+    let mut expected_second = second_bytes.clone();
+    expected_second.extend_from_slice(&second_tail);
+    assert_eq!(
+        fs.read_file("/second.bin")
+            .expect("read materialized base plus new overlay"),
+        expected_second
+    );
+    let same_inode_pressure = fs
+        .take_admission_snapshot()
+        .expect("read same-inode pressure usage");
+    assert_eq!(
+        same_inode_pressure.current_dirty_bytes,
+        second_tail.len() as u64
+    );
+    assert_eq!(same_inode_pressure.current_dirty_ops, 1);
+    assert_eq!(same_inode_pressure.current_outstanding_permits, 1);
+
+    fs.do_commit().expect("publish both admitted files");
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        reopened.read_file("/first.bin").expect("read first"),
+        rewritten_first
+    );
+    assert_eq!(
+        reopened.read_file("/second.bin").expect("read second"),
+        expected_second
+    );
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
+fn truncate_retires_materialized_current_group_dirty_suffix() {
+    let root = temp_root("truncate-retires-materialized-dirty-suffix");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.stop_background_scheduler();
+    let first = fs
+        .create_file("/first.bin", 0o644)
+        .expect("create first file");
+    fs.create_file("/second.bin", 0o644)
+        .expect("create second file");
+    fs.sync_all().expect("commit test fixture");
+    fs.set_auto_commit(false)
+        .expect("disable automatic per-mutation commits");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("retain the open commit group");
+    fs.set_write_buffer_flush_threshold_bytes(64 * 1024 * 1024)
+        .expect("retain mounted per-inode writeback batching");
+    let admission = fs.admission_config();
+    fs.filesystem
+        .write_admission
+        .apply_dynamic_tuning(crate::admission::LocalAdmissionTuning {
+            max_dirty_bytes: 4096,
+            max_dirty_ops: admission.hard_max_dirty_ops,
+            max_dirty_age_ticks: admission.hard_max_dirty_age_ticks,
+        });
+    fs.commit_group.config.commit_group_target_ops = u64::MAX;
+    fs.commit_group.config.commit_group_target_bytes = u64::MAX;
+    fs.commit_group.config.commit_group_dirty_max_bytes = u64::MAX;
+    fs.commit_group.config.commit_group_target_secs = 3600.0;
+
+    let first_bytes = vec![0x31; 3072];
+    fs.write_file("/first.bin", 0, &first_bytes)
+        .expect("buffer first write");
+    fs.write_file("/second.bin", 0, &[0x52; 2048])
+        .expect("materialize first inode under admission pressure");
+    assert!(!fs.write_buffers.contains_key(&first.inode_id));
+    assert!(!fs
+        .filesystem
+        .buffered_write_base_records
+        .contains_key(&first.inode_id));
+    assert!(!fs.filesystem.pending_permits.contains_key(&first.inode_id));
+    assert_eq!(fs.filesystem.dirty_set.data_bytes, 5120);
+    assert_eq!(fs.commit_group.dirty_bytes, 5120);
+
+    let commit_group_before = fs.commit_group.current_commit_group();
+    fs.truncate_file("/first.bin", 1024)
+        .expect("truncate materialized current-group suffix");
+
+    assert_eq!(fs.commit_group.current_commit_group(), commit_group_before);
+    assert_eq!(fs.filesystem.dirty_set.data_bytes, 3072);
+    assert_eq!(fs.commit_group.dirty_bytes, 3072);
+    assert_eq!(
+        fs.filesystem.dirty_set.per_inode_bytes.get(&first.inode_id),
+        Some(&1024)
+    );
+    assert_eq!(
+        fs.read_file("/first.bin").expect("read retained prefix"),
+        first_bytes[..1024]
+    );
+
+    fs.do_commit().expect("publish truncated current group");
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        reopened
+            .read_file("/first.bin")
+            .expect("read retained prefix after reopen"),
+        first_bytes[..1024]
+    );
+    drop(reopened);
     cleanup(&root);
 }
 
