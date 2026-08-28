@@ -1240,6 +1240,31 @@ mod op {
         }
     }
 
+    /// Create and open an unnamed temporary regular file.
+    #[cfg(feature = "abi-7-37")]
+    #[derive(Debug)]
+    pub struct Tmpfile<'a> {
+        header: &'a fuse_in_header,
+        arg: &'a fuse_create_in,
+    }
+    #[cfg(feature = "abi-7-37")]
+    impl_request!(Tmpfile<'a>);
+    #[cfg(feature = "abi-7-37")]
+    impl<'a> Tmpfile<'a> {
+        pub fn mode(&self) -> u32 {
+            self.arg.mode
+        }
+        pub fn flags(&self) -> i32 {
+            self.arg.flags
+        }
+        pub fn umask(&self) -> u32 {
+            #[cfg(not(feature = "abi-7-12"))]
+            return 0;
+            #[cfg(feature = "abi-7-12")]
+            self.arg.umask
+        }
+    }
+
     /// If a process issuing a FUSE filesystem request is interrupted, the
     /// following will happen:
     ///
@@ -1926,6 +1951,12 @@ mod op {
                 header,
                 _arg: data.fetch()?,
             }),
+            #[cfg(feature = "abi-7-37")]
+            fuse_opcode::FUSE_TMPFILE => {
+                let arg = data.fetch()?;
+                let _name = data.fetch_str()?;
+                Operation::Tmpfile(Tmpfile { header, arg })
+            }
 
             #[cfg(target_os = "macos")]
             fuse_opcode::FUSE_SETVOLNAME => Operation::SetVolName(SetVolName {
@@ -2009,6 +2040,8 @@ pub enum Operation<'a> {
     Flock(Flock<'a>),
     #[cfg(feature = "abi-7-31")]
     SyncFs(SyncFs<'a>),
+    #[cfg(feature = "abi-7-37")]
+    Tmpfile(Tmpfile<'a>),
 
     #[cfg(target_os = "macos")]
     SetVolName(SetVolName<'a>),
@@ -2216,6 +2249,10 @@ impl<'a> fmt::Display for Operation<'a> {
             Operation::GetXTimes(_) => write!(f, "GETXTIMES"),
             #[cfg(feature = "abi-7-31")]
             Operation::SyncFs(_) => write!(f, "SYNCFS"),
+            #[cfg(feature = "abi-7-37")]
+            Operation::Tmpfile(x) => {
+                write!(f, "TMPFILE mode {:#05o}, flags {:#x}", x.mode(), x.flags())
+            }
             Operation::Exchange(x) => write!(
                 f,
                 "EXCHANGE from {:?}, to {:?}, options {:#x}",
@@ -2897,6 +2934,20 @@ mod tests {
         0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x00, 0x00, 0x00, // "hello\0"
     ]);
 
+    #[cfg(all(target_endian = "little", feature = "abi-7-37"))]
+    const TMPFILE_REQUEST: AlignedData<[u8; 57]> = AlignedData([
+        0x39, 0x00, 0x00, 0x00, 0x33, 0x00, 0x00, 0x00, // len=57, opcode=51
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        // fuse_create_in (abi-7-12)
+        0x02, 0x00, 0x41, 0x00, 0xa4, 0x01, 0x00, 0x00, // flags=O_RDWR|O_TMPFILE, mode=0644
+        0x92, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // umask=0o622, padding
+        // empty dentry name
+        0x00,
+    ]);
+
     // READLINK (opcode 5): header only, no extra args
     #[cfg(target_endian = "little")]
     const READLINK_REQUEST: AlignedData<[u8; 40]> = AlignedData([
@@ -3053,6 +3104,21 @@ mod tests {
                 assert_eq!(x.name(), OsStr::new("hello"));
             }
             other => panic!("Expected Create, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "abi-7-12", feature = "abi-7-37"))]
+    fn parse_tmpfile() {
+        let req = AnyRequest::try_from(&TMPFILE_REQUEST[..]).unwrap();
+        assert_eq!(req.header.opcode, 51);
+        match req.operation().unwrap() {
+            Operation::Tmpfile(x) => {
+                assert_eq!(x.mode(), 0o644);
+                assert_eq!(x.umask(), 0o622);
+                assert_eq!(x.flags(), 0x0041_0002);
+            }
+            other => panic!("Expected Tmpfile, got {:?}", other),
         }
     }
 

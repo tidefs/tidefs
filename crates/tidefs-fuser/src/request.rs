@@ -789,6 +789,17 @@ impl<'a> Request<'a> {
                     self.reply(),
                 );
             }
+            #[cfg(feature = "abi-7-37")]
+            ll::Operation::Tmpfile(x) => {
+                se.filesystem.tmpfile(
+                    self,
+                    self.request.nodeid().into(),
+                    x.mode(),
+                    x.umask(),
+                    x.flags(),
+                    self.reply(),
+                );
+            }
             ll::Operation::GetLk(x) => {
                 se.filesystem.getlk(
                     self,
@@ -1334,6 +1345,20 @@ mod tests {
             0o644,
             0,
             0,
+            dummy_reply_create(),
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "abi-7-37")]
+    fn dispatch_tmpfile_returns_reply() {
+        let mut fs = NullFS;
+        fs.tmpfile(
+            &dummy_req(),
+            1,
+            0o644,
+            0o022,
+            0x0041_0002,
             dummy_reply_create(),
         );
     }

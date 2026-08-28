@@ -11,7 +11,7 @@
 //! daemon as a separate process, sends real SIGKILL, lazy-unmounts with
 //! fusermount -uz, and restarts a fresh daemon on the same backing store.
 
-use std::os::unix::fs::PermissionsExt;
+use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 use tidefs_validation::mount_harness::MountHarness;
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -31,6 +31,13 @@ fn mount_or_skip() -> Option<MountHarness> {
             None
         }
     }
+}
+
+/// Fsync a directory path through the mounted filesystem.
+fn sync_directory(path: &Path) {
+    fs::File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .expect("fsync mounted directory");
 }
 
 // ── test 1: single-file fsync + SIGKILL + remount ───────────────────────
@@ -718,10 +725,12 @@ fn fsync_crash_delete_file_sigkill() {
     harness.fsync_file("testdir/keep.bin").expect("fsync keep");
     harness.fsync_file("testdir/del.bin").expect("fsync del");
 
-    // Delete del.bin, fsync its parent directory.
+    // Delete del.bin, then fsync its parent directory so the namespace
+    // mutation is part of the crash-durability contract under test.
     harness
         .remove_file("testdir/del.bin")
         .expect("remove del.bin");
+    sync_directory(&harness.mount_path().join("testdir"));
 
     harness.crash_and_remount().expect("crash_and_remount");
 
@@ -752,7 +761,8 @@ fn fsync_crash_delete_file_sigkill() {
 
 // ── test 17: rmdir + fsync + SIGKILL ─────────────────────────────────────
 
-/// Create empty dir, fsync, remove dir, SIGKILL, remount, verify dir gone.
+/// Create empty dir, remove it, fsync its parent directory, SIGKILL, remount,
+/// verify dir gone.
 #[test]
 fn fsync_crash_rmdir_sigkill() {
     let mut harness = match mount_or_skip() {
@@ -769,6 +779,7 @@ fn fsync_crash_rmdir_sigkill() {
         .remove_file("rm_me/placeholder.bin")
         .expect("remove placeholder");
     harness.remove_dir("rm_me").expect("rmdir rm_me");
+    sync_directory(harness.mount_path());
 
     harness.crash_and_remount().expect("crash_and_remount");
 

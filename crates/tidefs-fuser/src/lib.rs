@@ -880,6 +880,24 @@ pub trait Filesystem {
         reply.error(ENOSYS);
     }
 
+    /// Create and open an unnamed regular file in `parent`.
+    #[cfg(feature = "abi-7-37")]
+    fn tmpfile(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        debug!(
+            "[Not Implemented] tmpfile(parent: {parent:#x?}, mode: {mode}, umask: {umask:#x?}, \
+            flags: {flags:#x?})"
+        );
+        reply.error(ENOSYS);
+    }
+
     /// Test for a POSIX file lock.
     fn getlk(
         &mut self,

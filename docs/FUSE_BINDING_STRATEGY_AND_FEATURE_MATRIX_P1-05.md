@@ -179,7 +179,7 @@ stub placeholders.
 | `FUSE_RENAME2` | `rename(... flags)` | **Partially implemented** | fuser passes rename flags through `rename()` rather than a separate `rename2()` callback |
 | `FUSE_EXCHANGE` | `exchange()` | **Implemented** | Linux 6.13+/macOS exchange callback dispatches through `dispatch_exchange_entry()` as an additional exchange surface |
 | `FUSE_LINK` | `link()` | **Implemented** | |
-| `FUSE_OPEN` | `open()` | **Implemented** | `O_TMPFILE` is handled as an open-flag adjunct through `dispatch_tmpfile()`, not a distinct fuser callback |
+| `FUSE_OPEN` | `open()` | **Implemented** | Regular named-file opens dispatch through `open()`; mounted `O_TMPFILE` uses the distinct `FUSE_TMPFILE` callback |
 | `FUSE_READ` | `read()` | **Implemented** | |
 | `FUSE_WRITE` | `write()` | **Implemented** | Bounded by dirty-window budget |
 | `FUSE_STATFS` | `statfs()` | **Implemented** | |
@@ -215,7 +215,7 @@ stub placeholders.
 
 | Opcode | Protocol | Needed for | Deferral reason |
 |---|---|---|---|
-| `FUSE_TMPFILE` | ≥ 7.9 | xfstests O_TMPFILE | No distinct fuser callback in the current daemon; `O_TMPFILE` is handled as an open-flag adjunct and uses the same Pool-backed zero-link inode lifetime as open-unlinked files |
+| `FUSE_TMPFILE` | ≥ 7.37 | xfstests O_TMPFILE | Implemented through the mounted `tmpfile()` callback and uses the same Pool-backed zero-link inode lifetime as open-unlinked files |
 | `FUSE_COPY_FILE_RANGE_64` | ≥ 7.45 | Large file clone | No distinct daemon callback in the current fuser surface; current `copy_file_range()` is implemented and tested |
 
 ---

@@ -154,6 +154,8 @@ const fn fuse_opcode_to_name(op: fuse_opcode) -> &'static str {
         fuse_opcode::FUSE_STATX => "STATX",
         #[cfg(feature = "abi-7-31")]
         fuse_opcode::FUSE_SYNCFS => "SYNCFS",
+        #[cfg(feature = "abi-7-37")]
+        fuse_opcode::FUSE_TMPFILE => "TMPFILE",
         fuse_opcode::FUSE_EXCHANGE => "EXCHANGE",
         #[cfg(target_os = "macos")]
         fuse_opcode::FUSE_SETVOLNAME => "SETVOLNAME",
@@ -281,6 +283,8 @@ mod tests {
         assert_eq!(opcode_name(11_u32), "RMDIR");
         #[cfg(feature = "abi-7-31")]
         assert_eq!(opcode_name(50_u32), "SYNCFS");
+        #[cfg(feature = "abi-7-37")]
+        assert_eq!(opcode_name(51_u32), "TMPFILE");
     }
 
     #[test]

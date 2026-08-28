@@ -34,7 +34,7 @@ fn sender() -> NoopSender {
 
 #[test]
 fn opcode_name_every_known_opcode() {
-    let known: &[(u32, &str)] = &[
+    let mut known = vec![
         (1, "LOOKUP"),
         (2, "FORGET"),
         (3, "GETATTR"),
@@ -73,7 +73,11 @@ fn opcode_name_every_known_opcode() {
         (38, "DESTROY"),
         (63, "EXCHANGE"),
     ];
-    for &(code, expected) in known {
+    #[cfg(feature = "abi-7-31")]
+    known.push((50, "SYNCFS"));
+    #[cfg(feature = "abi-7-37")]
+    known.push((51, "TMPFILE"));
+    for (code, expected) in known {
         let name = fuser::opcode_name(code);
         assert_eq!(
             name, expected,
@@ -84,9 +88,14 @@ fn opcode_name_every_known_opcode() {
 
 #[test]
 fn opcode_name_unknown_for_unused_slots() {
-    for &code in &[
-        0u32, 7, 19, 41, 49, 50, 51, 54, 55, 56, 57, 58, 59, 60, 64, 100, 255,
-    ] {
+    let unknown = vec![
+        0u32, 7, 19, 41, 49, 54, 55, 56, 57, 58, 59, 60, 64, 100, 255,
+    ];
+    #[cfg(not(feature = "abi-7-31"))]
+    unknown.push(50);
+    #[cfg(not(feature = "abi-7-37"))]
+    unknown.push(51);
+    for &code in &unknown {
         assert_eq!(
             fuser::opcode_name(code),
             "UNKNOWN",

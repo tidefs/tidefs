@@ -16,7 +16,7 @@
 //! daemon as a separate process, sends real SIGKILL, lazy-unmounts with
 //! fusermount -uz, and restarts a fresh daemon on the same backing store.
 
-use std::os::unix::fs::PermissionsExt;
+use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 use tidefs_validation::mount_harness::MountHarness;
 
@@ -59,6 +59,13 @@ fn mount_or_skip() -> Option<MountHarness> {
             None
         }
     }
+}
+
+/// Fsync a directory path through the mounted filesystem.
+fn sync_directory(path: &Path) {
+    fs::File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .expect("fsync mounted directory");
 }
 
 // ── test 1: operation-mix crash-recovery ──────────────────────────────────
@@ -245,8 +252,8 @@ fn ops_mix_crash_recovery_full_surface() {
 
 // ── test 2: unlink + rmdir crash recovery ─────────────────────────────────
 
-/// Create files and directories, remove some via unlink/rmdir, fsync,
-/// SIGKILL, remount, verify deletions survived.
+/// Create files and directories, remove some via unlink/rmdir, fsync the
+/// affected parent directory, SIGKILL, remount, verify deletions survived.
 #[test]
 fn ops_mix_unlink_rmdir_crash_recovery() {
     let mut harness = match mount_or_skip() {
@@ -275,6 +282,7 @@ fn ops_mix_unlink_rmdir_crash_recovery() {
         .remove_file("todelete/gone.txt")
         .expect("remove gone.txt");
     harness.remove_dir("todelete").expect("rmdir todelete");
+    sync_directory(harness.mount_path());
 
     harness.crash_and_remount().expect("crash_and_remount");
 

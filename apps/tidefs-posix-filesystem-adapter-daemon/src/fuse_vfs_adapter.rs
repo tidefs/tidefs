@@ -2803,6 +2803,7 @@ enum FuseAdmissionOp {
     Bmap,
     CopyFileRange,
     Create,
+    Tmpfile,
     Exchange,
     Fallocate,
     Flock,
@@ -2849,6 +2850,7 @@ impl FuseAdmissionOp {
             self,
             Self::CopyFileRange
                 | Self::Create
+                | Self::Tmpfile
                 | Self::Exchange
                 | Self::Fallocate
                 | Self::Link
@@ -2877,6 +2879,7 @@ impl FuseAdmissionOp {
             | Self::Syncfs => FuseAdmissionClass::AlwaysAdmit,
             Self::CopyFileRange
             | Self::Create
+            | Self::Tmpfile
             | Self::Exchange
             | Self::Fallocate
             | Self::Flock
@@ -2927,6 +2930,7 @@ impl FuseAdmissionOp {
             Self::Access
             | Self::Bmap
             | Self::Create
+            | Self::Tmpfile
             | Self::Exchange
             | Self::Flush
             | Self::Fsync
@@ -5158,6 +5162,32 @@ impl FuseVfsAdapter {
             gid,
             pid,
             35, // opcode::FUSE_CREATE
+            PosixFilesystemAdapterRequestClass::NamespaceMut,
+            PosixFilesystemAdapterShardKeyPolicy::ParentDir,
+            parent,
+        )
+    }
+
+    /// P5-02 classification for an incoming FUSE tmpfile request.
+    #[must_use]
+    fn classify_fuse_tmpfile(
+        unique: u64,
+        parent: u64,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    ) -> tidefs_types_posix_filesystem_adapter_core::PosixFilesystemAdapterRequestContextMirrorRecord
+    {
+        use tidefs_types_posix_filesystem_adapter_core::{
+            PosixFilesystemAdapterRequestClass, PosixFilesystemAdapterShardKeyPolicy,
+        };
+        classify_request_context(
+            unique,
+            parent,
+            uid,
+            gid,
+            pid,
+            51, // opcode::FUSE_TMPFILE
             PosixFilesystemAdapterRequestClass::NamespaceMut,
             PosixFilesystemAdapterShardKeyPolicy::ParentDir,
             parent,
@@ -8800,13 +8830,16 @@ impl FuseVfsAdapter {
     /// Engine contract: `tmpfile(parent, mode, flags, ctx)` returns
     /// `(InodeAttr, EngineFileHandle)`.  The file data is discarded on
     /// release if never linked.
-    pub fn dispatch_tmpfile(
+    pub fn dispatch_tmpfile_entry(
         &self,
         ctx: &RequestCtx,
         parent_dir: u64,
         file_mode: u32,
         open_flags: u32,
-    ) -> Result<VfsOpenDispatch, Errno> {
+    ) -> Result<VfsCreateDispatch, Errno> {
+        self.check_not_read_only()?;
+        Self::validate_open_flags(open_flags)?;
+        let mount_identity = self.permission_mount_identity()?;
         // Strip O_TMPFILE from flags passed to the engine; the engine's
         // tmpfile method is already the TMPFILE path.  Use the stripped
         // flags for the handle table so the stored open_flags match what
@@ -8815,27 +8848,52 @@ impl FuseVfsAdapter {
         let (attr, engine_fh) = {
             let e = self.engine.lock().unwrap();
             let parent = InodeId::new(parent_dir);
+            check_parent_write_execute_mutation_preflight(&**e, parent, ctx, &mount_identity)?;
             e.tmpfile(parent, file_mode, engine_flags, ctx)?
         };
-        let ino = attr.inode_id.get();
-        let fuse_flags = self.fuse_open_flags_for_request(engine_flags);
+        self.dentry_invalidations
+            .lock()
+            .unwrap()
+            .observe_inode(attr.inode_id.get());
+        self.populate_getattr_cache(attr.inode_id.get(), &attr);
+        let fuse_open_flags = self.fuse_open_flags_for_request(engine_flags);
         let adapter_fh = {
             let mut handles = self.file_handles.lock().unwrap();
-            let adapter_fh = handles.allocate(ino, engine_flags, engine_fh);
+            let adapter_fh = handles.allocate(attr.inode_id.get(), engine_flags, engine_fh);
             if let Some(handle) = handles.handles.get_mut(&adapter_fh) {
-                handle.fuse_open_flags = fuse_flags;
+                handle.fuse_open_flags = fuse_open_flags;
             }
             adapter_fh
         };
         Self::emit_open_lifecycle_observation(OpenLifecycleObservation::opened(
-            ino, adapter_fh, engine_fh,
-        ));
-        self.file_handles.lock().unwrap().inc_open_ref(ino);
-        self.remember_writeback_inode(ino);
-        Ok(VfsOpenDispatch {
+            attr.inode_id.get(),
             adapter_fh,
-            open_flags: fuse_flags,
+            engine_fh,
+        ));
+        self.file_handles
+            .lock()
+            .unwrap()
+            .inc_open_ref(attr.inode_id.get());
+        self.remember_writeback_inode(attr.inode_id.get());
+        Ok(VfsCreateDispatch {
+            attr,
+            adapter_fh,
+            fuse_open_flags,
         })
+    }
+
+    pub fn dispatch_tmpfile(
+        &self,
+        ctx: &RequestCtx,
+        parent_dir: u64,
+        file_mode: u32,
+        open_flags: u32,
+    ) -> Result<VfsOpenDispatch, Errno> {
+        self.dispatch_tmpfile_entry(ctx, parent_dir, file_mode, open_flags)
+            .map(|dispatch| VfsOpenDispatch {
+                adapter_fh: dispatch.adapter_fh,
+                open_flags: dispatch.fuse_open_flags,
+            })
     }
 
     fn emit_open_lifecycle_observation(observation: OpenLifecycleObservation) {
@@ -10219,6 +10277,52 @@ impl Filesystem for FuseVfsAdapter {
             Err(errno) => {
                 crate::observability::HIST_CREATE.record(_start.elapsed());
                 crate::observability::FuseErrorCode::from_errno(errno, "create", parent).emit();
+                reply.reply_errno(errno)
+            }
+        }
+    }
+
+    fn tmpfile(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let _start = std::time::Instant::now();
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Tmpfile) {
+            crate::observability::HIST_CREATE.record(_start.elapsed());
+            crate::observability::FuseErrorCode::from_errno(errno, "tmpfile", parent).emit();
+            reply.reply_errno(errno);
+            return;
+        }
+        let ctx = RequestCtx {
+            umask,
+            ..Self::ctx_from_req(req)
+        };
+
+        let _p5_02 =
+            Self::classify_fuse_tmpfile(req.unique(), parent, req.uid(), req.gid(), req.pid());
+
+        let requested_open_flags = flags as u32;
+        match self.dispatch_tmpfile_entry(&ctx, parent, mode, requested_open_flags) {
+            Ok(dispatch) => {
+                crate::observability::HIST_CREATE.record(_start.elapsed());
+                let fa = file_attr_from_inode_attr(&dispatch.attr);
+                reply.created_with_ttls(
+                    &self.dentry_policy.positive_entry_ttl,
+                    &self.dentry_policy.positive_attr_ttl,
+                    &fa,
+                    dispatch.attr.generation.get(),
+                    dispatch.adapter_fh,
+                    dispatch.fuse_open_flags,
+                );
+            }
+            Err(errno) => {
+                crate::observability::HIST_CREATE.record(_start.elapsed());
+                crate::observability::FuseErrorCode::from_errno(errno, "tmpfile", parent).emit();
                 reply.reply_errno(errno)
             }
         }
