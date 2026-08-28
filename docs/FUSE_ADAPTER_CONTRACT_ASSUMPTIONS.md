@@ -18,8 +18,8 @@ VfsEngine/contract executor path rather than calling storage mutation APIs
 directly.
 
 Unsupported FUSE capabilities are explicit model outcomes. Known examples
-include `O_TMPFILE` and FIEMAP-class requests when the current mounted subset
-does not implement them. These outcomes are classified as unsupported with a
+include FIEMAP-class requests and any future mounted opcodes that the current
+subset does not implement. These outcomes are classified as unsupported with a
 stable errno and are not harness failures.
 
 The guardrail for this assumption is

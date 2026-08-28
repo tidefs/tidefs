@@ -74,8 +74,20 @@ pub const FUSE_KERNEL_MINOR_VERSION: u32 = 28;
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 29;
 #[cfg(all(feature = "abi-7-30", not(feature = "abi-7-31")))]
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 30;
-#[cfg(feature = "abi-7-31")]
+#[cfg(all(feature = "abi-7-31", not(feature = "abi-7-32")))]
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
+#[cfg(all(feature = "abi-7-32", not(feature = "abi-7-33")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 32;
+#[cfg(all(feature = "abi-7-33", not(feature = "abi-7-34")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 33;
+#[cfg(all(feature = "abi-7-34", not(feature = "abi-7-35")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 34;
+#[cfg(all(feature = "abi-7-35", not(feature = "abi-7-36")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 35;
+#[cfg(all(feature = "abi-7-36", not(feature = "abi-7-37")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 36;
+#[cfg(feature = "abi-7-37")]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 37;
 
 pub const FUSE_ROOT_ID: u64 = 1;
 
@@ -359,6 +371,8 @@ pub enum fuse_opcode {
     FUSE_COPY_FILE_RANGE = 47,
     #[cfg(feature = "abi-7-31")]
     FUSE_SYNCFS = 50,
+    #[cfg(feature = "abi-7-37")]
+    FUSE_TMPFILE = 51,
     #[cfg(feature = "abi-7-30")]
     FUSE_STATX = 52,
 
@@ -428,6 +442,8 @@ impl TryFrom<u32> for fuse_opcode {
             47 => Ok(fuse_opcode::FUSE_COPY_FILE_RANGE),
             #[cfg(feature = "abi-7-31")]
             50 => Ok(fuse_opcode::FUSE_SYNCFS),
+            #[cfg(feature = "abi-7-37")]
+            51 => Ok(fuse_opcode::FUSE_TMPFILE),
             #[cfg(feature = "abi-7-30")]
             52 => Ok(fuse_opcode::FUSE_STATX),
 

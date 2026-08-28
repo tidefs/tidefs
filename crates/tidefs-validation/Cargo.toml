@@ -124,7 +124,7 @@ full = [
 ]
 
 [dependencies]
-fuser = { version = "0.14.0", features = ["abi-7-30", "abi-7-32"], optional = true }
+fuser = { version = "0.14.0", features = ["abi-7-37"], optional = true }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 blake3 = "=1.5.5"

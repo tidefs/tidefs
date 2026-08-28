@@ -88,6 +88,13 @@ fn fsync_fd(fd: i32) -> io::Result<()> {
     }
 }
 
+/// Fsync a directory path through the mounted filesystem.
+fn sync_directory(path: &Path) {
+    fs::File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .expect("fsync mounted directory");
+}
+
 /// Close a file descriptor.
 fn close_fd(fd: i32) {
     // SAFETY: close(2) is a C FFI call; fd is a valid file descriptor.
@@ -140,6 +147,7 @@ fn tmpfile_create_crash_reclaim() {
 
     // Create a subdirectory to hold the tmpfile.
     harness.mkdir("tmpdir").expect("mkdir tmpdir");
+    sync_directory(harness.mount_path());
     let dir_path = harness.mount_path().join("tmpdir");
 
     // Create an unnamed temporary file in tmpdir.
@@ -179,6 +187,7 @@ fn tmpfile_fsync_crash_reclaim() {
     };
 
     harness.mkdir("tmpdir").expect("mkdir tmpdir");
+    sync_directory(harness.mount_path());
     let dir_path = harness.mount_path().join("tmpdir");
 
     let fd = open_tmpfile(&dir_path).expect("O_TMPFILE openat");
@@ -215,6 +224,7 @@ fn multi_tmpfile_crash_reclaim() {
 
     harness.mkdir("A").expect("mkdir A");
     harness.mkdir("B").expect("mkdir B");
+    sync_directory(harness.mount_path());
 
     let mut fds: Vec<i32> = Vec::new();
 
@@ -267,6 +277,7 @@ fn tmpfile_close_before_crash_no_orphan() {
     };
 
     harness.mkdir("tmpdir").expect("mkdir tmpdir");
+    sync_directory(harness.mount_path());
     let dir_path = harness.mount_path().join("tmpdir");
 
     let fd = open_tmpfile(&dir_path).expect("O_TMPFILE openat");
@@ -665,6 +676,7 @@ fn tmpfile_full_pipeline_orphan_reclaim() {
     };
 
     harness.mkdir("pipeline_dir").expect("mkdir pipeline_dir");
+    sync_directory(harness.mount_path());
     let dir_path = harness.mount_path().join("pipeline_dir");
 
     // Phase 1: Create O_TMPFILE orphan.
