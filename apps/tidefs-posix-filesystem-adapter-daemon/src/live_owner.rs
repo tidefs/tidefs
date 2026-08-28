@@ -1769,19 +1769,17 @@ fn pool_status(
         umask: 0,
         groups: vec![0],
     };
-    let (carrier_statfs, physical_capacity) = match admin {
+    let (carrier_statfs, carrier_statfs_error, physical_capacity) = match admin {
         LiveOwnerAdmin::Fuse {
             engine, pool_owner, ..
         } => {
-            let statfs = match engine.lock() {
+            let (statfs, statfs_error) = match engine.lock() {
                 Ok(engine) => match engine.statfs(&ctx) {
-                    Ok(statfs) => statfs,
-                    Err(errno) => {
-                        return LivePoolAdminResponse::error(
-                            1,
-                            format!("live owner statfs failed with {errno:?}"),
-                        )
-                    }
+                    Ok(statfs) => (Some(statfs), None),
+                    Err(errno) => (
+                        None,
+                        Some(format!("live owner statfs failed with {errno:?}")),
+                    ),
                 },
                 Err(_) => {
                     return LivePoolAdminResponse::error(1, "live owner engine lock poisoned")
@@ -1797,7 +1795,8 @@ fn pool_status(
                 }
             };
             (
-                Some(statfs),
+                statfs,
+                statfs_error,
                 PoolStatusPhysicalCapacity {
                     total_bytes: capacity.total_bytes,
                     used_bytes: capacity.used_bytes,
@@ -1810,6 +1809,7 @@ fn pool_status(
         LiveOwnerAdmin::StandaloneBlock { runtime } => match runtime.lock() {
             Ok(runtime) => match runtime.physical_capacity() {
                 Ok(capacity) => (
+                    None,
                     None,
                     PoolStatusPhysicalCapacity {
                         total_bytes: capacity.total_bytes,
@@ -1842,6 +1842,7 @@ fn pool_status(
             pool_status_json(
                 manifest,
                 carrier_statfs.as_ref(),
+                carrier_statfs_error.as_deref(),
                 &physical_capacity,
                 &topology,
             )
@@ -1851,6 +1852,7 @@ fn pool_status(
         LivePoolAdminResponse::ok_text(pool_status_text(
             manifest,
             carrier_statfs.as_ref(),
+            carrier_statfs_error.as_deref(),
             &physical_capacity,
             &topology,
         ))
@@ -1868,6 +1870,7 @@ struct PoolStatusPhysicalCapacity {
 fn pool_status_json(
     manifest: &LiveOwnerManifest,
     carrier_statfs: Option<&tidefs_types_vfs_core::StatFs>,
+    carrier_statfs_error: Option<&str>,
     physical_capacity: &PoolStatusPhysicalCapacity,
     topology: &PoolTopologyStatus,
 ) -> serde_json::Value {
@@ -1890,7 +1893,7 @@ fn pool_status_json(
             "fsid_lo": statfs.fsid_lo,
         })
     });
-    json!({
+    let mut value = json!({
         "pool_name": manifest.pool_name,
         "pool_uuid": manifest.pool_uuid,
         "state": "Active",
@@ -1912,7 +1915,11 @@ fn pool_status_json(
             "object_count": physical_capacity.object_count,
         },
         "carrier_statfs": carrier_statfs,
-    })
+    });
+    if let Some(error) = carrier_statfs_error {
+        value["carrier_statfs_error"] = json!(error);
+    }
+    value
 }
 
 fn pool_member_status_json(member: &PoolMemberStatus) -> serde_json::Value {
@@ -1927,6 +1934,7 @@ fn pool_member_status_json(member: &PoolMemberStatus) -> serde_json::Value {
 fn pool_status_text(
     manifest: &LiveOwnerManifest,
     carrier_statfs: Option<&tidefs_types_vfs_core::StatFs>,
+    carrier_statfs_error: Option<&str>,
     physical_capacity: &PoolStatusPhysicalCapacity,
     topology: &PoolTopologyStatus,
 ) -> String {
@@ -1961,6 +1969,8 @@ fn pool_status_text(
             statfs.files,
             statfs.files_free,
         ));
+    } else if let Some(error) = carrier_statfs_error {
+        text.push_str(&format!("\n  carrier statfs: unavailable ({error})"));
     }
     for member in &topology.members {
         text.push_str(&format!(
@@ -2400,7 +2410,13 @@ mod tests {
             object_count: 42,
         };
 
-        let text = pool_status_text(&manifest(), Some(&statfs), &physical_capacity, &topology);
+        let text = pool_status_text(
+            &manifest(),
+            Some(&statfs),
+            None,
+            &physical_capacity,
+            &topology,
+        );
 
         assert!(text.contains("health:      Degraded"));
         assert!(text.contains("access:      ReadOnly"));
@@ -2421,7 +2437,13 @@ mod tests {
         let present_json = pool_member_status_json(&topology.members[1]);
         assert_eq!(present_json["runtime_locator"], "/dev/tidefs-member-1");
 
-        let value = pool_status_json(&manifest(), Some(&statfs), &physical_capacity, &topology);
+        let value = pool_status_json(
+            &manifest(),
+            Some(&statfs),
+            None,
+            &physical_capacity,
+            &topology,
+        );
         assert_eq!(value["physical_capacity"]["total_bytes"], 16 * 1024 * 1024);
         assert_eq!(value["physical_capacity"]["used_bytes"], 4 * 1024 * 1024);
         assert_eq!(
@@ -2432,10 +2454,77 @@ mod tests {
         assert_eq!(value["carrier_statfs"]["total_blocks"], 1024);
         assert!(value.get("statfs").is_none());
 
-        let block_value = pool_status_json(&manifest(), None, &physical_capacity, &topology);
+        let block_value = pool_status_json(&manifest(), None, None, &physical_capacity, &topology);
         assert_eq!(block_value["carrier_statfs"], serde_json::Value::Null);
-        let block_text = pool_status_text(&manifest(), None, &physical_capacity, &topology);
+        let block_text = pool_status_text(&manifest(), None, None, &physical_capacity, &topology);
         assert!(!block_text.contains("carrier statfs"));
+    }
+
+    #[test]
+    fn live_pool_status_keeps_truthful_topology_when_carrier_statfs_is_unavailable() {
+        let topology = PoolTopologyStatus {
+            health: PoolHealth::Online,
+            read_only: false,
+            expected_members: 2,
+            present_members: 2,
+            missing_members: 0,
+            members: vec![
+                PoolMemberStatus {
+                    device_index: 0,
+                    device_guid: [0x33; 16],
+                    runtime_locator: Some(PathBuf::from("/dev/vda")),
+                    present: true,
+                    operational_state: Some(DeviceState::Online),
+                },
+                PoolMemberStatus {
+                    device_index: 1,
+                    device_guid: [0x44; 16],
+                    runtime_locator: Some(PathBuf::from("/dev/vdb")),
+                    present: true,
+                    operational_state: Some(DeviceState::Online),
+                },
+            ],
+        };
+        let physical_capacity = PoolStatusPhysicalCapacity {
+            total_bytes: 32 * 1024 * 1024,
+            used_bytes: 8 * 1024 * 1024,
+            available_bytes: 24 * 1024 * 1024,
+            object_count: 64,
+        };
+        let error = "live owner statfs failed with Errno(5)";
+
+        let value = pool_status_json(
+            &manifest(),
+            None,
+            Some(error),
+            &physical_capacity,
+            &topology,
+        );
+        assert_eq!(value["health"], "Online");
+        assert_eq!(value["access"], "ReadWrite");
+        assert_eq!(value["members_expected"], 2);
+        assert_eq!(value["members_present"], 2);
+        assert_eq!(value["members_missing"], 0);
+        assert_eq!(value["members"][0]["index"], 0);
+        assert_eq!(
+            value["members"][0]["guid"],
+            "33333333333333333333333333333333"
+        );
+        assert_eq!(value["carrier_statfs"], serde_json::Value::Null);
+        assert_eq!(value["carrier_statfs_error"], error);
+
+        let text = pool_status_text(
+            &manifest(),
+            None,
+            Some(error),
+            &physical_capacity,
+            &topology,
+        );
+        assert!(text.contains("health:      Online"));
+        assert!(text.contains("access:      ReadWrite"));
+        assert!(text.contains("members:     expected=2 present=2 missing=0"));
+        assert!(text.contains("carrier statfs: unavailable"));
+        assert!(text.contains(error));
     }
 
     #[test]

@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, DatasetType};
 use tidefs_dataset_properties::{PropertyKey, PropertySet, PropertyValue};
+use tidefs_local_object_store::device::DeviceState;
+use tidefs_local_object_store::pool::PoolHealth;
 use tidefs_local_object_store::CompressionAlgorithm;
 use tidefs_local_object_store::{checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey};
 use tidefs_recovery_loop::RecoveryPolicy;
@@ -915,6 +917,121 @@ fn open_two_device_block_filesystem(
         },
     )
     .expect("open two-device block filesystem")
+}
+
+fn open_two_device_replicated_block_filesystem(
+    root: &Path,
+    devices: &[PathBuf],
+    allocator_policy: LocalStorageAllocatorPolicy,
+) -> LocalFileSystem {
+    LocalFileSystem::open_named_pool_with_allocator_policy_and_root_authentication_key(
+        root,
+        "tidefs",
+        PoolRedundancyPolicy::replicated(2),
+        LocalFileSystemOpenConfig {
+            options: options(),
+            allocator_policy,
+            root_authentication_key: RootAuthenticationKey::demo_key(),
+            encryption: None,
+            compression: None,
+            log_device_device_path: None,
+            recovery_policy: RecoveryPolicy::default(),
+            block_devices: Some(devices),
+        },
+    )
+    .expect("open two-device replicated block filesystem")
+}
+
+#[test]
+fn administrative_offline_refuses_mounted_mutation_and_keeps_close_reimport_clean() {
+    let (root, devices) = two_device_block_fixture("administrative-offline-close-reimport");
+    let mut fs = open_two_device_replicated_block_filesystem(
+        &root,
+        &devices,
+        LocalStorageAllocatorPolicy::default(),
+    );
+    fs.create_file("/stable.txt", DEFAULT_FILE_PERMISSIONS)
+        .expect("create stable file");
+    fs.write_file("/stable.txt", 0, b"stable")
+        .expect("write stable file");
+    fs.sync_all().expect("sync stable state");
+
+    let target_guid = fs.store.pool().topology_status().members[0].device_guid;
+    fs.store
+        .pool_mut()
+        .device_offline(target_guid)
+        .expect("take one exact member administratively offline");
+    assert_eq!(fs.pool_topology_status().health, PoolHealth::Degraded);
+
+    let err = fs
+        .create_file("/administrative-offline-write", DEFAULT_FILE_PERMISSIONS)
+        .expect_err("mounted mutation must refuse while a replicated member is offline");
+    match err {
+        FileSystemError::Store(StoreError::InvalidOptions { reason }) => {
+            assert!(
+                reason.contains("administratively offline")
+                    || reason.contains("not enough eligible pool devices"),
+                "unexpected refusal reason: {reason}"
+            );
+        }
+        other => panic!("unexpected mounted offline mutation error: {other:?}"),
+    }
+    assert!(matches!(
+        fs.lookup("/administrative-offline-write"),
+        Err(FileSystemError::NotFound { .. })
+    ));
+    assert_eq!(
+        fs.mounted_mutation_quiescence_failure(),
+        None,
+        "refused mutation must not leave dirty mounted state"
+    );
+
+    fs.close_mounted().expect("close mounted owner cleanly");
+    drop(fs);
+
+    let mut reopened = open_two_device_replicated_block_filesystem(
+        &root,
+        &devices,
+        LocalStorageAllocatorPolicy::default(),
+    );
+    let status = reopened.pool_topology_status();
+    assert_eq!(status.health, PoolHealth::Degraded);
+    let member = status
+        .members
+        .iter()
+        .find(|member| member.device_guid == target_guid)
+        .expect("offline member remains in topology");
+    assert_eq!(member.operational_state, Some(DeviceState::Offline));
+
+    reopened
+        .store
+        .pool_mut()
+        .device_online(target_guid)
+        .expect("readmit administratively offline member");
+    assert_eq!(reopened.pool_topology_status().health, PoolHealth::Online);
+    reopened
+        .create_file("/after-online.txt", DEFAULT_FILE_PERMISSIONS)
+        .expect("mounted mutation should resume after readmission");
+    reopened
+        .write_file("/after-online.txt", 0, b"back-online")
+        .expect("write after readmission");
+    reopened.sync_all().expect("sync after readmission");
+    drop(reopened);
+
+    let reopened = open_two_device_replicated_block_filesystem(
+        &root,
+        &devices,
+        LocalStorageAllocatorPolicy::default(),
+    );
+    assert_eq!(
+        reopened
+            .read_file("/after-online.txt")
+            .expect("read post-readmission file"),
+        b"back-online"
+    );
+    drop(reopened);
+
+    cleanup_two_device_block_fixture(&root, &devices);
 }
 
 struct OffPrimaryCommittedContent {
@@ -3041,6 +3158,7 @@ fn create_family_parent_preflights_do_not_cache_directory_listing() {
     fs.set_auto_commit(false)
         .expect("test setup mutation must be admitted");
     let cache_before = fs.inode_cache.borrow().report();
+    let start_commit_group = fs.commit_group.current_commit_group().0;
 
     fs.create_dir("/dir-a", 0o755).expect("create first dir");
     fs.create_dir("/dir-b", 0o755).expect("create second dir");
@@ -3051,6 +3169,11 @@ fn create_family_parent_preflights_do_not_cache_directory_listing() {
     assert_eq!(cache_after.resident_entries, cache_before.resident_entries);
     assert_eq!(fs.uncommitted_mutation_count(), 3);
     fs.rollback_mutation_delta();
+    assert_eq!(fs.uncommitted_mutation_count(), 0);
+    assert_eq!(fs.commit_group.current_commit_group().0, start_commit_group);
+    assert_eq!(fs.commit_group.phase, CommitGroupPhase::Open);
+    assert_eq!(fs.commit_group.dirty_ops, 0);
+    assert_eq!(fs.commit_group.dirty_bytes, 0);
     drop(fs);
     cleanup(&root);
 }

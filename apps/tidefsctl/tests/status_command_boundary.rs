@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{atomic::AtomicBool, Arc};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, SyncGuarantee};
 use tidefs_local_filesystem::{
@@ -20,11 +21,126 @@ use tidefs_posix_filesystem_adapter_daemon::{
 };
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(0);
+const ROOT_AUTHENTICATION_KEY_HEX: &str =
+    "4141414141414141414141414141414141414141414141414141414141414141";
 const STATUS_COMMANDS: &[&str] = &[
     #[cfg(feature = "cluster")]
     "cluster",
     "device",
 ];
+
+fn fuse_available() -> bool {
+    Path::new("/dev/fuse").exists()
+}
+
+fn mountpoint_is_active(mountpoint: &Path) -> bool {
+    Command::new("mountpoint")
+        .arg("-q")
+        .arg(mountpoint)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn write_and_sync_file(path: &Path, payload: &[u8]) {
+    let mut file = File::create(path).expect("create mounted file");
+    file.write_all(payload).expect("write mounted file");
+    file.sync_all().expect("sync mounted file");
+}
+
+struct MountedPoolProcess {
+    mountpoint: PathBuf,
+    log_path: PathBuf,
+    child: Option<Child>,
+}
+
+impl MountedPoolProcess {
+    fn start(
+        pool_name: &str,
+        mountpoint: &Path,
+        devices: &[PathBuf],
+        log_path: PathBuf,
+    ) -> MountedPoolProcess {
+        let log = File::create(&log_path).expect("create mount log");
+        let log_err = log.try_clone().expect("clone mount log");
+        let child = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+            .env(
+                "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX",
+                ROOT_AUTHENTICATION_KEY_HEX,
+            )
+            .args(["pool", "mount", pool_name])
+            .arg(mountpoint)
+            .arg("--devices")
+            .args(devices)
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err))
+            .spawn()
+            .expect("spawn tidefsctl pool mount");
+        MountedPoolProcess {
+            mountpoint: mountpoint.to_path_buf(),
+            log_path,
+            child: Some(child),
+        }
+    }
+
+    fn wait_until_mounted(&mut self) {
+        for _ in 0..60 {
+            if mountpoint_is_active(&self.mountpoint) {
+                return;
+            }
+            if let Some(child) = self.child.as_mut() {
+                if let Some(status) = child.try_wait().expect("poll mount child") {
+                    panic!(
+                        "tidefsctl pool mount exited before mountpoint became active: {status}\n{}",
+                        self.log_contents()
+                    );
+                }
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        panic!(
+            "timed out waiting for mounted pool at {}\n{}",
+            self.mountpoint.display(),
+            self.log_contents()
+        );
+    }
+
+    fn wait_for_exit(&mut self) -> std::process::ExitStatus {
+        self.child
+            .take()
+            .expect("mount child still tracked")
+            .wait()
+            .expect("wait for mount child")
+    }
+
+    fn log_contents(&self) -> String {
+        fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+}
+
+impl Drop for MountedPoolProcess {
+    fn drop(&mut self) {
+        if mountpoint_is_active(&self.mountpoint) {
+            let _ = Command::new("umount")
+                .arg("-l")
+                .arg(&self.mountpoint)
+                .status();
+            thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(child) = self.child.as_mut() {
+            if child
+                .try_wait()
+                .expect("poll mount child in drop")
+                .is_none()
+            {
+                let _ = child.kill();
+            }
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+    }
+}
 
 fn prepare_volume_lifecycle_graph(
     filesystem: &mut LocalFileSystem,
@@ -643,6 +759,242 @@ fn live_degraded_pool_status_reports_durable_member_identity() {
     assert!(
         human.contains(&format!("member 1:   {} Present", hex_guid(&present_guid))),
         "{human}"
+    );
+}
+
+#[test]
+fn mounted_administrative_online_keeps_live_owner_pool_status_truthful() {
+    if !fuse_available() {
+        eprintln!("SKIP: /dev/fuse not available -- mounted live-owner status needs FUSE");
+        return;
+    }
+
+    let fixture = tempfile::tempdir().expect("create mounted administrative-online fixture");
+    let mountpoint = fixture.path().join("mnt");
+    let metadata_dir = fixture.path().join("metadata");
+    let devices = [
+        fixture.path().join("member-0.img"),
+        fixture.path().join("member-1.img"),
+    ];
+    let mount_log = fixture.path().join("mount.log");
+    let remount_log = fixture.path().join("remount.log");
+    fs::create_dir_all(&mountpoint).expect("create mountpoint directory");
+    fs::create_dir_all(&metadata_dir).expect("create Pool metadata directory");
+    for device in &devices {
+        File::create(device)
+            .expect("create regular-file Pool member")
+            .set_len(16 * 1024 * 1024)
+            .expect("size regular-file Pool member");
+    }
+
+    let pool_name = format!(
+        "mounted-admin-online-{}-{}",
+        std::process::id(),
+        NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let create = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .env(
+            "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX",
+            ROOT_AUTHENTICATION_KEY_HEX,
+        )
+        .args([
+            "pool",
+            "create",
+            &pool_name,
+            "--file-devices",
+            "--devices",
+            devices[0].to_str().expect("UTF-8 device path"),
+            devices[1].to_str().expect("UTF-8 device path"),
+            "--redundancy",
+            "replicated=2",
+            "--json",
+        ])
+        .output()
+        .expect("create Pool through tidefsctl");
+    assert!(create.status.success(), "{create:?}");
+    assert!(create.stderr.is_empty(), "{create:?}");
+
+    let mut mount = MountedPoolProcess::start(&pool_name, &mountpoint, &devices, mount_log);
+    mount.wait_until_mounted();
+
+    let carried_path = mountpoint.join("carried.bin");
+    let carried_payload = b"carried bytes survive administrative availability";
+    write_and_sync_file(&carried_path, carried_payload);
+    assert_eq!(
+        fs::read(&carried_path).expect("read carried file before offline"),
+        carried_payload
+    );
+
+    let device_status = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args(["device", "status", &pool_name, "--json"])
+        .output()
+        .expect("run mounted device status");
+    assert!(device_status.status.success(), "{device_status:?}");
+    let device_status: serde_json::Value =
+        serde_json::from_slice(&device_status.stdout).expect("parse mounted device status JSON");
+    let device_guid = device_status["members"]
+        .as_array()
+        .expect("device status members")
+        .iter()
+        .find(|member| member["device_index"] == 0)
+        .and_then(|member| member["device_guid"].as_str())
+        .expect("find exact durable member-0 guid")
+        .to_string();
+
+    let offline = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args(["device", "offline", &pool_name, &device_guid, "--json"])
+        .output()
+        .expect("run device offline through mounted owner");
+    assert!(offline.status.success(), "{offline:?}");
+    assert!(offline.stderr.is_empty(), "{offline:?}");
+    let offline: serde_json::Value =
+        serde_json::from_slice(&offline.stdout).expect("parse device offline JSON");
+    assert_eq!(offline["status"], "completed", "{offline}");
+    assert_eq!(offline["operation"], "offline", "{offline}");
+    assert_eq!(offline["device_guid"], device_guid, "{offline}");
+    assert_eq!(offline["device_index"], 0, "{offline}");
+    assert_eq!(offline["operational_state"], "Offline", "{offline}");
+    assert_eq!(offline["pool_health"], "Degraded", "{offline}");
+    assert_eq!(
+        fs::read(&carried_path).expect("read carried file while administratively offline"),
+        carried_payload
+    );
+
+    let refused_path = mountpoint.join("administrative-offline-write");
+    let refused = fs::write(&refused_path, b"must-refuse\n")
+        .expect_err("administratively offline mounted write must refuse");
+    assert!(
+        !refused_path.exists(),
+        "refused offline mounted write left a visible entry: {refused:?}"
+    );
+
+    let export = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args([
+            "pool",
+            "export",
+            &pool_name,
+            "--devices",
+            devices[0].to_str().expect("UTF-8 device path"),
+            devices[1].to_str().expect("UTF-8 device path"),
+        ])
+        .output()
+        .expect("run pool export through mounted owner");
+    assert!(export.status.success(), "{export:?}");
+    assert!(export.stderr.is_empty(), "{export:?}");
+    let first_mount_exit = mount.wait_for_exit();
+    assert!(
+        first_mount_exit.success(),
+        "mounted owner exited unsuccessfully after export: {first_mount_exit}\n{}",
+        mount.log_contents()
+    );
+    assert!(
+        !mountpoint_is_active(&mountpoint),
+        "mountpoint remained active after clean export\n{}",
+        mount.log_contents()
+    );
+
+    let mut remount = MountedPoolProcess::start(&pool_name, &mountpoint, &devices, remount_log);
+    remount.wait_until_mounted();
+
+    let persisted_status = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args(["device", "status", &pool_name, "--json"])
+        .output()
+        .expect("run device status after offline reimport");
+    assert!(persisted_status.status.success(), "{persisted_status:?}");
+    let persisted_status: serde_json::Value = serde_json::from_slice(&persisted_status.stdout)
+        .expect("parse persisted device status JSON");
+    assert_eq!(persisted_status["health"], "Degraded", "{persisted_status}");
+    assert!(
+        persisted_status["members"]
+            .as_array()
+            .expect("persisted members")
+            .iter()
+            .any(|member| {
+                member["device_guid"] == device_guid && member["operational_state"] == "Offline"
+            }),
+        "{persisted_status}"
+    );
+    assert_eq!(
+        fs::read(&carried_path).expect("read carried file after offline reimport"),
+        carried_payload
+    );
+
+    let online = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args(["device", "online", &pool_name, &device_guid, "--json"])
+        .output()
+        .expect("run device online through mounted owner");
+    assert!(online.status.success(), "{online:?}");
+    assert!(online.stderr.is_empty(), "{online:?}");
+    let online: serde_json::Value =
+        serde_json::from_slice(&online.stdout).expect("parse device online JSON");
+    assert_eq!(online["status"], "completed", "{online}");
+    assert_eq!(online["operation"], "online", "{online}");
+    assert_eq!(online["device_guid"], device_guid, "{online}");
+    assert_eq!(online["device_index"], 0, "{online}");
+    assert_eq!(online["operational_state"], "Online", "{online}");
+    assert_eq!(online["pool_health"], "Online", "{online}");
+    assert!(
+        online["verified_receipts"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "{online}"
+    );
+
+    let online_write_path = mountpoint.join("administrative-online-write");
+    write_and_sync_file(&online_write_path, b"online-write-admitted\n");
+    assert_eq!(
+        fs::read_to_string(&online_write_path)
+            .expect("read mounted file after verified readmission"),
+        "online-write-admitted\n"
+    );
+
+    let pool_status = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args(["pool", "status", &pool_name, "--json"])
+        .output()
+        .expect("run live-owner pool status after administrative online");
+    assert!(
+        pool_status.status.success(),
+        "pool status failed after administrative online write\nstdout={}\nstderr={}\nmount-log={}",
+        String::from_utf8_lossy(&pool_status.stdout),
+        String::from_utf8_lossy(&pool_status.stderr),
+        remount.log_contents()
+    );
+    assert!(pool_status.stderr.is_empty(), "{pool_status:?}");
+    let pool_status: serde_json::Value =
+        serde_json::from_slice(&pool_status.stdout).expect("parse pool status JSON after online");
+    assert_eq!(pool_status["source_classification"], "source:live-owner");
+    assert_eq!(pool_status["health"], "Online", "{pool_status}");
+    assert_eq!(pool_status["access"], "ReadWrite", "{pool_status}");
+    assert_eq!(pool_status["members_expected"], 2, "{pool_status}");
+    assert_eq!(pool_status["members_present"], 2, "{pool_status}");
+    assert_eq!(pool_status["members_missing"], 0, "{pool_status}");
+    assert!(
+        pool_status["members"]
+            .as_array()
+            .expect("pool-status members")
+            .iter()
+            .any(|member| member["index"] == 0 && member["guid"] == device_guid),
+        "{pool_status}"
+    );
+
+    let cleanup_export = Command::new(env!("CARGO_BIN_EXE_tidefsctl"))
+        .args([
+            "pool",
+            "export",
+            &pool_name,
+            "--devices",
+            devices[0].to_str().expect("UTF-8 device path"),
+            devices[1].to_str().expect("UTF-8 device path"),
+        ])
+        .output()
+        .expect("clean up mounted administrative-online test pool");
+    assert!(cleanup_export.status.success(), "{cleanup_export:?}");
+    assert!(cleanup_export.stderr.is_empty(), "{cleanup_export:?}");
+    let remount_exit = remount.wait_for_exit();
+    assert!(
+        remount_exit.success(),
+        "remounted owner exited unsuccessfully during cleanup: {remount_exit}\n{}",
+        remount.log_contents()
     );
 }
 
