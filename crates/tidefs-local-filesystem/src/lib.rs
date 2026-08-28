@@ -7903,7 +7903,10 @@ impl PoolDatasetOwner {
     }
 
     pub fn statfs(&mut self) -> Result<FileSystemStatfs> {
-        let physical = self.store.physical_capacity()?;
+        let physical = self
+            .store
+            .physical_capacity()
+            .map_err(FileSystemError::PoolRuntime)?;
         let live_pool_counters = PoolPhysicalCountersV1::mounted_authority_from_capacity(
             physical.total_bytes,
             physical.used_bytes,

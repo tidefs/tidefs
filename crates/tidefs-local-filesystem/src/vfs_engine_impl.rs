@@ -10934,6 +10934,17 @@ mod tests {
                 .expect("write resumes after verified readmission"),
             b"now admitted".len() as u32
         );
+        engine
+            .fsync(&resumed_fh, false, &ctx())
+            .expect("fsync admitted write after verified readmission");
+        engine
+            .fs
+            .borrow_mut()
+            .statfs()
+            .expect("mounted statfs remains readable after verified readmission");
+        engine
+            .statfs(&ctx())
+            .expect("engine statfs remains readable after verified readmission");
     }
 
     #[test]
