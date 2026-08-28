@@ -21,16 +21,10 @@ fn seq_data(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 256) as u8).collect()
 }
 
-/// Open a new MountHarness, printing a skip message if the daemon binary
-/// isn't found (e.g. not built yet).
-fn mount_or_skip() -> Option<MountHarness> {
-    match MountHarness::new() {
-        Ok(h) => Some(h),
-        Err(e) => {
-            eprintln!("SKIP: daemon not available -- {e}");
-            None
-        }
-    }
+/// Open the canonical mounted carrier or fail closed when the runtime
+/// substrate is absent.
+fn mount_or_fail() -> MountHarness {
+    MountHarness::new_or_fail(module_path!())
 }
 
 // ── test 1: single-file fsync + SIGKILL + remount ───────────────────────
@@ -39,10 +33,7 @@ fn mount_or_skip() -> Option<MountHarness> {
 /// SIGKILL the daemon, remount, and verify byte-for-byte survival.
 #[test]
 fn fsync_crash_single_file_sigkill_remount() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = seq_data(4096);
 
@@ -70,10 +61,7 @@ fn fsync_crash_single_file_sigkill_remount() {
 /// remount, verify all 5 survived with correct content.
 #[test]
 fn fsync_crash_multi_file_interleaved_fsync() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let files: [(&str, Vec<u8>); 5] = [
         ("a.bin", seq_data(256)),
@@ -109,10 +97,7 @@ fn fsync_crash_multi_file_interleaved_fsync() {
 /// (phantom) data.
 #[test]
 fn fsync_crash_unfsyncd_data_no_corruption() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = seq_data(1024);
 
@@ -146,10 +131,7 @@ fn fsync_crash_unfsyncd_data_no_corruption() {
 /// byte-for-byte survival.
 #[test]
 fn fsync_crash_large_file_segmented_fsync() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data: Vec<u8> = seq_data(256 * 1024); // 256 KiB
 
@@ -181,10 +163,7 @@ fn fsync_crash_large_file_segmented_fsync() {
 /// remount, verify the latest content survived (not the initial data).
 #[test]
 fn fsync_crash_overwrite_then_fsync() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let initial = b"original content that was overwritten\n".to_vec();
     let overwrite = b"new content that must survive the crash\n".to_vec();
@@ -216,10 +195,7 @@ fn fsync_crash_overwrite_then_fsync() {
 /// verify full tree and all file contents.
 #[test]
 fn fsync_crash_directory_tree_fsyncd() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     harness.mkdir_all("L1/L2").expect("mkdir L1/L2");
 
@@ -264,10 +240,7 @@ fn fsync_crash_directory_tree_fsyncd() {
 /// empty.
 #[test]
 fn fsync_crash_empty_file_after_fsync() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     harness
         .create_file("empty.bin", b"")
@@ -295,10 +268,7 @@ fn fsync_crash_empty_file_after_fsync() {
 /// B exists with correct data and A is gone.
 #[test]
 fn fsync_crash_rename_with_fsync() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = b"rename survivability test payload\n".to_vec();
 
@@ -348,10 +318,7 @@ fn fsync_crash_rename_with_fsync() {
 /// survived.
 #[test]
 fn fsync_crash_fdatasync_durability() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = seq_data(4096);
 
@@ -376,10 +343,7 @@ fn fsync_crash_fdatasync_durability() {
 /// hole.
 #[test]
 fn fsync_crash_sparse_file_with_hole() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let head = seq_data(1024);
     let tail = seq_data(2048);
@@ -444,10 +408,7 @@ fn fsync_crash_sparse_file_with_hole() {
 /// and no interleaved or torn writes.
 #[test]
 fn fsync_crash_concurrent_writers_sigkill() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let mount = harness.mount_path().to_path_buf();
     let files: Vec<(String, Vec<u8>)> = (0..4)
@@ -504,10 +465,7 @@ fn fsync_crash_concurrent_writers_sigkill() {
 /// size=1 KiB and first 1 KiB matches original data.
 #[test]
 fn fsync_crash_truncate_fsync_sigkill() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let initial = seq_data(8192); // 8 KiB
     let mount = harness.mount_path().to_path_buf();
@@ -551,10 +509,7 @@ fn fsync_crash_truncate_fsync_sigkill() {
 /// remount, verify size=4 KiB, first 1 KiB intact, tail zero-filled.
 #[test]
 fn fsync_crash_extend_fsync_sigkill() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let initial = seq_data(1024);
     let mount = harness.mount_path().to_path_buf();
@@ -609,10 +564,7 @@ fn fsync_crash_extend_fsync_sigkill() {
 /// survived.
 #[test]
 fn fsync_crash_chmod_fsync_sigkill() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = b"chmod persistence test\n";
 
@@ -642,10 +594,7 @@ fn fsync_crash_chmod_fsync_sigkill() {
 /// verify file in B with correct content and absent from A.
 #[test]
 fn fsync_crash_rename_across_dirs_sigkill() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = b"cross-directory rename payload\n".to_vec();
 
@@ -699,10 +648,7 @@ fn fsync_crash_rename_across_dirs_sigkill() {
 /// verify deleted file is gone and remaining files intact.
 #[test]
 fn fsync_crash_delete_file_sigkill() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let keep_data = b"this file should survive\n".to_vec();
     let del_data = b"this file should be deleted\n".to_vec();
@@ -755,10 +701,7 @@ fn fsync_crash_delete_file_sigkill() {
 /// Create empty dir, fsync, remove dir, SIGKILL, remount, verify dir gone.
 #[test]
 fn fsync_crash_rmdir_sigkill() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     harness.mkdir_all("rm_me").expect("mkdir rm_me");
     harness
@@ -784,10 +727,7 @@ fn fsync_crash_rmdir_sigkill() {
 /// verify final metadata state survived.
 #[test]
 fn fsync_crash_mixed_metadata_sigkill() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let initial = seq_data(4096);
     let mount = harness.mount_path().to_path_buf();
@@ -842,10 +782,7 @@ fn fsync_crash_mixed_metadata_sigkill() {
 /// survive byte-for-byte regardless of what was in-flight at crash time.
 #[test]
 fn fsync_crash_checkpoint_fsync_sigkill() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let chunk_size = 8 * 1024; // 8 KiB per chunk
     let checkpoint_interval = 4; // fsync every 4 chunks = 32 KiB
@@ -914,10 +851,7 @@ fn fsync_crash_checkpoint_fsync_sigkill() {
 /// absent, empty, or intact but must never be corrupted.
 #[test]
 fn fsync_crash_mid_write_sigkill_unfsynced_tail() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let chunk_size = 8 * 1024; // 8 KiB
     let fsync_interval = 2; // fsync every 2 chunks = 16 KiB
@@ -998,10 +932,7 @@ fn fsync_crash_mid_write_sigkill_unfsynced_tail() {
 /// with correct content and the mount remains usable.
 #[test]
 fn fsync_crash_loop_ten_cycles() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = seq_data(4096);
 
@@ -1065,10 +996,7 @@ fn fsync_crash_loop_ten_cycles() {
 /// exits, so there is no opportunity for a clean writeback flush.
 #[test]
 fn fsync_crash_power_loss_lazy_unmount_sigkill() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = seq_data(8192);
     harness
@@ -1129,10 +1057,7 @@ fn fsync_crash_power_loss_lazy_unmount_sigkill() {
 /// the appended region survived along with the original prefix.
 #[test]
 fn fsync_crash_append_fsync_sigkill() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let prefix = b"original data that was written first\n".to_vec();
     let suffix = b"appended after fsync of prefix\n".to_vec();
@@ -1181,10 +1106,7 @@ fn fsync_crash_append_fsync_sigkill() {
 /// clean mount-state write, and FUSE unmount before the process exits.
 #[test]
 fn graceful_shutdown_sigterm_data_survival() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = seq_data(4096);
 

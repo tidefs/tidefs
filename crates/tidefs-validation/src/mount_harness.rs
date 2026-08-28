@@ -1030,16 +1030,16 @@ pub fn find_tidefsctl_binary() -> io::Result<PathBuf> {
         }
     }
 
+    let mut candidates = Vec::new();
+
+    if let Ok(path) = std::env::var("TIDEFSCTL_BIN") {
+        candidates.push(PathBuf::from(path));
+    }
+
     // 2. CARGO_TARGET_DIR (set when target dir is non-default).
     if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
-        let dbg = Path::new(&td).join("debug/tidefsctl");
-        if dbg.is_file() {
-            return Ok(dbg);
-        }
-        let rel = Path::new(&td).join("release/tidefsctl");
-        if rel.is_file() {
-            return Ok(rel);
-        }
+        candidates.push(Path::new(&td).join("debug/tidefsctl"));
+        candidates.push(Path::new(&td).join("release/tidefsctl"));
     }
 
     // 3. Workspace-relative target dir.
@@ -1048,10 +1048,8 @@ pub fn find_tidefsctl_binary() -> io::Result<PathBuf> {
         .and_then(Path::parent)
         .ok_or_else(|| io::Error::other("cannot determine workspace root"))?;
 
-    let candidates = [
-        workspace_root.join("target/debug/tidefsctl"),
-        workspace_root.join("target/release/tidefsctl"),
-    ];
+    candidates.push(workspace_root.join("target/debug/tidefsctl"));
+    candidates.push(workspace_root.join("target/release/tidefsctl"));
 
     for candidate in &candidates {
         if candidate.is_file() {
