@@ -996,6 +996,9 @@ struct MutationDelta {
     old_lifecycle: DatasetLifecycle,
     old_generation: u64,
     old_inode_authority: DatasetInodeAuthority,
+    old_uncommitted_mutation_count: u64,
+    old_mutation_recorded_commit_group_write: bool,
+    old_commit_group: CommitGroupStateMachine,
     // Side-ledger snapshots for full transaction rollback (#5980).
     // Buffered payload snapshots are lazy so metadata-only mutations do not
     // clone dirty writeback buffers.
@@ -16206,7 +16209,8 @@ impl PoolDatasetOwner {
 
     fn begin_mutation(&mut self, operation: &'static str) -> Result<()> {
         self.ensure_mutation_allowed(operation)?;
-        self.filesystem.mutation_recorded_commit_group_write = false;
+        let old_mutation_recorded_commit_group_write =
+            self.filesystem.mutation_recorded_commit_group_write;
         if self.filesystem.mutation_delta.is_none() {
             // Snapshot the dirty-page tracker for rollback.
             let old_dirty_pages = self
@@ -16221,6 +16225,9 @@ impl PoolDatasetOwner {
                 old_lifecycle: self.filesystem.lifecycle.clone(),
                 old_generation: self.filesystem.state.generation,
                 old_inode_authority: self.filesystem.state.inode_authority,
+                old_uncommitted_mutation_count: self.filesystem.uncommitted_mutation_count,
+                old_mutation_recorded_commit_group_write,
+                old_commit_group: self.filesystem.commit_group.clone(),
                 old_write_buffers: None,
                 old_buffered_write_base_records: self
                     .filesystem
@@ -16238,6 +16245,7 @@ impl PoolDatasetOwner {
                 intent_log_seq_at_begin: self.filesystem.intent_log.next_entry_id(),
             });
         }
+        self.filesystem.mutation_recorded_commit_group_write = false;
         Ok(())
     }
 
@@ -16290,6 +16298,10 @@ impl PoolDatasetOwner {
             self.filesystem.lifecycle = delta.old_lifecycle;
             self.filesystem.state.generation = delta.old_generation;
             self.filesystem.state.inode_authority = delta.old_inode_authority;
+            self.filesystem.uncommitted_mutation_count = delta.old_uncommitted_mutation_count;
+            self.filesystem.mutation_recorded_commit_group_write =
+                delta.old_mutation_recorded_commit_group_write;
+            self.filesystem.commit_group = delta.old_commit_group;
             self.filesystem.state.dirty_content.clear();
             self.filesystem.state.dirty_inodes.clear();
             self.filesystem.state.dirty_dirs.clear();

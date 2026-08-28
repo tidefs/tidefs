@@ -308,6 +308,7 @@ impl Clock for FixedClock {
 /// The multi-phase commit_group state machine.
 ///
 /// Drives the write-path durability contract: OPEN -> QUIESCE -> SYNC -> OPEN.
+#[derive(Clone)]
 pub struct CommitGroupStateMachine<C: Clock = SystemClock> {
     /// Current transaction group id (monotonically increasing).
     pub current_commit_group: TxnGroupId,
