@@ -18605,7 +18605,9 @@ mod tests {
         let root = engine.get_root_inode(&ctx()).unwrap();
         for file_idx in 0..FILE_COUNT {
             let name = format!("generic074-{file_idx}.bin");
-            let (_attr, fh) = engine.create(root, name.as_bytes(), 0o644, O_RDWR, &ctx()).unwrap();
+            let (_attr, fh) = engine
+                .create(root, name.as_bytes(), 0o644, O_RDWR, &ctx())
+                .unwrap();
             engine.release(&fh).unwrap();
         }
 
@@ -18620,13 +18622,13 @@ mod tests {
             fs.set_write_buffer_flush_threshold_bytes(64 * 1024 * 1024)
                 .expect("retain buffered sparse writes until pressure or fsync");
             let admission = fs.admission_config();
-            fs.filesystem
-                .write_admission
-                .apply_dynamic_tuning(crate::admission::LocalAdmissionTuning {
+            fs.filesystem.write_admission.apply_dynamic_tuning(
+                crate::admission::LocalAdmissionTuning {
                     max_dirty_bytes: (BLOCK_SIZE * 8) as u64,
                     max_dirty_ops: admission.hard_max_dirty_ops,
                     max_dirty_age_ticks: admission.hard_max_dirty_age_ticks,
-                });
+                },
+            );
             fs.commit_group.config.commit_group_target_ops = u64::MAX;
             fs.commit_group.config.commit_group_target_bytes = u64::MAX;
             fs.commit_group.config.commit_group_dirty_max_bytes = u64::MAX;
@@ -18660,28 +18662,25 @@ mod tests {
                     );
                 }
 
-                engine
-                    .flush(&fh, &ctx())
-                    .unwrap_or_else(|error| {
-                        panic!("loop {loop_idx} file {file_idx}: flush failed: {error:?}")
-                    });
-                engine
-                    .release(&fh)
-                    .unwrap_or_else(|error| {
-                        panic!("loop {loop_idx} file {file_idx}: release failed: {error:?}")
-                    });
-
-                let reader = engine.open(inode_id, O_RDONLY, &ctx()).unwrap_or_else(|error| {
-                    panic!("loop {loop_idx} file {file_idx}: reopen failed: {error:?}")
+                engine.flush(&fh, &ctx()).unwrap_or_else(|error| {
+                    panic!("loop {loop_idx} file {file_idx}: flush failed: {error:?}")
                 });
+                engine.release(&fh).unwrap_or_else(|error| {
+                    panic!("loop {loop_idx} file {file_idx}: release failed: {error:?}")
+                });
+
+                let reader = engine
+                    .open(inode_id, O_RDONLY, &ctx())
+                    .unwrap_or_else(|error| {
+                        panic!("loop {loop_idx} file {file_idx}: reopen failed: {error:?}")
+                    });
                 let reopened = engine
                     .getattr(inode_id, Some(&reader), &ctx())
                     .unwrap_or_else(|error| {
                         panic!("loop {loop_idx} file {file_idx}: getattr failed: {error:?}")
                     });
                 assert_eq!(
-                    reopened.posix.size,
-                    expected_size as u64,
+                    reopened.posix.size, expected_size as u64,
                     "loop {loop_idx} file {file_idx}: unexpected reopened size"
                 );
 
@@ -18719,11 +18718,9 @@ mod tests {
                     }
                 }
 
-                engine
-                    .release(&reader)
-                    .unwrap_or_else(|error| {
-                        panic!("loop {loop_idx} file {file_idx}: reader release failed: {error:?}")
-                    });
+                engine.release(&reader).unwrap_or_else(|error| {
+                    panic!("loop {loop_idx} file {file_idx}: reader release failed: {error:?}")
+                });
             }
         }
     }

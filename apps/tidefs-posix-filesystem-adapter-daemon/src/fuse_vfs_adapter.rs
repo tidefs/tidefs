@@ -8991,10 +8991,8 @@ impl FuseVfsAdapter {
         let (adapter_fh, fuse_flags) = {
             let mut handles = self.file_handles.lock().unwrap();
             let existing_open_state = handles.inode_open_state(ino);
-            let fuse_flags = self.fuse_open_flags_for_existing_state(
-                engine_open_flags,
-                existing_open_state,
-            );
+            let fuse_flags =
+                self.fuse_open_flags_for_existing_state(engine_open_flags, existing_open_state);
             let adapter_fh = handles.allocate(ino, engine_open_flags, engine_fh);
             if let Some(handle) = handles.handles.get_mut(&adapter_fh) {
                 handle.fuse_open_flags = fuse_flags;
@@ -42359,7 +42357,13 @@ mod tests {
         let mut fixture = fixture;
         fixture
             .adapter
-            .dispatch_release(create.attr.inode_id.get(), truncate_open.adapter_fh, 0, None, false)
+            .dispatch_release(
+                create.attr.inode_id.get(),
+                truncate_open.adapter_fh,
+                0,
+                None,
+                false,
+            )
             .expect("release truncate-open handle");
     }
 
@@ -42470,7 +42474,13 @@ mod tests {
         );
         fixture
             .adapter
-            .dispatch_release(create.attr.inode_id.get(), read_open.adapter_fh, 0, None, false)
+            .dispatch_release(
+                create.attr.inode_id.get(),
+                read_open.adapter_fh,
+                0,
+                None,
+                false,
+            )
             .expect("release read reopen");
     }
 
