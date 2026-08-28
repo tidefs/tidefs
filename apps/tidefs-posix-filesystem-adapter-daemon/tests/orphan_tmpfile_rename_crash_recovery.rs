@@ -520,6 +520,7 @@ fn unlink_while_open_crash_recovery() {
     harness
         .remove_file("unlink_me.txt")
         .expect("unlink unlink_me.txt");
+    sync_directory(harness.mount_path());
 
     // The file should no longer be visible in the namespace.
     assert!(
