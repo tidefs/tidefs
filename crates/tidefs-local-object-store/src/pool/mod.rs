@@ -5653,6 +5653,17 @@ impl Pool {
         (present_predecessor || missing_predecessor).then_some(evidence)
     }
 
+    fn missing_member_rebuild_has_absent_predecessor(&self) -> bool {
+        self.replacement_evidence.as_ref().is_some_and(|evidence| {
+            !evidence.old_member_present
+                && self.missing_member_rebuild_only
+                && self.read_only
+                && self.expected_device_count == 2
+                && self.durable_device_guids.get(evidence.device_index)
+                    == Some(&evidence.old_device_guid)
+        })
+    }
+
     /// Admit the not-yet-loaded replacement target while reopening the old
     /// topology after receipt rebuilding became durable.
     ///
@@ -7671,14 +7682,10 @@ impl Pool {
         class: IoClass,
         key: ObjectKey,
     ) -> Result<Option<(Vec<u8>, PlacementReceipt)>> {
+        let missing_predecessor = self.missing_member_rebuild_has_absent_predecessor();
         let fenced_guid = match self.allocation_fenced_device_guid {
             Some(guid) => Some(guid),
-            None if self
-                .predecessor_replacement_resume_evidence()
-                .is_some_and(|evidence| !evidence.old_member_present) =>
-            {
-                None
-            }
+            None if missing_predecessor => None,
             None => {
                 return Err(StoreError::InvalidOptions {
                     reason: "device lifecycle survivor read lacks exact transition evidence",
@@ -7707,12 +7714,10 @@ impl Pool {
         class: IoClass,
         key: ObjectKey,
     ) -> Result<Option<(Vec<u8>, PlacementReceipt)>> {
+        let missing_predecessor = self.missing_member_rebuild_has_absent_predecessor();
         let fenced_guid = match self.allocation_fenced_device_guid {
             Some(guid) => guid,
-            None if self
-                .predecessor_replacement_resume_evidence()
-                .is_some_and(|evidence| !evidence.old_member_present) =>
-            {
+            None if missing_predecessor => {
                 return Ok(None);
             }
             None => {
@@ -7725,9 +7730,21 @@ impl Pool {
             .device_guids
             .iter()
             .position(|guid| *guid == fenced_guid)
-            .ok_or(StoreError::InvalidOptions {
-                reason: "removal predecessor target is no longer attached",
-            })?;
+            .map_or_else(
+                || {
+                    if missing_predecessor {
+                        Ok(None)
+                    } else {
+                        Err(StoreError::InvalidOptions {
+                            reason: "removal predecessor target is no longer attached",
+                        })
+                    }
+                },
+                |idx| Ok(Some(idx)),
+            )?;
+        let Some(fenced_idx) = fenced_idx else {
+            return Ok(None);
+        };
         if !self.class_map.get(class).contains(&fenced_idx) {
             return Ok(None);
         }
@@ -13869,6 +13886,19 @@ mod tests {
         assert_eq!(prepared.verified_receipt_count, subjects.len() as u64);
         assert_eq!(prepared.objects_failed, 0);
         assert!(!prepared.complete);
+        assert_eq!(
+            recovery
+                .get_with_device_lifecycle_survivor_receipt(IoClass::Data, subjects[0].0)
+                .expect("survivor read remains authoritative during missing-member rebuild")
+                .map(|(bytes, _)| bytes),
+            Some(subjects[0].1.clone())
+        );
+        assert_eq!(
+            recovery
+                .get_with_device_lifecycle_predecessor_receipt(IoClass::Data, subjects[0].0)
+                .expect("missing predecessor read returns None instead of refusing"),
+            None
+        );
         let completed = recovery
             .finish_missing_member_rebuild(missing_device_guid)
             .expect("publish same-cardinality successor topology");
