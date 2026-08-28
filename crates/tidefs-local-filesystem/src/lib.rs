@@ -377,6 +377,19 @@ use std::time::{Duration, Instant};
 
 static NEXT_LOCAL_DATASET_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 
+fn shutdown_diagnostics_enabled() -> bool {
+    fn enabled_var(name: &str) -> bool {
+        matches!(
+            std::env::var(name).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+    }
+
+    enabled_var("TIDEFS_VFS_OP_DIAGNOSTICS")
+        || enabled_var("TIDEFS_FUSE_OP_DIAGNOSTICS")
+        || enabled_var("TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS")
+}
+
 use crate::ack_receipt::{
     LocalAckOperation, LocalAckReceipt, LocalAckReceiptLedger, LocalAckReceiptTarget,
 };
@@ -4284,25 +4297,93 @@ impl PoolDatasetOwner {
     /// On failure the same fence forces recovery through a fresh reopen instead
     /// of giving the destructor an unreportable second publication attempt.
     pub fn close_mounted(&mut self) -> Result<()> {
+        let diagnostic = shutdown_diagnostics_enabled();
+        let started = Instant::now();
         let _released_locks = self.release_all_locks_for_mount();
         self.stop_background_scheduler();
         if let Some(handle) = self.filesystem.writeback_handle.take() {
             handle.shutdown();
         }
 
-        let result = if self.filesystem.recovery_policy.allows_any_mutation() {
-            if self.mounted_mutation_quiescence_failure().is_none() {
-                self.store
+        let mutation_allowed = self.filesystem.recovery_policy.allows_any_mutation();
+        let quiescence_failure = if mutation_allowed {
+            self.mounted_mutation_quiescence_failure()
+        } else {
+            None
+        };
+        if diagnostic {
+            let (shared_tracker_inodes, shared_tracker_ranges, unresolved_writeback) =
+                match self.filesystem.writeback_range_tracker.lock() {
+                    Ok(tracker) => (
+                        tracker.dirty_inode_count(),
+                        tracker.total_dirty_ranges(),
+                        tracker.dirty_ranges_have_unresolved_writeback(),
+                    ),
+                    Err(_) => (usize::MAX, usize::MAX, true),
+                };
+            eprintln!(
+                "tidefs-diagnostic: close_mounted start mutation_allowed={} quiescence_failure={:?} state_dirty={} intent_pending_flush={} intent_entries={} mutation_delta={} in_transaction={} uncommitted_mutations={} pending_permits={} write_buffers={} buffered_bases={} dirty_page_ranges={} shared_writeback_inodes={} shared_writeback_ranges={} unresolved_writeback={} commit_group_phase={:?} commit_group_inflight={} pending_snapshot_roots={}",
+                mutation_allowed,
+                quiescence_failure,
+                self.is_state_dirty(),
+                self.filesystem.intent_log.pending_flush_count(),
+                !self.filesystem.intent_log.is_empty(),
+                self.filesystem.mutation_delta.is_some(),
+                self.filesystem.in_transaction,
+                self.filesystem.uncommitted_mutation_count,
+                self.filesystem.pending_permits.len(),
+                self.filesystem.write_buffers.len(),
+                self.filesystem.buffered_write_base_records.len(),
+                self.filesystem.dirty_page_tracker.borrow().dirty_page_count(),
+                shared_tracker_inodes,
+                shared_tracker_ranges,
+                unresolved_writeback,
+                self.filesystem.commit_group.phase,
+                self.filesystem.commit_group.inflight_writes,
+                self.filesystem.pending_snapshot_root_rewrites.len(),
+            );
+        }
+
+        let result = if mutation_allowed {
+            if quiescence_failure.is_none() {
+                let sync_started = Instant::now();
+                let result = self
+                    .store
                     .pool_mut()
                     .sync_all()
-                    .map_err(FileSystemError::from)
+                    .map_err(FileSystemError::from);
+                if diagnostic {
+                    eprintln!(
+                        "tidefs-diagnostic: close_mounted quiescent_sync status={} elapsed_ms={}",
+                        if result.is_ok() { "ok" } else { "err" },
+                        sync_started.elapsed().as_millis()
+                    );
+                }
+                result
             } else {
-                self.fsync_all()
+                let sync_started = Instant::now();
+                let result = self.fsync_all();
+                if diagnostic {
+                    eprintln!(
+                        "tidefs-diagnostic: close_mounted fsync_all status={} reason={:?} elapsed_ms={}",
+                        if result.is_ok() { "ok" } else { "err" },
+                        quiescence_failure,
+                        sync_started.elapsed().as_millis()
+                    );
+                }
+                result
             }
         } else {
             Ok(())
         };
         self.arm_mutation_reopen_fence();
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: close_mounted end status={} elapsed_ms={}",
+                if result.is_ok() { "ok" } else { "err" },
+                started.elapsed().as_millis()
+            );
+        }
         result
     }
 
@@ -8286,12 +8367,22 @@ impl PoolDatasetOwner {
         Ok(fs)
     }
 
-    pub fn sync_all(&mut self) -> Result<()> {
-        self.commit_if_dirty()?;
+    fn sync_mounted_pool_barrier(&mut self) -> Result<()> {
+        // A filesystem-wide barrier must commit dirty mounted state before it
+        // flushes the Pool, but a quiescent mounted owner must not manufacture
+        // fresh raw-store writes just to re-cross the same durable boundary.
+        if self.mounted_mutation_quiescence_failure().is_some() {
+            self.do_commit()?;
+        }
         self.store
             .pool_mut()
             .sync_all()
             .map_err(FileSystemError::from)
+    }
+
+    pub fn sync_all(&mut self) -> Result<()> {
+        self.ensure_mutation_allowed("synchronize mounted filesystem")?;
+        self.sync_mounted_pool_barrier()
     }
 
     pub fn list_snapshots(&self) -> Vec<SnapshotSummary> {
@@ -15585,12 +15676,7 @@ impl PoolDatasetOwner {
     pub fn fsync_all(&mut self) -> Result<()> {
         self.ensure_mutation_allowed("synchronize mounted filesystem")?;
         let started = Instant::now();
-        self.do_commit()?;
-        let result = self
-            .store
-            .pool_mut()
-            .sync_all()
-            .map_err(FileSystemError::from);
+        let result = self.sync_mounted_pool_barrier();
         self.filesystem
             .fsync_stats
             .fsync_all_count
@@ -17253,6 +17339,8 @@ impl PoolDatasetOwner {
     /// Apply and persist the accumulated space delta.
     fn commit_space_delta(&mut self) -> Result<()> {
         let phys = self.derive_dataset_capacity_counters();
+        let counters_before = *self.filesystem.state.space_accounting.counters();
+        let pending_delta = self.filesystem.state.space_accounting.pending_delta();
         if !self.filesystem.state.space_accounting.has_pending_delta() {
             self.filesystem
                 .dataset_capacity
@@ -17266,8 +17354,15 @@ impl PoolDatasetOwner {
             .state
             .space_accounting
             .commit_pending(phys)
-            .map_err(|_e| FileSystemError::CorruptState {
-                reason: "space accounting delta application failed",
+            .map_err(|error| {
+                if shutdown_diagnostics_enabled() {
+                    eprintln!(
+                        "tidefs-diagnostic: commit_space_delta failed counters_before={counters_before:?} pending_delta={pending_delta:?} phys={phys:?} error={error:?}"
+                    );
+                }
+                FileSystemError::CorruptState {
+                    reason: "space accounting delta application failed",
+                }
             })?;
         // Persist space counters alongside committed state
         let counters = self.filesystem.state.space_accounting.counters();

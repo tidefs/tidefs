@@ -100,6 +100,13 @@ fn vfs_op_diagnostics_enabled() -> bool {
     enabled_var("TIDEFS_VFS_OP_DIAGNOSTICS") || enabled_var("TIDEFS_FUSE_OP_DIAGNOSTICS")
 }
 
+fn vfs_shutdown_diagnostics_enabled() -> bool {
+    matches!(
+        std::env::var("TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    ) || vfs_op_diagnostics_enabled()
+}
+
 // ── Path helpers ─────────────────────────────────────────────────────────
 
 fn bytes_to_str(bytes: &[u8]) -> std::result::Result<&str, Errno> {
@@ -8395,7 +8402,23 @@ impl VfsEngine for VfsLocalFileSystem {
         if self.read_only {
             return Ok(());
         }
-        self.fs.borrow_mut().sync_all().map_err(|e| map_errno(&e))
+        let diagnostic = vfs_shutdown_diagnostics_enabled();
+        let started = std::time::Instant::now();
+        let result = self.fs.borrow_mut().sync_all();
+        if diagnostic {
+            match &result {
+                Ok(()) => eprintln!(
+                    "tidefs-diagnostic: vfs syncfs ok elapsed_ms={}",
+                    started.elapsed().as_millis()
+                ),
+                Err(error) => eprintln!(
+                    "tidefs-diagnostic: vfs syncfs error errno={:?} err={error:?} elapsed_ms={}",
+                    map_errno(error),
+                    started.elapsed().as_millis()
+                ),
+            }
+        }
+        result.map_err(|e| map_errno(&e))
     }
 
     // == Extended attribute operations ======================================
@@ -11167,6 +11190,46 @@ mod tests {
                 .expect("read exact bytes after replacement reimport"),
             payload
         );
+    }
+
+    #[test]
+    fn quiescent_mounted_sync_all_does_not_advance_raw_store_sequence() {
+        let (engine, _td, _devices) = temp_fs_with_block_devices(1);
+        engine
+            .fs
+            .borrow_mut()
+            .set_auto_commit(false)
+            .expect("select deferred mounted commit policy");
+        let root = engine.get_root_inode(&ctx()).expect("root inode");
+        let (_attr, fh) = engine
+            .create(root, b"quiescent-sync.bin", 0o644, O_RDWR, &ctx())
+            .expect("create mounted sync fixture");
+        engine
+            .write(&fh, 0, b"mounted sync payload", &ctx())
+            .expect("write mounted sync fixture");
+        engine.release(&fh).expect("release mounted sync handle");
+
+        {
+            let mut filesystem = engine.fs.borrow_mut();
+            filesystem
+                .sync_all()
+                .expect("commit dirty mounted state once");
+            assert_eq!(filesystem.mounted_mutation_quiescence_failure(), None);
+            let before = filesystem.stats().object_store;
+            filesystem
+                .sync_all()
+                .expect("sync already-quiescent mounted state");
+            let after = filesystem.stats().object_store;
+            assert_eq!(
+                after.next_sequence, before.next_sequence,
+                "quiescent mounted sync_all must not append fresh raw-store state"
+            );
+            assert_eq!(
+                after.live_objects, before.live_objects,
+                "quiescent mounted sync_all must not publish new live objects"
+            );
+        }
+        drop(engine);
     }
 
     #[test]
@@ -18527,6 +18590,142 @@ mod tests {
 
         assert_eq!(truncated_attr.posix.size, 0);
         assert!(engine.read(&truncated, 0, 16, &ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn generic074_sparse_truncate_rewrites_survive_admission_pressure() {
+        const FILE_COUNT: usize = 3;
+        const LOOPS: usize = 3;
+        const BLOCK_SIZE: usize = 512;
+        const STRIDE: usize = 1024;
+        let logical_size = crate::constants::content_chunk_size() as usize * 2;
+        let expected_size = logical_size - BLOCK_SIZE;
+
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        for file_idx in 0..FILE_COUNT {
+            let name = format!("generic074-{file_idx}.bin");
+            let (_attr, fh) = engine.create(root, name.as_bytes(), 0o644, O_RDWR, &ctx()).unwrap();
+            engine.release(&fh).unwrap();
+        }
+
+        {
+            let mut fs = engine.fs.borrow_mut();
+            fs.stop_background_scheduler();
+            fs.sync_all().expect("commit generic/074 fixture files");
+            fs.set_auto_commit(false)
+                .expect("defer mounted commits during sparse rewrite loop");
+            fs.set_max_uncommitted_mutations(1_000_000)
+                .expect("keep the mounted commit group open");
+            fs.set_write_buffer_flush_threshold_bytes(64 * 1024 * 1024)
+                .expect("retain buffered sparse writes until pressure or fsync");
+            let admission = fs.admission_config();
+            fs.filesystem
+                .write_admission
+                .apply_dynamic_tuning(crate::admission::LocalAdmissionTuning {
+                    max_dirty_bytes: (BLOCK_SIZE * 8) as u64,
+                    max_dirty_ops: admission.hard_max_dirty_ops,
+                    max_dirty_age_ticks: admission.hard_max_dirty_age_ticks,
+                });
+            fs.commit_group.config.commit_group_target_ops = u64::MAX;
+            fs.commit_group.config.commit_group_target_bytes = u64::MAX;
+            fs.commit_group.config.commit_group_dirty_max_bytes = u64::MAX;
+            fs.commit_group.config.commit_group_target_secs = 3600.0;
+        }
+
+        for loop_idx in 0..LOOPS {
+            for file_idx in 0..FILE_COUNT {
+                let name = format!("generic074-{file_idx}.bin");
+                let (attr, fh) = engine
+                    .create(root, name.as_bytes(), 0o644, O_RDWR | O_TRUNC, &ctx())
+                    .unwrap_or_else(|error| {
+                        panic!("loop {loop_idx} file {file_idx}: truncate-open failed: {error:?}")
+                    });
+                let inode_id = attr.inode_id;
+
+                for offset in (0..logical_size).step_by(STRIDE) {
+                    let block_index = offset / BLOCK_SIZE;
+                    let expected_byte =
+                        (loop_idx as u64 + file_idx as u64 + block_index as u64) as u8;
+                    let block = vec![expected_byte; BLOCK_SIZE];
+                    assert_eq!(
+                        engine
+                            .write(&fh, offset as u64, &block, &ctx())
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "loop {loop_idx} file {file_idx} offset {offset}: write failed: {error:?}"
+                                )
+                            }),
+                        BLOCK_SIZE as u32
+                    );
+                }
+
+                engine
+                    .flush(&fh, &ctx())
+                    .unwrap_or_else(|error| {
+                        panic!("loop {loop_idx} file {file_idx}: flush failed: {error:?}")
+                    });
+                engine
+                    .release(&fh)
+                    .unwrap_or_else(|error| {
+                        panic!("loop {loop_idx} file {file_idx}: release failed: {error:?}")
+                    });
+
+                let reader = engine.open(inode_id, O_RDONLY, &ctx()).unwrap_or_else(|error| {
+                    panic!("loop {loop_idx} file {file_idx}: reopen failed: {error:?}")
+                });
+                let reopened = engine
+                    .getattr(inode_id, Some(&reader), &ctx())
+                    .unwrap_or_else(|error| {
+                        panic!("loop {loop_idx} file {file_idx}: getattr failed: {error:?}")
+                    });
+                assert_eq!(
+                    reopened.posix.size,
+                    expected_size as u64,
+                    "loop {loop_idx} file {file_idx}: unexpected reopened size"
+                );
+
+                for offset in (0..logical_size).step_by(STRIDE) {
+                    let block_index = offset / BLOCK_SIZE;
+                    let expected_byte =
+                        (loop_idx as u64 + file_idx as u64 + block_index as u64) as u8;
+                    let expected = vec![expected_byte; BLOCK_SIZE];
+                    let actual = engine
+                        .read(&reader, offset as u64, BLOCK_SIZE as u32, &ctx())
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "loop {loop_idx} file {file_idx} offset {offset}: data read failed: {error:?}"
+                            )
+                        });
+                    assert_eq!(
+                        actual, expected,
+                        "loop {loop_idx} file {file_idx} offset {offset}: written sparse block changed"
+                    );
+
+                    let hole_offset = offset + BLOCK_SIZE;
+                    if hole_offset < expected_size {
+                        let hole = engine
+                            .read(&reader, hole_offset as u64, BLOCK_SIZE as u32, &ctx())
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "loop {loop_idx} file {file_idx} hole {hole_offset}: hole read failed: {error:?}"
+                                )
+                            });
+                        assert_eq!(
+                            hole,
+                            vec![0; BLOCK_SIZE],
+                            "loop {loop_idx} file {file_idx} hole {hole_offset}: sparse gap lost zero visibility"
+                        );
+                    }
+                }
+
+                engine
+                    .release(&reader)
+                    .unwrap_or_else(|error| {
+                        panic!("loop {loop_idx} file {file_idx}: reader release failed: {error:?}")
+                    });
+            }
+        }
     }
 
     #[test]

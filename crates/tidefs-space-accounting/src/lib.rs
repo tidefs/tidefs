@@ -256,6 +256,12 @@ impl SpaceAccounting {
         self.pending_delta.accumulate(delta);
     }
 
+    /// Return the currently accumulated commit-group delta without mutating it.
+    #[must_use]
+    pub const fn pending_delta(&self) -> SpaceDelta {
+        self.pending_delta
+    }
+
     /// Commit the accumulated pending delta and reset it to ZERO.
     ///
     /// Refreshes pool counters from the provided [`PoolPhysicalCountersV1`]
@@ -266,11 +272,13 @@ impl SpaceAccounting {
         pool: PoolPhysicalCountersV1,
     ) -> Result<(), SpaceAccountingError> {
         self.update_pool_counters(pool);
-        let delta = core::mem::replace(&mut self.pending_delta, SpaceDelta::ZERO);
+        let delta = self.pending_delta;
         if delta.is_zero() {
             return Ok(());
         }
-        self.commit_delta(delta)
+        self.commit_delta(delta)?;
+        self.pending_delta = SpaceDelta::ZERO;
+        Ok(())
     }
 
     /// Whether there is a non-zero pending delta to commit.

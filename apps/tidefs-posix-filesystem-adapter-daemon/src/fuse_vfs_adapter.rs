@@ -87,6 +87,13 @@ fn fuse_op_diagnostics_enabled() -> bool {
     )
 }
 
+fn fuse_shutdown_diagnostics_enabled() -> bool {
+    matches!(
+        std::env::var("TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    ) || fuse_op_diagnostics_enabled()
+}
+
 /// Validate protocol flags carried by a FUSE WRITE request.
 ///
 /// `FUSE_WRITE_CACHE` is not limited to mounts that negotiated the optional
@@ -631,9 +638,20 @@ impl Default for DentryPolicy {
 impl DentryPolicy {
     fn for_timestamp_policy(self, timestamp_policy: TimestampPolicy, read_only: bool) -> Self {
         let mut policy = self;
-        if read_only || timestamp_policy != TimestampPolicy::NoAtime {
+        if read_only {
             policy.positive_entry_ttl = Duration::ZERO;
             policy.positive_attr_ttl = Duration::ZERO;
+            return policy;
+        }
+        match timestamp_policy {
+            TimestampPolicy::NoAtime => {}
+            TimestampPolicy::RelativeAtime => {
+                policy.positive_entry_ttl = Duration::ZERO;
+            }
+            TimestampPolicy::StrictAtime => {
+                policy.positive_entry_ttl = Duration::ZERO;
+                policy.positive_attr_ttl = Duration::ZERO;
+            }
         }
         policy
     }
@@ -3936,21 +3954,17 @@ impl FuseVfsAdapter {
             .remove(&ino)
     }
 
-    fn has_relatime_read_atime_pending(&self, ino: u64) -> bool {
-        self.relatime_read_atime_pending
-            .lock()
-            .unwrap()
-            .contains(&ino)
-    }
-
     fn writeback_open_should_keep_cache(
         &self,
         open_flags: u32,
         existing_open_state: InodeOpenState,
-        relatime_read_atime_pending: bool,
     ) -> bool {
         if open_flags_allow_write(open_flags).unwrap_or(false) {
-            return true;
+            // Writable truncate opens must start from a cold kernel cache
+            // generation so stale pre-truncate pages cannot leak into the
+            // new file contents. The later read-only reopen may still retain
+            // the post-truncate cache it built during the write phase.
+            return (open_flags & libc::O_TRUNC as u32) == 0;
         }
         if !open_flags_allow_read(open_flags).unwrap_or(false) {
             return true;
@@ -3959,7 +3973,7 @@ impl FuseVfsAdapter {
             return true;
         }
         if self.writeback_cache_enabled && self.timestamp_policy == TimestampPolicy::RelativeAtime {
-            return !relatime_read_atime_pending;
+            return true;
         }
         !self.active_read_atime_policy()
     }
@@ -3968,7 +3982,6 @@ impl FuseVfsAdapter {
         &self,
         open_flags: u32,
         existing_open_state: InodeOpenState,
-        relatime_read_atime_pending: bool,
     ) -> u32 {
         let mut reply_flags = fuse_open_reply_flags(open_flags);
         if self.force_direct_io {
@@ -3976,11 +3989,7 @@ impl FuseVfsAdapter {
         }
         if self.writeback_cache_enabled
             && (reply_flags & fuser::consts::FOPEN_DIRECT_IO) == 0
-            && self.writeback_open_should_keep_cache(
-                open_flags,
-                existing_open_state,
-                relatime_read_atime_pending,
-            )
+            && self.writeback_open_should_keep_cache(open_flags, existing_open_state)
         {
             reply_flags |= fuser::consts::FOPEN_KEEP_CACHE;
         }
@@ -3988,7 +3997,7 @@ impl FuseVfsAdapter {
     }
 
     fn fuse_open_flags_for_request(&self, open_flags: u32) -> u32 {
-        self.fuse_open_flags_for_existing_state(open_flags, InodeOpenState::default(), false)
+        self.fuse_open_flags_for_existing_state(open_flags, InodeOpenState::default())
     }
 
     fn invalidate_inode_metadata_local(&self, ino: u64) {
@@ -7586,6 +7595,7 @@ impl FuseVfsAdapter {
     /// and does not require a file handle.
     pub fn dispatch_syncfs(&self, ctx: &RequestCtx) -> Result<(), Errno> {
         let _start = std::time::Instant::now();
+        let diagnostic = fuse_shutdown_diagnostics_enabled();
         // The mount-wide barrier owns every reconciliation stripe so no FUSE
         // write can publish a dirty projection between the snapshots and their
         // post-barrier retirement.
@@ -7618,6 +7628,23 @@ impl FuseVfsAdapter {
             Vec::new()
         };
         dirty_projection_inodes.extend(tracked_ranges.iter().map(|(inode, _)| inode.get()));
+        if diagnostic {
+            let tracked_range_count: usize =
+                tracked_ranges.iter().map(|(_, ranges)| ranges.len()).sum();
+            let writeback_dirty_pages = self
+                .writeback_page_cache
+                .as_ref()
+                .map_or(0, |cache| cache.dirty_pages().len());
+            eprintln!(
+                "tidefs-diagnostic: fuse syncfs start dirty_state_inodes={} worker_dirty_ranges={} tracked_inodes={} tracked_ranges={} write_page_cache_dirty_pages={} writeback_page_cache_dirty_pages={}",
+                dirty_state_snapshots.len(),
+                worker_dirty_ranges.len(),
+                tracked_ranges.len(),
+                tracked_range_count,
+                self.write_page_cache.dirty_pages().len(),
+                writeback_dirty_pages,
+            );
+        }
 
         let sync_result = (|| {
             // Mirror every snapshotted regular-file range into the optional
@@ -7688,6 +7715,14 @@ impl FuseVfsAdapter {
             let engine = self.engine.lock().unwrap();
             engine.syncfs(ctx)
         })();
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse syncfs engine status={} errno={:?} elapsed_ms={}",
+                if sync_result.is_ok() { "ok" } else { "err" },
+                sync_result.as_ref().err(),
+                _start.elapsed().as_millis()
+            );
+        }
 
         let mut tracker_completion_failed = false;
         if let Some(ref tracker) = self.writeback_range_tracker {
@@ -7721,8 +7756,21 @@ impl FuseVfsAdapter {
                 }
             }
         }
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse syncfs tracker_cleanup status={} tracker_completion_failed={} elapsed_ms={}",
+                if sync_result.is_ok() { "ok" } else { "err" },
+                tracker_completion_failed,
+                _start.elapsed().as_millis()
+            );
+        }
         sync_result?;
         if tracker_completion_failed {
+            if diagnostic {
+                eprintln!(
+                    "tidefs-diagnostic: fuse syncfs returning EIO after successful engine barrier because tracked ranges remained after cleanup"
+                );
+            }
             return Err(Errno::EIO);
         }
 
@@ -8946,7 +8994,6 @@ impl FuseVfsAdapter {
             let fuse_flags = self.fuse_open_flags_for_existing_state(
                 engine_open_flags,
                 existing_open_state,
-                self.has_relatime_read_atime_pending(ino),
             );
             let adapter_fh = handles.allocate(ino, engine_open_flags, engine_fh);
             if let Some(handle) = handles.handles.get_mut(&adapter_fh) {
@@ -11043,8 +11090,11 @@ impl Filesystem for FuseVfsAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
     use tidefs_background_scheduler::{
         BackgroundScheduler, BackgroundService, ServiceBudget, ServiceError, ServicePriority,
         TickReport,
@@ -11310,6 +11360,95 @@ mod tests {
     impl Drop for AdapterFixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    struct MountedWritebackFixture {
+        root: PathBuf,
+        store: PathBuf,
+        mount: PathBuf,
+        session: Option<fuser::BackgroundSession>,
+    }
+
+    impl MountedWritebackFixture {
+        fn new() -> Self {
+            let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "tidefs-mounted-writeback-{}-{temp_id}",
+                std::process::id()
+            ));
+            let store = root.join("store");
+            let mount = root.join("mnt");
+            fs::create_dir_all(&store).expect("create mounted store root");
+            fs::create_dir_all(&mount).expect("create mounted mountpoint");
+
+            let mut fixture = Self {
+                root,
+                store,
+                mount,
+                session: None,
+            };
+            fixture.mount();
+            fixture
+        }
+
+        fn mount(&mut self) {
+            let mut local_fs = LocalFileSystem::open_with_root_authentication_key(
+                &self.store,
+                StoreOptions::default(),
+                RootAuthenticationKey::demo_key(),
+            )
+            .expect("open mounted writeback local filesystem");
+            local_fs
+                .set_write_buffer_flush_threshold_bytes(64 * 1024 * 1024)
+                .expect("set mounted write buffer threshold");
+            local_fs
+                .set_auto_commit(false)
+                .expect("disable auto commit for mounted writeback fixture");
+            local_fs
+                .set_commit_group_throughput_profile()
+                .expect("set mounted throughput profile");
+            local_fs
+                .set_max_uncommitted_mutations(64 * 1024)
+                .expect("set mounted uncommitted mutation limit");
+            let writeback_tracker = local_fs
+                .clone_writeback_range_tracker()
+                .expect("clone mounted writeback tracker");
+
+            let engine = VfsLocalFileSystem::new(local_fs);
+            let adapter = FuseVfsAdapter::new(Box::new(engine))
+                .expect("create mounted writeback adapter")
+                .with_writeback_cache_enabled()
+                .with_writeback_range_tracker(writeback_tracker);
+            let options = vec![
+                fuser::MountOption::FSName("tidefs-mounted-writeback".to_string()),
+                fuser::MountOption::RW,
+                fuser::MountOption::NoDev,
+                fuser::MountOption::NoSuid,
+                fuser::MountOption::Subtype("tidefs".to_string()),
+                fuser::MountOption::WritebackCache,
+            ];
+            let session =
+                fuser::spawn_mount2(adapter, &self.mount, &options).expect("mount FUSE writeback");
+            self.session = Some(session);
+        }
+
+        fn unmount(&mut self) {
+            if let Some(session) = self.session.take() {
+                drop(session);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.mount.join(relative.trim_start_matches('/'))
+        }
+    }
+
+    impl Drop for MountedWritebackFixture {
+        fn drop(&mut self) {
+            self.unmount();
+            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
@@ -12613,12 +12752,12 @@ mod tests {
         assert_eq!(
             read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
             0,
-            "active-atime read opens after the writer closes must keep buffered reads enabled"
+            "relatime read opens after the writer closes must keep buffered reads enabled"
         );
-        assert_eq!(
+        assert_ne!(
             read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
             0,
-            "active-atime read opens after the writer closes must not preserve stale kernel pages"
+            "relatime read opens after the writer closes should preserve the post-write kernel cache"
         );
 
         let after_read_open = {
@@ -26341,9 +26480,9 @@ mod tests {
         assert_eq!(getattr_out.attr.gid, expected.gid);
         assert_eq!(getattr_out.attr.rdev, expected.rdev);
         assert_eq!(getattr_out.attr.blksize, expected.blksize);
-        // GETATTR must follow the active adapter coherency policy.  The
-        // default test fixture uses RelativeAtime, which intentionally disables
-        // positive attr TTLs so lookup/getattr cannot hide atime updates.
+        // GETATTR must follow the active adapter coherency policy. The default
+        // test fixture uses RelativeAtime, which preserves attr TTLs while
+        // still forcing lookup revalidation through a zero entry TTL.
         assert_eq!(
             fuse_attr_out_ttl(&getattr_out),
             fixture.adapter.dentry_policy.positive_attr_ttl
@@ -41447,7 +41586,7 @@ mod tests {
         )
         .expect("open local filesystem");
         let mut engine = VfsLocalFileSystem::new(local_fs);
-        engine
+        let _ = engine
             .set_timestamp_policy(tidefs_inode_attributes::timestamp::TimestampPolicy::Strictatime);
         let mut adapter = FuseVfsAdapter::new(Box::new(engine))
             .expect("create adapter")
@@ -41521,6 +41660,115 @@ mod tests {
             .expect("create adapter")
             .with_writeback_cache_enabled();
         AdapterFixture { adapter, root }
+    }
+
+    #[test]
+    fn mounted_writeback_cache_generic074_sparse_truncate_rewrites_survive() {
+        static MOUNTED_WRITEBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        const CHILDREN: usize = 3;
+        const FILES_PER_CHILD: usize = 5;
+        const LOOPS: usize = 10;
+        const FILE_SIZE: usize = 30 * 1024 * 1024;
+        const BLOCK_SIZE: usize = 512;
+        const STRIDE: usize = 1024;
+        const EXPECTED_SIZE: usize = FILE_SIZE - BLOCK_SIZE;
+
+        let _guard = MOUNTED_WRITEBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mounted = MountedWritebackFixture::new();
+
+        let mut workers = Vec::new();
+        for child_idx in 0..CHILDREN {
+            let child_root = mounted.path(&format!("fstest.{child_idx}/child{child_idx}"));
+            fs::create_dir_all(&child_root).expect("create child work directory");
+            workers.push(std::thread::spawn(move || {
+                let mut block = vec![0_u8; BLOCK_SIZE];
+                let mut readback = vec![0_u8; BLOCK_SIZE];
+
+                for loop_idx in 0..LOOPS {
+                    for file_idx in 0..FILES_PER_CHILD {
+                        let path = child_root.join(format!("file{file_idx}.bin"));
+                        {
+                            let mut file = OpenOptions::new()
+                                .create(true)
+                                .truncate(true)
+                                .read(true)
+                                .write(true)
+                                .open(&path)
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "child {child_idx} loop {loop_idx} file {file_idx}: truncate-open failed: {error}"
+                                    )
+                                });
+                            for offset in (0..FILE_SIZE).step_by(STRIDE) {
+                                let expected_byte = (loop_idx
+                                    .wrapping_add(child_idx)
+                                    .wrapping_add(file_idx)
+                                    .wrapping_add(offset / BLOCK_SIZE))
+                                    as u8;
+                                block.fill(expected_byte);
+                                file.seek(SeekFrom::Start(offset as u64)).unwrap_or_else(|error| {
+                                    panic!(
+                                        "child {child_idx} loop {loop_idx} file {file_idx} offset {offset}: seek failed: {error}"
+                                    )
+                                });
+                                file.write_all(&block).unwrap_or_else(|error| {
+                                    panic!(
+                                        "child {child_idx} loop {loop_idx} file {file_idx} offset {offset}: write failed: {error}"
+                                    )
+                                });
+                            }
+                        }
+
+                        let metadata = fs::metadata(&path).unwrap_or_else(|error| {
+                            panic!(
+                                "child {child_idx} loop {loop_idx} file {file_idx}: metadata failed: {error}"
+                            )
+                        });
+                        assert_eq!(
+                            metadata.len(),
+                            EXPECTED_SIZE as u64,
+                            "child {child_idx} loop {loop_idx} file {file_idx}: unexpected truncated sparse size"
+                        );
+
+                        let mut reader = File::open(&path).unwrap_or_else(|error| {
+                            panic!(
+                                "child {child_idx} loop {loop_idx} file {file_idx}: reopen failed: {error}"
+                            )
+                        });
+                        for offset in (0..FILE_SIZE).step_by(STRIDE) {
+                            let expected_byte = (loop_idx
+                                .wrapping_add(child_idx)
+                                .wrapping_add(file_idx)
+                                .wrapping_add(offset / BLOCK_SIZE))
+                                as u8;
+                            block.fill(expected_byte);
+                            reader.seek(SeekFrom::Start(offset as u64)).unwrap_or_else(|error| {
+                                panic!(
+                                    "child {child_idx} loop {loop_idx} file {file_idx} offset {offset}: read seek failed: {error}"
+                                )
+                            });
+                            reader.read_exact(&mut readback).unwrap_or_else(|error| {
+                                panic!(
+                                    "child {child_idx} loop {loop_idx} file {file_idx} offset {offset}: read failed: {error}"
+                                )
+                            });
+                            assert_eq!(
+                                readback,
+                                block,
+                                "child {child_idx} loop {loop_idx} file {file_idx} offset {offset}: sparse rewrite changed after close"
+                            );
+                        }
+                    }
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().expect("mounted writeback worker");
+        }
     }
 
     #[test]
@@ -42055,6 +42303,67 @@ mod tests {
     }
 
     #[test]
+    fn writeback_truncating_open_drops_keep_cache_but_keeps_buffered_io() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+
+        let create = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"wb-truncate-drop-keep-cache.txt",
+                0o644,
+                libc::O_RDWR as u32,
+            )
+            .expect("create writeback-cache file");
+
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                create.attr.inode_id.get(),
+                create.adapter_fh,
+                0,
+                b"seed-before-truncate",
+                0,
+            )
+            .expect("seed file");
+        fixture
+            .adapter
+            .dispatch_release(create.attr.inode_id.get(), create.adapter_fh, 0, None, true)
+            .expect("release seed writer");
+
+        let truncate_open = fixture
+            .adapter
+            .dispatch_open(
+                &ctx,
+                create.attr.inode_id.get(),
+                libc::O_RDWR as u32 | libc::O_TRUNC as u32,
+            )
+            .expect("open existing file with O_TRUNC under writeback cache");
+        assert_eq!(
+            truncate_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
+            0,
+            "writeback-cache O_TRUNC should keep buffered I/O enabled"
+        );
+        assert_eq!(
+            truncate_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
+            0,
+            "truncate-open must drop pre-truncate kernel cache identity"
+        );
+        let mut fixture = fixture;
+        fixture
+            .adapter
+            .dispatch_release(create.attr.inode_id.get(), truncate_open.adapter_fh, 0, None, false)
+            .expect("release truncate-open handle");
+    }
+
+    #[test]
     fn writeback_readonly_open_preserves_kernel_page_cache_while_writer_open() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
@@ -42090,7 +42399,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_active_atime_readonly_reopen_drops_kernel_page_cache() {
+    fn writeback_relatime_readonly_reopen_after_write_keeps_cache_and_updates_atime() {
         let mut fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let root = {
@@ -42110,23 +42419,59 @@ mod tests {
 
         fixture
             .adapter
+            .dispatch_write(
+                &ctx,
+                create.attr.inode_id.get(),
+                create.adapter_fh,
+                0,
+                b"relatime writeback payload",
+                0,
+            )
+            .expect("write payload before read reopen");
+        fixture
+            .adapter
             .dispatch_release(create.attr.inode_id.get(), create.adapter_fh, 0, None, true)
             .expect("release writer");
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(create.attr.inode_id, None, &ctx)
+                .expect("getattr before read reopen")
+        };
 
+        std::thread::sleep(Duration::from_millis(1));
         let read_open = fixture
             .adapter
-            .dispatch_open(&ctx, create.attr.inode_id.get(), libc::O_RDONLY as u32)
-            .expect("open read-only under active atime");
+            .dispatch_open_entry(&ctx, create.attr.inode_id.get(), libc::O_RDONLY as u32)
+            .expect("open read-only after write under relatime");
         assert_eq!(
             read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
             0,
-            "active-atime read-only writeback opens must still use buffered I/O"
+            "relatime read-only writeback reopens must still use buffered I/O"
         );
-        assert_eq!(
+        assert_ne!(
             read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
             0,
-            "clean active-atime read-only reopens must invalidate page cache so reads reach the daemon"
+            "relatime read-only reopens after a write should preserve the post-write kernel cache"
         );
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(create.attr.inode_id, None, &ctx)
+                .expect("getattr after read reopen")
+        };
+        assert!(
+            after.posix.atime_ns > before.posix.atime_ns,
+            "the first relatime read-only reopen after a write must still advance atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "relatime read-open atime update must not advance ctime"
+        );
+        fixture
+            .adapter
+            .dispatch_release(create.attr.inode_id.get(), read_open.adapter_fh, 0, None, false)
+            .expect("release read reopen");
     }
 
     #[test]
@@ -44476,7 +44821,7 @@ mod tests {
     }
 
     #[test]
-    fn read_atime_policy_zeroes_positive_attr_ttl() {
+    fn relatime_policy_preserves_positive_attr_ttl_but_zeroes_lookup_ttl() {
         let adapter = fresh_test_adapter()
             .with_coherency_profile(crate::coherency_profile::CoherencyProfile::Writeback)
             .with_timestamp_policy(TimestampPolicy::RelativeAtime);
@@ -44486,7 +44831,10 @@ mod tests {
             Duration::from_secs(5)
         );
         assert_eq!(adapter.dentry_policy.positive_entry_ttl, Duration::ZERO);
-        assert_eq!(adapter.dentry_policy.positive_attr_ttl, Duration::ZERO);
+        assert_eq!(
+            adapter.dentry_policy.positive_attr_ttl,
+            Duration::from_secs(5)
+        );
         assert_eq!(adapter.dentry_policy.positive_reply_ttl(), Duration::ZERO);
     }
 
