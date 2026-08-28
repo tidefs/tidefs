@@ -29,15 +29,10 @@ const O_TMPFILE: libc::c_int = 0o20200000;
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
-/// Try to create a MountHarness; skip test gracefully if daemon not available.
-fn mount_or_skip() -> Option<MountHarness> {
-    match MountHarness::new() {
-        Ok(h) => Some(h),
-        Err(e) => {
-            eprintln!("SKIP: daemon not available -- {e}");
-            None
-        }
-    }
+/// Open the canonical mounted carrier or fail closed when the runtime
+/// substrate is absent.
+fn mount_or_fail() -> MountHarness {
+    MountHarness::new_or_fail(module_path!())
 }
 
 /// Open an unnamed temporary file via O_TMPFILE in the given directory.
@@ -133,10 +128,7 @@ const RENAME_EXCHANGE: u32 = 2;
 /// reclaimed during mount-time recovery).
 #[test]
 fn tmpfile_create_crash_reclaim() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     // Create a subdirectory to hold the tmpfile.
     harness.mkdir("tmpdir").expect("mkdir tmpdir");
@@ -173,10 +165,7 @@ fn tmpfile_create_crash_reclaim() {
 /// data must be reclaimed as part of orphan cleanup.
 #[test]
 fn tmpfile_fsync_crash_reclaim() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     harness.mkdir("tmpdir").expect("mkdir tmpdir");
     let dir_path = harness.mount_path().join("tmpdir");
@@ -208,10 +197,7 @@ fn tmpfile_fsync_crash_reclaim() {
 /// verify all orphans are reclaimed and the filesystem is healthy.
 #[test]
 fn multi_tmpfile_crash_reclaim() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     harness.mkdir("A").expect("mkdir A");
     harness.mkdir("B").expect("mkdir B");
@@ -261,10 +247,7 @@ fn multi_tmpfile_crash_reclaim() {
 /// already freed before the crash.
 #[test]
 fn tmpfile_close_before_crash_no_orphan() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     harness.mkdir("tmpdir").expect("mkdir tmpdir");
     let dir_path = harness.mount_path().join("tmpdir");
@@ -298,10 +281,7 @@ fn tmpfile_close_before_crash_no_orphan() {
 /// survive at the new path and the old path must be gone.
 #[test]
 fn rename_then_crash_target_survives() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = b"rename crash recovery test data\n";
 
@@ -340,10 +320,7 @@ fn rename_then_crash_target_survives() {
 /// must exist at either old or new path, but not both (no duplicate).
 #[test]
 fn rename_no_fsync_crash_consistent() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = b"rename without fsync crash test\n";
 
@@ -389,10 +366,7 @@ fn rename_no_fsync_crash_consistent() {
 /// consistent outcome.
 #[test]
 fn rename_noreplace_crash_recovery() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = b"rename_noreplace test data\n";
 
@@ -431,10 +405,7 @@ fn rename_noreplace_crash_recovery() {
 /// verify both files survived with swapped content.
 #[test]
 fn rename_exchange_crash_recovery() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data_a = b"file A content before exchange\n";
     let data_b = b"file B content before exchange\n";
@@ -483,10 +454,7 @@ fn rename_exchange_crash_recovery() {
 /// The file must be gone (orphan reclaimed) and the filesystem healthy.
 #[test]
 fn unlink_while_open_crash_recovery() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = b"unlink-while-open test payload\n";
 
@@ -539,10 +507,7 @@ fn unlink_while_open_crash_recovery() {
 /// verify no corruption and filesystem consistency.
 #[test]
 fn unlink_during_rename_crash() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data_src = b"source file for rename-overwrite\n";
     let data_dst = b"destination file to be overwritten\n";
@@ -608,10 +573,7 @@ fn unlink_during_rename_crash() {
 /// exactly one copy of the data exists and the filesystem is healthy.
 #[test]
 fn rename_chain_crash_recovery() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = b"rename chain payload\n";
 
@@ -659,10 +621,7 @@ fn rename_chain_crash_recovery() {
 /// backing storage.
 #[test]
 fn tmpfile_full_pipeline_orphan_reclaim() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     harness.mkdir("pipeline_dir").expect("mkdir pipeline_dir");
     let dir_path = harness.mount_path().join("pipeline_dir");

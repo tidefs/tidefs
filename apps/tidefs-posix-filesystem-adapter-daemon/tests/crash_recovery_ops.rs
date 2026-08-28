@@ -50,15 +50,10 @@ fn blake3_hex(data: &[u8]) -> String {
     hex
 }
 
-/// Try to create a MountHarness; skip test gracefully if daemon not available.
-fn mount_or_skip() -> Option<MountHarness> {
-    match MountHarness::new() {
-        Ok(h) => Some(h),
-        Err(e) => {
-            eprintln!("SKIP: daemon not available -- {e}");
-            None
-        }
-    }
+/// Open the canonical mounted carrier or fail closed when the runtime
+/// substrate is absent.
+fn mount_or_fail() -> MountHarness {
+    MountHarness::new_or_fail(module_path!())
 }
 
 // ── test 1: operation-mix crash-recovery ──────────────────────────────────
@@ -69,10 +64,7 @@ fn mount_or_skip() -> Option<MountHarness> {
 
 #[test]
 fn ops_mix_crash_recovery_full_surface() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data_a = patterned_bytes(1, 4096);
     let data_b = patterned_bytes(2, 2048);
@@ -249,10 +241,7 @@ fn ops_mix_crash_recovery_full_surface() {
 /// SIGKILL, remount, verify deletions survived.
 #[test]
 fn ops_mix_unlink_rmdir_crash_recovery() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let keep_data = b"this must survive\n";
     let del_data = b"this must be gone\n";
@@ -308,10 +297,7 @@ fn ops_mix_unlink_rmdir_crash_recovery() {
 /// verify file in dst_dir with correct content and absent from src_dir.
 #[test]
 fn ops_mix_rename_across_dirs_crash() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let payload = patterned_bytes(42, 2048);
 
@@ -361,10 +347,7 @@ fn ops_mix_rename_across_dirs_crash() {
 /// guarantees hold even for the non-fsynced path.
 #[test]
 fn mid_op_crash_no_fsync_no_corruption() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = seq_data(4096);
 
@@ -398,10 +381,7 @@ fn mid_op_crash_no_fsync_no_corruption() {
 /// must never contain phantom data.
 #[test]
 fn mid_op_crash_partial_fsync() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let d1 = seq_data(1024);
     let d2 = seq_data(2048);
@@ -450,10 +430,7 @@ fn mid_op_crash_partial_fsync() {
 /// survived the double-crash cycle.
 #[test]
 fn double_crash_during_replay_recovery() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = seq_data(8192);
 
@@ -502,10 +479,7 @@ fn double_crash_during_replay_recovery() {
 /// remount, verify byte-for-byte match AND BLAKE3 checksums match.
 #[test]
 fn blake3_data_integrity_crash_recovery() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let files: Vec<(&str, Vec<u8>, String)> = vec![
         {
@@ -562,10 +536,7 @@ fn blake3_data_integrity_crash_recovery() {
 /// remount, verify attributes survived.
 #[test]
 fn ops_mix_setattr_crash_recovery() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     let data = b"setattr test data\n";
     harness
@@ -610,10 +581,7 @@ fn ops_mix_setattr_crash_recovery() {
 /// operations, verifying data survives all cycles.
 #[test]
 fn crash_recovery_loop_five_cycles_mixed_ops() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     harness
         .create_file("loop_seed.bin", b"initial seed\n")
@@ -672,10 +640,7 @@ fn crash_recovery_loop_five_cycles_mixed_ops() {
 /// fsync, SIGKILL, remount, verify full tree, all contents, all xattrs.
 #[test]
 fn crash_recovery_directory_tree_xattr() {
-    let mut harness = match mount_or_skip() {
-        Some(h) => h,
-        None => return,
-    };
+    let mut harness = mount_or_fail();
 
     harness.mkdir_all("tree/A/B").expect("mkdir tree/A/B");
 
